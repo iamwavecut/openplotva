@@ -135,6 +135,9 @@ pub struct ChatContentPart {
     /// Image URL part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<ChatImageUrlPart>,
+    /// Video URL part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<ChatVideoUrlPart>,
 }
 
 /// AIFarm image URL payload.
@@ -145,6 +148,13 @@ pub struct ChatImageUrlPart {
     /// Image detail mode.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub detail: String,
+}
+
+/// OpenAI-compatible video URL payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChatVideoUrlPart {
+    /// Data URL or HTTP URL.
+    pub url: String,
 }
 
 /// OpenAI-compatible chat completion request subset used by AIFarm routing.
@@ -2972,11 +2982,15 @@ fn redacted_chat_completion_request(request: &ChatCompletionRequest) -> ChatComp
     let mut out = request.clone();
     for message in &mut out.messages {
         for part in &mut message.content_parts {
-            let Some(image_url) = part.image_url.as_mut() else {
-                continue;
-            };
-            if image_url.url.trim_start().starts_with("data:") {
+            if let Some(image_url) = part.image_url.as_mut()
+                && image_url.url.trim_start().starts_with("data:")
+            {
                 image_url.url = "data:<redacted-image>".to_owned();
+            }
+            if let Some(video_url) = part.video_url.as_mut()
+                && video_url.url.trim_start().starts_with("data:")
+            {
+                video_url.url = "data:<redacted-video>".to_owned();
             }
         }
     }
@@ -4964,11 +4978,7 @@ fn multimodal_content_parts(
     if images.is_empty() {
         return Vec::new();
     }
-    let mut parts = vec![ChatContentPart {
-        part_type: "text".to_owned(),
-        text: text.trim().to_owned(),
-        image_url: None,
-    }];
+    let mut parts = Vec::with_capacity(images.len() + 1);
     for image in images {
         let data_url = image.data_url.trim();
         if data_url.is_empty() {
@@ -4981,11 +4991,18 @@ fn multimodal_content_parts(
                 url: data_url.to_owned(),
                 detail: "auto".to_owned(),
             }),
+            video_url: None,
         });
     }
-    if parts.len() <= 1 {
+    if parts.is_empty() {
         return Vec::new();
     }
+    parts.push(ChatContentPart {
+        part_type: "text".to_owned(),
+        text: text.trim().to_owned(),
+        image_url: None,
+        video_url: None,
+    });
     parts
 }
 
@@ -6689,7 +6706,7 @@ mod tests {
     }
 
     #[test]
-    fn aifarm_trace_request_redacts_data_url_images() {
+    fn aifarm_trace_request_redacts_data_url_media() {
         let request = ChatCompletionRequest {
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
@@ -6701,6 +6718,15 @@ mod tests {
                             url: "data:image/png;base64,secret".to_owned(),
                             detail: "auto".to_owned(),
                         }),
+                        video_url: None,
+                    },
+                    ChatContentPart {
+                        part_type: "video_url".to_owned(),
+                        text: String::new(),
+                        image_url: None,
+                        video_url: Some(ChatVideoUrlPart {
+                            url: "data:video/mp4;base64,video-secret".to_owned(),
+                        }),
                     },
                     ChatContentPart {
                         part_type: "image_url".to_owned(),
@@ -6709,6 +6735,7 @@ mod tests {
                             url: "https://example.test/image.png".to_owned(),
                             detail: "auto".to_owned(),
                         }),
+                        video_url: None,
                     },
                 ],
                 ..ChatMessage::default()
@@ -6724,9 +6751,14 @@ mod tests {
             "data:<redacted-image>"
         );
         assert_eq!(
-            value["messages"][0]["content"][1]["image_url"]["url"],
+            value["messages"][0]["content"][2]["image_url"]["url"],
             "https://example.test/image.png"
         );
+        assert_eq!(
+            value["messages"][0]["content"][1]["video_url"]["url"],
+            "data:<redacted-video>"
+        );
+        assert!(!value.to_string().contains("video-secret"));
     }
 
     #[test]

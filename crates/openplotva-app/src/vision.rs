@@ -9,7 +9,7 @@ use openplotva_config::AppConfig;
 use openplotva_dialog::{DialogInput, MultimodalImage, ToolboxError};
 use openplotva_llm::aifarm::{
     AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport, ChatCompletionRequest,
-    ChatContentPart, ChatImageUrlPart, ChatMessage, ReqwestAifarmTransport,
+    ChatContentPart, ChatImageUrlPart, ChatMessage, ChatVideoUrlPart, ReqwestAifarmTransport,
 };
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_storage::{
@@ -43,6 +43,7 @@ pub const LEGACY_VISION_SERVICE_NAME: &str = "vision-api";
 pub const LEGACY_VISION_ENDPOINT_NAME: &str = "generate";
 pub const VISION_MAX_SIDE: u32 = 512;
 pub const VISION_MAX_PIXELS: u64 = VISION_MAX_SIDE as u64 * VISION_MAX_SIDE as u64;
+pub const VISION_MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
 
 /// Boxed future returned by Telegram file metadata lookups.
 pub type TelegramFileLookupFuture<'a, E> =
@@ -294,16 +295,23 @@ where
             let started = std::time::Instant::now();
             let data_url = self
                 .data_url
-                .telegram_file_data_url(&request.latest_file_id)
+                .telegram_file_data_url(
+                    &request.latest_file_id,
+                    &request.media_kind,
+                    request.mime_type.as_deref(),
+                )
                 .await
                 .map_err(|error| AifarmVisionCaptionerError::DataUrl(error.to_string()))?;
             let completion = if self.cfg.uses_legacy_vision_api() {
+                if vision_request_is_video(&request) {
+                    return Err(AifarmVisionCaptionerError::LegacyVideoUnsupported);
+                }
                 self.client
                     .complete_json_discovery(self.legacy_request(&data_url), &mut |_status| {})
                     .await
             } else {
                 self.client
-                    .complete(self.request(&data_url)?, &mut |_status| {})
+                    .complete(self.request(&data_url, &request)?, &mut |_status| {})
                     .await
             }
             .map_err(|error| AifarmVisionCaptionerError::Provider(error.to_string()))?;
@@ -440,9 +448,39 @@ fn vision_retryable_reason(error: &AifarmVisionCaptionerError) -> Option<Failure
 }
 
 impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
-    fn request(&self, data_url: &str) -> Result<ChatCompletionRequest, AifarmVisionCaptionerError> {
-        let system_prompt = openplotva_prompts::read("vision/caption_system")?;
-        let user_prompt = openplotva_prompts::read("vision/caption_user")?;
+    fn request(
+        &self,
+        data_url: &str,
+        request: &TelegramVisionCaptionRequest,
+    ) -> Result<ChatCompletionRequest, AifarmVisionCaptionerError> {
+        let is_video = vision_request_is_video(request);
+        let prompt_prefix = if is_video {
+            "vision/video"
+        } else {
+            "vision/caption"
+        };
+        let system_prompt = openplotva_prompts::read(&format!("{prompt_prefix}_system"))?;
+        let user_prompt = openplotva_prompts::read(&format!("{prompt_prefix}_user"))?;
+        let media_part = if is_video {
+            ChatContentPart {
+                part_type: "video_url".to_owned(),
+                text: String::new(),
+                image_url: None,
+                video_url: Some(ChatVideoUrlPart {
+                    url: data_url.trim().to_owned(),
+                }),
+            }
+        } else {
+            ChatContentPart {
+                part_type: "image_url".to_owned(),
+                text: String::new(),
+                image_url: Some(ChatImageUrlPart {
+                    url: data_url.trim().to_owned(),
+                    detail: "auto".to_owned(),
+                }),
+                video_url: None,
+            }
+        };
         Ok(ChatCompletionRequest {
             model: self.cfg.model.clone(),
             messages: vec![
@@ -456,18 +494,12 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                     role: "user".to_owned(),
                     content: String::new(),
                     content_parts: vec![
+                        media_part,
                         ChatContentPart {
                             part_type: "text".to_owned(),
                             text: user_prompt.trim().to_owned(),
                             image_url: None,
-                        },
-                        ChatContentPart {
-                            part_type: "image_url".to_owned(),
-                            text: String::new(),
-                            image_url: Some(ChatImageUrlPart {
-                                url: data_url.trim().to_owned(),
-                                detail: "auto".to_owned(),
-                            }),
+                            video_url: None,
                         },
                     ],
                     ..ChatMessage::default()
@@ -508,6 +540,8 @@ pub enum AifarmVisionCaptionerError {
     /// Upstream did not return a caption.
     #[error("empty caption")]
     EmptyCaption,
+    #[error("legacy vision API does not support video input")]
+    LegacyVideoUnsupported,
 }
 
 pub trait TelegramVisionDataUrlProvider {
@@ -518,6 +552,8 @@ pub trait TelegramVisionDataUrlProvider {
     fn telegram_file_data_url<'a>(
         &'a self,
         latest_file_id: &'a str,
+        media_kind: &'a str,
+        mime_type: Option<&'a str>,
     ) -> TelegramVisionDataUrlFuture<'a, Self::Error>;
 }
 
@@ -548,8 +584,11 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
     fn telegram_file_data_url<'a>(
         &'a self,
         latest_file_id: &'a str,
+        media_kind: &'a str,
+        mime_type: Option<&'a str>,
     ) -> TelegramVisionDataUrlFuture<'a, Self::Error> {
         Box::pin(async move {
+            let video = vision_media_is_video(media_kind, mime_type);
             let file: carapax::types::File = self
                 .client
                 .execute(carapax::types::GetFile::new(latest_file_id))
@@ -569,9 +608,18 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
             let mut data = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(TelegramVisionDataUrlError::DownloadChunk)?;
+                if video && data.len().saturating_add(chunk.len()) > VISION_MAX_VIDEO_BYTES {
+                    return Err(TelegramVisionDataUrlError::VideoTooLarge);
+                }
                 data.extend_from_slice(&chunk);
             }
-            telegram_vision_data_url_from_bytes(&data).map_err(TelegramVisionDataUrlError::Build)
+            if video {
+                telegram_vision_video_data_url_from_bytes(&data, mime_type)
+                    .map_err(TelegramVisionDataUrlError::Build)
+            } else {
+                telegram_vision_data_url_from_bytes(&data)
+                    .map_err(TelegramVisionDataUrlError::Build)
+            }
         })
     }
 }
@@ -591,6 +639,9 @@ pub enum TelegramVisionDataUrlError {
     /// Download stream failed.
     #[error("download telegram file chunk: {0}")]
     DownloadChunk(#[source] reqwest::Error),
+    /// Video exceeded the Bot API download contract and local memory bound.
+    #[error("telegram video exceeds 20 MiB")]
+    VideoTooLarge,
     /// Downloaded bytes were not usable as a vision image payload.
     #[error("build vision data url: {0}")]
     Build(#[source] TelegramVisionDataUrlBuildError),
@@ -603,6 +654,8 @@ pub enum TelegramVisionDataUrlBuildError {
     EmptyImageData,
     #[error("unsupported image data")]
     UnsupportedImageData,
+    #[error("video exceeds 20 MiB")]
+    VideoTooLarge,
     /// Image re-encoding failed after resize.
     #[error("encode image data: {0}")]
     EncodeImage(String),
@@ -1018,6 +1071,9 @@ where
                 );
                 captions.push(format!("{}: {}", candidate.label, caption));
 
+                if candidate.media_kind != "image" {
+                    continue;
+                }
                 if direct_images.len() >= direct_limit {
                     continue;
                 }
@@ -1025,7 +1081,15 @@ where
                 if latest_file_id.is_empty() {
                     continue;
                 }
-                match self.data_url.telegram_file_data_url(latest_file_id).await {
+                match self
+                    .data_url
+                    .telegram_file_data_url(
+                        latest_file_id,
+                        &record.media_kind,
+                        record.mime_type.as_deref(),
+                    )
+                    .await
+                {
                     Ok(data_url) if !data_url.trim().is_empty() => {
                         direct_images.push(MultimodalImage {
                             file_unique_id: result.file_unique_id.clone(),
@@ -1187,6 +1251,39 @@ pub fn telegram_vision_data_url_from_bytes(
         "data:{mime};base64,{}",
         BASE64_STANDARD.encode(data)
     ))
+}
+
+pub fn telegram_vision_video_data_url_from_bytes(
+    data: &[u8],
+    mime_type: Option<&str>,
+) -> Result<String, TelegramVisionDataUrlBuildError> {
+    if data.is_empty() {
+        return Err(TelegramVisionDataUrlBuildError::EmptyImageData);
+    }
+    if data.len() > VISION_MAX_VIDEO_BYTES {
+        return Err(TelegramVisionDataUrlBuildError::VideoTooLarge);
+    }
+    let mime = mime_type
+        .map(str::trim)
+        .filter(|mime| mime.starts_with("video/"))
+        .unwrap_or("video/mp4");
+    Ok(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(data)
+    ))
+}
+
+fn vision_request_is_video(request: &TelegramVisionCaptionRequest) -> bool {
+    vision_media_is_video(&request.media_kind, request.mime_type.as_deref())
+}
+
+fn vision_media_is_video(media_kind: &str, mime_type: Option<&str>) -> bool {
+    matches!(
+        media_kind.trim().to_lowercase().as_str(),
+        "video" | "animation" | "video_note"
+    ) || mime_type
+        .map(str::trim)
+        .is_some_and(|mime| mime.starts_with("video/"))
 }
 
 fn telegram_vision_image_mime(data: &[u8]) -> Option<&'static str> {
@@ -1581,6 +1678,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn dialog_vision_materializer_adds_video_caption_without_reembedding_video()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_time(1_710_000_000)?;
+        let mut video = file_record("video-u", "video-file", now)
+            .with_status(TELEGRAM_FILE_VISION_STATUS_COMPLETED)
+            .with_caption("00:00 человек входит в комнату");
+        video.media_kind = "video".to_owned();
+        video.mime_type = Some("video/mp4".to_owned());
+        let store = FileStoreStub::with_records(vec![video]);
+        let describer =
+            TelegramVisionDescriber::new(store, CaptionerStub::successful("unused", 1.0));
+        let data_urls = DataUrlStub::default();
+        let materializer =
+            TelegramDialogVisionInputMaterializer::new(describer, data_urls.clone(), 1);
+        let input = DialogInput {
+            context: DialogContext {
+                chat_id: 42,
+                ..DialogContext::default()
+            },
+            message: DialogMessage {
+                id: 77,
+                meta: ChatMessageMeta {
+                    attachments: vec![ChatAttachment {
+                        kind: "video".to_owned(),
+                        source: "message".to_owned(),
+                        file_unique_id: "video-u".to_owned(),
+                        mime_type: "video/mp4".to_owned(),
+                        ..ChatAttachment::default()
+                    }],
+                    ..ChatMessageMeta::default()
+                },
+                ..DialogMessage::default()
+            },
+            ..DialogInput::default()
+        };
+
+        let input = materializer
+            .materialize_dialog_vision_input(input, now)
+            .await;
+
+        assert_eq!(
+            input.message.meta.vision_description,
+            "message_77_video_1: 00:00 человек входит в комнату"
+        );
+        assert!(input.multimodal_images.is_empty());
+        assert!(data_urls.calls().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn telegram_vision_data_url_from_bytes_accepts_and_resizes_go_image_formats()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1633,6 +1780,25 @@ mod tests {
         assert_eq!(
             telegram_vision_data_url_from_bytes(b"not an image"),
             Err(TelegramVisionDataUrlBuildError::UnsupportedImageData)
+        );
+    }
+
+    #[test]
+    fn telegram_vision_video_data_url_preserves_container_and_enforces_limit() {
+        let data_url =
+            telegram_vision_video_data_url_from_bytes(b"small mp4 payload", Some("video/mp4"))
+                .expect("video data url");
+        assert!(data_url.starts_with("data:video/mp4;base64,"));
+        assert_eq!(
+            telegram_vision_video_data_url_from_bytes(&[], Some("video/mp4")),
+            Err(TelegramVisionDataUrlBuildError::EmptyImageData)
+        );
+        assert_eq!(
+            telegram_vision_video_data_url_from_bytes(
+                &vec![0_u8; VISION_MAX_VIDEO_BYTES + 1],
+                Some("video/mp4"),
+            ),
+            Err(TelegramVisionDataUrlBuildError::VideoTooLarge)
         );
     }
 
@@ -1692,18 +1858,69 @@ mod tests {
                 .is_some_and(|text| text.contains("vision-модуль"))
         );
         assert!(
-            body["messages"][1]["content"][0]["text"]
+            body["messages"][1]["content"][1]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("Опиши изображение"))
         );
         assert_eq!(
-            body["messages"][1]["content"][1]["image_url"]["url"],
+            body["messages"][1]["content"][0]["image_url"]["url"],
             "data:image/jpeg;base64,photo-file"
         );
         assert_eq!(
-            body["messages"][1]["content"][1]["image_url"]["detail"],
+            body["messages"][1]["content"][0]["image_url"]["detail"],
             "auto"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aifarm_vision_captioner_sends_video_before_instruction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let data_urls = DataUrlStub::default();
+        let transport = AifarmTransportStub::new(vec![Ok(AifarmHttpResponse {
+            status_code: 200,
+            body:
+                br#"{"choices":[{"message":{"role":"assistant","content":" visual timeline "}}]}"#
+                    .to_vec(),
+            ..AifarmHttpResponse::default()
+        })]);
+        let probe = transport.clone();
+        let captioner = AifarmVisionCaptioner::with_transport(
+            AifarmVisionCaptionerConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://vision.example.test/v1/chat/completions".to_owned(),
+                    default_model: "vision-model".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                model: "vision-model".to_owned(),
+                max_tokens: 768,
+                temperature: 0.1,
+            },
+            data_urls,
+            transport,
+        );
+
+        let result = captioner
+            .caption_telegram_file(TelegramVisionCaptionRequest {
+                file_unique_id: "video-u".to_owned(),
+                latest_file_id: "video-file".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            })
+            .await?;
+
+        assert_eq!(result.caption, "visual timeline");
+        let body: serde_json::Value = serde_json::from_slice(&probe.requests()[0].body)?;
+        assert_eq!(
+            body["messages"][1]["content"][0]["video_url"]["url"],
+            "data:video/mp4;base64,video-file"
+        );
+        assert!(
+            body["messages"][1]["content"][1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("хронологическом порядке"))
+        );
+        assert!(body.to_string().contains("только визуальные данные"));
         Ok(())
     }
 
@@ -2004,13 +2221,19 @@ mod tests {
         fn telegram_file_data_url<'a>(
             &'a self,
             latest_file_id: &'a str,
+            media_kind: &'a str,
+            mime_type: Option<&'a str>,
         ) -> TelegramVisionDataUrlFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .expect("data url calls")
                     .push(latest_file_id.to_owned());
-                Ok(format!("data:image/jpeg;base64,{latest_file_id}"))
+                if vision_media_is_video(media_kind, mime_type) {
+                    Ok(format!("data:video/mp4;base64,{latest_file_id}"))
+                } else {
+                    Ok(format!("data:image/jpeg;base64,{latest_file_id}"))
+                }
             })
         }
     }
