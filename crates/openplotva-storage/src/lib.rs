@@ -11992,6 +11992,9 @@ mod tests {
             assert_eq!(count, 0);
 
             let reset_at = occurred_at + time::Duration::seconds(2);
+            let reset_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+                reset_at.unix_timestamp_nanos() / 1_000 * 1_000,
+            )?;
             assert!(store.reset_history_at(chat_id, 77, reset_at).await?);
             assert_eq!(store.history_reset_at(chat_id, 77).await?, Some(reset_at));
             assert_eq!(store.history_reset_at(chat_id, 78).await?, None);
