@@ -49,6 +49,7 @@ pub struct ParkedJob {
 #[derive(Default)]
 struct InboxState {
     injected: Vec<InjectedMessage>,
+    consumed: Vec<InjectedMessage>,
     sealed: bool,
 }
 
@@ -75,13 +76,31 @@ impl SessionInbox {
     #[must_use]
     pub fn drain_open(&self) -> Vec<InjectedMessage> {
         let mut state = self.state.lock().expect("session inbox");
-        std::mem::take(&mut state.injected)
+        let drained = std::mem::take(&mut state.injected);
+        state.consumed.extend(drained.iter().cloned());
+        drained
     }
 
-    fn seal(&self) -> Vec<InjectedMessage> {
+    #[must_use]
+    pub fn has_consumed(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("session inbox")
+            .consumed
+            .is_empty()
+    }
+
+    fn seal(&self, commit_consumed: bool) -> Vec<InjectedMessage> {
         let mut state = self.state.lock().expect("session inbox");
         state.sealed = true;
-        std::mem::take(&mut state.injected)
+        let mut remaining = if commit_consumed {
+            Vec::new()
+        } else {
+            std::mem::take(&mut state.consumed)
+        };
+        remaining.append(&mut state.injected);
+        remaining
     }
 }
 
@@ -186,7 +205,7 @@ impl DialogSessionRegistry {
     /// can slip in between the seal and the removal) and returns everything
     /// that still needs a turn.
     #[must_use]
-    pub fn release(&self, key: SessionKey, job_id: i64) -> SessionRelease {
+    pub fn release(&self, key: SessionKey, job_id: i64, commit_consumed: bool) -> SessionRelease {
         let slot = {
             let mut active = self.active.lock().expect("session registry");
             match active.get(&key) {
@@ -198,7 +217,7 @@ impl DialogSessionRegistry {
             return SessionRelease::default();
         };
         SessionRelease {
-            leftover_injected: slot.inbox.seal(),
+            leftover_injected: slot.inbox.seal(commit_consumed),
             parked: slot.parked,
         }
     }
@@ -270,7 +289,7 @@ mod tests {
             }
         ));
 
-        let release = registry.release(key, 1);
+        let release = registry.release(key, 1, true);
         assert_eq!(release.leftover_injected.len(), 1, "undrained leftover");
         assert_eq!(release.parked.len(), 1);
         assert_eq!(registry.active_count(), 0);
@@ -290,9 +309,26 @@ mod tests {
         let ClaimOutcome::Claimed(_) = registry.claim(key, 1, 7) else {
             panic!("claimed");
         };
-        let release = registry.release(key, 999);
+        let release = registry.release(key, 999, true);
         assert!(release.leftover_injected.is_empty());
         assert_eq!(registry.active_count(), 1, "the live session survives");
+    }
+
+    #[test]
+    fn failed_session_releases_consumed_injected_message_for_followup() {
+        let registry = DialogSessionRegistry::new();
+        let key = SessionKey::new(42, Some(9));
+        let ClaimOutcome::Claimed(inbox) = registry.claim(key, 1, 7) else {
+            panic!("claimed");
+        };
+        assert!(registry.inject(key, 1, message(7, "retry me")));
+        assert_eq!(inbox.drain_open().len(), 1);
+        assert!(inbox.has_consumed());
+
+        let release = registry.release(key, 1, false);
+
+        assert_eq!(release.leftover_injected.len(), 1);
+        assert_eq!(release.leftover_injected[0].params.message_text, "retry me");
     }
 
     #[test]

@@ -11531,6 +11531,12 @@ async fn start_runtime_workers(
     );
     let dialog_context_asr: Arc<dyn asr::DialogAsrInputMaterializer> =
         dialog_context_asr_runtime.clone();
+    let dialog_tool_media: Arc<dyn dialog_tools::VisionDescriber> =
+        Arc::new(vision::TelegramMediaDescriber::new(
+            dialog_tool_vision,
+            Arc::clone(&dialog_context_asr),
+            PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+        ));
     let asr_task_queue = Arc::clone(&task_queue_for_updates);
     let asr_task_processor = Arc::clone(&dialog_context_asr_runtime);
     let asr_task_stop = stop.subscribe();
@@ -11642,7 +11648,7 @@ async fn start_runtime_workers(
     .with_drawing_canceller(dialog_tool_adapter.clone())
     .with_image_scheduler(dialog_tool_adapter.clone())
     .with_song_scheduler(dialog_tool_adapter.clone())
-    .with_vision_describer(dialog_tool_vision);
+    .with_vision_describer(dialog_tool_media);
     let dialog_history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
         agent_runtime::PostgresHistorySearch::new(history_store.clone()),
     );

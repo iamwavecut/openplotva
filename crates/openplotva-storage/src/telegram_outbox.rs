@@ -183,6 +183,14 @@ pub struct TelegramReceiptHistoryEntry {
     pub payload: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingTelegramHistoryReceipt {
+    pub outbox_id: i64,
+    pub batch_id: String,
+    pub bot_id: i64,
+    pub receipt: Value,
+}
+
 /// Immutable batch metadata plus ordered parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TelegramOutboxBatchInput {
@@ -534,8 +542,8 @@ WITH finished AS (
         confirmed_at = statement_timestamp(),
         lease_owner = NULL,
         leased_until = NULL,
-        last_error_class = NULL,
-        last_error = NULL,
+        last_error_class = 'history_pending',
+        last_error = 'Telegram receipt committed; canonical history pending',
         updated_at = statement_timestamp()
     WHERE operation.id = $1
       AND operation.lease_token = $2
@@ -563,6 +571,26 @@ WITH finished AS (
     RETURNING attempt.outbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
+"#;
+
+const SQL_PENDING_HISTORY_RECEIPTS: &str = r#"
+SELECT id, batch_id, bot_id, receipt
+FROM telegram_outbox
+WHERE state = 'delivered'
+  AND last_error_class = 'history_pending'
+ORDER BY confirmed_at, id
+LIMIT $1
+"#;
+
+const SQL_MARK_HISTORY_COMMITTED: &str = r#"
+UPDATE telegram_outbox
+SET last_error_class = NULL,
+    last_error = NULL,
+    updated_at = statement_timestamp()
+WHERE id = $1
+  AND state = 'delivered'
+  AND last_error_class = 'history_pending'
+RETURNING id
 "#;
 
 const SQL_RETRY_OPERATION: &str = r#"
@@ -758,7 +786,8 @@ impl PostgresTelegramOutboxStore {
             .map_err(StorageError::from)
     }
 
-    /// Record the Telegram acknowledgement and its canonical history rows in one transaction.
+    /// Durably record the Telegram acknowledgement, then commit canonical history.
+    /// A history failure leaves a delivered `history_pending` marker for repair.
     pub async fn mark_delivered_with_history(
         &self,
         outbox_id: i64,
@@ -768,19 +797,50 @@ impl PostgresTelegramOutboxStore {
         receipt: &Value,
         history_entries: &[TelegramReceiptHistoryEntry],
     ) -> Result<bool, StorageError> {
-        let mut transaction = self.pool.begin().await?;
-        let delivered = sqlx::query_scalar::<_, bool>(SQL_DELIVER_OPERATION)
-            .bind(outbox_id)
-            .bind(lease_token)
-            .bind(response_kind)
-            .bind(telegram_message_ids)
-            .bind(sqlx::types::Json(receipt))
-            .fetch_one(&mut *transaction)
+        let delivered = self
+            .mark_delivered(
+                outbox_id,
+                lease_token,
+                response_kind,
+                telegram_message_ids,
+                receipt,
+            )
             .await?;
         if !delivered {
-            transaction.rollback().await?;
             return Ok(false);
         }
+        self.commit_pending_history(outbox_id, history_entries)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn pending_history_receipts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingTelegramHistoryReceipt>, StorageError> {
+        let rows = sqlx::query(SQL_PENDING_HISTORY_RECEIPTS)
+            .bind(i64::try_from(limit.max(1)).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingTelegramHistoryReceipt {
+                    outbox_id: row.try_get("id")?,
+                    batch_id: row.try_get("batch_id")?,
+                    bot_id: row.try_get("bot_id")?,
+                    receipt: row.try_get::<sqlx::types::Json<Value>, _>("receipt")?.0,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn commit_pending_history(
+        &self,
+        outbox_id: i64,
+        history_entries: &[TelegramReceiptHistoryEntry],
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.pool.begin().await?;
         let mut ensured_days = Vec::new();
         for entry in history_entries {
             if !ensured_days.contains(&entry.bucket_day) {
@@ -804,8 +864,13 @@ impl PostgresTelegramOutboxStore {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let committed = sqlx::query_scalar::<_, i64>(SQL_MARK_HISTORY_COMMITTED)
+            .bind(outbox_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
         transaction.commit().await?;
-        Ok(true)
+        Ok(committed)
     }
 
     /// Release a definitive transient failure. `replacement_payload` supports
@@ -1080,7 +1145,9 @@ SELECT
     count(*) FILTER (WHERE state = 'expired')::bigint AS expired,
     count(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled,
     count(*) FILTER (
-        WHERE protected AND state IN ('pending', 'leased', 'retry_wait', 'ambiguous', 'dead_letter')
+        WHERE protected
+          AND (state IN ('pending', 'leased', 'retry_wait', 'ambiguous', 'dead_letter')
+               OR last_error_class = 'history_pending')
     )::bigint AS protected_unresolved,
     min(created_at) FILTER (WHERE state IN ('pending', 'retry_wait')) AS oldest_pending_at,
     min(leased_until) FILTER (WHERE state = 'leased') AS oldest_lease_expiry
@@ -1615,12 +1682,25 @@ mod tests {
         );
         assert!(
             store
-                .mark_delivered_with_history(
+                .mark_delivered(
                     first[0].id,
                     first[0].lease_token,
                     "message",
                     &[11],
-                    &serde_json::json!({"message_id": 11}),
+                    &serde_json::json!({"kind": "message", "response": {"message_id": 11}}),
+                )
+                .await?
+        );
+        let pending = store.pending_history_receipts(10).await?;
+        assert!(
+            pending
+                .iter()
+                .any(|receipt| receipt.outbox_id == first[0].id)
+        );
+        assert!(
+            store
+                .commit_pending_history(
+                    first[0].id,
                     &[TelegramReceiptHistoryEntry {
                         bucket_day: OffsetDateTime::now_utc().date(),
                         chat_id: 42,
@@ -1635,6 +1715,13 @@ mod tests {
                     }],
                 )
                 .await?
+        );
+        assert!(
+            store
+                .pending_history_receipts(10)
+                .await?
+                .iter()
+                .all(|receipt| receipt.outbox_id != first[0].id)
         );
         let history_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM chat_history_entries WHERE chat_id = 42 AND entry_id = $1",

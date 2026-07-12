@@ -215,6 +215,7 @@ pub struct TelegramOutboxWorkerReport {
     pub jobs_completed: u64,
     pub jobs_failed: u64,
     pub delivery_outcomes_reconciled: u64,
+    pub history_receipts_repaired: u64,
     pub errors: u64,
     pub last_error: Option<String>,
 }
@@ -247,7 +248,7 @@ where
         if last_maintenance
             .is_none_or(|last: Instant| last.elapsed() >= config.maintenance_interval)
         {
-            run_outbox_maintenance(&store, &jobs, &mut report).await;
+            run_outbox_maintenance(&store, &history, &jobs, &mut report).await;
             last_maintenance = Some(Instant::now());
         }
 
@@ -687,7 +688,10 @@ fn telegram_response_history_entries(
     let messages: Vec<_> = match response {
         TelegramOutboundResponse::Message(message) => vec![message.as_ref()],
         TelegramOutboundResponse::Messages(messages) => messages.iter().collect(),
-        TelegramOutboundResponse::EditMessage(_)
+        TelegramOutboundResponse::EditMessage(EditMessageResult::Message(message)) => {
+            vec![message.as_ref()]
+        }
+        TelegramOutboundResponse::EditMessage(EditMessageResult::Bool(_))
         | TelegramOutboundResponse::Boolean(_)
         | TelegramOutboundResponse::SentGuestMessage(_)
         | TelegramOutboundResponse::String(_) => Vec::new(),
@@ -712,6 +716,24 @@ fn telegram_response_history_entries(
                 .expect("history text entry payload is serialized JSON"),
         })
         .collect()
+}
+
+fn telegram_receipt_history_entries(
+    receipt: &Value,
+    bot_id: i64,
+) -> Result<Vec<TelegramReceiptHistoryEntry>, serde_json::Error> {
+    let kind = receipt
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let response = receipt.get("response").cloned().unwrap_or(Value::Null);
+    let response = match kind {
+        "message" => TelegramOutboundResponse::Message(Box::new(serde_json::from_value(response)?)),
+        "messages" => TelegramOutboundResponse::Messages(serde_json::from_value(response)?),
+        "edit_message" => TelegramOutboundResponse::EditMessage(serde_json::from_value(response)?),
+        _ => return Ok(Vec::new()),
+    };
+    Ok(telegram_response_history_entries(&response, bot_id))
 }
 
 fn telegram_response_receipt(response: TelegramOutboundResponse) -> TelegramReceipt {
@@ -1001,6 +1023,7 @@ async fn enqueue_ambiguity_reaction_fields(
 
 async fn run_outbox_maintenance<Jobs>(
     store: &PostgresTelegramOutboxStore,
+    history: &PostgresHistoryStore,
     jobs: &Jobs,
     report: &mut TelegramOutboxWorkerReport,
 ) where
@@ -1048,9 +1071,73 @@ async fn run_outbox_maintenance<Jobs>(
         }
     }
 
+    repair_pending_receipt_history(store, history, jobs, report).await;
     reconcile_ambiguity_reactions(store, report).await;
     reconcile_dialog_turn_delivery_states(store, report).await;
     reconcile_resolved_taskman_batches(store, jobs, report).await;
+}
+
+async fn repair_pending_receipt_history<Jobs>(
+    store: &PostgresTelegramOutboxStore,
+    history: &PostgresHistoryStore,
+    jobs: &Jobs,
+    report: &mut TelegramOutboxWorkerReport,
+) where
+    Jobs: TelegramOutboxJobResolver,
+{
+    let pending = match store
+        .pending_history_receipts(OUTBOX_MAINTENANCE_LIMIT)
+        .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            record_worker_error(report, format!("scan pending receipt history: {error}"));
+            return;
+        }
+    };
+    for receipt in pending {
+        let entries = match telegram_receipt_history_entries(&receipt.receipt, receipt.bot_id) {
+            Ok(entries) => entries,
+            Err(error) => {
+                record_worker_error(
+                    report,
+                    format!(
+                        "decode receipt history for outbox {}: {error}",
+                        receipt.outbox_id
+                    ),
+                );
+                continue;
+            }
+        };
+        match store
+            .commit_pending_history(receipt.outbox_id, &entries)
+            .await
+        {
+            Ok(true) => {
+                for entry in &entries {
+                    if let Err(error) = history.invalidate_chat_history_cache(entry.chat_id).await {
+                        tracing::warn!(
+                            %error,
+                            chat_id = entry.chat_id,
+                            outbox_id = receipt.outbox_id,
+                            "repaired Telegram history but cache invalidation failed"
+                        );
+                    }
+                }
+                report.history_receipts_repaired =
+                    report.history_receipts_repaired.saturating_add(1);
+                resolve_batch(store, jobs, &receipt.batch_id, report).await;
+            }
+            Ok(false) => {}
+            Err(error) => record_worker_error(
+                report,
+                format!(
+                    "repair receipt history for outbox {}: {error}",
+                    receipt.outbox_id
+                ),
+            ),
+        }
+    }
 }
 
 async fn reconcile_ambiguity_reactions(
@@ -1121,12 +1208,12 @@ async fn reconcile_dialog_turn_delivery_states(
         "WITH candidates AS ( \
              SELECT outcome.id, outcome.job_id, \
                     count(*) AS operation_count, \
-                    count(*) FILTER (WHERE operation.state = 'delivered') = count(*) \
+                    count(*) FILTER (WHERE operation.state = 'delivered' AND operation.last_error_class IS DISTINCT FROM 'history_pending') = count(*) \
                         AS all_delivered, \
-                    count(*) FILTER (WHERE operation.state = 'delivered') > 0 \
+                    count(*) FILTER (WHERE operation.state = 'delivered' AND operation.last_error_class IS DISTINCT FROM 'history_pending') > 0 \
                         AS any_delivered, \
                     bool_or(operation.state = 'ambiguous') AS any_ambiguous, \
-                    max(operation.confirmed_at) FILTER (WHERE operation.state = 'delivered') \
+                    max(operation.confirmed_at) FILTER (WHERE operation.state = 'delivered' AND operation.last_error_class IS DISTINCT FROM 'history_pending') \
                         AS delivered_at, \
                     string_agg(DISTINCT operation.state, ',' ORDER BY operation.state) AS states \
              FROM dialog_turn_outcomes AS outcome \
@@ -1137,7 +1224,8 @@ async fn reconcile_dialog_turn_delivery_states(
                AND NOT EXISTS ( \
                    SELECT 1 FROM telegram_outbox AS unresolved \
                    WHERE unresolved.dialog_job_id = outcome.job_id \
-                     AND unresolved.state IN ('pending', 'leased', 'retry_wait') \
+                     AND (unresolved.state IN ('pending', 'leased', 'retry_wait') \
+                          OR unresolved.last_error_class = 'history_pending') \
                ) \
              GROUP BY outcome.id, outcome.job_id \
              ORDER BY outcome.id DESC \
@@ -1216,7 +1304,8 @@ async fn reconcile_resolved_taskman_batches<Jobs>(
            AND NOT EXISTS ( \
                SELECT 1 FROM telegram_outbox AS unresolved \
                WHERE unresolved.batch_id = operation.batch_id \
-                 AND unresolved.state IN ('pending', 'leased', 'retry_wait') \
+                 AND (unresolved.state IN ('pending', 'leased', 'retry_wait') \
+                      OR unresolved.last_error_class = 'history_pending') \
            ) \
          ORDER BY operation.batch_id \
          LIMIT $1",
@@ -1248,8 +1337,8 @@ async fn batch_resolution(
 ) -> Result<BatchResolution, sqlx::Error> {
     let row = sqlx::query(
         "SELECT max(dialog_job_id) AS dialog_job_id, \
-                count(*) FILTER (WHERE state = 'delivered') = count(*) AS delivered, \
-                count(*) FILTER (WHERE state IN ('pending', 'leased', 'retry_wait')) > 0 \
+                count(*) FILTER (WHERE state = 'delivered' AND last_error_class IS DISTINCT FROM 'history_pending') = count(*) AS delivered, \
+                count(*) FILTER (WHERE state IN ('pending', 'leased', 'retry_wait') OR last_error_class = 'history_pending') > 0 \
                     AS unresolved, \
                 string_agg(DISTINCT state, ',' ORDER BY state) AS states \
          FROM telegram_outbox \
@@ -1364,6 +1453,9 @@ fn merge_worker_report(
     aggregate.delivery_outcomes_reconciled = aggregate
         .delivery_outcomes_reconciled
         .saturating_add(report.delivery_outcomes_reconciled);
+    aggregate.history_receipts_repaired = aggregate
+        .history_receipts_repaired
+        .saturating_add(report.history_receipts_repaired);
     aggregate.errors = aggregate.errors.saturating_add(report.errors);
     if report.last_error.is_some() {
         aggregate.last_error = report.last_error;
@@ -1469,5 +1561,29 @@ mod tests {
         assert_eq!(entries[0].entry_id, "msg:92");
         assert_eq!(entries[0].role, "model");
         assert_eq!(entries[0].payload["text"], "confirmed text");
+    }
+
+    #[test]
+    fn edit_receipt_updates_model_history_and_is_repairable() {
+        let message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 93,
+            "from": {"id": 7, "is_bot": true, "first_name": "Plotva"},
+            "date": 2,
+            "edit_date": 3,
+            "chat": {"id": 42, "type": "private", "first_name": "Test"},
+            "text": "edited text"
+        }))
+        .expect("message");
+        let response =
+            TelegramOutboundResponse::EditMessage(EditMessageResult::Message(Box::new(message)));
+        let receipt = telegram_response_receipt(response.clone());
+
+        let direct = telegram_response_history_entries(&response, 7);
+        let repaired = telegram_receipt_history_entries(&receipt.value, 7).expect("receipt");
+
+        assert_eq!(direct, repaired);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].entry_id, "msg:93");
+        assert_eq!(direct[0].payload["text"], "edited text");
     }
 }

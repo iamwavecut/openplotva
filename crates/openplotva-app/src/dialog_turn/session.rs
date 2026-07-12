@@ -233,6 +233,7 @@ where
 
     let mut budget = SessionBudget::new(ctx.budget, cfg.tool_extension_secs, cfg.hard_cap_secs);
     let mut base_input = base_input;
+    let mut duplicate_guard_history = duplicate_guard_history.to_vec();
     let mut active_params = ctx.params.clone();
     let mut meta = dialog_tool_context(&base_input);
     let native_tools = match session_native_tools() {
@@ -266,33 +267,32 @@ where
     let mut iteration: i32 = 0;
     loop {
         iteration += 1;
-        if let Some(inbox) = ctx.inbox.as_ref() {
-            for injected in inbox.drain_open() {
-                let injected_params = injected.params;
-                transcript.push(SessionMessage::InjectedUser {
-                    rendered: render_injected_params(&injected_params),
-                });
-                match materializer
-                    .materialize_dialog_input(&injected_params, OffsetDateTime::now_utc())
-                    .await
-                {
-                    Ok(input) => {
-                        active_params = injected_params;
-                        meta = dialog_tool_context(&input);
-                        base_input = input;
-                    }
-                    Err(error) => {
-                        let error = format!("materialize injected dialog input: {error}");
-                        report.materialization_error = Some(error.clone());
-                        return TurnResolution {
-                            outcome: TurnOutcome::TerminalFailed {
-                                reason: "injected_input_materialization",
-                                error: error.clone(),
-                                user_signal: UserSignalPlan::React,
-                            },
-                            disposition: JobDisposition::Fail(error),
-                        };
-                    }
+        if let Some(inbox) = ctx.inbox.as_ref()
+            && let Some(injected) = inbox.drain_open().into_iter().last()
+        {
+            let injected_params = injected.params;
+            match materializer
+                .materialize_dialog_input(&injected_params, OffsetDateTime::now_utc())
+                .await
+            {
+                Ok(input) => {
+                    active_params = injected_params;
+                    meta = dialog_tool_context(&input);
+                    duplicate_guard_history.clone_from(&input.history);
+                    base_input = input;
+                    transcript.clear();
+                }
+                Err(error) => {
+                    let error = format!("materialize injected dialog input: {error}");
+                    report.materialization_error = Some(error.clone());
+                    return TurnResolution {
+                        outcome: TurnOutcome::TerminalFailed {
+                            reason: "injected_input_materialization",
+                            error: error.clone(),
+                            user_signal: UserSignalPlan::React,
+                        },
+                        disposition: JobDisposition::Fail(error),
+                    };
                 }
             }
         }
@@ -463,7 +463,7 @@ where
             }
 
             let (duplicate_message_id, duplicate) =
-                should_suppress_duplicate_bot_reply(duplicate_guard_history, &sanitized);
+                should_suppress_duplicate_bot_reply(&duplicate_guard_history, &sanitized);
             if duplicate || sent.contains(&sanitized) {
                 if regenerations < ctx.max_regenerations.max(0)
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
@@ -1151,23 +1151,6 @@ async fn append_session_tool_event<Queue>(
     if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
         tracing::debug!(error = %error, job_id, "failed to append session tool event");
     }
-}
-
-/// Injected chat messages render with the same body format as history user
-/// turns so sender attribution stays coherent for the model.
-fn render_injected_params(params: &openplotva_taskman::DialogJobParams) -> String {
-    let turn = HistoryMessage {
-        message_id: params.message_id,
-        role: openplotva_dialog::ROLE_USER.to_owned(),
-        kind: openplotva_dialog::MESSAGE_KIND_TEXT.to_owned(),
-        name: params.user_full_name.clone(),
-        user_id: params.user_id,
-        text: params.message_text.clone(),
-        original_text: params.original_text.clone(),
-        meta: serde_json::from_value(params.meta.clone()).unwrap_or_default(),
-        ..HistoryMessage::default()
-    };
-    openplotva_llm::aifarm::format_message_body(&turn)
 }
 
 /// Output of one captured (non-dispatching) session run for the runtime

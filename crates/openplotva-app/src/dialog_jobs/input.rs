@@ -499,7 +499,13 @@ impl PostgresDialogInputMaterializer {
             })?;
 
         let reply_payloads = self
-            .load_reply_chain_payloads(params.chat_id, params.message_id)
+            .load_reply_chain_payloads(
+                params.chat_id,
+                params.message_id,
+                chat_cutoff,
+                thread_id,
+                thread_cutoff,
+            )
             .await?;
         chat_payloads.extend(reply_payloads);
         let thread_payloads = if thread_id == 0 {
@@ -529,6 +535,9 @@ impl PostgresDialogInputMaterializer {
         &self,
         chat_id: i64,
         message_id: i32,
+        chat_cutoff: OffsetDateTime,
+        thread_id: i32,
+        thread_cutoff: OffsetDateTime,
     ) -> Result<Vec<Vec<u8>>, DialogInputMaterializationError> {
         let mut payloads = Vec::new();
         let mut current_id = message_id;
@@ -539,7 +548,13 @@ impl PostgresDialogInputMaterializer {
             }
             let current_payloads = self
                 .history
-                .history_message_payloads(chat_id, current_id)
+                .history_message_payloads(
+                    chat_id,
+                    current_id,
+                    chat_cutoff,
+                    thread_id,
+                    thread_cutoff,
+                )
                 .await
                 .map_err(|error| DialogInputMaterializationError::History {
                     message: format!("chat {chat_id} reply message {current_id}: {error}"),

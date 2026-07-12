@@ -103,6 +103,44 @@ jobs:
             tools/rust-fast-gate.sh
           fi
 
+  postgres-integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: openplotva_test
+          POSTGRES_PASSWORD: openplotva_test
+          POSTGRES_DB: openplotva_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openplotva_test -d openplotva_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      OPENPLOTVA_TEST_POSTGRES_DSN: postgres://openplotva_test:openplotva_test@127.0.0.1:5432/openplotva_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-postgres
+
+      - name: Run PostgreSQL storage integration tests serially
+        run: |
+          cargo test -p openplotva-storage outbox_roundtrip_is_idempotent_ordered_and_fenced -- --test-threads=1
+          cargo test -p openplotva-storage live_ -- --test-threads=1
+
   rust-dependencies:
     name: Rust dependencies
     runs-on: ubuntu-latest
