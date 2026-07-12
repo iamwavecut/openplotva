@@ -830,6 +830,8 @@ pub struct VisionDescribeResult {
     pub caption: String,
     /// Spoken audio transcribed from video media, when available.
     pub transcript: String,
+    /// Non-error information about why a transcript is absent.
+    pub transcript_note: String,
     /// ASR failure or incomplete status for video media.
     pub transcript_error: String,
     /// Resolved Telegram media kind.
@@ -2605,6 +2607,14 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
         (true, true) => String::new(),
     };
     let transcript_error = result.transcript_error.trim();
+    let transcript_note = result.transcript_note.trim();
+    if !transcript_note.is_empty() {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str("Аудиодорожка: ");
+        message.push_str(transcript_note);
+    }
     if !transcript_error.is_empty() {
         if !message.is_empty() {
             message.push_str("\n\n");
@@ -2626,6 +2636,7 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
             "file_unique_id": result.file_unique_id,
             "visual_description": result.caption,
             "transcript": result.transcript,
+            "transcript_note": result.transcript_note,
             "transcript_error": result.transcript_error,
             "media_kind": result.media_kind,
             "history_updated": result.history_updated,
@@ -4187,6 +4198,7 @@ mod tests {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "  cat on table  ".to_owned(),
             transcript: "  hello from video  ".to_owned(),
+            transcript_note: String::new(),
             transcript_error: String::new(),
             media_kind: "video".to_owned(),
             source: "vision".to_owned(),
@@ -4223,6 +4235,7 @@ mod tests {
                 "file_unique_id": "file-unique",
                 "visual_description": "  cat on table  ",
                 "transcript": "  hello from video  ",
+                "transcript_note": "",
                 "transcript_error": "",
                 "media_kind": "video",
                 "history_updated": true,
@@ -4246,6 +4259,7 @@ mod tests {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "person enters a room".to_owned(),
             transcript: String::new(),
+            transcript_note: String::new(),
             transcript_error: "Telegram file is too big".to_owned(),
             media_kind: "video".to_owned(),
             source: "vision".to_owned(),
@@ -4271,6 +4285,38 @@ mod tests {
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("understand_media_asr_incomplete")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_reports_missing_audio_as_successful_media_analysis()
+    -> Result<(), ToolboxError> {
+        let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
+            caption: "person enters a room".to_owned(),
+            transcript: String::new(),
+            transcript_note: "В медиа нет доступной для распознавания аудиодорожки.".to_owned(),
+            transcript_error: String::new(),
+            media_kind: "video".to_owned(),
+            source: "vision".to_owned(),
+            file_unique_id: "silent-video".to_owned(),
+            history_updated: true,
+        }));
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok("ignored".to_owned()),
+        }))
+        .with_vision_describer(describer);
+
+        let result = toolbox
+            .understand_media(VisionRequest {
+                context: context(),
+                file_id: "message_11_video_1".to_owned(),
+            })
+            .await?;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert!(result.message.contains("person enters a room"));
+        assert!(result.message.contains("нет доступной"));
+        assert!(result.error.is_none());
         Ok(())
     }
 

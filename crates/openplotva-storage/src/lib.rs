@@ -790,7 +790,7 @@ pub const SQL_UPDATE_TELEGRAM_FILE_VISION: &str = "UPDATE telegram_files SET vis
 
 pub const SQL_UPDATE_TELEGRAM_FILE_ASR: &str = "UPDATE telegram_files SET asr_status = $2, asr_text = COALESCE($3, asr_text), asr_provider = COALESCE($4, asr_provider), asr_model = COALESCE($5, asr_model), asr_latency_ms = COALESCE($6, asr_latency_ms), asr_fallback_used = COALESCE($7, asr_fallback_used), asr_chunks = COALESCE($8, asr_chunks), asr_warnings = COALESCE($9, asr_warnings), asr_error = $10, asr_requested_at = COALESCE($11, asr_requested_at), asr_completed_at = COALESCE($12, asr_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_fallback_used = NULL, asr_chunks = NULL, asr_warnings = NULL, asr_error = NULL, asr_requested_at = $2, updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status <> 'completed' AND (asr_status <> 'processing' OR asr_requested_at IS NULL OR asr_requested_at < ($2 - INTERVAL '10 minutes')) RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_fallback_used = NULL, asr_chunks = NULL, asr_warnings = NULL, asr_error = NULL, asr_requested_at = $2, updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status NOT IN ('completed', 'unavailable') AND (asr_status <> 'processing' OR asr_requested_at IS NULL OR asr_requested_at < ($2 - INTERVAL '10 minutes')) RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
 pub const SQL_GET_CHAT_DISCOVERED: &str = "SELECT discovered FROM chats WHERE id = $1";
 
@@ -1632,6 +1632,8 @@ pub const TELEGRAM_FILE_ASR_STATUS_PROCESSING: &str = "processing";
 pub const TELEGRAM_FILE_ASR_STATUS_COMPLETED: &str = "completed";
 
 pub const TELEGRAM_FILE_ASR_STATUS_FAILED: &str = "failed";
+
+pub const TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE: &str = "unavailable";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TelegramFileMetadataUpsert {
@@ -10078,7 +10080,8 @@ mod tests {
         );
         assert!(super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING.contains("asr_warnings = NULL"));
         assert!(
-            super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING.contains("asr_status <> 'completed'")
+            super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING
+                .contains("asr_status NOT IN ('completed', 'unavailable')")
         );
         assert!(
             super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING
@@ -10467,6 +10470,26 @@ mod tests {
             assert_eq!(
                 asr.asr_warnings.as_deref(),
                 Some(["primary_failed:gigaam:GPU lock is busy".to_owned()].as_slice())
+            );
+
+            let unavailable = store
+                .update_asr(&super::TelegramFileAsrUpdate {
+                    file_unique_id: unique_id.clone(),
+                    asr_status: super::TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE.to_owned(),
+                    asr_error: Some("no decodable audio track".to_owned()),
+                    asr_completed_at: Some(completed_at),
+                    ..super::TelegramFileAsrUpdate::default()
+                })
+                .await?;
+            assert_eq!(
+                unavailable.asr_status,
+                super::TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE
+            );
+            assert!(
+                store
+                    .claim_asr_processing(&unique_id, completed_at + time::Duration::hours(1))
+                    .await?
+                    .is_none()
             );
             Ok(())
         }
