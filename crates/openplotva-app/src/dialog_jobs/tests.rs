@@ -3933,6 +3933,71 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
+async fn session_accepts_final_text_already_delivered_by_send_message() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("посмотри видео"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "send-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                    text: "в видео говорят о контексте".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("в видео говорят о контексте")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert!(!report.failed, "{report:?}");
+    assert_eq!(report.regenerations, 0);
+    assert_eq!(provider.calls(), 2, "the tool result reached the model");
+    assert_eq!(effects.intermediates().len(), 1);
+    assert!(
+        effects.sent().is_empty(),
+        "the final must not be sent twice"
+    );
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    let record = queue.record(job_id).expect("job record");
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE)
+    );
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "sent");
+    assert_eq!(rows[0].sent_message_parts, Some(1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_queued_draw_terminates_without_confirmation_text() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();

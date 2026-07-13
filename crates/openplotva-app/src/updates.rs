@@ -1088,7 +1088,7 @@ where
     H: UpdateHandler + Sync,
     Tracker: UpdateStageTracker + ?Sized,
 {
-    let update = match claim.decode_payload::<TelegramUpdate>() {
+    let update = match decode_telegram_update_payload(&claim.raw_payload) {
         Ok(update) => update,
         Err(error) => {
             return transition_claimed_update(
@@ -1218,6 +1218,37 @@ where
         },
     };
     transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
+}
+
+fn decode_telegram_update_payload(raw_payload: &[u8]) -> Result<TelegramUpdate, serde_json::Error> {
+    let mut payload = serde_json::from_slice(raw_payload)?;
+    prefer_sender_chat_in_messages(&mut payload);
+    serde_json::from_value(payload)
+}
+
+fn prefer_sender_chat_in_messages(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                prefer_sender_chat_in_messages(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let is_message = object.contains_key("message_id") && object.contains_key("chat");
+            if is_message
+                && object
+                    .get("sender_chat")
+                    .is_some_and(|value| !value.is_null())
+                && object.get("from").is_some_and(|value| !value.is_null())
+            {
+                object.remove("from");
+            }
+            for value in object.values_mut() {
+                prefer_sender_chat_in_messages(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn transition_retry_or_dead_letter(
@@ -1898,6 +1929,38 @@ mod tests {
         assert!(payload.get("original_text").is_none());
         assert_eq!(payload["meta"]["sender_id"], 99);
         assert_eq!(payload["meta"]["sender_name"], "Ada");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_sender_automatic_forward_persists_sender_chat_history()
+    -> Result<(), Box<dyn Error>> {
+        let update = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135730,
+                "message": {
+                    "message_id": 529364,
+                    "date": 1783909208,
+                    "chat": {"id": -1002633257301, "type": "supergroup", "title": "Chat"},
+                    "from": {"id": 777000, "is_bot": false, "first_name": "Telegram"},
+                    "sender_chat": {"id": -1002689651729, "type": "channel", "title": "News"},
+                    "text": "automatic forward",
+                    "is_automatic_forward": true
+                }
+            }"#,
+        )?;
+        let store = HistoryStoreStub::default();
+
+        let report = super::persist_update_history(&store, &update, 0).await?;
+
+        assert!(report.inbound_entry_persisted);
+        let entries = store.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sender_id, -1002689651729);
+        let payload: Value = serde_json::from_slice(&entries[0].payload)?;
+        assert_eq!(payload["sender_chat"]["id"], -1002689651729_i64);
+        assert!(payload.get("from").is_none());
+        assert_eq!(payload["meta"]["sender_type"], "channel");
         Ok(())
     }
 

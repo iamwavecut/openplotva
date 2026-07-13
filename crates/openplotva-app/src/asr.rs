@@ -1034,6 +1034,16 @@ where
             .map_err(|error| error.to_string());
         let audio = match audio {
             Ok(audio) => audio,
+            Err(error) if asr_download_unavailable_error(&error) => {
+                self.store_unavailable(record, &error, OffsetDateTime::now_utc())
+                    .await
+                    .map_err(|store_error| {
+                        format!(
+                            "failed to store unavailable Telegram media ASR state: {store_error}"
+                        )
+                    })?;
+                return Ok(None);
+            }
             Err(error) => {
                 self.mark_failed_best_effort(record, &error).await;
                 return Err(error);
@@ -1064,8 +1074,12 @@ where
         let text = transcript.text.trim().to_owned();
         if text.is_empty() {
             let error = "empty transcript".to_owned();
-            self.mark_failed_best_effort(record, &error).await;
-            return Err(error);
+            self.store_unavailable(record, &error, OffsetDateTime::now_utc())
+                .await
+                .map_err(|store_error| {
+                    format!("failed to store empty Telegram media ASR state: {store_error}")
+                })?;
+            return Ok(None);
         }
         let stored = if let Err(error) = self
             .store_completed(record, &text, &transcript, OffsetDateTime::now_utc())
@@ -1383,6 +1397,11 @@ fn asr_audio_unavailable_error(error: &str) -> bool {
         .contains("failed to decode audio with ffmpeg")
 }
 
+fn asr_download_unavailable_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("file is too big") || error.contains("exceeds 20 mib")
+}
+
 fn apply_transcript(input: &mut DialogInput, attachment_index: usize, text: &str) {
     let is_video = input
         .message
@@ -1463,6 +1482,12 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct FakeDownloader {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailingDownloader {
+        error: String,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1594,6 +1619,23 @@ mod tests {
         }
     }
 
+    impl TelegramVoiceDownloader for FailingDownloader {
+        type Error = String;
+
+        fn download_voice<'a>(
+            &'a self,
+            latest_file_id: &'a str,
+        ) -> TelegramVoiceDownloadFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("lock")
+                    .push(latest_file_id.to_owned());
+                Err(self.error.clone())
+            })
+        }
+    }
+
     impl AsrTranscriber for FakeTranscriber {
         type Error = String;
 
@@ -1608,6 +1650,19 @@ mod tests {
                 self.result.clone()
             })
         }
+    }
+
+    #[test]
+    fn deterministic_download_size_errors_are_terminal() {
+        assert!(asr_download_unavailable_error(
+            "Bad Request: file is too big"
+        ));
+        assert!(asr_download_unavailable_error(
+            "telegram media exceeds 20 MiB"
+        ));
+        assert!(!asr_download_unavailable_error(
+            "telegram transport timeout"
+        ));
     }
 
     #[tokio::test]
@@ -2089,6 +2144,84 @@ mod tests {
         assert_eq!(updates[0].asr_status, TELEGRAM_FILE_ASR_STATUS_PROCESSING);
         assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
         assert!(updates[1].asr_completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn materializer_terminally_skips_media_without_detected_speech() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FakeDownloader::default();
+        let transcriber = FakeTranscriber {
+            result: Ok(transcript("")),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let first = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+        let second = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(first.message.text.is_empty());
+        assert!(second.message.text.is_empty());
+        assert_eq!(downloader.calls.lock().expect("lock").len(), 1);
+        assert_eq!(transcriber.calls.lock().expect("lock").len(), 1);
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
+        assert_eq!(updates[1].asr_error.as_deref(), Some("empty transcript"));
+        assert!(updates[1].asr_completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn materializer_terminally_skips_telegram_files_over_download_limit() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FailingDownloader {
+            error: "Bad Request: file is too big; error_code=400".to_owned(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let transcriber = FakeTranscriber {
+            result: Ok(transcript("unused")),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let first = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+        let second = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(first.message.text.is_empty());
+        assert!(second.message.text.is_empty());
+        assert_eq!(downloader.calls.lock().expect("lock").len(), 1);
+        assert!(transcriber.calls.lock().expect("lock").is_empty());
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
+        assert!(
+            updates[1]
+                .asr_error
+                .as_deref()
+                .is_some_and(|error| error.contains("file is too big"))
+        );
     }
 
     #[test]
