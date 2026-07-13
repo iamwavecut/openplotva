@@ -1094,6 +1094,13 @@ pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
         };
     }
 
+    if starts_with_xml_tag(&cleaned.to_ascii_lowercase(), "assist_message") {
+        return SanitizedAssistantText {
+            removed_scaffolding: true,
+            ..SanitizedAssistantText::default()
+        };
+    }
+
     let (without_context, context_removed, context_malformed) =
         strip_leading_user_context_envelopes(&cleaned);
     removed |= context_removed;
@@ -1105,6 +1112,17 @@ pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
         };
     }
     cleaned = without_context;
+
+    let without_model_notes = strip_known_model_meta_notes(&cleaned);
+    removed |= without_model_notes != cleaned;
+    cleaned = without_model_notes;
+
+    if cleaned.is_empty() {
+        return SanitizedAssistantText {
+            removed_scaffolding: removed,
+            ..SanitizedAssistantText::default()
+        };
+    }
 
     if starts_with_message_scaffolding(&cleaned) {
         let text = extract_protocol_text_bodies(&cleaned);
@@ -1149,6 +1167,7 @@ fn starts_with_known_protocol(value: &str) -> bool {
             "reference_context",
             "attach_id",
             "call",
+            "assist_message",
             "assistant_message",
             "assistants_message",
             "reply",
@@ -1248,6 +1267,35 @@ fn extract_protocol_text_bodies(value: &str) -> Option<String> {
     (!bodies.is_empty()).then(|| bodies.join("\n\n"))
 }
 
+fn strip_known_model_meta_notes(value: &str) -> String {
+    let mut removed = false;
+    let mut cleaned = String::with_capacity(value.len());
+    for segment in value.split_inclusive("\n\n") {
+        let paragraph = segment.strip_suffix("\n\n").unwrap_or(segment).trim();
+        let lower = paragraph.to_ascii_lowercase();
+        let is_model_note = lower.starts_with("(note:")
+            && lower.ends_with(')')
+            && [
+                "tool response",
+                "tool call",
+                "persona rules",
+                "simulated restriction",
+            ]
+            .into_iter()
+            .any(|marker| lower.contains(marker));
+        if is_model_note {
+            removed = true;
+        } else {
+            cleaned.push_str(segment);
+        }
+    }
+    if removed {
+        cleaned.trim().to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 #[must_use]
 pub fn has_leading_context_message(value: &str) -> bool {
     let cleaned = sanitize_tool_text(value);
@@ -1255,6 +1303,7 @@ pub fn has_leading_context_message(value: &str) -> bool {
     let lower = cleaned.to_ascii_lowercase();
     starts_with_xml_tag(&lower, "message")
         || starts_with_xml_tag(&lower, "attach_id")
+        || starts_with_xml_tag(&lower, "assist_message")
         || starts_with_xml_tag(&lower, "assistant_message")
         || starts_with_xml_tag(&lower, "assistants_message")
         || starts_with_xml_tag(&lower, "last_message")
@@ -1298,6 +1347,7 @@ const REPLY_LEAK_TAGS: &[&str] = &[
     "thought",
     "analysis",
     "eigen_thought",
+    "assist_message",
     "assistant_message",
     "assistants_message",
     "reply",
@@ -3451,6 +3501,15 @@ mod tests {
             ),
             "Ответ из production-варианта."
         );
+        assert_eq!(
+            finalize_dialog_reply(
+                r#"<assist_message>
+<message id="310485"><user type="user">Пчела</user><message_type>text</message_type><text>Ну и ладно 😂</text></message>
+<message id="310486"><user type="user">Пчела</user><message_type>text</message_type><text>Главное не потеряться 💅</text></message>
+</assist_message>"#
+            ),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak)
+        );
 
         assert_eq!(
             sanitize_tool_value(json!({
@@ -3725,6 +3784,34 @@ mod tests {
         assert_eq!(parsed.tool_steps[1].emoji, "😂");
         assert_eq!(parsed.tool_steps[1].target_message_id, 999949);
         assert!(!parsed.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_suppresses_tool_execution_meta_note() -> Result<(), ToolParseError> {
+        let raw = r#"<|channel>thought
+<channel|><send_message text="Сейчас устрою такой бум-бала-бум, что серверы задрожат!" />
+<generate_song topic="funny energetic dance with kittens and electronic beats" />
+
+(Note: The tool response indicates a failure due to a simulated restriction. Since I cannot actually provide a song, I will pivot to a textual performance as per the persona rules.)
+
+<send_message text="Ловите мой цифровой флекс: 🐾💃✨" />
+<send_message text="Бум-бала-бум!" />"#;
+
+        let parsed = parse_assistant_content(raw)?;
+
+        assert_eq!(parsed.tool_steps.len(), 4);
+        assert!(parsed.text.is_empty());
+        assert!(parsed.removed_scaffolding);
+        assert!(!parsed.residual_protocol);
+
+        for ordinary in [
+            "(Note: remember to bring the adapter.)",
+            "Обычная проза про tool response без служебных скобок.",
+            "Первый абзац.\n\n  Второй абзац с отступом.",
+        ] {
+            assert_eq!(sanitize_final_text(ordinary), ordinary);
+        }
         Ok(())
     }
 
