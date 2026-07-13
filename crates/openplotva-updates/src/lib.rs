@@ -1569,7 +1569,8 @@ pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> Pars
         };
     }
 
-    let is_addressed = addressed_by_bot_reply(message, bot);
+    let is_addressed = addressed_by_bot_on_later_line(bot, &text_for_parsing)
+        || addressed_by_bot_reply(message, bot);
     ParsedAddressedMessage {
         message_text,
         first_word,
@@ -2821,9 +2822,10 @@ fn addressable_message_text(message: &TelegramMessage) -> (String, String) {
 }
 
 fn cut_first_word(text: &str) -> (String, String) {
-    let Some((first, rest)) = text.split_once(' ') else {
+    let Some(boundary) = text.find(char::is_whitespace) else {
         return (first_word_trim_no_space(text).to_owned(), String::new());
     };
+    let (first, rest) = text.split_at(boundary);
 
     (
         first_word_trim(first).to_owned(),
@@ -3079,6 +3081,13 @@ fn addressed_by_bot_mention(bot: &TelegramUser, first_word: &str) -> bool {
         return false;
     };
     first_word.eq_ignore_ascii_case(&format!("@{username}"))
+}
+
+fn addressed_by_bot_on_later_line(bot: &TelegramUser, text: &str) -> bool {
+    text.lines().skip(1).any(|line| {
+        let (first_word, _) = cut_first_word(line.trim_start());
+        addressed_by_bot_name(bot, &first_word) || addressed_by_bot_mention(bot, &first_word)
+    })
 }
 
 fn addressed_by_bot_reply(message: &TelegramMessage, bot: &TelegramUser) -> bool {
@@ -5801,6 +5810,71 @@ mod tests {
         assert!(parsed.is_addressed);
         assert_eq!(parsed.first_word, "измени");
         assert_eq!(parsed.rest_text, "фон");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_if_addressed_accepts_bot_name_before_a_newline() -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let name_address = sample_message_from_value(json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "Плотва,\nнапомни про встречу"
+        }))?;
+
+        let parsed = parse_if_addressed(&name_address, &bot);
+
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.first_word, "напомни");
+        assert_eq!(parsed.rest_text, "про встречу");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_if_addressed_accepts_bot_name_at_start_of_later_line() -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let name_address = sample_message_from_value(json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "Вышла новая версия.\nПлотва, как это прокомментируешь?"
+        }))?;
+        let inline_name = sample_message_from_value(json!({
+            "message_id": 11,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "Вышла новая версия, и Плотва это прокомментирует"
+        }))?;
+
+        let parsed = parse_if_addressed(&name_address, &bot);
+
+        assert!(parsed.is_addressed);
+        assert_eq!(
+            parsed.message_text,
+            "Вышла новая версия.\nПлотва, как это прокомментируешь?"
+        );
+        assert_eq!(parsed.first_word, "Вышла");
+        assert_eq!(
+            parsed.rest_text,
+            "новая версия.\nПлотва, как это прокомментируешь?"
+        );
+        assert!(!parse_if_addressed(&inline_name, &bot).is_addressed);
         Ok(())
     }
 
