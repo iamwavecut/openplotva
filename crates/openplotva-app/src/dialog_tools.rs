@@ -2689,6 +2689,9 @@ fn dialog_understand_media_error(error: ToolboxError) -> ToolResult {
             crate::vision::VisionDescribeError::UnsupportedMedia { .. } => {
                 ("unsupported_media", false)
             }
+            crate::vision::VisionDescribeError::DownloadUnavailable => {
+                ("understand_media_download_unavailable", false)
+            }
             crate::vision::VisionDescribeError::EmptyFileId
             | crate::vision::VisionDescribeError::EmptyFileUniqueId
             | crate::vision::VisionDescribeError::EmptyLatestFileId => {
@@ -4387,6 +4390,18 @@ mod tests {
         );
         assert_eq!(
             unsupported.error.as_ref().map(|error| error.retryable),
+            Some(false)
+        );
+
+        let oversized = dialog_understand_media_error(Box::new(
+            crate::vision::VisionDescribeError::DownloadUnavailable,
+        ));
+        assert_eq!(
+            oversized.error.as_ref().map(|error| error.code.as_str()),
+            Some("understand_media_download_unavailable")
+        );
+        assert_eq!(
+            oversized.error.as_ref().map(|error| error.retryable),
             Some(false)
         );
     }

@@ -48,6 +48,8 @@ pub const LEGACY_VISION_ENDPOINT_NAME: &str = "generate";
 pub const VISION_MAX_SIDE: u32 = 512;
 pub const VISION_MAX_PIXELS: u64 = VISION_MAX_SIDE as u64 * VISION_MAX_SIDE as u64;
 pub const VISION_MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
+const TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE: &str =
+    "Визуальное описание недоступно: файл превышает лимит скачивания Telegram Bot API.";
 
 /// Boxed future returned by Telegram file metadata lookups.
 pub type TelegramFileLookupFuture<'a, E> =
@@ -859,6 +861,9 @@ where
             let result = vision_describe_result(&record, caption, "cache", history_updated);
             return Ok((record, result));
         }
+        if telegram_file_exceeds_download_limit(&record) {
+            return Err(VisionDescribeError::DownloadUnavailable);
+        }
         if vision_caption_pending_at(&record, now) {
             return Err(VisionDescribeError::CaptionPending);
         }
@@ -1115,6 +1120,24 @@ where
                     .await
                 {
                     Ok(result) => result,
+                    Err(VisionDescribeError::DownloadUnavailable) => {
+                        update_dialog_vision_attachment_caption(
+                            &mut meta,
+                            candidate.attachment_index,
+                            &candidate.file_unique_id,
+                            TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE,
+                        );
+                        captions.push(format!(
+                            "{}: {}",
+                            candidate.label, TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE
+                        ));
+                        tracing::debug!(
+                            file_unique_id = candidate.file_unique_id,
+                            label = candidate.label,
+                            "skipped VLM caption for Telegram file above download limit"
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         if error == VisionDescribeError::NotFound {
                             tracing::debug!(
@@ -1457,6 +1480,9 @@ pub enum VisionDescribeError {
     /// Another worker is already processing a fresh caption.
     #[error("vision caption pending")]
     CaptionPending,
+    /// Telegram Bot API cannot download the known file size.
+    #[error("telegram file exceeds 20 MiB Telegram Bot API limit")]
+    DownloadUnavailable,
     /// Provider returned an empty caption.
     #[error("empty caption")]
     EmptyCaption,
@@ -1490,6 +1516,12 @@ fn caption_from_record(record: &TelegramFileRecord) -> Option<String> {
     }
     let caption = record.vision_caption.as_deref()?.trim();
     (!caption.is_empty()).then(|| caption.to_owned())
+}
+
+fn telegram_file_exceeds_download_limit(record: &TelegramFileRecord) -> bool {
+    record
+        .file_size
+        .is_some_and(|size| size > i64::try_from(VISION_MAX_VIDEO_BYTES).unwrap_or(i64::MAX))
 }
 
 fn vision_caption_pending_at(record: &TelegramFileRecord, now: OffsetDateTime) -> bool {
@@ -2058,6 +2090,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_describer_skips_known_oversized_file_without_download_or_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_time(1_710_000_000)?;
+        let mut record = file_record("video-u", "video-file", now);
+        record.media_kind = "video".to_owned();
+        record.mime_type = Some("video/mp4".to_owned());
+        record.file_size = Some(i64::try_from(VISION_MAX_VIDEO_BYTES)? + 1);
+        let store = FileStoreStub::with_records(vec![record]);
+        let captioner = CaptionerStub::successful("must not run", 1.0);
+        let service = TelegramVisionDescriber::new(store.clone(), captioner.clone());
+
+        let error = service
+            .describe_image_at(vision_request("video-u"), now)
+            .await
+            .expect_err("known oversized Telegram file must be terminal");
+
+        assert_eq!(error, VisionDescribeError::DownloadUnavailable);
+        assert!(captioner.calls().is_empty());
+        assert!(store.updates().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dialog_vision_materializer_adds_captions_direct_images_and_history_like_go()
     -> Result<(), Box<dyn std::error::Error>> {
         let now = unix_time(1_710_000_000)?;
@@ -2176,6 +2231,61 @@ mod tests {
             "00:00 человек входит в комнату"
         );
         assert!(input.multimodal_images.is_empty());
+        assert!(data_urls.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_vision_materializer_exposes_oversized_file_note_without_download()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_time(1_710_000_000)?;
+        let mut video = file_record("video-u", "video-file", now);
+        video.media_kind = "video".to_owned();
+        video.mime_type = Some("video/mp4".to_owned());
+        video.file_size = Some(i64::try_from(VISION_MAX_VIDEO_BYTES)? + 1);
+        let store = FileStoreStub::with_records(vec![video]);
+        let captioner = CaptionerStub::successful("must not run", 1.0);
+        let describer = TelegramVisionDescriber::new(store.clone(), captioner.clone());
+        let data_urls = DataUrlStub::default();
+        let materializer =
+            TelegramDialogVisionInputMaterializer::new(describer, data_urls.clone(), 1);
+        let input = DialogInput {
+            context: DialogContext {
+                chat_id: 42,
+                ..DialogContext::default()
+            },
+            message: DialogMessage {
+                id: 77,
+                meta: ChatMessageMeta {
+                    attachments: vec![ChatAttachment {
+                        kind: "video".to_owned(),
+                        source: "message".to_owned(),
+                        file_unique_id: "video-u".to_owned(),
+                        mime_type: "video/mp4".to_owned(),
+                        ..ChatAttachment::default()
+                    }],
+                    ..ChatMessageMeta::default()
+                },
+                ..DialogMessage::default()
+            },
+            ..DialogInput::default()
+        };
+
+        let input = materializer
+            .materialize_dialog_vision_input(input, now)
+            .await;
+
+        assert_eq!(
+            input.message.meta.vision_description,
+            format!("message_77_video_1: {TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE}")
+        );
+        assert_eq!(
+            input.message.meta.attachments[0].caption,
+            TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE
+        );
+        assert!(input.multimodal_images.is_empty());
+        assert!(captioner.calls().is_empty());
+        assert!(store.updates().is_empty());
         assert!(data_urls.calls().is_empty());
         Ok(())
     }

@@ -8485,6 +8485,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_step_salvages_production_named_call_sequence() -> Result<(), CompletionError> {
+        let (provider, _transport, _) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<|channel>thought\n<channel|><call>\n  <tool_name>react_to_message</tool_name>\n  <arguments><emoji>🤣</emoji><message_id>999948</message_id></arguments>\n</call>\n<call>\n  <tool_name>react_to_message</tool_name>\n  <arguments><emoji>😂</emoji><message_id>999949</message_id></arguments>\n</call>\n\nНу и за что тебе такое наказание божье?"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    openplotva_dialog::chat_completion_tools_for_specs(&[
+                        SESSION_REACT_TO_MESSAGE_SPEC,
+                    ])
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+
+        assert_eq!(output.tool_calls.len(), 2);
+        assert!(output.tool_calls.iter().all(|call| call.salvaged));
+        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
+        assert_eq!(output.tool_calls[0].step.target_message_id, 999948);
+        assert_eq!(output.tool_calls[1].step.emoji, "😂");
+        assert_eq!(output.tool_calls[1].step.target_message_id, 999949);
+        assert_eq!(output.text, "Ну и за что тебе такое наказание божье?");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_malformed_named_call_is_retryable_protocol_failure() {
+        let (provider, _transport, _) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<call><tool_name>react_to_message</tool_name><arguments><emoji>😂</emoji>"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+
+        let error = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    openplotva_dialog::chat_completion_tools_for_specs(&[
+                        SESSION_REACT_TO_MESSAGE_SPEC,
+                    ])
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await
+        .expect_err("malformed named call must be a retryable provider protocol error");
+
+        assert_eq!(
+            crate::retry::retryable_reason(error.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(error.to_string().contains("tool protocol error"), "{error}");
+    }
+
+    #[tokio::test]
     async fn chat_step_salvages_production_nested_video_preamble_sequence()
     -> Result<(), CompletionError> {
         let (provider, _transport, _) = direct_dialog_provider(
