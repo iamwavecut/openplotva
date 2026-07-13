@@ -1363,9 +1363,12 @@ fn select_voice_candidate(meta: &ChatMessageMeta) -> Option<VoiceCandidate> {
 }
 
 fn voice_candidate(index: usize, attachment: &ChatAttachment) -> Option<VoiceCandidate> {
-    if !matches!(attachment.kind.trim(), "voice" | "video" | "video_note")
-        || attachment.source.trim() != "message"
-    {
+    let kind = attachment.kind.trim();
+    let mime = attachment.mime_type.trim();
+    let speech_bearing = matches!(kind, "voice" | "audio" | "video" | "video_note")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/");
+    if !speech_bearing || attachment.source.trim() != "message" {
         return None;
     }
     let file_unique_id = attachment.file_unique_id.trim();
@@ -1702,8 +1705,8 @@ mod tests {
     }
 
     #[test]
-    fn video_and_video_note_are_asr_candidates_but_animation_is_not() {
-        for kind in ["voice", "video", "video_note"] {
+    fn speech_bearing_kinds_and_mime_types_are_asr_candidates() {
+        for kind in ["voice", "audio", "video", "video_note"] {
             let candidate = voice_candidate(
                 2,
                 &ChatAttachment {
@@ -1729,6 +1732,19 @@ mod tests {
                 },
             )
             .is_none()
+        );
+        assert!(
+            voice_candidate(
+                0,
+                &ChatAttachment {
+                    kind: "document".to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: "document-u".to_owned(),
+                    mime_type: "audio/ogg".to_owned(),
+                    ..ChatAttachment::default()
+                },
+            )
+            .is_some()
         );
     }
 

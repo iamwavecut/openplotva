@@ -2139,6 +2139,16 @@ fn prepare_dialog_chat_response_matches_go_dialog_send_sanitizer() {
         "very-long-language-name\nbody"
     );
     assert_eq!(prepare_dialog_chat_response("`hello`"), "hello");
+    assert_eq!(
+        prepare_dialog_chat_response(
+            r#"<reply to_id="6877"><to_user>WaveCut</to_user></reply>
+<assistant id="6878">Плотва</assistant>
+<message_type>text</message_type>
+<text>Только этот текст должен дойти.</text>"#
+        ),
+        "Только этот текст должен дойти."
+    );
+    assert_eq!(prepare_dialog_chat_response("thought\n<channel|>"), "");
 }
 
 #[test]
@@ -2827,6 +2837,7 @@ impl DialogJobEffects for EffectsStub {
     fn send_dialog_intermediate<'a>(
         &'a self,
         _dialog_job_id: i64,
+        _causation_update_id: Option<i64>,
         _params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -3245,6 +3256,7 @@ impl openplotva_llm::ChatStepProvider for StepProviderStub {
 #[derive(Default)]
 struct SessionToolboxStub {
     web_search_queries: Mutex<Vec<String>>,
+    understand_media_refs: Mutex<Vec<String>>,
     draw_requests: Mutex<Vec<openplotva_dialog::DrawRequest>>,
     draw_result: Mutex<Option<openplotva_dialog::ToolResult>>,
     song_result: Mutex<Option<openplotva_dialog::ToolResult>>,
@@ -3289,6 +3301,24 @@ impl openplotva_dialog::DialogToolbox for SessionToolboxStub {
             Ok(openplotva_dialog::ToolResult {
                 status: "ok".to_owned(),
                 message: "results: solstice is on June 21".to_owned(),
+                ..openplotva_dialog::ToolResult::default()
+            })
+        })
+    }
+
+    fn understand_media<'a>(
+        &'a self,
+        request: openplotva_dialog::VisionRequest,
+    ) -> openplotva_dialog::ToolboxFuture<'a> {
+        self.understand_media_refs
+            .lock()
+            .expect("media refs")
+            .push(request.file_id);
+        Box::pin(async {
+            Ok(openplotva_dialog::ToolResult {
+                status: "ok".to_owned(),
+                message: "media understood".to_owned(),
+                data: Some(serde_json::json!({"file_unique_id": "media-unique"})),
                 ..openplotva_dialog::ToolResult::default()
             })
         })
@@ -3999,6 +4029,123 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
+async fn session_reuses_semantically_identical_tool_result_within_trigger()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что там в мире?"), now),
+    );
+    let search = |id: &str, query: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: query.to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(search("call-1", "новости")),
+        Ok(search("call-2", "  новости  ")),
+        Ok(step_text("всё спокойно")),
+    ]);
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox.clone(), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(
+        toolbox
+            .web_search_queries
+            .lock()
+            .expect("queries")
+            .as_slice(),
+        ["новости"],
+        "the second semantic call must reuse the first result"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_reuses_understand_media_result_by_resolved_unique_id() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что на видео?"), now),
+    );
+    let media = |id: &str, file_id: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_UNDERSTAND_MEDIA.to_owned(),
+                    file_id: file_id.to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(media("call-1", "message\\_77\\_video\\_1")),
+        Ok(media("call-2", "media-unique")),
+        Ok(step_text("готово")),
+    ]);
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox.clone(), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(
+        toolbox
+            .understand_media_refs
+            .lock()
+            .expect("media refs")
+            .as_slice(),
+        ["message\\_77\\_video\\_1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_accepts_final_text_already_delivered_by_send_message() -> Result<(), Box<dyn Error>>
 {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -4190,7 +4337,7 @@ async fn session_send_message_tool_respects_cap_and_dedup() -> Result<(), Box<dy
     };
     let provider = StepProviderStub::with_steps(vec![
         Ok(send("часть один", "c1")),
-        Ok(send("часть один", "c2")), // duplicate → error result
+        Ok(send("часть один", "c2")), // duplicate → cached success result
         Ok(send("часть два", "c3")),
         Ok(send("часть три", "c4")),
         Ok(send("часть четыре", "c5")),
@@ -4224,10 +4371,10 @@ async fn session_send_message_tool_respects_cap_and_dedup() -> Result<(), Box<dy
         intermediates[1..].iter().all(|(_, _, reply)| !reply),
         "only the first send replies to the trigger"
     );
-    // The duplicate and the over-cap calls came back as error results.
+    // The duplicate reuses the first result; the over-cap call remains an error.
     let requests = provider.requests();
     let transcript_json = format!("{:?}", requests.last().expect("final request").transcript);
-    assert!(transcript_json.contains("duplicate_message"));
+    assert!(transcript_json.contains("reused_from_call_id"));
     assert!(transcript_json.contains("message_limit"));
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].sent_message_parts, Some(5));
