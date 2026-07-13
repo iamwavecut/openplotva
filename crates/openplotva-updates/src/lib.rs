@@ -924,9 +924,7 @@ pub fn is_passive_update(update: &TelegramUpdate) -> bool {
     !is_payment_update(update)
         && matches!(
             &update.update_type,
-            TelegramUpdateType::ChannelPost(_)
-                | TelegramUpdateType::EditedChannelPost(_)
-                | TelegramUpdateType::ChosenInlineResult(_)
+            TelegramUpdateType::ChosenInlineResult(_)
                 | TelegramUpdateType::Poll(_)
                 | TelegramUpdateType::PollAnswer(_)
                 | TelegramUpdateType::MessageReaction(_)
