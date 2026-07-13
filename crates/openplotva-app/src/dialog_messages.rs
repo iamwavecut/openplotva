@@ -2445,6 +2445,11 @@ async fn schedule_direct_image_shortcut(
         .and_then(|thread_id| i32::try_from(thread_id).ok())
         .filter(|thread_id| *thread_id != 0);
     let prompt = prompt.trim().to_owned();
+    let prompt_variants = if is_bang_draw_shortcut(request.first_word_lower) {
+        vec![prompt.clone()]
+    } else {
+        Vec::new()
+    };
     let result = image_scheduler
         .schedule_image(DrawImageScheduleRequest {
             chat_id: request.chat_id,
@@ -2453,6 +2458,7 @@ async fn schedule_direct_image_shortcut(
             user_id: request.sender.id,
             user_full_name: message_user_full_name(request.sender),
             prompt: prompt.clone(),
+            prompt_variants,
             message_text: control_context.text,
             attachments,
             edit_media_group_id,
@@ -5078,6 +5084,7 @@ mod tests {
         assert_eq!(record.job.priority, DEFAULT_PRIORITY);
         let image = record.job.data.image_data.as_ref().expect("image");
         assert_eq!(image.prompt, "cat");
+        assert!(image.prompt_variants.is_empty());
         assert_eq!(image.original_text, "cat");
         assert_eq!(image.author, "Ada");
         Ok(())
@@ -5123,6 +5130,7 @@ mod tests {
         assert_eq!(record.queue_name, IMAGE_REGULAR_QUEUE_NAME);
         let image = record.job.data.image_data.as_ref().expect("image");
         assert_eq!(image.prompt, "neon cat");
+        assert_eq!(image.prompt_variants, ["neon cat"]);
         assert_eq!(image.original_text, "neon cat");
         assert_eq!(image.author, "Ada");
         Ok(())
