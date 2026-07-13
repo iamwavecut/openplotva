@@ -3189,6 +3189,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_message_addressed_on_later_line_schedules_dialog_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = SchedulerStub::default();
+        let mut config = test_config();
+        config.bot_user.first_name = "Плотва".to_owned();
+        let text = "Вышла новая версия.\nПлотва, как это прокомментируешь?";
+
+        let route = handle_dialog_message_update_or_else(
+            &scheduler,
+            &config,
+            group_message_update(text)?,
+            |_update| async { Err("addressed group message should not delegate") },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            }
+        );
+        assert_eq!(scheduler.calls(), vec![text.to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dialog_task_is_durable_before_typing_and_carries_update_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = Arc::new(InMemoryTaskQueue::new());
