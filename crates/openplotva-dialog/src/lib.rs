@@ -1147,6 +1147,8 @@ fn starts_with_known_protocol(value: &str) -> bool {
             "last_message",
             "chat_context",
             "reference_context",
+            "attach_id",
+            "call",
             "assistant_message",
             "assistants_message",
             "reply",
@@ -1252,6 +1254,7 @@ pub fn has_leading_context_message(value: &str) -> bool {
     let cleaned = cleaned.trim();
     let lower = cleaned.to_ascii_lowercase();
     starts_with_xml_tag(&lower, "message")
+        || starts_with_xml_tag(&lower, "attach_id")
         || starts_with_xml_tag(&lower, "assistant_message")
         || starts_with_xml_tag(&lower, "assistants_message")
         || starts_with_xml_tag(&lower, "last_message")
@@ -1300,6 +1303,8 @@ const REPLY_LEAK_TAGS: &[&str] = &[
     "reply",
     "assistant",
     "message_type",
+    "attach_id",
+    "call",
 ];
 
 #[must_use]
@@ -1683,7 +1688,8 @@ fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) ->
         raw
     };
     match decision.form.as_str() {
-        "xmlish" => remove_xmlish_tool_protocol(content),
+        "xmlish" => remove_leading_xmlish_named_call_protocol(content)
+            .or_else(|| remove_xmlish_tool_protocol(content)),
         "inline" => remove_inline_tool_protocol(content),
         "bare_start" | "bare_block" => remove_bare_tool_protocol(content),
         "fenced" => remove_fenced_tool_protocol(content),
@@ -1693,6 +1699,30 @@ fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) ->
         }
         _ => None,
     }
+}
+
+fn remove_leading_xmlish_named_call_protocol(raw: &str) -> Option<String> {
+    let protocol = strip_reasoning_channels(raw);
+    let protocol = protocol.trim_start();
+    if !starts_with_xml_tag(&protocol.to_ascii_lowercase(), "call") {
+        return None;
+    }
+    let mut offset = raw.rfind(protocol)?;
+    let mut spans = Vec::new();
+    loop {
+        offset += raw[offset..].len() - raw[offset..].trim_start().len();
+        let lower = raw[offset..].to_ascii_lowercase();
+        if !starts_with_xml_tag(&lower, "call") {
+            break;
+        }
+        let open_end = raw[offset..].find('>')? + offset + 1;
+        let close = "</call>";
+        let close_start = index_fold(&raw[open_end..], close)? + open_end;
+        let end = close_start + close.len();
+        spans.push((offset, end));
+        offset = end;
+    }
+    (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
 }
 
 fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
@@ -1913,6 +1943,21 @@ pub fn extract_content_tool_steps(
 fn detect_tool_steps_in(
     content: &str,
 ) -> Result<Option<(Vec<ToolStep>, ToolParseDecision)>, ToolParseError> {
+    let named_call_steps = parse_xmlish_named_call_steps(content)?;
+    if !named_call_steps.is_empty() {
+        let decision = ToolParseDecision {
+            form: "xmlish".to_owned(),
+            tool: named_call_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
+        return Ok(Some((named_call_steps, decision)));
+    }
+
     let direct_steps = parse_xmlish_direct_tool_tag_steps(content)?;
     if !direct_steps.is_empty() {
         let decision = ToolParseDecision {
@@ -1930,6 +1975,46 @@ fn detect_tool_steps_in(
 
     detect_tool_step_in(content)
         .map(|maybe_step| maybe_step.map(|(step, decision)| (vec![step], decision)))
+}
+
+fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
+    let protocol = strip_reasoning_channels(raw);
+    let mut remaining = protocol.trim_start();
+    if !starts_with_xml_tag(&remaining.to_ascii_lowercase(), "call") {
+        return Ok(Vec::new());
+    }
+
+    let mut steps = Vec::new();
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        if !starts_with_xml_tag(&lower, "call") {
+            break;
+        }
+        let open_end = remaining
+            .find('>')
+            .ok_or_else(|| ToolParseError::new("unterminated XML-ish call tag"))?
+            + 1;
+        let close = "</call>";
+        let body_end = index_fold(&remaining[open_end..], close)
+            .map(|offset| open_end + offset)
+            .ok_or_else(|| ToolParseError::new("unterminated XML-ish call element"))?;
+        let body = &remaining[open_end..body_end];
+        let raw_name = xmlish_child_text(body, "tool_name")
+            .ok_or_else(|| ToolParseError::new("XML-ish call has no tool_name"))?;
+        let name = canonical_known_step(&raw_name)
+            .ok_or_else(|| ToolParseError::new(format!("unknown step {raw_name:?}")))?;
+        let arguments_body = xmlish_child_text(body, "arguments").unwrap_or_default();
+        let mut arguments = serde_json::Map::new();
+        for key in INLINE_TOOL_ARG_KEYS {
+            if let Some(value) = xmlish_child_text(&arguments_body, key) {
+                arguments.insert((*key).to_owned(), Value::String(value));
+            }
+        }
+        steps.push(decode_tool_call_arguments(name, &Value::Object(arguments))?);
+
+        remaining = remaining[body_end + close.len()..].trim_start();
+    }
+    Ok(steps)
 }
 
 fn detect_tool_step_in(
@@ -3086,6 +3171,17 @@ mod tests {
             finalize_dialog_reply("<message id=\"1\"><text>old</text></message>"),
             Suppressed(ContextLeak)
         );
+        assert_eq!(
+            finalize_dialog_reply(
+                r#"<attach_id>171363</attach_id>
+<message id="171363" thread_id="171360" timestamp="2026-07-13T14:49:25Z">
+  <user username="Плотва" type="bot"></user>
+  <message_type>text</message_type>
+  <text>*шепотом* ...они уже начали ГОВОРИТЬ в эфире...</text>
+</message>"#
+            ),
+            Suppressed(ContextLeak)
+        );
         assert_eq!(finalize_dialog_reply("   "), Suppressed(Empty));
 
         // Exact production message envelope: only the text node is visible.
@@ -3595,6 +3691,70 @@ mod tests {
         assert_eq!(wrapper.text, "Секунду.");
         assert_eq!(wrapper.tool_steps.len(), 1);
         assert!(!wrapper.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_recovers_production_named_calls() -> Result<(), ToolParseError> {
+        let raw = r#"<|channel>thought
+<channel|><call>
+  <tool_name>react_to_message</tool_name>
+  <arguments>
+    <emoji>🤣</emoji>
+    <message_id>999948</message_id>
+  </arguments>
+</call>
+<call>
+  <tool_name>react_to_message</tool_name>
+  <arguments>
+    <emoji>😂</emoji>
+    <message_id>999949</message_id>
+  </arguments>
+</call>
+
+Ну и за что тебе такое наказание божье?"#;
+
+        let parsed = parse_assistant_content(raw)?;
+
+        assert_eq!(parsed.text, "Ну и за что тебе такое наказание божье?");
+        assert_eq!(parsed.tool_steps.len(), 2);
+        assert_eq!(parsed.tool_steps[0].step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(parsed.tool_steps[0].emoji, "🤣");
+        assert_eq!(parsed.tool_steps[0].target_message_id, 999948);
+        assert_eq!(parsed.tool_steps[1].step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(parsed.tool_steps[1].emoji, "😂");
+        assert_eq!(parsed.tool_steps[1].target_message_id, 999949);
+        assert!(!parsed.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn named_call_protocol_is_leading_only_and_malformed_calls_fail_loud()
+    -> Result<(), ToolParseError> {
+        for raw in [
+            "Это XML-пример: <call><tool_name>queue_status</tool_name></call>.",
+            "```xml\n<call><tool_name>queue_status</tool_name></call>\n```",
+        ] {
+            let parsed = parse_assistant_content(raw)?;
+            assert!(parsed.tool_steps.is_empty());
+            assert_eq!(parsed.text, raw);
+        }
+
+        let mixed = parse_assistant_content(
+            "<call><tool_name>queue_status</tool_name></call>\n\nПример остаётся: <call><tool_name>queue_status</tool_name></call>.",
+        )?;
+        assert_eq!(mixed.tool_steps.len(), 1);
+        assert_eq!(mixed.tool_steps[0].step, STEP_QUEUE_STATUS);
+        assert_eq!(
+            mixed.text,
+            "Пример остаётся: <call><tool_name>queue_status</tool_name></call>."
+        );
+
+        let error = parse_assistant_content(
+            "<call><tool_name>react_to_message</tool_name><arguments><emoji>😂</emoji>",
+        )
+        .expect_err("unterminated leading call must be a provider protocol error");
+        assert!(error.to_string().contains("unterminated XML-ish call"));
         Ok(())
     }
 

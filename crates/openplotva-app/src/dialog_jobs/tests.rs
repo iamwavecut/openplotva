@@ -2149,6 +2149,17 @@ fn prepare_dialog_chat_response_matches_go_dialog_send_sanitizer() {
         "Только этот текст должен дойти."
     );
     assert_eq!(prepare_dialog_chat_response("thought\n<channel|>"), "");
+    assert_eq!(
+        prepare_dialog_chat_response(
+            r#"<attach_id>171363</attach_id>
+<message id="171363" thread_id="171360" timestamp="2026-07-13T14:49:25Z">
+  <user username="Плотва" type="bot"></user>
+  <message_type>text</message_type>
+  <text>*шепотом* ...они уже начали ГОВОРИТЬ в эфире...</text>
+</message>"#
+        ),
+        ""
+    );
 }
 
 #[test]
