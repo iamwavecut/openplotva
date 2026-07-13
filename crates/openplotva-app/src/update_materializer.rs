@@ -1402,6 +1402,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn channel_posts_remain_pending_until_canonical_history_is_persisted() {
+        let channel_post = br#"{"update_id":44,"channel_post":{"message_id":7,"date":1700000000,"chat":{"id":-1007,"type":"channel","title":"News"},"sender_chat":{"id":-1007,"type":"channel","title":"News"},"text":"first"}}"#;
+        let edited_channel_post = br#"{"update_id":45,"edited_channel_post":{"message_id":7,"date":1700000000,"edit_date":1700000010,"chat":{"id":-1007,"type":"channel","title":"News"},"sender_chat":{"id":-1007,"type":"channel","title":"News"},"text":"edited"}}"#;
+
+        for (index, payload) in [channel_post.as_slice(), edited_channel_post.as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let prepared = preprocess_batch(
+                &[stream_entry(
+                    1_700_000_000_001 + index as u64,
+                    0,
+                    44 + index as i64,
+                    1_700_000_000_010 + index as i64,
+                    payload,
+                )],
+                123,
+            );
+
+            assert!(prepared.quarantine.is_empty());
+            assert_eq!(prepared.updates.len(), 1);
+            assert_eq!(
+                prepared.updates[0].disposition,
+                openplotva_storage::MaterializedUpdateDisposition::Pending
+            );
+        }
+    }
+
     fn stream_entry(
         stream_ms: u64,
         stream_seq: u64,

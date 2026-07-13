@@ -664,6 +664,16 @@ where
             }
         })?;
 
+    if matches!(
+        &update.update_type,
+        TelegramUpdateType::ChannelPost(_) | TelegramUpdateType::EditedChannelPost(_)
+    ) {
+        return Ok(UpdateHistorySideEffectReport {
+            persistence: history,
+            error: None,
+        });
+    }
+
     handle(update)
         .await
         .map_err(|error| UpdateHandleWithHistoryError::Handler {
@@ -2197,6 +2207,61 @@ mod tests {
         let payload: Value = serde_json::from_slice(&entries[0].payload)?;
         assert_eq!(payload["meta"]["sender_type"], "same_chat");
         assert_eq!(store.edits()[0].new_text, "edited");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_posts_are_history_only_and_never_reach_dialog_routes()
+    -> Result<(), Box<dyn Error>> {
+        let channel_post = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135734,
+                "channel_post": {
+                    "message_id": 78,
+                    "date": 1783909208,
+                    "chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "caption": "photo caption",
+                    "photo": [{
+                        "file_id": "photo-id",
+                        "file_unique_id": "photo-unique",
+                        "width": 320,
+                        "height": 240,
+                        "file_size": 1234
+                    }]
+                }
+            }"#,
+        )?;
+        let edited_channel_post = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135735,
+                "edited_channel_post": {
+                    "message_id": 78,
+                    "date": 1783909208,
+                    "edit_date": 1783909210,
+                    "chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "caption": "edited caption",
+                    "photo": [{
+                        "file_id": "photo-id",
+                        "file_unique_id": "photo-unique",
+                        "width": 320,
+                        "height": 240,
+                        "file_size": 1234
+                    }]
+                }
+            }"#,
+        )?;
+        let history = Arc::new(HistoryStoreStub::default());
+        let handler =
+            UpdateHandlerWithHistory::new(Arc::clone(&history), Arc::new(FailingUpdateHandler), 0);
+
+        handler.handle_update(channel_post).await?;
+        handler.handle_update(edited_channel_post).await?;
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.edits().len(), 1);
+        assert_eq!(history.edits()[0].new_text, "edited caption");
         Ok(())
     }
 
