@@ -22,9 +22,9 @@ use openplotva_core::ToolCall;
 use openplotva_dialog::{
     ChatStepRequest, ChatStepToolCall, DialogInput, DialogToolbox, HistoryMessage,
     SESSION_REACT_TO_MESSAGE_SPEC, SESSION_REACTION_ALLOWED_EMOJI, SESSION_SEND_MESSAGE_SPEC,
-    STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, SessionMessage,
-    SessionToolCall, ToolContext, ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs,
-    dialog_tool_context, dispatch_dialog_tool,
+    STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
+    STEP_UNDERSTAND_MEDIA, SessionMessage, SessionToolCall, ToolContext, ToolResult, ToolStep,
+    ToolsMode, chat_completion_tools_for_specs, dialog_tool_context, dispatch_dialog_tool,
     turn::{
         ANTI_LOOP_HINT, QueuedSideEffect, SIDE_EFFECT_KIND_IMAGE, SIDE_EFFECT_KIND_MUSIC,
         SIDE_EFFECT_STATE_QUEUED,
@@ -263,6 +263,8 @@ where
     let mut draws_scheduled: i32 = 0;
     let mut songs_scheduled: i32 = 0;
     let mut reacted_message_ids: BTreeSet<i64> = BTreeSet::new();
+    let mut tool_result_cache: BTreeMap<String, (String, ToolResult)> = BTreeMap::new();
+    let mut media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
     let max_iterations = cfg.max_iterations.max(1);
 
     let mut iteration: i32 = 0;
@@ -283,6 +285,8 @@ where
                     duplicate_guard_history.clone_from(&input.history);
                     base_input = input;
                     transcript.clear();
+                    tool_result_cache.clear();
+                    media_reference_aliases.clear();
                 }
                 Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
                     ..
@@ -656,6 +660,7 @@ where
                     effects,
                     queue,
                     ctx.item_id,
+                    ctx.item.latest_update_id,
                     &mut sent,
                     cfg.max_messages,
                     &announcement,
@@ -676,25 +681,47 @@ where
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
         for call in &step.tool_calls {
             let tool_started = tokio::time::Instant::now();
-            let result = execute_session_tool(
-                SessionToolExecution {
-                    call,
-                    cfg,
-                    meta: &meta,
-                    params: &active_params,
-                    budget: &mut budget,
-                    sent: &mut sent,
-                    draws_scheduled: &mut draws_scheduled,
-                    songs_scheduled: &mut songs_scheduled,
-                    reacted_message_ids: &mut reacted_message_ids,
-                    processing_started,
-                    now: ctx.now,
-                },
-                effects,
-                queue,
-                ctx.item_id,
-            )
-            .await;
+            let semantic_key = semantic_tool_call_key(
+                active_params.message_id,
+                &call.step,
+                &media_reference_aliases,
+            );
+            let result = if let Some((original_call_id, cached)) =
+                tool_result_cache.get(&semantic_key)
+            {
+                reused_tool_result(cached, original_call_id)
+            } else {
+                let result = execute_session_tool(
+                    SessionToolExecution {
+                        call,
+                        cfg,
+                        meta: &meta,
+                        params: &active_params,
+                        causation_update_id: ctx.item.latest_update_id,
+                        budget: &mut budget,
+                        sent: &mut sent,
+                        draws_scheduled: &mut draws_scheduled,
+                        songs_scheduled: &mut songs_scheduled,
+                        reacted_message_ids: &mut reacted_message_ids,
+                        processing_started,
+                        now: ctx.now,
+                    },
+                    effects,
+                    queue,
+                    ctx.item_id,
+                )
+                .await;
+                remember_media_reference_alias(&mut media_reference_aliases, &call.step, &result);
+                let resolved_key = semantic_tool_call_key(
+                    active_params.message_id,
+                    &call.step,
+                    &media_reference_aliases,
+                );
+                let cached = (call.id.clone(), result.clone());
+                tool_result_cache.insert(semantic_key, cached.clone());
+                tool_result_cache.insert(resolved_key, cached);
+                result
+            };
             if let Some(effect) = queued_generation_side_effect(&result) {
                 batch_side_effects.push(effect);
             }
@@ -836,11 +863,107 @@ fn queued_generation_side_effect(result: &ToolResult) -> Option<QueuedSideEffect
     })
 }
 
+fn semantic_tool_call_key(
+    trigger_message_id: i32,
+    step: &ToolStep,
+    media_reference_aliases: &BTreeMap<String, String>,
+) -> String {
+    let mut normalized_step = step.clone();
+    if normalized_step.step == STEP_UNDERSTAND_MEDIA {
+        let reference = normalize_media_reference(&normalized_step.file_id);
+        if let Some(file_unique_id) = media_reference_aliases.get(&reference) {
+            normalized_step.file_id.clone_from(file_unique_id);
+        }
+    }
+    let mut value = serde_json::to_value(normalized_step).unwrap_or(Value::Null);
+    normalize_semantic_tool_value(&mut value, None);
+    format!(
+        "{trigger_message_id}:{}",
+        serde_json::to_string(&value).unwrap_or_default()
+    )
+}
+
+fn remember_media_reference_alias(
+    aliases: &mut BTreeMap<String, String>,
+    step: &ToolStep,
+    result: &ToolResult,
+) {
+    if step.step != STEP_UNDERSTAND_MEDIA {
+        return;
+    }
+    let Some(file_unique_id) = result
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("file_unique_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    aliases.insert(
+        normalize_media_reference(&step.file_id),
+        file_unique_id.to_owned(),
+    );
+    aliases.insert(
+        normalize_media_reference(file_unique_id),
+        file_unique_id.to_owned(),
+    );
+}
+
+fn normalize_media_reference(value: &str) -> String {
+    value.trim().replace("\\_", "_")
+}
+
+fn normalize_semantic_tool_value(value: &mut Value, key: Option<&str>) {
+    match value {
+        Value::String(text) => {
+            *text = if key == Some("file_id") {
+                normalize_media_reference(text)
+            } else {
+                text.trim().to_owned()
+            };
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_semantic_tool_value(value, None);
+            }
+        }
+        Value::Object(values) => {
+            let mut sorted = BTreeMap::new();
+            for (key, mut value) in std::mem::take(values) {
+                normalize_semantic_tool_value(&mut value, Some(&key));
+                sorted.insert(key, value);
+            }
+            values.extend(sorted);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn reused_tool_result(cached: &ToolResult, original_call_id: &str) -> ToolResult {
+    let mut result = cached.clone();
+    let mut data = match result.data.take() {
+        Some(Value::Object(data)) => data,
+        Some(value) => serde_json::Map::from_iter([("result".to_owned(), value)]),
+        None => serde_json::Map::new(),
+    };
+    data.insert("reused".to_owned(), Value::Bool(true));
+    data.insert(
+        "reused_from_call_id".to_owned(),
+        Value::String(original_call_id.to_owned()),
+    );
+    result.data = Some(Value::Object(data));
+    result
+}
+
 struct SessionToolExecution<'a, 'b> {
     call: &'a ChatStepToolCall,
     cfg: &'a SessionTurnConfig<'b>,
     meta: &'a ToolContext,
     params: &'a openplotva_taskman::DialogJobParams,
+    causation_update_id: Option<i64>,
     budget: &'a mut SessionBudget,
     sent: &'a mut SentLog,
     draws_scheduled: &'a mut i32,
@@ -874,6 +997,7 @@ where
                 effects,
                 queue,
                 item_id,
+                exec.causation_update_id,
                 exec.sent,
                 exec.cfg.max_messages,
                 &sanitized,
@@ -970,6 +1094,7 @@ async fn try_send_intermediate<Effects, Queue>(
     effects: &Effects,
     queue: &Queue,
     item_id: i64,
+    causation_update_id: Option<i64>,
     sent: &mut SentLog,
     max_messages: i32,
     sanitized: &str,
@@ -994,7 +1119,14 @@ where
     let first_send = !sent.any();
     let seq = sent.intermediate_count + 1;
     match effects
-        .send_dialog_intermediate(item_id, params, sanitized, seq, first_send)
+        .send_dialog_intermediate(
+            item_id,
+            causation_update_id,
+            params,
+            sanitized,
+            seq,
+            first_send,
+        )
         .await
     {
         Ok(()) => {

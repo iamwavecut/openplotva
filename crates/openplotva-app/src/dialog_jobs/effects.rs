@@ -108,6 +108,7 @@ pub trait DialogJobEffects {
     fn send_dialog_intermediate<'a>(
         &'a self,
         dialog_job_id: i64,
+        causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -308,6 +309,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
     fn send_dialog_intermediate<'a>(
         &'a self,
         dialog_job_id: i64,
+        causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -329,6 +331,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 enqueue_durable_dialog_intermediate(
                     outbox,
                     dialog_job_id,
+                    causation_update_id,
                     params,
                     text,
                     seq,
@@ -402,6 +405,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
 async fn enqueue_durable_dialog_intermediate(
     outbox: &DurableDialogOutbox,
     dialog_job_id: i64,
+    causation_update_id: Option<i64>,
     params: &DialogJobParams,
     text: &str,
     seq: u32,
@@ -451,32 +455,44 @@ async fn enqueue_durable_dialog_intermediate(
             expires_at: None,
         });
     }
-    outbox
-        .store
-        .enqueue_batch(&TelegramOutboxBatchInput {
-            batch_id: format!(
-                "dialog-intermediate:v1:{}:{dialog_job_id}:{seq}",
-                outbox.bot_id
-            ),
-            bot_id: outbox.bot_id,
-            chat_id: Some(params.chat_id),
-            thread_id: params.thread_id,
-            ordering_key: format!(
-                "dialog:{}:{}:{}",
-                outbox.bot_id,
-                params.chat_id,
-                params.thread_id.unwrap_or_default()
-            ),
-            causation_update_id: None,
-            dialog_job_id: None,
-            trigger_message_id: Some(i64::from(params.message_id)),
-            delivery_policy: TelegramDeliveryPolicy::Create,
-            protected: true,
-            priority: 0,
-            parts,
-        })
-        .await?;
+    let batch = dialog_intermediate_outbox_batch(
+        outbox.bot_id,
+        dialog_job_id,
+        causation_update_id,
+        params,
+        seq,
+        parts,
+    );
+    outbox.store.enqueue_batch(&batch).await?;
     Ok(())
+}
+
+fn dialog_intermediate_outbox_batch(
+    bot_id: i64,
+    dialog_job_id: i64,
+    causation_update_id: Option<i64>,
+    params: &DialogJobParams,
+    seq: u32,
+    parts: Vec<TelegramOutboxPartInput>,
+) -> TelegramOutboxBatchInput {
+    TelegramOutboxBatchInput {
+        batch_id: format!("dialog-intermediate:v1:{bot_id}:{dialog_job_id}:{seq}"),
+        bot_id,
+        chat_id: Some(params.chat_id),
+        thread_id: params.thread_id,
+        ordering_key: format!(
+            "dialog:{bot_id}:{}:{}",
+            params.chat_id,
+            params.thread_id.unwrap_or_default()
+        ),
+        causation_update_id,
+        dialog_job_id: Some(dialog_job_id),
+        trigger_message_id: Some(i64::from(params.message_id)),
+        delivery_policy: TelegramDeliveryPolicy::Create,
+        protected: true,
+        priority: 0,
+        parts,
+    }
 }
 
 fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {
@@ -569,4 +585,31 @@ async fn enqueue_durable_dialog_answer(
             .collect(),
         delivery_complete,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intermediate_outbox_carries_dialog_causation_and_ordering() {
+        let params = DialogJobParams {
+            chat_id: -100,
+            thread_id: Some(7),
+            message_id: 11,
+            user_id: 42,
+            user_full_name: "Ada".to_owned(),
+            message_text: "hello".to_owned(),
+            original_text: String::new(),
+            meta: serde_json::Value::Null,
+            max_output_tokens: 0,
+        };
+        let batch = dialog_intermediate_outbox_batch(42, 123, Some(456), &params, 2, Vec::new());
+
+        assert_eq!(batch.batch_id, "dialog-intermediate:v1:42:123:2");
+        assert_eq!(batch.ordering_key, "dialog:42:-100:7");
+        assert_eq!(batch.dialog_job_id, Some(123));
+        assert_eq!(batch.causation_update_id, Some(456));
+        assert_eq!(batch.trigger_message_id, Some(11));
+    }
 }

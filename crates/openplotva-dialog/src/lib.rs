@@ -336,7 +336,7 @@ pub trait DialogToolbox: Send + Sync {
         unsupported_tool_future(STEP_GENERATE_SONG)
     }
 
-    /// Understand an image or video attachment.
+    /// Understand a supported visual, video, voice, or audio attachment.
     fn understand_media<'a>(&'a self, _req: VisionRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future(STEP_UNDERSTAND_MEDIA)
     }
@@ -539,7 +539,7 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
     required: false,
-    description: "Image, animation, video, or video-note attachment handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. For video media the tool analyzes the visuals and transcribes spoken audio in the same call. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment. If Telegram refuses to download an oversized file, the result explicitly reports that permanent limitation and must not be retried.",
+    description: "Supported image, raster/video sticker, animation, video, video-note, voice, audio, or MIME-typed document handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. Video media returns visual analysis and spoken-audio transcription together; voice and audio return transcription without visual decoding. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment. Oversized files rejected by Telegram and unsupported media are permanent errors and must not be retried.",
 }];
 
 const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
@@ -638,9 +638,9 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     },
     ToolSpec {
         name: STEP_UNDERSTAND_MEDIA,
-        summary: "Understand visual media and spoken audio from chat context.",
-        when_to_use: "Use when the latest user message asks about an image, animation, video, or video note, including what is shown and what is said.",
-        result: "Returns the visual description and, for video media, the spoken-audio transcript together. Media without a decodable audio track is reported explicitly without failing the visual result. If either modality fails, returns its explicit partial-result error. Telegram's permanent oversized-file download limit is non-retryable and should be explained to the user.",
+        summary: "Understand supported visual media, voice, and audio from chat context.",
+        when_to_use: "Use when the latest user message asks about an image, supported sticker, animation, video, video note, voice, audio, or media document, including what is shown or what is said.",
+        result: "Returns visual description for images and video, transcription for voice and audio, and both together for video. A missing audio track is an explicit note rather than a visual failure. Partial modality failures, unsupported media, missing references, and Telegram's permanent oversized-file download limit are returned with stable retryability.",
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {
@@ -1040,44 +1040,218 @@ pub fn sanitize_tool_text(value: &str) -> String {
 
 #[must_use]
 pub fn sanitize_final_text(value: &str) -> String {
-    let cleaned = sanitize_tool_text(value);
-    if has_leading_plain_context_message(&cleaned) {
-        return String::new();
-    }
-    let stripped = strip_leading_context_messages(&cleaned);
-    if !stripped.trim().is_empty() {
-        return stripped;
-    }
-    recover_from_assistant_envelope(&cleaned).unwrap_or(stripped)
+    sanitize_assistant_text(value).text
 }
 
-fn recover_from_assistant_envelope(value: &str) -> Option<String> {
-    let cleaned = value.trim();
-    if !cleaned.starts_with("<assistant_message") {
-        return None;
+/// Provider-visible assistant text after known reasoning and message protocol
+/// scaffolding has been removed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SanitizedAssistantText {
+    /// Text that may be shown to the user.
+    pub text: String,
+    /// Whether known model protocol scaffolding was removed.
+    pub removed_scaffolding: bool,
+    /// Whether an ambiguous protocol fragment remained.
+    pub residual_protocol: bool,
+}
+
+/// Extract only user-visible assistant text. This deliberately recognizes a
+/// small protocol vocabulary instead of treating arbitrary HTML as model
+/// metadata.
+#[must_use]
+pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return SanitizedAssistantText::default();
     }
-    let close_tag = "</assistant_message>";
-    let end = cleaned.find(close_tag)?;
-    let envelope_end = end + close_tag.len();
-    if !cleaned[envelope_end..].trim().is_empty() {
-        return None;
+    let decoded = unescape_xmlish(raw);
+    let original = if decoded.trim() != raw && starts_with_known_protocol(decoded.trim()) {
+        decoded.trim()
+    } else {
+        raw
+    };
+
+    let channel_stripped = strip_reasoning_channels(original);
+    let mut cleaned = channel_stripped.trim().to_owned();
+    let mut removed = cleaned != original;
+
+    while let Some((rest, did_remove, malformed)) = strip_one_leading_reasoning_block(&cleaned) {
+        removed |= did_remove;
+        if malformed {
+            return SanitizedAssistantText {
+                removed_scaffolding: true,
+                residual_protocol: true,
+                ..SanitizedAssistantText::default()
+            };
+        }
+        cleaned = rest;
     }
-    let inner = &cleaned[..end];
-    let open_tag = "<text>";
-    let last_text_open = inner.rfind(open_tag)?;
-    let body = &inner[last_text_open + open_tag.len()..];
-    let close = body.find("</text>")?;
-    let answer = body[..close].trim();
-    (!answer.is_empty()).then(|| answer.to_owned())
+
+    if cleaned.is_empty() || has_leading_plain_context_message(&cleaned) {
+        return SanitizedAssistantText {
+            removed_scaffolding: removed || !original.is_empty(),
+            ..SanitizedAssistantText::default()
+        };
+    }
+
+    let (without_context, context_removed, context_malformed) =
+        strip_leading_user_context_envelopes(&cleaned);
+    removed |= context_removed;
+    if context_malformed {
+        return SanitizedAssistantText {
+            removed_scaffolding: true,
+            residual_protocol: true,
+            ..SanitizedAssistantText::default()
+        };
+    }
+    cleaned = without_context;
+
+    if starts_with_message_scaffolding(&cleaned) {
+        let text = extract_protocol_text_bodies(&cleaned);
+        return SanitizedAssistantText {
+            residual_protocol: text.is_none(),
+            text: text.unwrap_or_default(),
+            removed_scaffolding: true,
+        };
+    }
+
+    let cleaned = sanitize_tool_text(&cleaned);
+    let residual_protocol = reply_has_residual_leak(&cleaned);
+    SanitizedAssistantText {
+        text: if residual_protocol {
+            String::new()
+        } else {
+            cleaned
+        },
+        removed_scaffolding: removed,
+        residual_protocol,
+    }
+}
+
+fn starts_with_known_protocol(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    [
+        "<|channel",
+        "<channel|",
+        "<type:",
+        "<tool_call",
+        "<|tool_call",
+    ]
+    .into_iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || [
+            "thought",
+            "analysis",
+            "eigen_thought",
+            "message",
+            "last_message",
+            "chat_context",
+            "reference_context",
+            "assistant_message",
+            "reply",
+            "assistant",
+            "message_type",
+            "text",
+        ]
+        .into_iter()
+        .any(|tag| starts_with_xml_tag(&lower, tag))
+}
+
+fn strip_one_leading_reasoning_block(value: &str) -> Option<(String, bool, bool)> {
+    let trimmed = value.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let tag = ["thought", "analysis", "eigen_thought"]
+        .into_iter()
+        .find(|tag| starts_with_xml_tag(&lower, tag))?;
+    let open_end = trimmed.find('>')? + 1;
+    let close = format!("</{tag}>");
+    let Some(close_start) = lower[open_end..].find(&close).map(|idx| open_end + idx) else {
+        return Some((String::new(), true, true));
+    };
+    let rest = trimmed[close_start + close.len()..].trim_start().to_owned();
+    Some((rest, true, false))
+}
+
+fn strip_leading_user_context_envelopes(value: &str) -> (String, bool, bool) {
+    let mut cleaned = value.trim().to_owned();
+    let mut removed = false;
+    loop {
+        let lower = cleaned.to_ascii_lowercase();
+        let tag = if starts_with_xml_tag(&lower, "message") {
+            "message"
+        } else if starts_with_xml_tag(&lower, "last_message") {
+            "last_message"
+        } else if starts_with_xml_tag(&lower, "chat_context") {
+            "chat_context"
+        } else if starts_with_xml_tag(&lower, "reference_context") {
+            "reference_context"
+        } else {
+            return (cleaned, removed, false);
+        };
+        let close = format!("</{tag}>");
+        let Some(end) = lower.find(&close) else {
+            return (String::new(), true, true);
+        };
+        cleaned = cleaned[end + close.len()..].trim_start().to_owned();
+        removed = true;
+    }
+}
+
+fn starts_with_xml_tag(value: &str, tag: &str) -> bool {
+    let prefix = format!("<{tag}");
+    let Some(rest) = value.strip_prefix(&prefix) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '>' | '/') || ch.is_whitespace())
+}
+
+fn starts_with_message_scaffolding(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    [
+        "assistant_message",
+        "reply",
+        "assistant",
+        "message_type",
+        "text",
+    ]
+    .into_iter()
+    .any(|tag| starts_with_xml_tag(&lower, tag))
+}
+
+fn extract_protocol_text_bodies(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let mut from = 0;
+    let mut bodies = Vec::new();
+    while let Some(relative_open) = lower[from..].find("<text>") {
+        let body_start = from + relative_open + "<text>".len();
+        if let Some(relative_close) = lower[body_start..].find("</text>") {
+            let body_end = body_start + relative_close;
+            let body = value[body_start..body_end].trim();
+            if !body.is_empty() {
+                bodies.push(body.to_owned());
+            }
+            from = body_end + "</text>".len();
+            continue;
+        }
+        let body = value[body_start..].trim();
+        if !body.is_empty() && !body.contains('<') {
+            bodies.push(body.to_owned());
+        }
+        break;
+    }
+    (!bodies.is_empty()).then(|| bodies.join("\n\n"))
 }
 
 #[must_use]
 pub fn has_leading_context_message(value: &str) -> bool {
     let cleaned = sanitize_tool_text(value);
     let cleaned = cleaned.trim();
-    has_prefix_fold(cleaned, "<message")
-        || has_prefix_fold(cleaned, "<assistant_message")
-        || has_prefix_fold(cleaned, "<last_message")
+    let lower = cleaned.to_ascii_lowercase();
+    starts_with_xml_tag(&lower, "message")
+        || starts_with_xml_tag(&lower, "assistant_message")
+        || starts_with_xml_tag(&lower, "last_message")
         || has_leading_plain_context_message(cleaned)
 }
 
@@ -1085,25 +1259,6 @@ fn has_leading_plain_context_message(value: &str) -> bool {
     let cleaned = value.trim();
     has_prefix_fold(cleaned, "previous bot message")
         || has_prefix_fold(cleaned, "предыдущая реплика")
-}
-
-fn strip_leading_context_messages(value: &str) -> String {
-    let mut cleaned = value.trim();
-    loop {
-        let end_tag = if cleaned.starts_with("<message") {
-            "</message>"
-        } else if cleaned.starts_with("<assistant_message") {
-            "</assistant_message>"
-        } else if cleaned.starts_with("<last_message") {
-            "</last_message>"
-        } else {
-            return cleaned.to_owned();
-        };
-        let Some(end) = cleaned.find(end_tag) else {
-            return String::new();
-        };
-        cleaned = cleaned[end + end_tag.len()..].trim();
-    }
 }
 
 // Harmony/channel framing (qwen3.6, Gemma variants) labels its reasoning channel
@@ -1130,10 +1285,18 @@ const REPLY_LEAK_MARKERS: &[&str] = &[
     "relevant memory (read-only",
     "<message id=",
     "<last_message",
-    "<assistant_message",
+    "<type:",
 ];
 
-const LEADING_REASONING_MARKUP: &[&str] = &["<thought", "<analysis", "<type:"];
+const REPLY_LEAK_TAGS: &[&str] = &[
+    "thought",
+    "analysis",
+    "eigen_thought",
+    "assistant_message",
+    "reply",
+    "assistant",
+    "message_type",
+];
 
 #[must_use]
 pub fn strip_reasoning_channels(content: &str) -> String {
@@ -1184,6 +1347,9 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
     REPLY_LEAK_MARKERS
         .iter()
         .any(|marker| lower.starts_with(marker))
+        || REPLY_LEAK_TAGS
+            .iter()
+            .any(|tag| starts_with_xml_tag(&lower, tag))
 }
 
 fn is_cyrillic(ch: char) -> bool {
@@ -1261,18 +1427,14 @@ pub fn finalize_dialog_reply(content: &str) -> DialogReplyOutcome {
     if content.trim().is_empty() {
         return DialogReplyOutcome::Suppressed(DialogReplySuppression::Empty);
     }
-    let lower = content.trim_start().to_lowercase();
-    if LEADING_REASONING_MARKUP
-        .iter()
-        .any(|marker| lower.starts_with(marker))
-    {
-        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
-    }
-    let recovered = strip_reasoning_channels(content);
-    let answer = sanitize_final_text(&recovered);
+    let sanitized = sanitize_assistant_text(content);
+    let answer = sanitized.text;
     if answer.trim().is_empty() {
-        if has_leading_context_message(&recovered) || has_leading_context_message(content) {
+        if has_leading_context_message(content) {
             return DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak);
+        }
+        if sanitized.residual_protocol {
+            return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
         }
         return DialogReplyOutcome::Suppressed(DialogReplySuppression::ProtocolOnly);
     }
@@ -1442,6 +1604,21 @@ pub struct ToolParseDecision {
     pub reason: String,
 }
 
+/// Typed interpretation of one assistant content string.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ParsedAssistantContent {
+    /// User-visible text after protocol sanitization.
+    pub text: String,
+    /// Ordered pseudo-tool calls recovered from the content channel.
+    pub tool_steps: Vec<ToolStep>,
+    /// Parser decision used for observability.
+    pub decision: ToolParseDecision,
+    /// Whether known reasoning or message scaffolding was removed.
+    pub removed_scaffolding: bool,
+    /// Whether ambiguous protocol markup remains.
+    pub residual_protocol: bool,
+}
+
 /// Tool parse error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolParseError {
@@ -1463,6 +1640,209 @@ impl fmt::Display for ToolParseError {
 }
 
 impl Error for ToolParseError {}
+
+/// Parse pseudo-tool calls before sanitizing the remaining assistant text.
+pub fn parse_assistant_content(
+    raw_content: &str,
+) -> Result<ParsedAssistantContent, ToolParseError> {
+    let (tool_steps, decision) = extract_content_tool_steps(raw_content)?;
+    let sanitized = if tool_steps.is_empty() {
+        sanitize_assistant_text(raw_content)
+    } else {
+        let Some(remainder) = content_without_pseudo_tool_calls(raw_content, &decision) else {
+            return Ok(ParsedAssistantContent {
+                tool_steps,
+                decision,
+                removed_scaffolding: true,
+                residual_protocol: true,
+                ..ParsedAssistantContent::default()
+            });
+        };
+        let mut sanitized = sanitize_assistant_text(&remainder);
+        sanitized.removed_scaffolding = true;
+        sanitized
+    };
+    Ok(ParsedAssistantContent {
+        text: sanitized.text,
+        tool_steps,
+        decision,
+        removed_scaffolding: sanitized.removed_scaffolding,
+        residual_protocol: sanitized.residual_protocol,
+    })
+}
+
+fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) -> Option<String> {
+    let decoded = unescape_xmlish(raw);
+    let content = if decision.form == "xmlish" && !raw.contains('<') && decoded.contains('<') {
+        decoded.as_str()
+    } else {
+        raw
+    };
+    match decision.form.as_str() {
+        "xmlish" => remove_xmlish_tool_protocol(content),
+        "inline" => remove_inline_tool_protocol(content),
+        "bare_start" | "bare_block" => remove_bare_tool_protocol(content),
+        "fenced" => remove_fenced_tool_protocol(content),
+        "json" => Some(String::new()),
+        "tool_prefix" | "function_args" | "colon_args" => {
+            remove_tool_protocol_line(content, &decision.tool)
+        }
+        _ => None,
+    }
+}
+
+fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = raw[offset..].find('<') {
+        let start = offset + relative_start;
+        if raw[start..].starts_with("</") {
+            offset = start + 2;
+            continue;
+        }
+        let relative_open_end = raw[start..].find('>')?;
+        let open_end = start + relative_open_end + 1;
+        let tag = &raw[start..open_end];
+        let name = xmlish_tool_tag_name(tag);
+        let recognized = matches!(name.as_str(), "tool" | "tool_call" | "tool_calls")
+            || name.starts_with("tool:")
+            || canonical_known_step(&name).is_some();
+        if !recognized {
+            offset = open_end;
+            continue;
+        }
+        if tag.trim_end().ends_with("/>")
+            || name.starts_with("tool:")
+            || canonical_known_step(&name)
+                .is_some_and(|step| xmlish_direct_tool_tag_has_args(tag, step))
+        {
+            spans.push((start, open_end));
+            offset = open_end;
+            continue;
+        }
+        let close = format!("</{name}>");
+        let relative_close = index_fold(&raw[open_end..], &close)?;
+        let end = open_end + relative_close + close.len();
+        spans.push((start, end));
+        offset = end;
+    }
+    (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
+}
+
+fn remove_inline_tool_protocol(raw: &str) -> Option<String> {
+    let (start, marker_len) = find_inline_tool_call_start(raw)?;
+    let call_start = start + marker_len;
+    let end = [
+        "<tool_call|>",
+        "</tool_call>",
+        "</|tool_call>",
+        "</|tool_call|>",
+    ]
+    .into_iter()
+    .filter_map(|marker| {
+        raw[call_start..]
+            .find(marker)
+            .map(|relative| call_start + relative + marker.len())
+    })
+    .min()
+    .unwrap_or(raw.len());
+    Some(remove_content_spans(raw, &[(start, end)]))
+}
+
+fn remove_bare_tool_protocol(raw: &str) -> Option<String> {
+    let start = usize::try_from(bare_tool_call_start(raw)).ok()?;
+    let open = raw[start..].find('{')? + start;
+    let end = matching_brace_end(raw, open)?;
+    Some(remove_content_spans(raw, &[(start, end)]))
+}
+
+fn matching_brace_end(raw: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, ch) in raw[open..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + relative + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn remove_fenced_tool_protocol(raw: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(relative_start) = raw[offset..].find("```") {
+        let start = offset + relative_start;
+        let header_end = raw[start + 3..].find(['\n', '\r'])? + start + 3;
+        let body_start = header_end + 1;
+        let relative_end = raw[body_start..].find("```")?;
+        let end = body_start + relative_end + 3;
+        if detect_tool_step_in(raw[body_start..body_start + relative_end].trim())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Some(remove_content_spans(raw, &[(start, end)]));
+        }
+        offset = end;
+    }
+    None
+}
+
+fn remove_tool_protocol_line(raw: &str, tool: &str) -> Option<String> {
+    let mut start = 0;
+    for line in raw.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if detect_tool_step_in(trimmed)
+            .ok()
+            .flatten()
+            .is_some_and(|(step, _)| step.step == tool)
+        {
+            return Some(remove_content_spans(raw, &[(start, start + line.len())]));
+        }
+        start += line.len();
+    }
+    None
+}
+
+fn remove_content_spans(raw: &str, spans: &[(usize, usize)]) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for &(start, end) in spans {
+        if start < cursor || end < start || end > raw.len() {
+            continue;
+        }
+        output.push_str(&raw[cursor..start]);
+        cursor = end;
+    }
+    output.push_str(&raw[cursor..]);
+    output.trim().to_owned()
+}
 
 pub fn parse_native_tool_step(calls: &[NativeToolCall]) -> Result<ToolStep, ToolParseError> {
     if calls.len() != 1 {
@@ -2673,14 +3053,14 @@ mod tests {
             Suppressed(ProtocolOnly)
         );
 
-        // Structural scaffolding that survives sanitization → suppressed.
+        // Closed known reasoning blocks are removed while their answer survives.
         assert_eq!(
             finalize_dialog_reply("<chat_context><reference_context>leaked</reference_context>"),
             Suppressed(ReasoningLeak)
         );
         assert_eq!(
             finalize_dialog_reply("<thought>сначала рассуждение</thought>\nОтвет"),
-            Suppressed(ReasoningLeak)
+            Reply("Ответ".to_owned())
         );
         assert_eq!(
             finalize_dialog_reply("<type:analysis>внутренний протокол\nОтвет"),
@@ -2703,6 +3083,41 @@ mod tests {
             Suppressed(ContextLeak)
         );
         assert_eq!(finalize_dialog_reply("   "), Suppressed(Empty));
+
+        // Exact production message envelope: only the text node is visible.
+        assert_eq!(
+            finalize_dialog_reply(
+                r#"<reply to_id="6877"><to_user>WaveCut</to_user></reply>
+<assistant id="6878">Плотва</assistant>
+<message_type>text</message_type>
+<text>Да, это уже нормальный ответ.</text>"#
+            ),
+            Reply("Да, это уже нормальный ответ.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "&lt;reply&gt;&lt;to_user&gt;Ada&lt;/to_user&gt;&lt;/reply&gt;\n&lt;message_type&gt;text&lt;/message_type&gt;\n&lt;text&gt;entity answer&lt;/text&gt;"
+            ),
+            Reply("entity answer".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "<message_type>text</message_type><text>first</text><text>second</text>"
+            ),
+            Reply("first\n\nsecond".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("<reply></reply><text>malformed but clear"),
+            Reply("malformed but clear".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("```xml\n<reply><to_user>Ada</to_user></reply>\n```"),
+            Reply("```xml\n<reply><to_user>Ada</to_user></reply>\n```".to_owned())
+        );
+        assert_eq!(
+            sanitize_assistant_text("<assistantship>fiction</assistantship>").text,
+            "<assistantship>fiction</assistantship>"
+        );
 
         // Degenerate loop → pathological.
         assert!(matches!(
@@ -3145,6 +3560,31 @@ mod tests {
         assert_eq!(steps[0].text, "Так, сейчас гляну, что там за видео");
         assert_eq!(steps[1].step, STEP_UNDERSTAND_MEDIA);
         assert_eq!(steps[1].file_id, "message_1110901_video_1");
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_removes_only_recognized_tool_spans() -> Result<(), ToolParseError> {
+        let bare = parse_assistant_content(
+            "Сейчас проверю.\n\nunderstand_media{file_id:\"message_177154_image_1\"}",
+        )?;
+        assert_eq!(bare.text, "Сейчас проверю.");
+        assert_eq!(bare.tool_steps.len(), 1);
+        assert!(!bare.residual_protocol);
+
+        let xml = parse_assistant_content(
+            "<b>Проверяю</b><send_message><text>Уже смотрю</text></send_message><understand_media><file_id>message_1110901_video_1</file_id></understand_media>",
+        )?;
+        assert_eq!(xml.text, "<b>Проверяю</b>");
+        assert_eq!(xml.tool_steps.len(), 2);
+        assert!(!xml.residual_protocol);
+
+        let wrapper = parse_assistant_content(
+            "Секунду.<tool call=\"understand_media{file_id: 'message_1_video_1'}\"/>",
+        )?;
+        assert_eq!(wrapper.text, "Секунду.");
+        assert_eq!(wrapper.tool_steps.len(), 1);
+        assert!(!wrapper.residual_protocol);
         Ok(())
     }
 

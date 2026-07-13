@@ -1779,6 +1779,25 @@ pub fn build_history_text_entry(
     meta: ChatMessageMeta,
     bot_id: i64,
 ) -> Option<HistoryTextEntry> {
+    build_history_text_entry_with_text(
+        message,
+        &fetcher_message_text(message),
+        original_text,
+        meta,
+        bot_id,
+    )
+}
+
+/// Build a history entry with text recovered from the raw Telegram payload.
+/// This is needed for Bot API fields that the current typed client drops.
+#[must_use]
+pub fn build_history_text_entry_with_text(
+    message: &TelegramMessage,
+    text: &str,
+    original_text: &str,
+    meta: ChatMessageMeta,
+    bot_id: i64,
+) -> Option<HistoryTextEntry> {
     if message.chat.get_id() == 0 {
         return None;
     }
@@ -1788,8 +1807,7 @@ pub fn build_history_text_entry(
         return None;
     }
 
-    let text = fetcher_message_text(message);
-    let (text, original_text, meta) = normalize_history_text_payload(&text, original_text, meta);
+    let (text, original_text, meta) = normalize_history_text_payload(text, original_text, meta);
     if !history_text_entry_has_content(&text, &original_text, &meta) {
         return None;
     }

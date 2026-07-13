@@ -16,15 +16,16 @@ use carapax::types::{
     ChatMember as TelegramChatMember, ChatMemberUpdated as TelegramChatMemberUpdated,
     Update as TelegramUpdate, UpdateType as TelegramUpdateType,
 };
-use openplotva_core::{ChatMessageMeta, ChatState, UserState};
+use openplotva_core::{ChatAttachment, ChatMessageMeta, ChatState, UserState};
 use openplotva_storage::{
-    ClaimedTelegramUpdate, PostgresTelegramDeliveryStore, TelegramFileMetadataUpsert,
+    ClaimedTelegramUpdate, PostgresHistoryStore, PostgresTelegramDeliveryStore,
+    TelegramFileMetadataUpsert,
 };
 use openplotva_updates::{
     HistoryTextEntry, NoopUpdateStageTracker, UpdateConsumerConfig, UpdateProcessReport,
     UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
-    build_fetcher_message_context, build_history_text_entry, extract_update_state,
-    fetcher_message_text, should_skip_side_effects_at,
+    build_fetcher_message_context, build_history_text_entry, build_history_text_entry_with_text,
+    extract_update_state, fetcher_message_text, should_skip_side_effects_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -1197,6 +1198,22 @@ where
     };
     finish_tracked_stage(tracker, token, UpdateStage::Handle, outcome, started);
 
+    if matches!(&handled, Ok(Ok(())))
+        && let Some(caption) = raw_paid_media_caption(&claim.raw_payload)
+        && let Err(error) =
+            persist_paid_media_caption_history(delivery_store, &update, &caption, claim.bot_id)
+                .await
+    {
+        return transition_retry_or_dead_letter(
+            delivery_store,
+            claim,
+            "paid_media_history",
+            &error.to_string(),
+            lease_lost,
+        )
+        .await;
+    }
+
     let disposition = match handled {
         Ok(Ok(())) => UpdateDisposition::Handled,
         Ok(Err(error)) => {
@@ -1239,6 +1256,93 @@ fn decode_telegram_update_payload(raw_payload: &[u8]) -> Result<TelegramUpdate, 
     remove_legacy_forward_fields(&mut payload);
     prefer_sender_chat_in_messages(&mut payload);
     serde_json::from_value(payload)
+}
+
+fn raw_paid_media_caption(raw_payload: &[u8]) -> Option<String> {
+    let payload: serde_json::Value = serde_json::from_slice(raw_payload).ok()?;
+    [
+        "message",
+        "channel_post",
+        "edited_message",
+        "edited_channel_post",
+    ]
+    .into_iter()
+    .filter_map(|field| payload.get(field))
+    .find(|message| message.get("paid_media").is_some())?
+    .get("caption")?
+    .as_str()
+    .map(str::trim)
+    .filter(|caption| !caption.is_empty())
+    .map(str::to_owned)
+}
+
+async fn persist_paid_media_caption_history(
+    delivery_store: &PostgresTelegramDeliveryStore,
+    update: &TelegramUpdate,
+    caption: &str,
+    bot_id: i64,
+) -> Result<(), openplotva_storage::StorageError> {
+    let message = match &update.update_type {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::ChannelPost(message) => message,
+        _ => return Ok(()),
+    };
+    let mut context = build_fetcher_message_context(message);
+    restore_paid_media_context(&mut context.meta, caption);
+    let Some(mut entry) = build_history_text_entry_with_text(
+        message,
+        caption,
+        &context.original_text,
+        context.meta,
+        bot_id,
+    ) else {
+        return Ok(());
+    };
+    restore_paid_media_attachment_caption(&mut entry, caption);
+    PostgresHistoryStore::new(delivery_store.pool().clone())
+        .upsert_inbound_history(inbound_history_upsert(&entry))
+        .await
+}
+
+fn restore_paid_media_context(meta: &mut ChatMessageMeta, caption: &str) {
+    let mut restored_attachment = false;
+    for attachment in &mut meta.attachments {
+        if attachment.kind == "paid_media" && attachment.source == "message" {
+            attachment.caption = caption.to_owned();
+            restored_attachment = true;
+        }
+    }
+    if !restored_attachment {
+        meta.attachments.push(ChatAttachment {
+            kind: "paid_media".to_owned(),
+            source: "message".to_owned(),
+            caption: caption.to_owned(),
+            content: "Telegram paid media attachment".to_owned(),
+            ..ChatAttachment::default()
+        });
+    }
+    if matches!(meta.message_type.trim(), "" | "text") {
+        meta.message_type = "paid_media".to_owned();
+    }
+}
+
+fn restore_paid_media_attachment_caption(entry: &mut HistoryTextEntry, caption: &str) {
+    if let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&entry.payload) {
+        if let Some(attachments) = payload
+            .get_mut("meta")
+            .and_then(|meta| meta.get_mut("attachments"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for attachment in attachments {
+                if attachment.get("kind").and_then(serde_json::Value::as_str) == Some("paid_media")
+                {
+                    attachment["caption"] = serde_json::Value::String(caption.to_owned());
+                }
+            }
+        }
+        if let Ok(encoded) = serde_json::to_vec(&payload) {
+            entry.payload = encoded;
+        }
+    }
 }
 
 fn remove_legacy_forward_fields(value: &mut serde_json::Value) {
@@ -1881,9 +1985,60 @@ mod tests {
         InboundHistoryStoreFuture, InboundHistoryUpsert, TelegramFileMetadataStoreFuture,
         UpdateHandler, UpdateHandlerFuture, UpdateHandlerWithHistory, UpdateSource,
         UpdateSourceBatchFuture, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
-        persist_update_state, process_update_with_state_and_history_store_at,
-        process_update_with_state_store_at, run_update_consumer_until,
+        decode_telegram_update_payload, persist_update_state,
+        process_update_with_state_and_history_store_at, process_update_with_state_store_at,
+        raw_paid_media_caption, restore_paid_media_attachment_caption, restore_paid_media_context,
+        run_update_consumer_until,
     };
+
+    #[test]
+    fn paid_media_caption_survives_typed_client_gap() -> Result<(), Box<dyn Error>> {
+        let raw = serde_json::to_vec(&json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 77,
+                "date": 1_700_000_000,
+                "chat": {"id": -100, "type": "supergroup", "title": "Chat"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Ada"},
+                "paid_media": {
+                    "star_count": 10,
+                    "paid_media": [{
+                        "type": "preview",
+                        "width": 640,
+                        "height": 480,
+                        "duration": 3
+                    }]
+                },
+                "caption": "paid caption"
+            }
+        }))?;
+        assert_eq!(
+            raw_paid_media_caption(&raw).as_deref(),
+            Some("paid caption")
+        );
+
+        let update = decode_telegram_update_payload(&raw)?;
+        let carapax::types::UpdateType::Message(message) = &update.update_type else {
+            return Err("expected message update".into());
+        };
+        let mut context = openplotva_updates::build_fetcher_message_context(message);
+        restore_paid_media_context(&mut context.meta, "paid caption");
+        let mut entry = openplotva_updates::build_history_text_entry_with_text(
+            message,
+            "paid caption",
+            &context.original_text,
+            context.meta,
+            -1,
+        )
+        .ok_or("expected paid-media history entry")?;
+        restore_paid_media_attachment_caption(&mut entry, "paid caption");
+        let payload: Value = serde_json::from_slice(&entry.payload)?;
+        assert_eq!(entry.entry_id, "msg:77");
+        assert_eq!(entry.role, "user");
+        assert_eq!(payload["text"], "paid caption");
+        assert_eq!(payload["meta"]["attachments"][0]["caption"], "paid caption");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn persist_update_state_writes_chat_before_user_like_go_consumer()

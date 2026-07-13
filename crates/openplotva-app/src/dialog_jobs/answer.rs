@@ -1,7 +1,9 @@
 //! Dialog answer preparation: sanitization, deliverability validation, rich
 //! detection, and the duplicate-reply guard.
 
-use openplotva_dialog::{DialogOutput, HistoryMessage, ROLE_MODEL, conversation_projection};
+use openplotva_dialog::{
+    DialogOutput, HistoryMessage, ROLE_MODEL, conversation_projection, sanitize_assistant_text,
+};
 use openplotva_telegram::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
     ensure_telegram_safe_text, sanitize_rich_html, sanitize_telegram_html,
@@ -21,7 +23,11 @@ pub fn dialog_job_answer(output: &DialogOutput) -> String {
 
 #[must_use]
 pub fn prepare_dialog_chat_response(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let protocol = sanitize_assistant_text(raw);
+    if protocol.residual_protocol {
+        return String::new();
+    }
+    let trimmed = protocol.text.trim();
     if trimmed.is_empty() {
         return String::new();
     }

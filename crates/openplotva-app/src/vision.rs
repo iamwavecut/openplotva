@@ -1232,36 +1232,155 @@ impl TelegramMediaDescriber {
     ) -> Self {
         Self { vision, asr, files }
     }
+
+    async fn resolve_attachment(
+        &self,
+        request: &VisionDescribeRequest,
+    ) -> Result<ChatAttachment, VisionDescribeError> {
+        if let Some(attachment) = request_media_attachment(request) {
+            return Ok(attachment);
+        }
+        let input = request.file_id.trim();
+        let record = if let Some(record) =
+            self.files
+                .get_file(input)
+                .await
+                .map_err(|error| VisionDescribeError::Storage {
+                    message: error.to_string(),
+                })? {
+            Some(record)
+        } else {
+            self.files
+                .get_file_by_latest_file_id(input)
+                .await
+                .map_err(|error| VisionDescribeError::Storage {
+                    message: error.to_string(),
+                })?
+        };
+        let Some(record) = record else {
+            return Err(VisionDescribeError::NotFound);
+        };
+        Ok(ChatAttachment {
+            kind: record.media_kind,
+            source: "message".to_owned(),
+            file_unique_id: record.file_unique_id,
+            file_id: record.latest_file_id,
+            mime_type: record.mime_type.unwrap_or_default(),
+            ..ChatAttachment::default()
+        })
+    }
+
+    async fn attach_transcript(
+        &self,
+        request: &VisionDescribeRequest,
+        mut attachment: ChatAttachment,
+        result: &mut VisionDescribeResult,
+    ) {
+        attachment.source = "message".to_owned();
+        let mut input = DialogInput::default();
+        input.context.chat_id = request.chat_id;
+        input.context.thread_id = request.thread_id;
+        input.message.id = request.message_id;
+        input.message.meta.attachments = vec![attachment];
+        let _ = self
+            .asr
+            .materialize_dialog_asr_input(input, OffsetDateTime::now_utc())
+            .await;
+
+        match self.files.get_file(&result.file_unique_id).await {
+            Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_COMPLETED => {
+                result.transcript = record.asr_text.unwrap_or_default().trim().to_owned();
+                if result.transcript.is_empty() {
+                    result.transcript_error = "ASR completed without transcript text".to_owned();
+                }
+            }
+            Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_FAILED => {
+                result.transcript_error = record
+                    .asr_error
+                    .unwrap_or_else(|| "ASR failed without diagnostic".to_owned());
+            }
+            Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE => {
+                result.transcript_note = asr_unavailable_note(&record);
+                result.download_unavailable |=
+                    telegram_download_unavailable_error(&result.transcript_note);
+            }
+            Ok(Some(record)) => {
+                result.transcript_error = format!(
+                    "ASR did not complete during media analysis (status={})",
+                    record.asr_status
+                );
+            }
+            Ok(None) => {
+                result.transcript_error =
+                    "Telegram media metadata disappeared during ASR".to_owned();
+            }
+            Err(error) => {
+                result.transcript_error = format!("load ASR result: {error}");
+            }
+        }
+        result.download_unavailable |= telegram_download_unavailable_error(&format!(
+            "{} {}",
+            result.transcript_note, result.transcript_error
+        ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaAnalysisRoute {
+    Visual,
+    Audio,
+    VisualAndAudio,
+    Unsupported,
+}
+
+fn media_analysis_route(attachment: &ChatAttachment) -> MediaAnalysisRoute {
+    let kind = attachment.kind.trim().to_ascii_lowercase();
+    let mime = attachment.mime_type.trim().to_ascii_lowercase();
+    if mime.starts_with("video/") || matches!(kind.as_str(), "video" | "video_note") {
+        return MediaAnalysisRoute::VisualAndAudio;
+    }
+    if mime.starts_with("audio/") || matches!(kind.as_str(), "voice" | "audio") {
+        return MediaAnalysisRoute::Audio;
+    }
+    if mime.starts_with("image/") || matches!(kind.as_str(), "image" | "photo" | "animation") {
+        return MediaAnalysisRoute::Visual;
+    }
+    MediaAnalysisRoute::Unsupported
 }
 
 impl VisionDescriber for TelegramMediaDescriber {
     fn describe_image<'a>(&'a self, request: VisionDescribeRequest) -> VisionImageFuture<'a> {
         Box::pin(async move {
+            let attachment = self
+                .resolve_attachment(&request)
+                .await
+                .map_err(|error| Box::new(error) as ToolboxError)?;
+            if attachment.file_unique_id.trim().is_empty() {
+                return Err(Box::new(VisionDescribeError::EmptyFileUniqueId) as ToolboxError);
+            }
+            let route = media_analysis_route(&attachment);
+            if route == MediaAnalysisRoute::Unsupported {
+                return Err(Box::new(VisionDescribeError::UnsupportedMedia {
+                    kind: attachment.kind.clone(),
+                    mime_type: attachment.mime_type.clone(),
+                }) as ToolboxError);
+            }
+            if route == MediaAnalysisRoute::Audio {
+                let mut result = VisionDescribeResult {
+                    media_kind: attachment.kind.trim().to_ascii_lowercase(),
+                    source: "asr".to_owned(),
+                    file_unique_id: attachment.file_unique_id.clone(),
+                    ..VisionDescribeResult::default()
+                };
+                self.attach_transcript(&request, attachment, &mut result)
+                    .await;
+                return Ok(result);
+            }
+
             let described = self.vision.describe_image(request.clone()).await;
-            let (mut result, mut attachment) = match described {
-                Ok(result) => {
-                    let attachment = request
-                        .message_meta
-                        .attachments
-                        .iter()
-                        .find(|attachment| attachment.file_unique_id == result.file_unique_id)
-                        .cloned()
-                        .unwrap_or_else(|| ChatAttachment {
-                            kind: result.media_kind.clone(),
-                            source: "message".to_owned(),
-                            file_unique_id: result.file_unique_id.clone(),
-                            ..ChatAttachment::default()
-                        });
-                    (result, attachment)
-                }
+            let (mut result, attachment) = match described {
+                Ok(result) => (result, attachment),
                 Err(error) if telegram_download_unavailable_error(&error.to_string()) => {
-                    let attachment =
-                        request_media_attachment(&request).unwrap_or_else(|| ChatAttachment {
-                            kind: "video".to_owned(),
-                            source: "message".to_owned(),
-                            file_unique_id: request.file_id.trim().to_owned(),
-                            ..ChatAttachment::default()
-                        });
                     let result = VisionDescribeResult {
                         visual_error: "файл превышает лимит скачивания Telegram Bot API".to_owned(),
                         download_unavailable: true,
@@ -1275,57 +1394,11 @@ impl VisionDescriber for TelegramMediaDescriber {
                 Err(error) => return Err(error),
             };
             result.media_kind = attachment.kind.trim().to_lowercase();
-            if !matches!(result.media_kind.as_str(), "video" | "video_note") {
+            if route != MediaAnalysisRoute::VisualAndAudio {
                 return Ok(result);
             }
-
-            attachment.source = "message".to_owned();
-            let mut input = DialogInput::default();
-            input.context.chat_id = request.chat_id;
-            input.context.thread_id = request.thread_id;
-            input.message.id = request.message_id;
-            input.message.meta.attachments = vec![attachment];
-            let _ = self
-                .asr
-                .materialize_dialog_asr_input(input, OffsetDateTime::now_utc())
+            self.attach_transcript(&request, attachment, &mut result)
                 .await;
-
-            match self.files.get_file(&result.file_unique_id).await {
-                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_COMPLETED => {
-                    result.transcript = record.asr_text.unwrap_or_default().trim().to_owned();
-                    if result.transcript.is_empty() {
-                        result.transcript_error =
-                            "ASR completed without transcript text".to_owned();
-                    }
-                }
-                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_FAILED => {
-                    result.transcript_error = record
-                        .asr_error
-                        .unwrap_or_else(|| "ASR failed without diagnostic".to_owned());
-                }
-                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE => {
-                    result.transcript_note = asr_unavailable_note(&record);
-                    result.download_unavailable |=
-                        telegram_download_unavailable_error(&result.transcript_note);
-                }
-                Ok(Some(record)) => {
-                    result.transcript_error = format!(
-                        "ASR did not complete during media analysis (status={})",
-                        record.asr_status
-                    );
-                }
-                Ok(None) => {
-                    result.transcript_error =
-                        "Telegram media metadata disappeared during ASR".to_owned();
-                }
-                Err(error) => {
-                    result.transcript_error = format!("load ASR result: {error}");
-                }
-            }
-            result.download_unavailable |= telegram_download_unavailable_error(&format!(
-                "{} {}",
-                result.transcript_note, result.transcript_error
-            ));
             Ok(result)
         })
     }
@@ -1372,6 +1445,9 @@ pub enum VisionDescribeError {
     /// Metadata row was not found.
     #[error("telegram file not found")]
     NotFound,
+    /// The resolved Telegram attachment cannot be analyzed by vision or ASR.
+    #[error("unsupported media kind {kind:?} with MIME type {mime_type:?}")]
+    UnsupportedMedia { kind: String, mime_type: String },
     /// Metadata row has no stable unique ID.
     #[error("file_unique_id is empty")]
     EmptyFileUniqueId,
@@ -1734,6 +1810,36 @@ mod tests {
         assert!(!telegram_download_unavailable_error(
             "vision provider temporarily unavailable"
         ));
+    }
+
+    #[test]
+    fn media_router_selects_modalities_before_decoding() {
+        let route = |kind: &str, mime: &str| {
+            media_analysis_route(&ChatAttachment {
+                kind: kind.to_owned(),
+                mime_type: mime.to_owned(),
+                ..ChatAttachment::default()
+            })
+        };
+        assert_eq!(route("image", "image/jpeg"), MediaAnalysisRoute::Visual);
+        assert_eq!(
+            route("video", "video/mp4"),
+            MediaAnalysisRoute::VisualAndAudio
+        );
+        assert_eq!(route("voice", "audio/ogg"), MediaAnalysisRoute::Audio);
+        assert_eq!(route("audio", "audio/mpeg"), MediaAnalysisRoute::Audio);
+        assert_eq!(
+            route("document", "video/webm"),
+            MediaAnalysisRoute::VisualAndAudio
+        );
+        assert_eq!(
+            route("sticker", "application/x-tgsticker"),
+            MediaAnalysisRoute::Unsupported
+        );
+        assert_eq!(
+            route("sticker", "application/octet-stream"),
+            MediaAnalysisRoute::Unsupported
+        );
     }
 
     #[tokio::test]

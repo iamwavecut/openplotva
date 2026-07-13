@@ -2361,10 +2361,7 @@ where
             };
             match describer.describe_image(request).await {
                 Ok(result) => Ok(dialog_understand_media_tool_result(&result)),
-                Err(error) => Ok(ToolResult::failed(
-                    "understand_media_failed",
-                    error.to_string(),
-                )),
+                Err(error) => Ok(dialog_understand_media_error(error)),
             }
         })
     }
@@ -2680,6 +2677,39 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
             },
             retryable: !result.download_unavailable,
         }),
+    }
+}
+
+fn dialog_understand_media_error(error: ToolboxError) -> ToolResult {
+    let reason = error.to_string();
+    let (code, retryable) = error
+        .downcast_ref::<crate::vision::VisionDescribeError>()
+        .map_or(("understand_media_failed", true), |error| match error {
+            crate::vision::VisionDescribeError::NotFound => ("media_ref_not_found", false),
+            crate::vision::VisionDescribeError::UnsupportedMedia { .. } => {
+                ("unsupported_media", false)
+            }
+            crate::vision::VisionDescribeError::EmptyFileId
+            | crate::vision::VisionDescribeError::EmptyFileUniqueId
+            | crate::vision::VisionDescribeError::EmptyLatestFileId => {
+                ("invalid_media_reference", false)
+            }
+            crate::vision::VisionDescribeError::CaptionPending
+            | crate::vision::VisionDescribeError::EmptyCaption
+            | crate::vision::VisionDescribeError::Storage { .. }
+            | crate::vision::VisionDescribeError::Caption { .. } => {
+                ("understand_media_failed", true)
+            }
+        });
+    ToolResult {
+        status: TOOL_RESULT_STATUS_FAILED.to_owned(),
+        message: reason.clone(),
+        error: Some(ToolError {
+            code: code.to_owned(),
+            reason,
+            retryable,
+        }),
+        ..ToolResult::default()
     }
 }
 
@@ -4330,6 +4360,35 @@ mod tests {
             Some(false)
         );
         Ok(())
+    }
+
+    #[test]
+    fn understand_media_classifies_permanent_reference_and_format_errors() {
+        let not_found =
+            dialog_understand_media_error(Box::new(crate::vision::VisionDescribeError::NotFound));
+        assert_eq!(
+            not_found.error,
+            Some(ToolError {
+                code: "media_ref_not_found".to_owned(),
+                reason: "telegram file not found".to_owned(),
+                retryable: false,
+            })
+        );
+
+        let unsupported = dialog_understand_media_error(Box::new(
+            crate::vision::VisionDescribeError::UnsupportedMedia {
+                kind: "sticker".to_owned(),
+                mime_type: "application/x-tgsticker".to_owned(),
+            },
+        ));
+        assert_eq!(
+            unsupported.error.as_ref().map(|error| error.code.as_str()),
+            Some("unsupported_media")
+        );
+        assert_eq!(
+            unsupported.error.as_ref().map(|error| error.retryable),
+            Some(false)
+        );
     }
 
     #[tokio::test]
