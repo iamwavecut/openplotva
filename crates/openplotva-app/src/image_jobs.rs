@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     future::Future,
+    io::Cursor,
     pin::Pin,
     sync::Arc,
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
@@ -88,6 +89,7 @@ pub const BOOGU_GRADIO_RESOLUTION_MODE: &str = "Recommended resolutions";
 
 const IMAGE_REGULAR_WORKER_ID: &str = "image-regular-worker";
 const IMAGE_VIP_WORKER_ID: &str = "image-vip-worker";
+const FLUX_WATERMARK_OPACITY: u16 = 51;
 const TELEGRAM_MEDIA_GROUP_MAX_ITEMS: usize = 10;
 const DRAW_CAPTION_WORD_THRESHOLD: usize = 25;
 const TELEGRAM_CAPTION_MAX_VISIBLE: usize = 1024;
@@ -741,11 +743,22 @@ where
         let payload = draw_api_payload(&prompt, &[], draw_api_dimensions(&request.aspect_ratio))
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let job_id = self.submit_draw_api_job(job_id, payload).await?;
-        let result = self.wait_draw_api_job(&job_id).await?;
+        let mut result = self.wait_draw_api_job(&job_id).await?;
         if result.images.is_empty() && result.urls.is_empty() {
             return Err(ImageGenerationError::Provider(
                 "job completed but produced no images".to_owned(),
             ));
+        }
+        if is_flux_generation_endpoint(&self.cfg.endpoint_name) {
+            if result.images.is_empty() {
+                return Err(ImageGenerationError::Provider(
+                    "Flux result did not include image bytes for watermark".to_owned(),
+                ));
+            }
+            for image in &mut result.images {
+                *image = add_flux_watermark(image).map_err(ImageGenerationError::Provider)?;
+            }
+            result.urls.clear();
         }
         Ok(ImageGenerationResult {
             image_url: result.urls.first().cloned().unwrap_or_default(),
@@ -905,6 +918,43 @@ where
             })?;
         draw_api_status_from_envelope(job_id, &envelope)
     }
+}
+
+fn add_flux_watermark(encoded: &[u8]) -> Result<Vec<u8>, String> {
+    let mut image = image::load_from_memory(encoded)
+        .map_err(|error| format!("decode Flux image for watermark: {error}"))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    if width < 2 || height < 2 {
+        return Err("Flux image is too small for watermark".to_owned());
+    }
+
+    for (x, y, color) in [
+        (width - 1, height - 1, [128, 128, 128]),
+        (width - 2, height - 1, [0, 0, 0]),
+        (width - 1, height - 2, [255, 255, 255]),
+    ] {
+        let pixel = image.get_pixel_mut(x, y);
+        for (channel, target) in pixel.0[..3].iter_mut().zip(color) {
+            *channel = blend_flux_watermark_channel(*channel, target);
+        }
+    }
+
+    let mut output = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|error| format!("encode watermarked Flux image: {error}"))?;
+    Ok(output.into_inner())
+}
+
+fn is_flux_generation_endpoint(endpoint_name: &str) -> bool {
+    endpoint_name.eq_ignore_ascii_case(AIFARM_DRAW_API_ENDPOINT_NAME)
+}
+
+fn blend_flux_watermark_channel(source: u8, target: u8) -> u8 {
+    let source = u16::from(source);
+    let target = u16::from(target);
+    ((source * (255 - FLUX_WATERMARK_OPACITY) + target * FLUX_WATERMARK_OPACITY + 127) / 255) as u8
 }
 
 impl<T> ImageGenerator for AifarmDrawApiImageGenerator<T>
@@ -4597,6 +4647,14 @@ mod tests {
 
     use super::*;
 
+    fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(width, height, color))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode test image");
+        encoded.into_inner()
+    }
+
     #[derive(Debug)]
     struct RecordingActivityEffects {
         report: crate::telegram_activity::TelegramActivityReport,
@@ -6708,6 +6766,44 @@ mod tests {
     }
 
     #[test]
+    fn flux_watermark_blends_only_the_three_corner_pixels_at_twenty_percent() {
+        let source = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 200]));
+
+        let marked = add_flux_watermark(&encode_solid_png(
+            source.width(),
+            source.height(),
+            image::Rgba([10, 20, 30, 200]),
+        ))
+        .expect("watermark image");
+        let marked = image::load_from_memory(&marked)
+            .expect("decode marked image")
+            .to_rgba8();
+
+        assert_eq!(marked.get_pixel(3, 3).0, [34, 42, 50, 200]);
+        assert_eq!(marked.get_pixel(2, 3).0, [8, 16, 24, 200]);
+        assert_eq!(marked.get_pixel(3, 2).0, [59, 67, 75, 200]);
+        assert_eq!(
+            source
+                .pixels()
+                .zip(marked.pixels())
+                .filter(|(before, after)| before != after)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn flux_watermark_is_limited_to_the_primary_generation_endpoint() {
+        assert!(is_flux_generation_endpoint(AIFARM_DRAW_API_ENDPOINT_NAME));
+        assert!(!is_flux_generation_endpoint(
+            AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME
+        ));
+        assert!(!is_flux_generation_endpoint(
+            AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME
+        ));
+    }
+
+    #[test]
     fn decode_draw_api_result_payload_accepts_go_shapes() {
         let image = general_purpose::STANDARD.encode([1_u8, 2, 3]);
         let images = decode_draw_api_result_payload(
@@ -6753,8 +6849,12 @@ mod tests {
 
     #[tokio::test]
     async fn aifarm_draw_api_generator_submits_go_shaped_job_and_polls_result() {
-        let draw_payload = serde_json::to_vec(&json!({"image_url": [" https://img.test/1.png "]}))
-            .expect("draw payload");
+        let source_image = encode_solid_png(4, 4, image::Rgba([10, 20, 30, 255]));
+        let draw_payload = serde_json::to_vec(&json!({
+            "image_b64": [general_purpose::STANDARD.encode(source_image)],
+            "image_url": [" https://img.test/1.png "]
+        }))
+        .expect("draw payload");
         let response_body = general_purpose::STANDARD.encode(draw_payload);
         let transport = AifarmTransportStub::new(vec![
             Ok(json_response(
@@ -6801,11 +6901,13 @@ mod tests {
             .await
             .expect("draw result");
 
-        assert_eq!(result.image_url, "https://img.test/1.png");
-        assert_eq!(
-            result.first_image_url().as_deref(),
-            Some("https://img.test/1.png")
-        );
+        assert!(result.image_url.is_empty());
+        assert!(result.image_urls.is_empty());
+        assert_eq!(result.image_bytes.len(), 1);
+        let marked = image::load_from_memory(&result.image_bytes[0])
+            .expect("decode marked result")
+            .to_rgba8();
+        assert_eq!(marked.get_pixel(3, 3).0, [34, 42, 50, 255]);
         let requests = probe.requests();
         assert_eq!(requests[0].method, AifarmHttpMethod::Post);
         assert_eq!(requests[0].url, "https://draw.example.test/v1/jobs");
