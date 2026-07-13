@@ -12,13 +12,13 @@ use openplotva_server::{
     RuntimeUpdatesTaskData,
 };
 use openplotva_updates::{
-    UPDATE_STALL_AGE, UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
-    extract_update_state, update_name,
+    UPDATE_CLAIM_TIMEOUT, UPDATE_STALL_AGE, UpdateStage, UpdateStageOutcome, UpdateStageReport,
+    UpdateStageTracker, extract_update_state, update_name,
 };
 use sqlx::{PgPool, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const UPDATE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const UPDATE_STALL_LOG_INTERVAL: Duration = UPDATE_CLAIM_TIMEOUT;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeUpdatesInspectorHandle {
