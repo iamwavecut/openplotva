@@ -601,6 +601,8 @@ pub struct DrawImageScheduleRequest {
     pub user_full_name: String,
     /// Sanitized image prompt.
     pub prompt: String,
+    /// Pre-resolved prompts that bypass prompt refinement.
+    pub prompt_variants: Vec<String>,
     /// Source message text.
     pub message_text: String,
     /// Message attachments copied from dialog metadata.
@@ -1254,6 +1256,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     prompt: base_prompt.clone(),
                     original_text: base_prompt,
                     meta,
+                    prompt_variants: request.prompt_variants,
                     negative_prompt: request.negative_prompt,
                     aspect_ratio: request.aspect_ratio,
                     seed: request.seed,
@@ -2299,6 +2302,7 @@ where
                 user_id: req.context.user_id,
                 user_full_name: req.context.user_full_name,
                 prompt: prompt.clone(),
+                prompt_variants: Vec::new(),
                 message_text: req.context.message_text,
                 attachments: req.context.message_meta.attachments,
                 edit_media_group_id: String::new(),
@@ -4107,6 +4111,7 @@ mod tests {
                 user_id: 42,
                 user_full_name: "Alice".to_owned(),
                 prompt: "neon castle".to_owned(),
+                prompt_variants: Vec::new(),
                 message_text: "$".to_owned(),
                 attachments: vec![attachment],
                 edit_media_group_id: String::new(),

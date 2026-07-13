@@ -5324,6 +5324,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimizing_image_generator_preserves_pre_resolved_prompt() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer = OptimizerStub::default();
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        );
+        let prompt = "cat seed:123 16:9 | blur";
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: prompt.to_owned(),
+                prompt_variants: vec![prompt.to_owned()],
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert!(optimizer.calls().is_empty());
+        assert_eq!(generator.requests()[0].prompt, prompt);
+        assert_eq!(generator.requests()[0].prompt_variants, [prompt]);
+    }
+
+    #[tokio::test]
     async fn optimizing_image_generator_extracts_prompt_modifiers_like_go_part_image_prompt() {
         let generator = GeneratorStub::success("https://img.test/1.png");
         let optimizer =
