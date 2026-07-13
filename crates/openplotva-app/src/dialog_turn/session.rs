@@ -166,7 +166,11 @@ fn normalize_sent_text(text: &str) -> String {
 /// `react_to_message` deliberately never enter the shared catalog constant —
 /// the legacy provider loop must not advertise tools it cannot execute.
 fn session_native_tools() -> Result<Vec<Value>, String> {
-    let mut specs = openplotva_dialog::alternative_dialog_tools();
+    let names = openplotva_dialog::alternative_dialog_tool_names();
+    let mut specs = openplotva_dialog::alternative_dialog_tools()
+        .into_iter()
+        .filter(|spec| names.contains(&spec.name))
+        .collect::<Vec<_>>();
     specs.push(SESSION_SEND_MESSAGE_SPEC);
     specs.push(SESSION_REACT_TO_MESSAGE_SPEC);
     chat_completion_tools_for_specs(&specs)
@@ -1444,4 +1448,22 @@ pub async fn run_captured_session(
         tool_calls: recorded,
         provider,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_native_tools_exclude_agent_only_tools() {
+        let tools = session_native_tools().expect("native tool schemas");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&openplotva_dialog::STEP_MEMORY_SEARCH));
+        assert!(names.contains(&STEP_SEND_MESSAGE));
+        assert!(names.contains(&STEP_REACT_TO_MESSAGE));
+    }
 }

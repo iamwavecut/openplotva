@@ -2319,9 +2319,11 @@ fn materialized_dialog_input_fills_go_context_settings_history_and_meta()
         enable_profanity: false,
         ..ChatSettings::defaults(params.chat_id)
     };
+    let canonical_message_at = now - TimeDuration::seconds(5);
     let history = vec![HistoryMessage {
         message_id: params.message_id,
         kind: MESSAGE_KIND_TEXT.to_owned(),
+        timestamp: Some(canonical_message_at),
         reply_to_id: 55,
         reply_to_name: "Bob".to_owned(),
         ..HistoryMessage::default()
@@ -2364,6 +2366,7 @@ fn materialized_dialog_input_fills_go_context_settings_history_and_meta()
     assert_eq!(input.persona.proactivity, 2);
     assert_eq!(input.message.reply_to_id, 55);
     assert_eq!(input.message.reply_to_name, "Bob");
+    assert_eq!(input.message.timestamp, Some(canonical_message_at));
     assert_eq!(input.message.meta.message_type, "image");
     assert_eq!(input.message.meta.sender_id, params.user_id);
     assert_eq!(input.message.meta.sender_name, "Ada");

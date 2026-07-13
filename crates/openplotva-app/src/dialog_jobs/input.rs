@@ -9,16 +9,17 @@ use openplotva_core::{
 };
 use openplotva_dialog::{
     CapturedMemory, DialogContext, DialogInput, DialogMessage, DialogUser, HistoryMessage,
-    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, Persona,
-    PersonaSnapshot, ROLE_MODEL, ROLE_TOOL, ROLE_USER, SettingKv, TurnContextArtifact,
+    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, MultimodalImage,
+    Persona, PersonaSnapshot, ROLE_MODEL, ROLE_TOOL, ROLE_USER, SettingKv, TurnContextArtifact,
     daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
     is_dialog_history_noise_tool_call_name,
 };
 use openplotva_memory::{CARD_STATUS_COMPETING, format_context as format_memory_context};
 use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchRequest};
 use openplotva_storage::{
-    DialogMemoryChatMeta, PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore,
-    PostgresMemoryStore, PostgresShieldStore, PostgresVirtualMessageStore,
+    DialogMemoryChatMeta, HistoryMessagePosition, PostgresChatMemberStore,
+    PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore, PostgresShieldStore,
+    PostgresVirtualMessageStore,
 };
 use openplotva_taskman::DialogJobParams;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -315,9 +316,11 @@ impl PostgresDialogInputMaterializer {
     ) -> Result<DialogInput, DialogInputMaterializationError> {
         let mut effective = params.clone();
         for _ in 0..3 {
-            let (canonical, revision) = self.load_canonical_trigger(&effective).await?;
-            let input = self.materialize_canonical(&canonical, now).await?;
-            let (_, current_revision) = self.load_canonical_trigger(&canonical).await?;
+            let (canonical, trigger_at, revision) = self.load_canonical_trigger(&effective).await?;
+            let input = self
+                .materialize_canonical(&canonical, trigger_at, now)
+                .await?;
+            let (_, _, current_revision) = self.load_canonical_trigger(&canonical).await?;
             if current_revision == revision {
                 return Ok(input);
             }
@@ -334,7 +337,7 @@ impl PostgresDialogInputMaterializer {
     async fn load_canonical_trigger(
         &self,
         scheduled: &DialogJobParams,
-    ) -> Result<(DialogJobParams, Vec<u8>), DialogInputMaterializationError> {
+    ) -> Result<(DialogJobParams, OffsetDateTime, Vec<u8>), DialogInputMaterializationError> {
         let payload = self
             .history
             .text_history_payload(scheduled.chat_id, scheduled.message_id)
@@ -357,6 +360,15 @@ impl PostgresDialogInputMaterializer {
                 ),
             }
         })?;
+        let trigger_at =
+            message
+                .timestamp
+                .ok_or_else(|| DialogInputMaterializationError::History {
+                    message: format!(
+                        "chat {} trigger {} has no canonical timestamp",
+                        scheduled.chat_id, scheduled.message_id
+                    ),
+                })?;
         let mut params = scheduled.clone();
         params.message_text = message.text;
         params.original_text = message.original_text;
@@ -364,12 +376,13 @@ impl PostgresDialogInputMaterializer {
         params.user_full_name = message.name;
         params.thread_id = (message.thread_id != 0).then_some(message.thread_id);
         params.meta = serde_json::to_value(message.meta).unwrap_or_default();
-        Ok((params, payload))
+        Ok((params, trigger_at, payload))
     }
 
     async fn materialize_canonical(
         &self,
         params: &DialogJobParams,
+        trigger_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<DialogInput, DialogInputMaterializationError> {
         let settings = self.load_settings(params.chat_id).await;
@@ -377,7 +390,7 @@ impl PostgresDialogInputMaterializer {
         self.ensure_trigger_sender_is_member(params, chat.as_ref())
             .await?;
         let user = self.load_user(params.user_id).await;
-        let history = self.load_history(params, now).await?;
+        let history = self.load_history(params, trigger_at, now).await?;
         let (reference_context, captured_memories) = self.load_reference_context(params).await;
         let shield_context = self.load_shield_context(params, &history).await;
         let mut input = dialog_input_from_materialized_context(
@@ -490,11 +503,7 @@ impl PostgresDialogInputMaterializer {
             input.history[index].original_text = media_input.message.original_text;
             input.history[index].meta = media_input.message.meta;
             for image in media_input.multimodal_images {
-                if input
-                    .multimodal_images
-                    .iter()
-                    .any(|existing| existing.label == image.label)
-                {
+                if multimodal_image_already_present(&input.multimodal_images, &image) {
                     continue;
                 }
                 input.multimodal_images.push(image);
@@ -569,6 +578,7 @@ impl PostgresDialogInputMaterializer {
     async fn load_history(
         &self,
         params: &DialogJobParams,
+        trigger_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Vec<HistoryMessage>, DialogInputMaterializationError> {
         if params.chat_id == 0 {
@@ -596,6 +606,10 @@ impl PostgresDialogInputMaterializer {
         let ttl_cutoff = now - DIALOG_HISTORY_TTL;
         let chat_cutoff = max_offset_datetime(ttl_cutoff, chat_reset_at);
         let thread_cutoff = max_offset_datetime(ttl_cutoff, thread_reset_at);
+        let trigger = HistoryMessagePosition {
+            occurred_at: trigger_at,
+            message_id: params.message_id,
+        };
 
         let mut chat_payloads = self
             .history
@@ -604,6 +618,7 @@ impl PostgresDialogInputMaterializer {
                 chat_cutoff,
                 thread_id,
                 thread_reset_at,
+                trigger,
                 DIALOG_HISTORY_FETCH_LIMIT,
             )
             .await
@@ -629,6 +644,7 @@ impl PostgresDialogInputMaterializer {
                     params.chat_id,
                     thread_id,
                     thread_cutoff,
+                    trigger,
                     DIALOG_HISTORY_FETCH_LIMIT,
                 )
                 .await
@@ -867,6 +883,14 @@ pub fn dialog_input_from_materialized_context(
         .unwrap_or_default();
     input.persona = dialog_persona(params.chat_id, now, settings, &bot.name);
     input.history = history;
+    if let Some(timestamp) = input
+        .history
+        .iter()
+        .find(|item| item.message_id == params.message_id && item.kind == MESSAGE_KIND_TEXT)
+        .and_then(|item| item.timestamp)
+    {
+        input.message.timestamp = Some(timestamp);
+    }
     let (reply_to_id, reply_to_name) =
         current_message_reply_context(&input.history, params.message_id);
     input.message.reply_to_id = reply_to_id;
@@ -1331,6 +1355,19 @@ fn history_message_key(message: &HistoryMessage) -> String {
     String::new()
 }
 
+fn multimodal_image_already_present(
+    existing: &[MultimodalImage],
+    candidate: &MultimodalImage,
+) -> bool {
+    let file_unique_id = candidate.file_unique_id.trim();
+    let data_url = candidate.data_url.trim();
+    existing.iter().any(|image| {
+        (!file_unique_id.is_empty() && image.file_unique_id.trim() == file_unique_id)
+            || (!data_url.is_empty() && image.data_url.trim() == data_url)
+            || image.label == candidate.label
+    })
+}
+
 fn max_offset_datetime(left: OffsetDateTime, right: OffsetDateTime) -> OffsetDateTime {
     left.max(right)
 }
@@ -1446,6 +1483,36 @@ mod context_artifact_tests {
         assert_eq!(canonical.user_full_name, "Current");
         assert_eq!(canonical.thread_id, Some(99));
         assert_eq!(canonical.max_output_tokens, 321);
+    }
+
+    #[test]
+    fn reply_media_deduplicates_stable_file_identity_across_prompt_labels() {
+        let existing = vec![MultimodalImage {
+            file_unique_id: "telegram-photo".to_owned(),
+            label: "quoted_image_1".to_owned(),
+            data_url: "data:image/jpeg;base64,one".to_owned(),
+            ..MultimodalImage::default()
+        }];
+        let same_file_from_reply_chain = MultimodalImage {
+            file_unique_id: "telegram-photo".to_owned(),
+            label: "message_41_image_1".to_owned(),
+            data_url: "data:image/jpeg;base64,two".to_owned(),
+            ..MultimodalImage::default()
+        };
+
+        assert!(multimodal_image_already_present(
+            &existing,
+            &same_file_from_reply_chain
+        ));
+        assert!(!multimodal_image_already_present(
+            &existing,
+            &MultimodalImage {
+                file_unique_id: "another-photo".to_owned(),
+                label: "message_42_image_1".to_owned(),
+                data_url: "data:image/jpeg;base64,other".to_owned(),
+                ..MultimodalImage::default()
+            }
+        ));
     }
 
     fn card(id: i64, salience: f64, competing: bool, fact: &str) -> Card {

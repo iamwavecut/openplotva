@@ -1148,6 +1148,7 @@ fn starts_with_known_protocol(value: &str) -> bool {
             "chat_context",
             "reference_context",
             "assistant_message",
+            "assistants_message",
             "reply",
             "assistant",
             "message_type",
@@ -1211,6 +1212,7 @@ fn starts_with_message_scaffolding(value: &str) -> bool {
     let lower = value.trim_start().to_ascii_lowercase();
     [
         "assistant_message",
+        "assistants_message",
         "reply",
         "assistant",
         "message_type",
@@ -1251,6 +1253,7 @@ pub fn has_leading_context_message(value: &str) -> bool {
     let lower = cleaned.to_ascii_lowercase();
     starts_with_xml_tag(&lower, "message")
         || starts_with_xml_tag(&lower, "assistant_message")
+        || starts_with_xml_tag(&lower, "assistants_message")
         || starts_with_xml_tag(&lower, "last_message")
         || has_leading_plain_context_message(cleaned)
 }
@@ -1293,6 +1296,7 @@ const REPLY_LEAK_TAGS: &[&str] = &[
     "analysis",
     "eigen_thought",
     "assistant_message",
+    "assistants_message",
     "reply",
     "assistant",
     "message_type",
@@ -3344,6 +3348,12 @@ mod tests {
                 r#"<assistant_message id="7"><meta>copied</meta><text>Ответ восстановлен.</text></assistant_message>"#
             ),
             "Ответ восстановлен."
+        );
+        assert_eq!(
+            sanitize_final_text(
+                r#"<assistants_message><text>Ответ из production-варианта.</text></assistants_message>"#
+            ),
+            "Ответ из production-варианта."
         );
 
         assert_eq!(
