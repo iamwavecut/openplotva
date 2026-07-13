@@ -750,9 +750,15 @@ where
             ));
         }
         if is_flux_generation_endpoint(&self.cfg.endpoint_name) {
+            if result.images.is_empty() {
+                return Err(ImageGenerationError::Provider(
+                    "Flux result did not include image bytes for watermark".to_owned(),
+                ));
+            }
             for image in &mut result.images {
                 *image = add_flux_watermark(image).map_err(ImageGenerationError::Provider)?;
             }
+            result.urls.clear();
         }
         Ok(ImageGenerationResult {
             image_url: result.urls.first().cloned().unwrap_or_default(),
@@ -4641,6 +4647,14 @@ mod tests {
 
     use super::*;
 
+    fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(width, height, color))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode test image");
+        encoded.into_inner()
+    }
+
     #[derive(Debug)]
     struct RecordingActivityEffects {
         report: crate::telegram_activity::TelegramActivityReport,
@@ -6754,12 +6768,13 @@ mod tests {
     #[test]
     fn flux_watermark_blends_only_the_three_corner_pixels_at_twenty_percent() {
         let source = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 200]));
-        let mut encoded = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(source.clone())
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .expect("encode source");
 
-        let marked = add_flux_watermark(encoded.get_ref()).expect("watermark image");
+        let marked = add_flux_watermark(&encode_solid_png(
+            source.width(),
+            source.height(),
+            image::Rgba([10, 20, 30, 200]),
+        ))
+        .expect("watermark image");
         let marked = image::load_from_memory(&marked)
             .expect("decode marked image")
             .to_rgba8();
@@ -6834,8 +6849,12 @@ mod tests {
 
     #[tokio::test]
     async fn aifarm_draw_api_generator_submits_go_shaped_job_and_polls_result() {
-        let draw_payload = serde_json::to_vec(&json!({"image_url": [" https://img.test/1.png "]}))
-            .expect("draw payload");
+        let source_image = encode_solid_png(4, 4, image::Rgba([10, 20, 30, 255]));
+        let draw_payload = serde_json::to_vec(&json!({
+            "image_b64": [general_purpose::STANDARD.encode(source_image)],
+            "image_url": [" https://img.test/1.png "]
+        }))
+        .expect("draw payload");
         let response_body = general_purpose::STANDARD.encode(draw_payload);
         let transport = AifarmTransportStub::new(vec![
             Ok(json_response(
@@ -6882,11 +6901,13 @@ mod tests {
             .await
             .expect("draw result");
 
-        assert_eq!(result.image_url, "https://img.test/1.png");
-        assert_eq!(
-            result.first_image_url().as_deref(),
-            Some("https://img.test/1.png")
-        );
+        assert!(result.image_url.is_empty());
+        assert!(result.image_urls.is_empty());
+        assert_eq!(result.image_bytes.len(), 1);
+        let marked = image::load_from_memory(&result.image_bytes[0])
+            .expect("decode marked result")
+            .to_rgba8();
+        assert_eq!(marked.get_pixel(3, 3).0, [34, 42, 50, 255]);
         let requests = probe.requests();
         assert_eq!(requests[0].method, AifarmHttpMethod::Post);
         assert_eq!(requests[0].url, "https://draw.example.test/v1/jobs");
