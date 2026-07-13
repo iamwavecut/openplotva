@@ -2072,6 +2072,7 @@ fn append_telegram_image_attachment(
             kind: "image".to_owned(),
             source: source.to_owned(),
             file_unique_id: ref_data.file_unique_id.clone(),
+            file_id: ref_data.file_id.clone(),
             caption: caption.to_owned(),
             ..ChatAttachment::default()
         });
@@ -2089,6 +2090,7 @@ fn append_telegram_file_attachments(
             kind: "video".to_owned(),
             source: source.to_owned(),
             file_unique_id: video.data.file_unique_id.clone(),
+            file_id: video.data.file_id.clone(),
             file_name: video.data.file_name.clone().unwrap_or_default(),
             mime_type: video.data.mime_type.clone().unwrap_or_default(),
             caption: caption.to_owned(),
@@ -2101,6 +2103,7 @@ fn append_telegram_file_attachments(
             kind: "animation".to_owned(),
             source: source.to_owned(),
             file_unique_id: animation.file_unique_id.clone(),
+            file_id: animation.file_id.clone(),
             file_name: animation.file_name.clone().unwrap_or_default(),
             mime_type: animation
                 .mime_type
@@ -2116,6 +2119,7 @@ fn append_telegram_file_attachments(
             kind: "video_note".to_owned(),
             source: source.to_owned(),
             file_unique_id: video_note.file_unique_id.clone(),
+            file_id: video_note.file_id.clone(),
             mime_type: "video/mp4".to_owned(),
             duration_seconds: video_note.duration,
             width: video_note.length,
@@ -2126,6 +2130,7 @@ fn append_telegram_file_attachments(
             kind: "audio".to_owned(),
             source: source.to_owned(),
             file_unique_id: audio.data.file_unique_id.clone(),
+            file_id: audio.data.file_id.clone(),
             file_name: audio.data.file_name.clone().unwrap_or_default(),
             mime_type: audio.data.mime_type.clone().unwrap_or_default(),
             caption: caption.to_owned(),
@@ -2138,6 +2143,7 @@ fn append_telegram_file_attachments(
             kind: "voice".to_owned(),
             source: source.to_owned(),
             file_unique_id: voice.data.file_unique_id.clone(),
+            file_id: voice.data.file_id.clone(),
             duration_seconds: voice.data.duration,
             ..ChatAttachment::default()
         }),
@@ -2153,6 +2159,7 @@ fn append_telegram_file_attachments(
             .to_owned(),
             source: source.to_owned(),
             file_unique_id: document.data.file_unique_id.clone(),
+            file_id: document.data.file_id.clone(),
             file_name: document.data.file_name.clone().unwrap_or_default(),
             mime_type: document.data.mime_type.clone().unwrap_or_default(),
             caption: caption.to_owned(),
@@ -2162,6 +2169,7 @@ fn append_telegram_file_attachments(
             kind: "sticker".to_owned(),
             source: source.to_owned(),
             file_unique_id: sticker.file_unique_id.clone(),
+            file_id: sticker.file_id.clone(),
             content: sticker.emoji.clone().unwrap_or_default(),
             ..ChatAttachment::default()
         }),
@@ -2266,6 +2274,7 @@ fn telegram_first_image_attachment(
             kind: "image".to_owned(),
             source: source.to_owned(),
             file_unique_id: ref_data.file_unique_id.clone(),
+            file_id: ref_data.file_id.clone(),
             caption: caption.to_owned(),
             ..ChatAttachment::default()
         }),
@@ -2279,6 +2288,7 @@ fn telegram_first_image_attachment(
                 kind: "image".to_owned(),
                 source: source.to_owned(),
                 file_unique_id: document.data.file_unique_id.clone(),
+                file_id: document.data.file_id.clone(),
                 mime_type: document.data.mime_type.clone().unwrap_or_default(),
                 caption: caption.to_owned(),
                 ..ChatAttachment::default()
@@ -2288,6 +2298,7 @@ fn telegram_first_image_attachment(
             kind: "image".to_owned(),
             source: source.to_owned(),
             file_unique_id: sticker.file_unique_id.clone(),
+            file_id: sticker.file_id.clone(),
             caption: caption.to_owned(),
             ..ChatAttachment::default()
         }),
@@ -4396,6 +4407,7 @@ mod tests {
                     kind: "image".to_owned(),
                     source: "message".to_owned(),
                     file_unique_id: "doc-image".to_owned(),
+                    file_id: "doc-file".to_owned(),
                     mime_type: "image/png".to_owned(),
                     caption: "diagram".to_owned(),
                     ..openplotva_core::ChatAttachment::default()
@@ -4404,6 +4416,7 @@ mod tests {
                     kind: "document".to_owned(),
                     source: "message".to_owned(),
                     file_unique_id: "doc-image".to_owned(),
+                    file_id: "doc-file".to_owned(),
                     file_name: "diagram.png".to_owned(),
                     mime_type: "image/png".to_owned(),
                     caption: "diagram".to_owned(),
@@ -4485,6 +4498,7 @@ mod tests {
                 kind: "sticker".to_owned(),
                 source: "message".to_owned(),
                 file_unique_id: "sticker-1".to_owned(),
+                file_id: "sticker-file".to_owned(),
                 content: "ok".to_owned(),
                 ..openplotva_core::ChatAttachment::default()
             }]
@@ -5353,6 +5367,7 @@ mod tests {
         assert_eq!(got.attachments[1].kind, "image");
         assert_eq!(got.attachments[1].source, "message");
         assert_eq!(got.attachments[1].file_unique_id, "photo-1");
+        assert_eq!(got.attachments[1].file_id, "photo-file");
         assert_eq!(got.attachments[1].caption, "photo caption");
 
         Ok(())

@@ -1052,6 +1052,9 @@ fn member_state_sync_job_from_update(
         {
             return None;
         }
+        if matches!(&update.chat, TelegramChat::Private(_)) {
+            return None;
+        }
         (
             ControlKind::ChatAdminsSync,
             "chat admins sync",
@@ -1751,6 +1754,40 @@ mod tests {
             jobs[0].data.control_data.as_ref().map(|data| data.kind),
             Some(ControlKind::ChatAdminsSync)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn own_private_member_state_does_not_queue_admin_sync() -> Result<(), Box<dyn Error>> {
+        let store = MemberStoreStub::default();
+        let queue = MemberStateControlJobQueueStub::default();
+        let effects = CommunicationEffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let mut update =
+            serde_json::to_value(chat_member_update("my_chat_member", 999, "member")?)?;
+        update["my_chat_member"]["chat"] = json!({
+            "id": 42,
+            "type": "private",
+            "first_name": "Private"
+        });
+
+        let route = handle_chat_member_state_update_or_else_at(
+            &store,
+            &queue,
+            &effects,
+            999,
+            serde_json::from_value(update)?,
+            fixed_time()?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        let ChatMemberStateUpdateRoute::MemberState(outcome) = route else {
+            return Err(format!("expected member-state route, got {route:?}").into());
+        };
+        assert!(outcome.own_member);
+        assert_eq!(outcome.queued_job, None);
+        assert!(queue.jobs().is_empty());
         Ok(())
     }
 

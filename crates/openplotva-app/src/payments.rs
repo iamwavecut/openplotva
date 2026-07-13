@@ -1470,11 +1470,15 @@ impl PersistentPaymentControlJobQueue {
 const PAYMENT_CONTROL_FLUSH_ATTEMPTS: u32 = 3;
 const PAYMENT_CONTROL_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Payment-flow control kinds that must never be dropped by enqueue rate limiting.
+/// Control kinds that must never be dropped by enqueue rate limiting.
 const fn control_kind_skips_task_enqueue_rate_limit(kind: ControlKind) -> bool {
     matches!(
         kind,
-        ControlKind::SuccessfulPayment | ControlKind::VipInvoice | ControlKind::DonateInvoice
+        ControlKind::SuccessfulPayment
+            | ControlKind::VipInvoice
+            | ControlKind::DonateInvoice
+            | ControlKind::ChatAdminsSync
+            | ControlKind::ChatMemberSync
     )
 }
 
@@ -1492,10 +1496,9 @@ impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
             let chat_id = params.chat_id;
             let user_id = params.user_id;
             let control_kind = params.data.kind;
-            // Payment-flow control jobs are exempt from enqueue throttling: dropping a
-            // user's /vip or /donate (or a SuccessfulPayment) on a rate limit would
-            // silently lose payment intent with no feedback. They are rare, deliberate
-            // actions, not the dialog burst the limiter targets.
+            // Payment and member-state control jobs are exempt from enqueue throttling:
+            // dropping them would silently lose durable payment intent or Telegram state.
+            // They are rare control-plane events, not the dialog burst the limiter targets.
             let rate_limit = if control_kind_skips_task_enqueue_rate_limit(control_kind) {
                 None
             } else {
@@ -12068,6 +12071,33 @@ mod tests {
         assert_eq!(queue.snapshot().len(), 1);
         assert!(limiter.check_calls().is_empty());
         assert!(limiter.grow_calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_control_queue_does_not_rate_limit_member_state_sync()
+    -> Result<(), Box<dyn Error>> {
+        for kind in [ControlKind::ChatAdminsSync, ControlKind::ChatMemberSync] {
+            let limiter = Arc::new(TaskEnqueueRateLimitStub::limited());
+            let queue =
+                super::PersistentPaymentControlJobQueue::from_task_queue(InMemoryTaskQueue::new())
+                    .with_task_enqueue_rate_limit(limiter.clone());
+            let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+            let job = new_control_job_at(sample_invoice_job(kind), created)
+                .with_name("member state sync")
+                .with_priority(HIGH_PRIORITY);
+
+            queue
+                .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+                .await?;
+
+            assert_eq!(queue.snapshot().len(), 1, "{kind:?} must be queued");
+            assert!(
+                limiter.check_calls().is_empty(),
+                "{kind:?} must skip the limiter"
+            );
+            assert!(limiter.grow_calls().is_empty());
+        }
         Ok(())
     }
 

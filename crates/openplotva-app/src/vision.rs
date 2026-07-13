@@ -17,8 +17,9 @@ use openplotva_storage::{
     PostgresHistoryStore, PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED,
     TELEGRAM_FILE_ASR_STATUS_FAILED, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE,
     TELEGRAM_FILE_VISION_REQUEST_TIMEOUT, TELEGRAM_FILE_VISION_STATUS_COMPLETED,
-    TELEGRAM_FILE_VISION_STATUS_FAILED, TELEGRAM_FILE_VISION_STATUS_PROCESSING, TelegramFileRecord,
-    TelegramFileVisionUpdate, VisionDescriptionUpdate,
+    TELEGRAM_FILE_VISION_STATUS_FAILED, TELEGRAM_FILE_VISION_STATUS_PROCESSING,
+    TelegramFileMetadataUpsert, TelegramFileRecord, TelegramFileVisionUpdate,
+    VisionDescriptionUpdate,
 };
 use openplotva_telegram::TelegramClient;
 use thiserror::Error;
@@ -85,6 +86,12 @@ pub trait TelegramFileVisionStore {
         latest_file_id: &'a str,
     ) -> TelegramFileLookupFuture<'a, Self::Error>;
 
+    /// Recreate metadata from canonical history when retention removed the cache row.
+    fn upsert_metadata<'a>(
+        &'a self,
+        params: &'a TelegramFileMetadataUpsert,
+    ) -> TelegramFileLookupFuture<'a, Self::Error>;
+
     /// Update Telegram file vision status/caption metadata.
     fn update_vision<'a>(
         &'a self,
@@ -110,6 +117,17 @@ impl TelegramFileVisionStore for PostgresTelegramFileStore {
             self,
             latest_file_id,
         ))
+    }
+
+    fn upsert_metadata<'a>(
+        &'a self,
+        params: &'a TelegramFileMetadataUpsert,
+    ) -> TelegramFileLookupFuture<'a, Self::Error> {
+        Box::pin(async move {
+            PostgresTelegramFileStore::upsert_metadata(self, params)
+                .await
+                .map(Some)
+        })
     }
 
     fn update_vision<'a>(
@@ -901,7 +919,53 @@ where
             }
         }
 
+        if let Some(record) = self.restore_file_from_history(request, input).await? {
+            return resolved_record(record);
+        }
+
         Err(VisionDescribeError::NotFound)
+    }
+
+    async fn restore_file_from_history(
+        &self,
+        request: &VisionDescribeRequest,
+        input: &str,
+    ) -> Result<Option<TelegramFileRecord>, VisionDescribeError> {
+        let aliases =
+            vision_attachment_file_id_candidates(input, request.message_id, &request.message_meta);
+        let attachment = request.message_meta.attachments.iter().find(|attachment| {
+            let unique_id = attachment.file_unique_id.trim();
+            !attachment.file_id.trim().is_empty()
+                && (unique_id == input || aliases.iter().any(|alias| alias.trim() == unique_id))
+        });
+        let Some(attachment) = attachment else {
+            return Ok(None);
+        };
+        let chat_id = (request.chat_id != 0).then_some(request.chat_id);
+        let message_id = (request.message_id != 0).then_some(i64::from(request.message_id));
+        self.store
+            .upsert_metadata(&TelegramFileMetadataUpsert {
+                file_unique_id: attachment.file_unique_id.trim().to_owned(),
+                latest_file_id: attachment.file_id.trim().to_owned(),
+                media_kind: attachment.kind.trim().to_owned(),
+                mime_type: (!attachment.mime_type.trim().is_empty())
+                    .then(|| attachment.mime_type.trim().to_owned()),
+                width: i32::try_from(attachment.width)
+                    .ok()
+                    .filter(|value| *value > 0),
+                height: i32::try_from(attachment.height)
+                    .ok()
+                    .filter(|value| *value > 0),
+                file_size: None,
+                first_seen_chat_id: chat_id,
+                first_seen_message_id: message_id,
+                last_seen_chat_id: chat_id,
+                last_seen_message_id: message_id,
+            })
+            .await
+            .map_err(|error| VisionDescribeError::Storage {
+                message: error.to_string(),
+            })
     }
 
     async fn lookup_file(
@@ -1052,12 +1116,20 @@ where
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        tracing::warn!(
-                            error = error.to_string(),
-                            file_unique_id = candidate.file_unique_id,
-                            label = candidate.label,
-                            "failed to materialize VLM vision caption"
-                        );
+                        if error == VisionDescribeError::NotFound {
+                            tracing::debug!(
+                                file_unique_id = candidate.file_unique_id,
+                                label = candidate.label,
+                                "VLM vision metadata is unavailable"
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = error.to_string(),
+                                file_unique_id = candidate.file_unique_id,
+                                label = candidate.label,
+                                "failed to materialize VLM vision caption"
+                            );
+                        }
                         continue;
                     }
                 };
@@ -1208,8 +1280,7 @@ impl VisionDescriber for TelegramMediaDescriber {
                         .unwrap_or_else(|| "ASR failed without diagnostic".to_owned());
                 }
                 Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE => {
-                    result.transcript_note =
-                        "В медиа нет доступной для распознавания аудиодорожки.".to_owned();
+                    result.transcript_note = asr_unavailable_note(&record);
                 }
                 Ok(Some(record)) => {
                     result.transcript_error = format!(
@@ -1347,6 +1418,21 @@ fn vision_describe_result(
         file_unique_id: record.file_unique_id.clone(),
         history_updated,
     }
+}
+
+fn asr_unavailable_note(record: &TelegramFileRecord) -> String {
+    let error = record
+        .asr_error
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if error.contains("empty transcript") {
+        return "Речь в аудиодорожке не обнаружена.".to_owned();
+    }
+    if error.contains("file is too big") || error.contains("exceeds 20 mib") {
+        return "Аудиодорожку нельзя распознать: файл превышает лимит Telegram Bot API.".to_owned();
+    }
+    "В медиа нет доступной для распознавания аудиодорожки.".to_owned()
 }
 
 pub fn telegram_vision_data_url_from_bytes(
@@ -1603,6 +1689,61 @@ mod tests {
         );
         assert!(captioner.calls().is_empty());
         assert!(store.updates().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vision_describer_restores_expired_metadata_from_canonical_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_time(1_710_000_000)?;
+        let store = FileStoreStub::default();
+        let captioner = CaptionerStub::successful("restored video", 0.5);
+        let service = TelegramVisionDescriber::new(store.clone(), captioner.clone());
+        let mut request = vision_request("message_77_image_1");
+        request.message_meta.attachments[0].kind = "video".to_owned();
+        request.message_meta.attachments[0].mime_type = "video/mp4".to_owned();
+        request.message_meta.attachments[0].file_id = "fresh-download-id".to_owned();
+
+        let result = service.describe_image_at(request, now).await?;
+
+        assert_eq!(result.caption, "restored video");
+        assert_eq!(result.file_unique_id, "photo-u");
+        assert_eq!(result.media_kind, "video");
+        assert_eq!(
+            captioner.calls(),
+            vec![TelegramVisionCaptionRequest {
+                file_unique_id: "photo-u".to_owned(),
+                latest_file_id: "fresh-download-id".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            }]
+        );
+        assert_eq!(store.updates().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_asr_note_preserves_terminal_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_time(1_710_000_000)?;
+        let mut record = file_record("video-u", "video-file", now);
+
+        record.asr_error = Some("empty transcript".to_owned());
+        assert_eq!(
+            asr_unavailable_note(&record),
+            "Речь в аудиодорожке не обнаружена."
+        );
+
+        record.asr_error = Some("Telegram getFile failed: file is too big".to_owned());
+        assert_eq!(
+            asr_unavailable_note(&record),
+            "Аудиодорожку нельзя распознать: файл превышает лимит Telegram Bot API."
+        );
+
+        record.asr_error = Some("no audio stream".to_owned());
+        assert_eq!(
+            asr_unavailable_note(&record),
+            "В медиа нет доступной для распознавания аудиодорожки."
+        );
         Ok(())
     }
 
@@ -2203,6 +2344,42 @@ mod tests {
                     .iter()
                     .find(|record| record.latest_file_id == latest_file_id)
                     .cloned())
+            })
+        }
+
+        fn upsert_metadata<'a>(
+            &'a self,
+            params: &'a TelegramFileMetadataUpsert,
+        ) -> TelegramFileLookupFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut records = self
+                    .records
+                    .lock()
+                    .map_err(|_| StubError("records poisoned".to_owned()))?;
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.file_unique_id == params.file_unique_id)
+                {
+                    record.latest_file_id.clone_from(&params.latest_file_id);
+                    return Ok(Some(record.clone()));
+                }
+                let now = OffsetDateTime::now_utc();
+                let mut record = file_record(
+                    params.file_unique_id.clone(),
+                    params.latest_file_id.clone(),
+                    now,
+                );
+                record.media_kind.clone_from(&params.media_kind);
+                record.mime_type.clone_from(&params.mime_type);
+                record.width = params.width;
+                record.height = params.height;
+                record.file_size = params.file_size;
+                record.first_seen_chat_id = params.first_seen_chat_id;
+                record.first_seen_message_id = params.first_seen_message_id;
+                record.last_seen_chat_id = params.last_seen_chat_id;
+                record.last_seen_message_id = params.last_seen_message_id;
+                records.push(record.clone());
+                Ok(Some(record))
             })
         }
 

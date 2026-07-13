@@ -277,6 +277,9 @@ pub struct ChatAttachment {
     /// Telegram stable file unique ID.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub file_unique_id: String,
+    /// Latest downloadable Telegram file ID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_id: String,
     /// Original file name, when Telegram provides it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub file_name: String,

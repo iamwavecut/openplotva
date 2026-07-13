@@ -464,7 +464,25 @@ where
 
             let (duplicate_message_id, duplicate) =
                 should_suppress_duplicate_bot_reply(&duplicate_guard_history, &sanitized);
-            if duplicate || sent.contains(&sanitized) {
+            if sent.contains(&sanitized) {
+                // A final round may repeat successful send_message content as confirmation.
+                // It terminates the turn without delivering the same Telegram text twice.
+                report.sent_answer = true;
+                if let Some(runs) = ctx.llm_runs {
+                    runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                }
+                let sent_now = ctx.now
+                    + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
+                append_session_sent_marker(queue, ctx.item_id, sent_now).await;
+                return TurnResolution {
+                    outcome: TurnOutcome::Sent {
+                        parts: sent.total_count,
+                        side_effect_tickets: ticket_ids(&side_effect_tickets),
+                    },
+                    disposition: JobDisposition::Complete,
+                };
+            }
+            if duplicate {
                 if regenerations < ctx.max_regenerations.max(0)
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
                 {
