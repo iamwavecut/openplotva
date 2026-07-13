@@ -825,9 +825,9 @@ pub const SQL_UPSERT_CHAT_HISTORY_RESET: &str = "INSERT INTO chat_history_resets
 pub const SQL_GET_CHAT_HISTORY_RESET_AT: &str =
     "SELECT reset_at FROM chat_history_resets WHERE chat_id = $1 AND thread_id = $2";
 
-pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $5";
+pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
 
-pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $4";
+pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
 
 pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id <> $4 OR occurred_at > $5) ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
 
@@ -4242,6 +4242,13 @@ pub struct HistoryEntryUpsert<'payload> {
     pub payload: &'payload [u8],
 }
 
+/// Inclusive causal upper bound for dialog-history tail queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryMessagePosition {
+    pub occurred_at: OffsetDateTime,
+    pub message_id: i32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HistoryToolEntryUpsert {
     /// UTC bucket day partition.
@@ -4601,6 +4608,7 @@ impl PostgresHistoryStore {
         cutoff: OffsetDateTime,
         thread_id: i32,
         thread_reset_at: OffsetDateTime,
+        trigger: HistoryMessagePosition,
         limit_count: i32,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         if chat_id == 0 {
@@ -4611,6 +4619,8 @@ impl PostgresHistoryStore {
             .bind(cutoff)
             .bind(thread_id)
             .bind(thread_reset_at)
+            .bind(trigger.occurred_at)
+            .bind(trigger.message_id)
             .bind(limit_count.max(1))
             .fetch_all(&self.pool)
             .await?;
@@ -4622,6 +4632,7 @@ impl PostgresHistoryStore {
         chat_id: i64,
         thread_id: i32,
         cutoff: OffsetDateTime,
+        trigger: HistoryMessagePosition,
         limit_count: i32,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         if chat_id == 0 || thread_id == 0 {
@@ -4631,6 +4642,8 @@ impl PostgresHistoryStore {
             .bind(chat_id)
             .bind(thread_id)
             .bind(cutoff)
+            .bind(trigger.occurred_at)
+            .bind(trigger.message_id)
             .bind(limit_count.max(1))
             .fetch_all(&self.pool)
             .await?;
@@ -11374,6 +11387,18 @@ mod tests {
         assert_eq!(
             super::SQL_ENSURE_CHAT_HISTORY_PARTITION,
             "SELECT ensure_chat_history_partition($1::date)"
+        );
+    }
+
+    #[test]
+    fn recent_history_queries_are_bounded_by_the_dialog_trigger() {
+        assert!(
+            super::SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS
+                .contains("occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)")
+        );
+        assert!(
+            super::SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS
+                .contains("occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)")
         );
     }
 

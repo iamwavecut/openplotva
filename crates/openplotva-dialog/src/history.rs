@@ -542,10 +542,22 @@ fn select_history_messages_filtered(
         return Vec::new();
     }
 
+    let trigger = turns
+        .iter()
+        .find(|turn| {
+            turn.message_id == exclude_message_id
+                && normalize_history_message_kind(turn) == MESSAGE_KIND_TEXT
+        })
+        .or_else(|| {
+            turns
+                .iter()
+                .find(|turn| turn.message_id == exclude_message_id)
+        });
     let mut seen = HashMap::<i32, usize>::new();
     let mut selected = Vec::<HistoryMessage>::with_capacity(limit);
     for turn in turns {
-        let Some(turn) = history_selection_candidate(turn, exclude_message_id, thread_filter)
+        let Some(turn) =
+            history_selection_candidate(turn, exclude_message_id, thread_filter, trigger)
         else {
             continue;
         };
@@ -567,11 +579,15 @@ fn history_selection_candidate(
     turn: &HistoryMessage,
     exclude_message_id: i32,
     thread_filter: Option<i32>,
+    trigger: Option<&HistoryMessage>,
 ) -> Option<HistoryMessage> {
     if turn.message_id == 0 || turn.message_id == exclude_message_id {
         return None;
     }
     if thread_filter.is_some_and(|thread_id| turn.thread_id != thread_id) {
+        return None;
+    }
+    if trigger.is_some_and(|trigger| history_message_is_after(turn, trigger)) {
         return None;
     }
     let mut turn = turn.clone();
@@ -581,6 +597,15 @@ fn history_selection_candidate(
         turn.original_text.clear();
     }
     history_message_has_context_content(&turn).then_some(turn)
+}
+
+fn history_message_is_after(message: &HistoryMessage, trigger: &HistoryMessage) -> bool {
+    if let (Some(message_at), Some(trigger_at)) = (message.timestamp, trigger.timestamp)
+        && message_at != trigger_at
+    {
+        return message_at > trigger_at;
+    }
+    message.message_id > trigger.message_id
 }
 
 fn should_include_reply_ancestors(selected: &[HistoryMessage], trigger_message_id: i32) -> bool {
@@ -910,6 +935,69 @@ mod tests {
         assert_eq!(
             got.iter().map(|turn| turn.message_id).collect::<Vec<_>>(),
             vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn select_history_messages_for_context_excludes_messages_after_trigger() {
+        let turns = vec![
+            HistoryMessage {
+                message_id: 12,
+                text: "arrived while trigger was debounced".to_owned(),
+                timestamp: ts(112),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 11,
+                text: "trigger".to_owned(),
+                timestamp: ts(111),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 10,
+                text: "prior context".to_owned(),
+                timestamp: ts(110),
+                ..HistoryMessage::default()
+            },
+        ];
+
+        let got = select_history_messages_for_context(&turns, 10, 11, 0);
+
+        assert_eq!(
+            got.iter().map(|turn| turn.message_id).collect::<Vec<_>>(),
+            vec![10],
+            "the model must never see post-trigger chat events before the current message"
+        );
+    }
+
+    #[test]
+    fn select_history_messages_for_context_uses_message_id_for_equal_timestamps() {
+        let turns = vec![
+            HistoryMessage {
+                message_id: 12,
+                text: "same-second future".to_owned(),
+                timestamp: ts(111),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 11,
+                text: "trigger".to_owned(),
+                timestamp: ts(111),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 10,
+                text: "same-second prior".to_owned(),
+                timestamp: ts(111),
+                ..HistoryMessage::default()
+            },
+        ];
+
+        let got = select_history_messages_for_context(&turns, 10, 11, 0);
+
+        assert_eq!(
+            got.iter().map(|turn| turn.message_id).collect::<Vec<_>>(),
+            vec![10]
         );
     }
 
