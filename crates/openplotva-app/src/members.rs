@@ -50,11 +50,13 @@ pub trait LeftChatMemberStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Delete one stored chat member.
-    fn delete_chat_member<'a>(
+    /// Persist the Telegram user row needed by the membership foreign key.
+    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error>;
+
+    /// Persist an explicit local `left` membership state.
+    fn upsert_chat_member<'a>(
         &'a self,
-        chat_id: i64,
-        user_id: i64,
+        member: ChatMemberUpsert,
     ) -> MemberStoreFuture<'a, (), Self::Error>;
 }
 
@@ -69,13 +71,6 @@ pub trait ChatMemberStateStore {
         user_id: i64,
     ) -> MemberStoreFuture<'a, Option<ChatMemberRecord>, Self::Error>;
 
-    /// Delete departed member state.
-    fn delete_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStoreFuture<'a, (), Self::Error>;
-
     /// Persist new member state.
     fn upsert_chat_member<'a>(
         &'a self,
@@ -89,12 +84,15 @@ pub trait ChatMemberStateStore {
 impl LeftChatMemberStore for openplotva_storage::PostgresChatMemberStore {
     type Error = openplotva_storage::StorageError;
 
-    fn delete_chat_member<'a>(
+    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_user_state(&user).await })
+    }
+
+    fn upsert_chat_member<'a>(
         &'a self,
-        chat_id: i64,
-        user_id: i64,
+        member: ChatMemberUpsert,
     ) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.delete_chat_member(chat_id, user_id).await })
+        Box::pin(async move { self.upsert_chat_member(&member).await })
     }
 }
 
@@ -107,14 +105,6 @@ impl ChatMemberStateStore for openplotva_storage::PostgresChatMemberStore {
         user_id: i64,
     ) -> MemberStoreFuture<'a, Option<ChatMemberRecord>, Self::Error> {
         Box::pin(async move { self.get_chat_member(chat_id, user_id).await })
-    }
-
-    fn delete_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.delete_chat_member(chat_id, user_id).await })
     }
 
     fn upsert_chat_member<'a>(
@@ -456,8 +446,10 @@ pub struct LeftChatMemberOutcome {
     pub user_id: i64,
     /// Whether the leaving user was the current bot.
     pub bot_left: bool,
-    /// Non-fatal delete error, if any.
-    pub delete_error: Option<String>,
+    pub user_upserted: bool,
+    pub member_upserted: bool,
+    pub user_upsert_error: Option<String>,
+    pub member_upsert_error: Option<String>,
     /// Non-fatal communication-disable error, if any.
     pub disable_error: Option<String>,
 }
@@ -472,8 +464,8 @@ pub struct ChatMemberStateOutcome {
     pub status: String,
     /// Whether the state update targeted the current bot.
     pub own_member: bool,
-    /// Whether a departed row was deleted instead of upserted.
-    pub deleted: bool,
+    /// Whether the observed state is explicitly inactive.
+    pub inactive: bool,
     /// Whether an active row was upserted.
     pub upserted: bool,
     /// Whether the user row needed by the member foreign key was upserted.
@@ -486,8 +478,6 @@ pub struct ChatMemberStateOutcome {
     pub queue_error: Option<String>,
     /// Non-fatal member load error, if any.
     pub load_error: Option<String>,
-    /// Non-fatal member delete error, if any.
-    pub delete_error: Option<String>,
     /// Non-fatal member upsert error, if any.
     pub upsert_error: Option<String>,
     /// Non-fatal user upsert error, if any.
@@ -795,18 +785,7 @@ where
     if status == openplotva_storage::CHAT_MEMBER_STATUS_LEFT
         || status == openplotva_storage::CHAT_MEMBER_STATUS_KICKED
     {
-        outcome.deleted = true;
-        if let Err(error) = ChatMemberStateStore::delete_chat_member(store, chat_id, user_id).await
-        {
-            let message = error.to_string();
-            tracing::debug!(
-                message,
-                chat_id,
-                user_id,
-                "failed to delete chat member on leave/kick"
-            );
-            outcome.delete_error = Some(message);
-        }
+        outcome.inactive = true;
         if own_member && let Err(error) = effects.disable_chat_communication(chat_id).await {
             let message = error.to_string();
             tracing::warn!(
@@ -817,7 +796,6 @@ where
             );
             outcome.communication_error = Some(message);
         }
-        return Some(outcome);
     }
 
     match store.get_chat_member(chat_id, user_id).await {
@@ -1123,6 +1101,7 @@ pub fn chat_member_state_upsert_from_telegram(
         chat_id,
         user_id,
         status: telegram_chat_member_status(member).to_owned(),
+        is_member: Some(member.is_member()),
         is_anonymous: Some(telegram_chat_member_is_anonymous(member)),
         can_be_edited: Some(false),
         ..ChatMemberUpsert::default()
@@ -1240,13 +1219,17 @@ where
     let UpdateType::Message(message) = &update.update_type else {
         return None;
     };
-    let (chat_id, user_id) = left_chat_member_ids(message)?;
+    let (chat_id, user) = left_chat_member_context(message)?;
+    let user_id = user.id.into();
     let bot_left = bot_id != 0 && user_id == bot_id;
     let mut outcome = LeftChatMemberOutcome {
         chat_id,
         user_id,
         bot_left,
-        delete_error: None,
+        user_upserted: false,
+        member_upserted: false,
+        user_upsert_error: None,
+        member_upsert_error: None,
         disable_error: None,
     };
 
@@ -1261,29 +1244,54 @@ where
         outcome.disable_error = Some(message);
     }
 
-    if let Err(error) = store.delete_chat_member(chat_id, user_id).await {
+    if let Err(error) = store
+        .upsert_user_state(user_state_from_telegram_user(user))
+        .await
+    {
         let message = error.to_string();
         tracing::warn!(
             message,
             chat_id,
             user_id,
-            "failed to delete left chat member"
+            "failed to persist departed Telegram user"
         );
-        outcome.delete_error = Some(message);
+        outcome.user_upsert_error = Some(message);
+    } else {
+        outcome.user_upserted = true;
+    }
+    let member = ChatMemberUpsert {
+        chat_id,
+        user_id,
+        status: openplotva_storage::CHAT_MEMBER_STATUS_LEFT.to_owned(),
+        is_member: Some(false),
+        is_anonymous: Some(false),
+        can_be_edited: Some(false),
+        ..ChatMemberUpsert::default()
+    };
+    if let Err(error) = store.upsert_chat_member(member).await {
+        let message = error.to_string();
+        tracing::warn!(
+            message,
+            chat_id,
+            user_id,
+            "failed to persist left chat member"
+        );
+        outcome.member_upsert_error = Some(message);
+    } else {
+        outcome.member_upserted = true;
     }
     Some(outcome)
 }
 
-fn left_chat_member_ids(message: &TelegramMessage) -> Option<(i64, i64)> {
+fn left_chat_member_context(message: &TelegramMessage) -> Option<(i64, &TelegramUser)> {
     let TelegramMessageData::LeftChatMember(user) = &message.data else {
         return None;
     };
     let chat_id = message.chat.get_id().into();
-    let user_id = user.id.into();
-    if chat_id == 0 || user_id == 0 {
+    if chat_id == 0 || user.id == 0 {
         return None;
     }
-    Some((chat_id, user_id))
+    Some((chat_id, user))
 }
 
 fn chat_communication_update(
@@ -1559,7 +1567,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn left_chat_member_update_deletes_member_then_delegates() -> Result<(), Box<dyn Error>> {
+    async fn left_chat_member_update_persists_inactive_member_then_delegates()
+    -> Result<(), Box<dyn Error>> {
         let store = MemberStoreStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
@@ -1579,7 +1588,10 @@ mod tests {
         assert_eq!(outcome.chat_id, -10042);
         assert_eq!(outcome.user_id, 7);
         assert!(!outcome.bot_left);
-        assert_eq!(store.deleted(), vec![(-10042, 7)]);
+        assert!(outcome.user_upserted);
+        assert!(outcome.member_upserted);
+        assert_eq!(store.users()[0].id, 7);
+        assert_eq!(store.upserted(), vec![member_upsert(-10042, 7, "left")]);
         assert!(effects.disabled().is_empty());
         assert_eq!(next.calls(), vec![12351]);
         Ok(())
@@ -1605,7 +1617,9 @@ mod tests {
         };
         assert!(outcome.bot_left);
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.deleted(), vec![(-10042, 999)]);
+        assert!(outcome.user_upserted);
+        assert!(outcome.member_upserted);
+        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         assert_eq!(next.calls(), vec![12351]);
         Ok(())
     }
@@ -1627,7 +1641,6 @@ mod tests {
         .await?;
 
         assert_eq!(route, LeftChatMemberUpdateRoute::Delegated);
-        assert!(store.deleted().is_empty());
         assert_eq!(next.calls(), vec![777]);
         Ok(())
     }
@@ -1647,7 +1660,7 @@ mod tests {
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.deleted(), vec![(-10042, 999)]);
+        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         Ok(())
     }
 
@@ -1692,7 +1705,6 @@ mod tests {
             )]
         );
         assert_eq!(store.upserted(), vec![member_upsert(-10042, 7, "member")]);
-        assert!(store.deleted().is_empty());
         assert!(effects.enabled().is_empty());
         assert!(effects.disabled().is_empty());
         assert_eq!(next.calls(), vec![2468]);
@@ -1792,7 +1804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn departed_own_member_state_deletes_and_disables_chat() -> Result<(), Box<dyn Error>> {
+    async fn departed_own_member_state_persists_and_disables_chat() -> Result<(), Box<dyn Error>> {
         let store = MemberStoreStub::default();
         let queue = MemberStateControlJobQueueStub::default();
         let effects = CommunicationEffectsStub::default();
@@ -1812,11 +1824,11 @@ mod tests {
         let ChatMemberStateUpdateRoute::MemberState(outcome) = route else {
             return Err(format!("expected member-state route, got {route:?}").into());
         };
-        assert!(outcome.deleted);
-        assert!(!outcome.upserted);
+        assert!(outcome.inactive);
+        assert!(outcome.upserted);
         assert_eq!(outcome.queued_job, None);
-        assert_eq!(store.deleted(), vec![(-10042, 999)]);
-        assert!(store.upserted().is_empty());
+        assert_eq!(store.upserted()[0].status, "left");
+        assert_eq!(store.upserted()[0].is_member, Some(false));
         assert_eq!(effects.disabled(), vec![-10042]);
         assert!(effects.enabled().is_empty());
         assert_eq!(queue.jobs(), Vec::<StatelessJobItem>::new());
@@ -1845,7 +1857,7 @@ mod tests {
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.deleted(), vec![(-10042, 999)]);
+        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         Ok(())
     }
 
@@ -1935,6 +1947,7 @@ mod tests {
             vec![
                 member_upsert(-10042, 7, "member"),
                 admin_member_state_upsert(-10042, 999),
+                member_upsert(-10042, 999, "left"),
             ]
         );
         assert_eq!(queue.jobs().len(), 2);
@@ -1948,7 +1961,6 @@ mod tests {
         );
         assert_eq!(effects.enabled(), vec![-10042]);
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.deleted(), vec![(-10042, 999)]);
         assert_eq!(terminal.calls(), Vec::<i64>::new());
         let state_calls = state_store.calls();
         assert_eq!(
@@ -2163,6 +2175,7 @@ mod tests {
             chat_id,
             user_id,
             status: status.to_owned(),
+            is_member: Some(!matches!(status, "left" | "kicked")),
             is_anonymous: Some(false),
             can_be_edited: Some(false),
             can_delete_messages: (status == "administrator").then_some(true),
@@ -2234,16 +2247,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct MemberStoreStub {
         current: Arc<Mutex<Vec<ChatMemberRecord>>>,
-        deleted: Arc<Mutex<Vec<(i64, i64)>>>,
         upserted: Arc<Mutex<Vec<ChatMemberUpsert>>>,
         users: Arc<Mutex<Vec<UserState>>>,
     }
 
     impl MemberStoreStub {
-        fn deleted(&self) -> Vec<(i64, i64)> {
-            self.deleted.lock().expect("member store").clone()
-        }
-
         fn upserted(&self) -> Vec<ChatMemberUpsert> {
             self.upserted.lock().expect("member store").clone()
         }
@@ -2256,16 +2264,22 @@ mod tests {
     impl LeftChatMemberStore for MemberStoreStub {
         type Error = StubError;
 
-        fn delete_chat_member<'a>(
+        fn upsert_user_state<'a>(
             &'a self,
-            chat_id: i64,
-            user_id: i64,
+            user: UserState,
         ) -> MemberStoreFuture<'a, (), Self::Error> {
             Box::pin(async move {
-                self.deleted
-                    .lock()
-                    .expect("member store")
-                    .push((chat_id, user_id));
+                self.users.lock().expect("member store").push(user);
+                Ok(())
+            })
+        }
+
+        fn upsert_chat_member<'a>(
+            &'a self,
+            member: ChatMemberUpsert,
+        ) -> MemberStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.upserted.lock().expect("member store").push(member);
                 Ok(())
             })
         }
@@ -2287,20 +2301,6 @@ mod tests {
                     .iter()
                     .find(|member| member.chat_id == chat_id && member.user_id == user_id)
                     .cloned())
-            })
-        }
-
-        fn delete_chat_member<'a>(
-            &'a self,
-            chat_id: i64,
-            user_id: i64,
-        ) -> MemberStoreFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.deleted
-                    .lock()
-                    .expect("member store")
-                    .push((chat_id, user_id));
-                Ok(())
             })
         }
 

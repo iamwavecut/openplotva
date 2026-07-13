@@ -85,15 +85,15 @@ pub fn go_skipped_update_name(update: &UpdateType) -> Option<&'static str> {
         UpdateType::ChatJoinRequest(_) => Some("chat_join_request"),
         UpdateType::MessageReaction(_) => Some("message_reaction"),
         UpdateType::MessageReactionCount(_) => Some("message_reaction_count"),
-        UpdateType::BusinessConnection(_)
-        | UpdateType::BusinessMessage(_)
-        | UpdateType::ChatBoostRemoved(_)
-        | UpdateType::ChatBoostUpdated(_)
-        | UpdateType::DeletedBusinessMessages(_)
-        | UpdateType::EditedBusinessMessage(_)
-        | UpdateType::ManagedBot(_)
-        | UpdateType::PurchasedPaidMedia(_)
-        | UpdateType::Unknown(_) => Some("unknown"),
+        UpdateType::BusinessConnection(_) => Some("business_connection"),
+        UpdateType::BusinessMessage(_) => Some("business_message"),
+        UpdateType::DeletedBusinessMessages(_) => Some("deleted_business_messages"),
+        UpdateType::EditedBusinessMessage(_) => Some("edited_business_message"),
+        UpdateType::ChatBoostRemoved(_) => Some("removed_chat_boost"),
+        UpdateType::ChatBoostUpdated(_) => Some("chat_boost"),
+        UpdateType::ManagedBot(_) => Some("managed_bot"),
+        UpdateType::PurchasedPaidMedia(_) => Some("purchased_paid_media"),
+        UpdateType::Unknown(_) => Some("unknown"),
         _ => None,
     }
 }
@@ -365,9 +365,9 @@ mod tests {
             ("unknown", unknown_update()?),
         ];
         cases.extend(
-            newer_go_unknown_update_cases()?
+            newer_go_skipped_update_cases()?
                 .into_iter()
-                .map(|(_, update)| ("unknown", update)),
+                .map(|(name, _, update)| (name, update)),
         );
         Ok(cases)
     }
@@ -435,26 +435,36 @@ mod tests {
             ("unknown", 211, "unknown", unknown_update()?),
         ];
         cases.extend(
-            newer_go_unknown_update_cases()?
+            newer_go_skipped_update_cases()?
                 .into_iter()
-                .map(|(update_id, update)| ("unknown", update_id, "unknown", update)),
+                .map(|(name, update_id, update)| (name, update_id, name, update)),
         );
         Ok(cases)
     }
 
-    fn newer_go_unknown_update_cases() -> Result<Vec<(i64, TelegramUpdate)>, serde_json::Error> {
+    fn newer_go_skipped_update_cases()
+    -> Result<Vec<(&'static str, i64, TelegramUpdate)>, serde_json::Error> {
         Ok(vec![
-            (214, business_connection_update()?),
-            (215, business_message_update("business_message", 215)?),
+            ("business_connection", 214, business_connection_update()?),
             (
+                "business_message",
+                215,
+                business_message_update("business_message", 215)?,
+            ),
+            (
+                "edited_business_message",
                 216,
                 business_message_update("edited_business_message", 216)?,
             ),
-            (217, deleted_business_messages_update()?),
-            (218, chat_boost_update()?),
-            (219, removed_chat_boost_update()?),
-            (220, managed_bot_update()?),
-            (221, purchased_paid_media_update()?),
+            (
+                "deleted_business_messages",
+                217,
+                deleted_business_messages_update()?,
+            ),
+            ("chat_boost", 218, chat_boost_update()?),
+            ("removed_chat_boost", 219, removed_chat_boost_update()?),
+            ("managed_bot", 220, managed_bot_update()?),
+            ("purchased_paid_media", 221, purchased_paid_media_update()?),
         ])
     }
 

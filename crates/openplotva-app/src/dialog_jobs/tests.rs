@@ -1738,6 +1738,54 @@ async fn dialog_worker_completes_content_blocked_provider_error() -> Result<(), 
 }
 
 #[tokio::test]
+async fn dialog_worker_silently_completes_departed_member_without_provider_call()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("spam"), now),
+    );
+    let provider = ProviderStub::returning(DialogOutput {
+        answer: "must not run".to_owned(),
+        ..DialogOutput::default()
+    });
+    let effects = EffectsStub::default();
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &DepartedMemberMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            queue_name: DIALOG_AIFARM_QUEUE_NAME,
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
+            now,
+            routing_events: None,
+            turn_outcomes: None,
+            session: leaked_session_wiring(),
+            llm_runs: None,
+            activity_pulse: None,
+        },
+    )
+    .await;
+
+    assert!(report.skipped_sender_not_member);
+    assert!(report.completed);
+    assert!(!report.failed);
+    assert!(provider.inputs().is_empty());
+    assert!(effects.sent().is_empty());
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn dialog_worker_marks_provider_and_send_errors_failed() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let provider_queue = InMemoryTaskQueue::new();
@@ -2857,6 +2905,24 @@ impl DialogToolCallHistoryStore for ToolHistoryStub {
 #[derive(Clone, Default)]
 struct MaterializerStub {
     history: Vec<HistoryMessage>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DepartedMemberMaterializer;
+
+impl DialogInputMaterializer for DepartedMemberMaterializer {
+    fn materialize_dialog_input<'a>(
+        &'a self,
+        params: &'a DialogJobParams,
+        _now: OffsetDateTime,
+    ) -> DialogInputMaterializerFuture<'a> {
+        Box::pin(async move {
+            Err(DialogInputMaterializationError::SenderNotMember {
+                chat_id: params.chat_id,
+                user_id: params.user_id,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Default)]

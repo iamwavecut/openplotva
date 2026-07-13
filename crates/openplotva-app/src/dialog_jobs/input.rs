@@ -17,8 +17,8 @@ use openplotva_dialog::{
 use openplotva_memory::{CARD_STATUS_COMPETING, format_context as format_memory_context};
 use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchRequest};
 use openplotva_storage::{
-    DialogMemoryChatMeta, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
-    PostgresShieldStore, PostgresVirtualMessageStore,
+    DialogMemoryChatMeta, PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore,
+    PostgresMemoryStore, PostgresShieldStore, PostgresVirtualMessageStore,
 };
 use openplotva_taskman::DialogJobParams;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -115,6 +115,7 @@ pub struct PostgresDialogInputMaterializer {
     settings: PostgresChatSettingsStore,
     identity: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,
+    members: PostgresChatMemberStore,
     memory: Option<PostgresMemoryStore>,
     memory_embedder: Option<Arc<dyn EmbeddingProvider>>,
     memory_embedding_dim: i32,
@@ -136,10 +137,12 @@ impl PostgresDialogInputMaterializer {
         history: PostgresHistoryStore,
         bot: DialogBotIdentity,
     ) -> Self {
+        let members = PostgresChatMemberStore::new(history.pool().clone());
         Self {
             settings,
             identity,
             history,
+            members,
             memory: None,
             memory_embedder: None,
             memory_embedding_dim: 0,
@@ -286,14 +289,93 @@ pub fn dialog_input_from_job_params_at(
     }
 }
 
+#[must_use]
+pub(crate) fn dialog_job_params_from_input(
+    scheduled: &DialogJobParams,
+    input: &DialogInput,
+) -> DialogJobParams {
+    DialogJobParams {
+        chat_id: input.context.chat_id,
+        message_id: input.message.id,
+        user_id: input.user.id,
+        user_full_name: input.user.full_name.clone(),
+        message_text: input.message.text.clone(),
+        original_text: input.message.original_text.clone(),
+        meta: serde_json::to_value(&input.message.meta).unwrap_or_default(),
+        max_output_tokens: scheduled.max_output_tokens,
+        thread_id: input.context.thread_id,
+    }
+}
+
 impl PostgresDialogInputMaterializer {
     async fn materialize(
         &self,
         params: &DialogJobParams,
         now: OffsetDateTime,
     ) -> Result<DialogInput, DialogInputMaterializationError> {
+        let mut effective = params.clone();
+        for _ in 0..3 {
+            let (canonical, revision) = self.load_canonical_trigger(&effective).await?;
+            let input = self.materialize_canonical(&canonical, now).await?;
+            let (_, current_revision) = self.load_canonical_trigger(&canonical).await?;
+            if current_revision == revision {
+                return Ok(input);
+            }
+            effective = canonical;
+        }
+        Err(DialogInputMaterializationError::History {
+            message: format!(
+                "trigger {}/{} changed repeatedly during materialization",
+                params.chat_id, params.message_id
+            ),
+        })
+    }
+
+    async fn load_canonical_trigger(
+        &self,
+        scheduled: &DialogJobParams,
+    ) -> Result<(DialogJobParams, Vec<u8>), DialogInputMaterializationError> {
+        let payload = self
+            .history
+            .text_history_payload(scheduled.chat_id, scheduled.message_id)
+            .await
+            .map_err(|error| DialogInputMaterializationError::History {
+                message: format!(
+                    "chat {} trigger {}: {error}",
+                    scheduled.chat_id, scheduled.message_id
+                ),
+            })?
+            .ok_or(DialogInputMaterializationError::TriggerMissing {
+                chat_id: scheduled.chat_id,
+                message_id: scheduled.message_id,
+            })?;
+        let message = history_message_from_payload(&payload, self.bot.id).ok_or_else(|| {
+            DialogInputMaterializationError::History {
+                message: format!(
+                    "chat {} trigger {} has an invalid text payload",
+                    scheduled.chat_id, scheduled.message_id
+                ),
+            }
+        })?;
+        let mut params = scheduled.clone();
+        params.message_text = message.text;
+        params.original_text = message.original_text;
+        params.user_id = message.user_id;
+        params.user_full_name = message.name;
+        params.thread_id = (message.thread_id != 0).then_some(message.thread_id);
+        params.meta = serde_json::to_value(message.meta).unwrap_or_default();
+        Ok((params, payload))
+    }
+
+    async fn materialize_canonical(
+        &self,
+        params: &DialogJobParams,
+        now: OffsetDateTime,
+    ) -> Result<DialogInput, DialogInputMaterializationError> {
         let settings = self.load_settings(params.chat_id).await;
         let chat = self.load_chat(params.chat_id).await;
+        self.ensure_trigger_sender_is_member(params, chat.as_ref())
+            .await?;
         let user = self.load_user(params.user_id).await;
         let history = self.load_history(params, now).await?;
         let (reference_context, captured_memories) = self.load_reference_context(params).await;
@@ -318,6 +400,37 @@ impl PostgresDialogInputMaterializer {
         self.materialize_reply_media(&mut input, now).await;
         input.context_capture = Some(turn_context_artifact(&input, &settings, captured_memories));
         Ok(input)
+    }
+
+    async fn ensure_trigger_sender_is_member(
+        &self,
+        params: &DialogJobParams,
+        chat: Option<&openplotva_core::ChatState>,
+    ) -> Result<(), DialogInputMaterializationError> {
+        let group_chat =
+            chat.is_some_and(|chat| matches!(chat.chat_type.trim(), "group" | "supergroup"));
+        let meta = dialog_meta_from_value(&params.meta);
+        if !group_chat || params.user_id == 0 || meta.sender_type != SENDER_TYPE_USER {
+            return Ok(());
+        }
+        let member = self
+            .members
+            .get_chat_member(params.chat_id, params.user_id)
+            .await
+            .map_err(|error| DialogInputMaterializationError::History {
+                message: format!(
+                    "chat {} sender {} membership: {error}",
+                    params.chat_id, params.user_id
+                ),
+            })?;
+        let inactive = member.as_ref().is_some_and(stored_member_is_inactive);
+        if inactive {
+            return Err(DialogInputMaterializationError::SenderNotMember {
+                chat_id: params.chat_id,
+                user_id: params.user_id,
+            });
+        }
+        Ok(())
     }
 
     async fn materialize_reply_media(&self, input: &mut DialogInput, now: OffsetDateTime) {
@@ -1276,10 +1389,64 @@ fn non_zero_i64(value: i64) -> Option<i64> {
     (value != 0).then_some(value)
 }
 
+fn stored_member_is_inactive(member: &openplotva_storage::ChatMemberRecord) -> bool {
+    member.is_member == Some(false) || matches!(member.status.as_str(), "left" | "kicked")
+}
+
 #[cfg(test)]
 mod context_artifact_tests {
     use super::*;
     use openplotva_memory::{Card, RetrievedMemory};
+
+    #[test]
+    fn membership_gate_distinguishes_unknown_restricted_and_departed_users() {
+        let member = |status: &str, is_member| openplotva_storage::ChatMemberRecord {
+            status: status.to_owned(),
+            is_member,
+            ..openplotva_storage::ChatMemberRecord::default()
+        };
+
+        assert!(!stored_member_is_inactive(&member("member", None)));
+        assert!(!stored_member_is_inactive(&member("member", Some(true))));
+        assert!(!stored_member_is_inactive(&member(
+            "restricted",
+            Some(true)
+        )));
+        assert!(stored_member_is_inactive(&member(
+            "restricted",
+            Some(false)
+        )));
+        assert!(stored_member_is_inactive(&member("left", None)));
+        assert!(stored_member_is_inactive(&member("kicked", Some(false))));
+    }
+
+    #[test]
+    fn canonical_input_replaces_stale_job_content_and_reply_target() {
+        let scheduled = DialogJobParams {
+            chat_id: -100,
+            message_id: 7,
+            user_id: 42,
+            user_full_name: "Old".to_owned(),
+            message_text: "old".to_owned(),
+            original_text: String::new(),
+            meta: serde_json::Value::Null,
+            max_output_tokens: 321,
+            thread_id: None,
+        };
+        let mut input = dialog_input_from_job_params_at(&scheduled, OffsetDateTime::UNIX_EPOCH);
+        input.user.full_name = "Current".to_owned();
+        input.message.text = "edited".to_owned();
+        input.message.original_text = "old".to_owned();
+        input.context.thread_id = Some(99);
+
+        let canonical = dialog_job_params_from_input(&scheduled, &input);
+
+        assert_eq!(canonical.message_text, "edited");
+        assert_eq!(canonical.original_text, "old");
+        assert_eq!(canonical.user_full_name, "Current");
+        assert_eq!(canonical.thread_id, Some(99));
+        assert_eq!(canonical.max_output_tokens, 321);
+    }
 
     fn card(id: i64, salience: f64, competing: bool, fact: &str) -> Card {
         Card {

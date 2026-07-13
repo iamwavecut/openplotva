@@ -2295,6 +2295,7 @@ where
             chat_id,
             user_id: member.id.into(),
             status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+            is_member: Some(true),
             is_anonymous: Some(false),
             can_be_edited: Some(false),
             ..ChatMemberUpsert::default()
@@ -3032,6 +3033,7 @@ pub fn chat_member_upsert_from_telegram(
         chat_id,
         user_id,
         status: telegram_chat_member_status(member).to_owned(),
+        is_member: Some(member.is_member()),
         is_anonymous: Some(telegram_chat_member_is_anonymous(member)),
         can_be_edited: Some(telegram_chat_member_can_be_edited(member)),
         ..ChatMemberUpsert::default()
@@ -3147,6 +3149,7 @@ pub fn admin_chat_member_upsert_from_telegram(
         chat_id,
         user_id: i64::from(user.id),
         status: status.to_owned(),
+        is_member: Some(true),
         is_anonymous: Some(is_anonymous),
         custom_title: Some(custom_title),
         can_be_edited: Some(false),

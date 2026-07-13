@@ -542,8 +542,9 @@ pub async fn persist_inbound_message_history<S>(
 where
     S: InboundHistoryStore + Sync,
 {
-    let TelegramUpdateType::Message(message) = &update.update_type else {
-        return Ok(InboundMessageHistoryReport::default());
+    let message = match &update.update_type {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::ChannelPost(message) => message,
+        _ => return Ok(InboundMessageHistoryReport::default()),
     };
     let Some(entry) = build_history_text_entry(message, original_text, meta, bot_id) else {
         return Ok(InboundMessageHistoryReport::default());
@@ -570,8 +571,10 @@ pub async fn persist_edited_message_history<S>(
 where
     S: EditedHistoryStore + Sync,
 {
-    let TelegramUpdateType::EditedMessage(message) = &update.update_type else {
-        return Ok(EditedMessageHistoryReport::default());
+    let message = match &update.update_type {
+        TelegramUpdateType::EditedMessage(message)
+        | TelegramUpdateType::EditedChannelPost(message) => message,
+        _ => return Ok(EditedMessageHistoryReport::default()),
     };
     let chat_id = message.chat.get_id().into();
     if chat_id == 0 {
@@ -600,7 +603,7 @@ where
     S: InboundHistoryStore + EditedHistoryStore + Sync,
 {
     match &update.update_type {
-        TelegramUpdateType::Message(message) => {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::ChannelPost(message) => {
             let context = build_fetcher_message_context(message);
             let report = persist_inbound_message_history(
                 store,
@@ -619,7 +622,8 @@ where
                 edited_entry_updated: false,
             })
         }
-        TelegramUpdateType::EditedMessage(message) => {
+        TelegramUpdateType::EditedMessage(message)
+        | TelegramUpdateType::EditedChannelPost(message) => {
             let context = build_fetcher_message_context(message);
             let report =
                 persist_edited_message_history(store, update, &context.original_text, context.meta)
@@ -1222,8 +1226,40 @@ where
 
 fn decode_telegram_update_payload(raw_payload: &[u8]) -> Result<TelegramUpdate, serde_json::Error> {
     let mut payload = serde_json::from_slice(raw_payload)?;
+    remove_legacy_forward_fields(&mut payload);
     prefer_sender_chat_in_messages(&mut payload);
     serde_json::from_value(payload)
+}
+
+fn remove_legacy_forward_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_legacy_forward_fields(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let has_modern_origin = object
+                .get("forward_origin")
+                .is_some_and(|value| !value.is_null());
+            if has_modern_origin {
+                for key in [
+                    "forward_date",
+                    "forward_from",
+                    "forward_from_chat",
+                    "forward_from_message_id",
+                    "forward_sender_name",
+                    "forward_signature",
+                ] {
+                    object.remove(key);
+                }
+            }
+            for value in object.values_mut() {
+                remove_legacy_forward_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn prefer_sender_chat_in_messages(value: &mut serde_json::Value) {
@@ -1965,6 +2001,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_forward_fields_do_not_hide_forwarded_sticker() -> Result<(), Box<dyn Error>> {
+        let update = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135731,
+                "message": {
+                    "message_id": 529365,
+                    "date": 1783909208,
+                    "chat": {"id": -1002633257301, "type": "supergroup", "title": "Chat"},
+                    "from": {"id": 42, "is_bot": false, "first_name": "Forwarder"},
+                    "sticker": {
+                        "file_id": "sticker-file",
+                        "file_unique_id": "sticker-unique",
+                        "type": "regular",
+                        "width": 512,
+                        "height": 512,
+                        "is_animated": false,
+                        "is_video": false,
+                        "emoji": "\ud83d\udc1f"
+                    },
+                    "forward_origin": {
+                        "type": "channel",
+                        "date": 1783909000,
+                        "message_id": 10,
+                        "chat": {"id": -100200, "type": "channel", "title": "News"}
+                    },
+                    "forward_date": 1783909000,
+                    "forward_from_chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "forward_from_message_id": 10
+                }
+            }"#,
+        )?;
+        let carapax::types::UpdateType::Message(message) = &update.update_type else {
+            return Err(io::Error::other("expected message update").into());
+        };
+        assert!(matches!(
+            message.data,
+            carapax::types::MessageData::Sticker(_)
+        ));
+
+        let store = HistoryStoreStub::default();
+        let report = super::persist_update_history(&store, &update, 0).await?;
+
+        assert!(report.inbound_entry_persisted);
+        let entries = store.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sender_id, 42);
+        let payload: Value = serde_json::from_slice(&entries[0].payload)?;
+        assert_eq!(payload["forward_origin"]["type"], "channel");
+        assert_eq!(
+            payload["meta"]["annotation"],
+            "Forwarded from channel News."
+        );
+        let kinds = payload["meta"]["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["image", "sticker"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_forward_fields_preserve_supported_media_variants() -> Result<(), Box<dyn Error>>
+    {
+        let cases = [
+            (
+                "photo",
+                json!([{"file_id": "p", "file_unique_id": "pu", "width": 10, "height": 10}]),
+                "image",
+            ),
+            (
+                "video",
+                json!({"file_id": "v", "file_unique_id": "vu", "width": 10, "height": 10, "duration": 1}),
+                "video",
+            ),
+            (
+                "animation",
+                json!({"file_id": "a", "file_unique_id": "au", "width": 10, "height": 10, "duration": 1}),
+                "animation",
+            ),
+            (
+                "video_note",
+                json!({"file_id": "n", "file_unique_id": "nu", "length": 10, "duration": 1}),
+                "video_note",
+            ),
+            (
+                "audio",
+                json!({"file_id": "a", "file_unique_id": "audio-u", "duration": 1}),
+                "audio",
+            ),
+            (
+                "voice",
+                json!({"file_id": "o", "file_unique_id": "ou", "duration": 1}),
+                "voice",
+            ),
+            (
+                "document",
+                json!({"file_id": "d", "file_unique_id": "du", "file_name": "file.bin"}),
+                "document",
+            ),
+            (
+                "sticker",
+                json!({
+                    "file_id": "s",
+                    "file_unique_id": "su",
+                    "type": "regular",
+                    "width": 10,
+                    "height": 10,
+                    "is_animated": false,
+                    "is_video": false
+                }),
+                "image",
+            ),
+        ];
+
+        for (index, (field, media, expected_type)) in cases.into_iter().enumerate() {
+            let mut message = json!({
+                "message_id": 600_000 + index,
+                "date": 1_783_909_208,
+                "chat": {"id": -1002633257301_i64, "type": "supergroup", "title": "Chat"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Forwarder"},
+                "forward_origin": {
+                    "type": "channel",
+                    "date": 1_783_909_000,
+                    "message_id": 10,
+                    "chat": {"id": -100200, "type": "channel", "title": "News"}
+                },
+                "forward_date": 1_783_909_000,
+                "forward_from_chat": {"id": -100200, "type": "channel", "title": "News"},
+                "forward_from_message_id": 10
+            });
+            message[field] = media;
+            let raw = serde_json::to_vec(&json!({
+                "update_id": 1_521_200_000 + index,
+                "message": message
+            }))?;
+            let update = super::decode_telegram_update_payload(&raw)?;
+            assert!(
+                matches!(update.update_type, carapax::types::UpdateType::Message(_)),
+                "{field}"
+            );
+            let store = HistoryStoreStub::default();
+            let report = super::persist_update_history(&store, &update, 0).await?;
+            assert!(report.inbound_entry_persisted, "{field}");
+            let entries = store.entries();
+            let payload: Value = serde_json::from_slice(&entries[0].payload)?;
+            assert_eq!(payload["meta"]["type"], expected_type, "{field}");
+            assert_eq!(
+                payload["meta"]["annotation"], "Forwarded from channel News.",
+                "{field}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_posts_persist_and_edits_update_in_place() -> Result<(), Box<dyn Error>> {
+        let channel_post = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135732,
+                "channel_post": {
+                    "message_id": 77,
+                    "date": 1783909208,
+                    "chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "text": "first"
+                }
+            }"#,
+        )?;
+        let edited_channel_post = super::decode_telegram_update_payload(
+            br#"{
+                "update_id": 1521135733,
+                "edited_channel_post": {
+                    "message_id": 77,
+                    "date": 1783909208,
+                    "edit_date": 1783909210,
+                    "chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -100200, "type": "channel", "title": "News"},
+                    "text": "edited"
+                }
+            }"#,
+        )?;
+        let store = HistoryStoreStub::default();
+
+        let initial = super::persist_update_history(&store, &channel_post, 0).await?;
+        let edited = super::persist_update_history(&store, &edited_channel_post, 0).await?;
+
+        assert!(initial.inbound_entry_persisted);
+        assert!(edited.edited_entry_updated);
+        let entries = store.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sender_id, -100200);
+        let payload: Value = serde_json::from_slice(&entries[0].payload)?;
+        assert_eq!(payload["meta"]["sender_type"], "same_chat");
+        assert_eq!(store.edits()[0].new_text, "edited");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn persist_edited_message_history_updates_existing_go_entry() -> Result<(), Box<dyn Error>>
     {
         let store = HistoryStoreStub::default();
@@ -2403,8 +2639,8 @@ mod tests {
     }
 
     #[test]
-    fn buffered_member_coalescing_preserves_active_to_inactive_delete() -> Result<(), Box<dyn Error>>
-    {
+    fn buffered_member_coalescing_preserves_active_to_inactive_transition()
+    -> Result<(), Box<dyn Error>> {
         let update = sample_chat_member_update(12352, 7, "member", "left")?;
         let mut report = super::UpdateConsumerRunReport::default();
 

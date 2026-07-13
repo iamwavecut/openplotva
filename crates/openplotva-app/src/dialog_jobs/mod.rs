@@ -68,6 +68,10 @@ pub type DialogToolCallHistoryFuture<'a, E> =
 pub enum DialogInputMaterializationError {
     #[error("load canonical chat history: {message}")]
     History { message: String },
+    #[error("canonical trigger {chat_id}/{message_id} is missing from chat history")]
+    TriggerMissing { chat_id: i64, message_id: i32 },
+    #[error("trigger sender {user_id} is no longer a member of chat {chat_id}")]
+    SenderNotMember { chat_id: i64, user_id: i64 },
 }
 
 /// Boxed future returned by dialog input materializers.
