@@ -1237,19 +1237,43 @@ impl TelegramMediaDescriber {
 impl VisionDescriber for TelegramMediaDescriber {
     fn describe_image<'a>(&'a self, request: VisionDescribeRequest) -> VisionImageFuture<'a> {
         Box::pin(async move {
-            let mut result = self.vision.describe_image(request.clone()).await?;
-            let mut attachment = request
-                .message_meta
-                .attachments
-                .iter()
-                .find(|attachment| attachment.file_unique_id == result.file_unique_id)
-                .cloned()
-                .unwrap_or_else(|| ChatAttachment {
-                    kind: result.media_kind.clone(),
-                    source: "message".to_owned(),
-                    file_unique_id: result.file_unique_id.clone(),
-                    ..ChatAttachment::default()
-                });
+            let described = self.vision.describe_image(request.clone()).await;
+            let (mut result, mut attachment) = match described {
+                Ok(result) => {
+                    let attachment = request
+                        .message_meta
+                        .attachments
+                        .iter()
+                        .find(|attachment| attachment.file_unique_id == result.file_unique_id)
+                        .cloned()
+                        .unwrap_or_else(|| ChatAttachment {
+                            kind: result.media_kind.clone(),
+                            source: "message".to_owned(),
+                            file_unique_id: result.file_unique_id.clone(),
+                            ..ChatAttachment::default()
+                        });
+                    (result, attachment)
+                }
+                Err(error) if telegram_download_unavailable_error(&error.to_string()) => {
+                    let attachment =
+                        request_media_attachment(&request).unwrap_or_else(|| ChatAttachment {
+                            kind: "video".to_owned(),
+                            source: "message".to_owned(),
+                            file_unique_id: request.file_id.trim().to_owned(),
+                            ..ChatAttachment::default()
+                        });
+                    let result = VisionDescribeResult {
+                        visual_error: "файл превышает лимит скачивания Telegram Bot API".to_owned(),
+                        download_unavailable: true,
+                        media_kind: attachment.kind.trim().to_lowercase(),
+                        source: "unavailable".to_owned(),
+                        file_unique_id: attachment.file_unique_id.clone(),
+                        ..VisionDescribeResult::default()
+                    };
+                    (result, attachment)
+                }
+                Err(error) => return Err(error),
+            };
             result.media_kind = attachment.kind.trim().to_lowercase();
             if !matches!(result.media_kind.as_str(), "video" | "video_note") {
                 return Ok(result);
@@ -1281,6 +1305,8 @@ impl VisionDescriber for TelegramMediaDescriber {
                 }
                 Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE => {
                     result.transcript_note = asr_unavailable_note(&record);
+                    result.download_unavailable |=
+                        telegram_download_unavailable_error(&result.transcript_note);
                 }
                 Ok(Some(record)) => {
                     result.transcript_error = format!(
@@ -1296,9 +1322,45 @@ impl VisionDescriber for TelegramMediaDescriber {
                     result.transcript_error = format!("load ASR result: {error}");
                 }
             }
+            result.download_unavailable |= telegram_download_unavailable_error(&format!(
+                "{} {}",
+                result.transcript_note, result.transcript_error
+            ));
             Ok(result)
         })
     }
+}
+
+fn request_media_attachment(request: &VisionDescribeRequest) -> Option<ChatAttachment> {
+    let candidates = vision_attachment_file_id_candidates(
+        request.file_id.trim(),
+        request.message_id,
+        &request.message_meta,
+    );
+    request
+        .message_meta
+        .attachments
+        .iter()
+        .find(|attachment| {
+            let file_id = attachment.file_id.trim();
+            let unique_id = attachment.file_unique_id.trim();
+            file_id == request.file_id.trim()
+                || unique_id == request.file_id.trim()
+                || candidates
+                    .iter()
+                    .any(|candidate| candidate == file_id || candidate == unique_id)
+        })
+        .cloned()
+}
+
+fn telegram_download_unavailable_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("file is too big")
+        || message.contains("file too big")
+        || message.contains("exceeds 20 mib")
+        || message.contains("exceeds the telegram bot api")
+        || message.contains("превышает лимит telegram bot api")
+        || message.contains("превышает лимит скачивания telegram bot api")
 }
 
 /// Error returned by the app-level Telegram vision describer.
@@ -1401,6 +1463,7 @@ fn vision_describe_result(
 ) -> VisionDescribeResult {
     VisionDescribeResult {
         caption,
+        visual_error: String::new(),
         transcript: record
             .asr_text
             .as_deref()
@@ -1410,6 +1473,7 @@ fn vision_describe_result(
             .to_owned(),
         transcript_note: String::new(),
         transcript_error: String::new(),
+        download_unavailable: false,
         media_kind: match record.media_kind.trim().to_lowercase().as_str() {
             "photo" => "image".to_owned(),
             kind => kind.to_owned(),
@@ -1659,6 +1723,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn telegram_download_limit_is_terminal_but_provider_failures_are_not() {
+        assert!(telegram_download_unavailable_error(
+            "Bad Request: file is too big"
+        ));
+        assert!(telegram_download_unavailable_error(
+            "file exceeds 20 MiB Telegram Bot API limit"
+        ));
+        assert!(!telegram_download_unavailable_error(
+            "vision provider temporarily unavailable"
+        ));
+    }
+
     #[tokio::test]
     async fn vision_describer_returns_cached_caption_by_alias_like_go()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1678,9 +1755,11 @@ mod tests {
             result,
             VisionDescribeResult {
                 caption: "cached cat".to_owned(),
+                visual_error: String::new(),
                 transcript: String::new(),
                 transcript_note: String::new(),
                 transcript_error: String::new(),
+                download_unavailable: false,
                 media_kind: "image".to_owned(),
                 source: "cache".to_owned(),
                 file_unique_id: "photo-u".to_owned(),

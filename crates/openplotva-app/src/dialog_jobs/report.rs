@@ -16,6 +16,8 @@ pub struct DialogJobWorkerReport {
     pub skipped_empty_payload: bool,
     /// Never-processed job outlived the queue-age gate and was dropped.
     pub skipped_queue_backlog: bool,
+    /// The locally authoritative Telegram member state is inactive.
+    pub skipped_sender_not_member: bool,
     pub content_blocked: bool,
     pub sent_answer: bool,
     /// Final answer was committed to Postgres and awaits Telegram receipts.
@@ -104,6 +106,8 @@ pub struct DialogJobWorkerRunReport {
     pub skipped_empty_payload: u64,
     /// Number of expired-backlog jobs dropped without provider execution.
     pub skipped_queue_backlog: u64,
+    /// Number of jobs skipped because the trigger sender left the chat.
+    pub skipped_sender_not_member: u64,
     /// Number of content-blocked provider results treated as completed.
     pub content_blocked: u64,
     /// Number of answers queued.
@@ -145,6 +149,9 @@ impl DialogJobWorkerRunReport {
         }
         if tick.skipped_queue_backlog {
             self.skipped_queue_backlog += 1;
+        }
+        if tick.skipped_sender_not_member {
+            self.skipped_sender_not_member += 1;
         }
         if tick.content_blocked {
             self.content_blocked += 1;
@@ -200,6 +207,7 @@ pub(crate) fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         failed = tick.failed,
         skipped_empty_payload = tick.skipped_empty_payload,
         skipped_queue_backlog = tick.skipped_queue_backlog,
+        skipped_sender_not_member = tick.skipped_sender_not_member,
         content_blocked = tick.content_blocked,
         sent_answer = tick.sent_answer,
         queued_answer = tick.queued_answer,

@@ -539,7 +539,7 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
     required: false,
-    description: "Image, animation, video, or video-note attachment handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. For video media the tool analyzes the visuals and transcribes spoken audio in the same call. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment.",
+    description: "Image, animation, video, or video-note attachment handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. For video media the tool analyzes the visuals and transcribes spoken audio in the same call. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment. If Telegram refuses to download an oversized file, the result explicitly reports that permanent limitation and must not be retried.",
 }];
 
 const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
@@ -640,7 +640,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_UNDERSTAND_MEDIA,
         summary: "Understand visual media and spoken audio from chat context.",
         when_to_use: "Use when the latest user message asks about an image, animation, video, or video note, including what is shown and what is said.",
-        result: "Returns the visual description and, for video media, the spoken-audio transcript together. Media without a decodable audio track is reported explicitly without failing the visual result. If either modality actually fails, returns an explicit partial-result error instead of silently claiming complete analysis.",
+        result: "Returns the visual description and, for video media, the spoken-audio transcript together. Media without a decodable audio track is reported explicitly without failing the visual result. If either modality fails, returns its explicit partial-result error. Telegram's permanent oversized-file download limit is non-retryable and should be explained to the user.",
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {

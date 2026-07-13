@@ -165,6 +165,15 @@ where
         .await
     {
         Ok(input) => input,
+        Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember { .. }) => {
+            report.skipped_sender_not_member = true;
+            return TurnResolution {
+                outcome: TurnOutcome::NoReplyIntentional {
+                    reason: "sender_not_member",
+                },
+                disposition: JobDisposition::Complete,
+            };
+        }
         Err(error) => {
             let error = error.to_string();
             report.materialization_error = Some(error);

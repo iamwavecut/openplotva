@@ -764,7 +764,7 @@ pub const SQL_DELETE_CHAT_MEMBER: &str =
 pub const SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS: &str =
     "DELETE FROM chat_members WHERE status IN ('left', 'kicked') AND updated_at < $1";
 
-pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
+pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_member, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_member = COALESCE(EXCLUDED.is_member, chat_members.is_member), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
 
 pub const SQL_UPDATE_MEMBER_LAST_MESSAGE: &str = "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2";
 
@@ -3511,6 +3511,8 @@ pub struct ChatMemberRecord {
     pub user_id: i64,
     /// Telegram chat-member status string.
     pub status: String,
+    /// Telegram's authoritative membership bit when the status was observed.
+    pub is_member: Option<bool>,
     /// Whether the member is anonymous.
     pub is_anonymous: Option<bool>,
     /// Custom admin/creator title.
@@ -3574,6 +3576,8 @@ pub struct ChatMemberUpsert {
     pub user_id: i64,
     /// Telegram chat-member status string.
     pub status: String,
+    /// Telegram's authoritative membership bit when the status was observed.
+    pub is_member: Option<bool>,
     /// Whether the member is anonymous.
     pub is_anonymous: Option<bool>,
     /// Custom admin/creator title.
@@ -3713,6 +3717,7 @@ impl PostgresChatMemberStore {
             .bind(member.chat_id)
             .bind(member.user_id)
             .bind(&member.status)
+            .bind(member.is_member)
             .bind(member.is_anonymous)
             .bind(member.custom_title.as_deref())
             .bind(member.can_be_edited)
@@ -4320,6 +4325,25 @@ impl PostgresHistoryStore {
 
         self.invalidate_history_cache(entry.chat_id).await?;
         Ok(())
+    }
+
+    /// Load the current canonical text payload for one Telegram message.
+    pub async fn text_history_payload(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if chat_id == 0 || message_id == 0 {
+            return Ok(None);
+        }
+        let row = sqlx::query(SQL_SELECT_TEXT_HISTORY_ENTRY)
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| row.try_get::<String, _>("payload").map(String::into_bytes))
+            .transpose()
+            .map_err(StorageError::from)
     }
 
     /// Update the stored text for an existing inbound history row.
@@ -9007,6 +9031,7 @@ fn chat_member_from_row(row: PgRow) -> Result<ChatMemberRecord, sqlx::Error> {
         chat_id: row.try_get("chat_id")?,
         user_id: row.try_get("user_id")?,
         status: row.try_get("status")?,
+        is_member: row.try_get("is_member")?,
         is_anonymous: row.try_get("is_anonymous")?,
         custom_title: row.try_get("custom_title")?,
         can_be_edited: row.try_get("can_be_edited")?,
@@ -11132,10 +11157,15 @@ mod tests {
             super::SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS,
             "DELETE FROM chat_members WHERE status IN ('left', 'kicked') AND updated_at < $1"
         );
-        assert_eq!(
-            super::SQL_UPSERT_CHAT_MEMBER,
-            "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP"
+        assert!(
+            super::SQL_UPSERT_CHAT_MEMBER
+                .contains("chat_id, user_id, status, is_member, is_anonymous")
         );
+        assert!(
+            super::SQL_UPSERT_CHAT_MEMBER
+                .contains("is_member = COALESCE(EXCLUDED.is_member, chat_members.is_member)")
+        );
+        assert!(super::SQL_UPSERT_CHAT_MEMBER.contains("$24"));
         assert_eq!(
             super::SQL_UPDATE_MEMBER_LAST_MESSAGE,
             "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2"
@@ -11966,6 +11996,14 @@ mod tests {
                     .len(),
                 1
             );
+            assert_eq!(
+                store
+                    .text_history_payload(chat_id, message_id)
+                    .await?
+                    .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+                    .and_then(|payload| payload["text"].as_str().map(str::to_owned)),
+                Some("old text".to_owned())
+            );
             assert!(
                 store
                     .history_message_payloads(chat_id, message_id, range_end, 77, range_start)
@@ -12002,6 +12040,14 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&updated_payload)?["text"],
                 "new text"
+            );
+            assert_eq!(
+                store
+                    .text_history_payload(chat_id, message_id)
+                    .await?
+                    .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+                    .and_then(|payload| payload["text"].as_str().map(str::to_owned)),
+                Some("new text".to_owned())
             );
 
             assert_eq!(store.delete_message_entries(chat_id, message_id).await?, 1);
@@ -12426,6 +12472,7 @@ mod tests {
                     chat_id,
                     user_id,
                     status: super::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+                    is_member: Some(true),
                     can_promote_members: Some(true),
                     can_delete_messages: Some(true),
                     ..super::ChatMemberUpsert::default()
@@ -12449,12 +12496,45 @@ mod tests {
             assert_eq!(member.chat_id, chat_id);
             assert_eq!(member.user_id, user_id);
             assert_eq!(member.status, super::CHAT_MEMBER_STATUS_ADMINISTRATOR);
+            assert_eq!(member.is_member, Some(true));
             assert_eq!(
                 member.can_promote_members,
                 Some(true),
                 "COALESCE upsert preserves nullable permissions when later writes omit them"
             );
             assert_eq!(member.can_delete_messages, Some(false));
+
+            store
+                .upsert_chat_member(&super::ChatMemberUpsert {
+                    chat_id,
+                    user_id,
+                    status: super::CHAT_MEMBER_STATUS_LEFT.to_owned(),
+                    is_member: Some(false),
+                    ..super::ChatMemberUpsert::default()
+                })
+                .await?;
+            let departed = store
+                .get_chat_member(chat_id, user_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("departed member was not readable"))?;
+            assert_eq!(departed.status, super::CHAT_MEMBER_STATUS_LEFT);
+            assert_eq!(departed.is_member, Some(false));
+
+            store
+                .upsert_chat_member(&super::ChatMemberUpsert {
+                    chat_id,
+                    user_id,
+                    status: super::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+                    is_member: Some(true),
+                    ..super::ChatMemberUpsert::default()
+                })
+                .await?;
+            let rejoined = store
+                .get_chat_member(chat_id, user_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("rejoined member was not readable"))?;
+            assert_eq!(rejoined.status, super::CHAT_MEMBER_STATUS_MEMBER);
+            assert_eq!(rejoined.is_member, Some(true));
             let members = store.list_chat_members(chat_id).await?;
             assert_eq!(members.len(), 1);
             assert_eq!(members[0].user_id, user_id);

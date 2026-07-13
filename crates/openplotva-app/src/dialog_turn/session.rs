@@ -234,7 +234,8 @@ where
     let mut budget = SessionBudget::new(ctx.budget, cfg.tool_extension_secs, cfg.hard_cap_secs);
     let mut base_input = base_input;
     let mut duplicate_guard_history = duplicate_guard_history.to_vec();
-    let mut active_params = ctx.params.clone();
+    let mut active_params =
+        crate::dialog_jobs::dialog_job_params_from_input(ctx.params, &base_input);
     let mut meta = dialog_tool_context(&base_input);
     let native_tools = match session_native_tools() {
         Ok(tools) => tools,
@@ -276,11 +277,21 @@ where
                 .await
             {
                 Ok(input) => {
-                    active_params = injected_params;
+                    active_params =
+                        crate::dialog_jobs::dialog_job_params_from_input(&injected_params, &input);
                     meta = dialog_tool_context(&input);
                     duplicate_guard_history.clone_from(&input.history);
                     base_input = input;
                     transcript.clear();
+                }
+                Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
+                    ..
+                }) => {
+                    tracing::debug!(
+                        chat_id = injected_params.chat_id,
+                        user_id = injected_params.user_id,
+                        "dropping injected message from a departed member"
+                    );
                 }
                 Err(error) => {
                     let error = format!("materialize injected dialog input: {error}");

@@ -2815,6 +2815,7 @@ fn chat_member_record_from_upsert(
         chat_id: upsert.chat_id,
         user_id: upsert.user_id,
         status: upsert.status.clone(),
+        is_member: upsert.is_member,
         is_anonymous: upsert.is_anonymous,
         custom_title: upsert.custom_title.clone(),
         can_be_edited: upsert.can_be_edited,

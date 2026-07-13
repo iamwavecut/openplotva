@@ -12,8 +12,8 @@ use std::{
 
 use carapax::types::{
     Chat as TelegramChat, MaybeInaccessibleMessage, Message as TelegramMessage,
-    MessageData as TelegramMessageData, PollAnswerVoter, ReplyTo as TelegramReplyTo,
-    Text as TelegramText, TextEntity as TelegramTextEntity,
+    MessageData as TelegramMessageData, MessageOrigin as TelegramMessageOrigin, PollAnswerVoter,
+    ReplyTo as TelegramReplyTo, Text as TelegramText, TextEntity as TelegramTextEntity,
     TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType, User as TelegramUser,
 };
@@ -1460,6 +1460,7 @@ pub fn build_message_meta(
     vision_description: &str,
 ) -> ChatMessageMeta {
     let mut meta = ChatMessageMeta {
+        annotation: message.map(forward_annotation).unwrap_or_default(),
         vision_description: vision_description.trim().to_owned(),
         sender_type: sender.sender_type.clone(),
         sender_id: sender.id,
@@ -1473,6 +1474,38 @@ pub fn build_message_meta(
         .extend(collect_media_attachments(message, &meta.attachments));
     meta.message_type = detect_message_type(message, &meta.attachments);
     meta
+}
+
+fn forward_annotation(message: &TelegramMessage) -> String {
+    let prefix = if message.is_automatic_forward {
+        "Automatically forwarded"
+    } else if message.forward_origin.is_some() {
+        "Forwarded"
+    } else {
+        return String::new();
+    };
+    let Some(origin) = message.forward_origin.as_ref() else {
+        return format!("{prefix} message.");
+    };
+    let (source_type, source_name) = match origin {
+        TelegramMessageOrigin::Channel(origin) => {
+            ("channel", telegram_chat_full_name(&origin.chat))
+        }
+        TelegramMessageOrigin::Chat(origin) => {
+            ("chat", telegram_chat_full_name(&origin.sender_chat))
+        }
+        TelegramMessageOrigin::HiddenUser(origin) => {
+            ("hidden user", origin.sender_user_name.trim().to_owned())
+        }
+        TelegramMessageOrigin::User(origin) => {
+            ("user", telegram_user_full_name(&origin.sender_user))
+        }
+    };
+    if source_name.is_empty() {
+        format!("{prefix} from a {source_type}.")
+    } else {
+        format!("{prefix} from {source_type} {source_name}.")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1938,7 +1971,11 @@ fn telegram_message_type(message: Option<&TelegramMessage>) -> Option<&'static s
         TelegramMessageData::Document(_) => Some("document"),
         TelegramMessageData::Location(_) | TelegramMessageData::Venue(_) => Some("location"),
         TelegramMessageData::Contact(_) => Some("contact"),
-        TelegramMessageData::Photo(_) | TelegramMessageData::Sticker(_) => Some("image"),
+        TelegramMessageData::Photo(_) => Some("image"),
+        TelegramMessageData::Sticker(sticker) if !sticker.is_animated && !sticker.is_video => {
+            Some("image")
+        }
+        TelegramMessageData::Sticker(_) => Some("sticker"),
         TelegramMessageData::Dice(_) => Some("dice"),
         TelegramMessageData::Checklist(_) => Some("checklist"),
         TelegramMessageData::Story(_) => Some("story"),
@@ -2294,14 +2331,16 @@ fn telegram_first_image_attachment(
                 ..ChatAttachment::default()
             })
         }
-        TelegramMessageData::Sticker(sticker) => Some(ChatAttachment {
-            kind: "image".to_owned(),
-            source: source.to_owned(),
-            file_unique_id: sticker.file_unique_id.clone(),
-            file_id: sticker.file_id.clone(),
-            caption: caption.to_owned(),
-            ..ChatAttachment::default()
-        }),
+        TelegramMessageData::Sticker(sticker) if !sticker.is_animated && !sticker.is_video => {
+            Some(ChatAttachment {
+                kind: "image".to_owned(),
+                source: source.to_owned(),
+                file_unique_id: sticker.file_unique_id.clone(),
+                file_id: sticker.file_id.clone(),
+                caption: caption.to_owned(),
+                ..ChatAttachment::default()
+            })
+        }
         _ => None,
     }
 }
@@ -5370,6 +5409,69 @@ mod tests {
         assert_eq!(got.attachments[1].file_id, "photo-file");
         assert_eq!(got.attachments[1].caption, "photo caption");
 
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_message_meta_keeps_forwarder_and_safe_source_annotation()
+    -> Result<(), Box<dyn Error>> {
+        let update: TelegramUpdate = serde_json::from_value(json!({
+            "update_id": 1401,
+            "message": {
+                "message_id": 720,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "text": "forwarded",
+                "forward_origin": {
+                    "type": "channel",
+                    "date": 1_709_999_999,
+                    "message_id": 12,
+                    "chat": {"id": -200, "type": "channel", "title": "News"}
+                }
+            }
+        }))?;
+
+        let got = super::build_fetcher_message_context(update_message(&update)?);
+
+        assert_eq!(got.meta.sender_id, 99);
+        assert_eq!(got.meta.sender_name, "Ada");
+        assert_eq!(got.meta.annotation, "Forwarded from channel News.");
+        Ok(())
+    }
+
+    #[test]
+    fn animated_and_video_stickers_remain_stickers_without_vision_image()
+    -> Result<(), Box<dyn Error>> {
+        for (flag, value) in [("is_animated", true), ("is_video", true)] {
+            let mut sticker = json!({
+                "file_id": "sticker-file",
+                "file_unique_id": "sticker-unique",
+                "type": "regular",
+                "width": 512,
+                "height": 512,
+                "is_animated": false,
+                "is_video": false,
+                "emoji": "🐟"
+            });
+            sticker[flag] = json!(value);
+            let update: TelegramUpdate = serde_json::from_value(json!({
+                "update_id": 1402,
+                "message": {
+                    "message_id": 721,
+                    "date": 1_710_000_000,
+                    "chat": sample_private_chat_json(),
+                    "from": sample_user_json(),
+                    "sticker": sticker
+                }
+            }))?;
+
+            let got = super::build_fetcher_message_context(update_message(&update)?);
+
+            assert_eq!(got.meta.message_type, "sticker", "{flag}");
+            assert_eq!(got.meta.attachments.len(), 1, "{flag}");
+            assert_eq!(got.meta.attachments[0].kind, "sticker", "{flag}");
+        }
         Ok(())
     }
 

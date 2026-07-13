@@ -828,12 +828,16 @@ pub struct VisionDescribeRequest {
 pub struct VisionDescribeResult {
     /// Generated caption.
     pub caption: String,
+    /// Visual-analysis failure while another modality may still be usable.
+    pub visual_error: String,
     /// Spoken audio transcribed from video media, when available.
     pub transcript: String,
     /// Non-error information about why a transcript is absent.
     pub transcript_note: String,
     /// ASR failure or incomplete status for video media.
     pub transcript_error: String,
+    /// Telegram could not make the underlying file downloadable to bots.
+    pub download_unavailable: bool,
     /// Resolved Telegram media kind.
     pub media_kind: String,
     /// Caption source label.
@@ -2608,6 +2612,14 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
     };
     let transcript_error = result.transcript_error.trim();
     let transcript_note = result.transcript_note.trim();
+    let visual_error = result.visual_error.trim();
+    if !visual_error.is_empty() {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str("Визуальная часть не распознана: ");
+        message.push_str(visual_error);
+    }
     if !transcript_note.is_empty() {
         if !message.is_empty() {
             message.push_str("\n\n");
@@ -2622,8 +2634,20 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
         message.push_str("Речь и аудио не распознаны: ");
         message.push_str(transcript_error);
     }
+    let incomplete =
+        !visual_error.is_empty() || !transcript_error.is_empty() || result.download_unavailable;
+    let download_note = if result.download_unavailable {
+        transcript_note
+    } else {
+        ""
+    };
+    let error_reason = [visual_error, transcript_error, download_note]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
     ToolResult {
-        status: if transcript_error.is_empty() {
+        status: if !incomplete {
             TOOL_RESULT_STATUS_OK.to_owned()
         } else {
             TOOL_RESULT_STATUS_FAILED.to_owned()
@@ -2635,16 +2659,26 @@ fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolRes
             "source": result.source,
             "file_unique_id": result.file_unique_id,
             "visual_description": result.caption,
+            "visual_error": result.visual_error,
             "transcript": result.transcript,
             "transcript_note": result.transcript_note,
             "transcript_error": result.transcript_error,
             "media_kind": result.media_kind,
             "history_updated": result.history_updated,
+            "download_unavailable": result.download_unavailable,
         })),
-        error: (!transcript_error.is_empty()).then(|| ToolError {
-            code: "understand_media_asr_incomplete".to_owned(),
-            reason: transcript_error.to_owned(),
-            retryable: true,
+        error: incomplete.then(|| ToolError {
+            code: if result.download_unavailable {
+                "understand_media_download_unavailable".to_owned()
+            } else {
+                "understand_media_incomplete".to_owned()
+            },
+            reason: if error_reason.is_empty() {
+                "Telegram Bot API could not provide the media file for analysis".to_owned()
+            } else {
+                error_reason
+            },
+            retryable: !result.download_unavailable,
         }),
     }
 }
@@ -4197,9 +4231,11 @@ mod tests {
     async fn app_dialog_toolbox_formats_vision_result() -> Result<(), ToolboxError> {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "  cat on table  ".to_owned(),
+            visual_error: String::new(),
             transcript: "  hello from video  ".to_owned(),
             transcript_note: String::new(),
             transcript_error: String::new(),
+            download_unavailable: false,
             media_kind: "video".to_owned(),
             source: "vision".to_owned(),
             file_unique_id: "file-unique".to_owned(),
@@ -4234,11 +4270,13 @@ mod tests {
                 "source": "vision",
                 "file_unique_id": "file-unique",
                 "visual_description": "  cat on table  ",
+                "visual_error": "",
                 "transcript": "  hello from video  ",
                 "transcript_note": "",
                 "transcript_error": "",
                 "media_kind": "video",
                 "history_updated": true,
+                "download_unavailable": false,
             }))
         );
         assert_eq!(
@@ -4258,9 +4296,11 @@ mod tests {
     async fn app_dialog_toolbox_reports_partial_video_analysis() -> Result<(), ToolboxError> {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "person enters a room".to_owned(),
+            visual_error: String::new(),
             transcript: String::new(),
             transcript_note: String::new(),
             transcript_error: "Telegram file is too big".to_owned(),
+            download_unavailable: true,
             media_kind: "video".to_owned(),
             source: "vision".to_owned(),
             file_unique_id: "video-unique".to_owned(),
@@ -4283,7 +4323,11 @@ mod tests {
         assert!(result.message.contains("Telegram file is too big"));
         assert_eq!(
             result.error.as_ref().map(|error| error.code.as_str()),
-            Some("understand_media_asr_incomplete")
+            Some("understand_media_download_unavailable")
+        );
+        assert_eq!(
+            result.error.as_ref().map(|error| error.retryable),
+            Some(false)
         );
         Ok(())
     }
@@ -4293,9 +4337,11 @@ mod tests {
     -> Result<(), ToolboxError> {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "person enters a room".to_owned(),
+            visual_error: String::new(),
             transcript: String::new(),
             transcript_note: "В медиа нет доступной для распознавания аудиодорожки.".to_owned(),
             transcript_error: String::new(),
+            download_unavailable: false,
             media_kind: "video".to_owned(),
             source: "vision".to_owned(),
             file_unique_id: "silent-video".to_owned(),
