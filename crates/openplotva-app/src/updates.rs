@@ -22,7 +22,8 @@ use openplotva_storage::{
     TelegramFileMetadataUpsert,
 };
 use openplotva_updates::{
-    HistoryTextEntry, NoopUpdateStageTracker, UpdateConsumerConfig, UpdateProcessReport,
+    HistoryTextEntry, NoopUpdateStageTracker, UPDATE_CLAIM_RETRY_AFTER,
+    UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT, UpdateConsumerConfig, UpdateProcessReport,
     UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
     build_fetcher_message_context, build_history_text_entry, build_history_text_entry_with_text,
     extract_update_state, fetcher_message_text, should_skip_side_effects_at,
@@ -943,6 +944,7 @@ const MATERIALIZED_UPDATE_CLAIM_POLL: Duration = Duration::from_millis(100);
 const MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
 const MATERIALIZED_UPDATE_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const MATERIALIZED_UPDATE_MAX_ATTEMPTS: i32 = 8;
+const MATERIALIZED_UPDATE_REPORTED_CLAIM_ERRORS: usize = 64;
 
 /// Consume only committed inbox rows. Unlike the legacy Redis List consumer,
 /// this path intentionally does not use Telegram event time as an admission
@@ -1004,17 +1006,42 @@ where
         // A claim commits leased rows in PostgreSQL. Dropping this future after
         // the commit can discard the returned rows and leave them unprocessed
         // until lease expiry, so it must never race a worker join or shutdown.
-        let claimed = match delivery_store.claim_updates(&worker_id, available).await {
+        let claim_started = Instant::now();
+        let claim_result = delivery_store
+            .claim_updates(&worker_id, available, UPDATE_CLAIM_TIMEOUT)
+            .await;
+        let claim_elapsed = claim_started.elapsed();
+        let elapsed_ms = u64::try_from(claim_elapsed.as_millis()).unwrap_or(u64::MAX);
+        let timeout_ms = u64::try_from(UPDATE_CLAIM_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let claimed = match claim_result {
             Ok(claimed) => claimed,
             Err(error) => {
-                report.claim_errors.push(error.to_string());
+                tracing::warn!(
+                    error = %error,
+                    elapsed_ms,
+                    timeout_ms,
+                    "materialized Telegram update claim failed"
+                );
+                if report.claim_errors.len() < MATERIALIZED_UPDATE_REPORTED_CLAIM_ERRORS {
+                    report.claim_errors.push(error.to_string());
+                }
                 tokio::select! {
                     _ = &mut stop => break,
-                    () = tokio::time::sleep(MATERIALIZED_UPDATE_CLAIM_POLL) => {}
+                    () = tokio::time::sleep(UPDATE_CLAIM_RETRY_AFTER) => {}
                 }
                 continue;
             }
         };
+
+        if claim_elapsed >= UPDATE_CLAIM_SLOW_LOG_AFTER {
+            tracing::warn!(
+                elapsed_ms,
+                timeout_ms,
+                claimed = claimed.len(),
+                requested = available,
+                "materialized Telegram update claim is slow"
+            );
+        }
 
         if claimed.is_empty() {
             tokio::select! {

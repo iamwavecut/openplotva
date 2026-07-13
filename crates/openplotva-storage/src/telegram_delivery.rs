@@ -4,7 +4,7 @@
 //! whole Stream batch and provides the leased, fenced processing boundary used
 //! after that commit.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use serde::de::DeserializeOwned;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
@@ -87,6 +87,8 @@ SELECT pg_advisory_xact_lock(
 FROM telegram_update_inbox AS inbox
 WHERE inbox.id = $1
 "#;
+
+const SQL_SET_LOCAL_STATEMENT_TIMEOUT: &str = "SELECT set_config('statement_timeout', $1, true)";
 
 const SQL_CLAIM_UPDATES: &str = r#"
 WITH candidates AS (
@@ -214,9 +216,12 @@ WITH locked_lane AS MATERIALIZED (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
-), lane_advanced AS (
-    UPDATE telegram_update_lanes AS lane
-    SET head_inbox_id = (
+), next_lane_head AS MATERIALIZED (
+    SELECT
+        finished.id,
+        finished.bot_id,
+        finished.ordering_key,
+        (
             SELECT next.id
             FROM telegram_update_inbox AS next
             WHERE next.bot_id = finished.bot_id
@@ -225,16 +230,30 @@ WITH locked_lane AS MATERIALIZED (
               AND next.status IN ('pending', 'processing', 'retry_wait')
             ORDER BY next.stream_ms, next.stream_seq, next.id
             LIMIT 1
-        ),
-        updated_at = statement_timestamp()
+        ) AS head_inbox_id
     FROM finished
-    WHERE lane.bot_id = finished.bot_id
-      AND lane.ordering_key = finished.ordering_key
-      AND lane.head_inbox_id = finished.id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = next_lane_head.head_inbox_id,
+        updated_at = statement_timestamp()
+    FROM next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NOT NULL
+    RETURNING lane.head_inbox_id
+), lane_removed AS (
+    DELETE FROM telegram_update_lanes AS lane
+    USING next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NULL
     RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
 FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
+CROSS JOIN (SELECT count(*) FROM lane_removed) AS lane_removal_barrier
 "#;
 
 const SQL_RETRY_UPDATE: &str = r#"
@@ -298,9 +317,12 @@ WITH locked_lane AS MATERIALIZED (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
-), lane_advanced AS (
-    UPDATE telegram_update_lanes AS lane
-    SET head_inbox_id = (
+), next_lane_head AS MATERIALIZED (
+    SELECT
+        finished.id,
+        finished.bot_id,
+        finished.ordering_key,
+        (
             SELECT next.id
             FROM telegram_update_inbox AS next
             WHERE next.bot_id = finished.bot_id
@@ -309,16 +331,30 @@ WITH locked_lane AS MATERIALIZED (
               AND next.status IN ('pending', 'processing', 'retry_wait')
             ORDER BY next.stream_ms, next.stream_seq, next.id
             LIMIT 1
-        ),
-        updated_at = statement_timestamp()
+        ) AS head_inbox_id
     FROM finished
-    WHERE lane.bot_id = finished.bot_id
-      AND lane.ordering_key = finished.ordering_key
-      AND lane.head_inbox_id = finished.id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = next_lane_head.head_inbox_id,
+        updated_at = statement_timestamp()
+    FROM next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NOT NULL
+    RETURNING lane.head_inbox_id
+), lane_removed AS (
+    DELETE FROM telegram_update_lanes AS lane
+    USING next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NULL
     RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
 FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
+CROSS JOIN (SELECT count(*) FROM lane_removed) AS lane_removal_barrier
 "#;
 
 const SQL_DEAD_LETTER_UPDATE: &str = r#"
@@ -355,9 +391,12 @@ WITH locked_lane AS MATERIALIZED (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
-), lane_advanced AS (
-    UPDATE telegram_update_lanes AS lane
-    SET head_inbox_id = (
+), next_lane_head AS MATERIALIZED (
+    SELECT
+        finished.id,
+        finished.bot_id,
+        finished.ordering_key,
+        (
             SELECT next.id
             FROM telegram_update_inbox AS next
             WHERE next.bot_id = finished.bot_id
@@ -366,16 +405,30 @@ WITH locked_lane AS MATERIALIZED (
               AND next.status IN ('pending', 'processing', 'retry_wait')
             ORDER BY next.stream_ms, next.stream_seq, next.id
             LIMIT 1
-        ),
-        updated_at = statement_timestamp()
+        ) AS head_inbox_id
     FROM finished
-    WHERE lane.bot_id = finished.bot_id
-      AND lane.ordering_key = finished.ordering_key
-      AND lane.head_inbox_id = finished.id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = next_lane_head.head_inbox_id,
+        updated_at = statement_timestamp()
+    FROM next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NOT NULL
+    RETURNING lane.head_inbox_id
+), lane_removed AS (
+    DELETE FROM telegram_update_lanes AS lane
+    USING next_lane_head
+    WHERE lane.bot_id = next_lane_head.bot_id
+      AND lane.ordering_key = next_lane_head.ordering_key
+      AND lane.head_inbox_id = next_lane_head.id
+      AND next_lane_head.head_inbox_id IS NULL
     RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
 FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
+CROSS JOIN (SELECT count(*) FROM lane_removed) AS lane_removal_barrier
 "#;
 
 const SQL_INBOX_STATS: &str = r#"
@@ -943,14 +996,26 @@ impl PostgresTelegramDeliveryStore {
         &self,
         worker_id: &str,
         limit: usize,
+        timeout: Duration,
     ) -> Result<Vec<ClaimedTelegramUpdate>, StorageError> {
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        let timeout_ms = i64::try_from(timeout.as_millis().max(1)).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(SQL_SET_LOCAL_STATEMENT_TIMEOUT)
+            .bind(format!("{timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query(SQL_CLAIM_UPDATES)
             .bind(limit)
             .bind(worker_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
-        rows.into_iter().map(claimed_update_from_row).collect()
+        let claimed = rows
+            .into_iter()
+            .map(claimed_update_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     /// Extend a live lease. An expired or superseded token cannot be renewed.
@@ -1512,6 +1577,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+
     fn update(
         bot_id: i64,
         update_id: i64,
@@ -1562,6 +1629,13 @@ mod tests {
             error_class: "invalid_json".to_owned(),
             error: "unexpected end of input".to_owned(),
         }
+    }
+
+    async fn lane_count(pool: &PgPool, bot_id: i64) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT count(*) FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .fetch_one(pool)
+            .await
     }
 
     #[test]
@@ -1661,6 +1735,56 @@ mod tests {
         assert!(SQL_CLAIM_UPDATES.contains("lease_token = inbox.lease_token + 1"));
         assert!(SQL_CLAIM_UPDATES.contains("interval '90 seconds'"));
         assert!(!SQL_CLAIM_UPDATES.contains("NOT EXISTS"));
+        assert!(SQL_SET_LOCAL_STATEMENT_TIMEOUT.contains("set_config('statement_timeout'"));
+    }
+
+    #[test]
+    fn terminal_transitions_remove_inactive_lane_rows() {
+        for sql in [
+            SQL_COMPLETE_UPDATE,
+            SQL_IGNORE_UPDATE,
+            SQL_DEAD_LETTER_UPDATE,
+        ] {
+            assert!(sql.contains("DELETE FROM telegram_update_lanes AS lane"));
+            assert!(sql.contains("next_lane_head.head_inbox_id IS NULL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_uses_server_side_statement_timeout() -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let store = PostgresTelegramDeliveryStore::new(pool.clone());
+        let mut lock_tx = pool.begin().await?;
+        sqlx::query("LOCK TABLE telegram_update_lanes IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await?;
+
+        let started = std::time::Instant::now();
+        let error = store
+            .claim_updates("claim-timeout-test", 1, Duration::from_millis(50))
+            .await
+            .expect_err("claim must time out while the lane table is locked");
+        let elapsed = started.elapsed();
+        let StorageError::Postgres { source } = error else {
+            return Err("claim timeout did not return a Postgres error".into());
+        };
+        let sql_state = source
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .map(|code| code.into_owned());
+
+        assert_eq!(sql_state.as_deref(), Some("57014"));
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_secs(2));
+        lock_tx.rollback().await?;
+        Ok(())
     }
 
     #[test]
@@ -2010,7 +2134,9 @@ mod tests {
 
         let next = update(bot_id, 8, 3, br#"{"update_id":8}"#, 3);
         store.materialize_update_batch(&[next], &[]).await?;
-        let first_claim = store.claim_updates("storage-test", 10).await?;
+        let first_claim = store
+            .claim_updates("storage-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(first_claim.len(), 1, "same ordering key must serialize");
         assert_eq!(first_claim[0].update_id, 7);
         assert!(
@@ -2030,7 +2156,9 @@ mod tests {
                 .await?
         );
 
-        let second_claim = store.claim_updates("storage-test", 10).await?;
+        let second_claim = store
+            .claim_updates("storage-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(second_claim.len(), 1);
         assert_eq!(second_claim[0].update_id, 8);
         assert!(
@@ -2042,10 +2170,13 @@ mod tests {
                 )
                 .await?
         );
+        assert_eq!(lane_count(&pool, bot_id).await?, 0);
 
         let third = update(bot_id, 9, 4, br#"{"update_id":9}"#, 4);
         store.materialize_update_batch(&[third], &[]).await?;
-        let third_claim = store.claim_updates("storage-test", 10).await?;
+        let third_claim = store
+            .claim_updates("storage-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(third_claim.len(), 1);
         assert!(
             store
@@ -2068,7 +2199,9 @@ mod tests {
                 )
                 .await?
         );
-        let retried_claim = store.claim_updates("storage-test", 10).await?;
+        let retried_claim = store
+            .claim_updates("storage-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(retried_claim.len(), 1);
         assert_eq!(retried_claim[0].update_id, 9);
         assert_eq!(retried_claim[0].attempt, 2);
@@ -2083,10 +2216,13 @@ mod tests {
                 )
                 .await?
         );
+        assert_eq!(lane_count(&pool, bot_id).await?, 0);
 
         let abandoned = update(bot_id, 10, 5, br#"{"update_id":10}"#, 5);
         store.materialize_update_batch(&[abandoned], &[]).await?;
-        let abandoned_claim = store.claim_updates("storage-test", 10).await?;
+        let abandoned_claim = store
+            .claim_updates("storage-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(abandoned_claim.len(), 1);
         sqlx::query(
             "UPDATE telegram_update_inbox SET leased_until = statement_timestamp() - interval '1 second' WHERE id = $1",
@@ -2094,7 +2230,9 @@ mod tests {
         .bind(abandoned_claim[0].id)
         .execute(&pool)
         .await?;
-        let reclaimed = store.claim_updates("storage-test-reclaimer", 10).await?;
+        let reclaimed = store
+            .claim_updates("storage-test-reclaimer", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].attempt, 2);
         let abandoned_attempts = store.attempts(reclaimed[0].id, 10).await?;
@@ -2113,6 +2251,7 @@ mod tests {
                 .complete_update(reclaimed[0].id, reclaimed[0].lease_token)
                 .await?
         );
+        assert_eq!(lane_count(&pool, bot_id).await?, 0);
 
         let stats = store.stats().await?;
         assert!(stats.completed >= 1);
@@ -2163,7 +2302,9 @@ mod tests {
         let store = PostgresTelegramDeliveryStore::new(pool.clone());
         let first = update(bot_id, 30, 1, br#"{"update_id":30}"#, 1);
         store.materialize_update_batch(&[first], &[]).await?;
-        let claim = store.claim_updates("lane-race-test", 1).await?;
+        let claim = store
+            .claim_updates("lane-race-test", 1, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(claim.len(), 1);
         assert!(
             store
@@ -2206,7 +2347,9 @@ mod tests {
         .await?;
         assert_eq!(next_head_update_id, 31);
 
-        let next_claim = store.claim_updates("lane-race-test", 1).await?;
+        let next_claim = store
+            .claim_updates("lane-race-test", 1, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(next_claim.len(), 1);
         assert_eq!(next_claim[0].update_id, 31);
         assert!(
@@ -2214,6 +2357,7 @@ mod tests {
                 .ignore_update(next_claim[0].id, next_claim[0].lease_token, "test_cleanup",)
                 .await?
         );
+        assert_eq!(lane_count(&pool, bot_id).await?, 0);
 
         sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
             .bind(bot_id)
@@ -2322,7 +2466,9 @@ mod tests {
         .await?;
         assert!(repaired_finished_at.is_some());
 
-        let claim = store.claim_updates("startup-reconcile-test", 10).await?;
+        let claim = store
+            .claim_updates("startup-reconcile-test", 10, TEST_CLAIM_TIMEOUT)
+            .await?;
         assert_eq!(claim.len(), 1);
         assert_eq!(claim[0].update_id, 21);
         assert!(

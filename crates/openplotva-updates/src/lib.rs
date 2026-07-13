@@ -60,12 +60,23 @@ pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const UPDATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Maximum time PostgreSQL may spend executing one materialized-update claim.
+pub const UPDATE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Emit an early warning before a claim reaches its hard timeout.
+pub const UPDATE_CLAIM_SLOW_LOG_AFTER: Duration =
+    Duration::from_secs(UPDATE_CLAIM_TIMEOUT.as_secs() / 4);
+
+/// Back off briefly after a failed claim before asking PostgreSQL again.
+pub const UPDATE_CLAIM_RETRY_AFTER: Duration =
+    Duration::from_secs(UPDATE_CLAIM_TIMEOUT.as_secs() / 60);
+
 // Go parity: the consumer skips side effects for updates older than this. go-plotva
 // calls shouldSkipSideEffects(update, time.Minute) (internal/processor/consumer.go), so the
 // boundary is 60s — not 5 minutes. A wider window would re-handle stale backlog updates.
 pub const UPDATE_SIDE_EFFECT_MAX_AGE: Duration = Duration::from_secs(60);
 
-pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
+pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(UPDATE_CLAIM_TIMEOUT.as_secs() * 2);
 
 pub const UPDATE_WORKER_LIMIT_PER_CPU: usize = 4;
 
@@ -3502,20 +3513,21 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GoUpdateType, GuestChainMessage, GuestChainRole,
-        MAX_ENQUEUE_ERRORS, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
-        UpdateConsumerConfig, UpdateIngressDecision, UpdateIngressGuard, UpdateIngressGuardConfig,
-        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
-        UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
-        UpdateStageTracker, blocking_response_timeout, blpop_timeout_arg, build_guest_dialog_text,
-        build_guest_shield_query_text, command_connection_config, compose_image_prompt,
-        edited_image_prompt_update, extract_update_state, fetcher_message_text,
-        format_guest_chain_for_prompt, guest_current_request_text, guest_has_other_bot_mention,
-        guest_message_reject_reason, guest_request_has_visible_text, guest_visible_text,
-        is_guest_unsupported_feature_request, is_settings_command_message,
-        looks_like_guest_history_summary_request, normalize_guest_command_word, parse_edit_command,
-        parse_if_addressed, process_update_at, process_update_with_stage_tracker_at,
-        producer_update_name, producer_update_type, react_message_words,
-        resolve_draw_prompt_from_message, run_update_producer_until,
+        MAX_ENQUEUE_ERRORS, RedisUpdateQueue, TelegramMessageAttachmentOptions,
+        UPDATE_CLAIM_RETRY_AFTER, UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT,
+        UPDATE_STALL_AGE, UpdateCodecError, UpdateConsumerConfig, UpdateIngressDecision,
+        UpdateIngressGuard, UpdateIngressGuardConfig, UpdateProducerQueue,
+        UpdateProducerQueueFuture, UpdateProducerSource, UpdateProducerSourceFuture, UpdateStage,
+        UpdateStageOutcome, UpdateStageReport, UpdateStageTracker, blocking_response_timeout,
+        blpop_timeout_arg, build_guest_dialog_text, build_guest_shield_query_text,
+        command_connection_config, compose_image_prompt, edited_image_prompt_update,
+        extract_update_state, fetcher_message_text, format_guest_chain_for_prompt,
+        guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
+        guest_request_has_visible_text, guest_visible_text, is_guest_unsupported_feature_request,
+        is_settings_command_message, looks_like_guest_history_summary_request,
+        normalize_guest_command_word, parse_edit_command, parse_if_addressed, process_update_at,
+        process_update_with_stage_tracker_at, producer_update_name, producer_update_type,
+        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
@@ -3523,6 +3535,14 @@ mod tests {
         Message as TelegramMessage, MessageData as TelegramMessageData, Update as TelegramUpdate,
         UpdateType as TelegramUpdateType,
     };
+
+    #[test]
+    fn update_claim_timing_uses_one_minute_base() {
+        assert_eq!(UPDATE_CLAIM_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT / 4);
+        assert_eq!(UPDATE_CLAIM_RETRY_AFTER, UPDATE_CLAIM_TIMEOUT / 60);
+        assert_eq!(UPDATE_STALL_AGE, UPDATE_CLAIM_TIMEOUT * 2);
+    }
 
     #[test]
     fn queue_key_matches_go_update_queue() {
