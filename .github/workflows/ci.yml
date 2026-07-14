@@ -27,10 +27,10 @@ jobs:
       pull-requests: read
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@v7 # v5
 
       - name: Cache Rust toolchain
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v6 # v4
         with:
           path: |
             ~/.rustup/toolchains
@@ -44,12 +44,12 @@ jobs:
 
       - name: Setup reviewdog
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        uses: reviewdog/action-setup@v1 # v1.5.0
         with:
           reviewdog_version: v0.21.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@v2 # v2
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-workspace
 
@@ -124,7 +124,7 @@ jobs:
       OPENPLOTVA_TEST_POSTGRES_DSN: postgres://openplotva_test:openplotva_test@127.0.0.1:5432/openplotva_test
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@v7 # v5
 
       - name: Install Rust
         run: |
@@ -132,7 +132,7 @@ jobs:
           rustup default "$RUST_VERSION"
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@v2 # v2
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-postgres
 
@@ -150,10 +150,10 @@ jobs:
       pull-requests: read
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@v7 # v5
 
       - name: Cache Rust toolchain
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v6 # v4
         with:
           path: |
             ~/.rustup/toolchains
@@ -167,17 +167,17 @@ jobs:
 
       - name: Setup reviewdog
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        uses: reviewdog/action-setup@v1 # v1.5.0
         with:
           reviewdog_version: v0.21.0
 
       - name: Cache Rust dependency artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@v2 # v2
         with:
           shared-key: rust-${{ runner.os }}-${{ env.RUST_VERSION }}-dependencies
 
       - name: Cache cargo analysis tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v6 # v4
         with:
           path: |
             ~/.cargo/bin/cargo-deny
