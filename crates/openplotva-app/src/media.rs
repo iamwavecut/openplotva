@@ -684,18 +684,14 @@ pub(crate) fn genkit_openai_compatible_media_prompt_optimizer_config_from_app_co
     model: &str,
 ) -> Option<(AifarmStructuredJsonConfig, &'static str)> {
     let model = model.trim();
-    let (direct_url, api_key, model, request_timeout_seconds, provider) =
-        if let Some(model) = strip_provider_prefix_fold(model, OPENROUTER_MODEL_PREFIX) {
-            (
-                OPENROUTER_CHAT_COMPLETIONS_URL,
-                config.open_router.key.trim().to_owned(),
-                model.trim().to_owned(),
-                config.open_router.request_timeout_seconds,
-                "openrouter",
-            )
-        } else {
-            return None;
-        };
+    let model = strip_provider_prefix_fold(model, OPENROUTER_MODEL_PREFIX)?;
+    let (direct_url, api_key, model, request_timeout_seconds, provider) = (
+        OPENROUTER_CHAT_COMPLETIONS_URL,
+        config.open_router.key.trim().to_owned(),
+        model.trim().to_owned(),
+        config.open_router.request_timeout_seconds,
+        "openrouter",
+    );
     if model.is_empty() || api_key.trim().is_empty() {
         return None;
     }

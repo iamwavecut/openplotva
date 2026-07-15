@@ -25,6 +25,8 @@ services:
       RUNTIME_API_ENABLED: "true"
       RUNTIME_API_HOST: 0.0.0.0
       RUNTIME_API_PORT: 9091
+      RUNTIME_API_CERT_FILE: /home/openplotva/.plotva/runtime-api.crt
+      RUNTIME_API_KEY_FILE: /home/openplotva/.plotva/runtime-api.key
       OPENPLOTVA_CONNECT_SERVICES: "true"
       OPENPLOTVA_RUN_MIGRATIONS: "true"
       OPENPLOTVA_CONSUME_UPDATES: "true"

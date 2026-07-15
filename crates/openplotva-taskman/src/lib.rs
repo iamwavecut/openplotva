@@ -21,6 +21,7 @@ pub const DEFAULT_PRIORITY: Priority = 0;
 pub const HIGH_PRIORITY: Priority = 2;
 pub const HIGHEST_PRIORITY: Priority = 4;
 pub const ASR_PRIORITY: Priority = HIGHEST_PRIORITY + 2;
+pub const TRANSACTION_PRIORITY: Priority = ASR_PRIORITY + 2;
 pub const LOW_PRIORITY: Priority = -2;
 pub const LOWEST_PRIORITY: Priority = -4;
 
@@ -3236,16 +3237,18 @@ fn next_pending_index_matching(
         .filter(|(index, record)| {
             !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
         })
-        .filter(|(_index, record)| !image_work_blocked_by_active_asr(records, record, now))
+        .filter(|(_index, record)| {
+            !image_work_blocked_by_higher_priority_accelerator_work(records, record, now)
+        })
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
 }
 
-/// Preserve GPU-1 priority across separate ASR and draw worker queues. This is
-/// evaluated while the queue state is locked, so a draw claim cannot race an
-/// already assigned ASR job.
-fn image_work_blocked_by_active_asr(
+/// Preserve accelerator priority across separate ASR, VIP-image, and regular-
+/// image worker queues. This is evaluated while the queue state is locked, so
+/// a lower-priority draw claim cannot race already queued higher-priority work.
+fn image_work_blocked_by_higher_priority_accelerator_work(
     records: &[TaskQueueRecord],
     candidate: &TaskQueueRecord,
     now: OffsetDateTime,
@@ -3259,7 +3262,10 @@ fn image_work_blocked_by_active_asr(
     records.iter().any(|record| {
         (record.status == JobStatus::Processing
             || (record.status == JobStatus::Pending && task_queue_record_is_available(record, now)))
-            && record.job.data.job_type == JobType::Asr
+            && matches!(
+                record.job.data.job_type,
+                JobType::Asr | JobType::ImageGen | JobType::ImageEdit
+            )
             && record.job.priority > candidate.job.priority
     })
 }
@@ -4485,19 +4491,28 @@ mod tests {
         queue.complete(asr, now)?;
         assert_eq!(
             queue
-                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
-                    job.data.job_type == JobType::ImageGen
-                })
-                .map(|work| work.id),
-            Some(regular)
-        );
-        assert_eq!(
-            queue
                 .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, |job| {
                     job.data.job_type == JobType::ImageEdit
                 })
                 .map(|work| work.id),
             Some(vip)
+        );
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .is_none(),
+            "processing VIP draw must keep regular draw queued"
+        );
+        queue.complete(vip, now)?;
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(regular)
         );
         Ok(())
     }

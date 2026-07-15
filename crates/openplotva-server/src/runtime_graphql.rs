@@ -1100,7 +1100,7 @@ pub struct RuntimeLlmRequestsFilter {
     pub message_id: Option<i32>,
     /// Only traces whose result carries a non-empty error.
     pub error_only: bool,
-    /// Only traces with neither a response preview nor an error — the
+    /// Only traces with no response preview, error, or usable tool call — the
     /// silent-completion fingerprint.
     pub empty_only: bool,
     pub limit: i32,

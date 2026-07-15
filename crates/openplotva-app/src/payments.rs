@@ -33,8 +33,9 @@ use openplotva_storage::{
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-    HIGH_PRIORITY, InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem, TaskQueueIdAllocator,
-    TaskQueueRecord, control_job_params_from_stateless_job, new_control_job_at,
+    InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem, TRANSACTION_PRIORITY,
+    TaskQueueIdAllocator, TaskQueueRecord, control_job_params_from_stateless_job,
+    new_control_job_at,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -3844,7 +3845,7 @@ fn successful_payment_control_job_from_message_at(
     Some(
         new_control_job_at(params, created)
             .with_name("successful payment")
-            .with_priority(HIGH_PRIORITY),
+            .with_priority(TRANSACTION_PRIORITY),
     )
 }
 
@@ -5814,7 +5815,7 @@ fn control_job_from_message_at(
     Some(
         new_control_job_at(params, created)
             .with_name(title)
-            .with_priority(HIGH_PRIORITY),
+            .with_priority(TRANSACTION_PRIORITY),
     )
 }
 
@@ -6766,7 +6767,7 @@ mod tests {
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
         DEFAULT_PRIORITY, HIGH_PRIORITY, InMemoryTaskQueue, JobPayload, JobType, StatelessJobItem,
-        new_control_job_at,
+        TRANSACTION_PRIORITY, new_control_job_at,
     };
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
@@ -7291,7 +7292,7 @@ mod tests {
         assert_eq!(CONTROL_QUEUE_NAME, "control");
         assert_eq!(job.title, "successful payment");
         assert_eq!(job.created, created);
-        assert_eq!(job.priority, HIGH_PRIORITY);
+        assert_eq!(job.priority, TRANSACTION_PRIORITY);
         assert_eq!(job.data.job_type, JobType::Control);
         let telegram_data = job.data.telegram_data.as_ref().expect("Telegram data");
         assert_eq!(telegram_data.chat_id, 42);
@@ -7396,7 +7397,7 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "successful payment");
-        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(assigned[0].1.priority, TRANSACTION_PRIORITY);
         assert_eq!(
             assigned[0]
                 .1
@@ -7476,7 +7477,7 @@ mod tests {
 
         assert_eq!(job.title, "vip invoice");
         assert_eq!(job.created, created);
-        assert_eq!(job.priority, HIGH_PRIORITY);
+        assert_eq!(job.priority, TRANSACTION_PRIORITY);
         assert_eq!(job.data.job_type, JobType::Control);
         let telegram_data = job.data.telegram_data.as_ref().expect("Telegram data");
         assert_eq!(telegram_data.chat_id, 42);
@@ -8732,7 +8733,7 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "donate invoice");
-        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(assigned[0].1.priority, TRANSACTION_PRIORITY);
         let control_data = assigned[0]
             .1
             .data
@@ -10457,7 +10458,7 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "successful payment");
-        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(assigned[0].1.priority, TRANSACTION_PRIORITY);
         let telegram = assigned[0]
             .1
             .data
@@ -10541,7 +10542,7 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "donate invoice");
-        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(assigned[0].1.priority, TRANSACTION_PRIORITY);
         let control = assigned[0]
             .1
             .data
@@ -10613,7 +10614,7 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "vip invoice");
-        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(assigned[0].1.priority, TRANSACTION_PRIORITY);
         let control = assigned[0]
             .1
             .data
