@@ -260,6 +260,32 @@ pub fn memory_retrieval_limits(req: &openplotva_memory::RetrievalRequest) -> Mem
     }
 }
 
+const MEMORY_LEXICAL_QUERY_MAX_TERMS: usize = 64;
+const MEMORY_LEXICAL_QUERY_MAX_BYTES: usize = 2_048;
+
+fn bounded_memory_lexical_query(query: &str) -> String {
+    let mut bounded = String::new();
+    for term in query
+        .split_whitespace()
+        .take(MEMORY_LEXICAL_QUERY_MAX_TERMS)
+    {
+        let separator = usize::from(!bounded.is_empty());
+        if bounded
+            .len()
+            .saturating_add(separator)
+            .saturating_add(term.len())
+            > MEMORY_LEXICAL_QUERY_MAX_BYTES
+        {
+            break;
+        }
+        if separator == 1 {
+            bounded.push(' ');
+        }
+        bounded.push_str(term);
+    }
+    bounded
+}
+
 #[must_use]
 pub fn memory_card_upsert_params(
     card: openplotva_memory::CardInput,
@@ -1387,11 +1413,11 @@ pub const SQL_RESTORE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'act
 
 pub const SQL_SOFT_DELETE_VISIBLE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'deleted', deleted_at = CURRENT_TIMESTAMP, deleted_by_user_id = $1, updated_at = CURRENT_TIMESTAMP, retracted_at = CURRENT_TIMESTAMP WHERE id = $2 AND status <> 'deleted' AND ((visibility = 'chat' AND chat_id = $3 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $3 AND thread_id = $4 AND $4 <> 0) OR (visibility = 'chat_user' AND chat_id = $3 AND user_id = $5) OR (visibility = 'private_chat' AND chat_id = $3 AND user_id = $5) OR (visibility = 'public_user' AND user_id = $5 AND ($6::bool OR portable OR origin_chat_id = $3)))";
 
-pub const SQL_RETRIEVE_MEMORY_CARDS_LEXICAL: &str = "WITH q AS (SELECT websearch_to_tsquery('simple', $1) AS tsq) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.45 * ts_rank_cd(text_search, q.tsq) + 0.20 * salience + 0.20 * confidence + 0.15 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND text_search @@ q.tsq AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY score DESC, updated_at DESC LIMIT $6";
+pub const SQL_RETRIEVE_MEMORY_CARDS_LEXICAL: &str = "WITH q AS (SELECT plainto_tsquery('simple', $1) AS tsq) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.45 * ts_rank_cd(text_search, q.tsq) + 0.20 * salience + 0.20 * confidence + 0.15 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND text_search @@ q.tsq AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY score DESC, updated_at DESC LIMIT $6";
 
 pub const SQL_RETRIEVE_MEMORY_CARDS_VECTOR: &str = "WITH q AS (SELECT $1::vector AS embedding) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.50 * (1 - (memory_cards.embedding <=> q.embedding)) + 0.20 * salience + 0.20 * confidence + 0.10 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND memory_cards.embedding IS NOT NULL AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY memory_cards.embedding <=> q.embedding LIMIT $6";
 
-pub const SQL_RETRIEVE_MEMORY_EPISODES: &str = "WITH q AS (SELECT websearch_to_tsquery('simple', $1) AS tsq) SELECT id, visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, created_at FROM memory_episodes, q WHERE chat_id = $2 AND (thread_id = 0 OR thread_id = $3) AND text_search @@ q.tsq ORDER BY ts_rank_cd(text_search, q.tsq) DESC, range_end_at DESC LIMIT $4";
+pub const SQL_RETRIEVE_MEMORY_EPISODES: &str = "WITH q AS (SELECT plainto_tsquery('simple', $1) AS tsq) SELECT id, visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, created_at FROM memory_episodes, q WHERE chat_id = $2 AND (thread_id = 0 OR thread_id = $3) AND text_search @@ q.tsq ORDER BY ts_rank_cd(text_search, q.tsq) DESC, range_end_at DESC LIMIT $4";
 
 pub const SQL_CREATE_SHIELD_DOCUMENT: &str = "INSERT INTO shield_documents (slug, title, body, category, enabled, priority, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7::vector) RETURNING id, slug, title, body, category, enabled, priority, created_at, updated_at";
 
@@ -5995,8 +6021,9 @@ impl PostgresMemoryStore {
         query: &str,
         limit: i32,
     ) -> Result<Vec<ScoredMemoryCard>, StorageError> {
+        let query = bounded_memory_lexical_query(query);
         let rows = sqlx::query(SQL_RETRIEVE_MEMORY_CARDS_LEXICAL)
-            .bind(query)
+            .bind(&query)
             .bind(scope.chat_id)
             .bind(scope.thread_id)
             .bind(scope.user_id)
@@ -6046,8 +6073,9 @@ impl PostgresMemoryStore {
         query: &str,
         limit: i32,
     ) -> Result<Vec<openplotva_memory::Episode>, StorageError> {
+        let query = bounded_memory_lexical_query(query);
         let rows = sqlx::query(SQL_RETRIEVE_MEMORY_EPISODES)
-            .bind(query)
+            .bind(&query)
             .bind(scope.chat_id)
             .bind(scope.thread_id)
             .bind(limit)
@@ -9780,6 +9808,20 @@ mod tests {
     }
 
     #[test]
+    fn memory_lexical_query_is_bounded_before_tsquery_parsing() {
+        let query = (0..100)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let bounded = super::bounded_memory_lexical_query(&query);
+
+        assert_eq!(bounded.split_whitespace().count(), 64);
+        assert!(bounded.len() <= super::MEMORY_LEXICAL_QUERY_MAX_BYTES);
+        assert!(bounded.ends_with("term63"));
+    }
+
+    #[test]
     fn memory_storage_sql_matches_go_query_contracts() {
         assert!(super::SQL_UPSERT_MEMORY_CARD_LEXICAL.contains("ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active'"));
         assert!(
@@ -9902,7 +9944,7 @@ mod tests {
             super::SQL_RETRIEVE_MEMORY_CARDS_VECTOR
                 .contains("ORDER BY memory_cards.embedding <=> q.embedding")
         );
-        assert!(super::SQL_RETRIEVE_MEMORY_EPISODES.contains("websearch_to_tsquery('simple'"));
+        assert!(super::SQL_RETRIEVE_MEMORY_EPISODES.contains("plainto_tsquery('simple'"));
         // Durability TTL: retrieval hides expired cards; upsert carries expiry.
         assert!(
             super::SQL_RETRIEVE_MEMORY_CARDS_LEXICAL

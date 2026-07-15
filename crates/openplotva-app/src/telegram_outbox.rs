@@ -571,13 +571,7 @@ async fn handle_send_error<Jobs>(
         return;
     }
 
-    if matches!(operation.delivery_policy.as_str(), "create" | "financial")
-        && !matches!(
-            class,
-            OutboundSendErrorClass::RetryableRateLimited { .. }
-                | OutboundSendErrorClass::RetryableTransient
-        )
-    {
+    if delivery_outcome_is_ambiguous(operation.delivery_policy.as_str(), class) {
         if operation.delivery_policy == "create" {
             match enqueue_ambiguity_reaction(store, operation).await {
                 Ok(true) => {
@@ -636,6 +630,11 @@ async fn handle_send_error<Jobs>(
             format!("dead-letter Telegram outbox operation: {store_error}"),
         ),
     }
+}
+
+fn delivery_outcome_is_ambiguous(delivery_policy: &str, class: OutboundSendErrorClass) -> bool {
+    matches!(delivery_policy, "create" | "financial")
+        && matches!(class, OutboundSendErrorClass::TerminalOther)
 }
 
 fn record_retry_transition(
@@ -1523,6 +1522,22 @@ mod tests {
         let first = deterministic_retry_jitter_ms("tgop:v1:abc");
         assert_eq!(first, deterministic_retry_jitter_ms("tgop:v1:abc"));
         assert!(first < 250);
+    }
+
+    #[test]
+    fn definitive_telegram_rejections_are_not_ambiguous() {
+        assert!(!delivery_outcome_is_ambiguous(
+            "create",
+            OutboundSendErrorClass::TerminalPermission,
+        ));
+        assert!(!delivery_outcome_is_ambiguous(
+            "create",
+            OutboundSendErrorClass::TerminalBadRequest,
+        ));
+        assert!(delivery_outcome_is_ambiguous(
+            "create",
+            OutboundSendErrorClass::TerminalOther,
+        ));
     }
 
     #[test]

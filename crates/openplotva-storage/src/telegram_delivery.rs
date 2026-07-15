@@ -91,21 +91,39 @@ WHERE inbox.id = $1
 const SQL_SET_LOCAL_STATEMENT_TIMEOUT: &str = "SELECT set_config('statement_timeout', $1, true)";
 
 const SQL_CLAIM_UPDATES: &str = r#"
-WITH candidates AS (
-    SELECT inbox.id
+WITH lane_heads AS MATERIALIZED (
+    SELECT lane.head_inbox_id
     FROM telegram_update_lanes AS lane
-    JOIN telegram_update_inbox AS inbox ON inbox.id = lane.head_inbox_id
     WHERE lane.head_inbox_id IS NOT NULL
-    AND (
-        (inbox.status IN ('pending', 'retry_wait') AND inbox.available_at <= statement_timestamp())
-        OR (
-            inbox.status = 'processing'
-            AND (inbox.leased_until IS NULL OR inbox.leased_until <= statement_timestamp())
+), candidates AS MATERIALIZED (
+    SELECT inbox.id
+    FROM lane_heads AS lane
+    CROSS JOIN LATERAL (
+        SELECT candidate.id, candidate.stream_ms, candidate.stream_seq,
+               candidate.bot_id
+        FROM telegram_update_inbox AS candidate
+        WHERE candidate.id = lane.head_inbox_id
+        AND (
+            (candidate.status IN ('pending', 'retry_wait')
+                AND candidate.available_at <= statement_timestamp())
+            OR (
+                candidate.status = 'processing'
+                AND (
+                    candidate.leased_until IS NULL
+                    OR candidate.leased_until <= statement_timestamp()
+                )
+            )
         )
-    )
+        OFFSET 0
+    ) AS inbox
     ORDER BY inbox.stream_ms, inbox.stream_seq, inbox.bot_id, inbox.id
-    FOR UPDATE OF lane, inbox SKIP LOCKED
     LIMIT $1
+), locked_candidates AS (
+    SELECT candidates.id
+    FROM candidates
+    JOIN telegram_update_lanes AS lane ON lane.head_inbox_id = candidates.id
+    JOIN telegram_update_inbox AS inbox ON inbox.id = candidates.id
+    FOR UPDATE OF lane, inbox SKIP LOCKED
 ), claimed AS (
     UPDATE telegram_update_inbox AS inbox
     SET status = 'processing',
@@ -115,8 +133,8 @@ WITH candidates AS (
         leased_until = statement_timestamp() + interval '90 seconds',
         processing_started_at = statement_timestamp(),
         updated_at = statement_timestamp()
-    FROM candidates
-    WHERE inbox.id = candidates.id
+    FROM locked_candidates
+    WHERE inbox.id = locked_candidates.id
     RETURNING inbox.*
 ), abandoned_attempts AS (
     UPDATE telegram_update_attempts AS attempt
@@ -1730,6 +1748,11 @@ mod tests {
     #[test]
     fn claim_sql_is_ordered_fenced_and_skip_locked() {
         assert!(SQL_CLAIM_UPDATES.contains("FROM telegram_update_lanes AS lane"));
+        assert!(SQL_CLAIM_UPDATES.contains("lane_heads AS MATERIALIZED"));
+        assert!(SQL_CLAIM_UPDATES.contains("candidates AS MATERIALIZED"));
+        assert!(SQL_CLAIM_UPDATES.contains("CROSS JOIN LATERAL"));
+        assert!(SQL_CLAIM_UPDATES.contains("candidate.id = lane.head_inbox_id"));
+        assert!(SQL_CLAIM_UPDATES.contains("OFFSET 0"));
         assert!(SQL_CLAIM_UPDATES.contains("FOR UPDATE OF lane, inbox SKIP LOCKED"));
         assert!(SQL_CLAIM_UPDATES.contains("ORDER BY inbox.stream_ms, inbox.stream_seq"));
         assert!(SQL_CLAIM_UPDATES.contains("lease_token = inbox.lease_token + 1"));

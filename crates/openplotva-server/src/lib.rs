@@ -107,6 +107,9 @@ pub struct ReadinessCheck {
     pub detail: String,
 }
 
+/// Process-local check evaluated for every readiness request.
+pub type ReadinessProbe = Arc<dyn Fn() -> ReadinessCheck + Send + Sync>;
+
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
 pub const RUNTIME_API_AUTHENTICATE_HEADER: &str = r#"Bearer realm="plotva-runtime-api""#;
@@ -725,9 +728,10 @@ fn runtime_api_pprof_text(profile: &str, note: &str) -> String {
     )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AppState {
     readiness: ReadinessResponse,
+    readiness_probes: Vec<ReadinessProbe>,
 }
 
 /// Build the HTTP router for the current app shell.
@@ -737,10 +741,21 @@ pub fn router() -> Router {
 
 /// Build the HTTP router with a startup readiness snapshot.
 pub fn router_with_readiness(readiness: ReadinessResponse) -> Router {
+    router_with_readiness_probes(readiness, Vec::new())
+}
+
+/// Build the HTTP router with startup checks plus live process-local probes.
+pub fn router_with_readiness_probes(
+    readiness: ReadinessResponse,
+    readiness_probes: Vec<ReadinessProbe>,
+) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
-        .with_state(Arc::new(AppState { readiness }))
+        .with_state(Arc::new(AppState {
+            readiness,
+            readiness_probes,
+        }))
 }
 
 /// Build the health payload without transport details.
@@ -862,6 +877,15 @@ impl ReadinessCheck {
             detail: detail.into(),
         }
     }
+
+    /// Build a failing readiness check.
+    pub fn error(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: "error",
+            detail: detail.into(),
+        }
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -869,7 +893,22 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ReadinessResponse>) {
-    (StatusCode::OK, Json(state.readiness.clone()))
+    let (status, readiness) = readiness_snapshot(&state);
+    (status, Json(readiness))
+}
+
+fn readiness_snapshot(state: &AppState) -> (StatusCode, ReadinessResponse) {
+    let mut readiness = state.readiness.clone();
+    readiness
+        .checks
+        .extend(state.readiness_probes.iter().map(|probe| probe()));
+    let status = if readiness.checks.iter().any(|check| check.status == "error") {
+        readiness.status = "error";
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (status, readiness)
 }
 
 #[cfg(test)]
@@ -949,6 +988,22 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.service, "openplotva");
         assert_eq!(response.checks.len(), 2);
+    }
+
+    #[test]
+    fn live_readiness_probe_controls_status() {
+        let state = super::AppState {
+            readiness: ReadinessResponse::ready(vec![ReadinessCheck::ok("runtime", "ready")]),
+            readiness_probes: vec![Arc::new(|| {
+                ReadinessCheck::error("materializer", "supervisor stopped")
+            })],
+        };
+
+        let (status, response) = super::readiness_snapshot(&state);
+
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "error");
+        assert_eq!(response.checks[1].name, "materializer");
     }
 
     #[test]
