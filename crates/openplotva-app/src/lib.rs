@@ -9501,9 +9501,43 @@ fn runtime_api_tls_material(
     let cert_file_present = !config.cert_file.trim().is_empty();
     let key_file_present = !config.key_file.trim().is_empty();
     if cert_file_present && key_file_present {
-        let cert_pem = std::fs::read(&config.cert_file)
+        let cert_path = std::path::Path::new(&config.cert_file);
+        let key_path = std::path::Path::new(&config.key_file);
+        let cert_exists = cert_path
+            .try_exists()
+            .with_context(|| format!("inspect runtime API certificate {}", config.cert_file))?;
+        let key_exists = key_path
+            .try_exists()
+            .with_context(|| format!("inspect runtime API private key {}", config.key_file))?;
+        if cert_exists != key_exists {
+            anyhow::bail!(
+                "runtime API TLS certificate and private key must both exist or both be absent"
+            );
+        }
+        if !cert_exists {
+            let generated = openplotva_server::generate_runtime_api_tls_material(
+                runtime_api_tls_subject_alt_names(config),
+            )
+            .context("generate persistent runtime API TLS material")?;
+            persist_runtime_api_tls_file(key_path, &generated.key_pem, true)
+                .with_context(|| format!("persist runtime API private key {}", config.key_file))?;
+            if let Err(error) = persist_runtime_api_tls_file(cert_path, &generated.cert_pem, false)
+            {
+                let _ = std::fs::remove_file(key_path);
+                return Err(error).with_context(|| {
+                    format!("persist runtime API certificate {}", config.cert_file)
+                });
+            }
+            return Ok(RuntimeApiTlsMaterial {
+                cert_pem: generated.cert_pem,
+                key_pem: generated.key_pem,
+                tls_public_key_pin: generated.tls_public_key_pin,
+                source: "generated-persisted",
+            });
+        }
+        let cert_pem = std::fs::read(cert_path)
             .with_context(|| format!("read runtime API certificate {}", config.cert_file))?;
-        let key_pem = std::fs::read(&config.key_file)
+        let key_pem = std::fs::read(key_path)
             .with_context(|| format!("read runtime API private key {}", config.key_file))?;
         let tls_public_key_pin =
             openplotva_server::runtime_api_tls_public_key_pin_from_pem(&cert_pem)
@@ -9526,6 +9560,50 @@ fn runtime_api_tls_material(
         tls_public_key_pin: generated.tls_public_key_pin,
         source: "generated",
     })
+}
+
+fn persist_runtime_api_tls_file(
+    path: &std::path::Path,
+    contents: &[u8],
+    private: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("runtime-api-tls");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if private { 0o600 } else { 0o644 });
+    }
+    let result = (|| {
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn runtime_api_tls_subject_alt_names(config: &openplotva_config::RuntimeApiConfig) -> Vec<String> {
@@ -15665,6 +15743,40 @@ mod tests {
         assert_eq!(certificate.name, "cert.pem");
         assert_eq!(certificate.bytes, b"cert-bytes");
         let _ = std::fs::remove_file(cert_path);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_api_reuses_generated_tls_material_from_persistent_paths()
+    -> Result<(), Box<dyn Error>> {
+        let cert_path = unique_temp_file("openplotva-runtime-api.crt");
+        let key_path = unique_temp_file("openplotva-runtime-api.key");
+        let config = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            runtime_api_enabled: Some("true".to_owned()),
+            runtime_api_cert_file: Some(cert_path.to_string_lossy().into_owned()),
+            runtime_api_key_file: Some(key_path.to_string_lossy().into_owned()),
+            ..openplotva_config::RawConfig::default()
+        })?;
+
+        let generated = super::runtime_api_tls_material(&config.runtime_api)?;
+        let reloaded = super::runtime_api_tls_material(&config.runtime_api)?;
+
+        assert_eq!(generated.source, "generated-persisted");
+        assert_eq!(reloaded.source, "configured");
+        assert_eq!(generated.cert_pem, reloaded.cert_pem);
+        assert_eq!(generated.key_pem, reloaded.key_pem);
+        assert_eq!(generated.tls_public_key_pin, reloaded.tls_public_key_pin);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
         Ok(())
     }
 

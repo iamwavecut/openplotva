@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,6 +129,7 @@ impl RoutedAttemptWalker {
         let mut failed_attempts = 0usize;
         let mut last_reason = None;
         let mut deadline_cut = false;
+        let mut attempted_targets = HashSet::new();
 
         // Selection-pass loop: walk a fresh chain, skipping candidates whose
         // capacity pool is full. A busy skip touches neither the breaker nor
@@ -189,6 +191,9 @@ impl RoutedAttemptWalker {
             let mut quota_skips = 0usize;
             let mut executed_this_pass = 0usize;
             for attempt in attempts {
+                if attempted_targets.contains(&(attempt.provider, attempt.model)) {
+                    continue;
+                }
                 if started.elapsed().saturating_sub(total_slot_wait) > route.retry.wall_clock {
                     break 'passes;
                 }
@@ -259,6 +264,7 @@ impl RoutedAttemptWalker {
                         .unwrap_or_else(|| attempt.overrides.clone()),
                     variant: attempt.variant.clone(),
                 };
+                attempted_targets.insert((routed.provider_id, routed.model_id));
                 last_provider_model = Some((routed.provider_id, routed.model_id));
                 started_attempts += 1;
                 executed_this_pass += 1;
@@ -323,6 +329,18 @@ impl RoutedAttemptWalker {
                             attempt.model,
                             attempt.breaker,
                         );
+                        self.record_event(routing_event_with_severity(
+                            "attempt_failed",
+                            "warn",
+                            &context,
+                            Some(attempt.provider),
+                            Some(attempt.model),
+                            "routed provider attempt failed",
+                            json!({
+                                "attempt": failed_attempts + 1,
+                                "retryable_reason": reason.as_str(),
+                            }),
+                        ));
                         if reason == FailureReason::CapacityUnavailable
                             && let Some(cooldown) =
                                 provider_capacity_cooldown(route, attempt.provider, attempt.model)
@@ -1204,6 +1222,55 @@ mod tests {
 
         assert_eq!(output, "ok");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_target_is_not_reselected_while_fallback_pool_is_busy() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.assignments[0].weight = Some(100);
+        snapshot.assignments[1].role = "fallback".to_owned();
+        snapshot.assignments[1].weight = None;
+        snapshot.assignments[1].fallback_order = Some(1);
+        snapshot.models[0].pool_id = None;
+        snapshot.models[1].pool_id = Some(1);
+
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let busy_fallback = pools.try_acquire(Some(1)).expect("occupy fallback pool");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(busy_fallback);
+        });
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executed_models = Arc::clone(&executed);
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let executed_models = Arc::clone(&executed_models);
+                    async move {
+                        executed_models
+                            .lock()
+                            .expect("models")
+                            .push(attempt.model_id);
+                        if attempt.model_id == 10 {
+                            Err(std::io::Error::other("primary protocol failure"))
+                        } else {
+                            Ok("fallback")
+                        }
+                    }
+                },
+                |_error| Some(FailureReason::ProviderProtocolError),
+            )
+            .await
+            .expect("fallback must run after its pool is released");
+
+        assert_eq!(output, "fallback");
+        assert_eq!(*executed.lock().expect("models"), vec![10, 20]);
     }
 
     #[tokio::test(start_paused = true)]

@@ -1603,6 +1603,24 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ambiguity_migration_is_narrow_and_updates_rollups() {
+        const MIGRATION: &str =
+            include_str!("../../../migrations/175_reconcile_terminal_outbox_ambiguity.up.sql");
+
+        assert!(MIGRATION.contains("state = 'ambiguous'"));
+        assert!(MIGRATION.contains("'terminal_permission'"));
+        assert!(MIGRATION.contains("'terminal_bad_request'"));
+        assert!(MIGRATION.contains("leave terminal_other untouched"));
+        assert!(
+            MIGRATION
+                .contains("last_error_class IN ('terminal_permission', 'terminal_bad_request')")
+        );
+        assert!(MIGRATION.contains("UPDATE telegram_outbox_attempts"));
+        assert!(MIGRATION.contains("UPDATE dialog_turn_outcomes"));
+        assert!(MIGRATION.contains("outcome.outcome = 'queued_for_delivery'"));
+    }
+
+    #[test]
     fn same_hash_with_different_bytes_is_rejected_before_sql() {
         let mut input = batch("blob-conflict", 2);
         let hash = vec![7; 32];

@@ -533,7 +533,9 @@ mod tests {
         time::Duration,
     };
 
-    use openplotva_taskman::{ControlJobData, ControlJobParams, HIGH_PRIORITY, new_control_job_at};
+    use openplotva_taskman::{
+        ControlJobData, ControlJobParams, HIGH_PRIORITY, TRANSACTION_PRIORITY, new_control_job_at,
+    };
 
     use super::*;
     use crate::payments::{InMemoryPaymentControlJobStatus, PaymentControlJobQueue};
@@ -587,6 +589,43 @@ mod tests {
             snapshot_record(&snapshot, low_id).status,
             InMemoryPaymentControlJobStatus::Pending
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transactional_control_job_overtakes_older_membership_sync()
+    -> Result<(), Box<dyn Error>> {
+        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        queue
+            .assign_payment_control_job(
+                CONTROL_QUEUE_NAME,
+                control_job(ControlKind::ChatMemberSync, now, HIGH_PRIORITY),
+            )
+            .await?;
+        queue
+            .assign_payment_control_job(
+                CONTROL_QUEUE_NAME,
+                control_job(
+                    ControlKind::SuccessfulPayment,
+                    now + Duration::from_secs(1),
+                    TRANSACTION_PRIORITY,
+                ),
+            )
+            .await?;
+
+        let item = queue
+            .dequeue_shared_control_job_matching(
+                CONTROL_QUEUE_NAME,
+                "priority-test",
+                is_control_job,
+            )
+            .await?
+            .expect("transactional job");
+        let params = control_job_params_from_stateless_job(&item.job)?;
+
+        assert_eq!(params.data.kind, ControlKind::SuccessfulPayment);
+        assert_eq!(item.job.priority, TRANSACTION_PRIORITY);
         Ok(())
     }
 

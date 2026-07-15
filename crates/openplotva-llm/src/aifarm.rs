@@ -2881,8 +2881,11 @@ mod call_trace_artifact_tests {
 
 fn aifarm_step_error_with_trace(
     error: CompletionError,
-    trace: DialogTraceArtifacts,
+    mut trace: DialogTraceArtifacts,
 ) -> CompletionError {
+    if trace.error.trim().is_empty() {
+        trace.error = error.to_string();
+    }
     Box::new(DialogTraceError::new(error, vec![trace]))
 }
 
@@ -4274,7 +4277,7 @@ fn extract_final_answer_for_provider(
         Ok(answer) => Ok(answer),
         Err(err) if is_retryable_final_answer_error(&err) => Err(Box::new(ProviderError::new(
             provider,
-            FailureReason::ProviderUnavailable,
+            FailureReason::ProviderProtocolError,
             err.to_string(),
         ))),
         Err(err) => Err(Box::new(err)),
@@ -6836,8 +6839,21 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderUnavailable)
+            Some(FailureReason::ProviderProtocolError)
         );
+    }
+
+    #[test]
+    fn step_error_stamps_the_trace_artifact() {
+        let error = aifarm_step_error_with_trace(
+            Box::new(std::io::Error::other("transport failed")),
+            DialogTraceArtifacts::default(),
+        );
+        let traced = error
+            .downcast_ref::<DialogTraceError>()
+            .expect("trace wrapper");
+
+        assert_eq!(traced.trace_events()[0].error, "transport failed");
     }
 
     #[test]
@@ -6858,7 +6874,7 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderUnavailable)
+            Some(FailureReason::ProviderProtocolError)
         );
         assert!(
             err.to_string().contains("reasoning without final content"),

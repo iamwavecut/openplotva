@@ -1354,7 +1354,11 @@ fn llm_trace_matches_filter(
                     .as_deref()
                     .unwrap_or_default()
                     .trim()
-                    .is_empty()))
+                    .is_empty()
+                && !trace
+                    .raw_response
+                    .as_ref()
+                    .is_some_and(trace_response_has_tool_calls)))
         && (filter.q.is_empty() || llm_trace_matches_query(trace, &filter.q))
 }
 
@@ -1415,6 +1419,48 @@ fn trace_response_text(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn trace_response_has_tool_calls(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(trace_response_has_tool_calls),
+        Value::Object(map) => {
+            for key in ["tool_calls", "toolCalls"] {
+                if map.get(key).is_some_and(tool_call_container_is_usable) {
+                    return true;
+                }
+            }
+            for key in ["function_call", "functionCall"] {
+                if map.get(key).is_some_and(tool_call_is_usable) {
+                    return true;
+                }
+            }
+            map.values().any(trace_response_has_tool_calls)
+        }
+        _ => false,
+    }
+}
+
+fn tool_call_container_is_usable(value: &Value) -> bool {
+    match value {
+        Value::Array(calls) => calls.iter().any(tool_call_is_usable),
+        call => tool_call_is_usable(call),
+    }
+}
+
+fn tool_call_is_usable(value: &Value) -> bool {
+    let Some(call) = value.as_object() else {
+        return false;
+    };
+    call.get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.trim().is_empty())
+        || call
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
 }
 
 fn compact_preview(value: &str, limit: usize) -> String {
@@ -1731,6 +1777,46 @@ mod tests {
             })
             .expect("trace list after rerecord");
         assert_eq!(traces[0].id, 3);
+    }
+
+    #[test]
+    fn empty_only_excludes_successful_tool_call_completions() {
+        let buffer = RuntimeLlmTraceBuffer::new(4);
+        buffer.record(RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            raw_response: Some(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"q\":\"status\"}"
+                            }
+                        }]
+                    }
+                }]
+            })),
+            ..RuntimeLlmRequestData::default()
+        });
+        buffer.record(RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            raw_response: Some(json!({"choices": [{"message": {"content": null}}]})),
+            ..RuntimeLlmRequestData::default()
+        });
+
+        let traces = buffer
+            .llm_requests(RuntimeLlmRequestsFilter {
+                empty_only: true,
+                limit: 100,
+                ..RuntimeLlmRequestsFilter::default()
+            })
+            .expect("empty traces");
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].id, 2);
     }
 
     #[test]
