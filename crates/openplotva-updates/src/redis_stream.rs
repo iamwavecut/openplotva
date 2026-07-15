@@ -529,7 +529,7 @@ impl RedisUpdateStream {
         owner: &str,
         ttl: Duration,
     ) -> Result<bool, UpdateStreamError> {
-        let mut connection = self.connections.command_connection().await?;
+        let mut connection = self.connections.lease_connection().await?;
         let result: Option<String> = redis::cmd("SET")
             .arg(&self.materializer_lease_key)
             .arg(owner)
@@ -547,7 +547,7 @@ impl RedisUpdateStream {
         owner: &str,
         ttl: Duration,
     ) -> Result<bool, UpdateStreamError> {
-        let mut connection = self.connections.command_connection().await?;
+        let mut connection = self.connections.lease_connection().await?;
         let renewed: i64 = redis::cmd("EVAL")
             .arg(RENEW_MATERIALIZER_LEASE_SCRIPT)
             .arg(1)
@@ -561,7 +561,7 @@ impl RedisUpdateStream {
 
     /// Best-effort compare-and-delete on orderly shutdown.
     pub async fn release_materializer_lease(&self, owner: &str) -> Result<bool, UpdateStreamError> {
-        let mut connection = self.connections.command_connection().await?;
+        let mut connection = self.connections.lease_connection().await?;
         let released: i64 = redis::cmd("EVAL")
             .arg(RELEASE_MATERIALIZER_LEASE_SCRIPT)
             .arg(1)

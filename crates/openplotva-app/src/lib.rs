@@ -104,7 +104,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{Stream, stream};
 use openplotva_config::AppConfig;
-use openplotva_server::{ReadinessCheck, ReadinessResponse};
+use openplotva_server::{ReadinessCheck, ReadinessProbe, ReadinessResponse};
 use openplotva_storage::{
     PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
     PostgresPaymentStore, PostgresRuntimeTokenStore, PostgresRuntimeVirtualDialogStore,
@@ -157,6 +157,7 @@ struct RuntimeWorkers {
     openrouter_free_gate: Option<Arc<openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     router_runtime: Option<Arc<model_routing::RouterRuntime>>,
     dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
+    readiness_probes: Vec<ReadinessProbe>,
 }
 
 struct DispatcherRuntime {
@@ -663,6 +664,7 @@ fn memory_token_estimator_source(config: &AppConfig) -> String {
 pub fn router() -> axum::Router {
     router_with_readiness_and_static_web(
         ReadinessResponse::ready(Vec::new()),
+        Vec::new(),
         static_web_routes(Vec::new(), "", "", "", None),
     )
 }
@@ -680,6 +682,7 @@ pub fn router_with_readiness_and_telegram_webhook(
 
     router_with_readiness_static_web_and_telegram_webhook_route(
         readiness,
+        Vec::new(),
         static_web_routes(Vec::new(), "", "", "", None),
         route,
     )
@@ -687,20 +690,22 @@ pub fn router_with_readiness_and_telegram_webhook(
 
 fn router_with_readiness_and_static_web(
     readiness: ReadinessResponse,
+    readiness_probes: Vec<ReadinessProbe>,
     static_web: StaticWebRoutes,
 ) -> axum::Router {
     install_static_web_routes(
-        openplotva_server::router_with_readiness(readiness),
+        openplotva_server::router_with_readiness_probes(readiness, readiness_probes),
         static_web,
     )
 }
 
 fn router_with_readiness_static_web_and_telegram_webhook_route(
     readiness: ReadinessResponse,
+    readiness_probes: Vec<ReadinessProbe>,
     static_web: StaticWebRoutes,
     route: TelegramWebhookRoute,
 ) -> axum::Router {
-    router_with_readiness_and_static_web(readiness, static_web)
+    router_with_readiness_and_static_web(readiness, readiness_probes, static_web)
         .route(
             openplotva_telegram::TELEGRAM_WEBHOOK_PATH,
             any(telegram_webhook).layer(DefaultBodyLimit::max(TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES)),
@@ -8809,11 +8814,16 @@ pub async fn run() -> anyhow::Result<()> {
     let app = if let Some(webhook_route) = runtime_workers.webhook_route.clone() {
         router_with_readiness_static_web_and_telegram_webhook_route(
             readiness,
+            runtime_workers.readiness_probes.clone(),
             static_web,
             webhook_route,
         )
     } else {
-        router_with_readiness_and_static_web(readiness, static_web)
+        router_with_readiness_and_static_web(
+            readiness,
+            runtime_workers.readiness_probes.clone(),
+            static_web,
+        )
     };
 
     let serve_result = axum::serve(listener, app)
@@ -9694,6 +9704,7 @@ async fn start_runtime_workers(
         openrouter_free_gate: None,
         router_runtime: None,
         dialog_worker_gauge: None,
+        readiness_probes: Vec::new(),
     };
     let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
     let (routing_event_recorder, routing_event_recorder_worker) =
@@ -12524,6 +12535,27 @@ async fn start_runtime_workers(
             service_clients.postgres.clone(),
         );
         let materializer_metrics = update_materializer::UpdateMaterializerMetrics::default();
+        let readiness_metrics = materializer_metrics.clone();
+        workers.readiness_probes.push(Arc::new(move || {
+            let snapshot = readiness_metrics.snapshot();
+            if snapshot.supervisor_running {
+                ReadinessCheck::ok(
+                    "telegram_update_materializer_live",
+                    format!(
+                        "supervisor running; lease held={}; {} restarts",
+                        snapshot.lease_held, snapshot.supervisor_restarts
+                    ),
+                )
+            } else {
+                ReadinessCheck::error(
+                    "telegram_update_materializer_live",
+                    format!(
+                        "supervisor is not running; {} restarts",
+                        snapshot.supervisor_restarts
+                    ),
+                )
+            }
+        }));
         updates_inspector.set_stream_plane(
             update_stream.clone(),
             service_clients.postgres.clone(),
@@ -12532,17 +12564,17 @@ async fn start_runtime_workers(
         let materializer_bot_id = bot_identity.id;
         let materializer_stop = stop.subscribe();
         let materializer_worker = tokio::spawn(async move {
-            match update_materializer::run_update_materializer_with_metrics_until(
+            match update_materializer::run_supervised_update_materializer_until(
                 materializer_stream,
                 materializer_store,
                 materializer_bot_id,
                 materializer_config,
                 materializer_metrics,
-                wait_for_runtime_stop(materializer_stop),
+                materializer_stop,
             )
             .await
             {
-                Ok(report) => tracing::info!(?report, "Telegram update bulk materializer stopped"),
+                Ok(()) => tracing::info!("Telegram update bulk materializer supervisor stopped"),
                 Err(error) => {
                     tracing::error!(%error, "Telegram update bulk materializer configuration rejected")
                 }
@@ -12552,7 +12584,7 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_materializer",
             format!(
-                "Redis Stream bulk materializer started ({} rows, {} bytes)",
+                "Redis Stream bulk materializer supervisor started ({} rows, {} bytes)",
                 config.update_queue.materializer_batch_max_rows,
                 config.update_queue.materializer_batch_max_bytes,
             ),
@@ -13042,6 +13074,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         openrouter_free_gate: _,
         router_runtime: _,
         dialog_worker_gauge: _,
+        readiness_probes: _,
     } = workers;
 
     if let Some(stop) = stop {

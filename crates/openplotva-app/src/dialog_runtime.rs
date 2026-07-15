@@ -262,6 +262,11 @@ impl ChatStepProvider for RouterChatProvider {
     fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> ChatStepFuture<'a> {
         Box::pin(async move {
             let request_for_attempts = request.clone();
+            let required_capabilities = if request.input.multimodal_images.is_empty() {
+                Vec::new()
+            } else {
+                vec!["vision".to_owned()]
+            };
             let factory = Arc::clone(&self.factory);
             let result = self
                 .walker
@@ -276,6 +281,7 @@ impl ChatStepProvider for RouterChatProvider {
                             .then_some(request.input.message.id),
                         deadline: crate::dialog_turn::current_turn_deadline(),
                         suppress_all_attempts_exhausted_admin_report: true,
+                        required_capabilities,
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {

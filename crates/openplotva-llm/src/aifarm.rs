@@ -4307,11 +4307,6 @@ fn final_answer_error_from_suppression(
 
 fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
     let message = first_choice_message_value(response)?;
-    if first_choice_finish_reason(response).eq_ignore_ascii_case("length") {
-        return Err(AifarmDialogError::ReasoningBudgetExhausted {
-            reasoning_chars: first_choice_reasoning_len(message),
-        });
-    }
     let content = message
         .get("content")
         .and_then(Value::as_str)
@@ -4323,7 +4318,9 @@ fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
         // reasoning-only completion is a budget problem, not a protocol one:
         // classify it so retries reselect a backend with headroom.
         let reasoning_chars = first_choice_reasoning_len(message);
-        if reasoning_chars > 0 {
+        if reasoning_chars > 0
+            || first_choice_finish_reason(response).eq_ignore_ascii_case("length")
+        {
             return Err(AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars });
         }
         return Err(AifarmDialogError::Response(
@@ -6886,6 +6883,22 @@ mod tests {
             err,
             AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars: 0 }
         ));
+    }
+
+    #[test]
+    fn length_truncated_completion_preserves_nonempty_final_content() {
+        let answer = extract_final_answer(&json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "A complete answer that reached the output limit.",
+                    "reasoning_content": "internal reasoning"
+                }
+            }]
+        }))
+        .expect("nonempty final content must remain usable");
+
+        assert_eq!(answer, "A complete answer that reached the output limit.");
     }
 
     #[test]

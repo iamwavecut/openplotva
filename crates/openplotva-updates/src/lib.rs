@@ -295,6 +295,7 @@ pub struct RedisUpdateQueue {
 struct RedisUpdateConnections {
     client: RedisClient,
     commands: Arc<OnceCell<ConnectionManager>>,
+    leases: Arc<OnceCell<ConnectionManager>>,
 }
 
 /// Margin added to the client-side response timeout of a blocking read so the
@@ -302,6 +303,7 @@ struct RedisUpdateConnections {
 const BLOCKING_RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REDIS_UPDATE_COMMAND_CLIENT_NAME: &str = "openplotva:updates:commands";
+const REDIS_UPDATE_LEASE_CLIENT_NAME: &str = "openplotva:updates:leases";
 const REDIS_UPDATE_BLOCKING_CLIENT_NAME: &str = "openplotva:updates:blocking";
 /// Cap on retained enqueue-error strings per producer run so a sustained queue
 /// outage cannot grow the report without bound.
@@ -332,7 +334,22 @@ impl RedisUpdateConnections {
         Self {
             client,
             commands: Arc::new(OnceCell::new()),
+            leases: Arc::new(OnceCell::new()),
         }
+    }
+
+    async fn lease_connection(&self) -> redis::RedisResult<ConnectionManager> {
+        self.leases
+            .get_or_try_init(|| async {
+                let mut connection = self
+                    .client
+                    .get_connection_manager_with_config(command_connection_config())
+                    .await?;
+                set_redis_client_name(&mut connection, REDIS_UPDATE_LEASE_CLIENT_NAME).await?;
+                Ok(connection)
+            })
+            .await
+            .cloned()
     }
 
     async fn command_connection(&self) -> redis::RedisResult<ConnectionManager> {

@@ -1,0 +1,7 @@
+UPDATE provider_models AS model
+SET capabilities = array_append(model.capabilities, 'vision')
+FROM llm_providers AS provider
+WHERE provider.id = model.provider_id
+  AND provider.name = 'aifarm-llamacpp-gpu2'
+  AND model.model_name = 'qwen3.6-27b-moq'
+  AND NOT model.capabilities @> ARRAY['vision'];

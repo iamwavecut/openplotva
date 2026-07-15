@@ -32,6 +32,8 @@ const MATERIALIZER_EMPTY_FILL_POLL_INTERVAL: Duration = Duration::from_millis(1)
 const MATERIALIZER_LEASE_TTL: Duration = Duration::from_secs(60);
 const MATERIALIZER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 const MATERIALIZER_LEASE_ACQUIRE_RECHECK: Duration = Duration::from_secs(1);
+const MATERIALIZER_SUPERVISOR_RESTART_DELAY: Duration =
+    Duration::from_secs(MATERIALIZER_LEASE_TTL.as_secs() / 60);
 
 static MATERIALIZER_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -47,6 +49,9 @@ fn materializer_owner_consumer_id(bot_id: i64) -> String {
 /// Point-in-time counters and last-batch gauges exposed to runtime diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UpdateMaterializerMetricsSnapshot {
+    pub supervisor_running: bool,
+    pub lease_held: bool,
+    pub supervisor_restarts: u64,
     pub batch_rows: usize,
     pub batch_bytes: usize,
     /// Utilization of whichever configured row/byte limit is closer to full.
@@ -87,6 +92,20 @@ impl UpdateMaterializerMetrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         update(&mut snapshot);
+    }
+
+    fn set_lease_held(&self, lease_held: bool) {
+        self.update(|snapshot| snapshot.lease_held = lease_held);
+    }
+
+    fn set_supervisor_running(&self, supervisor_running: bool) {
+        self.update(|snapshot| snapshot.supervisor_running = supervisor_running);
+    }
+
+    fn record_supervisor_restart(&self) {
+        self.update(|snapshot| {
+            snapshot.supervisor_restarts = snapshot.supervisor_restarts.saturating_add(1);
+        });
     }
 
     fn record_batch(&self, rows: usize, bytes: usize, max_rows: usize, max_bytes: usize) {
@@ -212,6 +231,72 @@ where
     .await
 }
 
+/// Keep the materializer available across transient lease-heartbeat failures.
+///
+/// The inner worker stops before its lease can expire whenever renewal becomes
+/// ambiguous. The supervisor then starts a fresh owner which must acquire the
+/// Redis lease before it can resume materialization.
+pub async fn run_supervised_update_materializer_until(
+    stream: RedisUpdateStream,
+    store: PostgresTelegramDeliveryStore,
+    bot_id: i64,
+    config: UpdateStreamMaterializerConfig,
+    metrics: UpdateMaterializerMetrics,
+    stop: watch::Receiver<bool>,
+) -> Result<(), UpdateStreamConfigError> {
+    config.validate()?;
+    metrics.set_supervisor_running(true);
+    let _running = MaterializerSupervisorRunning(metrics.clone());
+    loop {
+        let report = run_update_materializer_with_metrics_until(
+            stream.clone(),
+            store.clone(),
+            bot_id,
+            config,
+            metrics.clone(),
+            wait_for_stop(stop.clone()),
+        )
+        .await?;
+        if *stop.borrow() || report.last_error.is_none() {
+            return Ok(());
+        }
+
+        metrics.record_supervisor_restart();
+        tracing::warn!(
+            error = report.last_error.as_deref().unwrap_or_default(),
+            restart_delay_ms = MATERIALIZER_SUPERVISOR_RESTART_DELAY.as_millis(),
+            "restarting Telegram update materializer after transient lease failure"
+        );
+        if sleep_or_watch_stop(stop.clone(), MATERIALIZER_SUPERVISOR_RESTART_DELAY).await {
+            return Ok(());
+        }
+    }
+}
+
+struct MaterializerSupervisorRunning(UpdateMaterializerMetrics);
+
+impl Drop for MaterializerSupervisorRunning {
+    fn drop(&mut self) {
+        self.0.set_supervisor_running(false);
+        self.0.set_lease_held(false);
+    }
+}
+
+async fn wait_for_stop(mut stop: watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() || stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn sleep_or_watch_stop(stop: watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        () = wait_for_stop(stop.clone()) => true,
+    }
+}
+
 /// Run one active materializer while publishing live runtime metrics.
 pub async fn run_update_materializer_with_metrics_until<Stop>(
     stream: RedisUpdateStream,
@@ -292,6 +377,7 @@ where
         lease_renew_seconds = MATERIALIZER_LEASE_RENEW_INTERVAL.as_secs(),
         "acquired the active Telegram update materializer lease"
     );
+    metrics.set_lease_held(true);
 
     let (lease_lost_tx, lease_lost_observer) = watch::channel(false);
     let lease_heartbeat = tokio::spawn(run_materializer_lease_heartbeat(
@@ -514,6 +600,7 @@ where
             );
         }
     }
+    metrics.set_lease_held(false);
     match stream.release_materializer_lease(&owner_consumer_id).await {
         Ok(true) => tracing::debug!(
             stream_key = stream.key(),

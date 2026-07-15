@@ -140,6 +140,15 @@ impl RoutedAttemptWalker {
                 let liveness = BreakerLiveness::new(&self.breakers, selection_now);
                 let mut rng = rand::rng();
                 select_chain(route, &liveness, self.triggers.as_ref(), &mut rng)
+                    .into_iter()
+                    .filter(|attempt| {
+                        context.required_capabilities.iter().all(|capability| {
+                            table
+                                .model(attempt.model)
+                                .is_some_and(|model| model.has_capability(capability))
+                        })
+                    })
+                    .collect::<Vec<_>>()
             };
             if attempts.is_empty() {
                 self.record_event(routing_event(
@@ -148,7 +157,10 @@ impl RoutedAttemptWalker {
                     None,
                     None,
                     "workflow route has no eligible candidates",
-                    json!({ "reason": "zero_selected_attempts" }),
+                    json!({
+                        "reason": "zero_selected_attempts",
+                        "required_capabilities": &context.required_capabilities,
+                    }),
                 ));
                 return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
                     RoutedRoutingErrorKind::NoCandidates,
@@ -511,6 +523,8 @@ pub struct RoutedRequestContext {
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub vip: bool,
+    /// Capabilities every selected provider model must advertise.
+    pub required_capabilities: Vec<String>,
     /// The walker will not start an attempt at or past this instant, so one
     /// call cannot overshoot the caller's turn budget by a full attempt.
     pub deadline: Option<Instant>,
@@ -831,6 +845,34 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events[0].event_type, "route_unavailable");
+    }
+
+    #[tokio::test]
+    async fn walker_excludes_models_without_required_capabilities() {
+        let walker = walker_for(snapshot(json!({}), json!({})));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    required_capabilities: vec!["vision".to_owned()],
+                    ..RoutedRequestContext::default()
+                },
+                move |_attempt| {
+                    let call_count = Arc::clone(&call_count);
+                    async move {
+                        call_count.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>("unused")
+                    }
+                },
+                |_error| None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

@@ -19,6 +19,9 @@ use sqlx::{PgPool, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const UPDATE_STALL_LOG_INTERVAL: Duration = UPDATE_CLAIM_TIMEOUT;
+const POSTGRES_RUNTIME_STATS_TIMEOUT: Duration = Duration::from_secs(2);
+const POSTGRES_RUNTIME_STATS_RECENT_ROWS: i64 = 5_000;
+const POSTGRES_RUNTIME_STATS_TASK_ROWS: i64 = 500;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeUpdatesInspectorHandle {
@@ -143,6 +146,10 @@ impl RuntimeUpdatesInspector for RuntimeUpdatesInspectorHandle {
                     }
                 }
                 let materializer = stream_plane.materializer.snapshot();
+                snapshot.materializer_supervisor_running = materializer.supervisor_running;
+                snapshot.materializer_lease_held = materializer.lease_held;
+                snapshot.materializer_supervisor_restarts =
+                    u64_to_i64(materializer.supervisor_restarts);
                 snapshot.materializer_batch_rows =
                     materializer.batch_rows.min(i32::MAX as usize) as i32;
                 snapshot.materializer_batch_bytes = usize_to_i64(materializer.batch_bytes);
@@ -215,12 +222,34 @@ impl PostgresUpdateRuntimeStats {
 async fn postgres_update_runtime_stats(
     pool: &PgPool,
 ) -> Result<PostgresUpdateRuntimeStats, sqlx::Error> {
+    let timeout_ms = i64::try_from(POSTGRES_RUNTIME_STATS_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{timeout_ms}ms"))
+        .execute(&mut *tx)
+        .await?;
     let row = sqlx::query(
         r#"
+        WITH recent AS MATERIALIZED (
+            SELECT id, update_id, telegram_event_at, first_received_at,
+                   materialized_at, processing_started_at
+            FROM telegram_update_inbox
+            ORDER BY id DESC
+            LIMIT $1
+        ), recent_claimed AS MATERIALIZED (
+            SELECT update_id, processing_started_at
+            FROM recent
+            WHERE processing_started_at IS NOT NULL
+            ORDER BY id DESC
+            LIMIT $2
+        )
         SELECT
-            count(*) FILTER (WHERE status = 'pending')::bigint AS pending,
-            count(*) FILTER (WHERE status = 'retry_wait')::bigint AS retry_wait,
-            count(*) FILTER (WHERE status = 'dead_letter')::bigint AS dead_letter,
+            (SELECT count(*) FROM telegram_update_inbox
+                WHERE status = 'pending')::bigint AS pending,
+            (SELECT count(*) FROM telegram_update_inbox
+                WHERE status = 'retry_wait')::bigint AS retry_wait,
+            (SELECT count(*) FROM telegram_update_inbox
+                WHERE status = 'dead_letter')::bigint AS dead_letter,
             COALESCE(avg(GREATEST(0, EXTRACT(EPOCH FROM
                 (first_received_at - telegram_event_at)) * 1000))
                 FILTER (WHERE telegram_event_at IS NOT NULL), 0)::bigint AS event_to_redis_avg_ms,
@@ -233,23 +262,25 @@ async fn postgres_update_runtime_stats(
             COALESCE((
                 SELECT avg(GREATEST(0, EXTRACT(EPOCH FROM
                     (task.created_at - inbox.processing_started_at)) * 1000))::bigint
-                FROM telegram_update_inbox AS inbox
+                FROM recent_claimed AS inbox
                 JOIN LATERAL (
                     SELECT created_at
                     FROM taskman_jobs
                     WHERE deleted_at IS NULL
-                      AND inbox.update_id = ANY(source_update_ids)
+                      AND cardinality(source_update_ids) > 0
+                      AND source_update_ids @> ARRAY[inbox.update_id]
                     ORDER BY created_at
                     LIMIT 1
                 ) AS task ON true
-                WHERE inbox.processing_started_at IS NOT NULL
             ), 0)::bigint AS claim_to_taskman_avg_ms
-        FROM telegram_update_inbox
+        FROM recent
         "#,
     )
-    .fetch_one(pool)
+    .bind(POSTGRES_RUNTIME_STATS_RECENT_ROWS)
+    .bind(POSTGRES_RUNTIME_STATS_TASK_ROWS)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(PostgresUpdateRuntimeStats {
+    let stats = PostgresUpdateRuntimeStats {
         pending: row.try_get("pending")?,
         retry_wait: row.try_get("retry_wait")?,
         dead_letter: row.try_get("dead_letter")?,
@@ -257,7 +288,9 @@ async fn postgres_update_runtime_stats(
         redis_to_postgres_avg_ms: row.try_get("redis_to_postgres_avg_ms")?,
         materialization_to_claim_avg_ms: row.try_get("materialization_to_claim_avg_ms")?,
         claim_to_taskman_avg_ms: row.try_get("claim_to_taskman_avg_ms")?,
-    })
+    };
+    tx.commit().await?;
+    Ok(stats)
 }
 
 fn usize_to_i64(value: usize) -> i64 {
