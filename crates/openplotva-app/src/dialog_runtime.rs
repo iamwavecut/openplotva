@@ -169,7 +169,7 @@ impl ChatClientFactory {
 
 /// Resolve a provider row's API key: an env-var reference wins, otherwise the
 /// AES-GCM sealed blob is opened under the operator's `MASTER_KEY`.
-fn resolve_provider_api_key(
+pub(crate) fn resolve_provider_api_key(
     api_key_ref: Option<&str>,
     api_key_encrypted: Option<&[u8]>,
 ) -> Option<String> {

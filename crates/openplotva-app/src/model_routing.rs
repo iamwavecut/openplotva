@@ -395,6 +395,17 @@ pub async fn seed_routing_from_env(
 
 /// Provider name for the direct OpenAI-compatible VRAM Cloud endpoint.
 const VRAM_CLOUD_PROVIDER: &str = "vram-cloud";
+const VRAM_CLOUD_VISION_BACKFILL_KEY: &str = "llm.routing.vram_cloud_vision_v1";
+const VRAM_CLOUD_VISION_MODELS: [&str; 2] =
+    ["vram.cloud/qwen3.6-35b-a3b", "vram.cloud/qwen3.6-27b"];
+
+fn vram_cloud_model_capabilities(model_name: &str) -> Vec<String> {
+    let mut capabilities = vec!["chat".to_owned(), "tools".to_owned()];
+    if VRAM_CLOUD_VISION_MODELS.contains(&model_name.trim()) {
+        capabilities.push("vision".to_owned());
+    }
+    capabilities
+}
 
 /// Lift the env-configured VRAM Cloud model list (`DIALOG_AIFARM_POOL_*`) into
 /// managed DB rows so the models show up in Studio and join the weighted dialog
@@ -449,7 +460,7 @@ pub async fn backfill_vram_cloud_from_env(
                 model_name: model_name.clone(),
                 display_name: None,
                 base_url,
-                capabilities: vec!["chat".to_owned(), "tools".to_owned()],
+                capabilities: vram_cloud_model_capabilities(model_name),
                 embedding_dim: None,
                 pool_id: None,
                 enabled: true,
@@ -464,6 +475,87 @@ pub async fn backfill_vram_cloud_from_env(
         models = dialog.aifarm_pool_models.len(),
         "backfilled VRAM Cloud models into routing tables"
     );
+    Ok(true)
+}
+
+/// Advertise the VRAM Cloud models whose live model metadata and production
+/// smokes confirm image/video input, and add them behind the existing vision
+/// primary. The existence checks keep operator-defined assignments intact.
+pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, StorageError> {
+    if app_setting_present(pool, VRAM_CLOUD_VISION_BACKFILL_KEY).await? {
+        return Ok(false);
+    }
+    let Some(provider_id) = list_providers(pool)
+        .await?
+        .iter()
+        .find(|provider| provider.name == VRAM_CLOUD_PROVIDER)
+        .map(|provider| provider.id)
+    else {
+        return Ok(false);
+    };
+    let mut models = list_models(pool).await?;
+    let mut targets = Vec::new();
+    for model_name in VRAM_CLOUD_VISION_MODELS {
+        let Some(index) = models.iter().position(|model| {
+            model.provider_id == provider_id && model.model_name == model_name && model.enabled
+        }) else {
+            continue;
+        };
+        if !models[index]
+            .capabilities
+            .iter()
+            .any(|capability| capability == "vision")
+        {
+            let mut input = model_input_from_record(&models[index], model_name.to_owned());
+            input.capabilities.push("vision".to_owned());
+            update_model(pool, models[index].id, &input).await?;
+            models[index].capabilities = input.capabilities;
+        }
+        targets.push(models[index].id);
+    }
+    if targets.is_empty() {
+        return Ok(false);
+    }
+
+    let mut assignments = list_assignments(pool).await?;
+    let mut fallback_order = assignments
+        .iter()
+        .filter(|assignment| {
+            assignment.workflow_key == "vision"
+                && assignment.scope == "global"
+                && assignment.role == "fallback"
+        })
+        .filter_map(|assignment| assignment.fallback_order)
+        .max()
+        .map_or(0, |order| order + 1);
+    let mut added = 0usize;
+    for model_id in targets {
+        if assignment_exists(&assignments, "vision", "fallback", model_id) {
+            continue;
+        }
+        ensure_assignment(
+            pool,
+            &mut assignments,
+            AssignmentInput {
+                workflow_key: "vision".to_owned(),
+                scope: "global".to_owned(),
+                role: "fallback".to_owned(),
+                provider_model_id: model_id,
+                weight: None,
+                fallback_order: Some(fallback_order),
+                canary_percent: None,
+                enabled: true,
+                inference_overrides: json!({ "enable_thinking": false }),
+                cb_failure_threshold: 5,
+                cb_cooldown_ms: 30_000,
+            },
+        )
+        .await?;
+        fallback_order += 1;
+        added += 1;
+    }
+    mark_app_setting(pool, VRAM_CLOUD_VISION_BACKFILL_KEY).await?;
+    tracing::info!(added, "backfilled VRAM Cloud image/video vision fallbacks");
     Ok(true)
 }
 
@@ -2229,6 +2321,20 @@ mod tests {
             enabled: true,
             config: json!({}),
         }
+    }
+
+    #[test]
+    fn only_live_verified_vram_cloud_models_advertise_vision() {
+        for model_name in VRAM_CLOUD_VISION_MODELS {
+            assert_eq!(
+                vram_cloud_model_capabilities(model_name),
+                vec!["chat", "tools", "vision"]
+            );
+        }
+        assert_eq!(
+            vram_cloud_model_capabilities("vram.cloud/text-only"),
+            vec!["chat", "tools"]
+        );
     }
 
     fn model(id: i64, provider_id: i64, name: &str) -> ModelRecord {

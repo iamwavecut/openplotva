@@ -9820,6 +9820,15 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
     }
+    if let Err(error) =
+        model_routing::backfill_vram_cloud_vision_fallback(&service_clients.postgres).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_vram_cloud_vision_fallback",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill VRAM Cloud vision fallbacks");
+    }
     if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
     {
         routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
