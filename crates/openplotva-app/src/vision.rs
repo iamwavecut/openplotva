@@ -172,6 +172,8 @@ pub struct AifarmVisionCaptionerConfig {
     pub max_tokens: i32,
     /// Temperature.
     pub temperature: f64,
+    /// Optional chat-template thinking control for models that expose it.
+    pub enable_thinking: Option<bool>,
 }
 
 impl AifarmVisionCaptionerConfig {
@@ -233,6 +235,7 @@ pub fn aifarm_vision_captioner_config_from_app_config(
         model,
         max_tokens: config.vision.max_tokens,
         temperature: config.vision.temperature,
+        enable_thinking: None,
     }
     .with_defaults()
 }
@@ -432,6 +435,11 @@ fn vision_config_for_attempt(
 ) -> AifarmVisionCaptionerConfig {
     config.model = attempt.model_name.clone();
     config.client.default_model = attempt.model_name.clone();
+    config.client.api_key = crate::dialog_runtime::resolve_provider_api_key(
+        attempt.provider_api_key_ref.as_deref(),
+        attempt.provider_api_key_encrypted.as_deref(),
+    )
+    .unwrap_or_default();
     if let Some(endpoint) = attempt
         .model_base_url
         .as_deref()
@@ -460,6 +468,11 @@ fn vision_config_for_attempt(
     if let Some(temperature) = attempt.overrides.temperature {
         config.temperature = temperature;
     }
+    config.enable_thinking = attempt
+        .overrides
+        .extra
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
     config.with_defaults()
 }
 
@@ -504,7 +517,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                 video_url: None,
             }
         };
-        Ok(ChatCompletionRequest {
+        let mut completion_request = ChatCompletionRequest {
             model: self.cfg.model.clone(),
             messages: vec![
                 ChatMessage {
@@ -532,7 +545,13 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
             max_tokens: self.cfg.max_tokens,
             temperature: Some(self.cfg.temperature),
             ..ChatCompletionRequest::default()
-        })
+        };
+        if let Some(enable_thinking) = self.cfg.enable_thinking {
+            completion_request.set_chat_template_kwargs(
+                serde_json::json!({ "enable_thinking": enable_thinking }),
+            );
+        }
+        Ok(completion_request)
     }
 
     fn legacy_request(&self, data_url: &str) -> serde_json::Value {
@@ -1832,6 +1851,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routed_vision_attempt_resolves_direct_endpoint_key_and_thinking_override() {
+        let path = std::env::var("PATH").expect("test process PATH");
+        let attempt = RoutedAttempt {
+            provider_id: 7,
+            model_id: 11,
+            provider_name: "vram-cloud".to_owned(),
+            model_name: "vram.cloud/qwen3.6-35b-a3b".to_owned(),
+            provider_endpoint: Some("https://vision.example.test/v1".to_owned()),
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            provider_api_key_ref: Some("PATH".to_owned()),
+            provider_api_key_encrypted: None,
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: json!({}),
+            model_config: json!({}),
+            overrides: openplotva_llm::router::InferenceOverrides {
+                extra: json!({ "enable_thinking": false }),
+                ..openplotva_llm::router::InferenceOverrides::default()
+            },
+            variant: None,
+        };
+
+        let config = vision_config_for_attempt(AifarmVisionCaptionerConfig::default(), &attempt);
+
+        assert_eq!(config.model, "vram.cloud/qwen3.6-35b-a3b");
+        assert_eq!(
+            config.client.direct_url,
+            "https://vision.example.test/v1/chat/completions"
+        );
+        assert_eq!(config.client.api_key, path);
+        assert_eq!(config.enable_thinking, Some(false));
+    }
+
+    #[test]
     fn telegram_download_limit_is_terminal_but_provider_failures_are_not() {
         assert!(telegram_download_unavailable_error(
             "Bad Request: file is too big"
@@ -2386,6 +2440,7 @@ mod tests {
                 model: "vision-model".to_owned(),
                 max_tokens: 123,
                 temperature: 0.2,
+                enable_thinking: Some(false),
             },
             data_urls.clone(),
             transport,
@@ -2414,6 +2469,11 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], 123);
         assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         assert!(
             body["messages"][0]["content"]
                 .as_str()
@@ -2457,6 +2517,7 @@ mod tests {
                 model: "vision-model".to_owned(),
                 max_tokens: 768,
                 temperature: 0.1,
+                enable_thinking: Some(false),
             },
             data_urls,
             transport,
@@ -2483,6 +2544,11 @@ mod tests {
                 .is_some_and(|text| text.contains("хронологическом порядке"))
         );
         assert!(body.to_string().contains("только визуальные данные"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         Ok(())
     }
 
@@ -2522,6 +2588,7 @@ mod tests {
                 model: "legacy-ignored".to_owned(),
                 max_tokens: 123,
                 temperature: 0.2,
+                enable_thinking: None,
             },
             data_urls.clone(),
             transport,

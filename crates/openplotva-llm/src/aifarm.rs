@@ -742,7 +742,18 @@ where
         };
         let mut artifact = match result {
             Ok(completion) => {
-                aifarm_call_trace_artifacts(request, completion, trace.tags.docs_chars, tags)
+                let mut artifact =
+                    aifarm_call_trace_artifacts(request, completion, trace.tags.docs_chars, tags);
+                if trace.tags.flow == "dialog"
+                    && let Some(error) = dialog_response_semantic_error(
+                        completion.response.as_ref(),
+                        &trace.tags.provider,
+                        !request.tools.is_empty(),
+                    )
+                {
+                    artifact.error = error;
+                }
+                artifact
             }
             Err(error) => {
                 let mut artifact = aifarm_call_trace_artifacts(
@@ -4151,6 +4162,35 @@ struct PendingToolStep {
     native_ref: Option<String>,
 }
 
+fn dialog_response_semantic_error(
+    response: Option<&Value>,
+    provider: &str,
+    tools_offered: bool,
+) -> Option<String> {
+    let Some(response) = response else {
+        return Some("chat completion response is nil".to_owned());
+    };
+    if !tools_offered {
+        return extract_final_answer_for_provider(response, provider)
+            .err()
+            .map(|error| error.to_string());
+    }
+    match first_choice_tool_steps(response) {
+        Err(error) => Some(error.to_string()),
+        Ok(ToolStepSelection::None(_)) => extract_final_answer_for_provider(response, provider)
+            .err()
+            .map(|error| error.to_string()),
+        Ok(ToolStepSelection::Steps {
+            residual_protocol: true,
+            ..
+        }) => Some(
+            tool_protocol_completion_error("assistant content retained ambiguous protocol markup")
+                .to_string(),
+        ),
+        Ok(ToolStepSelection::Steps { .. }) => None,
+    }
+}
+
 fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, CompletionError> {
     let message = first_choice_message_value(response)?;
     if let Some(tool_calls) = message
@@ -5813,6 +5853,61 @@ mod tests {
         assert_eq!(records[0].artifact.source, "aifarm");
         assert_eq!(records[0].context.chat_id, -100);
         assert_eq!(records[0].context.user_id, 7);
+        assert!(records[0].artifact.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dialog_call_trace_records_semantic_protocol_failure_after_http_success() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<message id=\"1\"><text>copied context</text></message>"
+                }
+            }]
+        });
+        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
+            status_code: 200,
+            status_text: "OK".to_owned(),
+            body: serde_json::to_vec(&response).expect("serialize response"),
+            ..AifarmHttpResponse::default()
+        })]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+        let request = ChatCompletionRequest {
+            trace: Some(crate::trace::LlmCallTrace {
+                tags: crate::trace::LlmCallTags {
+                    provider: PROVIDER_AIFARM.to_owned(),
+                    flow: "dialog".to_owned(),
+                    ..crate::trace::LlmCallTags::default()
+                },
+                ..crate::trace::LlmCallTrace::default()
+            }),
+            ..ChatCompletionRequest::default()
+        };
+
+        let result = client.complete(request, &mut |_status| {}).await;
+
+        assert!(
+            result.is_ok(),
+            "transport result stays successful: {result:?}"
+        );
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].artifact.error.contains("context"),
+            "semantic failure was not recorded: {}",
+            records[0].artifact.error
+        );
     }
 
     #[tokio::test]
