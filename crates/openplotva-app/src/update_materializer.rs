@@ -1260,8 +1260,8 @@ mod tests {
             .query_async(&mut connection)
             .await?;
 
-        let lease_ttl = Duration::from_secs(1);
-        let renew_interval = Duration::from_millis(50);
+        let lease_ttl = Duration::from_millis(200);
+        let renew_interval = Duration::from_millis(20);
         assert!(
             stream
                 .acquire_materializer_lease("owner-a", lease_ttl)
@@ -1276,7 +1276,7 @@ mod tests {
             lease_lost_tx,
         ));
 
-        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !stream
                 .acquire_materializer_lease("owner-b", lease_ttl)

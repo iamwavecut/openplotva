@@ -11,7 +11,7 @@ use openplotva_core::{ChatSettings, ChatSettingsUpdate, UserState};
 use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-    StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
+    StatelessJobItem, TaskQueueSchedule, control_job_params_from_stateless_job, new_control_job_at,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -163,7 +163,18 @@ where
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> MemberStateControlJobQueueFuture<'a, Self::Error> {
-        self.assign_payment_control_job(queue_name, job)
+        let debounce_key = control_job_params_from_stateless_job(&job)
+            .ok()
+            .filter(|params| params.data.kind == ControlKind::ChatMemberSync)
+            .map(|params| format!("chat-member-sync:{}:{}", params.chat_id, params.user_id));
+        self.schedule_payment_control_job(
+            queue_name,
+            job,
+            TaskQueueSchedule {
+                debounce_key,
+                ..TaskQueueSchedule::default()
+            },
+        )
     }
 }
 
@@ -1422,6 +1433,35 @@ mod tests {
                 .map(|data| data.kind),
             Some(ControlKind::ChatMemberSync)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_pending_chat_member_sync_jobs_are_coalesced() -> Result<(), Box<dyn Error>> {
+        let queue = InMemoryPaymentControlJobQueue::new();
+        let job = new_control_job_at(
+            ControlJobParams {
+                chat_id: -10042,
+                message_id: 77,
+                user_id: 42,
+                user_full_name: "Owner".to_owned(),
+                thread_id: None,
+                data: ControlJobData {
+                    kind: ControlKind::ChatMemberSync,
+                    ..ControlJobData::default()
+                },
+            },
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        queue
+            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job.clone())
+            .await?;
+        queue
+            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job)
+            .await?;
+
+        assert_eq!(queue.snapshot().len(), 1);
         Ok(())
     }
 

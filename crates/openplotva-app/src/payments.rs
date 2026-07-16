@@ -34,8 +34,8 @@ use openplotva_storage::{
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
     InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem, TRANSACTION_PRIORITY,
-    TaskQueueIdAllocator, TaskQueueRecord, control_job_params_from_stateless_job,
-    new_control_job_at,
+    TaskQueueIdAllocator, TaskQueueRecord, TaskQueueSchedule,
+    control_job_params_from_stateless_job, new_control_job_at,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1184,6 +1184,17 @@ pub trait PaymentControlJobQueue {
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> PaymentControlJobQueueFuture<'a, Self::Error>;
+
+    /// Assign or replace a pending control job under a stable debounce key.
+    fn schedule_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+        drop(schedule);
+        self.assign_payment_control_job(queue_name, job)
+    }
 }
 
 /// Queue/status boundary for the payment-owned taskman worker.
@@ -1483,6 +1494,112 @@ const fn control_kind_skips_task_enqueue_rate_limit(kind: ControlKind) -> bool {
     )
 }
 
+impl PersistentPaymentControlJobQueue {
+    async fn assign_payment_control_job_with_schedule(
+        &self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: Option<TaskQueueSchedule>,
+    ) -> Result<(), PersistentPaymentControlJobQueueError> {
+        let params = control_job_params_from_stateless_job(&job)
+            .map_err(|error| InMemoryPaymentControlJobQueueError::Taskman(error.to_string()))?;
+        let chat_id = params.chat_id;
+        let user_id = params.user_id;
+        let control_kind = params.data.kind;
+        // Payment and member-state control jobs are exempt from enqueue throttling:
+        // dropping them would silently lose durable payment intent or Telegram state.
+        // They are rare control-plane events, not the dialog burst the limiter targets.
+        let rate_limit = if control_kind_skips_task_enqueue_rate_limit(control_kind) {
+            None
+        } else {
+            self.task_enqueue_rate_limit.as_ref()
+        };
+        if let Some(rate_limit) = rate_limit {
+            let now = OffsetDateTime::now_utc();
+            let report = rate_limit
+                .check_task_enqueue_rate_limit(chat_id, user_id, now)
+                .await;
+            if report.limited {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    rate_limit_scope = ?report.scope,
+                    rate_limit_error = ?report.error,
+                    "task enqueue rate limit rejected control job"
+                );
+                return Err(PersistentPaymentControlJobQueueError::TaskEnqueueRateLimited);
+            }
+            if let Some(error) = report.error {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    error,
+                    "task enqueue rate limit store check failed before control job assignment"
+                );
+            }
+        }
+        if let Some(schedule) = schedule {
+            self.queue
+                .schedule_payment_control_job(queue_name, job, schedule)
+                .await?;
+        } else {
+            self.queue
+                .assign_payment_control_job(queue_name, job)
+                .await?;
+        }
+        // Best-effort synchronous durability for the payment-flow job: retry the
+        // flush a few times to ride out a transient Postgres blip so the job is
+        // durable before the update is acked. If every attempt fails, the 1s
+        // background sync worker remains the durability backstop (a crash inside
+        // that residual window would re-deliver the update, which is idempotent).
+        if let Some(journal) = &self.db_journal {
+            let mut last_error = None;
+            for attempt in 0..PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                match journal.flush_dirty().await {
+                    Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt + 1 < PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                            tokio::time::sleep(PAYMENT_CONTROL_FLUSH_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = last_error {
+                tracing::error!(
+                    queue_name,
+                    control_kind = ?control_kind,
+                    %error,
+                    "control job not durably flushed after retries; relying on background sync worker"
+                );
+            }
+        }
+        if let Some(rate_limit) = rate_limit {
+            let report = rate_limit
+                .grow_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
+                .await;
+            for error in report.save_errors {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    error,
+                    "task enqueue rate limit store save failed after control job assignment"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
     type Error = PersistentPaymentControlJobQueueError;
 
@@ -1491,98 +1608,16 @@ impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let params = control_job_params_from_stateless_job(&job)
-                .map_err(|error| InMemoryPaymentControlJobQueueError::Taskman(error.to_string()))?;
-            let chat_id = params.chat_id;
-            let user_id = params.user_id;
-            let control_kind = params.data.kind;
-            // Payment and member-state control jobs are exempt from enqueue throttling:
-            // dropping them would silently lose durable payment intent or Telegram state.
-            // They are rare control-plane events, not the dialog burst the limiter targets.
-            let rate_limit = if control_kind_skips_task_enqueue_rate_limit(control_kind) {
-                None
-            } else {
-                self.task_enqueue_rate_limit.as_ref()
-            };
-            if let Some(rate_limit) = rate_limit {
-                let now = OffsetDateTime::now_utc();
-                let report = rate_limit
-                    .check_task_enqueue_rate_limit(chat_id, user_id, now)
-                    .await;
-                if report.limited {
-                    tracing::warn!(
-                        queue_name,
-                        chat_id,
-                        user_id,
-                        control_kind = ?control_kind,
-                        rate_limit_scope = ?report.scope,
-                        rate_limit_error = ?report.error,
-                        "task enqueue rate limit rejected control job"
-                    );
-                    return Err(PersistentPaymentControlJobQueueError::TaskEnqueueRateLimited);
-                }
-                if let Some(error) = report.error {
-                    tracing::warn!(
-                        queue_name,
-                        chat_id,
-                        user_id,
-                        control_kind = ?control_kind,
-                        error,
-                        "task enqueue rate limit store check failed before control job assignment"
-                    );
-                }
-            }
-            self.queue
-                .assign_payment_control_job(queue_name, job)
-                .await?;
-            // Best-effort synchronous durability for the payment-flow job: retry the
-            // flush a few times to ride out a transient Postgres blip so the job is
-            // durable before the update is acked. If every attempt fails, the 1s
-            // background sync worker remains the durability backstop (a crash inside
-            // that residual window would re-deliver the update, which is idempotent).
-            if let Some(journal) = &self.db_journal {
-                let mut last_error = None;
-                for attempt in 0..PAYMENT_CONTROL_FLUSH_ATTEMPTS {
-                    match journal.flush_dirty().await {
-                        Ok(_) => {
-                            last_error = None;
-                            break;
-                        }
-                        Err(error) => {
-                            last_error = Some(error);
-                            if attempt + 1 < PAYMENT_CONTROL_FLUSH_ATTEMPTS {
-                                tokio::time::sleep(PAYMENT_CONTROL_FLUSH_RETRY_DELAY).await;
-                            }
-                        }
-                    }
-                }
-                if let Some(error) = last_error {
-                    tracing::error!(
-                        queue_name,
-                        control_kind = ?control_kind,
-                        %error,
-                        "control job not durably flushed after retries; relying on background sync worker"
-                    );
-                }
-            }
-            if let Some(rate_limit) = rate_limit {
-                let report = rate_limit
-                    .grow_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
-                    .await;
-                for error in report.save_errors {
-                    tracing::warn!(
-                        queue_name,
-                        chat_id,
-                        user_id,
-                        control_kind = ?control_kind,
-                        error,
-                        "task enqueue rate limit store save failed after control job assignment"
-                    );
-                }
-            }
-            Ok(())
-        })
+        Box::pin(self.assign_payment_control_job_with_schedule(queue_name, job, None))
+    }
+
+    fn schedule_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+        Box::pin(self.assign_payment_control_job_with_schedule(queue_name, job, Some(schedule)))
     }
 }
 
@@ -1677,6 +1712,18 @@ impl PaymentControlJobQueue for InMemoryPaymentControlJobQueue {
     ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
         Box::pin(async move {
             self.queue.assign(queue_name, job);
+            Ok(())
+        })
+    }
+
+    fn schedule_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.queue.schedule_or_replace(queue_name, job, schedule);
             Ok(())
         })
     }

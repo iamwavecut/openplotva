@@ -36,9 +36,14 @@ use openplotva_updates::{build_fetcher_message_context, build_history_text_entry
 
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_CLAIM_LIMIT: usize = 32;
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_MAX_ATTEMPTS: i32 = 8;
-pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
+const TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT_SECS: u64 = 60;
+pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT: Duration =
+    Duration::from_secs(TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT_SECS);
+pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_LEASE_RENEW_INTERVAL: Duration =
+    Duration::from_secs(TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT_SECS / 3);
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
-pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_MAINTENANCE_INTERVAL: Duration =
+    Duration::from_secs(TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT_SECS / 2);
 
 const OUTBOX_MAINTENANCE_LIMIT: usize = 1_000;
 const DIALOG_DELIVERY_RECONCILE_LIMIT: i64 = 250;
@@ -181,6 +186,7 @@ impl TelegramOutboxJobResolver for NoopTelegramOutboxJobResolver {
 pub struct TelegramOutboxWorkerConfig {
     pub claim_limit: usize,
     pub max_attempts: i32,
+    pub send_timeout: Duration,
     pub lease_renew_interval: Duration,
     pub idle_poll_interval: Duration,
     pub maintenance_interval: Duration,
@@ -191,9 +197,20 @@ impl Default for TelegramOutboxWorkerConfig {
         Self {
             claim_limit: TELEGRAM_OUTBOX_WORKER_DEFAULT_CLAIM_LIMIT,
             max_attempts: TELEGRAM_OUTBOX_WORKER_DEFAULT_MAX_ATTEMPTS,
+            send_timeout: TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT,
             lease_renew_interval: TELEGRAM_OUTBOX_WORKER_DEFAULT_LEASE_RENEW_INTERVAL,
             idle_poll_interval: TELEGRAM_OUTBOX_WORKER_DEFAULT_IDLE_POLL_INTERVAL,
             maintenance_interval: TELEGRAM_OUTBOX_WORKER_DEFAULT_MAINTENANCE_INTERVAL,
+        }
+    }
+}
+
+impl TelegramOutboxWorkerConfig {
+    fn send_timeout(&self) -> Duration {
+        if self.send_timeout.is_zero() {
+            TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT
+        } else {
+            self.send_timeout
         }
     }
 }
@@ -223,8 +240,9 @@ pub struct TelegramOutboxWorkerReport {
 /// Run a crash-recovering outbox worker until shutdown is requested.
 ///
 /// Shutdown is observed between operations. Once `request_started_at` is
-/// durable, the current network request is allowed to reach a durable outcome;
-/// cancelling it at that point would manufacture an avoidable ambiguity.
+/// durable, the current network request is allowed to reach a durable outcome
+/// until the configured send deadline. A deadline cut is persisted as
+/// ambiguity for create/financial operations and as a retry for safe policies.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_telegram_outbox_worker_until<Transport, Jobs>(
     store: PostgresTelegramOutboxStore,
@@ -406,6 +424,7 @@ async fn process_claimed_operation<Transport, Jobs>(
         &operation,
         method,
         config.lease_renew_interval,
+        config.send_timeout(),
         report,
     )
     .await;
@@ -413,6 +432,17 @@ async fn process_claimed_operation<Transport, Jobs>(
     match response {
         LeasedExecution::LeaseLost => {
             report.lease_lost = report.lease_lost.saturating_add(1);
+        }
+        LeasedExecution::TimedOut => {
+            handle_send_timeout(
+                store,
+                jobs,
+                &operation,
+                config.send_timeout(),
+                config.max_attempts,
+                report,
+            )
+            .await;
         }
         LeasedExecution::Response(Ok(response)) => {
             let history_entries = telegram_response_history_entries(&response, operation.bot_id);
@@ -472,7 +502,20 @@ async fn process_claimed_operation<Transport, Jobs>(
 
 enum LeasedExecution {
     Response(Result<TelegramOutboundResponse, TelegramOutboundExecuteError>),
+    TimedOut,
     LeaseLost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SendDeadlineExceeded;
+
+async fn enforce_send_deadline<T>(
+    deadline: Duration,
+    future: impl Future<Output = T>,
+) -> Result<T, SendDeadlineExceeded> {
+    tokio::time::timeout(deadline, future)
+        .await
+        .map_err(|_| SendDeadlineExceeded)
 }
 
 async fn execute_with_lease_renewal<Transport>(
@@ -481,12 +524,13 @@ async fn execute_with_lease_renewal<Transport>(
     operation: &ClaimedTelegramOutboxOperation,
     method: TelegramOutboundMethod,
     renew_interval: Duration,
+    send_timeout: Duration,
     report: &mut TelegramOutboxWorkerReport,
 ) -> LeasedExecution
 where
     Transport: TelegramOutboxTransport,
 {
-    let response = transport.execute(method);
+    let response = enforce_send_deadline(send_timeout, transport.execute(method));
     tokio::pin!(response);
     let mut ticker = tokio::time::interval(renew_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -494,7 +538,12 @@ where
 
     loop {
         tokio::select! {
-            response = &mut response => return LeasedExecution::Response(response),
+            response = &mut response => {
+                return match response {
+                    Ok(response) => LeasedExecution::Response(response),
+                    Err(SendDeadlineExceeded) => LeasedExecution::TimedOut,
+                };
+            },
             _ = ticker.tick() => {
                 match store
                     .renew_operation_lease(operation.id, operation.lease_token)
@@ -507,6 +556,97 @@ where
                         format!("renew Telegram outbox lease: {error}"),
                     ),
                 }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendTimeoutDisposition {
+    Retry,
+    Ambiguous,
+    DeadLetter,
+}
+
+fn send_timeout_disposition(
+    delivery_policy: &str,
+    attempt: i32,
+    max_attempts: i32,
+) -> SendTimeoutDisposition {
+    match delivery_policy {
+        "create" | "financial" => SendTimeoutDisposition::Ambiguous,
+        "target_idempotent" | "ephemeral" if attempt < max_attempts.max(1) => {
+            SendTimeoutDisposition::Retry
+        }
+        _ => SendTimeoutDisposition::DeadLetter,
+    }
+}
+
+async fn handle_send_timeout<Jobs>(
+    store: &PostgresTelegramOutboxStore,
+    jobs: &Jobs,
+    operation: &ClaimedTelegramOutboxOperation,
+    send_timeout: Duration,
+    max_attempts: i32,
+    report: &mut TelegramOutboxWorkerReport,
+) where
+    Jobs: TelegramOutboxJobResolver,
+{
+    let error_class = "request_timeout";
+    let error_text = format!(
+        "Telegram request did not finish within {}ms",
+        send_timeout.as_millis()
+    );
+    tracing::warn!(
+        outbox_id = operation.id,
+        operation_id = operation.operation_id,
+        delivery_policy = operation.delivery_policy,
+        timeout_ms = send_timeout.as_millis(),
+        "Telegram outbox request exceeded its send deadline"
+    );
+
+    match send_timeout_disposition(
+        operation.delivery_policy.as_str(),
+        operation.attempt,
+        max_attempts,
+    ) {
+        SendTimeoutDisposition::Retry => {
+            let transitioned = store
+                .retry_operation(
+                    operation.id,
+                    operation.lease_token,
+                    retry_available_at(operation, OutboundSendErrorClass::RetryableTransient),
+                    error_class,
+                    &error_text,
+                    None,
+                    None,
+                )
+                .await;
+            record_retry_transition(transitioned, report, "persist Telegram timeout retry");
+        }
+        SendTimeoutDisposition::Ambiguous => {
+            mark_ambiguous_delivery(store, jobs, operation, error_class, &error_text, report).await;
+        }
+        SendTimeoutDisposition::DeadLetter => {
+            match store
+                .dead_letter_operation(
+                    operation.id,
+                    operation.lease_token,
+                    error_class,
+                    &error_text,
+                    None,
+                )
+                .await
+            {
+                Ok(true) => {
+                    report.dead_lettered = report.dead_lettered.saturating_add(1);
+                    resolve_batch(store, jobs, &operation.batch_id, report).await;
+                }
+                Ok(false) => report.lease_lost = report.lease_lost.saturating_add(1),
+                Err(error) => record_worker_error(
+                    report,
+                    format!("dead-letter timed-out Telegram operation: {error}"),
+                ),
             }
         }
     }
@@ -572,41 +712,7 @@ async fn handle_send_error<Jobs>(
     }
 
     if delivery_outcome_is_ambiguous(operation.delivery_policy.as_str(), class) {
-        if operation.delivery_policy == "create" {
-            match enqueue_ambiguity_reaction(store, operation).await {
-                Ok(true) => {
-                    report.ambiguity_reactions_queued =
-                        report.ambiguity_reactions_queued.saturating_add(1);
-                }
-                Ok(false) => {}
-                Err(enqueue_error) => {
-                    record_worker_error(
-                        report,
-                        format!("enqueue ambiguous-create reaction: {enqueue_error}"),
-                    );
-                    return;
-                }
-            }
-        }
-        match store
-            .mark_ambiguous(
-                operation.id,
-                operation.lease_token,
-                class.as_str(),
-                &error_text,
-            )
-            .await
-        {
-            Ok(true) => {
-                report.ambiguous = report.ambiguous.saturating_add(1);
-                resolve_batch(store, jobs, &operation.batch_id, report).await;
-            }
-            Ok(false) => report.lease_lost = report.lease_lost.saturating_add(1),
-            Err(store_error) => record_worker_error(
-                report,
-                format!("mark Telegram create ambiguous: {store_error}"),
-            ),
-        }
+        mark_ambiguous_delivery(store, jobs, operation, class.as_str(), &error_text, report).await;
         return;
     }
 
@@ -629,6 +735,47 @@ async fn handle_send_error<Jobs>(
             report,
             format!("dead-letter Telegram outbox operation: {store_error}"),
         ),
+    }
+}
+
+async fn mark_ambiguous_delivery<Jobs>(
+    store: &PostgresTelegramOutboxStore,
+    jobs: &Jobs,
+    operation: &ClaimedTelegramOutboxOperation,
+    error_class: &str,
+    error_text: &str,
+    report: &mut TelegramOutboxWorkerReport,
+) where
+    Jobs: TelegramOutboxJobResolver,
+{
+    if operation.delivery_policy == "create" {
+        match enqueue_ambiguity_reaction(store, operation).await {
+            Ok(true) => {
+                report.ambiguity_reactions_queued =
+                    report.ambiguity_reactions_queued.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                record_worker_error(
+                    report,
+                    format!("enqueue ambiguous-create reaction: {error}"),
+                );
+                return;
+            }
+        }
+    }
+    match store
+        .mark_ambiguous(operation.id, operation.lease_token, error_class, error_text)
+        .await
+    {
+        Ok(true) => {
+            report.ambiguous = report.ambiguous.saturating_add(1);
+            resolve_batch(store, jobs, &operation.batch_id, report).await;
+        }
+        Ok(false) => report.lease_lost = report.lease_lost.saturating_add(1),
+        Err(error) => {
+            record_worker_error(report, format!("mark Telegram delivery ambiguous: {error}"))
+        }
     }
 }
 
@@ -1538,6 +1685,63 @@ mod tests {
             "create",
             OutboundSendErrorClass::TerminalOther,
         ));
+    }
+
+    #[test]
+    fn send_timeout_preserves_delivery_safety_policy() {
+        assert_eq!(
+            send_timeout_disposition("create", 1, 8),
+            SendTimeoutDisposition::Ambiguous
+        );
+        assert_eq!(
+            send_timeout_disposition("financial", 1, 8),
+            SendTimeoutDisposition::Ambiguous
+        );
+        assert_eq!(
+            send_timeout_disposition("target_idempotent", 1, 8),
+            SendTimeoutDisposition::Retry
+        );
+        assert_eq!(
+            send_timeout_disposition("ephemeral", 8, 8),
+            SendTimeoutDisposition::DeadLetter
+        );
+    }
+
+    #[test]
+    fn outbox_timing_defaults_derive_from_the_one_minute_send_deadline() {
+        let config = TelegramOutboxWorkerConfig::default();
+
+        assert_eq!(config.send_timeout(), Duration::from_secs(60));
+        assert_eq!(config.lease_renew_interval * 3, config.send_timeout());
+        assert_eq!(config.maintenance_interval * 2, config.send_timeout());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_deadline_uses_one_virtual_minute_without_wall_clock_delay() {
+        let started = tokio::time::Instant::now();
+
+        let result = enforce_send_deadline(
+            TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT,
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert_eq!(result, Err(SendDeadlineExceeded));
+        assert_eq!(
+            started.elapsed(),
+            TELEGRAM_OUTBOX_WORKER_DEFAULT_SEND_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_deadline_accepts_short_injected_test_intervals() {
+        let started = tokio::time::Instant::now();
+
+        let result =
+            enforce_send_deadline(Duration::from_secs(1), std::future::pending::<()>()).await;
+
+        assert_eq!(result, Err(SendDeadlineExceeded));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub type DialogProviderHandle = Arc<dyn ChatProvider>;
 
 /// Workflow key the dialog worker routes through.
 const DIALOG_WORKFLOW_KEY: &str = "dialog";
+const INTERACTIVE_CAPACITY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Builds and caches per-provider transport clients from DB provider rows, so
 /// a provider added in the admin panel is immediately routable without a
@@ -223,7 +224,8 @@ impl RouterChatProvider {
         factory: Arc<ChatClientFactory>,
     ) -> Self {
         Self {
-            walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools),
+            walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools)
+                .with_max_slot_wait(INTERACTIVE_CAPACITY_WAIT_TIMEOUT),
             factory,
             provider_name: "router".to_owned(),
         }
@@ -696,7 +698,7 @@ mod tests {
         retry::{FailureReason, ProviderError},
     };
     use openplotva_storage::llm_routing::{
-        AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, WorkflowRecord,
+        AssignmentRecord, ModelRecord, PoolRecord, ProviderRecord, RoutingSnapshot, WorkflowRecord,
     };
     use serde_json::json;
 
@@ -834,6 +836,55 @@ mod tests {
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events[0].event_type, "route_unavailable");
         assert_eq!(events[0].workflow_key, "dialog");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_router_stops_waiting_for_a_busy_gpu_after_one_virtual_second() {
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.models[0].pool_id = Some(1);
+        snapshot.pools.push(PoolRecord {
+            id: 1,
+            name: "shared-gpu".to_owned(),
+            max_concurrency: Some(1),
+            description: None,
+            config: json!({}),
+        });
+        let table = crate::model_routing::build_routing_table(&snapshot);
+        let handle = RouterHandle::new(table.clone());
+        let pools = Arc::new(PoolRegistry::new());
+        pools.apply(&table.pool_specs());
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the GPU pool");
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = RouterChatProvider::new(
+            Arc::clone(&handle),
+            Arc::new(BreakerSet::new()),
+            Arc::new(TriggerState::new()),
+            pools,
+            test_factory(handle, HashMap::new(), default_provider),
+        )
+        .with_routing_event_reporter(reporter.clone());
+        let started = tokio::time::Instant::now();
+
+        let error = provider
+            .run_chat_step(default_step_request())
+            .await
+            .expect_err("a permanently busy interactive route must fail fast");
+
+        assert!(error.to_string().contains("capacity unavailable"));
+        assert_eq!(started.elapsed(), INTERACTIVE_CAPACITY_WAIT_TIMEOUT);
+        assert!(
+            reporter
+                .buffer()
+                .routing_events(8)
+                .iter()
+                .any(|event| event.event_type == "capacity_wait_timeout")
+        );
     }
 
     #[tokio::test]

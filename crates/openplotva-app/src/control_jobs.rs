@@ -429,16 +429,24 @@ where
 {
     let mut report = ControlJobWorkerRunReport::default();
     let mut stop = std::pin::pin!(stop);
+    let mut drain_ready_jobs = false;
 
     loop {
-        tokio::select! {
-            () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
-                let tick = process_control_job_once_at(queue, registry, OffsetDateTime::now_utc()).await;
-                tracing::debug!(?tick, "control-job worker tick");
-                report.record_tick(&tick);
+        if !drain_ready_jobs {
+            tokio::select! {
+                () = &mut stop => break,
+                () = tokio::time::sleep(interval) => {}
             }
         }
+
+        let tick = tokio::select! {
+            biased;
+            () = &mut stop => break,
+            tick = process_control_job_once_at(queue, registry, OffsetDateTime::now_utc()) => tick,
+        };
+        tracing::debug!(?tick, "control-job worker tick");
+        report.record_tick(&tick);
+        drain_ready_jobs = tick.dequeued;
     }
 
     report
@@ -566,6 +574,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let registry = RecordingRegistry {
             seen: Arc::clone(&seen),
+            ..RecordingRegistry::default()
         };
 
         let report = process_control_job_once_at(&queue, &registry, now).await;
@@ -707,6 +716,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingRegistry {
         seen: Arc<Mutex<Vec<ControlKind>>>,
+        stop_after: Option<(usize, Arc<tokio::sync::Notify>)>,
     }
 
     impl ControlJobExecutorRegistry for RecordingRegistry {
@@ -716,7 +726,16 @@ mod tests {
             _now: OffsetDateTime,
         ) -> ControlJobExecutorFuture<'a> {
             Box::pin(async move {
-                self.seen.lock().expect("seen").push(params.data.kind);
+                let seen_count = {
+                    let mut seen = self.seen.lock().expect("seen");
+                    seen.push(params.data.kind);
+                    seen.len()
+                };
+                if let Some((stop_after, notify)) = &self.stop_after
+                    && seen_count >= *stop_after
+                {
+                    notify.notify_one();
+                }
                 match params.data.kind {
                     ControlKind::Translate => ControlJobExecutionResult::Completed(
                         ControlJobExecution::Translate(TranslateControlJobOutcome::Sent),
@@ -728,6 +747,37 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_drains_ready_control_jobs_without_poll_interval_between_them()
+    -> Result<(), Box<dyn Error>> {
+        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        for kind in [ControlKind::Translate, ControlKind::Checkin] {
+            queue
+                .assign_payment_control_job(CONTROL_QUEUE_NAME, control_job(kind, now, 0))
+                .await?;
+        }
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let registry = RecordingRegistry {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            stop_after: Some((2, Arc::clone(&notify))),
+        };
+        let started = tokio::time::Instant::now();
+
+        let report = run_control_job_worker_every_until(
+            &queue,
+            &registry,
+            Duration::from_secs(1),
+            notify.notified(),
+        )
+        .await;
+
+        assert_eq!(report.dequeued, 2);
+        assert_eq!(report.completed, 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        Ok(())
     }
 
     fn control_job(kind: ControlKind, created: OffsetDateTime, priority: i32) -> StatelessJobItem {

@@ -2084,10 +2084,10 @@ mod tests {
         assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stuck_immediate_send_times_out_so_worker_can_process_next_item() {
         let queue = DispatcherQueue::new(DispatcherConfig {
-            send_timeout: Duration::from_millis(10),
+            send_timeout: Duration::from_secs(1),
             ..DispatcherConfig::default()
         });
         let now = std::time::Instant::now();
