@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 use std::{collections::BTreeMap, future::Future, pin::Pin, time::Instant};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use openplotva_core::ToolCall;
 use openplotva_dialog::{
     ChatStepRequest, ChatStepToolCall, DialogInput, DialogToolbox, HistoryMessage,
@@ -66,6 +67,10 @@ const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 
 /// Slice reserved for the final send after a tool call finishes.
 const TOOL_RESERVE: TimeDuration = TimeDuration::seconds(5);
+
+/// Submit independent media reads together. The routing capacity pools still
+/// serialize calls that land on the same single-slot GPU.
+const MAX_PARALLEL_UNDERSTAND_MEDIA_CALLS: usize = 4;
 
 /// Boxed future for semantic reaction execution.
 pub type SessionReactionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -682,18 +687,46 @@ where
             }
         }
 
+        let mut parallel_media_results = BTreeMap::new();
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
-        for call in &step.tool_calls {
+        for (call_index, call) in step.tool_calls.iter().enumerate() {
+            if call.step.step == STEP_UNDERSTAND_MEDIA
+                && !parallel_media_results.contains_key(&call_index)
+            {
+                let batch_len =
+                    consecutive_understand_media_call_count(&step.tool_calls, call_index);
+                parallel_media_results.extend(
+                    execute_parallel_understand_media_calls(
+                        &step.tool_calls[call_index..call_index + batch_len],
+                        call_index,
+                        cfg,
+                        &meta,
+                        active_params.message_id,
+                        &media_reference_aliases,
+                        &tool_result_cache,
+                        &mut budget,
+                        processing_started,
+                        ctx.now,
+                    )
+                    .await,
+                );
+            }
             let tool_started = tokio::time::Instant::now();
             let semantic_key = semantic_tool_call_key(
                 active_params.message_id,
                 &call.step,
                 &media_reference_aliases,
             );
-            let result = if let Some((original_call_id, cached)) =
-                tool_result_cache.get(&semantic_key)
+            let (result, tool_duration_ms, executed) = if let Some(prepared) =
+                parallel_media_results.remove(&call_index)
             {
-                reused_tool_result(cached, original_call_id)
+                (prepared.result, prepared.duration_ms, true)
+            } else if let Some((original_call_id, cached)) = tool_result_cache.get(&semantic_key) {
+                (
+                    reused_tool_result(cached, original_call_id),
+                    tool_started.elapsed().as_millis(),
+                    false,
+                )
             } else {
                 let result = execute_session_tool(
                     SessionToolExecution {
@@ -715,6 +748,9 @@ where
                     ctx.item_id,
                 )
                 .await;
+                (result, tool_started.elapsed().as_millis(), true)
+            };
+            if executed {
                 remember_media_reference_alias(&mut media_reference_aliases, &call.step, &result);
                 let resolved_key = semantic_tool_call_key(
                     active_params.message_id,
@@ -724,8 +760,7 @@ where
                 let cached = (call.id.clone(), result.clone());
                 tool_result_cache.insert(semantic_key, cached.clone());
                 tool_result_cache.insert(resolved_key, cached);
-                result
-            };
+            }
             if let Some(effect) = queued_generation_side_effect(&result) {
                 batch_side_effects.push(effect);
             }
@@ -734,7 +769,7 @@ where
                 ctx.item_id,
                 &call.step.step,
                 &result.status,
-                tool_started.elapsed().as_millis(),
+                tool_duration_ms,
                 ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default(),
             )
             .await;
@@ -744,7 +779,7 @@ where
                     crate::runtime_llm_runs::RunToolCall {
                         name: call.step.step.clone(),
                         status: result.status.clone(),
-                        duration_ms: i64::try_from(tool_started.elapsed().as_millis()).ok(),
+                        duration_ms: i64::try_from(tool_duration_ms).ok(),
                         args_json: serde_json::to_string(&call.step).ok(),
                         result_json: serde_json::to_string(&result).ok(),
                     },
@@ -962,6 +997,127 @@ fn reused_tool_result(cached: &ToolResult, original_call_id: &str) -> ToolResult
     result
 }
 
+struct TimedToolResult {
+    result: ToolResult,
+    duration_ms: u128,
+}
+
+fn consecutive_understand_media_call_count(calls: &[ChatStepToolCall], start: usize) -> usize {
+    calls[start..]
+        .iter()
+        .take_while(|call| call.step.step == STEP_UNDERSTAND_MEDIA)
+        .count()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_parallel_understand_media_calls(
+    calls: &[ChatStepToolCall],
+    index_offset: usize,
+    cfg: &SessionTurnConfig<'_>,
+    meta: &ToolContext,
+    trigger_message_id: i32,
+    media_reference_aliases: &BTreeMap<String, String>,
+    tool_result_cache: &BTreeMap<String, (String, ToolResult)>,
+    budget: &mut SessionBudget,
+    processing_started: tokio::time::Instant,
+    now: OffsetDateTime,
+) -> BTreeMap<usize, TimedToolResult> {
+    let mut scheduled_keys = BTreeSet::new();
+    let mut jobs = Vec::new();
+    for (local_index, call) in calls.iter().enumerate() {
+        if call.step.step != STEP_UNDERSTAND_MEDIA {
+            continue;
+        }
+        let semantic_key =
+            semantic_tool_call_key(trigger_message_id, &call.step, media_reference_aliases);
+        if tool_result_cache.contains_key(&semantic_key) || !scheduled_keys.insert(semantic_key) {
+            continue;
+        }
+        budget.extend_for_tool_start();
+        let round_now =
+            now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
+        let slice = session_tool_slice(budget, cfg, round_now);
+        jobs.push((index_offset + local_index, call.step.clone(), slice));
+    }
+
+    let toolbox = cfg.toolbox;
+    let mut remaining = jobs.into_iter();
+    let mut pending = FuturesUnordered::new();
+    for _ in 0..MAX_PARALLEL_UNDERSTAND_MEDIA_CALLS {
+        let Some((index, step, slice)) = remaining.next() else {
+            break;
+        };
+        pending.push(execute_timed_session_tool(
+            index,
+            toolbox,
+            meta.clone(),
+            step,
+            slice,
+        ));
+    }
+    let mut results = BTreeMap::new();
+    while let Some((index, result)) = pending.next().await {
+        results.insert(index, result);
+        if let Some((next_index, step, slice)) = remaining.next() {
+            pending.push(execute_timed_session_tool(
+                next_index,
+                toolbox,
+                meta.clone(),
+                step,
+                slice,
+            ));
+        }
+    }
+    results
+}
+
+async fn execute_timed_session_tool(
+    index: usize,
+    toolbox: &dyn DialogToolbox,
+    meta: ToolContext,
+    step: ToolStep,
+    slice: std::time::Duration,
+) -> (usize, TimedToolResult) {
+    let started = tokio::time::Instant::now();
+    let result = dispatch_session_tool_with_timeout(toolbox, &meta, &step, slice).await;
+    (
+        index,
+        TimedToolResult {
+            result,
+            duration_ms: started.elapsed().as_millis(),
+        },
+    )
+}
+
+fn session_tool_slice(
+    budget: &SessionBudget,
+    cfg: &SessionTurnConfig<'_>,
+    round_now: OffsetDateTime,
+) -> std::time::Duration {
+    let slice = (budget.remaining(round_now) - TOOL_RESERVE)
+        .min(TimeDuration::seconds(i64::from(
+            cfg.tool_extension_secs.max(1),
+        )))
+        .max(TimeDuration::seconds(1));
+    std::time::Duration::try_from(slice).unwrap_or(std::time::Duration::from_secs(1))
+}
+
+async fn dispatch_session_tool_with_timeout(
+    toolbox: &dyn DialogToolbox,
+    meta: &ToolContext,
+    step: &ToolStep,
+    slice: std::time::Duration,
+) -> ToolResult {
+    match tokio::time::timeout(slice, dispatch_dialog_tool(toolbox, meta, step)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => ToolResult::failed("tool_error", error.to_string()),
+        Err(_) => ToolResult::failed(
+            "tool_timeout",
+            format!("tool did not finish within {}s", slice.as_secs()),
+        ),
+    }
+}
+
 struct SessionToolExecution<'a, 'b> {
     call: &'a ChatStepToolCall,
     cfg: &'a SessionTurnConfig<'b>,
@@ -1058,26 +1214,9 @@ where
             exec.budget.extend_for_tool_start();
             let round_now = exec.now
                 + TimeDuration::try_from(exec.processing_started.elapsed()).unwrap_or_default();
-            let slice = (exec.budget.remaining(round_now) - TOOL_RESERVE)
-                .min(TimeDuration::seconds(i64::from(
-                    exec.cfg.tool_extension_secs.max(1),
-                )))
-                .max(TimeDuration::seconds(1));
-            let slice =
-                std::time::Duration::try_from(slice).unwrap_or(std::time::Duration::from_secs(1));
-            let result = match tokio::time::timeout(
-                slice,
-                dispatch_dialog_tool(exec.cfg.toolbox, exec.meta, step),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => ToolResult::failed("tool_error", error.to_string()),
-                Err(_) => ToolResult::failed(
-                    "tool_timeout",
-                    format!("tool did not finish within {}s", slice.as_secs()),
-                ),
-            };
+            let slice = session_tool_slice(exec.budget, exec.cfg, round_now);
+            let result =
+                dispatch_session_tool_with_timeout(exec.cfg.toolbox, exec.meta, step, slice).await;
             if queued_generation_side_effect(&result).is_some() {
                 match step.step.as_str() {
                     STEP_DRAW_IMAGE => *exec.draws_scheduled += 1,
@@ -1452,7 +1591,46 @@ pub async fn run_captured_session(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use openplotva_dialog::{ToolboxFuture, VisionRequest};
+
     use super::*;
+
+    struct ParallelMediaToolbox {
+        barrier: tokio::sync::Barrier,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ParallelMediaToolbox {
+        fn new(parties: usize) -> Self {
+            Self {
+                barrier: tokio::sync::Barrier::new(parties),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DialogToolbox for ParallelMediaToolbox {
+        fn understand_media<'a>(&'a self, request: VisionRequest) -> ToolboxFuture<'a> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                self.barrier.wait().await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolResult {
+                    status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+                    message: request.file_id,
+                    ..ToolResult::default()
+                })
+            })
+        }
+    }
 
     #[test]
     fn session_native_tools_exclude_agent_only_tools() {
@@ -1465,5 +1643,77 @@ mod tests {
         assert!(!names.contains(&openplotva_dialog::STEP_MEMORY_SEARCH));
         assert!(names.contains(&STEP_SEND_MESSAGE));
         assert!(names.contains(&STEP_REACT_TO_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn independent_understand_media_calls_start_in_parallel_and_keep_call_order() {
+        let toolbox = Arc::new(ParallelMediaToolbox::new(2));
+        let cfg = SessionTurnConfig {
+            toolbox: toolbox.as_ref(),
+            reactor: None,
+            max_iterations: 4,
+            max_messages: 4,
+            tool_extension_secs: 10,
+            hard_cap_secs: 60,
+            max_draws: 1,
+            max_songs: 1,
+        };
+        let calls = ["file-a", "file-b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, file_id)| ChatStepToolCall {
+                id: format!("call-{index}"),
+                step: ToolStep {
+                    step: STEP_UNDERSTAND_MEDIA.to_owned(),
+                    file_id: file_id.to_owned(),
+                    ..ToolStep::default()
+                },
+                salvaged: false,
+            })
+            .collect::<Vec<_>>();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let base = TurnBudget::from_events(&[], 30, now);
+        let mut budget = SessionBudget::new(base, 10, 60);
+
+        let results = execute_parallel_understand_media_calls(
+            &calls,
+            0,
+            &cfg,
+            &ToolContext::default(),
+            42,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut budget,
+            tokio::time::Instant::now(),
+            now,
+        )
+        .await;
+
+        assert_eq!(toolbox.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(results[&0].result.message, "file-a");
+        assert_eq!(results[&1].result.message, "file-b");
+    }
+
+    #[test]
+    fn media_parallelism_does_not_cross_side_effect_tool_boundaries() {
+        let call = |id: &str, step: &str| ChatStepToolCall {
+            id: id.to_owned(),
+            step: ToolStep {
+                step: step.to_owned(),
+                file_id: id.to_owned(),
+                ..ToolStep::default()
+            },
+            salvaged: false,
+        };
+        let calls = vec![
+            call("announce", STEP_SEND_MESSAGE),
+            call("media-a", STEP_UNDERSTAND_MEDIA),
+            call("media-b", STEP_UNDERSTAND_MEDIA),
+            call("react", STEP_REACT_TO_MESSAGE),
+            call("media-c", STEP_UNDERSTAND_MEDIA),
+        ];
+
+        assert_eq!(consecutive_understand_media_call_count(&calls, 1), 2);
+        assert_eq!(consecutive_understand_media_call_count(&calls, 4), 1);
     }
 }
