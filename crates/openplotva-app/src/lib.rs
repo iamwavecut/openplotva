@@ -3658,7 +3658,7 @@ const SQL_ADMIN_GET_USER_BY_USERNAME: &str =
     "SELECT * FROM telegram_users_effective WHERE username = $1 LIMIT 1";
 const SQL_ADMIN_ENSURE_USER: &str = "INSERT INTO users (id, first_name, is_premium, is_vip) VALUES ($1, $2, FALSE, FALSE) ON CONFLICT (id) DO NOTHING";
 const SQL_ADMIN_LIST_VIP_USERS: &str = "WITH latest_vip AS (SELECT DISTINCT ON (user_id) id, user_id, event_type, delta_seconds, effective_expires_at, reason, created_at FROM vip_events ORDER BY user_id, id DESC), subscription_stats AS (SELECT user_id, COUNT(*)::bigint AS subscriptions_count, MAX(expires_at) AS latest_subscription_expires_at FROM subscriptions GROUP BY user_id) SELECT u.*, latest_vip.id AS latest_event_id, latest_vip.event_type AS latest_event_type, latest_vip.delta_seconds AS latest_delta_seconds, latest_vip.effective_expires_at AS vip_expires_at, latest_vip.reason AS latest_reason, latest_vip.created_at AS latest_created_at, (latest_vip.effective_expires_at > CURRENT_TIMESTAMP) AS vip_active, CASE WHEN latest_vip.effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (latest_vip.effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, COALESCE(subscription_stats.subscriptions_count, 0)::bigint AS subscriptions_count, subscription_stats.latest_subscription_expires_at AS latest_subscription_expires_at FROM latest_vip JOIN telegram_users_effective u ON u.id = latest_vip.user_id LEFT JOIN subscription_stats ON subscription_stats.user_id = u.id WHERE ($1::text = 'all' OR ($1::text = 'active' AND latest_vip.effective_expires_at > CURRENT_TIMESTAMP) OR ($1::text = 'expired' AND latest_vip.effective_expires_at <= CURRENT_TIMESTAMP)) AND ($2::text IS NULL OR CAST(u.id AS text) LIKE '%' || $2::text || '%' OR u.username ILIKE '%' || $2::text || '%' OR u.first_name ILIKE '%' || $2::text || '%' OR u.last_name ILIKE '%' || $2::text || '%') ORDER BY latest_vip.effective_expires_at DESC, latest_vip.id DESC LIMIT $3 OFFSET $4";
-const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
+const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_user_stage AS (DELETE FROM telegram_users_stage WHERE user_id = $1 RETURNING user_id), deleted_member_stage AS (DELETE FROM telegram_chat_members_stage WHERE user_id = $1 RETURNING user_id), deleted_activity_stage AS (DELETE FROM telegram_activity_stage WHERE user_id = $1 RETURNING user_id), deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
 const SQL_ADMIN_LIST_CHATS: &str =
     "SELECT * FROM telegram_chats_effective ORDER BY id LIMIT $1 OFFSET $2";
 const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM telegram_chats_effective WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR title ILIKE '%' || $1::text || '%' OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
@@ -13806,6 +13806,114 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    #[tokio::test]
+    async fn admin_user_delete_clears_pending_projections_before_they_can_flush()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(postgres_dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let bot_id = i64::try_from(suffix % 1_000_000_000)? + 8_000_000_000;
+        let user_id = bot_id + 1_000_000_000;
+        let chat_id = -(bot_id + 2_000_000_000);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&postgres_dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+
+        sqlx::query("INSERT INTO users (id, first_name) VALUES ($1, 'Delete me')")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO chats (id, type) VALUES ($1, 'supergroup')")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO chat_members (chat_id, user_id, status) VALUES ($1, $2, 'member')",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_users_stage \
+             (bot_id, user_id, first_name, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, 'Staged name', CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_chat_members_stage \
+             (bot_id, chat_id, user_id, status, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, $3, 'administrator', CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_activity_stage \
+             (bot_id, chat_id, user_id, last_message_at, last_active_at, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(super::SQL_ADMIN_SAFE_DELETE_USER)
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+
+        let remaining: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM telegram_users_stage WHERE user_id = $1), \
+             (SELECT count(*) FROM telegram_chat_members_stage WHERE user_id = $1), \
+             (SELECT count(*) FROM telegram_activity_stage WHERE user_id = $1)",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(remaining, (0, 0, 0));
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_users_effective WHERE id = $1)",
+            )
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        let flush = openplotva_storage::PostgresTelegramProjectionStore::new(pool.clone())
+            .flush_staged_projections(bot_id)
+            .await?;
+        assert_eq!(flush.users, 0);
+        assert_eq!(flush.members, 0);
+        assert_eq!(flush.member_activity, 0);
+        assert_eq!(flush.active_users, 0);
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+
+        sqlx::query("DELETE FROM chats WHERE id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
 
     mod routing_admin_inputs {
         use serde_json::json;
