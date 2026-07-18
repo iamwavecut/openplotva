@@ -362,6 +362,8 @@ verify_telegram_delivery_plane() {
   local redis_container
   local stream_key
   local stream_id
+  local stream_ms
+  local stream_seq
   local bot_id
   local update_id
   local received_at_ms
@@ -394,6 +396,9 @@ verify_telegram_delivery_plane() {
       received_at "$received_at_ms" \
       payload "$payload" \
       payload_sha256 | tr -d '\r')"
+  [[ "$stream_id" =~ ^([0-9]+)-([0-9]+)$ ]] || fail "cutover probe received an invalid Stream ID"
+  stream_ms="${BASH_REMATCH[1]}"
+  stream_seq="${BASH_REMATCH[2]}"
 
   db_user="$(env_file_value DB_POSTGRES_USER)"
   db_user="${db_user:-plotva}"
@@ -401,19 +406,31 @@ verify_telegram_delivery_plane() {
   db_name="${db_name:-plotva}"
   for _ in $(seq 1 60); do
     local row
+    local quarantine_id
+    local quarantine_error_class
     local stream_entry
     row="$(compose exec -T postgresql psql -U "$db_user" -d "$db_name" -Atc \
-      "SELECT status FROM telegram_update_inbox WHERE bot_id = ${bot_id} AND update_id = ${update_id}" 2>/dev/null || true)"
+      "SELECT id || '|' || error_class
+       FROM telegram_update_quarantine
+       WHERE bot_id = ${bot_id}
+         AND stream_ms = ${stream_ms}
+         AND stream_seq = ${stream_seq}" 2>/dev/null || true)"
+    quarantine_id="${row%%|*}"
+    quarantine_error_class="${row#*|}"
     stream_entry="$(docker exec "$redis_container" valkey-cli XRANGE "$stream_key" "$stream_id" "$stream_id" COUNT 1 | tr -d '\r')"
-    if [[ "$row" == "ignored" && -z "$stream_entry" ]]; then
+    if [[ "$quarantine_id" =~ ^[0-9]+$ && "$quarantine_error_class" == "unsupported_type" && -z "$stream_entry" ]]; then
       compose exec -T postgresql psql -U "$db_user" -d "$db_name" -Atc \
-        "DELETE FROM telegram_update_inbox WHERE bot_id = ${bot_id} AND update_id = ${update_id}" >/dev/null
-      log "Telegram delivery plane verified: XADD, inbox materialization, handler outcome, ACK/Delete"
+        "DELETE FROM telegram_update_quarantine
+         WHERE id = ${quarantine_id}
+           AND bot_id = ${bot_id}
+           AND stream_ms = ${stream_ms}
+           AND stream_seq = ${stream_seq}" >/dev/null
+      log "Telegram delivery plane verified: XADD, durable quarantine, ACK/Delete"
       return 0
     fi
     sleep 1
   done
-  fail "Telegram delivery plane cutover probe did not reach ignored + ACK/Delete"
+  fail "Telegram delivery plane cutover probe did not reach quarantine + ACK/Delete"
 }
 
 main() {
