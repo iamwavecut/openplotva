@@ -169,6 +169,17 @@ impl RuntimeUpdatesInspector for RuntimeUpdatesInspectorHandle {
                 snapshot.ack_delete_mismatches = u64_to_i64(materializer.ack_delete_mismatches);
                 snapshot.materializer_db_failures = u64_to_i64(materializer.db_failures);
                 snapshot.materializer_redis_failures = u64_to_i64(materializer.redis_failures);
+                snapshot.projection_stage_rows = materializer.projection_stage_rows;
+                snapshot.projection_oldest_stage_age_ms = materializer
+                    .projection_oldest_stage_age
+                    .map_or(0, duration_millis_i64);
+                snapshot.projection_last_flush_latency_ms = materializer
+                    .projection_last_flush_latency
+                    .map_or(0, duration_millis_i64);
+                snapshot.projection_staged_mutations =
+                    u64_to_i64(materializer.projection_staged_mutations);
+                snapshot.projection_flushed_rows = u64_to_i64(materializer.projection_flushed_rows);
+                snapshot.projection_flush_errors = u64_to_i64(materializer.projection_flush_errors);
                 match postgres_update_runtime_stats(&stream_plane.postgres).await {
                     Ok(postgres) => postgres.apply_to(&mut snapshot),
                     Err(error) => {

@@ -100,6 +100,14 @@ pub trait SettingsControlJobQueue {
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error>;
+
+    fn projection_state_is_authoritative(&self) -> bool {
+        false
+    }
+
+    fn materializes_human_new_members_directly(&self) -> bool {
+        false
+    }
 }
 
 impl<T> SettingsControlJobQueue for T
@@ -114,6 +122,66 @@ where
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error> {
         self.assign_payment_control_job(queue_name, job)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectionAwareSettingsControlQueue<Queue, Greeting> {
+    queue: Arc<Queue>,
+    greeting: Arc<Greeting>,
+    projection_state_is_authoritative: bool,
+}
+
+impl<Queue, Greeting> ProjectionAwareSettingsControlQueue<Queue, Greeting> {
+    pub fn new(
+        queue: Arc<Queue>,
+        greeting: Arc<Greeting>,
+        projection_state_is_authoritative: bool,
+    ) -> Self {
+        Self {
+            queue,
+            greeting,
+            projection_state_is_authoritative,
+        }
+    }
+}
+
+impl<Queue, Greeting> SettingsControlJobQueue
+    for ProjectionAwareSettingsControlQueue<Queue, Greeting>
+where
+    Queue: SettingsControlJobQueue + Send + Sync,
+    Greeting: NewMembersGreetingRunner + Send + Sync,
+{
+    type Error = Queue::Error;
+
+    fn assign_settings_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> SettingsControlJobQueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            if self.projection_state_is_authoritative
+                && let Ok(params) = control_job_params_from_stateless_job(&job)
+                && params.data.kind == ControlKind::NewMembersFollowup
+                && !params.data.bot_was_added
+            {
+                self.greeting
+                    .run_join_greeting(new_members_greeting_from_control_params(&params))
+                    .await;
+                return Ok(());
+            }
+            self.queue
+                .assign_settings_control_job(queue_name, job)
+                .await
+        })
+    }
+
+    fn projection_state_is_authoritative(&self) -> bool {
+        self.projection_state_is_authoritative
+    }
+
+    fn materializes_human_new_members_directly(&self) -> bool {
+        self.projection_state_is_authoritative
     }
 }
 
@@ -1039,6 +1107,9 @@ pub enum NewMembersFollowupUpdateOutcome {
         member_upsert_errors: usize,
     },
     Queued {
+        member_upsert_errors: usize,
+    },
+    Accumulated {
         member_upsert_errors: usize,
     },
 }
@@ -2013,12 +2084,21 @@ where
             Ok(NewMembersFollowupUpdateOutcome::InvalidMessage)
         }
         NewMembersFollowupControlJobBuild::Job(job) => {
-            let member_upsert_errors =
-                upsert_new_chat_members_from_message(member_store, message).await;
+            let direct_accumulation = control_queue.materializes_human_new_members_directly()
+                && control_job_params_from_stateless_job(&job)
+                    .is_ok_and(|params| !params.data.bot_was_added);
+            let member_upsert_errors = if control_queue.projection_state_is_authoritative() {
+                0
+            } else {
+                upsert_new_chat_members_from_message(member_store, message).await
+            };
             match control_queue
                 .assign_settings_control_job(CONTROL_QUEUE_NAME, *job)
                 .await
             {
+                Ok(()) if direct_accumulation => Ok(NewMembersFollowupUpdateOutcome::Accumulated {
+                    member_upsert_errors,
+                }),
                 Ok(()) => Ok(NewMembersFollowupUpdateOutcome::Queued {
                     member_upsert_errors,
                 }),
@@ -2088,6 +2168,7 @@ where
     let ran_new_members = matches!(
         new_members,
         NewMembersFollowupUpdateOutcome::Queued { .. }
+            | NewMembersFollowupUpdateOutcome::Accumulated { .. }
             | NewMembersFollowupUpdateOutcome::QueueError { .. }
     );
 
@@ -3606,10 +3687,10 @@ mod tests {
         AdminChatSettingsCommandUpdateHandler, AdminChatSettingsCommandUpdateOutcome,
         AdminChatSettingsCommandUpdateRuntime, GroupSettingsAdminSyncSource,
         GroupSettingsCommandOutcome, GroupSettingsControlJobBuild, GroupSettingsControlJobEffects,
-        GroupSettingsRuntimeEffects, SettingsCommandOutcome, SettingsControlJobExecution,
-        SettingsControlJobQueue, SettingsControlJobQueueFuture, SettingsUpdateContext,
-        SettingsUpdateHandler, SettingsUpdateHandlerConfig, SettingsUpdatePorts,
-        SettingsUpdateRoute, admin_chat_member_upsert_from_telegram,
+        GroupSettingsRuntimeEffects, ProjectionAwareSettingsControlQueue, SettingsCommandOutcome,
+        SettingsControlJobExecution, SettingsControlJobQueue, SettingsControlJobQueueFuture,
+        SettingsUpdateContext, SettingsUpdateHandler, SettingsUpdateHandlerConfig,
+        SettingsUpdatePorts, SettingsUpdateRoute, admin_chat_member_upsert_from_telegram,
         can_open_group_settings_with_sources, chat_member_upsert_from_telegram,
         execute_group_settings_control_job_at, execute_new_members_followup_control_job_at,
         group_settings_control_job_from_update_at,
@@ -4864,6 +4945,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_human_new_members_accumulate_without_member_write_or_control_job()
+    -> Result<(), Box<dyn Error>> {
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let persistent_queue = Arc::new(SettingsControlJobQueueStub::default());
+        let greeting = Arc::new(NewMembersFollowupEffectsStub::blocked());
+        let control_queue = ProjectionAwareSettingsControlQueue::new(
+            Arc::clone(&persistent_queue),
+            Arc::clone(&greeting),
+            true,
+        );
+        let update = human_new_members_update()?;
+
+        let outcome = handle_new_members_followup_update_at(
+            &dispatcher,
+            &member_store,
+            &control_queue,
+            super::NewMembersFollowupUpdateInput {
+                update: &update,
+                bot_id: 999,
+                created: OffsetDateTime::UNIX_EPOCH,
+            },
+            || "unused-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::NewMembersFollowupUpdateOutcome::Accumulated {
+                member_upsert_errors: 0
+            }
+        );
+        assert!(member_store.upserts().is_empty());
+        assert!(persistent_queue.assigned().is_empty());
+        assert_eq!(
+            greeting.greetings(),
+            vec![super::NewMembersGreeting {
+                chat_id: -10042,
+                message_id: 88,
+                thread_id: Some(99),
+                new_chat_member_ids: vec![7],
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn new_members_followup_update_queue_error_sends_go_failure_notice()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
@@ -5994,6 +6122,32 @@ mod tests {
         }))
     }
 
+    fn human_new_members_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12351,
+            "message": {
+                "message_id": 88,
+                "message_thread_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Lab"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Ada"
+                },
+                "new_chat_members": [{
+                    "id": 7,
+                    "is_bot": false,
+                    "first_name": "Grace"
+                }]
+            }
+        }))
+    }
+
     fn same_chat_settings_update() -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 12347,
@@ -6500,6 +6654,21 @@ mod tests {
         }
 
         fn try_send_greeting_for_join_wave<'a>(
+            &'a self,
+            greeting: super::NewMembersGreeting,
+        ) -> super::NewMembersFollowupFuture<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("new-members followup effects state")
+                    .greetings
+                    .push(greeting);
+            })
+        }
+    }
+
+    impl super::NewMembersGreetingRunner for NewMembersFollowupEffectsStub {
+        fn run_join_greeting<'a>(
             &'a self,
             greeting: super::NewMembersGreeting,
         ) -> super::NewMembersFollowupFuture<'a, ()> {

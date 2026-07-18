@@ -3652,23 +3652,25 @@ fn admin_json_no_cache_response(status: StatusCode, value: serde_json::Value) ->
 }
 
 const ADMIN_PAGE_LIMIT: i64 = 1000;
-const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM users WHERE ($1::text IS NULL OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
-const SQL_ADMIN_GET_USER: &str = "SELECT * FROM users WHERE id = $1";
-const SQL_ADMIN_GET_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
+const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM telegram_users_effective WHERE ($1::text IS NULL OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_GET_USER: &str = "SELECT * FROM telegram_users_effective WHERE id = $1";
+const SQL_ADMIN_GET_USER_BY_USERNAME: &str =
+    "SELECT * FROM telegram_users_effective WHERE username = $1 LIMIT 1";
 const SQL_ADMIN_ENSURE_USER: &str = "INSERT INTO users (id, first_name, is_premium, is_vip) VALUES ($1, $2, FALSE, FALSE) ON CONFLICT (id) DO NOTHING";
-const SQL_ADMIN_LIST_VIP_USERS: &str = "WITH latest_vip AS (SELECT DISTINCT ON (user_id) id, user_id, event_type, delta_seconds, effective_expires_at, reason, created_at FROM vip_events ORDER BY user_id, id DESC), subscription_stats AS (SELECT user_id, COUNT(*)::bigint AS subscriptions_count, MAX(expires_at) AS latest_subscription_expires_at FROM subscriptions GROUP BY user_id) SELECT u.*, latest_vip.id AS latest_event_id, latest_vip.event_type AS latest_event_type, latest_vip.delta_seconds AS latest_delta_seconds, latest_vip.effective_expires_at AS vip_expires_at, latest_vip.reason AS latest_reason, latest_vip.created_at AS latest_created_at, (latest_vip.effective_expires_at > CURRENT_TIMESTAMP) AS vip_active, CASE WHEN latest_vip.effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (latest_vip.effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, COALESCE(subscription_stats.subscriptions_count, 0)::bigint AS subscriptions_count, subscription_stats.latest_subscription_expires_at AS latest_subscription_expires_at FROM latest_vip JOIN users u ON u.id = latest_vip.user_id LEFT JOIN subscription_stats ON subscription_stats.user_id = u.id WHERE ($1::text = 'all' OR ($1::text = 'active' AND latest_vip.effective_expires_at > CURRENT_TIMESTAMP) OR ($1::text = 'expired' AND latest_vip.effective_expires_at <= CURRENT_TIMESTAMP)) AND ($2::text IS NULL OR CAST(u.id AS text) LIKE '%' || $2::text || '%' OR u.username ILIKE '%' || $2::text || '%' OR u.first_name ILIKE '%' || $2::text || '%' OR u.last_name ILIKE '%' || $2::text || '%') ORDER BY latest_vip.effective_expires_at DESC, latest_vip.id DESC LIMIT $3 OFFSET $4";
-const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
-const SQL_ADMIN_LIST_CHATS: &str = "SELECT * FROM chats ORDER BY id LIMIT $1 OFFSET $2";
-const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM chats WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR title ILIKE '%' || $1::text || '%' OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
-const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id JOIN users u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id LIMIT $3";
-const SQL_ADMIN_GET_CHAT: &str = "SELECT * FROM chats WHERE id = $1";
-const SQL_ADMIN_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
+const SQL_ADMIN_LIST_VIP_USERS: &str = "WITH latest_vip AS (SELECT DISTINCT ON (user_id) id, user_id, event_type, delta_seconds, effective_expires_at, reason, created_at FROM vip_events ORDER BY user_id, id DESC), subscription_stats AS (SELECT user_id, COUNT(*)::bigint AS subscriptions_count, MAX(expires_at) AS latest_subscription_expires_at FROM subscriptions GROUP BY user_id) SELECT u.*, latest_vip.id AS latest_event_id, latest_vip.event_type AS latest_event_type, latest_vip.delta_seconds AS latest_delta_seconds, latest_vip.effective_expires_at AS vip_expires_at, latest_vip.reason AS latest_reason, latest_vip.created_at AS latest_created_at, (latest_vip.effective_expires_at > CURRENT_TIMESTAMP) AS vip_active, CASE WHEN latest_vip.effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (latest_vip.effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, COALESCE(subscription_stats.subscriptions_count, 0)::bigint AS subscriptions_count, subscription_stats.latest_subscription_expires_at AS latest_subscription_expires_at FROM latest_vip JOIN telegram_users_effective u ON u.id = latest_vip.user_id LEFT JOIN subscription_stats ON subscription_stats.user_id = u.id WHERE ($1::text = 'all' OR ($1::text = 'active' AND latest_vip.effective_expires_at > CURRENT_TIMESTAMP) OR ($1::text = 'expired' AND latest_vip.effective_expires_at <= CURRENT_TIMESTAMP)) AND ($2::text IS NULL OR CAST(u.id AS text) LIKE '%' || $2::text || '%' OR u.username ILIKE '%' || $2::text || '%' OR u.first_name ILIKE '%' || $2::text || '%' OR u.last_name ILIKE '%' || $2::text || '%') ORDER BY latest_vip.effective_expires_at DESC, latest_vip.id DESC LIMIT $3 OFFSET $4";
+const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_user_stage AS (DELETE FROM telegram_users_stage WHERE user_id = $1 RETURNING user_id), deleted_member_stage AS (DELETE FROM telegram_chat_members_stage WHERE user_id = $1 RETURNING user_id), deleted_activity_stage AS (DELETE FROM telegram_activity_stage WHERE user_id = $1 RETURNING user_id), deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
+const SQL_ADMIN_LIST_CHATS: &str =
+    "SELECT * FROM telegram_chats_effective ORDER BY id LIMIT $1 OFFSET $2";
+const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM telegram_chats_effective WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR title ILIKE '%' || $1::text || '%' OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM telegram_chats_effective c JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id JOIN telegram_users_effective u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id LIMIT $3";
+const SQL_ADMIN_GET_CHAT: &str = "SELECT * FROM telegram_chats_effective WHERE id = $1";
+const SQL_ADMIN_GET_CHAT_TYPE: &str = "SELECT type FROM telegram_chats_effective WHERE id = $1";
 const SQL_ADMIN_GET_CHAT_SETTINGS: &str = "SELECT * FROM chat_settings WHERE chat_id = $1";
 const SQL_ADMIN_GET_CHAT_PERMISSIONS: &str =
     "SELECT * FROM chat_permissions WHERE chat_id = $1 LIMIT 1";
 const SQL_ADMIN_COUNT_CHAT_MEMBERS: &str =
-    "SELECT COUNT(*)::bigint AS count FROM chat_members WHERE chat_id = $1";
-const SQL_ADMIN_LIST_CHAT_MEMBERS_WITH_USERS: &str = "SELECT cm.chat_id AS member_chat_id, cm.user_id AS member_user_id, cm.status AS member_status, cm.is_anonymous AS member_is_anonymous, cm.custom_title AS member_custom_title, cm.can_be_edited AS member_can_be_edited, cm.can_manage_chat AS member_can_manage_chat, cm.can_delete_messages AS member_can_delete_messages, cm.can_manage_video_chats AS member_can_manage_video_chats, cm.can_restrict_members AS member_can_restrict_members, cm.can_promote_members AS member_can_promote_members, cm.can_change_info AS member_can_change_info, cm.can_invite_users AS member_can_invite_users, cm.can_post_messages AS member_can_post_messages, cm.can_edit_messages AS member_can_edit_messages, cm.can_pin_messages AS member_can_pin_messages, cm.can_manage_topics AS member_can_manage_topics, cm.can_send_messages AS member_can_send_messages, cm.can_send_media_messages AS member_can_send_media_messages, cm.can_send_polls AS member_can_send_polls, cm.can_send_other_messages AS member_can_send_other_messages, cm.can_add_web_page_previews AS member_can_add_web_page_previews, cm.until_date AS member_until_date, cm.created_at AS member_created_at, cm.updated_at AS member_updated_at, cm.last_message_at AS member_last_message_at, u.id AS user_id, u.is_premium AS user_is_premium, u.first_name AS user_first_name, u.last_name AS user_last_name, u.username AS user_username, u.language_code AS user_language_code, u.is_vip AS user_is_vip, u.settings AS user_settings, u.discovered AS user_discovered, u.updated AS user_updated FROM chat_members cm LEFT JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = $1";
+    "SELECT COUNT(*)::bigint AS count FROM telegram_chat_members_effective WHERE chat_id = $1";
+const SQL_ADMIN_LIST_CHAT_MEMBERS_WITH_USERS: &str = "SELECT cm.chat_id AS member_chat_id, cm.user_id AS member_user_id, cm.status AS member_status, cm.is_anonymous AS member_is_anonymous, cm.custom_title AS member_custom_title, cm.can_be_edited AS member_can_be_edited, cm.can_manage_chat AS member_can_manage_chat, cm.can_delete_messages AS member_can_delete_messages, cm.can_manage_video_chats AS member_can_manage_video_chats, cm.can_restrict_members AS member_can_restrict_members, cm.can_promote_members AS member_can_promote_members, cm.can_change_info AS member_can_change_info, cm.can_invite_users AS member_can_invite_users, cm.can_post_messages AS member_can_post_messages, cm.can_edit_messages AS member_can_edit_messages, cm.can_pin_messages AS member_can_pin_messages, cm.can_manage_topics AS member_can_manage_topics, cm.can_send_messages AS member_can_send_messages, cm.can_send_media_messages AS member_can_send_media_messages, cm.can_send_polls AS member_can_send_polls, cm.can_send_other_messages AS member_can_send_other_messages, cm.can_add_web_page_previews AS member_can_add_web_page_previews, cm.until_date AS member_until_date, cm.created_at AS member_created_at, cm.updated_at AS member_updated_at, cm.last_message_at AS member_last_message_at, u.id AS user_id, u.is_premium AS user_is_premium, u.first_name AS user_first_name, u.last_name AS user_last_name, u.username AS user_username, u.language_code AS user_language_code, u.is_vip AS user_is_vip, u.settings AS user_settings, u.discovered AS user_discovered, u.updated AS user_updated FROM telegram_chat_members_effective cm LEFT JOIN telegram_users_effective u ON u.id = cm.user_id WHERE cm.chat_id = $1";
 
 #[derive(Debug, Deserialize)]
 struct AdminChatSettingsUpdateRequest {
@@ -11004,7 +11006,7 @@ async fn start_runtime_workers(
     let new_members_effects = settings::NewMembersFollowupRuntimeEffects::new(
         members::ChatSettingsCommunicationEffects::new(chat_settings_store.clone()),
         service_clients.redis.blocked_chat_store(),
-        join_greeting_runtime,
+        join_greeting_runtime.clone(),
     );
     let member_effects = members::MemberStateRuntimeEffects::new(
         chat_member_store.clone(),
@@ -11411,13 +11413,21 @@ async fn start_runtime_workers(
     let store_for_updates = Arc::new(store.clone());
     let history_store_for_updates = Arc::new(history_store.clone());
     let chat_members_for_updates = Arc::new(chat_member_store.clone());
-    let (message_activity_store, message_activity_worker) =
-        activity::BufferedMessageActivityStore::spawn(
+    let projection_state_is_authoritative = config
+        .update_queue
+        .materialization_mode
+        .projection_is_authoritative();
+    let message_activity_store = if projection_state_is_authoritative {
+        activity::BufferedMessageActivityStore::new(Arc::clone(&chat_members_for_updates))
+    } else {
+        let (store, worker) = activity::BufferedMessageActivityStore::spawn(
             Arc::clone(&chat_members_for_updates),
             stop.subscribe(),
         );
+        workers.handles.push(worker);
+        store
+    };
     let message_activity_store = Arc::new(message_activity_store);
-    workers.handles.push(message_activity_worker);
     let checkin_game_store_for_updates = Arc::new(checkin_game_store.clone());
     let rate_limits_for_updates = Arc::clone(&rate_limit_policy);
     let permission_policy_for_updates = Arc::clone(&permission_policy);
@@ -12617,28 +12627,61 @@ async fn start_runtime_workers(
             ),
             ..openplotva_updates::UpdateStreamMaterializerConfig::default()
         };
+        let projection_materializer_config =
+            update_materializer::UpdateProjectionMaterializerConfig {
+                mode: config.update_queue.materialization_mode,
+                flush_interval: Duration::from_millis(
+                    u64::try_from(config.update_queue.projection_flush_interval_ms)
+                        .unwrap_or(10_000),
+                ),
+                flush_max_mutations: config.update_queue.projection_flush_max_mutations,
+                stage_hard_limit_rows: config.update_queue.projection_stage_hard_limit_rows,
+            };
         let materializer_stream = update_stream.clone();
         let materializer_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
             service_clients.postgres.clone(),
         );
         let materializer_metrics = update_materializer::UpdateMaterializerMetrics::default();
         let readiness_metrics = materializer_metrics.clone();
+        let readiness_projection_mode = projection_materializer_config.mode;
+        let readiness_stage_hard_limit =
+            i64::try_from(projection_materializer_config.stage_hard_limit_rows).unwrap_or(i64::MAX);
         workers.readiness_probes.push(Arc::new(move || {
             let snapshot = readiness_metrics.snapshot();
-            if snapshot.supervisor_running {
-                ReadinessCheck::ok(
-                    "telegram_update_materializer_live",
-                    format!(
-                        "supervisor running; lease held={}; {} restarts",
-                        snapshot.lease_held, snapshot.supervisor_restarts
-                    ),
-                )
-            } else {
-                ReadinessCheck::error(
+            if !snapshot.supervisor_running {
+                return ReadinessCheck::error(
                     "telegram_update_materializer_live",
                     format!(
                         "supervisor is not running; {} restarts",
                         snapshot.supervisor_restarts
+                    ),
+                );
+            }
+            if readiness_projection_mode.stages_projections()
+                && (snapshot.projection_stage_rows >= readiness_stage_hard_limit
+                    || snapshot
+                        .projection_oldest_stage_age
+                        .is_some_and(|age| age > Duration::from_secs(30)))
+            {
+                ReadinessCheck::error(
+                    "telegram_update_materializer_live",
+                    format!(
+                        "projection staging degraded; {} rows, oldest age {} ms, {} flush errors",
+                        snapshot.projection_stage_rows,
+                        snapshot
+                            .projection_oldest_stage_age
+                            .map_or(0, |age| age.as_millis()),
+                        snapshot.projection_flush_errors,
+                    ),
+                )
+            } else {
+                ReadinessCheck::ok(
+                    "telegram_update_materializer_live",
+                    format!(
+                        "supervisor running; lease held={}; {} restarts; {} staged projection rows",
+                        snapshot.lease_held,
+                        snapshot.supervisor_restarts,
+                        snapshot.projection_stage_rows,
                     ),
                 )
             }
@@ -12656,6 +12699,7 @@ async fn start_runtime_workers(
                 materializer_store,
                 materializer_bot_id,
                 materializer_config,
+                projection_materializer_config,
                 materializer_metrics,
                 materializer_stop,
             )
@@ -12842,10 +12886,15 @@ async fn start_runtime_workers(
                 Arc::new(service_clients.redis.blocked_chat_store()),
                 checkin_command,
             ));
+        let settings_control_queue = Arc::new(settings::ProjectionAwareSettingsControlQueue::new(
+            Arc::clone(&control_queue_for_updates),
+            Arc::new(join_greeting_runtime.clone()),
+            projection_state_is_authoritative,
+        ));
         let settings_handler = Arc::new(settings::SettingsUpdateHandler::new(
             Arc::clone(&dispatcher_queue_for_updates),
             Arc::clone(&chat_members_for_updates),
-            Arc::clone(&control_queue_for_updates),
+            settings_control_queue,
             settings::SettingsUpdateHandlerConfig::new(
                 bot_identity.username.clone(),
                 bot_identity.id,
@@ -12995,23 +13044,32 @@ async fn start_runtime_workers(
             )),
             diagnostics_handler,
         ));
-        let left_member = Arc::new(members::LeftChatMemberUpdateHandler::new(
-            Arc::clone(&chat_members_for_updates),
-            Arc::clone(&chat_communication),
-            bot_identity.id,
-            help_handler,
-        ));
-        let member_state = Arc::new(members::ChatMemberStateUpdateHandler::new(
-            Arc::clone(&chat_members_for_updates),
-            Arc::clone(&control_queue_for_updates),
-            chat_communication,
-            bot_identity.id,
-            left_member,
-        ));
-        let activity = Arc::new(activity::MessageActivityUpdateHandler::new(
-            Arc::clone(&message_activity_store),
-            member_state,
-        ));
+        let left_member = Arc::new(
+            members::LeftChatMemberUpdateHandler::new(
+                Arc::clone(&chat_members_for_updates),
+                Arc::clone(&chat_communication),
+                bot_identity.id,
+                help_handler,
+            )
+            .with_projection_state_authoritative(projection_state_is_authoritative),
+        );
+        let member_state = Arc::new(
+            members::ChatMemberStateUpdateHandler::new(
+                Arc::clone(&chat_members_for_updates),
+                Arc::clone(&control_queue_for_updates),
+                chat_communication,
+                bot_identity.id,
+                left_member,
+            )
+            .with_projection_state_authoritative(projection_state_is_authoritative),
+        );
+        let activity = Arc::new(
+            activity::MessageActivityUpdateHandler::new(
+                Arc::clone(&message_activity_store),
+                member_state,
+            )
+            .with_projection_state_authoritative(projection_state_is_authoritative),
+        );
         let edited_effects = Arc::new(
             edited::TaskmanEditedMessageEffects::new(
                 Arc::clone(&task_queue_for_updates),
@@ -13052,6 +13110,7 @@ async fn start_runtime_workers(
                 store_for_updates,
                 handler,
                 update_stage_tracker,
+                projection_state_is_authoritative,
                 wait_for_runtime_stop(update_consumer_stop),
             )
             .await;
@@ -13747,6 +13806,114 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    #[tokio::test]
+    async fn admin_user_delete_clears_pending_projections_before_they_can_flush()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(postgres_dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let bot_id = i64::try_from(suffix % 1_000_000_000)? + 8_000_000_000;
+        let user_id = bot_id + 1_000_000_000;
+        let chat_id = -(bot_id + 2_000_000_000);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&postgres_dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+
+        sqlx::query("INSERT INTO users (id, first_name) VALUES ($1, 'Delete me')")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO chats (id, type) VALUES ($1, 'supergroup')")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO chat_members (chat_id, user_id, status) VALUES ($1, $2, 'member')",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_users_stage \
+             (bot_id, user_id, first_name, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, 'Staged name', CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_chat_members_stage \
+             (bot_id, chat_id, user_id, status, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, $3, 'administrator', CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_activity_stage \
+             (bot_id, chat_id, user_id, last_message_at, last_active_at, observed_at, stream_ms, stream_seq) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, 0)",
+        )
+        .bind(bot_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(super::SQL_ADMIN_SAFE_DELETE_USER)
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+
+        let remaining: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM telegram_users_stage WHERE user_id = $1), \
+             (SELECT count(*) FROM telegram_chat_members_stage WHERE user_id = $1), \
+             (SELECT count(*) FROM telegram_activity_stage WHERE user_id = $1)",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(remaining, (0, 0, 0));
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_users_effective WHERE id = $1)",
+            )
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        let flush = openplotva_storage::PostgresTelegramProjectionStore::new(pool.clone())
+            .flush_staged_projections(bot_id)
+            .await?;
+        assert_eq!(flush.users, 0);
+        assert_eq!(flush.members, 0);
+        assert_eq!(flush.member_activity, 0);
+        assert_eq!(flush.active_users, 0);
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+
+        sqlx::query("DELETE FROM chats WHERE id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
 
     mod routing_admin_inputs {
         use serde_json::json;

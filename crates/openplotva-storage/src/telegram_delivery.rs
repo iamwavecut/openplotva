@@ -7,10 +7,13 @@
 use std::{collections::HashMap, time::Duration};
 
 use serde::de::DeserializeOwned;
-use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
+use sqlx::{PgPool, Postgres, Row, postgres::PgRow};
 use time::OffsetDateTime;
 
-use crate::StorageError;
+use crate::{
+    StorageError, TelegramProjectionBatch,
+    telegram_projection::apply_projection_batch_in_transaction,
+};
 
 /// Conservative bind budget below PostgreSQL's protocol limit.
 pub const POSTGRES_MATERIALIZATION_BIND_BUDGET: usize = 60_000;
@@ -21,59 +24,115 @@ pub const QUARANTINED_UPDATE_BINDS_PER_ROW: usize = 12;
 /// Longest claim lifetime before another worker may reclaim an update.
 pub const UPDATE_PROCESSING_LEASE_SECONDS: i64 = 90;
 
-const SQL_INSERT_UPDATES_PREFIX: &str = "WITH materialized AS (INSERT INTO telegram_update_inbox (\
-    bot_id, update_id, schema_version, source, stream_ms, stream_seq, last_stream_ms, \
-    last_stream_seq, raw_payload, payload_sha256, payload_conflict, update_type, \
-    telegram_event_at, first_received_at, last_received_at, delivery_count, ordering_key, \
-    priority, chat_id, thread_id, user_id, status, completed_at, outcome, ignored_reason)";
+const SQL_INSERT_UPDATES: &str = r#"
+WITH input AS MATERIALIZED (
+    SELECT *
+    FROM unnest(
+        $1::bigint[], $2::bigint[], $3::smallint[], $4::text[], $5::bigint[],
+        $6::bigint[], $7::bigint[], $8::bigint[], $9::bytea[], $10::bytea[],
+        $11::boolean[], $12::text[], $13::timestamptz[], $14::timestamptz[],
+        $15::timestamptz[], $16::bigint[], $17::text[], $18::integer[],
+        $19::bigint[], $20::integer[], $21::bigint[], $22::text[],
+        $23::timestamptz[], $24::text[], $25::text[]
+    ) AS input(
+        bot_id, update_id, schema_version, source, stream_ms, stream_seq,
+        last_stream_ms, last_stream_seq, raw_payload, payload_sha256,
+        payload_conflict, update_type, telegram_event_at, first_received_at,
+        last_received_at, delivery_count, ordering_key, priority, chat_id,
+        thread_id, user_id, status, completed_at, outcome, ignored_reason
+    )
+), materialized AS (
+    INSERT INTO telegram_update_inbox (
+        bot_id, update_id, schema_version, source, stream_ms, stream_seq,
+        last_stream_ms, last_stream_seq, raw_payload, payload_sha256,
+        payload_conflict, update_type, telegram_event_at, first_received_at,
+        last_received_at, delivery_count, ordering_key, priority, chat_id,
+        thread_id, user_id, status, completed_at, outcome, ignored_reason
+    )
+    SELECT
+        bot_id, update_id, schema_version, source, stream_ms, stream_seq,
+        last_stream_ms, last_stream_seq, raw_payload, payload_sha256,
+        payload_conflict, update_type, telegram_event_at, first_received_at,
+        last_received_at, delivery_count, ordering_key, priority, chat_id,
+        thread_id, user_id, status, completed_at, outcome, ignored_reason
+    FROM input
+    ON CONFLICT (bot_id, update_id) DO UPDATE SET
+        delivery_count = telegram_update_inbox.delivery_count + CASE
+            WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq)
+                > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq)
+            THEN EXCLUDED.delivery_count ELSE 0
+        END,
+        last_stream_ms = CASE
+            WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq)
+                > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq)
+            THEN EXCLUDED.last_stream_ms ELSE telegram_update_inbox.last_stream_ms
+        END,
+        last_stream_seq = CASE
+            WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq)
+                > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq)
+            THEN EXCLUDED.last_stream_seq ELSE telegram_update_inbox.last_stream_seq
+        END,
+        first_received_at = LEAST(
+            telegram_update_inbox.first_received_at,
+            EXCLUDED.first_received_at
+        ),
+        last_received_at = GREATEST(
+            telegram_update_inbox.last_received_at,
+            EXCLUDED.last_received_at
+        ),
+        payload_conflict = telegram_update_inbox.payload_conflict
+            OR EXCLUDED.payload_conflict
+            OR telegram_update_inbox.payload_sha256 <> EXCLUDED.payload_sha256,
+        updated_at = now()
+    RETURNING id, bot_id, ordering_key, stream_ms, stream_seq, status,
+        (xmax = 0) AS inserted, payload_conflict
+), lane_heads AS (
+    SELECT DISTINCT ON (bot_id, ordering_key)
+        bot_id, ordering_key, id AS head_inbox_id
+    FROM materialized
+    WHERE inserted AND status IN ('pending', 'processing', 'retry_wait')
+    ORDER BY bot_id, ordering_key, stream_ms, stream_seq, id
+), lane_upsert AS (
+    INSERT INTO telegram_update_lanes (bot_id, ordering_key, head_inbox_id)
+    SELECT bot_id, ordering_key, head_inbox_id FROM lane_heads
+    ON CONFLICT (bot_id, ordering_key) DO UPDATE SET
+        head_inbox_id = COALESCE(telegram_update_lanes.head_inbox_id, EXCLUDED.head_inbox_id),
+        updated_at = now()
+    RETURNING head_inbox_id
+)
+SELECT inserted, payload_conflict FROM materialized
+WHERE (SELECT count(*) FROM lane_upsert) >= 0
+"#;
 
-const SQL_INSERT_UPDATES_SUFFIX: &str = " ON CONFLICT (bot_id, update_id) DO UPDATE SET \
-    delivery_count = telegram_update_inbox.delivery_count + CASE \
-        WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq) \
-           > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq) \
-        THEN EXCLUDED.delivery_count ELSE 0 END, \
-    last_stream_ms = CASE \
-        WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq) \
-           > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq) \
-        THEN EXCLUDED.last_stream_ms ELSE telegram_update_inbox.last_stream_ms END, \
-    last_stream_seq = CASE \
-        WHEN (EXCLUDED.last_stream_ms, EXCLUDED.last_stream_seq) \
-           > (telegram_update_inbox.last_stream_ms, telegram_update_inbox.last_stream_seq) \
-        THEN EXCLUDED.last_stream_seq ELSE telegram_update_inbox.last_stream_seq END, \
-    first_received_at = LEAST(telegram_update_inbox.first_received_at, EXCLUDED.first_received_at), \
-    last_received_at = GREATEST(telegram_update_inbox.last_received_at, EXCLUDED.last_received_at), \
-    payload_conflict = telegram_update_inbox.payload_conflict \
-        OR EXCLUDED.payload_conflict \
-        OR telegram_update_inbox.payload_sha256 <> EXCLUDED.payload_sha256, \
-    updated_at = now() \
-    RETURNING id, bot_id, ordering_key, stream_ms, stream_seq, status, \
-        (xmax = 0) AS inserted, payload_conflict), \
-lane_heads AS (\
-    SELECT DISTINCT ON (bot_id, ordering_key) \
-        bot_id, ordering_key, id AS head_inbox_id \
-    FROM materialized \
-    WHERE inserted AND status IN ('pending', 'processing', 'retry_wait') \
-    ORDER BY bot_id, ordering_key, stream_ms, stream_seq, id\
-), lane_upsert AS (\
-    INSERT INTO telegram_update_lanes (bot_id, ordering_key, head_inbox_id) \
-    SELECT bot_id, ordering_key, head_inbox_id FROM lane_heads \
-    ON CONFLICT (bot_id, ordering_key) DO UPDATE SET \
-        head_inbox_id = COALESCE(telegram_update_lanes.head_inbox_id, EXCLUDED.head_inbox_id), \
-        updated_at = now() \
-    RETURNING head_inbox_id\
-) \
-SELECT inserted, payload_conflict FROM materialized \
-WHERE (SELECT count(*) FROM lane_upsert) >= 0";
-
-const SQL_INSERT_QUARANTINE_PREFIX: &str = "INSERT INTO telegram_update_quarantine (\
-    bot_id, stream_ms, stream_seq, schema_version, source, raw_payload, payload_sha256, \
-    first_received_at, last_received_at, delivery_count, error_class, error)";
-
-const SQL_INSERT_QUARANTINE_SUFFIX: &str = " ON CONFLICT (bot_id, stream_ms, stream_seq) DO UPDATE SET \
-    delivery_count = GREATEST(telegram_update_quarantine.delivery_count, EXCLUDED.delivery_count), \
-    first_received_at = LEAST(telegram_update_quarantine.first_received_at, EXCLUDED.first_received_at), \
-    last_received_at = GREATEST(telegram_update_quarantine.last_received_at, EXCLUDED.last_received_at), \
-    updated_at = now()";
+const SQL_INSERT_QUARANTINE: &str = r#"
+INSERT INTO telegram_update_quarantine (
+    bot_id, stream_ms, stream_seq, schema_version, source, raw_payload, payload_sha256,
+    first_received_at, last_received_at, delivery_count, error_class, error
+)
+SELECT *
+FROM unnest(
+    $1::bigint[], $2::bigint[], $3::bigint[], $4::smallint[], $5::text[],
+    $6::bytea[], $7::bytea[], $8::timestamptz[], $9::timestamptz[],
+    $10::bigint[], $11::text[], $12::text[]
+) AS input(
+    bot_id, stream_ms, stream_seq, schema_version, source, raw_payload, payload_sha256,
+    first_received_at, last_received_at, delivery_count, error_class, error
+)
+ON CONFLICT (bot_id, stream_ms, stream_seq) DO UPDATE SET
+    delivery_count = GREATEST(
+        telegram_update_quarantine.delivery_count,
+        EXCLUDED.delivery_count
+    ),
+    first_received_at = LEAST(
+        telegram_update_quarantine.first_received_at,
+        EXCLUDED.first_received_at
+    ),
+    last_received_at = GREATEST(
+        telegram_update_quarantine.last_received_at,
+        EXCLUDED.last_received_at
+    ),
+    updated_at = now()
+"#;
 
 const SQL_LOCK_UPDATE_LANES: &str = r#"
 SELECT pg_advisory_xact_lock(hashtextextended(lane_key, 0))
@@ -843,6 +902,17 @@ impl PostgresTelegramDeliveryStore {
         materialize_update_batch(&self.pool, updates, quarantine).await
     }
 
+    /// Commit immediate state dependencies and online inbox/quarantine rows in
+    /// one logged transaction.
+    pub async fn materialize_online_batch(
+        &self,
+        updates: &[MaterializedUpdateInput],
+        quarantine: &[QuarantinedUpdateInput],
+        projections: &TelegramProjectionBatch,
+    ) -> Result<MaterializationReport, StorageError> {
+        materialize_online_batch(&self.pool, updates, quarantine, projections).await
+    }
+
     /// Delete one bounded batch of terminal inbox rows and quarantined updates
     /// older than `cutoff`. Processing rows are never eligible; attempt rows
     /// follow terminal inbox deletion through their `ON DELETE CASCADE` key.
@@ -1208,6 +1278,23 @@ pub async fn materialize_update_batch(
     updates: &[MaterializedUpdateInput],
     quarantine: &[QuarantinedUpdateInput],
 ) -> Result<MaterializationReport, StorageError> {
+    materialize_online_batch(
+        pool,
+        updates,
+        quarantine,
+        &TelegramProjectionBatch::default(),
+    )
+    .await
+}
+
+/// Free-function boundary for callers that atomically materialize immediate
+/// projections with online update rows.
+pub async fn materialize_online_batch(
+    pool: &PgPool,
+    updates: &[MaterializedUpdateInput],
+    quarantine: &[QuarantinedUpdateInput],
+    projections: &TelegramProjectionBatch,
+) -> Result<MaterializationReport, StorageError> {
     let prepared_updates = prepare_updates(updates);
     let prepared_quarantine = prepare_quarantine(quarantine);
     let max_rows = materialization_bind_row_limit();
@@ -1225,7 +1312,7 @@ pub async fn materialize_update_batch(
             max_rows: max_quarantine_rows,
         });
     }
-    if prepared_updates.is_empty() && prepared_quarantine.is_empty() {
+    if prepared_updates.is_empty() && prepared_quarantine.is_empty() && projections.is_empty() {
         return Ok(MaterializationReport::default());
     }
 
@@ -1244,10 +1331,11 @@ pub async fn materialize_update_batch(
         ..MaterializationReport::default()
     };
 
+    apply_projection_batch_in_transaction(&mut tx, projections).await?;
+
     if !prepared_updates.is_empty() {
         lock_materialization_lanes(&mut tx, &prepared_updates).await?;
-        let mut builder = materialized_update_insert_builder(&prepared_updates);
-        let rows = builder.build().fetch_all(&mut *tx).await?;
+        let rows = insert_materialized_updates(&mut tx, &prepared_updates).await?;
         for row in rows {
             if row.try_get::<bool, _>("inserted")? {
                 report.inserted = report.inserted.saturating_add(1);
@@ -1259,8 +1347,7 @@ pub async fn materialize_update_batch(
     }
 
     if !prepared_quarantine.is_empty() {
-        let mut builder = quarantine_insert_builder(&prepared_quarantine);
-        builder.build().execute(&mut *tx).await?;
+        insert_quarantined_updates(&mut tx, &prepared_quarantine).await?;
     }
 
     tx.commit().await?;
@@ -1425,69 +1512,256 @@ fn prepare_quarantine(quarantine: &[QuarantinedUpdateInput]) -> Vec<QuarantinedU
     prepared
 }
 
-fn materialized_update_insert_builder(updates: &[PreparedUpdate]) -> QueryBuilder<Postgres> {
-    let mut builder = QueryBuilder::new(SQL_INSERT_UPDATES_PREFIX);
-    builder.push(" ");
-    builder.push_values(updates.iter(), |mut row, update| {
-        let canonical = &update.canonical;
-        let (status, completed_at, outcome, ignored_reason) = match &canonical.disposition {
-            MaterializedUpdateDisposition::Pending => ("pending", None, None, None),
-            MaterializedUpdateDisposition::Ignored { reason } => (
-                "ignored",
-                Some(OffsetDateTime::now_utc()),
-                Some("ignored"),
-                Some(reason.clone()),
-            ),
-        };
-        row.push_bind(canonical.bot_id)
-            .push_bind(canonical.update_id)
-            .push_bind(canonical.schema_version)
-            .push_bind(canonical.source.clone())
-            .push_bind(canonical.stream_ms)
-            .push_bind(canonical.stream_seq)
-            .push_bind(update.last_stream_ms)
-            .push_bind(update.last_stream_seq)
-            .push_bind(canonical.raw_payload.clone())
-            .push_bind(canonical.payload_sha256.clone())
-            .push_bind(canonical.payload_conflict)
-            .push_bind(canonical.update_type.clone())
-            .push_bind(canonical.telegram_event_at)
-            .push_bind(canonical.first_received_at)
-            .push_bind(canonical.last_received_at)
-            .push_bind(canonical.delivery_count)
-            .push_bind(canonical.ordering_key.clone())
-            .push_bind(canonical.priority)
-            .push_bind(canonical.chat_id)
-            .push_bind(canonical.thread_id)
-            .push_bind(canonical.user_id)
-            .push_bind(status)
-            .push_bind(completed_at)
-            .push_bind(outcome)
-            .push_bind(ignored_reason);
-    });
-    builder.push(SQL_INSERT_UPDATES_SUFFIX);
-    builder
+async fn insert_materialized_updates(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    updates: &[PreparedUpdate],
+) -> Result<Vec<PgRow>, StorageError> {
+    let ignored_at = OffsetDateTime::now_utc();
+    let statuses = updates
+        .iter()
+        .map(|update| match &update.canonical.disposition {
+            MaterializedUpdateDisposition::Pending => "pending",
+            MaterializedUpdateDisposition::Ignored { .. } => "ignored",
+        })
+        .collect::<Vec<_>>();
+    let completed_at = updates
+        .iter()
+        .map(|update| match &update.canonical.disposition {
+            MaterializedUpdateDisposition::Pending => None,
+            MaterializedUpdateDisposition::Ignored { .. } => Some(ignored_at),
+        })
+        .collect::<Vec<_>>();
+    let outcomes = updates
+        .iter()
+        .map(|update| match &update.canonical.disposition {
+            MaterializedUpdateDisposition::Pending => None,
+            MaterializedUpdateDisposition::Ignored { .. } => Some("ignored"),
+        })
+        .collect::<Vec<_>>();
+    let ignored_reasons = updates
+        .iter()
+        .map(|update| match &update.canonical.disposition {
+            MaterializedUpdateDisposition::Pending => None,
+            MaterializedUpdateDisposition::Ignored { reason } => Some(reason.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    sqlx::query(SQL_INSERT_UPDATES)
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.bot_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.update_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.schema_version)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.source.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.stream_ms)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.stream_seq)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.last_stream_ms)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.last_stream_seq)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.raw_payload.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.payload_sha256.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.payload_conflict)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.update_type.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.telegram_event_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.first_received_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.last_received_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.delivery_count)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.ordering_key.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.priority)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.chat_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.thread_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.canonical.user_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(statuses)
+        .bind(completed_at)
+        .bind(outcomes)
+        .bind(ignored_reasons)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StorageError::from)
 }
 
-fn quarantine_insert_builder(updates: &[QuarantinedUpdateInput]) -> QueryBuilder<Postgres> {
-    let mut builder = QueryBuilder::new(SQL_INSERT_QUARANTINE_PREFIX);
-    builder.push(" ");
-    builder.push_values(updates.iter(), |mut row, update| {
-        row.push_bind(update.bot_id)
-            .push_bind(update.stream_ms)
-            .push_bind(update.stream_seq)
-            .push_bind(update.schema_version)
-            .push_bind(update.source.clone())
-            .push_bind(update.raw_payload.clone())
-            .push_bind(update.payload_sha256.clone())
-            .push_bind(update.first_received_at)
-            .push_bind(update.last_received_at)
-            .push_bind(update.delivery_count)
-            .push_bind(update.error_class.clone())
-            .push_bind(update.error.clone());
-    });
-    builder.push(SQL_INSERT_QUARANTINE_SUFFIX);
-    builder
+async fn insert_quarantined_updates(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    updates: &[QuarantinedUpdateInput],
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_INSERT_QUARANTINE)
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.bot_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.stream_ms)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.stream_seq)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.schema_version)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.source.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.raw_payload.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.payload_sha256.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.first_received_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.last_received_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.delivery_count)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.error_class.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            updates
+                .iter()
+                .map(|update| update.error.clone())
+                .collect::<Vec<_>>(),
+        )
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn claimed_update_from_row(row: PgRow) -> Result<ClaimedTelegramUpdate, StorageError> {
@@ -1591,9 +1865,14 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 mod tests {
     use std::{env, error::Error, time::SystemTime};
 
-    use sqlx::{Execute as _, postgres::PgPoolOptions};
+    use openplotva_core::{ChatState, UserState};
+    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
+    use crate::{
+        ChatMemberUpsert, TelegramChatMemberProjection, TelegramChatProjection,
+        TelegramProjectionVersion, TelegramUserProjection,
+    };
 
     const TEST_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1657,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn full_bulk_uses_one_values_statement_for_all_valid_rows() {
+    fn full_bulk_uses_one_fixed_unnest_statement_for_all_valid_rows() {
         let updates = (0..512)
             .map(|index| {
                 update(
@@ -1669,17 +1948,22 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let prepared = prepare_updates(&updates);
-        let mut builder = materialized_update_insert_builder(&prepared);
-        let sql = builder.build().sql().as_ref().to_owned();
-
-        assert_eq!(sql.matches("INSERT INTO telegram_update_inbox").count(), 1);
-        assert_eq!(sql.matches("ON CONFLICT").count(), 2);
-        assert_eq!(sql.matches("INSERT INTO telegram_update_lanes").count(), 1);
+        assert_eq!(prepare_updates(&updates).len(), 512);
         assert_eq!(
-            sql.matches('$').count(),
-            512 * MATERIALIZED_UPDATE_BINDS_PER_ROW
+            SQL_INSERT_UPDATES
+                .matches("INSERT INTO telegram_update_inbox")
+                .count(),
+            1
         );
+        assert_eq!(SQL_INSERT_UPDATES.matches("ON CONFLICT").count(), 2);
+        assert_eq!(
+            SQL_INSERT_UPDATES
+                .matches("INSERT INTO telegram_update_lanes")
+                .count(),
+            1
+        );
+        assert_eq!(SQL_INSERT_UPDATES.matches('$').count(), 25);
+        assert!(SQL_INSERT_UPDATES.contains("FROM unnest("));
     }
 
     #[test]
@@ -1724,15 +2008,16 @@ mod tests {
     #[test]
     fn quarantine_uses_one_bulk_statement() {
         let prepared = prepare_quarantine(&[quarantine(1), quarantine(2)]);
-        let mut builder = quarantine_insert_builder(&prepared);
-        let sql = builder.build().sql().as_ref().to_owned();
-
+        assert_eq!(prepared.len(), 2);
         assert_eq!(
-            sql.matches("INSERT INTO telegram_update_quarantine")
+            SQL_INSERT_QUARANTINE
+                .matches("INSERT INTO telegram_update_quarantine")
                 .count(),
             1
         );
-        assert_eq!(sql.matches("ON CONFLICT").count(), 1);
+        assert_eq!(SQL_INSERT_QUARANTINE.matches("ON CONFLICT").count(), 1);
+        assert_eq!(SQL_INSERT_QUARANTINE.matches('$').count(), 12);
+        assert!(SQL_INSERT_QUARANTINE.contains("FROM unnest("));
     }
 
     #[test]
@@ -2307,6 +2592,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn online_materialization_commits_dependencies_and_inbox_atomically()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let bot_id = -i64::try_from(unique.min((i64::MAX - 10) as u128)).unwrap_or(i64::MAX - 10);
+        let user_id = -bot_id;
+        let chat_id = bot_id.saturating_add(1);
+        let observed_at = OffsetDateTime::now_utc();
+        let version = TelegramProjectionVersion {
+            bot_id,
+            observed_at,
+            stream_ms: 1_700_000_000_000,
+            stream_seq: 1,
+        };
+        let projections = TelegramProjectionBatch {
+            users: vec![TelegramUserProjection {
+                version,
+                state: UserState::new(user_id, "Online", None, None, None, None),
+            }],
+            chats: vec![TelegramChatProjection {
+                version,
+                state: ChatState::new(
+                    chat_id,
+                    "supergroup",
+                    Some("Online chat".to_owned()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            }],
+            members: vec![TelegramChatMemberProjection {
+                version,
+                state: ChatMemberUpsert {
+                    chat_id,
+                    user_id,
+                    status: "member".to_owned(),
+                    is_member: Some(true),
+                    ..ChatMemberUpsert::default()
+                },
+            }],
+            ..TelegramProjectionBatch::default()
+        };
+        let input = update(bot_id, 70, 1, br#"{"update_id":70}"#, 70);
+        let store = PostgresTelegramDeliveryStore::new(pool.clone());
+
+        let report = store
+            .materialize_online_batch(&[input], &[], &projections)
+            .await?;
+        assert_eq!(report.inserted, 1);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_update_inbox \
+                 WHERE bot_id = $1 AND update_id = 70)",
+            )
+            .bind(bot_id)
+            .fetch_one(&pool)
+            .await?
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM chat_members \
+                 WHERE chat_id = $1 AND user_id = $2)",
+            )
+            .bind(chat_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chats WHERE id = $1")
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn concurrent_materialization_and_terminal_transition_keep_lane_head()
     -> Result<(), Box<dyn Error>> {
         let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
@@ -2354,8 +2746,7 @@ mod tests {
             "terminal transition must wait for the materializer lane lock"
         );
 
-        let mut builder = materialized_update_insert_builder(&prepared);
-        builder.build().fetch_all(&mut *materializer_tx).await?;
+        insert_materialized_updates(&mut materializer_tx, &prepared).await?;
         materializer_tx.commit().await?;
         assert!(completion.await??);
 

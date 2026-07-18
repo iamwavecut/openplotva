@@ -361,12 +361,23 @@ pub enum MessageActivityError {
 pub struct MessageActivityUpdateHandler<Store, Next> {
     store: Arc<Store>,
     next: Arc<Next>,
+    projection_state_is_authoritative: bool,
 }
 
 impl<Store, Next> MessageActivityUpdateHandler<Store, Next> {
     /// Build an activity handler around the real downstream update handler.
     pub fn new(store: Arc<Store>, next: Arc<Next>) -> Self {
-        Self { store, next }
+        Self {
+            store,
+            next,
+            projection_state_is_authoritative: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_projection_state_authoritative(mut self, authoritative: bool) -> Self {
+        self.projection_state_is_authoritative = authoritative;
+        self
     }
 }
 
@@ -379,6 +390,13 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
+            if self.projection_state_is_authoritative {
+                return self.next.handle_update(update).await.map_err(|error| {
+                    MessageActivityError::Downstream {
+                        message: error.to_string(),
+                    }
+                });
+            }
             handle_message_activity_update_or_else(self.store.as_ref(), update, |update| {
                 self.next.handle_update(update)
             })

@@ -360,7 +360,7 @@ where
     Ok(report)
 }
 
-fn telegram_file_metadata_upsert_from_ref(
+pub(crate) fn telegram_file_metadata_upsert_from_ref(
     file_ref: &openplotva_updates::TelegramFileMetadataRef,
 ) -> Option<TelegramFileMetadataUpsert> {
     if file_ref.file_id.is_empty() || file_ref.file_unique_id.is_empty() {
@@ -955,6 +955,7 @@ pub async fn run_materialized_update_consumer_until<S, H, Tracker, Stop>(
     state_store: Arc<S>,
     handler: Arc<H>,
     tracker: Arc<Tracker>,
+    projection_state_is_authoritative: bool,
     stop: Stop,
 ) -> MaterializedUpdateConsumerRunReport
 where
@@ -1063,8 +1064,16 @@ where
             let handler = Arc::clone(&handler);
             let tracker = Arc::clone(&tracker);
             workers.spawn(async move {
-                process_claimed_update(delivery_store, claim, config, state_store, handler, tracker)
-                    .await
+                process_claimed_update(
+                    delivery_store,
+                    claim,
+                    config,
+                    state_store,
+                    handler,
+                    tracker,
+                    projection_state_is_authoritative,
+                )
+                .await
             });
         }
     }
@@ -1082,6 +1091,7 @@ async fn process_claimed_update<S, H, Tracker>(
     state_store: Arc<S>,
     handler: Arc<H>,
     tracker: Arc<Tracker>,
+    projection_state_is_authoritative: bool,
 ) -> ClaimedUpdateProcessResult
 where
     S: UpdateStateStore + Send + Sync + 'static,
@@ -1108,6 +1118,7 @@ where
         handler.as_ref(),
         tracker.as_ref(),
         lease_lost.as_ref(),
+        projection_state_is_authoritative,
     )
     .await;
     let _ = renew_stop.send(true);
@@ -1124,6 +1135,7 @@ async fn process_claimed_update_inner<S, H, Tracker>(
     handler: &H,
     tracker: &Tracker,
     lease_lost: &AtomicBool,
+    projection_state_is_authoritative: bool,
 ) -> ClaimedUpdateProcessResult
 where
     S: UpdateStateStore + Sync,
@@ -1147,42 +1159,44 @@ where
     };
 
     if claim.needs_state_application() {
-        let started_at = SystemTime::now();
-        let started = Instant::now();
-        let token = tracker.stage_started(&update, UpdateStage::State, started_at);
-        let state = tokio::time::timeout(
-            config.state_timeout,
-            persist_update_state(state_store, &update),
-        )
-        .await;
-        let outcome = match &state {
-            Ok(Ok(_)) => UpdateStageOutcome::Completed,
-            Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
-            Err(_) => UpdateStageOutcome::TimedOut,
-        };
-        finish_tracked_stage(tracker, token, UpdateStage::State, outcome, started);
+        if !projection_state_is_authoritative {
+            let started_at = SystemTime::now();
+            let started = Instant::now();
+            let token = tracker.stage_started(&update, UpdateStage::State, started_at);
+            let state = tokio::time::timeout(
+                config.state_timeout,
+                persist_update_state(state_store, &update),
+            )
+            .await;
+            let outcome = match &state {
+                Ok(Ok(_)) => UpdateStageOutcome::Completed,
+                Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
+                Err(_) => UpdateStageOutcome::TimedOut,
+            };
+            finish_tracked_stage(tracker, token, UpdateStage::State, outcome, started);
 
-        match state {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                return transition_retry_or_dead_letter(
-                    delivery_store,
-                    claim,
-                    "state_persistence",
-                    &error.to_string(),
-                    lease_lost,
-                )
-                .await;
-            }
-            Err(_) => {
-                return transition_retry_or_dead_letter(
-                    delivery_store,
-                    claim,
-                    "state_timeout",
-                    "update state stage timed out",
-                    lease_lost,
-                )
-                .await;
+            match state {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return transition_retry_or_dead_letter(
+                        delivery_store,
+                        claim,
+                        "state_persistence",
+                        &error.to_string(),
+                        lease_lost,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return transition_retry_or_dead_letter(
+                        delivery_store,
+                        claim,
+                        "state_timeout",
+                        "update state stage timed out",
+                        lease_lost,
+                    )
+                    .await;
+                }
             }
         }
 
