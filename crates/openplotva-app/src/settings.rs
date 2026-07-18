@@ -101,10 +101,6 @@ pub trait SettingsControlJobQueue {
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error>;
 
-    fn projection_state_is_authoritative(&self) -> bool {
-        false
-    }
-
     fn materializes_human_new_members_directly(&self) -> bool {
         false
     }
@@ -129,20 +125,11 @@ where
 pub struct ProjectionAwareSettingsControlQueue<Queue, Greeting> {
     queue: Arc<Queue>,
     greeting: Arc<Greeting>,
-    projection_state_is_authoritative: bool,
 }
 
 impl<Queue, Greeting> ProjectionAwareSettingsControlQueue<Queue, Greeting> {
-    pub fn new(
-        queue: Arc<Queue>,
-        greeting: Arc<Greeting>,
-        projection_state_is_authoritative: bool,
-    ) -> Self {
-        Self {
-            queue,
-            greeting,
-            projection_state_is_authoritative,
-        }
+    pub fn new(queue: Arc<Queue>, greeting: Arc<Greeting>) -> Self {
+        Self { queue, greeting }
     }
 }
 
@@ -160,8 +147,7 @@ where
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error> {
         Box::pin(async move {
-            if self.projection_state_is_authoritative
-                && let Ok(params) = control_job_params_from_stateless_job(&job)
+            if let Ok(params) = control_job_params_from_stateless_job(&job)
                 && params.data.kind == ControlKind::NewMembersFollowup
                 && !params.data.bot_was_added
             {
@@ -176,12 +162,8 @@ where
         })
     }
 
-    fn projection_state_is_authoritative(&self) -> bool {
-        self.projection_state_is_authoritative
-    }
-
     fn materializes_human_new_members_directly(&self) -> bool {
-        self.projection_state_is_authoritative
+        true
     }
 }
 
@@ -272,16 +254,6 @@ pub trait NewMembersFollowupControlJobEffects {
         &'a self,
         greeting: NewMembersGreeting,
     ) -> NewMembersFollowupFuture<'a, ()>;
-}
-
-pub trait NewMembersFollowupMemberStore {
-    /// Error returned by concrete member storage.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn upsert_new_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
 pub trait NewMembersBlockedChatStore {
@@ -1126,11 +1098,9 @@ pub struct NewMembersFollowupUpdateInput<'a> {
 
 /// Borrowed ports used by the settings-owned decoded-update slice.
 #[derive(Clone, Copy, Debug)]
-pub struct SettingsUpdatePorts<'a, Members, Queue> {
+pub struct SettingsUpdatePorts<'a, Queue> {
     /// Dispatcher queue used for immediate/future sends.
     pub dispatcher_queue: &'a DispatcherQueue,
-    /// Chat-member store used by new-member service messages.
-    pub member_store: &'a Members,
     /// Taskman control queue used by settings-owned jobs.
     pub control_queue: &'a Queue,
 }
@@ -1208,9 +1178,8 @@ impl SettingsUpdateHandlerConfig {
 
 /// `UpdateHandler` adapter for settings-owned decoded update behavior.
 #[derive(Clone)]
-pub struct SettingsUpdateHandler<Members, Queue, Next> {
+pub struct SettingsUpdateHandler<Queue, Next> {
     dispatcher_queue: Arc<DispatcherQueue>,
-    member_store: Arc<Members>,
     control_queue: Arc<Queue>,
     bot_username: String,
     bot_id: i64,
@@ -1219,18 +1188,16 @@ pub struct SettingsUpdateHandler<Members, Queue, Next> {
     next: Arc<Next>,
 }
 
-impl<Members, Queue, Next> SettingsUpdateHandler<Members, Queue, Next> {
+impl<Queue, Next> SettingsUpdateHandler<Queue, Next> {
     /// Build a settings-aware handler around the real downstream update handler.
     pub fn new(
         dispatcher_queue: Arc<DispatcherQueue>,
-        member_store: Arc<Members>,
         control_queue: Arc<Queue>,
         config: SettingsUpdateHandlerConfig,
         next: Arc<Next>,
     ) -> Self {
         Self {
             dispatcher_queue,
-            member_store,
             control_queue,
             bot_username: config.bot_username,
             bot_id: config.bot_id,
@@ -1248,9 +1215,8 @@ impl<Members, Queue, Next> SettingsUpdateHandler<Members, Queue, Next> {
     }
 }
 
-impl<Members, Queue, Next> UpdateHandler for SettingsUpdateHandler<Members, Queue, Next>
+impl<Queue, Next> UpdateHandler for SettingsUpdateHandler<Queue, Next>
 where
-    Members: NewMembersFollowupMemberStore + Send + Sync,
     Queue: SettingsControlJobQueue + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -1261,7 +1227,6 @@ where
             handle_settings_update_or_else_at(
                 SettingsUpdatePorts {
                     dispatcher_queue: self.dispatcher_queue.as_ref(),
-                    member_store: self.member_store.as_ref(),
                     control_queue: self.control_queue.as_ref(),
                 },
                 update,
@@ -2057,15 +2022,13 @@ where
     }
 }
 
-pub async fn handle_new_members_followup_update_at<Members, Queue, NextId>(
+pub async fn handle_new_members_followup_update_at<Queue, NextId>(
     dispatcher_queue: &DispatcherQueue,
-    member_store: &Members,
     control_queue: &Queue,
     input: NewMembersFollowupUpdateInput<'_>,
     next_virtual_id: NextId,
 ) -> Result<NewMembersFollowupUpdateOutcome, OutboundBuildError>
 where
-    Members: NewMembersFollowupMemberStore + Sync,
     Queue: SettingsControlJobQueue + Sync,
     NextId: FnMut() -> String,
 {
@@ -2087,11 +2050,7 @@ where
             let direct_accumulation = control_queue.materializes_human_new_members_directly()
                 && control_job_params_from_stateless_job(&job)
                     .is_ok_and(|params| !params.data.bot_was_added);
-            let member_upsert_errors = if control_queue.projection_state_is_authoritative() {
-                0
-            } else {
-                upsert_new_chat_members_from_message(member_store, message).await
-            };
+            let member_upsert_errors = 0;
             match control_queue
                 .assign_settings_control_job(CONTROL_QUEUE_NAME, *job)
                 .await
@@ -2124,22 +2083,14 @@ where
 }
 
 /// Handle settings-owned decoded-update behavior, delegating the rest.
-pub async fn handle_settings_update_or_else_at<
-    Members,
-    Queue,
-    NextId,
-    HandleFn,
-    HandleFuture,
-    HandleError,
->(
-    ports: SettingsUpdatePorts<'_, Members, Queue>,
+pub async fn handle_settings_update_or_else_at<Queue, NextId, HandleFn, HandleFuture, HandleError>(
+    ports: SettingsUpdatePorts<'_, Queue>,
     update: TelegramUpdate,
     context: SettingsUpdateContext<'_>,
     next_virtual_id: NextId,
     handle_other: HandleFn,
 ) -> Result<SettingsUpdateRoute, SettingsUpdateError>
 where
-    Members: NewMembersFollowupMemberStore + Sync,
     Queue: SettingsControlJobQueue + Sync,
     NextId: Fn() -> String,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
@@ -2153,7 +2104,6 @@ where
 
     let new_members = handle_new_members_followup_update_at(
         ports.dispatcher_queue,
-        ports.member_store,
         ports.control_queue,
         NewMembersFollowupUpdateInput {
             update: update_ref,
@@ -2357,35 +2307,6 @@ fn control_data_from_settings_message(message: &TelegramMessage) -> ControlJobDa
         data.is_premium = user.is_premium.unwrap_or_default();
     }
     data
-}
-
-async fn upsert_new_chat_members_from_message<Store>(
-    store: &Store,
-    message: &TelegramMessage,
-) -> usize
-where
-    Store: NewMembersFollowupMemberStore + Sync,
-{
-    let TelegramMessageData::NewChatMembers(members) = &message.data else {
-        return 0;
-    };
-    let chat_id = message.chat.get_id().into();
-    let mut errors = 0;
-    for member in members {
-        let upsert = ChatMemberUpsert {
-            chat_id,
-            user_id: member.id.into(),
-            status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
-            is_member: Some(true),
-            is_anonymous: Some(false),
-            can_be_edited: Some(false),
-            ..ChatMemberUpsert::default()
-        };
-        if store.upsert_new_chat_member(upsert).await.is_err() {
-            errors += 1;
-        }
-    }
-    errors
 }
 
 fn settings_outbound_error(error: OutboundBuildError) -> SettingsUpdateError {
@@ -3268,17 +3189,6 @@ impl GroupSettingsMemberStore for openplotva_storage::PostgresChatMemberStore {
     }
 
     fn upsert_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.upsert_chat_member(&member).await })
-    }
-}
-
-impl NewMembersFollowupMemberStore for openplotva_storage::PostgresChatMemberStore {
-    type Error = openplotva_storage::StorageError;
-
-    fn upsert_new_chat_member<'a>(
         &'a self,
         member: ChatMemberUpsert,
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
@@ -4897,16 +4807,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_members_followup_update_upserts_members_and_assigns_control_job()
+    async fn new_members_followup_update_relies_on_projection_and_assigns_control_job()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
-        let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
         let update = new_members_update()?;
 
         let outcome = handle_new_members_followup_update_at(
             &dispatcher,
-            &member_store,
             &control_queue,
             super::NewMembersFollowupUpdateInput {
                 update: &update,
@@ -4923,18 +4831,6 @@ mod tests {
                 member_upsert_errors: 0
             }
         );
-        let upserts = member_store.upserts();
-        assert_eq!(upserts.len(), 2);
-        assert_eq!(upserts[0].chat_id, -10042);
-        assert_eq!(upserts[0].user_id, 999);
-        assert_eq!(
-            upserts[0].status,
-            openplotva_storage::CHAT_MEMBER_STATUS_MEMBER
-        );
-        assert_eq!(upserts[0].is_anonymous, Some(false));
-        assert_eq!(upserts[0].can_be_edited, Some(false));
-        assert_eq!(upserts[1].user_id, 7);
-
         let assigned = control_queue.assigned();
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
@@ -4945,22 +4841,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_human_new_members_accumulate_without_member_write_or_control_job()
+    async fn human_new_members_accumulate_without_member_write_or_control_job()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
-        let member_store = GroupSettingsMemberStoreStub::default();
         let persistent_queue = Arc::new(SettingsControlJobQueueStub::default());
         let greeting = Arc::new(NewMembersFollowupEffectsStub::blocked());
         let control_queue = ProjectionAwareSettingsControlQueue::new(
             Arc::clone(&persistent_queue),
             Arc::clone(&greeting),
-            true,
         );
         let update = human_new_members_update()?;
 
         let outcome = handle_new_members_followup_update_at(
             &dispatcher,
-            &member_store,
             &control_queue,
             super::NewMembersFollowupUpdateInput {
                 update: &update,
@@ -4977,7 +4870,6 @@ mod tests {
                 member_upsert_errors: 0
             }
         );
-        assert!(member_store.upserts().is_empty());
         assert!(persistent_queue.assigned().is_empty());
         assert_eq!(
             greeting.greetings(),
@@ -4995,13 +4887,11 @@ mod tests {
     async fn new_members_followup_update_queue_error_sends_go_failure_notice()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
-        let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::failing();
         let update = new_members_update()?;
 
         let outcome = handle_new_members_followup_update_at(
             &dispatcher,
-            &member_store,
             &control_queue,
             super::NewMembersFollowupUpdateInput {
                 update: &update,
@@ -5040,7 +4930,6 @@ mod tests {
     async fn settings_update_wrapper_handles_private_settings_without_delegation()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
-        let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
         let update = private_settings_update()?;
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
@@ -5049,7 +4938,6 @@ mod tests {
         let route = handle_settings_update_or_else_at(
             SettingsUpdatePorts {
                 dispatcher_queue: &dispatcher,
-                member_store: &member_store,
                 control_queue: &control_queue,
             },
             update,
@@ -5080,7 +4968,6 @@ mod tests {
         assert_eq!(report.parts[0].virtual_id, "settings-wrapper-v1");
         assert!(fallback_calls.lock().expect("fallback calls").is_empty());
         assert!(control_queue.assigned().is_empty());
-        assert!(member_store.upserts().is_empty());
         Ok(())
     }
 
@@ -5088,7 +4975,6 @@ mod tests {
     async fn settings_update_wrapper_runs_new_members_then_delegates_like_go()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
-        let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
         let update = new_members_update()?;
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
@@ -5097,7 +4983,6 @@ mod tests {
         let route = handle_settings_update_or_else_at(
             SettingsUpdatePorts {
                 dispatcher_queue: &dispatcher,
-                member_store: &member_store,
                 control_queue: &control_queue,
             },
             update,
@@ -5133,7 +5018,6 @@ mod tests {
             fallback_calls.lock().expect("fallback calls").as_slice(),
             &[12350]
         );
-        assert_eq!(member_store.upserts().len(), 2);
         assert_eq!(control_queue.assigned().len(), 1);
         assert!(dispatcher.snapshot().immediate.is_empty());
         Ok(())
@@ -5143,13 +5027,11 @@ mod tests {
     async fn settings_update_handler_intercepts_group_settings_before_wrapped_handler()
     -> Result<(), Box<dyn Error>> {
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
         let control_queue = Arc::new(SettingsControlJobQueueStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
         let ids: VirtualIdFactory = Arc::new(|| "settings-handler-v1".to_owned());
         let handler = SettingsUpdateHandler::new(
             Arc::clone(&dispatcher),
-            Arc::clone(&member_store),
             Arc::clone(&control_queue),
             SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
             Arc::clone(&next),
@@ -5189,7 +5071,6 @@ mod tests {
 
         let settings_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let help_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
         let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
         let terminal = Arc::new(UpdateHandlerStub::default());
         let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
@@ -5204,7 +5085,6 @@ mod tests {
         let settings_handler = Arc::new(
             SettingsUpdateHandler::new(
                 Arc::clone(&settings_dispatcher),
-                Arc::clone(&member_store),
                 Arc::clone(&control_queue),
                 SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
                 dialog_terminal,
@@ -5260,7 +5140,6 @@ mod tests {
             vec!["chat:42:private".to_owned(), "user:42:Ada".to_owned()]
         );
         assert!(terminal.calls().is_empty());
-        assert!(member_store.upserts().is_empty());
         assert!(control_queue.snapshot().is_empty());
         assert!(help_dispatcher.snapshot().immediate.is_empty());
         assert!(help_dispatcher.snapshot().regular.is_empty());
@@ -5313,7 +5192,6 @@ mod tests {
         assert_eq!(update_queue.len().await?, 3);
 
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
         let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
         let terminal = Arc::new(UpdateHandlerStub::default());
         let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
@@ -5332,7 +5210,6 @@ mod tests {
         });
         let handler = SettingsUpdateHandler::new(
             Arc::clone(&dispatcher),
-            Arc::clone(&member_store),
             Arc::clone(&control_queue),
             SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
             dialog_terminal,
@@ -5382,11 +5259,6 @@ mod tests {
             ]
         );
         assert!(terminal.calls().is_empty());
-        let upserts = member_store.upserts();
-        assert_eq!(upserts.len(), 2);
-        assert_eq!(upserts[0].chat_id, -10042);
-        assert_eq!(upserts[0].user_id, 999);
-        assert_eq!(upserts[1].user_id, 7);
 
         let snapshot = control_queue.snapshot();
         assert_eq!(snapshot.len(), 2);
@@ -7080,24 +6952,6 @@ mod tests {
         }
 
         fn upsert_chat_member<'a>(
-            &'a self,
-            member: ChatMemberUpsert,
-        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.state
-                    .lock()
-                    .expect("group settings member store state")
-                    .upserts
-                    .push(member);
-                Ok(())
-            })
-        }
-    }
-
-    impl super::NewMembersFollowupMemberStore for GroupSettingsMemberStoreStub {
-        type Error = StubError;
-
-        fn upsert_new_chat_member<'a>(
             &'a self,
             member: ChatMemberUpsert,
         ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {

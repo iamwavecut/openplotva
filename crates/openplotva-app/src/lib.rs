@@ -1,6 +1,5 @@
 //! Composition root for the OpenPlotva application shell.
 
-pub mod activity;
 pub mod admin;
 pub mod agent_runtime;
 pub mod asr;
@@ -11410,24 +11409,7 @@ async fn start_runtime_workers(
         payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
         config.vip.chat_id,
     ));
-    let store_for_updates = Arc::new(store.clone());
     let history_store_for_updates = Arc::new(history_store.clone());
-    let chat_members_for_updates = Arc::new(chat_member_store.clone());
-    let projection_state_is_authoritative = config
-        .update_queue
-        .materialization_mode
-        .projection_is_authoritative();
-    let message_activity_store = if projection_state_is_authoritative {
-        activity::BufferedMessageActivityStore::new(Arc::clone(&chat_members_for_updates))
-    } else {
-        let (store, worker) = activity::BufferedMessageActivityStore::spawn(
-            Arc::clone(&chat_members_for_updates),
-            stop.subscribe(),
-        );
-        workers.handles.push(worker);
-        store
-    };
-    let message_activity_store = Arc::new(message_activity_store);
     let checkin_game_store_for_updates = Arc::new(checkin_game_store.clone());
     let rate_limits_for_updates = Arc::clone(&rate_limit_policy);
     let permission_policy_for_updates = Arc::clone(&permission_policy);
@@ -12629,7 +12611,6 @@ async fn start_runtime_workers(
         };
         let projection_materializer_config =
             update_materializer::UpdateProjectionMaterializerConfig {
-                mode: config.update_queue.materialization_mode,
                 flush_interval: Duration::from_millis(
                     u64::try_from(config.update_queue.projection_flush_interval_ms)
                         .unwrap_or(10_000),
@@ -12643,7 +12624,6 @@ async fn start_runtime_workers(
         );
         let materializer_metrics = update_materializer::UpdateMaterializerMetrics::default();
         let readiness_metrics = materializer_metrics.clone();
-        let readiness_projection_mode = projection_materializer_config.mode;
         let readiness_stage_hard_limit =
             i64::try_from(projection_materializer_config.stage_hard_limit_rows).unwrap_or(i64::MAX);
         workers.readiness_probes.push(Arc::new(move || {
@@ -12657,11 +12637,10 @@ async fn start_runtime_workers(
                     ),
                 );
             }
-            if readiness_projection_mode.stages_projections()
-                && (snapshot.projection_stage_rows >= readiness_stage_hard_limit
-                    || snapshot
-                        .projection_oldest_stage_age
-                        .is_some_and(|age| age > Duration::from_secs(30)))
+            if snapshot.projection_stage_rows >= readiness_stage_hard_limit
+                || snapshot
+                    .projection_oldest_stage_age
+                    .is_some_and(|age| age > Duration::from_secs(30))
             {
                 ReadinessCheck::error(
                     "telegram_update_materializer_live",
@@ -12889,11 +12868,9 @@ async fn start_runtime_workers(
         let settings_control_queue = Arc::new(settings::ProjectionAwareSettingsControlQueue::new(
             Arc::clone(&control_queue_for_updates),
             Arc::new(join_greeting_runtime.clone()),
-            projection_state_is_authoritative,
         ));
         let settings_handler = Arc::new(settings::SettingsUpdateHandler::new(
             Arc::clone(&dispatcher_queue_for_updates),
-            Arc::clone(&chat_members_for_updates),
             settings_control_queue,
             settings::SettingsUpdateHandlerConfig::new(
                 bot_identity.username.clone(),
@@ -13044,32 +13021,17 @@ async fn start_runtime_workers(
             )),
             diagnostics_handler,
         ));
-        let left_member = Arc::new(
-            members::LeftChatMemberUpdateHandler::new(
-                Arc::clone(&chat_members_for_updates),
-                Arc::clone(&chat_communication),
-                bot_identity.id,
-                help_handler,
-            )
-            .with_projection_state_authoritative(projection_state_is_authoritative),
-        );
-        let member_state = Arc::new(
-            members::ChatMemberStateUpdateHandler::new(
-                Arc::clone(&chat_members_for_updates),
-                Arc::clone(&control_queue_for_updates),
-                chat_communication,
-                bot_identity.id,
-                left_member,
-            )
-            .with_projection_state_authoritative(projection_state_is_authoritative),
-        );
-        let activity = Arc::new(
-            activity::MessageActivityUpdateHandler::new(
-                Arc::clone(&message_activity_store),
-                member_state,
-            )
-            .with_projection_state_authoritative(projection_state_is_authoritative),
-        );
+        let left_member = Arc::new(members::LeftChatMemberUpdateHandler::new(
+            Arc::clone(&chat_communication),
+            bot_identity.id,
+            help_handler,
+        ));
+        let member_state = Arc::new(members::ChatMemberStateUpdateHandler::new(
+            Arc::clone(&control_queue_for_updates),
+            chat_communication,
+            bot_identity.id,
+            left_member,
+        ));
         let edited_effects = Arc::new(
             edited::TaskmanEditedMessageEffects::new(
                 Arc::clone(&task_queue_for_updates),
@@ -13080,7 +13042,7 @@ async fn start_runtime_workers(
         let edited = Arc::new(edited::EditedMessageUpdateHandler::new(
             edited_effects,
             bot_user_from_get_me(&bot_identity),
-            activity,
+            member_state,
         ));
         let gated_handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
             Arc::clone(&rate_limit_policy),
@@ -13107,10 +13069,8 @@ async fn start_runtime_workers(
             let report = updates::run_materialized_update_consumer_until(
                 delivery_store,
                 update_consumer_config,
-                store_for_updates,
                 handler,
                 update_stage_tracker,
-                projection_state_is_authoritative,
                 wait_for_runtime_stop(update_consumer_stop),
             )
             .await;

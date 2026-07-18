@@ -949,17 +949,14 @@ const MATERIALIZED_UPDATE_REPORTED_CLAIM_ERRORS: usize = 64;
 /// Consume only committed inbox rows. Unlike the legacy Redis List consumer,
 /// this path intentionally does not use Telegram event time as an admission
 /// decision: an old addressed message remains processable after a long outage.
-pub async fn run_materialized_update_consumer_until<S, H, Tracker, Stop>(
+pub async fn run_materialized_update_consumer_until<H, Tracker, Stop>(
     delivery_store: PostgresTelegramDeliveryStore,
     config: UpdateConsumerConfig,
-    state_store: Arc<S>,
     handler: Arc<H>,
     tracker: Arc<Tracker>,
-    projection_state_is_authoritative: bool,
     stop: Stop,
 ) -> MaterializedUpdateConsumerRunReport
 where
-    S: UpdateStateStore + Send + Sync + 'static,
     H: UpdateHandler + Send + Sync + 'static,
     Tracker: UpdateStageTracker + Send + Sync + 'static,
     Stop: Future<Output = ()> + Send,
@@ -1060,20 +1057,10 @@ where
         report.claimed = report.claimed.saturating_add(claimed.len());
         for claim in claimed {
             let delivery_store = delivery_store.clone();
-            let state_store = Arc::clone(&state_store);
             let handler = Arc::clone(&handler);
             let tracker = Arc::clone(&tracker);
             workers.spawn(async move {
-                process_claimed_update(
-                    delivery_store,
-                    claim,
-                    config,
-                    state_store,
-                    handler,
-                    tracker,
-                    projection_state_is_authoritative,
-                )
-                .await
+                process_claimed_update(delivery_store, claim, config, handler, tracker).await
             });
         }
     }
@@ -1084,17 +1071,14 @@ where
     report
 }
 
-async fn process_claimed_update<S, H, Tracker>(
+async fn process_claimed_update<H, Tracker>(
     delivery_store: PostgresTelegramDeliveryStore,
     claim: ClaimedTelegramUpdate,
     config: UpdateConsumerConfig,
-    state_store: Arc<S>,
     handler: Arc<H>,
     tracker: Arc<Tracker>,
-    projection_state_is_authoritative: bool,
 ) -> ClaimedUpdateProcessResult
 where
-    S: UpdateStateStore + Send + Sync + 'static,
     H: UpdateHandler + Send + Sync + 'static,
     Tracker: UpdateStageTracker + Send + Sync + 'static,
 {
@@ -1114,11 +1098,9 @@ where
         &delivery_store,
         &claim,
         config,
-        state_store.as_ref(),
         handler.as_ref(),
         tracker.as_ref(),
         lease_lost.as_ref(),
-        projection_state_is_authoritative,
     )
     .await;
     let _ = renew_stop.send(true);
@@ -1127,18 +1109,15 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_claimed_update_inner<S, H, Tracker>(
+async fn process_claimed_update_inner<H, Tracker>(
     delivery_store: &PostgresTelegramDeliveryStore,
     claim: &ClaimedTelegramUpdate,
     config: UpdateConsumerConfig,
-    state_store: &S,
     handler: &H,
     tracker: &Tracker,
     lease_lost: &AtomicBool,
-    projection_state_is_authoritative: bool,
 ) -> ClaimedUpdateProcessResult
 where
-    S: UpdateStateStore + Sync,
     H: UpdateHandler + Sync,
     Tracker: UpdateStageTracker + ?Sized,
 {
@@ -1159,47 +1138,6 @@ where
     };
 
     if claim.needs_state_application() {
-        if !projection_state_is_authoritative {
-            let started_at = SystemTime::now();
-            let started = Instant::now();
-            let token = tracker.stage_started(&update, UpdateStage::State, started_at);
-            let state = tokio::time::timeout(
-                config.state_timeout,
-                persist_update_state(state_store, &update),
-            )
-            .await;
-            let outcome = match &state {
-                Ok(Ok(_)) => UpdateStageOutcome::Completed,
-                Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
-                Err(_) => UpdateStageOutcome::TimedOut,
-            };
-            finish_tracked_stage(tracker, token, UpdateStage::State, outcome, started);
-
-            match state {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return transition_retry_or_dead_letter(
-                        delivery_store,
-                        claim,
-                        "state_persistence",
-                        &error.to_string(),
-                        lease_lost,
-                    )
-                    .await;
-                }
-                Err(_) => {
-                    return transition_retry_or_dead_letter(
-                        delivery_store,
-                        claim,
-                        "state_timeout",
-                        "update state stage timed out",
-                        lease_lost,
-                    )
-                    .await;
-                }
-            }
-        }
-
         if lease_lost.load(Ordering::Acquire) {
             return ClaimedUpdateProcessResult::LeaseLost;
         }

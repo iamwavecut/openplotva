@@ -324,7 +324,7 @@ queueing glue).
 | `task_queue.rs` | `SharedTaskQueueRuntime`: buffered WAL journal + 7 background workers (heartbeat/recovery/cleanup/db-sync/stuck/placeholder) |
 | `message_gate.rs` | Pre-route decorator chain (rate-limit → permission → blocked-chat, fail-open) |
 | `control_jobs.rs` | Unified control-job worker (payments/settings/translate/admin-sync/checkin); legacy member-sync jobs complete as projection-superseded |
-| `update_materializer.rs` | Redis Stream microbatch router: online inbox transaction, UNLOGGED state staging, 10s durable flush, ACK+XDEL fencing |
+| `update_materializer.rs` | Redis Stream microbatch router: online inbox transaction, UNLOGGED state staging, independent 10s durable flush worker, ACK+XDEL fencing |
 | `permissions.rs` / `rate_limits.rs` | Cached policies (30min TTL, fail-open), per-window enqueue throttle |
 | `runtime_api.rs` / `runtime_sql.rs` / `runtime_entities.rs` / `runtime_taskman.rs` / `runtime_safety.rs` / `runtime_analytics_overview.rs` / `runtime_updates.rs` / `runtime_cache.rs` / `runtime_dispatcher.rs` / `runtime_retention.rs` | GraphQL/runtime-API inspector adapters over live state + Postgres |
 | `runtime_llm.rs` | `RuntimeLlmObserver` (single chokepoint → ring + Postgres recorder + run buffer); provider canonicalization from model name; cleanup/scrub workers |
