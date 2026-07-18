@@ -8,7 +8,7 @@ use carapax::types::{
     MessageData as TelegramMessageData, Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
 use openplotva_core::{ChatSettings, ChatSettingsUpdate, UserState};
-use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
+use openplotva_storage::ChatMemberUpsert;
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
     StatelessJobItem, TaskQueueSchedule, control_job_params_from_stateless_job, new_control_job_at,
@@ -20,9 +20,6 @@ use crate::{
     permissions::{ChatPermissionContext, ChatPermissionStore},
     updates::{UpdateHandler, UpdateHandlerFuture},
 };
-
-/// Boxed future returned by member storage calls.
-pub type MemberStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// Boxed future returned by chat-communication effects.
 pub type ChatCommunicationFuture<'a, T, E> =
@@ -45,79 +42,6 @@ pub type StaleInactiveMemberCleanupFuture<'a, E> =
 
 pub const STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const STALE_INACTIVE_MEMBER_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
-pub trait LeftChatMemberStore {
-    /// Store error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Persist the Telegram user row needed by the membership foreign key.
-    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error>;
-
-    /// Persist an explicit local `left` membership state.
-    fn upsert_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> MemberStoreFuture<'a, (), Self::Error>;
-}
-
-pub trait ChatMemberStateStore {
-    /// Store error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Load current member state before deciding whether the status changed.
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStoreFuture<'a, Option<ChatMemberRecord>, Self::Error>;
-
-    /// Persist new member state.
-    fn upsert_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> MemberStoreFuture<'a, (), Self::Error>;
-
-    /// Persist the Telegram user row needed by chat-member foreign keys.
-    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error>;
-}
-
-impl LeftChatMemberStore for openplotva_storage::PostgresChatMemberStore {
-    type Error = openplotva_storage::StorageError;
-
-    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.upsert_user_state(&user).await })
-    }
-
-    fn upsert_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.upsert_chat_member(&member).await })
-    }
-}
-
-impl ChatMemberStateStore for openplotva_storage::PostgresChatMemberStore {
-    type Error = openplotva_storage::StorageError;
-
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStoreFuture<'a, Option<ChatMemberRecord>, Self::Error> {
-        Box::pin(async move { self.get_chat_member(chat_id, user_id).await })
-    }
-
-    fn upsert_chat_member<'a>(
-        &'a self,
-        member: ChatMemberUpsert,
-    ) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.upsert_chat_member(&member).await })
-    }
-
-    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.upsert_user_state(&user).await })
-    }
-}
 
 pub trait StaleInactiveMemberCleanupStore {
     /// Store error type.
@@ -457,10 +381,6 @@ pub struct LeftChatMemberOutcome {
     pub user_id: i64,
     /// Whether the leaving user was the current bot.
     pub bot_left: bool,
-    pub user_upserted: bool,
-    pub member_upserted: bool,
-    pub user_upsert_error: Option<String>,
-    pub member_upsert_error: Option<String>,
     /// Non-fatal communication-disable error, if any.
     pub disable_error: Option<String>,
 }
@@ -477,22 +397,10 @@ pub struct ChatMemberStateOutcome {
     pub own_member: bool,
     /// Whether the observed state is explicitly inactive.
     pub inactive: bool,
-    /// Whether an active row was upserted.
-    pub upserted: bool,
-    /// Whether the user row needed by the member foreign key was upserted.
-    pub user_upserted: bool,
-    /// Whether stored status differed or could not be loaded.
-    pub changed: bool,
     /// Sync job kind assigned before storage mutation, if any.
     pub queued_job: Option<ControlKind>,
     /// Non-fatal queue error, if any.
     pub queue_error: Option<String>,
-    /// Non-fatal member load error, if any.
-    pub load_error: Option<String>,
-    /// Non-fatal member upsert error, if any.
-    pub upsert_error: Option<String>,
-    /// Non-fatal user upsert error, if any.
-    pub user_upsert_error: Option<String>,
     /// Non-fatal communication toggle error, if any.
     pub communication_error: Option<String>,
 }
@@ -577,72 +485,45 @@ pub enum ChatMemberStateUpdateError {
 }
 
 #[derive(Clone, Debug)]
-pub struct LeftChatMemberUpdateHandler<Store, Effects, Next> {
-    store: Arc<Store>,
+pub struct LeftChatMemberUpdateHandler<Effects, Next> {
     effects: Arc<Effects>,
     bot_id: i64,
     next: Arc<Next>,
-    projection_state_is_authoritative: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct ChatMemberStateUpdateHandler<Store, Queue, Effects, Next> {
-    store: Arc<Store>,
+pub struct ChatMemberStateUpdateHandler<Queue, Effects, Next> {
     queue: Arc<Queue>,
     effects: Arc<Effects>,
     bot_id: i64,
     next: Arc<Next>,
-    projection_state_is_authoritative: bool,
 }
 
-impl<Store, Effects, Next> LeftChatMemberUpdateHandler<Store, Effects, Next> {
+impl<Effects, Next> LeftChatMemberUpdateHandler<Effects, Next> {
     /// Build a left-chat-member handler around the real downstream update handler.
-    pub fn new(store: Arc<Store>, effects: Arc<Effects>, bot_id: i64, next: Arc<Next>) -> Self {
+    pub fn new(effects: Arc<Effects>, bot_id: i64, next: Arc<Next>) -> Self {
         Self {
-            store,
             effects,
             bot_id,
             next,
-            projection_state_is_authoritative: false,
         }
-    }
-
-    #[must_use]
-    pub fn with_projection_state_authoritative(mut self, authoritative: bool) -> Self {
-        self.projection_state_is_authoritative = authoritative;
-        self
     }
 }
 
-impl<Store, Queue, Effects, Next> ChatMemberStateUpdateHandler<Store, Queue, Effects, Next> {
+impl<Queue, Effects, Next> ChatMemberStateUpdateHandler<Queue, Effects, Next> {
     /// Build a member-state handler around the real downstream update handler.
-    pub fn new(
-        store: Arc<Store>,
-        queue: Arc<Queue>,
-        effects: Arc<Effects>,
-        bot_id: i64,
-        next: Arc<Next>,
-    ) -> Self {
+    pub fn new(queue: Arc<Queue>, effects: Arc<Effects>, bot_id: i64, next: Arc<Next>) -> Self {
         Self {
-            store,
             queue,
             effects,
             bot_id,
             next,
-            projection_state_is_authoritative: false,
         }
-    }
-
-    #[must_use]
-    pub fn with_projection_state_authoritative(mut self, authoritative: bool) -> Self {
-        self.projection_state_is_authoritative = authoritative;
-        self
     }
 }
 
-impl<Store, Effects, Next> UpdateHandler for LeftChatMemberUpdateHandler<Store, Effects, Next>
+impl<Effects, Next> UpdateHandler for LeftChatMemberUpdateHandler<Effects, Next>
 where
-    Store: LeftChatMemberStore + Send + Sync,
     Effects: ChatCommunicationEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -650,12 +531,10 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
-            handle_left_chat_member_update_or_else_with_state_mode(
-                self.store.as_ref(),
+            handle_left_chat_member_update_or_else(
                 self.effects.as_ref(),
                 self.bot_id,
                 update,
-                self.projection_state_is_authoritative,
                 |update| self.next.handle_update(update),
             )
             .await
@@ -664,10 +543,8 @@ where
     }
 }
 
-impl<Store, Queue, Effects, Next> UpdateHandler
-    for ChatMemberStateUpdateHandler<Store, Queue, Effects, Next>
+impl<Queue, Effects, Next> UpdateHandler for ChatMemberStateUpdateHandler<Queue, Effects, Next>
 where
-    Store: ChatMemberStateStore + Send + Sync,
     Queue: MemberStateControlJobQueue + Send + Sync,
     Effects: ChatCommunicationEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
@@ -676,14 +553,12 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
-            handle_chat_member_state_update_or_else_at_with_state_mode(
-                self.store.as_ref(),
+            handle_chat_member_state_update_or_else_at(
                 self.queue.as_ref(),
                 self.effects.as_ref(),
                 self.bot_id,
                 update,
                 OffsetDateTime::now_utc(),
-                self.projection_state_is_authoritative,
                 |update| self.next.handle_update(update),
             )
             .await
@@ -692,66 +567,19 @@ where
     }
 }
 
-pub async fn handle_left_chat_member_update_or_else<
-    Store,
-    Effects,
-    HandleFn,
-    HandleFuture,
-    HandleError,
->(
-    store: &Store,
+pub async fn handle_left_chat_member_update_or_else<Effects, HandleFn, HandleFuture, HandleError>(
     effects: &Effects,
     bot_id: i64,
     update: TelegramUpdate,
     handle_other: HandleFn,
 ) -> Result<LeftChatMemberUpdateRoute, LeftChatMemberUpdateError>
 where
-    Store: LeftChatMemberStore + Sync,
     Effects: ChatCommunicationEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    handle_left_chat_member_update_or_else_with_state_mode(
-        store,
-        effects,
-        bot_id,
-        update,
-        false,
-        handle_other,
-    )
-    .await
-}
-
-async fn handle_left_chat_member_update_or_else_with_state_mode<
-    Store,
-    Effects,
-    HandleFn,
-    HandleFuture,
-    HandleError,
->(
-    store: &Store,
-    effects: &Effects,
-    bot_id: i64,
-    update: TelegramUpdate,
-    projection_state_is_authoritative: bool,
-    handle_other: HandleFn,
-) -> Result<LeftChatMemberUpdateRoute, LeftChatMemberUpdateError>
-where
-    Store: LeftChatMemberStore + Sync,
-    Effects: ChatCommunicationEffects + Sync,
-    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
-    HandleFuture: Future<Output = Result<(), HandleError>>,
-    HandleError: fmt::Display,
-{
-    let outcome = left_chat_member_outcome(
-        store,
-        effects,
-        bot_id,
-        &update,
-        projection_state_is_authoritative,
-    )
-    .await;
+    let outcome = left_chat_member_outcome(effects, bot_id, &update).await;
     handle_other(update)
         .await
         .map_err(|error| LeftChatMemberUpdateError::Downstream {
@@ -765,14 +593,12 @@ where
 }
 
 pub async fn handle_chat_member_state_update_or_else_at<
-    Store,
     Queue,
     Effects,
     HandleFn,
     HandleFuture,
     HandleError,
 >(
-    store: &Store,
     queue: &Queue,
     effects: &Effects,
     bot_id: i64,
@@ -781,62 +607,13 @@ pub async fn handle_chat_member_state_update_or_else_at<
     handle_other: HandleFn,
 ) -> Result<ChatMemberStateUpdateRoute, ChatMemberStateUpdateError>
 where
-    Store: ChatMemberStateStore + Sync,
     Queue: MemberStateControlJobQueue + Sync,
     Effects: ChatCommunicationEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    handle_chat_member_state_update_or_else_at_with_state_mode(
-        store,
-        queue,
-        effects,
-        bot_id,
-        update,
-        created,
-        false,
-        handle_other,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_chat_member_state_update_or_else_at_with_state_mode<
-    Store,
-    Queue,
-    Effects,
-    HandleFn,
-    HandleFuture,
-    HandleError,
->(
-    store: &Store,
-    queue: &Queue,
-    effects: &Effects,
-    bot_id: i64,
-    update: TelegramUpdate,
-    created: OffsetDateTime,
-    projection_state_is_authoritative: bool,
-    handle_other: HandleFn,
-) -> Result<ChatMemberStateUpdateRoute, ChatMemberStateUpdateError>
-where
-    Store: ChatMemberStateStore + Sync,
-    Queue: MemberStateControlJobQueue + Sync,
-    Effects: ChatCommunicationEffects + Sync,
-    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
-    HandleFuture: Future<Output = Result<(), HandleError>>,
-    HandleError: fmt::Display,
-{
-    let outcome = chat_member_state_outcome(
-        store,
-        queue,
-        effects,
-        bot_id,
-        &update,
-        created,
-        projection_state_is_authoritative,
-    )
-    .await;
+    let outcome = chat_member_state_outcome(queue, effects, bot_id, &update, created).await;
     handle_other(update)
         .await
         .map_err(|error| ChatMemberStateUpdateError::Downstream {
@@ -849,17 +626,14 @@ where
     })
 }
 
-async fn chat_member_state_outcome<Store, Queue, Effects>(
-    store: &Store,
+async fn chat_member_state_outcome<Queue, Effects>(
     queue: &Queue,
     effects: &Effects,
     bot_id: i64,
     update: &TelegramUpdate,
     created: OffsetDateTime,
-    projection_state_is_authoritative: bool,
 ) -> Option<ChatMemberStateOutcome>
 where
-    Store: ChatMemberStateStore + Sync,
     Queue: MemberStateControlJobQueue + Sync,
     Effects: ChatCommunicationEffects + Sync,
 {
@@ -913,62 +687,6 @@ where
                 "failed to disable chat communication for departed bot"
             );
             outcome.communication_error = Some(message);
-        }
-    }
-
-    if !projection_state_is_authoritative {
-        match store.get_chat_member(chat_id, user_id).await {
-            Ok(Some(current)) => {
-                outcome.changed = current.status != status;
-            }
-            Ok(None) => {
-                outcome.changed = true;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                tracing::debug!(
-                    message,
-                    chat_id,
-                    user_id,
-                    "failed to load current chat member"
-                );
-                outcome.changed = true;
-                outcome.load_error = Some(message);
-            }
-        }
-
-        if let Err(error) = store
-            .upsert_user_state(user_state_from_telegram_user(member.get_user()))
-            .await
-        {
-            let message = error.to_string();
-            tracing::warn!(
-                message,
-                chat_id,
-                user_id,
-                "failed to upsert chat member user state"
-            );
-            outcome.user_upsert_error = Some(message);
-        } else {
-            outcome.user_upserted = true;
-        }
-
-        if let Err(error) = store
-            .upsert_chat_member(chat_member_state_upsert_from_telegram(
-                chat_id, user_id, member,
-            ))
-            .await
-        {
-            let message = error.to_string();
-            tracing::warn!(
-                message,
-                chat_id,
-                user_id,
-                "failed to upsert chat member state"
-            );
-            outcome.upsert_error = Some(message);
-        } else {
-            outcome.upserted = true;
         }
     }
 
@@ -1301,15 +1019,12 @@ fn chat_type_name(chat: &TelegramChat) -> &'static str {
     }
 }
 
-async fn left_chat_member_outcome<Store, Effects>(
-    store: &Store,
+async fn left_chat_member_outcome<Effects>(
     effects: &Effects,
     bot_id: i64,
     update: &TelegramUpdate,
-    projection_state_is_authoritative: bool,
 ) -> Option<LeftChatMemberOutcome>
 where
-    Store: LeftChatMemberStore + Sync,
     Effects: ChatCommunicationEffects + Sync,
 {
     let UpdateType::Message(message) = &update.update_type else {
@@ -1322,10 +1037,6 @@ where
         chat_id,
         user_id,
         bot_left,
-        user_upserted: false,
-        member_upserted: false,
-        user_upsert_error: None,
-        member_upsert_error: None,
         disable_error: None,
     };
 
@@ -1340,44 +1051,6 @@ where
         outcome.disable_error = Some(message);
     }
 
-    if !projection_state_is_authoritative {
-        if let Err(error) = store
-            .upsert_user_state(user_state_from_telegram_user(user))
-            .await
-        {
-            let message = error.to_string();
-            tracing::warn!(
-                message,
-                chat_id,
-                user_id,
-                "failed to persist departed Telegram user"
-            );
-            outcome.user_upsert_error = Some(message);
-        } else {
-            outcome.user_upserted = true;
-        }
-        let member = ChatMemberUpsert {
-            chat_id,
-            user_id,
-            status: openplotva_storage::CHAT_MEMBER_STATUS_LEFT.to_owned(),
-            is_member: Some(false),
-            is_anonymous: Some(false),
-            can_be_edited: Some(false),
-            ..ChatMemberUpsert::default()
-        };
-        if let Err(error) = store.upsert_chat_member(member).await {
-            let message = error.to_string();
-            tracing::warn!(
-                message,
-                chat_id,
-                user_id,
-                "failed to persist left chat member"
-            );
-            outcome.member_upsert_error = Some(message);
-        } else {
-            outcome.member_upserted = true;
-        }
-    }
     Some(outcome)
 }
 
@@ -1473,11 +1146,10 @@ mod tests {
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
 
     use super::{
-        ChatCommunicationEffects, ChatCommunicationFuture, ChatMemberStateStore,
-        ChatMemberStateUpdateHandler, ChatMemberStateUpdateRoute, ChatSettingsCommunicationEffects,
-        LeftChatMemberStore, LeftChatMemberUpdateHandler, LeftChatMemberUpdateRoute,
-        MemberStateControlJobEffects, MemberStateControlJobExecution, MemberStateControlJobQueue,
-        MemberStateControlJobQueueFuture, MemberStoreFuture,
+        ChatCommunicationEffects, ChatCommunicationFuture, ChatMemberStateUpdateHandler,
+        ChatMemberStateUpdateRoute, ChatSettingsCommunicationEffects, LeftChatMemberUpdateHandler,
+        LeftChatMemberUpdateRoute, MemberStateControlJobEffects, MemberStateControlJobExecution,
+        MemberStateControlJobQueue, MemberStateControlJobQueueFuture,
         STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL, STALE_INACTIVE_MEMBER_MAX_AGE,
         StaleInactiveMemberCleanupFuture, StaleInactiveMemberCleanupStore,
         handle_chat_member_state_update_or_else_at, handle_left_chat_member_update_or_else,
@@ -1699,14 +1371,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn left_chat_member_update_persists_inactive_member_then_delegates()
+    async fn left_chat_member_update_relies_on_projection_then_delegates()
     -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
         let route = handle_left_chat_member_update_or_else(
-            &store,
             &effects,
             999,
             left_member_update(7)?,
@@ -1720,10 +1390,6 @@ mod tests {
         assert_eq!(outcome.chat_id, -10042);
         assert_eq!(outcome.user_id, 7);
         assert!(!outcome.bot_left);
-        assert!(outcome.user_upserted);
-        assert!(outcome.member_upserted);
-        assert_eq!(store.users()[0].id, 7);
-        assert_eq!(store.upserted(), vec![member_upsert(-10042, 7, "left")]);
         assert!(effects.disabled().is_empty());
         assert_eq!(next.calls(), vec![12351]);
         Ok(())
@@ -1731,12 +1397,10 @@ mod tests {
 
     #[tokio::test]
     async fn left_chat_member_update_disables_chat_when_bot_left() -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
         let route = handle_left_chat_member_update_or_else(
-            &store,
             &effects,
             999,
             left_member_update(999)?,
@@ -1749,9 +1413,6 @@ mod tests {
         };
         assert!(outcome.bot_left);
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert!(outcome.user_upserted);
-        assert!(outcome.member_upserted);
-        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         assert_eq!(next.calls(), vec![12351]);
         Ok(())
     }
@@ -1759,18 +1420,14 @@ mod tests {
     #[tokio::test]
     async fn left_chat_member_update_delegates_non_left_messages_once() -> Result<(), Box<dyn Error>>
     {
-        let store = MemberStoreStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
-        let route = handle_left_chat_member_update_or_else(
-            &store,
-            &effects,
-            999,
-            text_update()?,
-            |update| next.handle_update(update),
-        )
-        .await?;
+        let route =
+            handle_left_chat_member_update_or_else(&effects, 999, text_update()?, |update| {
+                next.handle_update(update)
+            })
+            .await?;
 
         assert_eq!(route, LeftChatMemberUpdateRoute::Delegated);
         assert_eq!(next.calls(), vec![777]);
@@ -1780,11 +1437,9 @@ mod tests {
     #[tokio::test]
     async fn left_chat_member_handler_intercepts_before_wrapped_handler()
     -> Result<(), Box<dyn Error>> {
-        let store = Arc::new(MemberStoreStub::default());
         let effects = Arc::new(CommunicationEffectsStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
-        let handler =
-            LeftChatMemberUpdateHandler::new(Arc::clone(&store), Arc::clone(&effects), 999, next);
+        let handler = LeftChatMemberUpdateHandler::new(Arc::clone(&effects), 999, next);
 
         handler
             .handle_update(left_member_update(999)?)
@@ -1792,20 +1447,17 @@ mod tests {
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn chat_member_state_update_upserts_member_without_per_user_sync_job()
+    async fn chat_member_state_update_relies_on_projection_without_per_user_sync_job()
     -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
         let queue = MemberStateControlJobQueueStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
         let route = handle_chat_member_state_update_or_else_at(
-            &store,
             &queue,
             &effects,
             999,
@@ -1821,22 +1473,7 @@ mod tests {
         assert_eq!(outcome.chat_id, -10042);
         assert_eq!(outcome.user_id, 7);
         assert_eq!(outcome.status, "member");
-        assert!(outcome.changed);
-        assert!(outcome.user_upserted);
-        assert!(outcome.upserted);
         assert_eq!(outcome.queued_job, None);
-        assert_eq!(
-            store.users(),
-            vec![UserState::new(
-                7,
-                "Tracked".to_owned(),
-                None,
-                None,
-                None,
-                None
-            )]
-        );
-        assert_eq!(store.upserted(), vec![member_upsert(-10042, 7, "member")]);
         assert!(effects.enabled().is_empty());
         assert!(effects.disabled().is_empty());
         assert_eq!(next.calls(), vec![2468]);
@@ -1847,13 +1484,11 @@ mod tests {
 
     #[tokio::test]
     async fn own_member_state_enables_chat_and_queues_admin_sync() -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
         let queue = MemberStateControlJobQueueStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
         let route = handle_chat_member_state_update_or_else_at(
-            &store,
             &queue,
             &effects,
             999,
@@ -1870,10 +1505,6 @@ mod tests {
         assert_eq!(outcome.status, "administrator");
         assert!(outcome.own_member);
         assert_eq!(outcome.queued_job, Some(ControlKind::ChatAdminsSync));
-        assert_eq!(
-            store.upserted(),
-            vec![admin_member_state_upsert(-10042, 999)]
-        );
         assert_eq!(effects.enabled(), vec![-10042]);
         assert!(effects.disabled().is_empty());
 
@@ -1892,7 +1523,6 @@ mod tests {
 
     #[tokio::test]
     async fn own_private_member_state_does_not_queue_admin_sync() -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
         let queue = MemberStateControlJobQueueStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
@@ -1905,7 +1535,6 @@ mod tests {
         });
 
         let route = handle_chat_member_state_update_or_else_at(
-            &store,
             &queue,
             &effects,
             999,
@@ -1925,14 +1554,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn departed_own_member_state_persists_and_disables_chat() -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
+    async fn departed_own_member_state_relies_on_projection_and_disables_chat()
+    -> Result<(), Box<dyn Error>> {
         let queue = MemberStateControlJobQueueStub::default();
         let effects = CommunicationEffectsStub::default();
         let next = UpdateHandlerStub::default();
 
         let route = handle_chat_member_state_update_or_else_at(
-            &store,
             &queue,
             &effects,
             999,
@@ -1946,10 +1574,7 @@ mod tests {
             return Err(format!("expected member-state route, got {route:?}").into());
         };
         assert!(outcome.inactive);
-        assert!(outcome.upserted);
         assert_eq!(outcome.queued_job, None);
-        assert_eq!(store.upserted()[0].status, "left");
-        assert_eq!(store.upserted()[0].is_member, Some(false));
         assert_eq!(effects.disabled(), vec![-10042]);
         assert!(effects.enabled().is_empty());
         assert_eq!(queue.jobs(), Vec::<StatelessJobItem>::new());
@@ -1960,17 +1585,11 @@ mod tests {
     #[tokio::test]
     async fn chat_member_state_handler_intercepts_before_wrapped_handler()
     -> Result<(), Box<dyn Error>> {
-        let store = Arc::new(MemberStoreStub::default());
         let queue = Arc::new(MemberStateControlJobQueueStub::default());
         let effects = Arc::new(CommunicationEffectsStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
-        let handler = ChatMemberStateUpdateHandler::new(
-            Arc::clone(&store),
-            Arc::clone(&queue),
-            Arc::clone(&effects),
-            999,
-            next,
-        );
+        let handler =
+            ChatMemberStateUpdateHandler::new(Arc::clone(&queue), Arc::clone(&effects), 999, next);
 
         handler
             .handle_update(chat_member_update("my_chat_member", 999, "left")?)
@@ -1978,7 +1597,6 @@ mod tests {
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         assert_eq!(effects.disabled(), vec![-10042]);
-        assert_eq!(store.upserted(), vec![member_upsert(-10042, 999, "left")]);
         Ok(())
     }
 
@@ -2007,7 +1625,6 @@ mod tests {
             .await?;
         assert_eq!(update_queue.len().await?, 3);
 
-        let store = Arc::new(MemberStoreStub::default());
         let queue = Arc::new(MemberStateControlJobQueueStub::default());
         let effects = Arc::new(CommunicationEffectsStub::default());
         let terminal = Arc::new(UpdateHandlerStub::default());
@@ -2023,13 +1640,11 @@ mod tests {
             &dialog_terminal,
         )));
         let left_member = Arc::new(LeftChatMemberUpdateHandler::new(
-            Arc::clone(&store),
             Arc::clone(&effects),
             999,
             skipped,
         ));
         let member_state = ChatMemberStateUpdateHandler::new(
-            Arc::clone(&store),
             Arc::clone(&queue),
             Arc::clone(&effects),
             999,
@@ -2063,14 +1678,6 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            store.upserted(),
-            vec![
-                member_upsert(-10042, 7, "member"),
-                admin_member_state_upsert(-10042, 999),
-                member_upsert(-10042, 999, "left"),
-            ]
-        );
         assert_eq!(queue.jobs().len(), 2);
         assert_eq!(
             queue
@@ -2379,70 +1986,6 @@ mod tests {
 
         fn users(&self) -> Vec<UserState> {
             self.users.lock().expect("member store").clone()
-        }
-    }
-
-    impl LeftChatMemberStore for MemberStoreStub {
-        type Error = StubError;
-
-        fn upsert_user_state<'a>(
-            &'a self,
-            user: UserState,
-        ) -> MemberStoreFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.users.lock().expect("member store").push(user);
-                Ok(())
-            })
-        }
-
-        fn upsert_chat_member<'a>(
-            &'a self,
-            member: ChatMemberUpsert,
-        ) -> MemberStoreFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.upserted.lock().expect("member store").push(member);
-                Ok(())
-            })
-        }
-    }
-
-    impl ChatMemberStateStore for MemberStoreStub {
-        type Error = StubError;
-
-        fn get_chat_member<'a>(
-            &'a self,
-            chat_id: i64,
-            user_id: i64,
-        ) -> MemberStoreFuture<'a, Option<ChatMemberRecord>, Self::Error> {
-            Box::pin(async move {
-                Ok(self
-                    .current
-                    .lock()
-                    .expect("member store")
-                    .iter()
-                    .find(|member| member.chat_id == chat_id && member.user_id == user_id)
-                    .cloned())
-            })
-        }
-
-        fn upsert_chat_member<'a>(
-            &'a self,
-            member: ChatMemberUpsert,
-        ) -> MemberStoreFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.upserted.lock().expect("member store").push(member);
-                Ok(())
-            })
-        }
-
-        fn upsert_user_state<'a>(
-            &'a self,
-            user: UserState,
-        ) -> MemberStoreFuture<'a, (), Self::Error> {
-            Box::pin(async move {
-                self.users.lock().expect("member store").push(user);
-                Ok(())
-            })
         }
     }
 

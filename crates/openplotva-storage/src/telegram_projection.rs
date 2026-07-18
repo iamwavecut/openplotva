@@ -701,10 +701,12 @@ WHERE staged.bot_id = $1
 
 const SQL_APPLY_ACTIVE_USERS_FROM_STAGE: &str = r#"
 INSERT INTO chat_active_users (chat_id, user_id, last_active_at)
-SELECT chat_id, user_id, last_active_at
-FROM telegram_activity_stage
-WHERE bot_id = $1
-  AND last_active_at IS NOT NULL
+SELECT staged.chat_id, staged.user_id, staged.last_active_at
+FROM telegram_activity_stage AS staged
+JOIN chats ON chats.id = staged.chat_id
+JOIN users ON users.id = staged.user_id
+WHERE staged.bot_id = $1
+  AND staged.last_active_at IS NOT NULL
 ON CONFLICT (chat_id, user_id) DO UPDATE SET
     last_active_at = GREATEST(chat_active_users.last_active_at, EXCLUDED.last_active_at)
 WHERE chat_active_users.last_active_at IS DISTINCT FROM
@@ -912,6 +914,12 @@ impl PostgresTelegramProjectionStore {
         bot_id: i64,
     ) -> Result<TelegramProjectionFlushReport, StorageError> {
         let mut tx = self.pool.begin().await?;
+        // Every apply and delete must see the same staging snapshot. Otherwise a
+        // concurrent stage insert can commit after an apply statement and then
+        // be removed by a later DELETE without ever reaching durable storage.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
         let users = sqlx::query(SQL_APPLY_USERS_FROM_STAGE)
             .bind(bot_id)
             .execute(&mut *tx)
@@ -1521,6 +1529,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_stage_insert_survives_the_flush_snapshot() -> Result<(), Box<dyn Error>> {
+        let Some(pool) = migrated_test_pool().await? else {
+            return Ok(());
+        };
+        let suffix = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let bot_id = i64::try_from(suffix.rem_euclid(1_000_000_000))? + 15_000;
+        let first_user_id = bot_id + 1_500_000_000;
+        let concurrent_user_id = bot_id + 1_600_000_000;
+        let chat_id = -(bot_id + 1_700_000_000);
+        let file_unique_id = format!("projection-concurrent-flush-{suffix}");
+        cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
+        cleanup(&pool, bot_id, concurrent_user_id, chat_id, &file_unique_id).await?;
+
+        let store = PostgresTelegramProjectionStore::new(pool.clone());
+        let observed_at = OffsetDateTime::now_utc();
+        store
+            .stage_projection_batch(&user_only_batch(sample_batch(
+                bot_id,
+                first_user_id,
+                chat_id,
+                file_unique_id.clone(),
+                observed_at,
+                150,
+                "initial",
+            )))
+            .await?;
+        store.flush_staged_projections(bot_id).await?;
+        store
+            .stage_projection_batch(&user_only_batch(sample_batch(
+                bot_id,
+                first_user_id,
+                chat_id,
+                file_unique_id.clone(),
+                observed_at + Duration::seconds(1),
+                151,
+                "before-flush",
+            )))
+            .await?;
+
+        let mut blocker = pool.begin().await?;
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(first_user_id)
+            .execute(&mut *blocker)
+            .await?;
+
+        let flushing_store = store.clone();
+        let flush =
+            tokio::spawn(async move { flushing_store.flush_staged_projections(bot_id).await });
+        let mut flush_is_waiting = false;
+        for _ in 0..100 {
+            flush_is_waiting = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                 SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() \
+                   AND pid <> pg_backend_pid() \
+                   AND wait_event_type = 'Lock' \
+                   AND query LIKE '%INSERT INTO users%')",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if flush_is_waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            flush_is_waiting,
+            "flush must reach the blocked durable user merge before staging the concurrent row"
+        );
+
+        store
+            .stage_projection_batch(&user_only_batch(sample_batch(
+                bot_id,
+                concurrent_user_id,
+                chat_id,
+                file_unique_id.clone(),
+                observed_at + Duration::seconds(2),
+                152,
+                "concurrent",
+            )))
+            .await?;
+        blocker.commit().await?;
+        flush.await??;
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM telegram_users_stage \
+                 WHERE bot_id = $1 AND user_id = $2",
+            )
+            .bind(bot_id)
+            .bind(concurrent_user_id)
+            .fetch_one(&pool)
+            .await?,
+            1
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(concurrent_user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+
+        store.flush_staged_projections(bot_id).await?;
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND first_name = 'concurrent')",
+            )
+            .bind(concurrent_user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
+        cleanup(&pool, bot_id, concurrent_user_id, chat_id, &file_unique_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_activity_does_not_block_valid_projection_flush() -> Result<(), Box<dyn Error>> {
+        let Some(pool) = migrated_test_pool().await? else {
+            return Ok(());
+        };
+        let suffix = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let bot_id = i64::try_from(suffix.rem_euclid(1_000_000_000))? + 17_000;
+        let valid_user_id = bot_id + 1_800_000_000;
+        let valid_chat_id = -(bot_id + 1_900_000_000);
+        let orphan_user_id = bot_id + 2_000_000_000;
+        let orphan_chat_id = -(bot_id + 2_100_000_000);
+        let file_unique_id = format!("projection-orphan-activity-{suffix}");
+        cleanup(&pool, bot_id, valid_user_id, valid_chat_id, &file_unique_id).await?;
+
+        let store = PostgresTelegramProjectionStore::new(pool.clone());
+        let observed_at = OffsetDateTime::now_utc();
+        store
+            .stage_projection_batch(&activity_only_batch(sample_batch(
+                bot_id,
+                orphan_user_id,
+                orphan_chat_id,
+                format!("orphan-{file_unique_id}"),
+                observed_at,
+                170,
+                "orphan",
+            )))
+            .await?;
+        store
+            .stage_projection_batch(&sample_batch(
+                bot_id,
+                valid_user_id,
+                valid_chat_id,
+                file_unique_id.clone(),
+                observed_at + Duration::seconds(1),
+                171,
+                "valid",
+            ))
+            .await?;
+
+        let flushed = store.flush_staged_projections(bot_id).await?;
+        assert_eq!(flushed.active_users, 1);
+        assert_eq!(store.stage_stats(bot_id).await?.rows, 0);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM chat_active_users \
+                 WHERE chat_id = $1 AND user_id = $2)",
+            )
+            .bind(valid_chat_id)
+            .bind(valid_user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM chat_active_users \
+                 WHERE chat_id = $1 AND user_id = $2)",
+            )
+            .bind(orphan_chat_id)
+            .bind(orphan_user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        cleanup(&pool, bot_id, valid_user_id, valid_chat_id, &file_unique_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn immediate_bulk_apply_skips_unchanged_durable_rows() -> Result<(), Box<dyn Error>> {
         let Some(pool) = migrated_test_pool().await? else {
             return Ok(());
@@ -1673,7 +1866,7 @@ mod tests {
             return Ok(None);
         };
         let pool = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect(&dsn)
             .await?;
         crate::run_migrations_on(&pool).await?;
@@ -1750,6 +1943,22 @@ mod tests {
                 },
             }],
         }
+    }
+
+    fn user_only_batch(mut batch: TelegramProjectionBatch) -> TelegramProjectionBatch {
+        batch.chats.clear();
+        batch.members.clear();
+        batch.activity.clear();
+        batch.files.clear();
+        batch
+    }
+
+    fn activity_only_batch(mut batch: TelegramProjectionBatch) -> TelegramProjectionBatch {
+        batch.users.clear();
+        batch.chats.clear();
+        batch.members.clear();
+        batch.files.clear();
+        batch
     }
 
     async fn cleanup(
