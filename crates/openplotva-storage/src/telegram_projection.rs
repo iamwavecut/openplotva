@@ -1897,6 +1897,36 @@ mod tests {
                 "effective point lookup scanned a full overlay relation:\n{plan}"
             );
         }
+
+        let vip_actor_plan = sqlx::query_scalar::<_, String>(
+            "EXPLAIN (COSTS OFF) \
+             SELECT ve.id, actor.username, actor.first_name \
+             FROM vip_events AS ve \
+             LEFT JOIN LATERAL (\
+                 SELECT username, first_name \
+                 FROM telegram_users_effective \
+                 WHERE id = ve.actor_user_id \
+                 LIMIT 1\
+             ) AS actor ON TRUE \
+             WHERE ve.user_id = $1 \
+             ORDER BY ve.id DESC",
+        )
+        .bind(42_i64)
+        .fetch_all(&pool)
+        .await?
+        .join("\n");
+        assert!(
+            vip_actor_plan.contains("Nested Loop Left Join"),
+            "VIP actor lookup was flattened into a full effective-user join:\n{vip_actor_plan}"
+        );
+        assert!(
+            vip_actor_plan.contains("users_pkey"),
+            "VIP actor lookup missed the durable user primary key:\n{vip_actor_plan}"
+        );
+        assert!(
+            !vip_actor_plan.contains("Seq Scan on users durable"),
+            "VIP actor lookup scanned every durable user:\n{vip_actor_plan}"
+        );
         Ok(())
     }
 
