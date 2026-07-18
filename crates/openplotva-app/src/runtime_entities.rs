@@ -18,7 +18,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const SQL_COUNT_USERS_FILTERED: &str = r#"
 SELECT COUNT(*)::int
-FROM users
+FROM telegram_users_effective
 WHERE (
     $1::text IS NULL
     OR username ILIKE '%' || $1::text || '%'
@@ -28,7 +28,7 @@ WHERE (
 
 const SQL_LIST_USERS_FILTERED: &str = r#"
 SELECT *
-FROM users
+FROM telegram_users_effective
 WHERE (
     $1::text IS NULL
     OR username ILIKE '%' || $1::text || '%'
@@ -39,15 +39,17 @@ ORDER BY id
 LIMIT $2
 OFFSET $3"#;
 
-const SQL_GET_RUNTIME_USER: &str = "SELECT * FROM users WHERE id = $1";
-const SQL_GET_RUNTIME_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
+const SQL_GET_RUNTIME_USER: &str = "SELECT * FROM telegram_users_effective WHERE id = $1";
+const SQL_GET_RUNTIME_USER_BY_USERNAME: &str =
+    "SELECT * FROM telegram_users_effective WHERE username = $1 LIMIT 1";
 const SQL_GET_RUNTIME_USER_ID_BY_USERNAME: &str =
-    "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1";
-const SQL_LIST_RUNTIME_USERS_BY_IDS: &str = "SELECT * FROM users WHERE id = ANY($1::bigint[])";
+    "SELECT id FROM telegram_users_effective WHERE lower(username) = lower($1) LIMIT 1";
+const SQL_LIST_RUNTIME_USERS_BY_IDS: &str =
+    "SELECT * FROM telegram_users_effective WHERE id = ANY($1::bigint[])";
 
 const SQL_COUNT_CHATS_FILTERED: &str = r#"
 SELECT COUNT(*)::int
-FROM chats
+FROM telegram_chats_effective
 WHERE (
     $1::text IS NULL
     OR CAST(id AS text) LIKE '%' || $1::text || '%'
@@ -59,7 +61,7 @@ WHERE (
 
 const SQL_LIST_CHATS_FILTERED: &str = r#"
 SELECT *
-FROM chats
+FROM telegram_chats_effective
 WHERE (
     $1::text IS NULL
     OR CAST(id AS text) LIKE '%' || $1::text || '%'
@@ -74,21 +76,22 @@ OFFSET $3"#;
 
 const SQL_COUNT_CHATS_BY_MEMBER: &str = r#"
 SELECT COUNT(DISTINCT c.id)::int
-FROM chats c
-JOIN chat_members cm ON c.id = cm.chat_id
+FROM telegram_chats_effective c
+JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id
 WHERE cm.user_id = $1"#;
 
 const SQL_LIST_CHATS_BY_MEMBER: &str = r#"
 SELECT DISTINCT c.*
-FROM chats c
-JOIN chat_members cm ON c.id = cm.chat_id
+FROM telegram_chats_effective c
+JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id
 WHERE cm.user_id = $1
 ORDER BY c.id
 LIMIT $2
 OFFSET $3"#;
 
-const SQL_GET_RUNTIME_CHAT: &str = "SELECT * FROM chats WHERE id = $1";
-const SQL_LIST_RUNTIME_CHAT_MEMBERS: &str = "SELECT * FROM chat_members WHERE chat_id = $1";
+const SQL_GET_RUNTIME_CHAT: &str = "SELECT * FROM telegram_chats_effective WHERE id = $1";
+const SQL_LIST_RUNTIME_CHAT_MEMBERS: &str =
+    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1";
 
 /// SQLx-backed runtime API core entity reader.
 #[derive(Clone, Debug)]

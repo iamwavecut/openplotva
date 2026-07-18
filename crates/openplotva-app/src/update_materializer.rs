@@ -11,15 +11,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType};
+use carapax::types::{
+    ChatMember as TelegramChatMember, MessageData as TelegramMessageData, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType,
+};
+use openplotva_config::UpdateMaterializationMode;
 use openplotva_storage::{
-    MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport, MaterializedUpdateDisposition,
-    MaterializedUpdateInput, PostgresTelegramDeliveryStore, QuarantinedUpdateInput,
+    ChatMemberUpsert, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
+    MaterializedUpdateDisposition, MaterializedUpdateInput, PostgresTelegramDeliveryStore,
+    PostgresTelegramProjectionStore, QuarantinedUpdateInput, StorageError,
+    TelegramActivityProjection, TelegramChatMemberProjection, TelegramChatProjection,
+    TelegramFileProjection, TelegramProjectionBatch, TelegramProjectionVersion,
+    TelegramUserProjection,
 };
 use openplotva_updates::{
     RawUpdateStreamEntry, RedisUpdateStream, UpdateStreamConfigError, UpdateStreamEntry,
     UpdateStreamId, UpdateStreamMaterializerConfig, decode_telegram_update_json_slice,
-    is_passive_update, update_name,
+    extract_update_state, is_passive_update, update_file_metadata_refs, update_name,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -34,6 +42,56 @@ const MATERIALIZER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 const MATERIALIZER_LEASE_ACQUIRE_RECHECK: Duration = Duration::from_secs(1);
 const MATERIALIZER_SUPERVISOR_RESTART_DELAY: Duration =
     Duration::from_secs(MATERIALIZER_LEASE_TTL.as_secs() / 60);
+const PROJECTION_STAGE_DEGRADED_AGE: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateProjectionMaterializerConfig {
+    pub mode: UpdateMaterializationMode,
+    pub flush_interval: Duration,
+    pub flush_max_mutations: usize,
+    pub stage_hard_limit_rows: usize,
+}
+
+impl Default for UpdateProjectionMaterializerConfig {
+    fn default() -> Self {
+        Self {
+            mode: UpdateMaterializationMode::Legacy,
+            flush_interval: Duration::from_secs(10),
+            flush_max_mutations: 10_000,
+            stage_hard_limit_rows: 1_000_000,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateMaterializationPlan {
+    OnlineEvent,
+    ImmediateProjection,
+    DeferredProjection,
+    Ignored,
+    Quarantine,
+}
+
+struct ProjectionFlushState {
+    last_flush: Instant,
+    staged_mutations_since_flush: usize,
+}
+
+impl ProjectionFlushState {
+    fn new(flush_interval: Duration) -> Self {
+        Self {
+            last_flush: Instant::now()
+                .checked_sub(flush_interval)
+                .unwrap_or_else(Instant::now),
+            staged_mutations_since_flush: 0,
+        }
+    }
+
+    fn flush_due(&self, config: UpdateProjectionMaterializerConfig) -> bool {
+        self.last_flush.elapsed() >= config.flush_interval
+            || self.staged_mutations_since_flush >= config.flush_max_mutations
+    }
+}
 
 static MATERIALIZER_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -69,6 +127,12 @@ pub struct UpdateMaterializerMetricsSnapshot {
     pub ack_delete_mismatches: u64,
     pub db_failures: u64,
     pub redis_failures: u64,
+    pub projection_stage_rows: i64,
+    pub projection_oldest_stage_age: Option<Duration>,
+    pub projection_last_flush_latency: Option<Duration>,
+    pub projection_staged_mutations: u64,
+    pub projection_flushed_rows: u64,
+    pub projection_flush_errors: u64,
 }
 
 /// Cloneable live metrics handle shared by the materializer and runtime API.
@@ -143,6 +207,42 @@ impl UpdateMaterializerMetrics {
         });
     }
 
+    fn record_projection_stage(
+        &self,
+        staged_mutations: usize,
+        rows: i64,
+        oldest_observed_at: Option<OffsetDateTime>,
+    ) {
+        let oldest_stage_age = oldest_observed_at
+            .and_then(|oldest| (OffsetDateTime::now_utc() - oldest).try_into().ok());
+        self.update(|snapshot| {
+            snapshot.projection_stage_rows = rows;
+            snapshot.projection_oldest_stage_age = oldest_stage_age;
+            snapshot.projection_staged_mutations = snapshot
+                .projection_staged_mutations
+                .saturating_add(staged_mutations as u64);
+        });
+    }
+
+    fn record_projection_flush(&self, latency: Duration, flushed_rows: u64, remaining_rows: i64) {
+        self.update(|snapshot| {
+            snapshot.projection_last_flush_latency = Some(latency);
+            snapshot.projection_flushed_rows = snapshot
+                .projection_flushed_rows
+                .saturating_add(flushed_rows);
+            snapshot.projection_stage_rows = remaining_rows;
+            if remaining_rows == 0 {
+                snapshot.projection_oldest_stage_age = None;
+            }
+        });
+    }
+
+    fn record_projection_flush_error(&self) {
+        self.update(|snapshot| {
+            snapshot.projection_flush_errors = snapshot.projection_flush_errors.saturating_add(1);
+        });
+    }
+
     fn record_materialization(
         &self,
         batch: &PreprocessedBatch,
@@ -199,6 +299,231 @@ struct PreprocessedBatch {
     stream_ids: Vec<UpdateStreamId>,
     updates: Vec<MaterializedUpdateInput>,
     quarantine: Vec<QuarantinedUpdateInput>,
+    immediate_projections: TelegramProjectionBatch,
+    deferred_projections: TelegramProjectionBatch,
+}
+
+#[derive(Default)]
+struct ProjectionBatchReducer {
+    users: HashMap<i64, TelegramUserProjection>,
+    chats: HashMap<i64, TelegramChatProjection>,
+    members: HashMap<(i64, i64), TelegramChatMemberProjection>,
+    activity: HashMap<(i64, i64), TelegramActivityProjection>,
+    files: HashMap<String, TelegramFileProjection>,
+}
+
+impl ProjectionBatchReducer {
+    fn extend(&mut self, batch: TelegramProjectionBatch) {
+        for row in batch.users {
+            merge_user_projection(&mut self.users, row);
+        }
+        for row in batch.chats {
+            merge_chat_projection(&mut self.chats, row);
+        }
+        for row in batch.members {
+            merge_member_projection(&mut self.members, row);
+        }
+        for row in batch.activity {
+            merge_activity_projection(&mut self.activity, row);
+        }
+        for row in batch.files {
+            merge_file_projection(&mut self.files, row);
+        }
+    }
+
+    fn finish(self) -> TelegramProjectionBatch {
+        let mut users = self.users.into_values().collect::<Vec<_>>();
+        users.sort_by_key(|row| row.state.id);
+        let mut chats = self.chats.into_values().collect::<Vec<_>>();
+        chats.sort_by_key(|row| row.state.id);
+        let mut members = self.members.into_values().collect::<Vec<_>>();
+        members.sort_by_key(|row| (row.state.chat_id, row.state.user_id));
+        let mut activity = self.activity.into_values().collect::<Vec<_>>();
+        activity.sort_by_key(|row| (row.chat_id, row.user_id));
+        let mut files = self.files.into_values().collect::<Vec<_>>();
+        files.sort_by(|left, right| left.state.file_unique_id.cmp(&right.state.file_unique_id));
+        TelegramProjectionBatch {
+            users,
+            chats,
+            members,
+            activity,
+            files,
+        }
+    }
+}
+
+fn projection_is_newer(
+    candidate: TelegramProjectionVersion,
+    current: TelegramProjectionVersion,
+) -> bool {
+    (candidate.stream_ms, candidate.stream_seq) > (current.stream_ms, current.stream_seq)
+}
+
+fn merge_user_projection(
+    rows: &mut HashMap<i64, TelegramUserProjection>,
+    mut candidate: TelegramUserProjection,
+) {
+    let key = candidate.state.id;
+    match rows.remove(&key) {
+        Some(current) if projection_is_newer(candidate.version, current.version) => {
+            candidate.state.last_name = candidate.state.last_name.or(current.state.last_name);
+            candidate.state.username = candidate.state.username.or(current.state.username);
+            candidate.state.language_code = candidate
+                .state
+                .language_code
+                .or(current.state.language_code);
+            candidate.state.is_premium = candidate.state.is_premium.or(current.state.is_premium);
+            rows.insert(key, candidate);
+        }
+        Some(current) => {
+            rows.insert(key, current);
+        }
+        None => {
+            rows.insert(key, candidate);
+        }
+    }
+}
+
+fn merge_chat_projection(
+    rows: &mut HashMap<i64, TelegramChatProjection>,
+    mut candidate: TelegramChatProjection,
+) {
+    let key = candidate.state.id;
+    match rows.remove(&key) {
+        Some(current) if projection_is_newer(candidate.version, current.version) => {
+            candidate.state.title = candidate.state.title.or(current.state.title);
+            candidate.state.username = candidate.state.username.or(current.state.username);
+            candidate.state.first_name = candidate.state.first_name.or(current.state.first_name);
+            candidate.state.last_name = candidate.state.last_name.or(current.state.last_name);
+            candidate.state.is_forum = candidate.state.is_forum.or(current.state.is_forum);
+            rows.insert(key, candidate);
+        }
+        Some(current) => {
+            rows.insert(key, current);
+        }
+        None => {
+            rows.insert(key, candidate);
+        }
+    }
+}
+
+fn merge_member_projection(
+    rows: &mut HashMap<(i64, i64), TelegramChatMemberProjection>,
+    mut candidate: TelegramChatMemberProjection,
+) {
+    let key = (candidate.state.chat_id, candidate.state.user_id);
+    match rows.remove(&key) {
+        Some(current) if projection_is_newer(candidate.version, current.version) => {
+            merge_member_permissions(&mut candidate.state, current.state);
+            rows.insert(key, candidate);
+        }
+        Some(current) => {
+            rows.insert(key, current);
+        }
+        None => {
+            rows.insert(key, candidate);
+        }
+    }
+}
+
+fn merge_member_permissions(candidate: &mut ChatMemberUpsert, current: ChatMemberUpsert) {
+    candidate.is_member = candidate.is_member.or(current.is_member);
+    candidate.is_anonymous = candidate.is_anonymous.or(current.is_anonymous);
+    candidate.custom_title = candidate.custom_title.take().or(current.custom_title);
+    candidate.can_be_edited = candidate.can_be_edited.or(current.can_be_edited);
+    candidate.can_manage_chat = candidate.can_manage_chat.or(current.can_manage_chat);
+    candidate.can_delete_messages = candidate
+        .can_delete_messages
+        .or(current.can_delete_messages);
+    candidate.can_manage_video_chats = candidate
+        .can_manage_video_chats
+        .or(current.can_manage_video_chats);
+    candidate.can_restrict_members = candidate
+        .can_restrict_members
+        .or(current.can_restrict_members);
+    candidate.can_promote_members = candidate
+        .can_promote_members
+        .or(current.can_promote_members);
+    candidate.can_change_info = candidate.can_change_info.or(current.can_change_info);
+    candidate.can_invite_users = candidate.can_invite_users.or(current.can_invite_users);
+    candidate.can_post_messages = candidate.can_post_messages.or(current.can_post_messages);
+    candidate.can_edit_messages = candidate.can_edit_messages.or(current.can_edit_messages);
+    candidate.can_pin_messages = candidate.can_pin_messages.or(current.can_pin_messages);
+    candidate.can_manage_topics = candidate.can_manage_topics.or(current.can_manage_topics);
+    candidate.can_send_messages = candidate.can_send_messages.or(current.can_send_messages);
+    candidate.can_send_media_messages = candidate
+        .can_send_media_messages
+        .or(current.can_send_media_messages);
+    candidate.can_send_polls = candidate.can_send_polls.or(current.can_send_polls);
+    candidate.can_send_other_messages = candidate
+        .can_send_other_messages
+        .or(current.can_send_other_messages);
+    candidate.can_add_web_page_previews = candidate
+        .can_add_web_page_previews
+        .or(current.can_add_web_page_previews);
+    candidate.until_date = candidate.until_date.or(current.until_date);
+}
+
+fn merge_activity_projection(
+    rows: &mut HashMap<(i64, i64), TelegramActivityProjection>,
+    mut candidate: TelegramActivityProjection,
+) {
+    let key = (candidate.chat_id, candidate.user_id);
+    match rows.remove(&key) {
+        Some(current) => {
+            candidate.last_message_at =
+                max_optional_timestamp(candidate.last_message_at, current.last_message_at);
+            candidate.last_active_at =
+                max_optional_timestamp(candidate.last_active_at, current.last_active_at);
+            if !projection_is_newer(candidate.version, current.version) {
+                candidate.version = current.version;
+            }
+            rows.insert(key, candidate);
+        }
+        None => {
+            rows.insert(key, candidate);
+        }
+    }
+}
+
+fn max_optional_timestamp(
+    left: Option<OffsetDateTime>,
+    right: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn merge_file_projection(
+    rows: &mut HashMap<String, TelegramFileProjection>,
+    mut candidate: TelegramFileProjection,
+) {
+    let key = candidate.state.file_unique_id.clone();
+    match rows.remove(&key) {
+        Some(current) if projection_is_newer(candidate.version, current.version) => {
+            candidate.state.mime_type = candidate.state.mime_type.or(current.state.mime_type);
+            candidate.state.width = candidate.state.width.or(current.state.width);
+            candidate.state.height = candidate.state.height.or(current.state.height);
+            candidate.state.file_size = candidate.state.file_size.or(current.state.file_size);
+            candidate.state.first_seen_chat_id = current
+                .state
+                .first_seen_chat_id
+                .or(candidate.state.first_seen_chat_id);
+            candidate.state.first_seen_message_id = current
+                .state
+                .first_seen_message_id
+                .or(candidate.state.first_seen_message_id);
+            rows.insert(key, candidate);
+        }
+        Some(current) => {
+            rows.insert(key, current);
+        }
+        None => {
+            rows.insert(key, candidate);
+        }
+    }
 }
 
 /// Run one active materializer for a bot Stream until shutdown.
@@ -225,6 +550,7 @@ where
         store,
         bot_id,
         config,
+        UpdateProjectionMaterializerConfig::default(),
         UpdateMaterializerMetrics::default(),
         stop,
     )
@@ -241,6 +567,7 @@ pub async fn run_supervised_update_materializer_until(
     store: PostgresTelegramDeliveryStore,
     bot_id: i64,
     config: UpdateStreamMaterializerConfig,
+    projection_config: UpdateProjectionMaterializerConfig,
     metrics: UpdateMaterializerMetrics,
     stop: watch::Receiver<bool>,
 ) -> Result<(), UpdateStreamConfigError> {
@@ -253,6 +580,7 @@ pub async fn run_supervised_update_materializer_until(
             store.clone(),
             bot_id,
             config,
+            projection_config,
             metrics.clone(),
             wait_for_stop(stop.clone()),
         )
@@ -303,6 +631,7 @@ pub async fn run_update_materializer_with_metrics_until<Stop>(
     store: PostgresTelegramDeliveryStore,
     bot_id: i64,
     config: UpdateStreamMaterializerConfig,
+    projection_config: UpdateProjectionMaterializerConfig,
     metrics: UpdateMaterializerMetrics,
     stop: Stop,
 ) -> Result<UpdateMaterializerWorkerReport, UpdateStreamConfigError>
@@ -310,6 +639,15 @@ where
     Stop: Future<Output = ()> + Send,
 {
     let config = config.validate()?;
+    let projection_config = UpdateProjectionMaterializerConfig {
+        flush_interval: projection_config
+            .flush_interval
+            .max(Duration::from_millis(1)),
+        flush_max_mutations: projection_config.flush_max_mutations.max(1),
+        stage_hard_limit_rows: projection_config.stage_hard_limit_rows.max(1),
+        ..projection_config
+    };
+    let projection_store = PostgresTelegramProjectionStore::new(store.pool().clone());
     let max_rows = config.effective_max_rows(MATERIALIZED_UPDATE_BINDS_PER_ROW)?;
     let mut report = UpdateMaterializerWorkerReport::default();
     let mut external_stop = std::pin::pin!(stop);
@@ -397,6 +735,54 @@ where
     let mut stop = std::pin::pin!(combined_stop);
     consecutive_redis_failures = 0;
 
+    let mut projection_flush_state = ProjectionFlushState::new(projection_config.flush_interval);
+    let mut consecutive_flush_failures = 0_u32;
+    loop {
+        let flush = tokio::select! {
+            () = stop.as_mut() => None,
+            result = tokio::time::timeout(
+                config.db_timeout,
+                flush_staged_projections(
+                    &projection_store,
+                    bot_id,
+                    &metrics,
+                    &mut projection_flush_state,
+                ),
+            ) => Some(result),
+        };
+        match flush {
+            None => break,
+            Some(Ok(Ok(()))) => break,
+            Some(Ok(Err(error))) => {
+                report.db_failures = report.db_failures.saturating_add(1);
+                metrics.record_db_failure();
+                metrics.record_projection_flush_error();
+                report.last_error = Some(error.to_string());
+                consecutive_flush_failures = consecutive_flush_failures.saturating_add(1);
+                tracing::warn!(
+                    %error,
+                    consecutive_flush_failures,
+                    "failed to flush staged Telegram projections at materializer startup"
+                );
+            }
+            Some(Err(error)) => {
+                report.db_failures = report.db_failures.saturating_add(1);
+                metrics.record_db_failure();
+                metrics.record_projection_flush_error();
+                report.last_error = Some(error.to_string());
+                consecutive_flush_failures = consecutive_flush_failures.saturating_add(1);
+                tracing::warn!(
+                    %error,
+                    consecutive_flush_failures,
+                    "staged Telegram projection startup flush timed out"
+                );
+            }
+        }
+        if sleep_or_stop(&mut stop, retry_backoff(consecutive_flush_failures)).await {
+            break;
+        }
+    }
+
     let mut pending = VecDeque::with_capacity(max_rows);
     let mut reclaim_cursor = UpdateStreamId::MIN;
     // The lease is exclusive, so every pre-existing PEL owner is abandoned at
@@ -405,6 +791,28 @@ where
     let mut startup_reclaim = true;
 
     loop {
+        if projection_config.mode.stages_projections()
+            && projection_flush_state.flush_due(projection_config)
+            && let Err(error) = tokio::time::timeout(
+                config.db_timeout,
+                flush_staged_projections(
+                    &projection_store,
+                    bot_id,
+                    &metrics,
+                    &mut projection_flush_state,
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()))
+        {
+            report.db_failures = report.db_failures.saturating_add(1);
+            metrics.record_db_failure();
+            metrics.record_projection_flush_error();
+            report.last_error = Some(error.clone());
+            tracing::warn!(%error, "failed to flush staged Telegram projections");
+        }
+
         if pending.is_empty() {
             if stop_requested_now(&mut stop).await {
                 break;
@@ -561,9 +969,12 @@ where
         if !materialize_and_ack_batch(
             &stream,
             &store,
+            &projection_store,
             bot_id,
             &batch,
             config.db_timeout,
+            projection_config,
+            &mut projection_flush_state,
             &mut batch_stop,
             &mut report,
             &metrics,
@@ -571,6 +982,30 @@ where
         .await
         {
             break;
+        }
+    }
+
+    if projection_config.mode.stages_projections() {
+        match tokio::time::timeout(
+            config.db_timeout,
+            flush_staged_projections(
+                &projection_store,
+                bot_id,
+                &metrics,
+                &mut projection_flush_state,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                metrics.record_projection_flush_error();
+                tracing::warn!(%error, "failed to flush staged Telegram projections at shutdown");
+            }
+            Err(error) => {
+                metrics.record_projection_flush_error();
+                tracing::warn!(%error, "staged Telegram projection shutdown flush timed out");
+            }
         }
     }
 
@@ -714,9 +1149,12 @@ where
 async fn materialize_and_ack_batch<Stop>(
     stream: &RedisUpdateStream,
     store: &PostgresTelegramDeliveryStore,
+    projection_store: &PostgresTelegramProjectionStore,
     bot_id: i64,
     entries: &[RawUpdateStreamEntry],
     db_timeout: Duration,
+    projection_config: UpdateProjectionMaterializerConfig,
+    projection_flush_state: &mut ProjectionFlushState,
     stop: &mut Pin<&mut Stop>,
     report: &mut UpdateMaterializerWorkerReport,
     metrics: &UpdateMaterializerMetrics,
@@ -724,7 +1162,7 @@ async fn materialize_and_ack_batch<Stop>(
 where
     Stop: Future<Output = ()>,
 {
-    let batch = preprocess_batch(entries, bot_id);
+    let batch = preprocess_batch_for_mode(entries, bot_id, projection_config.mode);
     let mut consecutive_db_failures = 0_u32;
 
     let (materialization, transaction_latency) = loop {
@@ -733,7 +1171,11 @@ where
             () = stop.as_mut() => return false,
             result = tokio::time::timeout(
                 db_timeout,
-                store.materialize_update_batch(&batch.updates, &batch.quarantine),
+                store.materialize_online_batch(
+                    &batch.updates,
+                    &batch.quarantine,
+                    &batch.immediate_projections,
+                ),
             ) => result,
         };
         match result {
@@ -768,6 +1210,95 @@ where
             return false;
         }
     };
+
+    if !batch.deferred_projections.is_empty() {
+        let deferred_mutations = batch.deferred_projections.mutation_count();
+        if !ensure_projection_stage_capacity(
+            projection_store,
+            bot_id,
+            deferred_mutations,
+            db_timeout,
+            projection_config,
+            projection_flush_state,
+            stop,
+            report,
+            metrics,
+        )
+        .await
+        {
+            return false;
+        }
+
+        consecutive_db_failures = 0;
+        loop {
+            let staged = tokio::select! {
+                () = stop.as_mut() => return false,
+                result = tokio::time::timeout(
+                    db_timeout,
+                    projection_store.stage_projection_batch(&batch.deferred_projections),
+                ) => result,
+            };
+            match staged {
+                Ok(Ok(_)) => {
+                    projection_flush_state.staged_mutations_since_flush = projection_flush_state
+                        .staged_mutations_since_flush
+                        .saturating_add(deferred_mutations);
+                    match projection_store.stage_stats(bot_id).await {
+                        Ok(stats) => {
+                            metrics.record_projection_stage(
+                                deferred_mutations,
+                                stats.rows,
+                                stats.oldest_observed_at,
+                            );
+                            if stats.oldest_observed_at.is_some_and(|oldest| {
+                                OffsetDateTime::now_utc() - oldest
+                                    > time::Duration::seconds(
+                                        i64::try_from(PROJECTION_STAGE_DEGRADED_AGE.as_secs())
+                                            .unwrap_or(30),
+                                    )
+                            }) {
+                                tracing::warn!(
+                                    stage_rows = stats.rows,
+                                    "Telegram projection staging is older than the degraded threshold"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read Telegram projection stage stats");
+                        }
+                    }
+                    break;
+                }
+                Ok(Err(error)) => {
+                    report.db_failures = report.db_failures.saturating_add(1);
+                    metrics.record_db_failure();
+                    report.last_error = Some(error.to_string());
+                    consecutive_db_failures = consecutive_db_failures.saturating_add(1);
+                    tracing::warn!(
+                        %error,
+                        consecutive_db_failures,
+                        deferred_mutations,
+                        "failed to stage deferred Telegram projections"
+                    );
+                }
+                Err(error) => {
+                    report.db_failures = report.db_failures.saturating_add(1);
+                    metrics.record_db_failure();
+                    report.last_error = Some(error.to_string());
+                    consecutive_db_failures = consecutive_db_failures.saturating_add(1);
+                    tracing::warn!(
+                        %error,
+                        consecutive_db_failures,
+                        deferred_mutations,
+                        "deferred Telegram projection staging timed out"
+                    );
+                }
+            }
+            if sleep_or_stop(stop, retry_backoff(consecutive_db_failures)).await {
+                return false;
+            }
+        }
+    }
 
     record_materialization(report, &batch, materialization);
     metrics.record_materialization(&batch, materialization, transaction_latency);
@@ -811,7 +1342,105 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn ensure_projection_stage_capacity<Stop>(
+    store: &PostgresTelegramProjectionStore,
+    bot_id: i64,
+    pending_mutations: usize,
+    db_timeout: Duration,
+    config: UpdateProjectionMaterializerConfig,
+    flush_state: &mut ProjectionFlushState,
+    stop: &mut Pin<&mut Stop>,
+    report: &mut UpdateMaterializerWorkerReport,
+    metrics: &UpdateMaterializerMetrics,
+) -> bool
+where
+    Stop: Future<Output = ()>,
+{
+    let mut consecutive_failures = 0_u32;
+    loop {
+        let stats = tokio::select! {
+            () = stop.as_mut() => return false,
+            result = tokio::time::timeout(db_timeout, store.stage_stats(bot_id)) => result,
+        };
+        match stats {
+            Ok(Ok(stats)) => {
+                metrics.record_projection_stage(0, stats.rows, stats.oldest_observed_at);
+                let current_rows = usize::try_from(stats.rows.max(0)).unwrap_or(usize::MAX);
+                if current_rows.saturating_add(pending_mutations) <= config.stage_hard_limit_rows {
+                    return true;
+                }
+                tracing::warn!(
+                    stage_rows = stats.rows,
+                    pending_mutations,
+                    hard_limit_rows = config.stage_hard_limit_rows,
+                    "Telegram projection stage reached the hard limit; holding Redis entries"
+                );
+                match tokio::time::timeout(
+                    db_timeout,
+                    flush_staged_projections(store, bot_id, metrics, flush_state),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        report.last_error = Some(error.to_string());
+                        tracing::warn!(%error, "failed to flush full Telegram projection stage");
+                    }
+                    Err(error) => {
+                        report.last_error = Some(error.to_string());
+                        tracing::warn!(%error, "full Telegram projection stage flush timed out");
+                    }
+                }
+                metrics.record_projection_flush_error();
+            }
+            Ok(Err(error)) => {
+                report.last_error = Some(error.to_string());
+                tracing::warn!(%error, "failed to inspect Telegram projection stage capacity");
+            }
+            Err(error) => {
+                report.last_error = Some(error.to_string());
+                tracing::warn!(%error, "Telegram projection stage capacity check timed out");
+            }
+        }
+
+        report.db_failures = report.db_failures.saturating_add(1);
+        metrics.record_db_failure();
+        consecutive_failures = consecutive_failures.saturating_add(1);
+        if sleep_or_stop(stop, retry_backoff(consecutive_failures)).await {
+            return false;
+        }
+    }
+}
+
+async fn flush_staged_projections(
+    store: &PostgresTelegramProjectionStore,
+    bot_id: i64,
+    metrics: &UpdateMaterializerMetrics,
+    state: &mut ProjectionFlushState,
+) -> Result<(), StorageError> {
+    let started = Instant::now();
+    let report = store.flush_staged_projections(bot_id).await?;
+    let stats = store.stage_stats(bot_id).await?;
+    state.last_flush = Instant::now();
+    state.staged_mutations_since_flush = 0;
+    metrics.record_projection_flush(started.elapsed(), report.deleted_stage_rows, stats.rows);
+    Ok(())
+}
+
+#[cfg(test)]
 fn preprocess_batch(entries: &[RawUpdateStreamEntry], expected_bot_id: i64) -> PreprocessedBatch {
+    preprocess_batch_for_mode(entries, expected_bot_id, UpdateMaterializationMode::Legacy)
+}
+
+fn preprocess_batch_for_mode(
+    entries: &[RawUpdateStreamEntry],
+    expected_bot_id: i64,
+    mode: UpdateMaterializationMode,
+) -> PreprocessedBatch {
     let mut ordered = entries.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|entry| entry.stream_id);
 
@@ -819,11 +1448,56 @@ fn preprocess_batch(entries: &[RawUpdateStreamEntry], expected_bot_id: i64) -> P
     let mut updates = Vec::with_capacity(entries.len());
     let mut quarantine = Vec::with_capacity(entries.len());
     let mut update_indexes = HashMap::with_capacity(entries.len());
+    let mut immediate_projections = ProjectionBatchReducer::default();
+    let mut deferred_projections = ProjectionBatchReducer::default();
 
     for raw in ordered {
         stream_ids.push(raw.stream_id);
-        match materialized_input(raw, expected_bot_id) {
-            Ok(update) => {
+        match decoded_materialized_input(raw, expected_bot_id) {
+            Ok(decoded) => {
+                let plan = update_materialization_plan(&decoded.update, expected_bot_id);
+                if mode == UpdateMaterializationMode::Active
+                    && plan == UpdateMaterializationPlan::Quarantine
+                {
+                    quarantine.push(quarantine_input(
+                        raw,
+                        expected_bot_id,
+                        Some(&decoded.envelope),
+                        "unsupported_type",
+                        format!(
+                            "unsupported Telegram update type {}",
+                            update_name(&decoded.update)
+                        ),
+                    ));
+                    continue;
+                }
+
+                if mode.stages_projections() {
+                    let (immediate, deferred) = projection_batches_from_update(
+                        &decoded.update,
+                        projection_version(&decoded.input),
+                        plan,
+                    );
+                    if mode.projection_is_authoritative() {
+                        immediate_projections.extend(immediate);
+                        deferred_projections.extend(deferred);
+                    } else {
+                        deferred_projections.extend(immediate);
+                        deferred_projections.extend(deferred);
+                    }
+                }
+
+                let include_inbox = match mode {
+                    UpdateMaterializationMode::Legacy | UpdateMaterializationMode::Shadow => true,
+                    UpdateMaterializationMode::Active => {
+                        plan == UpdateMaterializationPlan::OnlineEvent
+                    }
+                };
+                if !include_inbox {
+                    continue;
+                }
+
+                let update = decoded.input;
                 let key = (update.bot_id, update.update_id);
                 if let Some(index) = update_indexes.get(&key).copied() {
                     aggregate_duplicate(&mut updates[index], &update);
@@ -849,15 +1523,23 @@ fn preprocess_batch(entries: &[RawUpdateStreamEntry], expected_bot_id: i64) -> P
         stream_ids,
         updates,
         quarantine,
+        immediate_projections: immediate_projections.finish(),
+        deferred_projections: deferred_projections.finish(),
     }
 }
 
 type InputConversionError = Box<(&'static str, String, Option<UpdateStreamEntry>)>;
 
-fn materialized_input(
+struct DecodedMaterializedInput {
+    input: MaterializedUpdateInput,
+    update: TelegramUpdate,
+    envelope: UpdateStreamEntry,
+}
+
+fn decoded_materialized_input(
     raw: &RawUpdateStreamEntry,
     expected_bot_id: i64,
-) -> Result<MaterializedUpdateInput, InputConversionError> {
+) -> Result<DecodedMaterializedInput, InputConversionError> {
     let entry = raw
         .decode()
         .map_err(|error| Box::new(("stream_envelope", error.to_string(), None)))?;
@@ -913,7 +1595,7 @@ fn materialized_input(
     let ordering_key = ordering_key(expected_bot_id, update.id, chat_id, thread_id, user_id);
     let disposition = materialized_disposition(&update);
 
-    Ok(MaterializedUpdateInput {
+    let input = MaterializedUpdateInput {
         bot_id: entry.bot_id,
         update_id: update.id,
         schema_version: i16::try_from(entry.schema_version).unwrap_or(i16::MAX),
@@ -922,7 +1604,7 @@ fn materialized_input(
         stream_seq,
         last_stream_ms: stream_ms,
         last_stream_seq: stream_seq,
-        raw_payload: entry.raw_payload,
+        raw_payload: entry.raw_payload.clone(),
         payload_sha256: entry.payload_sha256.to_vec(),
         payload_conflict: false,
         update_type: Some(update_name(&update).to_owned()),
@@ -936,6 +1618,11 @@ fn materialized_input(
         thread_id,
         user_id,
         disposition,
+    };
+    Ok(DecodedMaterializedInput {
+        input,
+        update,
+        envelope: entry,
     })
 }
 
@@ -951,6 +1638,220 @@ fn materialized_disposition(update: &TelegramUpdate) -> MaterializedUpdateDispos
     } else {
         MaterializedUpdateDisposition::Pending
     }
+}
+
+fn update_materialization_plan(update: &TelegramUpdate, bot_id: i64) -> UpdateMaterializationPlan {
+    match &update.update_type {
+        TelegramUpdateType::Unknown(_) => UpdateMaterializationPlan::Quarantine,
+        TelegramUpdateType::Message(_)
+        | TelegramUpdateType::EditedMessage(_)
+        | TelegramUpdateType::GuestMessage(_)
+        | TelegramUpdateType::ChannelPost(_)
+        | TelegramUpdateType::EditedChannelPost(_)
+        | TelegramUpdateType::BusinessMessage(_)
+        | TelegramUpdateType::EditedBusinessMessage(_)
+        | TelegramUpdateType::BotStatus(_) => UpdateMaterializationPlan::OnlineEvent,
+        TelegramUpdateType::UserStatus(status) => {
+            let member = &status.new_chat_member;
+            let user = member.get_user();
+            if user.is_bot
+                || i64::from(user.id) == bot_id
+                || sensitive_membership(&status.old_chat_member)
+                || sensitive_membership(member)
+            {
+                UpdateMaterializationPlan::OnlineEvent
+            } else {
+                UpdateMaterializationPlan::DeferredProjection
+            }
+        }
+        _ if is_passive_update(update) => {
+            if extract_update_state(update).is_some() {
+                UpdateMaterializationPlan::DeferredProjection
+            } else {
+                UpdateMaterializationPlan::Ignored
+            }
+        }
+        _ => UpdateMaterializationPlan::OnlineEvent,
+    }
+}
+
+fn sensitive_membership(member: &TelegramChatMember) -> bool {
+    matches!(
+        member,
+        TelegramChatMember::Administrator(_)
+            | TelegramChatMember::Creator(_)
+            | TelegramChatMember::Restricted(_)
+    )
+}
+
+fn projection_version(input: &MaterializedUpdateInput) -> TelegramProjectionVersion {
+    TelegramProjectionVersion {
+        bot_id: input.bot_id,
+        observed_at: input.last_received_at,
+        stream_ms: input.last_stream_ms,
+        stream_seq: input.last_stream_seq,
+    }
+}
+
+fn projection_batches_from_update(
+    update: &TelegramUpdate,
+    version: TelegramProjectionVersion,
+    plan: UpdateMaterializationPlan,
+) -> (TelegramProjectionBatch, TelegramProjectionBatch) {
+    let mut state = TelegramProjectionBatch::default();
+    if let Some(common) = extract_update_state(update) {
+        if let Some(user) = common.user {
+            state.users.push(TelegramUserProjection {
+                version,
+                state: user,
+            });
+        }
+        if let Some(chat) = common.chat {
+            state.chats.push(TelegramChatProjection {
+                version,
+                state: chat,
+            });
+        }
+    }
+    for file_ref in update_file_metadata_refs(update) {
+        if let Some(file) = crate::updates::telegram_file_metadata_upsert_from_ref(&file_ref) {
+            state.files.push(TelegramFileProjection {
+                version,
+                state: file,
+            });
+        }
+    }
+    append_membership_projections(update, version, &mut state);
+
+    let mut activity = TelegramProjectionBatch::default();
+    append_activity_projection(update, version, &mut activity);
+
+    match plan {
+        UpdateMaterializationPlan::OnlineEvent => (state, activity),
+        UpdateMaterializationPlan::ImmediateProjection => {
+            state.activity.append(&mut activity.activity);
+            (state, TelegramProjectionBatch::default())
+        }
+        UpdateMaterializationPlan::DeferredProjection => {
+            state.activity.append(&mut activity.activity);
+            (TelegramProjectionBatch::default(), state)
+        }
+        UpdateMaterializationPlan::Ignored | UpdateMaterializationPlan::Quarantine => (
+            TelegramProjectionBatch::default(),
+            TelegramProjectionBatch::default(),
+        ),
+    }
+}
+
+fn append_membership_projections(
+    update: &TelegramUpdate,
+    version: TelegramProjectionVersion,
+    batch: &mut TelegramProjectionBatch,
+) {
+    if let TelegramUpdateType::BotStatus(status) | TelegramUpdateType::UserStatus(status) =
+        &update.update_type
+    {
+        let chat_id = i64::from(status.chat.get_id());
+        let user = status.new_chat_member.get_user();
+        let user_id = i64::from(user.id);
+        if chat_id != 0 && user_id != 0 {
+            batch.users.push(TelegramUserProjection {
+                version,
+                state: crate::members::user_state_from_telegram_user(user),
+            });
+            batch.members.push(TelegramChatMemberProjection {
+                version,
+                state: crate::members::chat_member_state_upsert_from_telegram(
+                    chat_id,
+                    user_id,
+                    &status.new_chat_member,
+                ),
+            });
+        }
+        return;
+    }
+
+    let Some(message) = update.get_message() else {
+        return;
+    };
+    let chat_id = i64::from(message.chat.get_id());
+    if chat_id == 0 {
+        return;
+    }
+    match &message.data {
+        TelegramMessageData::NewChatMembers(members) => {
+            for user in members {
+                let user_id = i64::from(user.id);
+                if user_id == 0 {
+                    continue;
+                }
+                batch.users.push(TelegramUserProjection {
+                    version,
+                    state: crate::members::user_state_from_telegram_user(user),
+                });
+                batch.members.push(TelegramChatMemberProjection {
+                    version,
+                    state: ChatMemberUpsert {
+                        chat_id,
+                        user_id,
+                        status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+                        is_member: Some(true),
+                        is_anonymous: Some(false),
+                        can_be_edited: Some(false),
+                        ..ChatMemberUpsert::default()
+                    },
+                });
+            }
+        }
+        TelegramMessageData::LeftChatMember(user) => {
+            let user_id = i64::from(user.id);
+            if user_id != 0 {
+                batch.users.push(TelegramUserProjection {
+                    version,
+                    state: crate::members::user_state_from_telegram_user(user),
+                });
+                batch.members.push(TelegramChatMemberProjection {
+                    version,
+                    state: ChatMemberUpsert {
+                        chat_id,
+                        user_id,
+                        status: openplotva_storage::CHAT_MEMBER_STATUS_LEFT.to_owned(),
+                        is_member: Some(false),
+                        is_anonymous: Some(false),
+                        can_be_edited: Some(false),
+                        ..ChatMemberUpsert::default()
+                    },
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn append_activity_projection(
+    update: &TelegramUpdate,
+    version: TelegramProjectionVersion,
+    batch: &mut TelegramProjectionBatch,
+) {
+    let Some(message) = update.get_message() else {
+        return;
+    };
+    let Some(user) = message.sender.get_user() else {
+        return;
+    };
+    let chat_id = i64::from(message.chat.get_id());
+    let user_id = i64::from(user.id);
+    if chat_id == 0 || user_id == 0 || user.is_bot {
+        return;
+    }
+    let active_at = telegram_event_at(update).unwrap_or(version.observed_at);
+    batch.activity.push(TelegramActivityProjection {
+        version,
+        chat_id,
+        user_id,
+        last_message_at: Some(active_at),
+        last_active_at: Some(active_at),
+    });
 }
 
 fn aggregate_duplicate(
@@ -1194,21 +2095,28 @@ mod tests {
         collections::{BTreeMap, VecDeque},
         env,
         error::Error,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use openplotva_storage::{MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport};
+    use openplotva_config::UpdateMaterializationMode;
+    use openplotva_storage::{
+        MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport, PostgresTelegramDeliveryStore,
+        PostgresTelegramProjectionStore,
+    };
     use openplotva_updates::{
-        RawUpdateStreamEntry, RedisUpdateStream, UPDATE_STREAM_SCHEMA_VERSION, UpdateStreamId,
-        UpdateStreamMaterializerConfig,
+        RawUpdateStreamEntry, RedisUpdateStream, UPDATE_STREAM_SCHEMA_VERSION, UpdateStreamAppend,
+        UpdateStreamId, UpdateStreamMaterializerConfig, UpdateStreamSource,
     };
     use sha2::{Digest, Sha256};
+    use sqlx::postgres::PgPoolOptions;
+    use time::OffsetDateTime;
 
     use super::{
         MATERIALIZER_LEASE_RENEW_INTERVAL, MATERIALIZER_LEASE_TTL, UpdateMaterializerMetrics,
-        batch_prefix, materializer_owner_consumer_id, preprocess_batch, reclaim_idle_for_pass,
-        run_materializer_lease_heartbeat, stop_requested_now, take_batch,
-        wait_for_materializer_lease_loss,
+        UpdateMaterializerWorkerReport, UpdateProjectionMaterializerConfig, batch_prefix,
+        materialize_and_ack_batch, materializer_owner_consumer_id, preprocess_batch,
+        preprocess_batch_for_mode, reclaim_idle_for_pass, run_materializer_lease_heartbeat,
+        stop_requested_now, take_batch, wait_for_materializer_lease_loss,
     };
 
     #[tokio::test]
@@ -1303,6 +2211,157 @@ mod tests {
         let _: usize = redis::cmd("DEL")
             .arg(&key)
             .arg(&lease_key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offline_entry_stays_in_stream_until_stage_commit_then_exposes_the_accepted_loss_window()
+    -> Result<(), Box<dyn Error>> {
+        let (Ok(redis_url), Ok(postgres_dsn)) = (
+            env::var("OPENPLOTVA_TEST_REDIS_URL"),
+            env::var("OPENPLOTVA_TEST_POSTGRES_DSN"),
+        ) else {
+            return Ok(());
+        };
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let bot_id = i64::try_from(suffix % 1_000_000_000)? + 40_000;
+        let actor_id = bot_id + 1_000_000_000;
+        let user_id = bot_id + 2_000_000_000;
+        let chat_id = -(bot_id + 3_000_000_000);
+        let key = format!("openplotva:test:updates:projection-crash:{suffix}");
+        let client = redis::Client::open(redis_url)?;
+        let stream = RedisUpdateStream::with_key(client.clone(), key.clone());
+        stream.ensure_consumer_group().await?;
+        let received_at_unix_ms = i64::try_from(
+            OffsetDateTime::now_utc()
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000),
+        )?;
+        let payload = format!(
+            r#"{{"update_id":80,"chat_member":{{"chat":{{"id":{chat_id},"type":"supergroup","title":"Crash window"}},"from":{{"id":{actor_id},"is_bot":false,"first_name":"Admin"}},"date":1700000000,"old_chat_member":{{"status":"left","user":{{"id":{user_id},"is_bot":false,"first_name":"Tracked"}}}},"new_chat_member":{{"status":"member","user":{{"id":{user_id},"is_bot":false,"first_name":"Tracked"}}}}}}}}"#
+        );
+        stream
+            .append(&UpdateStreamAppend {
+                bot_id,
+                update_id: Some(80),
+                source: UpdateStreamSource::Webhook,
+                received_at_unix_ms,
+                raw_payload: payload.into_bytes(),
+            })
+            .await?;
+        let entries = stream
+            .read_group("projection-crash-test", Duration::ZERO, 1)
+            .await?;
+        assert_eq!(entries.len(), 1);
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&postgres_dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let delivery = PostgresTelegramDeliveryStore::new(pool.clone());
+        let unavailable_pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(20))
+            .connect_lazy("postgres://plotva:plotva@127.0.0.1:1/plotva")?;
+        let unavailable_projection = PostgresTelegramProjectionStore::new(unavailable_pool);
+        let projection_config = UpdateProjectionMaterializerConfig {
+            mode: UpdateMaterializationMode::Active,
+            ..UpdateProjectionMaterializerConfig::default()
+        };
+        let mut failed_flush_state =
+            super::ProjectionFlushState::new(projection_config.flush_interval);
+        let mut failed_report = UpdateMaterializerWorkerReport::default();
+        let failed_metrics = UpdateMaterializerMetrics::default();
+        let failed_stop = tokio::time::sleep(Duration::from_millis(150));
+        tokio::pin!(failed_stop);
+
+        assert!(
+            !materialize_and_ack_batch(
+                &stream,
+                &delivery,
+                &unavailable_projection,
+                bot_id,
+                &entries,
+                Duration::from_millis(50),
+                projection_config,
+                &mut failed_flush_state,
+                &mut failed_stop,
+                &mut failed_report,
+                &failed_metrics,
+            )
+            .await
+        );
+        let before_commit = stream.stats().await?;
+        assert_eq!(before_commit.length, 1);
+        assert_eq!(before_commit.group.expect("consumer group").pending, 1);
+
+        let projection = PostgresTelegramProjectionStore::new(pool.clone());
+        let mut committed_flush_state =
+            super::ProjectionFlushState::new(projection_config.flush_interval);
+        let mut committed_report = UpdateMaterializerWorkerReport::default();
+        let committed_metrics = UpdateMaterializerMetrics::default();
+        let committed_stop = std::future::pending::<()>();
+        tokio::pin!(committed_stop);
+        assert!(
+            materialize_and_ack_batch(
+                &stream,
+                &delivery,
+                &projection,
+                bot_id,
+                &entries,
+                Duration::from_secs(2),
+                projection_config,
+                &mut committed_flush_state,
+                &mut committed_stop,
+                &mut committed_report,
+                &committed_metrics,
+            )
+            .await
+        );
+        assert_eq!(stream.stats().await?.length, 0);
+        assert!(projection.stage_stats(bot_id).await?.rows > 0);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_chat_members_effective \
+                 WHERE chat_id = $1 AND user_id = $2 AND status = 'member')",
+            )
+            .bind(chat_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "DELETE FROM telegram_users_stage WHERE bot_id = $1",
+            "DELETE FROM telegram_chats_stage WHERE bot_id = $1",
+            "DELETE FROM telegram_chat_members_stage WHERE bot_id = $1",
+            "DELETE FROM telegram_activity_stage WHERE bot_id = $1",
+            "DELETE FROM telegram_files_stage WHERE bot_id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(bot_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_chat_members_effective \
+                 WHERE chat_id = $1 AND user_id = $2)",
+            )
+            .bind(chat_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?
+        );
+
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .arg(format!("{key}:materializer-lease"))
             .query_async(&mut connection)
             .await?;
         Ok(())
@@ -1518,7 +2577,313 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_mode_routes_ordinary_human_membership_only_to_deferred_projection() {
+        let payload = br#"{"update_id":50,"chat_member":{"chat":{"id":-10042,"type":"supergroup","title":"Plotva Lab"},"from":{"id":42,"is_bot":false,"first_name":"Admin"},"date":1700000000,"old_chat_member":{"status":"left","user":{"id":77,"is_bot":false,"first_name":"Tracked"}},"new_chat_member":{"status":"member","user":{"id":77,"is_bot":false,"first_name":"Tracked"}}}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[stream_entry(
+                1_700_000_000_001,
+                0,
+                50,
+                1_700_000_000_010,
+                payload,
+            )],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert!(prepared.updates.is_empty());
+        assert!(prepared.quarantine.is_empty());
+        assert!(prepared.immediate_projections.is_empty());
+        assert_eq!(prepared.deferred_projections.users.len(), 2);
+        assert_eq!(prepared.deferred_projections.chats.len(), 1);
+        assert_eq!(prepared.deferred_projections.members.len(), 1);
+        assert_eq!(
+            prepared.deferred_projections.members[0].state.status,
+            "member"
+        );
+    }
+
+    #[test]
+    fn active_mode_keeps_admin_membership_online_with_immediate_dependencies() {
+        let payload = br#"{"update_id":51,"chat_member":{"chat":{"id":-10042,"type":"supergroup","title":"Plotva Lab"},"from":{"id":42,"is_bot":false,"first_name":"Admin"},"date":1700000000,"old_chat_member":{"status":"member","user":{"id":77,"is_bot":false,"first_name":"Tracked"}},"new_chat_member":{"status":"administrator","user":{"id":77,"is_bot":false,"first_name":"Tracked"},"can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":true,"can_manage_video_chats":true,"can_restrict_members":true,"can_promote_members":true,"can_change_info":true,"can_invite_users":true}}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[stream_entry(
+                1_700_000_000_001,
+                0,
+                51,
+                1_700_000_000_010,
+                payload,
+            )],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert_eq!(prepared.updates.len(), 1);
+        assert_eq!(prepared.immediate_projections.users.len(), 2);
+        assert_eq!(prepared.immediate_projections.chats.len(), 1);
+        assert_eq!(prepared.immediate_projections.members.len(), 1);
+        assert_eq!(
+            prepared.immediate_projections.members[0].state.status,
+            "administrator"
+        );
+    }
+
+    #[test]
+    fn active_message_stays_online_while_activity_is_deferred() {
+        let payload = br#"{"update_id":52,"message":{"message_id":1,"date":1700000000,"chat":{"id":7,"type":"private","first_name":"Ada"},"from":{"id":9,"is_bot":false,"first_name":"Ada"},"text":"/checkin"}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[stream_entry(
+                1_700_000_000_001,
+                0,
+                52,
+                1_700_000_000_010,
+                payload,
+            )],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert_eq!(prepared.updates.len(), 1);
+        assert_eq!(prepared.immediate_projections.users.len(), 1);
+        assert_eq!(prepared.immediate_projections.chats.len(), 1);
+        assert_eq!(prepared.deferred_projections.activity.len(), 1);
+    }
+
+    #[test]
+    fn active_new_members_service_message_materializes_members_without_control_projection_job() {
+        let payload = br#"{"update_id":56,"message":{"message_id":3,"date":1700000000,"chat":{"id":-10042,"type":"supergroup","title":"Plotva Lab"},"from":{"id":42,"is_bot":false,"first_name":"Admin"},"new_chat_members":[{"id":77,"is_bot":false,"first_name":"Tracked"}]}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[stream_entry(
+                1_700_000_000_001,
+                0,
+                56,
+                1_700_000_000_010,
+                payload,
+            )],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert_eq!(prepared.updates.len(), 1);
+        assert_eq!(prepared.immediate_projections.users.len(), 2);
+        assert_eq!(prepared.immediate_projections.chats.len(), 1);
+        assert_eq!(prepared.immediate_projections.members.len(), 1);
+        assert_eq!(
+            prepared.immediate_projections.members[0].state.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_MEMBER
+        );
+    }
+
+    #[test]
+    fn active_unknown_payload_is_durably_quarantined_without_inbox_row() {
+        let payload = br#"{"update_id":53,"brand_new_update":{"value":1}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[stream_entry(
+                1_700_000_000_001,
+                0,
+                53,
+                1_700_000_000_010,
+                payload,
+            )],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert!(prepared.updates.is_empty());
+        assert_eq!(prepared.quarantine.len(), 1);
+        assert_eq!(prepared.quarantine[0].error_class, "unsupported_type");
+    }
+
+    #[test]
+    fn projection_reducer_keeps_one_latest_partial_state_per_key() {
+        let first = br#"{"update_id":54,"message":{"message_id":1,"date":1700000000,"chat":{"id":7,"type":"private","first_name":"Ada"},"from":{"id":9,"is_bot":false,"first_name":"Ada","username":"ada"},"text":"one"}}"#;
+        let latest = br#"{"update_id":55,"message":{"message_id":2,"date":1700000001,"chat":{"id":7,"type":"private","first_name":"Ada"},"from":{"id":9,"is_bot":false,"first_name":"Ada Lovelace"},"text":"two"}}"#;
+        let prepared = preprocess_batch_for_mode(
+            &[
+                stream_entry(1_700_000_000_001, 0, 54, 1_700_000_000_010, first),
+                stream_entry(1_700_000_000_002, 0, 55, 1_700_000_000_020, latest),
+            ],
+            123,
+            UpdateMaterializationMode::Active,
+        );
+
+        assert_eq!(prepared.immediate_projections.users.len(), 1);
+        let user = &prepared.immediate_projections.users[0];
+        assert_eq!(user.state.first_name, "Ada Lovelace");
+        assert_eq!(user.state.username.as_deref(), Some("ada"));
+        assert_eq!(user.version.stream_ms, 1_700_000_000_002);
+        assert_eq!(prepared.deferred_projections.activity.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "20k live PostgreSQL load scenario"]
+    async fn twenty_thousand_membership_updates_do_not_delay_midstream_checkin()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(postgres_dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        const MEMBERS: usize = 20_000;
+        const BATCH_ROWS: usize = 512;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let bot_id = i64::try_from(suffix % 1_000_000_000)? + 50_000;
+        let actor_id = bot_id + 1_000_000_000;
+        let first_member_id = bot_id + 2_000_000_000;
+        let membership_chat_id = -(bot_id + 3_000_000_000);
+        let checkin_chat_id = actor_id;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&postgres_dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let projection_store = PostgresTelegramProjectionStore::new(pool.clone());
+        let delivery_store = PostgresTelegramDeliveryStore::new(pool.clone());
+        let started = Instant::now();
+        let mut checkin_elapsed = None;
+
+        for chunk_start in (0..MEMBERS).step_by(BATCH_ROWS) {
+            let chunk_end = (chunk_start + BATCH_ROWS).min(MEMBERS);
+            let mut entries = Vec::with_capacity(chunk_end - chunk_start);
+            for index in chunk_start..chunk_end {
+                let user_id = first_member_id + i64::try_from(index)?;
+                let update_id = 1_000 + i64::try_from(index)?;
+                let payload = format!(
+                    r#"{{"update_id":{update_id},"chat_member":{{"chat":{{"id":{membership_chat_id},"type":"supergroup","title":"Load"}},"from":{{"id":{actor_id},"is_bot":false,"first_name":"Admin"}},"date":1700000000,"old_chat_member":{{"status":"left","user":{{"id":{user_id},"is_bot":false,"first_name":"Member"}}}},"new_chat_member":{{"status":"member","user":{{"id":{user_id},"is_bot":false,"first_name":"Member"}}}}}}}}"#
+                );
+                entries.push(stream_entry_for_bot(
+                    bot_id,
+                    1_800_000_000_000 + u64::try_from(index)?,
+                    0,
+                    update_id,
+                    1_800_000_000_000 + i64::try_from(index)?,
+                    payload.as_bytes(),
+                ));
+            }
+            let prepared =
+                preprocess_batch_for_mode(&entries, bot_id, UpdateMaterializationMode::Active);
+            assert!(prepared.updates.is_empty());
+            projection_store
+                .stage_projection_batch(&prepared.deferred_projections)
+                .await?;
+
+            if checkin_elapsed.is_none() && chunk_end >= MEMBERS / 2 {
+                let payload = format!(
+                    r#"{{"update_id":900000,"message":{{"message_id":1,"date":1700000001,"chat":{{"id":{checkin_chat_id},"type":"private","first_name":"Admin"}},"from":{{"id":{actor_id},"is_bot":false,"first_name":"Admin"}},"text":"/checkin"}}}}"#
+                );
+                let checkin = preprocess_batch_for_mode(
+                    &[stream_entry_for_bot(
+                        bot_id,
+                        1_900_000_000_000,
+                        0,
+                        900_000,
+                        1_900_000_000_000,
+                        payload.as_bytes(),
+                    )],
+                    bot_id,
+                    UpdateMaterializationMode::Active,
+                );
+                let report = delivery_store
+                    .materialize_online_batch(
+                        &checkin.updates,
+                        &checkin.quarantine,
+                        &checkin.immediate_projections,
+                    )
+                    .await?;
+                projection_store
+                    .stage_projection_batch(&checkin.deferred_projections)
+                    .await?;
+                assert_eq!(report.inserted, 1);
+                checkin_elapsed = Some(started.elapsed());
+            }
+        }
+
+        let checkin_elapsed = checkin_elapsed.expect("midstream checkin materialized");
+        println!("midstream /checkin wait: {checkin_elapsed:?}");
+        assert!(
+            checkin_elapsed < Duration::from_secs(2),
+            "midstream /checkin waited {checkin_elapsed:?}"
+        );
+        let flushed = projection_store.flush_staged_projections(bot_id).await?;
+        assert_eq!(flushed.members, MEMBERS as u64);
+        let durable_members: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM chat_members WHERE chat_id = $1")
+                .bind(membership_chat_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(durable_members, MEMBERS as i64);
+        let inbox_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM telegram_update_inbox WHERE bot_id = $1")
+                .bind(bot_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(inbox_rows, 1);
+
+        let repeated_payload = format!(
+            r#"{{"update_id":990000,"chat_member":{{"chat":{{"id":{membership_chat_id},"type":"supergroup","title":"Load"}},"from":{{"id":{actor_id},"is_bot":false,"first_name":"Admin"}},"date":1700000002,"old_chat_member":{{"status":"member","user":{{"id":{first_member_id},"is_bot":false,"first_name":"Member"}}}},"new_chat_member":{{"status":"member","user":{{"id":{first_member_id},"is_bot":false,"first_name":"Member"}}}}}}}}"#
+        );
+        let repeated = preprocess_batch_for_mode(
+            &[stream_entry_for_bot(
+                bot_id,
+                2_000_000_000_000,
+                0,
+                990_000,
+                2_000_000_000_000,
+                repeated_payload.as_bytes(),
+            )],
+            bot_id,
+            UpdateMaterializationMode::Active,
+        );
+        projection_store
+            .stage_projection_batch(&repeated.deferred_projections)
+            .await?;
+        let repeated_flush = projection_store.flush_staged_projections(bot_id).await?;
+        assert_eq!(repeated_flush.users, 0);
+        assert_eq!(repeated_flush.chats, 0);
+        assert_eq!(repeated_flush.members, 0);
+
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chat_active_users WHERE chat_id = $1")
+            .bind(checkin_chat_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chat_members WHERE chat_id = $1")
+            .bind(membership_chat_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chats WHERE id = ANY($1::bigint[])")
+            .bind(vec![membership_chat_id, checkin_chat_id])
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1 OR id BETWEEN $2 AND $3")
+            .bind(actor_id)
+            .bind(first_member_id)
+            .bind(first_member_id + i64::try_from(MEMBERS)? - 1)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     fn stream_entry(
+        stream_ms: u64,
+        stream_seq: u64,
+        update_id: i64,
+        received_at: i64,
+        payload: &[u8],
+    ) -> RawUpdateStreamEntry {
+        stream_entry_for_bot(123, stream_ms, stream_seq, update_id, received_at, payload)
+    }
+
+    fn stream_entry_for_bot(
+        bot_id: i64,
         stream_ms: u64,
         stream_seq: u64,
         update_id: i64,
@@ -1530,7 +2895,7 @@ mod tests {
             "schema_version".to_owned(),
             UPDATE_STREAM_SCHEMA_VERSION.to_string().into_bytes(),
         );
-        fields.insert("bot_id".to_owned(), b"123".to_vec());
+        fields.insert("bot_id".to_owned(), bot_id.to_string().into_bytes());
         fields.insert("update_id".to_owned(), update_id.to_string().into_bytes());
         fields.insert("source".to_owned(), b"webhook".to_vec());
         fields.insert(

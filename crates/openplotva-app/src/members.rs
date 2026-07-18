@@ -502,6 +502,7 @@ pub struct ChatMemberStateOutcome {
 pub enum MemberStateControlJobExecution {
     ChatAdminsSync,
     ChatMemberSync,
+    SupersededByProjectionMaterializer,
 }
 
 /// Result of one member-state taskman worker tick.
@@ -581,6 +582,7 @@ pub struct LeftChatMemberUpdateHandler<Store, Effects, Next> {
     effects: Arc<Effects>,
     bot_id: i64,
     next: Arc<Next>,
+    projection_state_is_authoritative: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -590,6 +592,7 @@ pub struct ChatMemberStateUpdateHandler<Store, Queue, Effects, Next> {
     effects: Arc<Effects>,
     bot_id: i64,
     next: Arc<Next>,
+    projection_state_is_authoritative: bool,
 }
 
 impl<Store, Effects, Next> LeftChatMemberUpdateHandler<Store, Effects, Next> {
@@ -600,7 +603,14 @@ impl<Store, Effects, Next> LeftChatMemberUpdateHandler<Store, Effects, Next> {
             effects,
             bot_id,
             next,
+            projection_state_is_authoritative: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_projection_state_authoritative(mut self, authoritative: bool) -> Self {
+        self.projection_state_is_authoritative = authoritative;
+        self
     }
 }
 
@@ -619,7 +629,14 @@ impl<Store, Queue, Effects, Next> ChatMemberStateUpdateHandler<Store, Queue, Eff
             effects,
             bot_id,
             next,
+            projection_state_is_authoritative: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_projection_state_authoritative(mut self, authoritative: bool) -> Self {
+        self.projection_state_is_authoritative = authoritative;
+        self
     }
 }
 
@@ -633,11 +650,12 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
-            handle_left_chat_member_update_or_else(
+            handle_left_chat_member_update_or_else_with_state_mode(
                 self.store.as_ref(),
                 self.effects.as_ref(),
                 self.bot_id,
                 update,
+                self.projection_state_is_authoritative,
                 |update| self.next.handle_update(update),
             )
             .await
@@ -658,13 +676,14 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
-            handle_chat_member_state_update_or_else_at(
+            handle_chat_member_state_update_or_else_at_with_state_mode(
                 self.store.as_ref(),
                 self.queue.as_ref(),
                 self.effects.as_ref(),
                 self.bot_id,
                 update,
                 OffsetDateTime::now_utc(),
+                self.projection_state_is_authoritative,
                 |update| self.next.handle_update(update),
             )
             .await
@@ -693,7 +712,46 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    let outcome = left_chat_member_outcome(store, effects, bot_id, &update).await;
+    handle_left_chat_member_update_or_else_with_state_mode(
+        store,
+        effects,
+        bot_id,
+        update,
+        false,
+        handle_other,
+    )
+    .await
+}
+
+async fn handle_left_chat_member_update_or_else_with_state_mode<
+    Store,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    store: &Store,
+    effects: &Effects,
+    bot_id: i64,
+    update: TelegramUpdate,
+    projection_state_is_authoritative: bool,
+    handle_other: HandleFn,
+) -> Result<LeftChatMemberUpdateRoute, LeftChatMemberUpdateError>
+where
+    Store: LeftChatMemberStore + Sync,
+    Effects: ChatCommunicationEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let outcome = left_chat_member_outcome(
+        store,
+        effects,
+        bot_id,
+        &update,
+        projection_state_is_authoritative,
+    )
+    .await;
     handle_other(update)
         .await
         .map_err(|error| LeftChatMemberUpdateError::Downstream {
@@ -730,7 +788,55 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    let outcome = chat_member_state_outcome(store, queue, effects, bot_id, &update, created).await;
+    handle_chat_member_state_update_or_else_at_with_state_mode(
+        store,
+        queue,
+        effects,
+        bot_id,
+        update,
+        created,
+        false,
+        handle_other,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_chat_member_state_update_or_else_at_with_state_mode<
+    Store,
+    Queue,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    store: &Store,
+    queue: &Queue,
+    effects: &Effects,
+    bot_id: i64,
+    update: TelegramUpdate,
+    created: OffsetDateTime,
+    projection_state_is_authoritative: bool,
+    handle_other: HandleFn,
+) -> Result<ChatMemberStateUpdateRoute, ChatMemberStateUpdateError>
+where
+    Store: ChatMemberStateStore + Sync,
+    Queue: MemberStateControlJobQueue + Sync,
+    Effects: ChatCommunicationEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let outcome = chat_member_state_outcome(
+        store,
+        queue,
+        effects,
+        bot_id,
+        &update,
+        created,
+        projection_state_is_authoritative,
+    )
+    .await;
     handle_other(update)
         .await
         .map_err(|error| ChatMemberStateUpdateError::Downstream {
@@ -750,6 +856,7 @@ async fn chat_member_state_outcome<Store, Queue, Effects>(
     bot_id: i64,
     update: &TelegramUpdate,
     created: OffsetDateTime,
+    projection_state_is_authoritative: bool,
 ) -> Option<ChatMemberStateOutcome>
 where
     Store: ChatMemberStateStore + Sync,
@@ -809,58 +916,60 @@ where
         }
     }
 
-    match store.get_chat_member(chat_id, user_id).await {
-        Ok(Some(current)) => {
-            outcome.changed = current.status != status;
+    if !projection_state_is_authoritative {
+        match store.get_chat_member(chat_id, user_id).await {
+            Ok(Some(current)) => {
+                outcome.changed = current.status != status;
+            }
+            Ok(None) => {
+                outcome.changed = true;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::debug!(
+                    message,
+                    chat_id,
+                    user_id,
+                    "failed to load current chat member"
+                );
+                outcome.changed = true;
+                outcome.load_error = Some(message);
+            }
         }
-        Ok(None) => {
-            outcome.changed = true;
-        }
-        Err(error) => {
+
+        if let Err(error) = store
+            .upsert_user_state(user_state_from_telegram_user(member.get_user()))
+            .await
+        {
             let message = error.to_string();
-            tracing::debug!(
+            tracing::warn!(
                 message,
                 chat_id,
                 user_id,
-                "failed to load current chat member"
+                "failed to upsert chat member user state"
             );
-            outcome.changed = true;
-            outcome.load_error = Some(message);
+            outcome.user_upsert_error = Some(message);
+        } else {
+            outcome.user_upserted = true;
         }
-    }
 
-    if let Err(error) = store
-        .upsert_user_state(user_state_from_telegram_user(member.get_user()))
-        .await
-    {
-        let message = error.to_string();
-        tracing::warn!(
-            message,
-            chat_id,
-            user_id,
-            "failed to upsert chat member user state"
-        );
-        outcome.user_upsert_error = Some(message);
-    } else {
-        outcome.user_upserted = true;
-    }
-
-    if let Err(error) = store
-        .upsert_chat_member(chat_member_state_upsert_from_telegram(
-            chat_id, user_id, member,
-        ))
-        .await
-    {
-        let message = error.to_string();
-        tracing::warn!(
-            message,
-            chat_id,
-            user_id,
-            "failed to upsert chat member state"
-        );
-        outcome.upsert_error = Some(message);
-    } else {
-        outcome.upserted = true;
+        if let Err(error) = store
+            .upsert_chat_member(chat_member_state_upsert_from_telegram(
+                chat_id, user_id, member,
+            ))
+            .await
+        {
+            let message = error.to_string();
+            tracing::warn!(
+                message,
+                chat_id,
+                user_id,
+                "failed to upsert chat member state"
+            );
+            outcome.upsert_error = Some(message);
+        } else {
+            outcome.upserted = true;
+        }
     }
 
     if own_member
@@ -978,10 +1087,14 @@ where
             Some(MemberStateControlJobExecution::ChatAdminsSync)
         }
         ControlKind::ChatMemberSync => {
-            effects
-                .sync_chat_member(params.chat_id, params.user_id)
-                .await;
-            Some(MemberStateControlJobExecution::ChatMemberSync)
+            tracing::info!(
+                job_id = item.id,
+                chat_id = params.chat_id,
+                user_id = params.user_id,
+                outcome = "superseded_by_projection_materializer",
+                "completed legacy chat-member sync without a Telegram API call"
+            );
+            Some(MemberStateControlJobExecution::SupersededByProjectionMaterializer)
         }
         kind => {
             let error = format!("unsupported member-state control job kind: {kind:?}");
@@ -1052,28 +1165,6 @@ fn member_state_sync_job_from_update(
             ControlJobData {
                 kind: ControlKind::ChatAdminsSync,
                 chat_type: chat_type_name(&update.chat).to_owned(),
-                ..ControlJobData::default()
-            },
-        )
-    } else if update.from.id != 0 {
-        (
-            ControlKind::ChatMemberSync,
-            "chat member sync",
-            i64::from(update.from.id),
-            user_full_name(&update.from),
-            ControlJobData {
-                kind: ControlKind::ChatMemberSync,
-                chat_type: chat_type_name(&update.chat).to_owned(),
-                user_name: update
-                    .from
-                    .username
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                first_name: update.from.first_name.clone(),
-                last_name: update.from.last_name.clone().unwrap_or_default(),
-                language_code: update.from.language_code.clone().unwrap_or_default(),
-                is_premium: update.from.is_premium.unwrap_or_default(),
                 ..ControlJobData::default()
             },
         )
@@ -1178,7 +1269,7 @@ fn apply_chat_member_state_role_permissions(
     }
 }
 
-fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
+pub(crate) fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
     UserState::new(
         user.id.into(),
         user.first_name.clone(),
@@ -1210,18 +1301,12 @@ fn chat_type_name(chat: &TelegramChat) -> &'static str {
     }
 }
 
-fn user_full_name(user: &carapax::types::User) -> String {
-    match user.last_name.as_deref().filter(|last| !last.is_empty()) {
-        Some(last_name) => format!("{} {last_name}", user.first_name),
-        None => user.first_name.clone(),
-    }
-}
-
 async fn left_chat_member_outcome<Store, Effects>(
     store: &Store,
     effects: &Effects,
     bot_id: i64,
     update: &TelegramUpdate,
+    projection_state_is_authoritative: bool,
 ) -> Option<LeftChatMemberOutcome>
 where
     Store: LeftChatMemberStore + Sync,
@@ -1255,41 +1340,43 @@ where
         outcome.disable_error = Some(message);
     }
 
-    if let Err(error) = store
-        .upsert_user_state(user_state_from_telegram_user(user))
-        .await
-    {
-        let message = error.to_string();
-        tracing::warn!(
-            message,
+    if !projection_state_is_authoritative {
+        if let Err(error) = store
+            .upsert_user_state(user_state_from_telegram_user(user))
+            .await
+        {
+            let message = error.to_string();
+            tracing::warn!(
+                message,
+                chat_id,
+                user_id,
+                "failed to persist departed Telegram user"
+            );
+            outcome.user_upsert_error = Some(message);
+        } else {
+            outcome.user_upserted = true;
+        }
+        let member = ChatMemberUpsert {
             chat_id,
             user_id,
-            "failed to persist departed Telegram user"
-        );
-        outcome.user_upsert_error = Some(message);
-    } else {
-        outcome.user_upserted = true;
-    }
-    let member = ChatMemberUpsert {
-        chat_id,
-        user_id,
-        status: openplotva_storage::CHAT_MEMBER_STATUS_LEFT.to_owned(),
-        is_member: Some(false),
-        is_anonymous: Some(false),
-        can_be_edited: Some(false),
-        ..ChatMemberUpsert::default()
-    };
-    if let Err(error) = store.upsert_chat_member(member).await {
-        let message = error.to_string();
-        tracing::warn!(
-            message,
-            chat_id,
-            user_id,
-            "failed to persist left chat member"
-        );
-        outcome.member_upsert_error = Some(message);
-    } else {
-        outcome.member_upserted = true;
+            status: openplotva_storage::CHAT_MEMBER_STATUS_LEFT.to_owned(),
+            is_member: Some(false),
+            is_anonymous: Some(false),
+            can_be_edited: Some(false),
+            ..ChatMemberUpsert::default()
+        };
+        if let Err(error) = store.upsert_chat_member(member).await {
+            let message = error.to_string();
+            tracing::warn!(
+                message,
+                chat_id,
+                user_id,
+                "failed to persist left chat member"
+            );
+            outcome.member_upsert_error = Some(message);
+        } else {
+            outcome.member_upserted = true;
+        }
     }
     Some(outcome)
 }
@@ -1389,8 +1476,9 @@ mod tests {
         ChatCommunicationEffects, ChatCommunicationFuture, ChatMemberStateStore,
         ChatMemberStateUpdateHandler, ChatMemberStateUpdateRoute, ChatSettingsCommunicationEffects,
         LeftChatMemberStore, LeftChatMemberUpdateHandler, LeftChatMemberUpdateRoute,
-        MemberStateControlJobEffects, MemberStateControlJobQueue, MemberStateControlJobQueueFuture,
-        MemberStoreFuture, STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL, STALE_INACTIVE_MEMBER_MAX_AGE,
+        MemberStateControlJobEffects, MemberStateControlJobExecution, MemberStateControlJobQueue,
+        MemberStateControlJobQueueFuture, MemberStoreFuture,
+        STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL, STALE_INACTIVE_MEMBER_MAX_AGE,
         StaleInactiveMemberCleanupFuture, StaleInactiveMemberCleanupStore,
         handle_chat_member_state_update_or_else_at, handle_left_chat_member_update_or_else,
         process_member_state_control_job_once_at,
@@ -1496,7 +1584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_state_control_worker_skips_other_jobs_and_syncs_admins_then_member()
+    async fn member_state_control_worker_skips_other_jobs_and_supersedes_legacy_member_sync()
     -> Result<(), Box<dyn Error>> {
         let queue = InMemoryPaymentControlJobQueue::new();
         let effects = MemberStateSyncEffectsStub::default();
@@ -1522,8 +1610,12 @@ mod tests {
         assert!(admins_report.completed);
         assert_eq!(member_report.job_id, Some(3));
         assert!(member_report.completed);
+        assert_eq!(
+            member_report.execution,
+            Some(MemberStateControlJobExecution::SupersededByProjectionMaterializer)
+        );
         assert_eq!(effects.admin_syncs(), vec![-10042]);
-        assert_eq!(effects.member_syncs(), vec![(-10042, 42)]);
+        assert!(effects.member_syncs().is_empty());
         let snapshot = queue.snapshot();
         assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
         assert_eq!(
@@ -1705,7 +1797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_member_state_update_upserts_member_and_queues_actor_sync()
+    async fn chat_member_state_update_upserts_member_without_per_user_sync_job()
     -> Result<(), Box<dyn Error>> {
         let store = MemberStoreStub::default();
         let queue = MemberStateControlJobQueueStub::default();
@@ -1732,7 +1824,7 @@ mod tests {
         assert!(outcome.changed);
         assert!(outcome.user_upserted);
         assert!(outcome.upserted);
-        assert_eq!(outcome.queued_job, Some(ControlKind::ChatMemberSync));
+        assert_eq!(outcome.queued_job, None);
         assert_eq!(
             store.users(),
             vec![UserState::new(
@@ -1749,18 +1841,7 @@ mod tests {
         assert!(effects.disabled().is_empty());
         assert_eq!(next.calls(), vec![2468]);
 
-        let jobs = queue.jobs();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].title, "chat member sync");
-        let telegram = jobs[0].data.telegram_data.as_ref().expect("telegram data");
-        assert_eq!(telegram.chat_id, -10042);
-        assert_eq!(telegram.message_id, 0);
-        assert_eq!(telegram.user_id, 42);
-        assert_eq!(telegram.user_full_name, "Admin Actor");
-        let control = jobs[0].data.control_data.as_ref().expect("control data");
-        assert_eq!(control.kind, ControlKind::ChatMemberSync);
-        assert_eq!(control.chat_type, "supergroup");
-        assert_eq!(control.user_name, "actor");
+        assert!(queue.jobs().is_empty());
         Ok(())
     }
 

@@ -91,6 +91,15 @@ pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS: i32 = 50;
 
 pub const DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS: i32 = 5_000;
 
+pub const DEFAULT_UPDATE_MATERIALIZATION_MODE: UpdateMaterializationMode =
+    UpdateMaterializationMode::Legacy;
+
+pub const DEFAULT_UPDATE_PROJECTION_FLUSH_INTERVAL_MS: i32 = 10_000;
+
+pub const DEFAULT_UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS: usize = 10_000;
+
+pub const DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS: usize = 1_000_000;
+
 pub const DEFAULT_CONNECT_SERVICES: bool = true;
 
 pub const DEFAULT_RUN_MIGRATIONS: bool = false;
@@ -458,6 +467,35 @@ pub struct UpdateQueueConfig {
     pub materializer_batch_max_wait_ms: i32,
     /// Timeout for the complete Postgres bulk transaction.
     pub materializer_db_timeout_ms: i32,
+    /// Hybrid state materialization rollout mode.
+    pub materialization_mode: UpdateMaterializationMode,
+    /// Maximum time staged projections remain UNLOGGED before durable flush.
+    pub projection_flush_interval_ms: i32,
+    /// Staged mutations that trigger an early durable flush.
+    pub projection_flush_max_mutations: usize,
+    /// Dirty-row ceiling beyond which offline Stream entries remain unacked.
+    pub projection_stage_hard_limit_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMaterializationMode {
+    #[default]
+    Legacy,
+    Shadow,
+    Active,
+}
+
+impl UpdateMaterializationMode {
+    #[must_use]
+    pub const fn stages_projections(self) -> bool {
+        matches!(self, Self::Shadow | Self::Active)
+    }
+
+    #[must_use]
+    pub const fn projection_is_authoritative(self) -> bool {
+        matches!(self, Self::Active)
+    }
 }
 
 /// Postgres configuration.
@@ -1048,6 +1086,14 @@ pub struct RawConfig {
     pub update_materializer_batch_max_wait_ms: Option<String>,
     /// `UPDATE_MATERIALIZER_DB_TIMEOUT_MS`.
     pub update_materializer_db_timeout_ms: Option<String>,
+    /// `UPDATE_MATERIALIZATION_MODE`.
+    pub update_materialization_mode: Option<String>,
+    /// `UPDATE_PROJECTION_FLUSH_INTERVAL_MS`.
+    pub update_projection_flush_interval_ms: Option<String>,
+    /// `UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS`.
+    pub update_projection_flush_max_mutations: Option<String>,
+    /// `UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS`.
+    pub update_projection_stage_hard_limit_rows: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
     /// `BOT_API_BASE_URL`.
@@ -1595,6 +1641,10 @@ pub enum ConfigError {
     PersistentQueueFallbackWatermarkRange,
     #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected stream")]
     InvalidUpdateQueueBackend { value: String },
+    #[error(
+        "invalid UPDATE_MATERIALIZATION_MODE value {value:?}: expected legacy, shadow, or active"
+    )]
+    InvalidUpdateMaterializationMode { value: String },
 }
 
 impl AppConfig {
@@ -2136,6 +2186,38 @@ impl AppConfig {
                         raw.update_materializer_db_timeout_ms,
                         DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS,
                     )?,
+                )?,
+                materialization_mode: parse_update_materialization_mode(
+                    raw.update_materialization_mode,
+                )?,
+                projection_flush_interval_ms: validate_positive_i32_returning_at_most(
+                    "UPDATE_PROJECTION_FLUSH_INTERVAL_MS",
+                    parse_i32(
+                        "UPDATE_PROJECTION_FLUSH_INTERVAL_MS",
+                        raw.update_projection_flush_interval_ms,
+                        DEFAULT_UPDATE_PROJECTION_FLUSH_INTERVAL_MS,
+                    )?,
+                    60_000,
+                )?,
+                projection_flush_max_mutations: validate_usize_range(
+                    "UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS",
+                    parse_usize(
+                        "UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS",
+                        raw.update_projection_flush_max_mutations,
+                        DEFAULT_UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS,
+                    )?,
+                    1,
+                    100_000,
+                )?,
+                projection_stage_hard_limit_rows: validate_usize_range(
+                    "UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS",
+                    parse_usize(
+                        "UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS",
+                        raw.update_projection_stage_hard_limit_rows,
+                        DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS,
+                    )?,
+                    1,
+                    10_000_000,
                 )?,
             },
             bot: BotConfig {
@@ -2926,6 +3008,10 @@ impl RawConfig {
             update_materializer_batch_max_bytes: env("UPDATE_MATERIALIZER_BATCH_MAX_BYTES"),
             update_materializer_batch_max_wait_ms: env("UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS"),
             update_materializer_db_timeout_ms: env("UPDATE_MATERIALIZER_DB_TIMEOUT_MS"),
+            update_materialization_mode: env("UPDATE_MATERIALIZATION_MODE"),
+            update_projection_flush_interval_ms: env("UPDATE_PROJECTION_FLUSH_INTERVAL_MS"),
+            update_projection_flush_max_mutations: env("UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS"),
+            update_projection_stage_hard_limit_rows: env("UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS"),
             bot_key: env("BOT_KEY"),
             bot_api_base_url: env("BOT_API_BASE_URL"),
             bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),
@@ -3320,6 +3406,24 @@ fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigErr
     }
 }
 
+fn parse_update_materialization_mode(
+    value: Option<String>,
+) -> Result<UpdateMaterializationMode, ConfigError> {
+    let value = parse_scalar_value(value)
+        .unwrap_or_else(|| match DEFAULT_UPDATE_MATERIALIZATION_MODE {
+            UpdateMaterializationMode::Legacy => "legacy".to_owned(),
+            UpdateMaterializationMode::Shadow => "shadow".to_owned(),
+            UpdateMaterializationMode::Active => "active".to_owned(),
+        })
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "legacy" => Ok(UpdateMaterializationMode::Legacy),
+        "shadow" => Ok(UpdateMaterializationMode::Shadow),
+        "active" => Ok(UpdateMaterializationMode::Active),
+        _ => Err(ConfigError::InvalidUpdateMaterializationMode { value }),
+    }
+}
+
 fn parse_scalar_value(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -3592,9 +3696,11 @@ mod tests {
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
         DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED,
         DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS,
-        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES,
-        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS,
-        DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS, DEFAULT_UPDATE_QUEUE_BACKEND,
+        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, DEFAULT_UPDATE_MATERIALIZATION_MODE,
+        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS,
+        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS, DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS,
+        DEFAULT_UPDATE_PROJECTION_FLUSH_INTERVAL_MS, DEFAULT_UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS,
+        DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS, DEFAULT_UPDATE_QUEUE_BACKEND,
         DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS,
         DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT,
         DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, RawConfig,
@@ -3658,6 +3764,22 @@ mod tests {
         assert_eq!(
             config.update_queue.materializer_db_timeout_ms,
             DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.update_queue.materialization_mode,
+            DEFAULT_UPDATE_MATERIALIZATION_MODE
+        );
+        assert_eq!(
+            config.update_queue.projection_flush_interval_ms,
+            DEFAULT_UPDATE_PROJECTION_FLUSH_INTERVAL_MS
+        );
+        assert_eq!(
+            config.update_queue.projection_flush_max_mutations,
+            DEFAULT_UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS
+        );
+        assert_eq!(
+            config.update_queue.projection_stage_hard_limit_rows,
+            DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS
         );
         assert_eq!(config.translation.deepl.key, "");
         assert_eq!(config.translation.deepl.url, "");
@@ -4916,6 +5038,10 @@ mod tests {
             update_materializer_batch_max_bytes: Some((32 * 1024 * 1024).to_string()),
             update_materializer_batch_max_wait_ms: Some("1000".to_owned()),
             update_materializer_db_timeout_ms: Some("7000".to_owned()),
+            update_materialization_mode: Some("active".to_owned()),
+            update_projection_flush_interval_ms: Some("15000".to_owned()),
+            update_projection_flush_max_mutations: Some("20000".to_owned()),
+            update_projection_stage_hard_limit_rows: Some("2000000".to_owned()),
             ..RawConfig::default()
         })?;
         assert_eq!(
@@ -4929,6 +5055,16 @@ mod tests {
         );
         assert_eq!(config.update_queue.materializer_batch_max_wait_ms, 1000);
         assert_eq!(config.update_queue.materializer_db_timeout_ms, 7000);
+        assert_eq!(
+            config.update_queue.materialization_mode,
+            super::UpdateMaterializationMode::Active
+        );
+        assert_eq!(config.update_queue.projection_flush_interval_ms, 15_000);
+        assert_eq!(config.update_queue.projection_flush_max_mutations, 20_000);
+        assert_eq!(
+            config.update_queue.projection_stage_hard_limit_rows,
+            2_000_000
+        );
 
         let error = AppConfig::from_raw(RawConfig {
             update_materializer_batch_max_rows: Some("1001".to_owned()),
@@ -4954,6 +5090,16 @@ mod tests {
                 name: "UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS",
                 ..
             })
+        ));
+
+        let error = AppConfig::from_raw(RawConfig {
+            update_materialization_mode: Some("memory".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::InvalidUpdateMaterializationMode { .. })
         ));
         Ok(())
     }

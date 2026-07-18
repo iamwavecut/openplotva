@@ -323,7 +323,8 @@ queueing glue).
 | `runtime_routing.rs` | `RoutingEventReporter` (ring + Postgres + admin paging with cooldown suppression) |
 | `task_queue.rs` | `SharedTaskQueueRuntime`: buffered WAL journal + 7 background workers (heartbeat/recovery/cleanup/db-sync/stuck/placeholder) |
 | `message_gate.rs` | Pre-route decorator chain (rate-limit → permission → blocked-chat, fail-open) |
-| `control_jobs.rs` | Unified control-job worker (payments/settings/translate/member-sync/checkin), per-kind timeouts |
+| `control_jobs.rs` | Unified control-job worker (payments/settings/translate/admin-sync/checkin); legacy member-sync jobs complete as projection-superseded |
+| `update_materializer.rs` | Redis Stream microbatch router: online inbox transaction, UNLOGGED state staging, 10s durable flush, ACK+XDEL fencing |
 | `permissions.rs` / `rate_limits.rs` | Cached policies (30min TTL, fail-open), per-window enqueue throttle |
 | `runtime_api.rs` / `runtime_sql.rs` / `runtime_entities.rs` / `runtime_taskman.rs` / `runtime_safety.rs` / `runtime_analytics_overview.rs` / `runtime_updates.rs` / `runtime_cache.rs` / `runtime_dispatcher.rs` / `runtime_retention.rs` | GraphQL/runtime-API inspector adapters over live state + Postgres |
 | `runtime_llm.rs` | `RuntimeLlmObserver` (single chokepoint → ring + Postgres recorder + run buffer); provider canonicalization from model name; cleanup/scrub workers |
@@ -404,6 +405,12 @@ reader (`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`) over the 6 routing
 tables + admin CRUD + audit feed + AES-GCM sealed provider keys. Memory
 retrieval uses RRF fusion (1/(K+rank+1)) + type boost. Bitemporal columns on
 `memory_cards` (`recorded_at`/`retracted_at`) support point-in-time replay.
+Telegram ingestion uses fixed prepared `UNNEST` statements: online events
+atomically upsert immediate dependencies with inbox/quarantine rows, while
+state-only updates coalesce in five UNLOGGED stage tables. All identity/member/
+activity/file reads use `telegram_*_effective` views, which overlay the newest
+staged value through predicate-pushable indexed joins before the 10s durable
+flush.
 **Memory consolidation methods** *(2026-07-06, PR #15, not deployed)*: `update_card_text` / `reinforce_card` / `demote_card` (in-place op-set), `archive_expired_cards` (soft-delete: `status='expired'` + `retracted_at`), `collapse_duplicate_cards` (groups by `lower(btrim(fact_text))`, per-group transaction, sums `observation_count`). `memory_cards.expires_at` (mig 152) bound on upsert via `GREATEST` (durability promotion clears prior TTL); all retrieval queries filter `expires_at IS NULL OR expires_at > now()`.
 
 #### `openplotva-media`
@@ -636,9 +643,9 @@ flowchart LR
 ## Schema Overview
 
 Postgres 17 + pgvector (`vector(512)` for memory/shield, `vector(1024)` legacy)
-+ pg_trgm. 153 migrations (`0_init` → `152`). Core table groups:
++ pg_trgm. 177 migrations (`0_init` → `176`). Core table groups:
 
-- **Identity**: `chats`, `users`, `chat_members`, `chat_permissions`, `chat_deputies`, `chat_active_users`, `vip_cache`.
+- **Identity**: `chats`, `users`, `chat_members`, `chat_permissions`, `chat_deputies`, `chat_active_users`, `vip_cache`; five `telegram_*_stage` UNLOGGED projections and matching `telegram_*_effective` overlay views.
 - **Per-chat config**: `chat_settings` (persona/mood/reactivity/feature flags/daily game/greeting), `user_settings`, `app_settings` (KV).
 - **Payments**: `subscriptions`, `donations`, `vip_events` (canonical ledger, immutable `vip_compute_effective_expires` + `vip_create_event`), `runtime_api_tokens`.
 - **Memory**: `memory_cards` (bitemporal: `recorded_at`/`retracted_at`, status active/superseded/deleted/competing/**expired**, `conflict_group`, `expires_at` TTL — mig 152, not deployed), `memory_episodes`, `memory_sources`, `memory_links`, `memory_runs` (lease-based queue; `prompt_version`-gated claiming).

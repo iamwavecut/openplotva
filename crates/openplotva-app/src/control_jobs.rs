@@ -275,11 +275,14 @@ where
                     ))
                 }
                 ControlKind::ChatMemberSync => {
-                    self.member_effects
-                        .sync_chat_member(params.chat_id, params.user_id)
-                        .await;
+                    tracing::info!(
+                        chat_id = params.chat_id,
+                        user_id = params.user_id,
+                        outcome = "superseded_by_projection_materializer",
+                        "completed legacy chat-member sync without a Telegram API call"
+                    );
                     ControlJobExecutionResult::Completed(ControlJobExecution::MemberState(
-                        MemberStateControlJobExecution::ChatMemberSync,
+                        MemberStateControlJobExecution::SupersededByProjectionMaterializer,
                     ))
                 }
                 ControlKind::Checkin => match self.checkin_effects.run_checkin_game(params).await {

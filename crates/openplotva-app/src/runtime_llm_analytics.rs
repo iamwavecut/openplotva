@@ -75,7 +75,7 @@ SELECT
     c.username,
     COALESCE(SUM(CASE WHEN e.is_rollup THEN e.request_count ELSE 1 END), 0)::int AS request_count
 FROM llm_request_events e
-LEFT JOIN chats c ON c.id = e.chat_id
+LEFT JOIN telegram_chats_effective c ON c.id = e.chat_id
 WHERE e.created_at >= $1
   AND (NOT e.is_rollup OR e.rollup_granularity = 'hour')
 GROUP BY e.chat_id, c.title, c.username

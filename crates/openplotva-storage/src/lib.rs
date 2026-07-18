@@ -40,6 +40,7 @@ use tokio::sync::OnceCell;
 pub mod llm_routing;
 pub mod telegram_delivery;
 pub mod telegram_outbox;
+pub mod telegram_projection;
 
 pub use telegram_delivery::{
     ClaimedTelegramUpdate, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
@@ -56,6 +57,12 @@ pub use telegram_outbox::{
     TelegramOutboxBatchInput, TelegramOutboxBlobInput, TelegramOutboxItem, TelegramOutboxPartInput,
     TelegramOutboxRecoveryReport, TelegramOutboxStats, TelegramReceiptHistoryEntry,
     deterministic_telegram_operation_id, enqueue_telegram_outbox_batch,
+};
+pub use telegram_projection::{
+    PostgresTelegramProjectionStore, TelegramActivityProjection, TelegramChatMemberProjection,
+    TelegramChatProjection, TelegramFileProjection, TelegramProjectionBatch,
+    TelegramProjectionFlushReport, TelegramProjectionStageStats, TelegramProjectionVersion,
+    TelegramUserProjection,
 };
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -664,16 +671,16 @@ fn memory_cursor_after_at(value: OffsetDateTime) -> OffsetDateTime {
     }
 }
 
-pub const SQL_UPSERT_USER: &str = "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), updated = CURRENT_TIMESTAMP";
+pub const SQL_UPSERT_USER: &str = "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), telegram_observed_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP";
 
-pub const SQL_GET_USER: &str = "SELECT id, first_name, last_name, username, language_code, is_premium FROM users WHERE id = $1";
+pub const SQL_GET_USER: &str = "SELECT id, first_name, last_name, username, language_code, is_premium FROM telegram_users_effective WHERE id = $1";
 
-pub const SQL_LIST_USERS_BY_IDS: &str = "SELECT id, first_name, last_name, username, language_code, is_premium FROM users WHERE id = ANY($1::bigint[])";
+pub const SQL_LIST_USERS_BY_IDS: &str = "SELECT id, first_name, last_name, username, language_code, is_premium FROM telegram_users_effective WHERE id = ANY($1::bigint[])";
 
-pub const SQL_SEARCH_CHAT_MEMBER_CANDIDATES: &str = "SELECT u.id, u.first_name, u.last_name, u.username, cm.status, cm.last_message_at, cm.updated_at FROM chat_members cm JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = $1 AND cm.status IN ('creator', 'administrator', 'member') AND ($2 = '' OR LOWER(COALESCE(u.username, '')) LIKE '%' || LOWER($2) || '%' OR LOWER(u.first_name) LIKE '%' || LOWER($2) || '%' OR LOWER(COALESCE(u.last_name, '')) LIKE '%' || LOWER($2) || '%') ORDER BY cm.last_message_at DESC NULLS LAST, cm.updated_at DESC, u.id LIMIT $3";
+pub const SQL_SEARCH_CHAT_MEMBER_CANDIDATES: &str = "SELECT u.id, u.first_name, u.last_name, u.username, cm.status, cm.last_message_at, cm.updated_at FROM telegram_chat_members_effective cm JOIN telegram_users_effective u ON u.id = cm.user_id WHERE cm.chat_id = $1 AND cm.status IN ('creator', 'administrator', 'member') AND ($2 = '' OR LOWER(COALESCE(u.username, '')) LIKE '%' || LOWER($2) || '%' OR LOWER(u.first_name) LIKE '%' || LOWER($2) || '%' OR LOWER(COALESCE(u.last_name, '')) LIKE '%' || LOWER($2) || '%') ORDER BY cm.last_message_at DESC NULLS LAST, cm.updated_at DESC, u.id LIMIT $3";
 
 pub const SQL_GET_USER_ID_BY_USERNAME: &str =
-    "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1";
+    "SELECT id FROM telegram_users_effective WHERE lower(username) = lower($1) LIMIT 1";
 
 pub const SQL_CREATE_RUNTIME_API_TOKEN: &str =
     "INSERT INTO runtime_api_tokens (id, token_hash) VALUES ($1, $2) RETURNING *";
@@ -753,26 +760,26 @@ ORDER BY occurred_at ASC,
          entry_id ASC
 LIMIT $2"#;
 
-pub const SQL_UPSERT_CHAT: &str = "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP";
+pub const SQL_UPSERT_CHAT: &str = "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), telegram_observed_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP";
 
-pub const SQL_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
+pub const SQL_GET_CHAT_TYPE: &str = "SELECT type FROM telegram_chats_effective WHERE id = $1";
 
-pub const SQL_GET_CHAT_STATE: &str =
-    "SELECT id, type, title, username, first_name, last_name, is_forum FROM chats WHERE id = $1";
+pub const SQL_GET_CHAT_STATE: &str = "SELECT id, type, title, username, first_name, last_name, is_forum FROM telegram_chats_effective WHERE id = $1";
 
-pub const SQL_LIST_USER_CHATS: &str = "SELECT c.id, c.type, c.title, c.username, c.first_name, c.last_name, c.is_forum FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = $1";
+pub const SQL_LIST_USER_CHATS: &str = "SELECT c.id, c.type, c.title, c.username, c.first_name, c.last_name, c.is_forum FROM telegram_chats_effective c JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id WHERE cm.user_id = $1";
 
-pub const SQL_GET_DIALOG_MEMORY_CHAT_META: &str = "SELECT type, username, COALESCE(active_usernames::text, '') AS active_usernames FROM chats WHERE id = $1";
+pub const SQL_GET_DIALOG_MEMORY_CHAT_META: &str = "SELECT type, username, COALESCE(active_usernames::text, '') AS active_usernames FROM telegram_chats_effective WHERE id = $1";
 
 pub const SQL_GET_CHAT_MEMBER: &str =
-    "SELECT * FROM chat_members WHERE chat_id = $1 AND user_id = $2";
+    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = $2";
 
-pub const SQL_LIST_CHAT_MEMBERS: &str = "SELECT * FROM chat_members WHERE chat_id = $1";
+pub const SQL_LIST_CHAT_MEMBERS: &str =
+    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1";
 
-pub const SQL_LIST_CHAT_MEMBERS_BY_USER_IDS: &str =
-    "SELECT * FROM chat_members WHERE chat_id = $1 AND user_id = ANY($2::bigint[])";
+pub const SQL_LIST_CHAT_MEMBERS_BY_USER_IDS: &str = "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = ANY($2::bigint[])";
 
-pub const SQL_LIST_USER_CHAT_MEMBERSHIPS: &str = "SELECT * FROM chat_members WHERE user_id = $1";
+pub const SQL_LIST_USER_CHAT_MEMBERSHIPS: &str =
+    "SELECT * FROM telegram_chat_members_effective WHERE user_id = $1";
 
 pub const SQL_LIST_CHAT_DEPUTY_IDS: &str =
     "SELECT user_id FROM chat_deputies WHERE chat_id = $1 ORDER BY user_id";
@@ -790,7 +797,7 @@ pub const SQL_DELETE_CHAT_MEMBER: &str =
 pub const SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS: &str =
     "DELETE FROM chat_members WHERE status IN ('left', 'kicked') AND updated_at < $1";
 
-pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_member, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_member = COALESCE(EXCLUDED.is_member, chat_members.is_member), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
+pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_member, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_member = COALESCE(EXCLUDED.is_member, chat_members.is_member), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), telegram_observed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP";
 
 pub const SQL_UPDATE_MEMBER_LAST_MESSAGE: &str = "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2";
 
@@ -800,17 +807,17 @@ pub const SQL_UPSERT_CHAT_ACTIVE_USER: &str = "INSERT INTO chat_active_users (ch
 
 pub const SQL_UPSERT_CHAT_ACTIVE_USERS: &str = "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) SELECT input.chat_id, input.user_id, CURRENT_TIMESTAMP FROM unnest($1::bigint[], $2::bigint[]) AS input(chat_id, user_id) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP";
 
-pub const SQL_LIST_ACTIVE_PARTICIPANTS: &str = "SELECT user_id FROM chat_members WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2";
+pub const SQL_LIST_ACTIVE_PARTICIPANTS: &str = "SELECT user_id FROM telegram_chat_members_effective WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2";
 
-pub const SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE: &str = "SELECT user_id FROM chat_active_users WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2";
+pub const SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE: &str = "SELECT user_id FROM telegram_chat_active_users_effective WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2";
 
-pub const SQL_UPSERT_TELEGRAM_FILE_METADATA: &str = "INSERT INTO telegram_files (file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) ON CONFLICT (file_unique_id) DO UPDATE SET latest_file_id = EXCLUDED.latest_file_id, media_kind = EXCLUDED.media_kind, mime_type = COALESCE(EXCLUDED.mime_type, telegram_files.mime_type), width = COALESCE(EXCLUDED.width, telegram_files.width), height = COALESCE(EXCLUDED.height, telegram_files.height), file_size = COALESCE(EXCLUDED.file_size, telegram_files.file_size), last_seen_chat_id = EXCLUDED.last_seen_chat_id, last_seen_message_id = EXCLUDED.last_seen_message_id, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_UPSERT_TELEGRAM_FILE_METADATA: &str = "INSERT INTO telegram_files (file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (file_unique_id) DO UPDATE SET latest_file_id = EXCLUDED.latest_file_id, media_kind = EXCLUDED.media_kind, mime_type = COALESCE(EXCLUDED.mime_type, telegram_files.mime_type), width = COALESCE(EXCLUDED.width, telegram_files.width), height = COALESCE(EXCLUDED.height, telegram_files.height), file_size = COALESCE(EXCLUDED.file_size, telegram_files.file_size), last_seen_chat_id = EXCLUDED.last_seen_chat_id, last_seen_message_id = EXCLUDED.last_seen_message_id, last_seen_at = CURRENT_TIMESTAMP, telegram_observed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_GET_TELEGRAM_FILE: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = $1 LIMIT 1";
+pub const SQL_GET_TELEGRAM_FILE: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files_effective WHERE file_unique_id = $1 LIMIT 1";
 
-pub const SQL_LIST_TELEGRAM_FILES_BY_UNIQUE_IDS: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = ANY($1::text[])";
+pub const SQL_LIST_TELEGRAM_FILES_BY_UNIQUE_IDS: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files_effective WHERE file_unique_id = ANY($1::text[])";
 
-pub const SQL_GET_TELEGRAM_FILE_BY_LATEST_FILE_ID: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE latest_file_id = $1 ORDER BY last_seen_at DESC LIMIT 1";
+pub const SQL_GET_TELEGRAM_FILE_BY_LATEST_FILE_ID: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files_effective WHERE latest_file_id = $1 ORDER BY last_seen_at DESC LIMIT 1";
 
 pub const SQL_UPDATE_TELEGRAM_FILE_VISION: &str = "UPDATE telegram_files SET vision_status = $2, vision_caption = COALESCE($3, vision_caption), vision_model = COALESCE($4, vision_model), vision_latency_ms = COALESCE($5, vision_latency_ms), recognition_requested_at = COALESCE($6, recognition_requested_at), recognition_completed_at = COALESCE($7, recognition_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
@@ -818,7 +825,8 @@ pub const SQL_UPDATE_TELEGRAM_FILE_ASR: &str = "UPDATE telegram_files SET asr_st
 
 pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_fallback_used = NULL, asr_chunks = NULL, asr_warnings = NULL, asr_error = NULL, asr_requested_at = $2, updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status NOT IN ('completed', 'unavailable') AND (asr_status <> 'processing' OR asr_requested_at IS NULL OR asr_requested_at < ($2 - INTERVAL '10 minutes')) RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_GET_CHAT_DISCOVERED: &str = "SELECT discovered FROM chats WHERE id = $1";
+pub const SQL_GET_CHAT_DISCOVERED: &str =
+    "SELECT discovered FROM telegram_chats_effective WHERE id = $1";
 
 pub const SQL_RECORD_CHAT_DAILY_WINNER: &str = "INSERT INTO chat_game_results (chat_id, user_id, theme) VALUES ($1, $2, $3) RETURNING id, chat_id, user_id, theme, won_at, won_on_date";
 
@@ -826,7 +834,7 @@ pub const SQL_GET_TODAY_CHAT_WINNER: &str = "SELECT id, chat_id, user_id, theme,
 
 pub const SQL_INCREMENT_CHAT_GAME_WIN: &str = "INSERT INTO chat_game_stats (chat_id, user_id, wins_count, last_win_at) VALUES ($1, $2, 1, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET wins_count = chat_game_stats.wins_count + 1, last_win_at = CURRENT_TIMESTAMP";
 
-pub const SQL_GET_YEARLY_TOP: &str = "SELECT u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium, COUNT(*)::int AS wins_count, MAX(r.won_at) AS last_win_at FROM chat_game_results r JOIN users u ON u.id = r.user_id WHERE r.chat_id = $1 AND r.won_at >= date_trunc('year', CURRENT_DATE) GROUP BY u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium ORDER BY wins_count DESC, last_win_at DESC LIMIT $2";
+pub const SQL_GET_YEARLY_TOP: &str = "SELECT u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium, COUNT(*)::int AS wins_count, MAX(r.won_at) AS last_win_at FROM chat_game_results r JOIN telegram_users_effective u ON u.id = r.user_id WHERE r.chat_id = $1 AND r.won_at >= date_trunc('year', CURRENT_DATE) GROUP BY u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium ORDER BY wins_count DESC, last_win_at DESC LIMIT $2";
 
 pub const SQL_GET_CHAT_SETTINGS: &str = "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1";
 
@@ -871,7 +879,7 @@ pub const SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS: &str =
 pub const SQL_DELETE_OLD_TELEGRAM_FILES_BATCH: &str = r#"
 WITH doomed AS (
     SELECT file_unique_id
-    FROM telegram_files
+    FROM telegram_files_effective
     WHERE last_seen_at < now() - ($1::int * interval '1 day')
     ORDER BY last_seen_at ASC
     LIMIT $2
@@ -1213,7 +1221,7 @@ pub const SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS: &str = r#"WITH grouped_windows AS (
         LEAST(date_trunc('hour', h.occurred_at) + interval '1 hour', $3::timestamptz) AS range_end_at,
         count(*)::int AS message_count
     FROM chat_history_entries h
-    LEFT JOIN chats c ON c.id = h.chat_id
+    LEFT JOIN telegram_chats_effective c ON c.id = h.chat_id
     WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
       AND h.bucket_day < $3::timestamptz::date
       AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
@@ -1301,7 +1309,7 @@ pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
         date_trunc('hour', h.occurred_at) AS range_start_at,
         count(*)::int AS message_count
     FROM chat_history_entries h
-    LEFT JOIN chats c ON c.id = h.chat_id
+    LEFT JOIN telegram_chats_effective c ON c.id = h.chat_id
     WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
       AND h.bucket_day < $3::timestamptz::date
       AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
@@ -1338,7 +1346,7 @@ pub const SQL_SKIP_SUPERSEDED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status
 
 pub const SQL_SELECT_MEMORY_RUN_MESSAGES: &str = r#"SELECT e.payload::text AS payload
 FROM chat_history_entries AS e
-LEFT JOIN chats c ON c.id = e.chat_id
+LEFT JOIN telegram_chats_effective c ON c.id = e.chat_id
 WHERE e.chat_id = $1
   AND CASE
         WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0 THEN e.thread_id
@@ -1364,7 +1372,7 @@ pub const SQL_LIST_VISIBLE_MEMORY_CARDS: &str = "SELECT id, visibility, card_typ
 
 pub const SQL_LIST_MEMORY_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE ($1::bigint = 0 OR chat_id = $1 OR origin_chat_id = $1) AND ($2::integer IS NULL OR thread_id = $2 OR origin_thread_id = $2) AND ($3::bigint = 0 OR user_id = $3 OR origin_user_id = $3) AND ($4::text = '' OR status = $4) AND ($6::text = '' OR card_type = $6) AND ($7::text = '' OR visibility = $7) AND ($8::timestamptz IS NULL OR (recorded_at <= $8 AND (retracted_at IS NULL OR retracted_at > $8))) ORDER BY updated_at DESC, id DESC LIMIT $5";
 
-pub const SQL_LIST_MEMORY_RUNS: &str = "SELECT r.id, r.chat_id, r.thread_id, r.range_start_at, r.range_end_at, r.prompt_version, r.status, r.attempts, r.message_count, r.cards_inserted, r.cards_updated, r.cards_superseded, r.episodes_inserted, r.input_token_estimate, r.output_token_estimate, r.error, r.error_log::text AS error_log, r.created_at, r.updated_at, r.lease_owner, r.started_at, r.completed_at, COALESCE(c.type, '') AS chat_type FROM memory_runs r LEFT JOIN chats c ON c.id = r.chat_id ORDER BY r.range_start_at DESC, r.id DESC LIMIT $1";
+pub const SQL_LIST_MEMORY_RUNS: &str = "SELECT r.id, r.chat_id, r.thread_id, r.range_start_at, r.range_end_at, r.prompt_version, r.status, r.attempts, r.message_count, r.cards_inserted, r.cards_updated, r.cards_superseded, r.episodes_inserted, r.input_token_estimate, r.output_token_estimate, r.error, r.error_log::text AS error_log, r.created_at, r.updated_at, r.lease_owner, r.started_at, r.completed_at, COALESCE(c.type, '') AS chat_type FROM memory_runs r LEFT JOIN telegram_chats_effective c ON c.id = r.chat_id ORDER BY r.range_start_at DESC, r.id DESC LIMIT $1";
 
 pub const SQL_GET_MEMORY_CARD: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE id = $1";
 
@@ -1468,7 +1476,7 @@ pub const SQL_GET_VIP_EVENT_BY_SUBSCRIPTION_ID: &str = "SELECT id, user_id, even
 
 pub const SQL_GET_VIP_SUMMARY_BY_USER: &str = "SELECT id AS latest_event_id, user_id, event_type AS latest_event_type, delta_seconds AS latest_delta_seconds, effective_expires_at, effective_expires_at > CURRENT_TIMESTAMP AS is_active, CASE WHEN effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, subscription_id AS latest_subscription_id, actor_user_id AS latest_actor_user_id, reason AS latest_reason, created_at AS latest_created_at FROM vip_events WHERE user_id = $1 ORDER BY id DESC LIMIT 1";
 
-pub const SQL_LIST_VIP_EVENTS_BY_USER: &str = "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN users actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC";
+pub const SQL_LIST_VIP_EVENTS_BY_USER: &str = "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN telegram_users_effective actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC";
 
 pub const SQL_GET_VIP_CACHE: &str =
     "SELECT * FROM vip_cache WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP LIMIT 1";
@@ -5829,7 +5837,7 @@ impl PostgresMemoryStore {
             )
             .await?;
         let top_rows = sqlx::query(
-            "SELECT m.chat_id, COALESCE(c.type, '') AS chat_type, COUNT(*)::bigint AS count FROM memory_cards m LEFT JOIN chats c ON c.id = m.chat_id WHERE m.status IN ('active', 'competing') AND m.chat_id <> 0 GROUP BY m.chat_id, c.type ORDER BY count DESC LIMIT 8",
+            "SELECT m.chat_id, COALESCE(c.type, '') AS chat_type, COUNT(*)::bigint AS count FROM memory_cards m LEFT JOIN telegram_chats_effective c ON c.id = m.chat_id WHERE m.status IN ('active', 'competing') AND m.chat_id <> 0 GROUP BY m.chat_id, c.type ORDER BY count DESC LIMIT 8",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -9872,7 +9880,10 @@ mod tests {
         assert!(super::SQL_RETRY_FAILED_MEMORY_RUNS.contains("WHERE status = 'failed'"));
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("error_log::text AS error_log"));
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("ORDER BY r.range_start_at DESC, r.id DESC"));
-        assert!(super::SQL_LIST_MEMORY_RUNS.contains("LEFT JOIN chats c ON c.id = r.chat_id"));
+        assert!(
+            super::SQL_LIST_MEMORY_RUNS
+                .contains("LEFT JOIN telegram_chats_effective c ON c.id = r.chat_id")
+        );
         assert!(
             super::SQL_LIST_MEMORY_CARDS.contains("($8::timestamptz IS NULL OR (recorded_at <= $8")
         );
@@ -11198,11 +11209,11 @@ mod tests {
     fn chat_member_sql_matches_go_query_contracts() {
         assert_eq!(
             super::SQL_GET_CHAT_MEMBER,
-            "SELECT * FROM chat_members WHERE chat_id = $1 AND user_id = $2"
+            "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = $2"
         );
         assert_eq!(
             super::SQL_LIST_CHAT_MEMBERS,
-            "SELECT * FROM chat_members WHERE chat_id = $1"
+            "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1"
         );
         assert_eq!(
             super::SQL_DELETE_CHAT_MEMBER,
@@ -11239,15 +11250,15 @@ mod tests {
         );
         assert_eq!(
             super::SQL_LIST_ACTIVE_PARTICIPANTS,
-            "SELECT user_id FROM chat_members WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2"
+            "SELECT user_id FROM telegram_chat_members_effective WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2"
         );
         assert_eq!(
             super::SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE,
-            "SELECT user_id FROM chat_active_users WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2"
+            "SELECT user_id FROM telegram_chat_active_users_effective WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2"
         );
         assert_eq!(
             super::SQL_GET_CHAT_DISCOVERED,
-            "SELECT discovered FROM chats WHERE id = $1"
+            "SELECT discovered FROM telegram_chats_effective WHERE id = $1"
         );
     }
 
@@ -11270,7 +11281,7 @@ mod tests {
         );
         assert_eq!(
             super::SQL_GET_YEARLY_TOP,
-            "SELECT u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium, COUNT(*)::int AS wins_count, MAX(r.won_at) AS last_win_at FROM chat_game_results r JOIN users u ON u.id = r.user_id WHERE r.chat_id = $1 AND r.won_at >= date_trunc('year', CURRENT_DATE) GROUP BY u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium ORDER BY wins_count DESC, last_win_at DESC LIMIT $2"
+            "SELECT u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium, COUNT(*)::int AS wins_count, MAX(r.won_at) AS last_win_at FROM chat_game_results r JOIN telegram_users_effective u ON u.id = r.user_id WHERE r.chat_id = $1 AND r.won_at >= date_trunc('year', CURRENT_DATE) GROUP BY u.id, u.first_name, u.last_name, u.username, u.language_code, u.is_premium ORDER BY wins_count DESC, last_win_at DESC LIMIT $2"
         );
     }
 
@@ -11486,15 +11497,15 @@ mod tests {
 
         assert_eq!(
             super::SQL_UPSERT_USER,
-            "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), updated = CURRENT_TIMESTAMP"
+            "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), telegram_observed_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP"
         );
         assert_eq!(
             super::SQL_GET_USER_ID_BY_USERNAME,
-            "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1"
+            "SELECT id FROM telegram_users_effective WHERE lower(username) = lower($1) LIMIT 1"
         );
         assert_eq!(
             super::SQL_UPSERT_CHAT,
-            "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP"
+            "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location, telegram_observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), telegram_observed_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP"
         );
     }
 
@@ -11503,7 +11514,7 @@ mod tests {
         let _settings = openplotva_core::ChatSettings::defaults(42);
         assert_eq!(
             super::SQL_GET_CHAT_TYPE,
-            "SELECT type FROM chats WHERE id = $1"
+            "SELECT type FROM telegram_chats_effective WHERE id = $1"
         );
         assert_eq!(
             super::SQL_GET_CHAT_SETTINGS,
@@ -11523,7 +11534,7 @@ mod tests {
         );
         assert_eq!(
             super::SQL_LIST_USER_CHATS,
-            "SELECT c.id, c.type, c.title, c.username, c.first_name, c.last_name, c.is_forum FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = $1"
+            "SELECT c.id, c.type, c.title, c.username, c.first_name, c.last_name, c.is_forum FROM telegram_chats_effective c JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id WHERE cm.user_id = $1"
         );
         assert_eq!(
             super::SQL_LIST_CHAT_DEPUTY_IDS,
@@ -11775,7 +11786,7 @@ mod tests {
         );
         assert_eq!(
             super::SQL_LIST_VIP_EVENTS_BY_USER,
-            "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN users actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC"
+            "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN telegram_users_effective actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC"
         );
         assert_eq!(
             super::SQL_GET_VIP_CACHE,
