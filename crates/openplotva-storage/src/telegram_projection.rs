@@ -767,11 +767,43 @@ WHERE EXCLUDED.telegram_observed_at
 )
 "#;
 
-const SQL_DELETE_USERS_STAGE: &str = "DELETE FROM telegram_users_stage WHERE bot_id = $1";
-const SQL_DELETE_CHATS_STAGE: &str = "DELETE FROM telegram_chats_stage WHERE bot_id = $1";
-const SQL_DELETE_MEMBERS_STAGE: &str = "DELETE FROM telegram_chat_members_stage WHERE bot_id = $1";
-const SQL_DELETE_ACTIVITY_STAGE: &str = "DELETE FROM telegram_activity_stage WHERE bot_id = $1";
-const SQL_DELETE_FILES_STAGE: &str = "DELETE FROM telegram_files_stage WHERE bot_id = $1";
+const SQL_STAGE_FLUSH_CUTOFF: &str = r#"
+SELECT stream_ms, stream_seq
+FROM (
+    SELECT stream_ms, stream_seq FROM telegram_users_stage WHERE bot_id = $1
+    UNION ALL
+    SELECT stream_ms, stream_seq FROM telegram_chats_stage WHERE bot_id = $1
+    UNION ALL
+    SELECT stream_ms, stream_seq FROM telegram_chat_members_stage WHERE bot_id = $1
+    UNION ALL
+    SELECT stream_ms, stream_seq FROM telegram_activity_stage WHERE bot_id = $1
+    UNION ALL
+    SELECT stream_ms, stream_seq FROM telegram_files_stage WHERE bot_id = $1
+) AS staged
+ORDER BY stream_ms DESC, stream_seq DESC
+LIMIT 1
+"#;
+
+const SQL_DELETE_USERS_STAGE: &str = r#"
+DELETE FROM telegram_users_stage
+WHERE bot_id = $1 AND (stream_ms, stream_seq) <= ($2, $3)
+"#;
+const SQL_DELETE_CHATS_STAGE: &str = r#"
+DELETE FROM telegram_chats_stage
+WHERE bot_id = $1 AND (stream_ms, stream_seq) <= ($2, $3)
+"#;
+const SQL_DELETE_MEMBERS_STAGE: &str = r#"
+DELETE FROM telegram_chat_members_stage
+WHERE bot_id = $1 AND (stream_ms, stream_seq) <= ($2, $3)
+"#;
+const SQL_DELETE_ACTIVITY_STAGE: &str = r#"
+DELETE FROM telegram_activity_stage
+WHERE bot_id = $1 AND (stream_ms, stream_seq) <= ($2, $3)
+"#;
+const SQL_DELETE_FILES_STAGE: &str = r#"
+DELETE FROM telegram_files_stage
+WHERE bot_id = $1 AND (stream_ms, stream_seq) <= ($2, $3)
+"#;
 
 const SQL_STAGE_STATS: &str = r#"
 SELECT
@@ -914,12 +946,18 @@ impl PostgresTelegramProjectionStore {
         bot_id: i64,
     ) -> Result<TelegramProjectionFlushReport, StorageError> {
         let mut tx = self.pool.begin().await?;
-        // Every apply and delete must see the same staging snapshot. Otherwise a
-        // concurrent stage insert can commit after an apply statement and then
-        // be removed by a later DELETE without ever reaching durable storage.
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .execute(&mut *tx)
-            .await?;
+        // The ingestion task stages one monotonically ordered Redis Stream
+        // batch at a time. Delete only versions visible at this boundary so a
+        // concurrent newer upsert remains staged for the next flush.
+        let Some((cutoff_stream_ms, cutoff_stream_seq)) =
+            sqlx::query_as::<_, (i64, i64)>(SQL_STAGE_FLUSH_CUTOFF)
+                .bind(bot_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            tx.commit().await?;
+            return Ok(TelegramProjectionFlushReport::default());
+        };
         let users = sqlx::query(SQL_APPLY_USERS_FROM_STAGE)
             .bind(bot_id)
             .execute(&mut *tx)
@@ -962,6 +1000,8 @@ impl PostgresTelegramProjectionStore {
             deleted_stage_rows = deleted_stage_rows.saturating_add(
                 sqlx::query(statement)
                     .bind(bot_id)
+                    .bind(cutoff_stream_ms)
+                    .bind(cutoff_stream_seq)
                     .execute(&mut *tx)
                     .await?
                     .rows_affected(),
@@ -1529,18 +1569,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_stage_insert_survives_the_flush_snapshot() -> Result<(), Box<dyn Error>> {
+    async fn concurrent_stage_update_survives_the_flush_cutoff() -> Result<(), Box<dyn Error>> {
         let Some(pool) = migrated_test_pool().await? else {
             return Ok(());
         };
         let suffix = OffsetDateTime::now_utc().unix_timestamp_nanos();
         let bot_id = i64::try_from(suffix.rem_euclid(1_000_000_000))? + 15_000;
         let first_user_id = bot_id + 1_500_000_000;
-        let concurrent_user_id = bot_id + 1_600_000_000;
         let chat_id = -(bot_id + 1_700_000_000);
         let file_unique_id = format!("projection-concurrent-flush-{suffix}");
         cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
-        cleanup(&pool, bot_id, concurrent_user_id, chat_id, &file_unique_id).await?;
 
         let store = PostgresTelegramProjectionStore::new(pool.clone());
         let observed_at = OffsetDateTime::now_utc();
@@ -1602,7 +1640,7 @@ mod tests {
         store
             .stage_projection_batch(&user_only_batch(sample_batch(
                 bot_id,
-                concurrent_user_id,
+                first_user_id,
                 chat_id,
                 file_unique_id.clone(),
                 observed_at + Duration::seconds(2),
@@ -1616,19 +1654,21 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM telegram_users_stage \
-                 WHERE bot_id = $1 AND user_id = $2",
+                 WHERE bot_id = $1 AND user_id = $2 AND first_name = 'concurrent'",
             )
             .bind(bot_id)
-            .bind(concurrent_user_id)
+            .bind(first_user_id)
             .fetch_one(&pool)
             .await?,
             1
         );
         assert!(
-            !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-                .bind(concurrent_user_id)
-                .fetch_one(&pool)
-                .await?
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND first_name = 'before-flush')",
+            )
+            .bind(first_user_id)
+            .fetch_one(&pool)
+            .await?
         );
 
         store.flush_staged_projections(bot_id).await?;
@@ -1636,13 +1676,12 @@ mod tests {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND first_name = 'concurrent')",
             )
-            .bind(concurrent_user_id)
+            .bind(first_user_id)
             .fetch_one(&pool)
             .await?
         );
 
         cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
-        cleanup(&pool, bot_id, concurrent_user_id, chat_id, &file_unique_id).await?;
         Ok(())
     }
 
