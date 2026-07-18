@@ -561,31 +561,17 @@ impl WebhookSetup {
     }
 }
 
-pub fn go_allowed_update_set() -> HashSet<AllowedUpdate> {
+pub fn product_allowed_update_set() -> HashSet<AllowedUpdate> {
     [
         AllowedUpdate::BotStatus,
-        AllowedUpdate::BusinessConnection,
-        AllowedUpdate::BusinessMessage,
         AllowedUpdate::CallbackQuery,
         AllowedUpdate::ChannelPost,
-        AllowedUpdate::ChatBoostRemoved,
-        AllowedUpdate::ChatBoostUpdated,
-        AllowedUpdate::ChatJoinRequest,
-        AllowedUpdate::ChosenInlineResult,
-        AllowedUpdate::DeletedBusinessMessages,
-        AllowedUpdate::EditedBusinessMessage,
         AllowedUpdate::EditedChannelPost,
         AllowedUpdate::EditedMessage,
         AllowedUpdate::GuestMessage,
         AllowedUpdate::InlineQuery,
         AllowedUpdate::Message,
-        AllowedUpdate::MessageReaction,
-        AllowedUpdate::MessageReactionCount,
-        AllowedUpdate::Poll,
-        AllowedUpdate::PollAnswer,
         AllowedUpdate::PreCheckoutQuery,
-        AllowedUpdate::PurchasedPaidMedia,
-        AllowedUpdate::ShippingQuery,
         AllowedUpdate::UserStatus,
     ]
     .into_iter()
@@ -600,7 +586,7 @@ pub fn build_get_updates_method_with_offset(offset: i64) -> GetUpdates {
     GetUpdates::default()
         .with_offset(offset)
         .with_timeout(GO_LONG_POLL_TIMEOUT)
-        .with_allowed_updates(go_allowed_update_set())
+        .with_allowed_updates(product_allowed_update_set())
 }
 
 pub fn build_delete_webhook_method() -> DeleteWebhook {
@@ -609,7 +595,7 @@ pub fn build_delete_webhook_method() -> DeleteWebhook {
 
 pub fn build_set_webhook_method(setup: &WebhookSetup) -> SetWebhook {
     let mut method =
-        SetWebhook::new(setup.url.clone()).with_allowed_updates(go_allowed_update_set());
+        SetWebhook::new(setup.url.clone()).with_allowed_updates(product_allowed_update_set());
 
     if let Some(secret_token) = setup
         .secret_token
@@ -643,16 +629,15 @@ mod tests {
     };
 
     #[test]
-    fn get_updates_method_matches_go_long_poll_startup_contract() {
+    fn get_updates_method_requests_only_product_updates() {
         let payload = serde_json::to_value(build_get_updates_method()).expect("getUpdates JSON");
 
         assert_eq!(payload.get("offset"), Some(&json!(0)));
         assert_eq!(payload.get("timeout"), Some(&json!(60)));
-        let allowed = allowed_update_names(&payload);
-        assert!(allowed.contains("message"));
-        assert!(allowed.contains("channel_post"));
-        assert!(allowed.contains("message_reaction"));
-        assert!(allowed.contains("shipping_query"));
+        assert_eq!(
+            allowed_update_names(&payload),
+            expected_product_allowed_update_names()
+        );
         assert!(
             payload.get("limit").is_none(),
             "Zero update limit stays unset"
@@ -669,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn set_webhook_method_matches_go_webhook_startup_contract() {
+    fn set_webhook_method_requests_only_product_updates() {
         let setup = WebhookSetup::new("https://plotva.example/tg", Some("secret-token".to_owned()));
         let payload =
             serde_json::to_value(build_set_webhook_method(&setup)).expect("setWebhook JSON");
@@ -679,10 +664,10 @@ mod tests {
             Some(&json!("https://plotva.example/tg"))
         );
         assert_eq!(payload.get("secret_token"), Some(&json!("secret-token")));
-        let allowed = allowed_update_names(&payload);
-        assert!(allowed.contains("message"));
-        assert!(allowed.contains("business_connection"));
-        assert!(allowed.contains("purchased_paid_media"));
+        assert_eq!(
+            allowed_update_names(&payload),
+            expected_product_allowed_update_names()
+        );
         assert_eq!(TELEGRAM_WEBHOOK_PATH, "/telegram/webhook");
     }
 
@@ -845,6 +830,21 @@ mod tests {
             .iter()
             .map(|value| value.as_str().expect("allowed update name"))
             .collect()
+    }
+
+    fn expected_product_allowed_update_names() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            "callback_query",
+            "channel_post",
+            "chat_member",
+            "edited_channel_post",
+            "edited_message",
+            "guest_message",
+            "inline_query",
+            "message",
+            "my_chat_member",
+            "pre_checkout_query",
+        ])
     }
 
     #[derive(Clone)]
