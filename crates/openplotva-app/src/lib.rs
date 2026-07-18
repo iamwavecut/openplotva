@@ -9016,7 +9016,7 @@ pub fn telegram_webhook_multipart_plan(
         .certificate
         .clone()
         .ok_or(TelegramWebhookMultipartPlanError::MissingCertificate)?;
-    let mut allowed_updates = openplotva_telegram::go_allowed_update_set()
+    let mut allowed_updates = openplotva_telegram::product_allowed_update_set()
         .into_iter()
         .map(|update| serde_json::to_value(update).and_then(serde_json::from_value::<String>))
         .collect::<Result<Vec<_>, _>>()?;
@@ -15993,7 +15993,7 @@ mod tests {
 
         assert_eq!(plan.certificate_name, "cert.pem");
         assert_eq!(plan.certificate_bytes, b"cert-bytes");
-        let mut allowed_updates = openplotva_telegram::go_allowed_update_set()
+        let mut allowed_updates = openplotva_telegram::product_allowed_update_set()
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
