@@ -67,6 +67,11 @@ const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 /// A duplicate final answer is regenerated only with this much budget left.
 const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 
+/// A searched answer gets two focused rewrites before the turn fails closed.
+const MAX_SEARCH_CITATION_REPAIRS: i32 = 2;
+
+const SEARCH_CITATION_REPAIR_HINT: &str = "ПРОВЕРКА ИСТОЧНИКОВ: предыдущий черновик финального ответа не содержит обязательной inline-ссылки на реально найденный источник. Сразу перепиши финальный ответ, не упоминая исправление и не выполняя новый поиск. Используй только URL из уже имеющихся результатов web_search/crawl_url и оберни конкретные подтверждаемые слова или фразы в <a href=\"URL\">...</a>. Не печатай raw URL или отдельную библиографию.";
+
 /// Slice reserved for the final send after a tool call finishes.
 const TOOL_RESERVE: TimeDuration = TimeDuration::seconds(5);
 
@@ -166,6 +171,74 @@ impl SentLog {
 
 fn normalize_sent_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn collect_web_source_urls(result: &ToolResult, urls: &mut BTreeSet<String>) {
+    if let Some(data) = result.data.as_ref() {
+        collect_web_source_urls_from_value(data, urls);
+    }
+}
+
+fn collect_web_source_urls_from_value(value: &Value, urls: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "link" | "url")
+                    && let Some(url) = value.as_str()
+                    && is_http_url(url)
+                {
+                    urls.insert(url.to_owned());
+                }
+                collect_web_source_urls_from_value(value, urls);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_web_source_urls_from_value(value, urls);
+            }
+        }
+        Value::String(serialized) => {
+            let serialized = serialized.trim();
+            if matches!(serialized.as_bytes().first(), Some(b'{') | Some(b'['))
+                && let Ok(nested) = serde_json::from_str(serialized)
+            {
+                collect_web_source_urls_from_value(&nested, urls);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
+fn answer_cites_web_source(answer: &str, web_source_urls: &BTreeSet<String>) -> bool {
+    inline_link_targets(answer)
+        .iter()
+        .any(|target| web_source_urls.contains(target))
+}
+
+fn inline_link_targets(answer: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut remainder = answer;
+    while let Some(anchor_start) = remainder.find("<a ") {
+        remainder = &remainder[anchor_start + 3..];
+        let Some(tag_end) = remainder.find('>') else {
+            break;
+        };
+        let tag = &remainder[..tag_end];
+        if let Some(href_start) = tag.find("href=\"") {
+            let value = &tag[href_start + 6..];
+            if let Some(href_end) = value.find('"') {
+                targets.push(openplotva_telegram::decode_html_entities(
+                    &value[..href_end],
+                ));
+            }
+        }
+        remainder = &remainder[tag_end + 1..];
+    }
+    targets
 }
 
 /// Native tool definitions for one session: the shared catalog the toolbox
@@ -277,6 +350,8 @@ where
     let mut tool_result_cache: BTreeMap<String, (String, ToolResult)> = BTreeMap::new();
     let mut media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
     let mut successful_web_search = false;
+    let mut web_source_urls = BTreeSet::new();
+    let mut search_citation_repairs: i32 = 0;
     let max_iterations = cfg.max_iterations.max(1);
 
     let mut iteration: i32 = 0;
@@ -300,6 +375,8 @@ where
                     tool_result_cache.clear();
                     media_reference_aliases.clear();
                     successful_web_search = false;
+                    web_source_urls.clear();
+                    search_citation_repairs = 0;
                 }
                 Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
                     ..
@@ -333,7 +410,7 @@ where
         let force_final = iteration == max_iterations;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
-        } else if force_final {
+        } else if force_final || search_citation_repairs > 0 {
             ToolsMode::FinalOnly
         } else {
             ToolsMode::Native(native_tools.clone())
@@ -342,6 +419,11 @@ where
         let mut input = base_input.clone();
         if anti_loop {
             input.reference_context.push(ANTI_LOOP_HINT.to_owned());
+        }
+        if search_citation_repairs > 0 {
+            input
+                .reference_context
+                .push(SEARCH_CITATION_REPAIR_HINT.to_owned());
         }
         let provider_deadline = Instant::now()
             + std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default();
@@ -433,10 +515,11 @@ where
         )
         .await;
 
-        if step.tool_calls.is_empty() || force_final {
+        if step.tool_calls.is_empty() || force_final || search_citation_repairs > 0 {
             // ---- Final-answer exit (text without tool calls). A forced
-            // final pass never executes tools; salvaged markup was already
-            // stripped by the step provider, so its text stands on its own.
+            // final or citation-repair pass never executes tools; salvaged
+            // markup was already stripped by the step provider, so its text
+            // stands on its own.
             let raw_answer = step.text.clone();
             let sanitized = prepare_dialog_chat_response(&raw_answer);
             if sanitized.trim().is_empty() {
@@ -488,6 +571,35 @@ where
                     report,
                 )
                 .await;
+            }
+
+            if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)
+            {
+                if search_citation_repairs < MAX_SEARCH_CITATION_REPAIRS
+                    && iteration < max_iterations
+                    && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
+                {
+                    search_citation_repairs += 1;
+                    tracing::info!(
+                        job_id = ctx.item_id,
+                        attempt = search_citation_repairs,
+                        sources = web_source_urls.len(),
+                        "regenerating searched answer without a source citation"
+                    );
+                    continue;
+                }
+                let error = format!(
+                    "dialog answer omitted a citation to {} web source(s) after {search_citation_repairs} repair attempt(s)",
+                    web_source_urls.len()
+                );
+                return TurnResolution {
+                    outcome: TurnOutcome::TerminalFailed {
+                        reason: "missing_search_citations",
+                        error: error.clone(),
+                        user_signal: UserSignalPlan::React,
+                    },
+                    disposition: JobDisposition::Fail(error),
+                };
             }
 
             let (duplicate_message_id, duplicate) =
@@ -777,6 +889,7 @@ where
                     .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
             {
                 successful_web_search = true;
+                collect_web_source_urls(&result, &mut web_source_urls);
             }
             append_session_tool_event(
                 queue,
@@ -1495,20 +1608,28 @@ pub async fn run_captured_session(
     let mut messages: Vec<String> = Vec::new();
     let mut recorded: Vec<ToolCall> = Vec::new();
     let mut provider = String::new();
+    let mut web_source_urls = BTreeSet::new();
+    let mut search_citation_repairs: i32 = 0;
     let max_iterations = max_iterations.max(1);
 
     for iteration in 1..=max_iterations {
         let force_final = iteration == max_iterations;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
-        } else if force_final {
+        } else if force_final || search_citation_repairs > 0 {
             ToolsMode::FinalOnly
         } else {
             ToolsMode::Native(native_tools.clone())
         };
+        let mut input = base_input.clone();
+        if search_citation_repairs > 0 {
+            input
+                .reference_context
+                .push(SEARCH_CITATION_REPAIR_HINT.to_owned());
+        }
         let step = step_provider
             .run_chat_step(ChatStepRequest {
-                input: base_input.clone(),
+                input,
                 transcript: transcript.clone(),
                 tools,
                 iteration: usize::try_from(iteration).unwrap_or(1),
@@ -1517,8 +1638,21 @@ pub async fn run_captured_session(
             .map_err(|error| error.to_string())?;
         provider = step.provider.clone();
 
-        if step.tool_calls.is_empty() || force_final {
+        if step.tool_calls.is_empty() || force_final || search_citation_repairs > 0 {
             let sanitized = prepare_dialog_chat_response(&step.text);
+            if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)
+            {
+                if search_citation_repairs < MAX_SEARCH_CITATION_REPAIRS
+                    && iteration < max_iterations
+                {
+                    search_citation_repairs += 1;
+                    continue;
+                }
+                return Err(format!(
+                    "final answer omitted a citation to {} web source(s) after {search_citation_repairs} repair attempt(s)",
+                    web_source_urls.len()
+                ));
+            }
             if !sanitized.trim().is_empty() {
                 messages.push(sanitized);
             }
@@ -1577,6 +1711,13 @@ pub async fn run_captured_session(
             };
             if queued_generation_side_effect(&result).is_some() {
                 terminal_side_effect = true;
+            }
+            if step_def.step == STEP_WEB_SEARCH
+                && result
+                    .status
+                    .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
+            {
+                collect_web_source_urls(&result, &mut web_source_urls);
             }
             recorded.push(recorded_session_tool_call(
                 step_def, &result, &call.id, iteration,

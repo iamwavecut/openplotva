@@ -3386,6 +3386,25 @@ impl SessionToolboxStub {
     }
 }
 
+fn successful_web_search_result(source_url: &str) -> openplotva_dialog::ToolResult {
+    openplotva_dialog::ToolResult {
+        status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+        message: "search results ready".to_owned(),
+        data: Some(serde_json::json!({
+            "query": "latest facts",
+            "results": serde_json::json!({
+                "organic": [{
+                    "title": "Current source",
+                    "link": source_url,
+                    "snippet": "Freshly verified fact",
+                }],
+            })
+            .to_string(),
+        })),
+        ..openplotva_dialog::ToolResult::default()
+    }
+}
+
 impl openplotva_dialog::DialogToolbox for SessionToolboxStub {
     fn web_search<'a>(&'a self, query: String) -> openplotva_dialog::ToolboxFuture<'a> {
         self.web_search_queries.lock().expect("queries").push(query);
@@ -3713,6 +3732,168 @@ async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>>
     assert!(rendered.contains("react_to_message"));
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let source_url = "https://example.com/current?q=1&x=2";
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что сейчас?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "что сейчас".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text(
+            r#"<a href="https://invented.example/fake">Свежий факт</a> с выдуманной ссылкой"#,
+        )),
+        Ok(step_text(&format!(
+            "<a href=\"{source_url}\">Свежий факт</a> с источником"
+        ))),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
+        SessionToolboxStub::with_web_search_result(successful_web_search_result(source_url)),
+    );
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(report.session_iterations, 3);
+    assert_eq!(
+        effects.sent()[0].1,
+        r#"<a href="https://example.com/current?q=1&amp;x=2">Свежий факт</a> с источником"#
+    );
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions {
+            disable_link_preview: true,
+        }]
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].input.reference_context.is_empty());
+    assert!(matches!(
+        &requests[2].tools,
+        openplotva_dialog::ToolsMode::FinalOnly
+    ));
+    assert!(
+        requests[2]
+            .input
+            .reference_context
+            .iter()
+            .any(|context| context.contains("ПРОВЕРКА ИСТОЧНИКОВ"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_repairs_missing_web_citation_for_runtime_smokes()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let source_url = "https://example.com/news";
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "search",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "latest news".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("Новости без ссылки")),
+        Ok(step_text(&format!(
+            "<a href=\"{source_url}\">Новости</a> со ссылкой"
+        ))),
+    ]);
+    let toolbox =
+        SessionToolboxStub::with_web_search_result(successful_web_search_result(source_url));
+    let input = dialog_input_from_job_params_at(&dialog_params("что нового?"), now);
+
+    let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
+
+    assert_eq!(
+        output.messages,
+        vec![format!("<a href=\"{source_url}\">Новости</a> со ссылкой")]
+    );
+    assert_eq!(output.tool_calls.len(), 1);
+    assert_eq!(provider.calls(), 3);
+    assert!(matches!(
+        &provider.requests()[2].tools,
+        openplotva_dialog::ToolsMode::FinalOnly
+    ));
+    assert!(
+        provider.requests()[2]
+            .input
+            .reference_context
+            .iter()
+            .any(|context| context.contains("ПРОВЕРКА ИСТОЧНИКОВ"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_fails_closed_when_web_citation_repairs_are_exhausted()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let source_url = "https://example.com/news";
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "search",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "latest news".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("Без ссылки, попытка один")),
+        Ok(step_text("Без ссылки, попытка два")),
+        Ok(step_text("Без ссылки, попытка три")),
+    ]);
+    let toolbox =
+        SessionToolboxStub::with_web_search_result(successful_web_search_result(source_url));
+    let input = dialog_input_from_job_params_at(&dialog_params("что нового?"), now);
+
+    let error = match crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await
+    {
+        Ok(_) => panic!("uncited searched answer escaped the captured session"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("after 2 repair attempt(s)"), "{error}");
+    assert_eq!(provider.calls(), 4);
     Ok(())
 }
 
@@ -4898,7 +5079,14 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
     let key = crate::dialog_turn::SessionKey::new(42, Some(9));
-    let wiring = wiring_with_registry(Arc::clone(&registry));
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::with_web_search_result(
+            successful_web_search_result("https://example.com/old-turn"),
+        ));
+    let wiring = crate::dialog_turn::SessionWorkerWiring {
+        registry: Arc::clone(&registry),
+        ..session_wiring(toolbox, None)
+    };
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
