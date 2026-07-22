@@ -646,16 +646,15 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: STEP_CURRENCY_RATES,
         summary: "Fetch current fiat and crypto exchange rates.",
-        when_to_use: "Use when the latest user message asks about exchange rates or recent currency movement.",
+        when_to_use: "Use first when the latest user message asks for a current fiat or crypto rate. Add web_search only when the user also needs external context, causes, comparison, or verification that this specialized live tool does not provide.",
         result: "Returns fresh rate data and may queue a rates side-effect message.",
         args: CURRENCY_RATES_ARGS,
     },
     ToolSpec {
         name: STEP_WEB_SEARCH,
-        summary: "Search the web for current or external information.",
-        when_to_use: "Use when the latest user message asks for current facts, news, recent events, or anything outside reliable memory.",
-        result: "Returns search results with links; follow the promising ones with crawl_url when \
-                 the snippets are not enough.",
+        summary: "Search the web for current, changeable, or uncertain external facts.",
+        when_to_use: "MUST use before answering when accuracy depends on facts that may have changed since model knowledge, including news, prices, weather, schedules, availability, laws, versions, current roles, sports, or economic indicators, or when an external fact is uncertain. An explicit request to search is not required. Prefer a specialized live tool when it fully answers the request; do not search for stable common knowledge, opinions, creative work, or facts supplied by the user.",
+        result: "Returns search results with source titles, snippets, and links. Ground the answer only in supporting results and cite each used source as a semantic inline HTML link. Follow promising links with crawl_url when snippets are not enough; never invent a source when search fails.",
         args: WEB_SEARCH_ARGS,
     },
     ToolSpec {
@@ -3334,6 +3333,33 @@ mod tests {
             .find(|tool| tool.function.name == STEP_TRANSLATE_TEXT)
             .expect("translate tool");
         assert_eq!(translate.function.parameters["required"], json!(["text"]));
+        let rates = tools
+            .iter()
+            .find(|tool| tool.function.name == STEP_CURRENCY_RATES)
+            .expect("currency rates tool");
+        assert!(rates.function.description.contains("Use first"));
+        let search = tools
+            .iter()
+            .find(|tool| tool.function.name == STEP_WEB_SEARCH)
+            .expect("web search tool");
+        assert!(
+            search
+                .function
+                .description
+                .contains("MUST use before answering")
+        );
+        assert!(
+            search
+                .function
+                .description
+                .contains("semantic inline HTML link")
+        );
+        assert!(
+            search
+                .function
+                .description
+                .contains("never invent a source")
+        );
         assert!(
             tools
                 .iter()

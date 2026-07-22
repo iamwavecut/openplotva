@@ -4891,6 +4891,13 @@ pub fn build_runtime_context(input: &DialogInput) -> String {
         "locale",
         &fallback_string(&input.context.locale, "ru"),
     );
+    if let Some(current_datetime) = input.timestamp.or(input.message.timestamp) {
+        write_text_element(
+            &mut out,
+            "current_datetime_utc",
+            &format_timestamp(current_datetime),
+        );
+    }
     write_text_element(
         &mut out,
         "mood",
@@ -7078,6 +7085,18 @@ mod tests {
         assert!(prompt.contains("Никогда не используй translate_text"));
         assert!(prompt.contains("<system_contract>"));
         assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<freshness_grounding>"));
+        assert!(prompt.contains("потребность в актуальности сама является основанием для tool"));
+        assert!(prompt.contains("Сначала используй специализированный live-tool"));
+        assert!(prompt.contains("не выдумывай источники"));
+        assert!(prompt.contains("MUST use before answering"));
+        assert!(prompt.contains("Prefer a specialized live tool"));
+        assert!(prompt.contains(
+            "&lt;a href=\"u1\"&gt;слово1&lt;/a&gt; &lt;a href=\"u2\"&gt;слово2&lt;/a&gt;"
+        ));
+        assert!(prompt.contains(
+            "&lt;a href=\"u1\"&gt;слово&lt;/a&gt; (&lt;a href=\"u2\"&gt;2&lt;/a&gt;, &lt;a href=\"u3\"&gt;3&lt;/a&gt;)"
+        ));
         let names = alternative_dialog_tool_names();
         for spec in alternative_dialog_tools()
             .into_iter()
@@ -7087,6 +7106,23 @@ mod tests {
             assert!(prompt.contains(spec.summary.trim()));
         }
         assert!(!prompt.contains("name=\"memory_search\""));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_dynamic_user_context_includes_current_datetime() -> Result<(), AifarmMessageError> {
+        let mut input = base_input();
+        input.timestamp = Some(at(12, 0));
+
+        let messages = build_initial_messages_with_options(&input, &[], true)?;
+
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.starts_with("<chat_context>"));
+        assert!(
+            messages[1]
+                .content
+                .contains("<current_datetime_utc>2026-05-01T12:00:00Z</current_datetime_utc>")
+        );
         Ok(())
     }
 

@@ -8,9 +8,10 @@ use carapax::types::{
     GetChatAdministrators, GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
     InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
-    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType, RefundStarPayment,
-    ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup,
-    SendMessage, SendPhoto, SendSticker, SetMessageReaction, WebAppInfo,
+    LinkPreviewOptions, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType,
+    RefundStarPayment, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio,
+    SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker, SetMessageReaction,
+    WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -512,6 +513,22 @@ pub fn build_text_message_methods(
     req: &TextMessageRequest,
     reply_to: Option<&ReplyMessageRef>,
 ) -> Result<Vec<SendMessage>, OutboundBuildError> {
+    build_text_message_methods_with_preview(req, reply_to, true)
+}
+
+/// Build all outbound `sendMessage` methods with Telegram link previews disabled.
+pub fn build_text_message_methods_without_link_previews(
+    req: &TextMessageRequest,
+    reply_to: Option<&ReplyMessageRef>,
+) -> Result<Vec<SendMessage>, OutboundBuildError> {
+    build_text_message_methods_with_preview(req, reply_to, false)
+}
+
+fn build_text_message_methods_with_preview(
+    req: &TextMessageRequest,
+    reply_to: Option<&ReplyMessageRef>,
+    link_previews_enabled: bool,
+) -> Result<Vec<SendMessage>, OutboundBuildError> {
     validate_text_message_text(&req.text, &req.render_as)?;
     let chat = message_target_chat(req.chat.as_ref(), reply_to)?;
     let parts = split_telegram_text(&req.text, &req.render_as, TELEGRAM_TEXT_MAX_BYTES);
@@ -523,7 +540,19 @@ pub fn build_text_message_methods(
     parts
         .into_iter()
         .enumerate()
-        .map(|(idx, part)| build_text_message_method(req, chat, reply_to, part, idx + 1 == total))
+        .map(|(idx, part)| {
+            Ok(if link_previews_enabled {
+                build_text_message_method(req, chat, reply_to, part, idx + 1 == total)?
+            } else {
+                build_text_message_method_without_link_preview(
+                    req,
+                    chat,
+                    reply_to,
+                    part,
+                    idx + 1 == total,
+                )?
+            })
+        })
         .collect()
 }
 
@@ -557,6 +586,20 @@ pub fn build_text_message_method(
     }
 
     Ok(method)
+}
+
+/// Build one outbound `sendMessage` method with Telegram link previews disabled.
+pub fn build_text_message_method_without_link_preview(
+    req: &TextMessageRequest,
+    chat: ChatRef,
+    reply_to: Option<&ReplyMessageRef>,
+    part: impl Into<String>,
+    is_last_part: bool,
+) -> Result<SendMessage, OutboundBuildError> {
+    Ok(
+        build_text_message_method(req, chat, reply_to, part, is_last_part)?
+            .with_link_preview_options(LinkPreviewOptions::default().with_is_disabled(true)),
+    )
 }
 
 /// Build one outbound `sendRichMessage` method.
@@ -1744,7 +1787,8 @@ mod tests {
         build_pre_checkout_ok_method, build_private_settings_keyboard,
         build_refund_star_payment_method, build_rich_message_method, build_sticker_message_method,
         build_sticker_message_plan, build_subscription_invoice_link_method,
-        build_text_message_method, build_text_message_methods, classify_payment_payload,
+        build_text_message_method, build_text_message_methods,
+        build_text_message_methods_without_link_previews, classify_payment_payload,
         donation_invoice_payload, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
@@ -2027,6 +2071,40 @@ mod tests {
 
         assert!(first.get("reply_markup").is_none());
         assert!(last.get("reply_markup").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_text_message_methods_leave_link_preview_options_unset_by_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let methods = build_text_message_methods(&base_text_request("https://example.com"), None)?;
+
+        for method in methods {
+            let payload = serde_json::to_value(method)?;
+            assert!(payload.get("link_preview_options").is_none());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_text_message_methods_disable_link_previews_on_every_split_part()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let req = TextMessageRequest {
+            text: format!(
+                "<a href=\"https://example.com/one\">{}</a> <a href=\"https://example.com/two\">tail</a>",
+                "a".repeat(TELEGRAM_TEXT_MAX_BYTES)
+            ),
+            ..base_text_request("unused")
+        };
+        let methods = build_text_message_methods_without_link_previews(&req, None)?;
+        assert!(methods.len() > 1);
+
+        for method in methods {
+            let payload = serde_json::to_value(method)?;
+            assert_eq!(payload["link_preview_options"]["is_disabled"], json!(true));
+        }
 
         Ok(())
     }

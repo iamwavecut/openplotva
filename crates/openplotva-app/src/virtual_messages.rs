@@ -22,7 +22,8 @@ use openplotva_telegram::{
     build_edit_media_message_plan, build_edit_text_message_method,
     build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
     build_photo_message_plan, build_rich_message_method, build_sticker_message_method,
-    build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
+    build_sticker_message_plan, build_text_message_method,
+    build_text_message_method_without_link_preview, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_rich_message, fingerprint_sticker_message_plan,
     fingerprint_text_message_part, hash_content, message_target_chat, split_telegram_text,
     validate_text_message_text,
@@ -585,7 +586,31 @@ fn trace_ephemeral_cleanup_tick(tick: &EphemeralCleanupReport) {
 pub async fn queue_text_message_parts<NextId>(
     queue: &DispatcherQueue,
     req: QueueTextRequest<'_>,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    NextId: FnMut() -> String,
+{
+    queue_text_message_parts_with_preview(queue, req, next_virtual_id, true).await
+}
+
+/// Queue every text part with Telegram link previews disabled.
+pub async fn queue_text_message_parts_without_link_previews<NextId>(
+    queue: &DispatcherQueue,
+    req: QueueTextRequest<'_>,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    NextId: FnMut() -> String,
+{
+    queue_text_message_parts_with_preview(queue, req, next_virtual_id, false).await
+}
+
+async fn queue_text_message_parts_with_preview<NextId>(
+    queue: &DispatcherQueue,
+    req: QueueTextRequest<'_>,
     mut next_virtual_id: NextId,
+    link_previews_enabled: bool,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
     NextId: FnMut() -> String,
@@ -605,13 +630,23 @@ where
     let total_parts = parts.len();
     for (index, part) in parts.into_iter().enumerate() {
         let virtual_id = next_virtual_id();
-        let method = build_text_message_method(
-            req.message,
-            chat,
-            req.reply_to,
-            part.clone(),
-            index + 1 == total_parts,
-        )?;
+        let method = if link_previews_enabled {
+            build_text_message_method(
+                req.message,
+                chat,
+                req.reply_to,
+                part.clone(),
+                index + 1 == total_parts,
+            )?
+        } else {
+            build_text_message_method_without_link_preview(
+                req.message,
+                chat,
+                req.reply_to,
+                part.clone(),
+                index + 1 == total_parts,
+            )?
+        };
         let mut dispatcher_message =
             DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
                 .with_method(TelegramOutboundMethod::from(method))

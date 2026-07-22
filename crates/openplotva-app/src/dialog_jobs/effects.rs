@@ -11,7 +11,8 @@ use openplotva_taskman::{DEFAULT_PRIORITY, DialogJobParams};
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
     TelegramOutboundMethod, TextMessageRequest, build_rich_message_method,
-    build_text_message_methods, snapshot_outbound_method,
+    build_text_message_methods, build_text_message_methods_without_link_previews,
+    snapshot_outbound_method,
 };
 use sqlx::Row;
 use thiserror::Error;
@@ -19,7 +20,7 @@ use time::OffsetDateTime;
 
 use crate::virtual_messages::{
     QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
-    queue_rich_message, queue_text_message_parts,
+    queue_rich_message, queue_text_message_parts, queue_text_message_parts_without_link_previews,
 };
 
 use super::{
@@ -34,6 +35,13 @@ pub struct QueuedBatchReceipt {
     pub operation_ids: Vec<String>,
     delivery: QueuedDelivery,
     delivery_complete: bool,
+}
+
+/// Final-answer delivery behavior derived from the completed dialog session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DialogAnswerSendOptions {
+    /// Disable Telegram link previews for a final answer grounded by web search.
+    pub disable_link_preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +97,7 @@ pub trait DialogJobEffects {
         causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
+        options: DialogAnswerSendOptions,
     ) -> DialogJobReceiptFuture<'a, Self::Error>;
 
     /// Return the already committed final-answer batch, if a crash happened
@@ -177,6 +186,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
         causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
+        options: DialogAnswerSendOptions,
     ) -> DialogJobReceiptFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
@@ -196,6 +206,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
                     causation_update_id,
                     params,
                     answer,
+                    options,
                     chat,
                     &reply_to,
                 )
@@ -239,20 +250,28 @@ impl DialogJobEffects for DialogDispatcherEffects {
                     render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
                     reply_markup: None,
                 };
-                queue_text_message_parts(
-                    &self.queue,
-                    QueueTextRequest {
-                        protected: true,
-                        debounce_key: Some(&debounce_key),
-                        message: &request,
-                        reply_to: Some(&reply_to),
-                        immediate_first: true,
-                        bypass_chat_restrictions: false,
-                        ephemeral_delete_after: None,
-                    },
-                    || (self.next_virtual_id)(),
-                )
-                .await?
+                let queue_request = QueueTextRequest {
+                    protected: true,
+                    debounce_key: Some(&debounce_key),
+                    message: &request,
+                    reply_to: Some(&reply_to),
+                    immediate_first: true,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: None,
+                };
+                if options.disable_link_preview {
+                    queue_text_message_parts_without_link_previews(
+                        &self.queue,
+                        queue_request,
+                        || (self.next_virtual_id)(),
+                    )
+                    .await?
+                } else {
+                    queue_text_message_parts(&self.queue, queue_request, || {
+                        (self.next_virtual_id)()
+                    })
+                    .await?
+                }
             };
             Ok(QueuedBatchReceipt::dispatcher(
                 format!("dispatcher:dialog-answer:{dialog_job_id}"),
@@ -499,6 +518,46 @@ fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {
     format!("dialog-answer:v1:{bot_id}:{dialog_job_id}")
 }
 
+fn build_dialog_answer_methods(
+    answer: &str,
+    options: DialogAnswerSendOptions,
+    chat: ChatRef,
+    reply_to: &ReplyMessageRef,
+) -> Result<Vec<TelegramOutboundMethod>, DialogDispatchEffectError> {
+    if dialog_response_requires_rich(answer) {
+        let request = RichMessageRequest {
+            chat: Some(chat),
+            message_thread_id: reply_to.message_thread_id,
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            html: answer.to_owned(),
+            reply_markup: None,
+        };
+        return Ok(vec![TelegramOutboundMethod::from(
+            build_rich_message_method(&request, chat, Some(reply_to))?,
+        )]);
+    }
+
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: reply_to.message_thread_id,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: answer.to_owned(),
+        render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+        reply_markup: None,
+    };
+    let methods = if options.disable_link_preview {
+        build_text_message_methods_without_link_previews(&request, Some(reply_to))?
+    } else {
+        build_text_message_methods(&request, Some(reply_to))?
+    };
+    Ok(methods
+        .into_iter()
+        .map(TelegramOutboundMethod::from)
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_durable_dialog_answer(
     outbox: &DurableDialogOutbox,
@@ -506,38 +565,11 @@ async fn enqueue_durable_dialog_answer(
     causation_update_id: Option<i64>,
     params: &DialogJobParams,
     answer: &str,
+    options: DialogAnswerSendOptions,
     chat: ChatRef,
     reply_to: &ReplyMessageRef,
 ) -> Result<QueuedBatchReceipt, DialogDispatchEffectError> {
-    let methods = if dialog_response_requires_rich(answer) {
-        let request = RichMessageRequest {
-            chat: Some(chat),
-            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
-            disable_notification: false,
-            allow_sending_without_reply: None,
-            html: answer.to_owned(),
-            reply_markup: None,
-        };
-        vec![TelegramOutboundMethod::from(build_rich_message_method(
-            &request,
-            chat,
-            Some(reply_to),
-        )?)]
-    } else {
-        let request = TextMessageRequest {
-            chat: Some(chat),
-            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
-            disable_notification: false,
-            allow_sending_without_reply: None,
-            text: answer.to_owned(),
-            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-            reply_markup: None,
-        };
-        build_text_message_methods(&request, Some(reply_to))?
-            .into_iter()
-            .map(TelegramOutboundMethod::from)
-            .collect()
-    };
+    let methods = build_dialog_answer_methods(answer, options, chat, reply_to)?;
     let now = OffsetDateTime::now_utc();
     let mut parts = Vec::with_capacity(methods.len());
     for method in &methods {
@@ -611,5 +643,54 @@ mod tests {
         assert_eq!(batch.dialog_job_id, Some(123));
         assert_eq!(batch.causation_update_id, Some(456));
         assert_eq!(batch.trigger_message_id, Some(11));
+    }
+
+    #[test]
+    fn durable_answer_payload_disables_preview_on_every_text_part() {
+        let chat = ChatRef {
+            id: -100,
+            is_forum: true,
+        };
+        let reply_to = ReplyMessageRef {
+            message_id: 11,
+            chat,
+            is_topic_message: true,
+            message_thread_id: 7,
+        };
+        let answer = format!(
+            "<a href=\"https://example.com/one\">{}</a> <a href=\"https://example.com/two\">tail</a>",
+            "a".repeat(openplotva_telegram::TELEGRAM_TEXT_MAX_BYTES)
+        );
+
+        let methods = build_dialog_answer_methods(
+            &answer,
+            DialogAnswerSendOptions {
+                disable_link_preview: true,
+            },
+            chat,
+            &reply_to,
+        )
+        .expect("build durable methods");
+        assert!(methods.len() > 1);
+
+        for method in methods {
+            let (_, payload) = snapshot_outbound_method(&method).expect("serializable method");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&payload).expect("serialized payload");
+            assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+        }
+
+        let default_methods = build_dialog_answer_methods(
+            "https://example.com/default",
+            DialogAnswerSendOptions::default(),
+            chat,
+            &reply_to,
+        )
+        .expect("build default durable method");
+        let (_, payload) =
+            snapshot_outbound_method(&default_methods[0]).expect("serializable default method");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("serialized default payload");
+        assert!(payload.get("link_preview_options").is_none());
     }
 }

@@ -107,6 +107,11 @@ async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<
         effects.sent(),
         vec![("hello".to_owned(), "pong".to_owned())]
     );
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions::default()],
+        "ordinary answers must preserve Telegram's default preview behavior"
+    );
     let input = provider.inputs().pop().expect("provider input");
     assert_eq!(input.context.chat_id, 42);
     assert_eq!(input.context.thread_id, Some(9));
@@ -382,7 +387,13 @@ async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
         .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
     effects
-        .send_dialog_answer(1, None, &dialog_params("hello"), "pong")
+        .send_dialog_answer(
+            1,
+            None,
+            &dialog_params("hello"),
+            "pong",
+            DialogAnswerSendOptions::default(),
+        )
         .await?;
 
     let item = queue.dequeue_immediate().expect("queued dialog answer");
@@ -411,6 +422,41 @@ async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
         value["reply_parameters"]["allow_sending_without_reply"],
         true
     );
+    assert!(value.get("link_preview_options").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn dialog_dispatcher_effects_disable_preview_for_search_grounded_final_text()
+-> Result<(), Box<dyn Error>> {
+    let queue = Arc::new(DispatcherQueue::new(
+        openplotva_telegram::DispatcherConfig::default(),
+    ));
+    let effects = DialogDispatcherEffects::new(Arc::clone(&queue))
+        .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
+
+    effects
+        .send_dialog_answer(
+            1,
+            None,
+            &dialog_params("latest"),
+            "<a href=\"https://example.com/current\">current fact</a>",
+            DialogAnswerSendOptions {
+                disable_link_preview: true,
+            },
+        )
+        .await?;
+
+    let item = queue.dequeue_immediate().expect("queued dialog answer");
+    let (_, method) = item.into_parts();
+    let Some(openplotva_telegram::TelegramOutboundMethod::SendMessage(method)) = method else {
+        return Err("expected sendMessage".into());
+    };
+    let value = serde_json::to_value(method.as_ref())?;
+    assert_eq!(
+        value["link_preview_options"]["is_disabled"],
+        serde_json::json!(true)
+    );
     Ok(())
 }
 
@@ -424,7 +470,15 @@ async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
         .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
     effects
-        .send_dialog_answer(1, None, &dialog_params("hello"), "<h2>pong</h2>")
+        .send_dialog_answer(
+            1,
+            None,
+            &dialog_params("hello"),
+            "<h2>pong</h2>",
+            DialogAnswerSendOptions {
+                disable_link_preview: true,
+            },
+        )
         .await?;
 
     let item = queue.dequeue_immediate().expect("queued dialog answer");
@@ -2791,6 +2845,7 @@ struct EffectsStub {
 #[derive(Default)]
 struct EffectsState {
     sent: Vec<(String, String)>,
+    answer_options: Vec<DialogAnswerSendOptions>,
     intermediates: Vec<(String, u32, bool)>,
     queued_answer: Option<QueuedBatchReceipt>,
     fail: bool,
@@ -2805,6 +2860,14 @@ impl EffectsStub {
 
     fn sent(&self) -> Vec<(String, String)> {
         self.state.lock().expect("effects state").sent.clone()
+    }
+
+    fn answer_options(&self) -> Vec<DialogAnswerSendOptions> {
+        self.state
+            .lock()
+            .expect("effects state")
+            .answer_options
+            .clone()
     }
 
     fn with_queued_answer(receipt: QueuedBatchReceipt) -> Self {
@@ -2832,6 +2895,7 @@ impl DialogJobEffects for EffectsStub {
         _causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
+        options: DialogAnswerSendOptions,
     ) -> DialogJobReceiptFuture<'a, Self::Error> {
         Box::pin(async move {
             let mut state = self.state.lock().expect("effects state");
@@ -2841,6 +2905,7 @@ impl DialogJobEffects for EffectsStub {
             state
                 .sent
                 .push((params.message_text.clone(), answer.to_owned()));
+            state.answer_options.push(options);
             Ok(QueuedBatchReceipt::dispatcher(
                 format!("test-dialog-answer:{dialog_job_id}"),
                 vec![format!("test-operation:{dialog_job_id}")],
@@ -3017,7 +3082,13 @@ async fn deliverable_validation_matches_outbound_acceptance() -> Result<(), Box<
     for answer in corpus {
         let validated = validate_dialog_answer_deliverable(&answer).is_ok();
         let accepted = effects
-            .send_dialog_answer(1, None, &params, &answer)
+            .send_dialog_answer(
+                1,
+                None,
+                &params,
+                &answer,
+                DialogAnswerSendOptions::default(),
+            )
             .await
             .is_ok();
         assert_eq!(
@@ -3270,6 +3341,7 @@ impl openplotva_llm::ChatStepProvider for StepProviderStub {
 #[derive(Default)]
 struct SessionToolboxStub {
     web_search_queries: Mutex<Vec<String>>,
+    web_search_result: Mutex<Option<openplotva_dialog::ToolResult>>,
     understand_media_refs: Mutex<Vec<String>>,
     draw_requests: Mutex<Vec<openplotva_dialog::DrawRequest>>,
     draw_result: Mutex<Option<openplotva_dialog::ToolResult>>,
@@ -3277,6 +3349,12 @@ struct SessionToolboxStub {
 }
 
 impl SessionToolboxStub {
+    fn with_web_search_result(result: openplotva_dialog::ToolResult) -> Self {
+        let stub = Self::default();
+        *stub.web_search_result.lock().expect("web search result") = Some(result);
+        stub
+    }
+
     fn with_queued_draw(ticket: &str) -> Self {
         let stub = Self::default();
         *stub.draw_result.lock().expect("draw result") = Some(openplotva_dialog::ToolResult {
@@ -3311,13 +3389,17 @@ impl SessionToolboxStub {
 impl openplotva_dialog::DialogToolbox for SessionToolboxStub {
     fn web_search<'a>(&'a self, query: String) -> openplotva_dialog::ToolboxFuture<'a> {
         self.web_search_queries.lock().expect("queries").push(query);
-        Box::pin(async {
-            Ok(openplotva_dialog::ToolResult {
+        let result = self
+            .web_search_result
+            .lock()
+            .expect("web search result")
+            .clone()
+            .unwrap_or_else(|| openplotva_dialog::ToolResult {
                 status: "ok".to_owned(),
                 message: "results: solstice is on June 21".to_owned(),
                 ..openplotva_dialog::ToolResult::default()
-            })
-        })
+            });
+        Box::pin(async move { Ok(result) })
     }
 
     fn understand_media<'a>(
@@ -3602,6 +3684,13 @@ async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>>
     assert_eq!(report.session_iterations, 2);
     assert_eq!(effects.sent().len(), 1);
     assert_eq!(effects.sent()[0].1, "21 июня, лови");
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions {
+            disable_link_preview: true,
+        }],
+        "a successful web_search disables previews only on the final answer"
+    );
     assert!(effects.intermediates().is_empty());
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     // The second step saw the first round's tool result in the transcript.
@@ -3624,6 +3713,58 @@ async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>>
     assert!(rendered.contains("react_to_message"));
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_web_search_keeps_final_answer_link_previews_unchanged() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что сейчас?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "что сейчас".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("не смогла проверить свежие данные")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::with_web_search_result(
+            openplotva_dialog::ToolResult::failed("search_down", "search unavailable"),
+        ));
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions::default()]
+    );
     Ok(())
 }
 
@@ -4036,6 +4177,13 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
         "text next to tool calls goes to the chat as the first send (reply-to)"
     );
     assert_eq!(effects.sent().len(), 1, "final answer still lands");
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions {
+            disable_link_preview: true,
+        }],
+        "the intermediate send is unchanged while the final records successful search"
+    );
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
     assert_eq!(rows[0].sent_message_parts, Some(2));
@@ -4825,6 +4973,11 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
         effects.sent()[0].0,
         "кстати умножь на два",
         "the final answer targets the newest injected trigger"
+    );
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions::default()],
+        "absorbing a new user turn must reset successful search state"
     );
     // The second injected message was left in the inbox → a follow-up job.
     assert!(report.followup_respawned.is_some(), "{report:?}");

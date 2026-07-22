@@ -24,8 +24,9 @@ use openplotva_dialog::{
     ChatStepRequest, ChatStepToolCall, DialogInput, DialogToolbox, HistoryMessage,
     SESSION_REACT_TO_MESSAGE_SPEC, SESSION_REACTION_ALLOWED_EMOJI, SESSION_SEND_MESSAGE_SPEC,
     STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
-    STEP_UNDERSTAND_MEDIA, SessionMessage, SessionToolCall, ToolContext, ToolResult, ToolStep,
-    ToolsMode, chat_completion_tools_for_specs, dialog_tool_context, dispatch_dialog_tool,
+    STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, SessionMessage, SessionToolCall, ToolContext,
+    ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs, dialog_tool_context,
+    dispatch_dialog_tool,
     turn::{
         ANTI_LOOP_HINT, QueuedSideEffect, SIDE_EFFECT_KIND_IMAGE, SIDE_EFFECT_KIND_MUSIC,
         SIDE_EFFECT_STATE_QUEUED,
@@ -40,10 +41,11 @@ use super::budget::{SessionBudget, TURN_DEADLINE, TurnBudget};
 use super::engine::{ANSWER_QUEUED_STAGE, ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use crate::dialog_jobs::{
-    DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport, DialogToolCallHistoryStore,
-    PROVIDER_EMPTY_RETRY_CODES, PROVIDER_ERROR_RETRY_CODES, RetryableDialogProviderFailure,
-    SANITIZED_EMPTY_RETRY_CODES, UNDELIVERABLE_RETRY_CODES, handle_retryable_dialog_provider_error,
-    persist_dialog_tool_calls, prepare_dialog_chat_response, should_suppress_duplicate_bot_reply,
+    DialogAnswerSendOptions, DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport,
+    DialogToolCallHistoryStore, PROVIDER_EMPTY_RETRY_CODES, PROVIDER_ERROR_RETRY_CODES,
+    RetryableDialogProviderFailure, SANITIZED_EMPTY_RETRY_CODES, UNDELIVERABLE_RETRY_CODES,
+    handle_retryable_dialog_provider_error, persist_dialog_tool_calls,
+    prepare_dialog_chat_response, should_suppress_duplicate_bot_reply,
     validate_dialog_answer_deliverable,
 };
 
@@ -274,6 +276,7 @@ where
     let mut reacted_message_ids: BTreeSet<i64> = BTreeSet::new();
     let mut tool_result_cache: BTreeMap<String, (String, ToolResult)> = BTreeMap::new();
     let mut media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
+    let mut successful_web_search = false;
     let max_iterations = cfg.max_iterations.max(1);
 
     let mut iteration: i32 = 0;
@@ -296,6 +299,7 @@ where
                     transcript.clear();
                     tool_result_cache.clear();
                     media_reference_aliases.clear();
+                    successful_web_search = false;
                 }
                 Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
                     ..
@@ -586,6 +590,9 @@ where
                     ctx.item.latest_update_id,
                     &active_params,
                     &sanitized,
+                    DialogAnswerSendOptions {
+                        disable_link_preview: successful_web_search,
+                    },
                 )
                 .await
             {
@@ -763,6 +770,13 @@ where
             }
             if let Some(effect) = queued_generation_side_effect(&result) {
                 batch_side_effects.push(effect);
+            }
+            if call.step.step == STEP_WEB_SEARCH
+                && result
+                    .status
+                    .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
+            {
+                successful_web_search = true;
             }
             append_session_tool_event(
                 queue,
