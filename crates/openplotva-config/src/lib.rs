@@ -83,6 +83,8 @@ pub const DEFAULT_UPDATE_QUEUE_BACKEND: &str = "stream";
 
 pub const DEFAULT_UPDATE_STREAM_REDIS_URL: &str = "";
 
+pub const DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS: usize = 4;
+
 pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS: usize = 512;
 
 pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -456,6 +458,8 @@ pub struct UpdateQueueConfig {
     /// Dedicated Redis/Valkey URL for the ingress stream. Empty reuses the
     /// primary Redis client, which keeps local development simple.
     pub stream_redis_url: String,
+    /// Independent Valkey connections used for concurrent ingress appends.
+    pub stream_append_connections: usize,
     /// Maximum updates materialized by one Postgres transaction.
     pub materializer_batch_max_rows: usize,
     /// Maximum raw payload bytes materialized by one Postgres transaction.
@@ -1052,6 +1056,8 @@ pub struct RawConfig {
     pub update_queue_backend: Option<String>,
     /// `UPDATE_STREAM_REDIS_URL`.
     pub update_stream_redis_url: Option<String>,
+    /// `UPDATE_STREAM_APPEND_CONNECTIONS`.
+    pub update_stream_append_connections: Option<String>,
     /// `UPDATE_MATERIALIZER_BATCH_MAX_ROWS`.
     pub update_materializer_batch_max_rows: Option<String>,
     /// `UPDATE_MATERIALIZER_BATCH_MAX_BYTES`.
@@ -2118,6 +2124,16 @@ impl AppConfig {
                     .update_stream_redis_url
                     .and_then(|value| parse_scalar_value(Some(value)))
                     .unwrap_or_else(|| DEFAULT_UPDATE_STREAM_REDIS_URL.to_owned()),
+                stream_append_connections: validate_usize_range(
+                    "UPDATE_STREAM_APPEND_CONNECTIONS",
+                    parse_usize(
+                        "UPDATE_STREAM_APPEND_CONNECTIONS",
+                        raw.update_stream_append_connections,
+                        DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS,
+                    )?,
+                    1,
+                    32,
+                )?,
                 materializer_batch_max_rows: validate_usize_range(
                     "UPDATE_MATERIALIZER_BATCH_MAX_ROWS",
                     parse_usize(
@@ -2969,6 +2985,7 @@ impl RawConfig {
             redis_db: env("REDIS_DB"),
             update_queue_backend: env("UPDATE_QUEUE_BACKEND"),
             update_stream_redis_url: env("UPDATE_STREAM_REDIS_URL"),
+            update_stream_append_connections: env("UPDATE_STREAM_APPEND_CONNECTIONS"),
             update_materializer_batch_max_rows: env("UPDATE_MATERIALIZER_BATCH_MAX_ROWS"),
             update_materializer_batch_max_bytes: env("UPDATE_MATERIALIZER_BATCH_MAX_BYTES"),
             update_materializer_batch_max_wait_ms: env("UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS"),
@@ -4976,6 +4993,7 @@ mod tests {
     fn update_stream_materializer_limits_are_validated() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             update_stream_redis_url: Some("redis://redis-ingress:6379/0".to_owned()),
+            update_stream_append_connections: Some("8".to_owned()),
             update_materializer_batch_max_rows: Some("1000".to_owned()),
             update_materializer_batch_max_bytes: Some((32 * 1024 * 1024).to_string()),
             update_materializer_batch_max_wait_ms: Some("1000".to_owned()),
@@ -4989,6 +5007,7 @@ mod tests {
             config.update_queue.stream_redis_url,
             "redis://redis-ingress:6379/0"
         );
+        assert_eq!(config.update_queue.stream_append_connections, 8);
         assert_eq!(config.update_queue.materializer_batch_max_rows, 1000);
         assert_eq!(
             config.update_queue.materializer_batch_max_bytes,
@@ -5012,6 +5031,19 @@ mod tests {
             error,
             Some(super::ConfigError::UnsignedIntegerOutsideRange {
                 name: "UPDATE_MATERIALIZER_BATCH_MAX_ROWS",
+                ..
+            })
+        ));
+
+        let error = AppConfig::from_raw(RawConfig {
+            update_stream_append_connections: Some("33".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::UnsignedIntegerOutsideRange {
+                name: "UPDATE_STREAM_APPEND_CONNECTIONS",
                 ..
             })
         ));

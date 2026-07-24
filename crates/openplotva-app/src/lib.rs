@@ -10756,9 +10756,10 @@ async fn start_runtime_workers(
                 reconcile_report.storage.lane_rows,
             ),
         ));
-        let stream = openplotva_updates::RedisUpdateStream::new(
+        let stream = openplotva_updates::RedisUpdateStream::with_append_connection_count(
             update_stream_redis_client.clone(),
             bot_identity.id,
+            config.update_queue.stream_append_connections,
         );
         let created = stream
             .ensure_consumer_group()

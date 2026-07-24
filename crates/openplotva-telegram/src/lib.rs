@@ -114,10 +114,11 @@ pub use update_startup::{
     GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture,
     LongPollStreamRunReport, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
     TELEGRAM_WEBHOOK_SECRET_HEADER, WEBHOOK_STREAM_APPEND_TIMEOUT, WebhookCertificate,
-    WebhookSetup, WebhookUpdateRequestError, WebhookUpdateSendError, WebhookUpdateSender,
-    build_delete_webhook_method, build_get_updates_method, build_get_updates_method_with_offset,
-    build_set_webhook_method, product_allowed_update_set, run_long_poll_stream_producer_until,
-    run_long_poll_stream_producer_with_ingress_guard_until, webhook_update_stream,
+    WebhookIngressSnapshot, WebhookSetup, WebhookUpdateRequestError, WebhookUpdateSendError,
+    WebhookUpdateSender, build_delete_webhook_method, build_get_updates_method,
+    build_get_updates_method_with_offset, build_set_webhook_method, product_allowed_update_set,
+    run_long_poll_stream_producer_until, run_long_poll_stream_producer_with_ingress_guard_until,
+    webhook_update_stream,
 };
 
 pub const INTEGRATION_CRATE: &str = "carapax";
