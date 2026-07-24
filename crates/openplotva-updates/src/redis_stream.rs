@@ -932,8 +932,10 @@ mod tests {
         env,
         error::Error,
         io,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    use tokio::task::JoinSet;
 
     use super::{
         DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS,
@@ -1154,6 +1156,76 @@ mod tests {
             .group
             .ok_or_else(|| io::Error::other("expected consumer group stats"))?;
         assert_eq!(group.pending, 0);
+
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_stream_handles_concurrent_webhook_burst_when_url_is_set()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+
+        const TOTAL_UPDATES: usize = 5_000;
+        const WEBHOOK_CONCURRENCY: usize = 40;
+
+        let client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:updates:webhook-burst:{suffix}");
+        let stream = RedisUpdateStream::with_key(client.clone(), key.clone());
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut appends = JoinSet::new();
+            for update_id in 0..TOTAL_UPDATES {
+                while appends.len() >= WEBHOOK_CONCURRENCY {
+                    let result = appends
+                        .join_next()
+                        .await
+                        .ok_or_else(|| io::Error::other("append task set stopped early"))?;
+                    result??;
+                }
+                let stream = stream.clone();
+                appends.spawn(async move {
+                    let update_id = i64::try_from(update_id)?;
+                    stream
+                        .append(&UpdateStreamAppend {
+                            bot_id: 42,
+                            update_id: Some(update_id),
+                            source: UpdateStreamSource::Webhook,
+                            received_at_unix_ms: 1_710_000_000_000 + update_id,
+                            raw_payload: format!(r#"{{"update_id":{update_id}}}"#).into_bytes(),
+                        })
+                        .await?;
+                    Ok::<(), Box<dyn Error + Send + Sync>>(())
+                });
+            }
+            while let Some(result) = appends.join_next().await {
+                result??;
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        })
+        .await
+        .map_err(|_| io::Error::other("concurrent webhook burst exceeded 30 seconds"))??;
+
+        let elapsed = started.elapsed();
+        let stats = stream.stats().await?;
+        assert_eq!(stats.length, TOTAL_UPDATES);
+        eprintln!(
+            "webhook-burst-ok updates={TOTAL_UPDATES} concurrency={WEBHOOK_CONCURRENCY} elapsed_ms={} updates_per_second={:.1}",
+            elapsed.as_millis(),
+            TOTAL_UPDATES as f64 / elapsed.as_secs_f64()
+        );
 
         let _: usize = redis::cmd("DEL")
             .arg(&key)
