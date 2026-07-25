@@ -118,8 +118,9 @@ jobs:
           ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
+          scp deploy/production/backup-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/backup-production.sh"
           tar -C tools/token-estimator -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/token-estimator'"
-          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh' '$GETA_DEPLOY_ROOT/backup-production.sh'"
 
       - name: Apply production deployment
         shell: bash

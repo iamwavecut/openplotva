@@ -526,6 +526,7 @@ SELECT
     observed_at
 FROM telegram_users_stage
 WHERE bot_id = $1
+  AND (stream_ms, stream_seq) <= ($2, $3)
 ON CONFLICT (id) DO UPDATE SET
     first_name = COALESCE(EXCLUDED.first_name, users.first_name),
     last_name = COALESCE(EXCLUDED.last_name, users.last_name),
@@ -556,6 +557,7 @@ SELECT
     observed_at
 FROM telegram_chats_stage
 WHERE bot_id = $1
+  AND (stream_ms, stream_seq) <= ($2, $3)
 ON CONFLICT (id) DO UPDATE SET
     type = COALESCE(EXCLUDED.type, chats.type),
     title = COALESCE(EXCLUDED.title, chats.title),
@@ -596,8 +598,11 @@ SELECT
     can_send_messages, can_send_media_messages, can_send_polls,
     can_send_other_messages, can_add_web_page_previews, until_date,
     observed_at
-FROM telegram_chat_members_stage
-WHERE bot_id = $1
+FROM telegram_chat_members_stage AS staged
+JOIN chats ON chats.id = staged.chat_id
+JOIN users ON users.id = staged.user_id
+WHERE staged.bot_id = $1
+  AND (staged.stream_ms, staged.stream_seq) <= ($2, $3)
 ON CONFLICT (chat_id, user_id) DO UPDATE SET
     status = COALESCE(EXCLUDED.status, chat_members.status),
     is_member = COALESCE(EXCLUDED.is_member, chat_members.is_member),
@@ -692,6 +697,7 @@ SET last_message_at = GREATEST(member.last_message_at, staged.last_message_at),
     updated_at = CURRENT_TIMESTAMP
 FROM telegram_activity_stage AS staged
 WHERE staged.bot_id = $1
+  AND (staged.stream_ms, staged.stream_seq) <= ($2, $3)
   AND staged.last_message_at IS NOT NULL
   AND member.chat_id = staged.chat_id
   AND member.user_id = staged.user_id
@@ -706,6 +712,7 @@ FROM telegram_activity_stage AS staged
 JOIN chats ON chats.id = staged.chat_id
 JOIN users ON users.id = staged.user_id
 WHERE staged.bot_id = $1
+  AND (staged.stream_ms, staged.stream_seq) <= ($2, $3)
   AND staged.last_active_at IS NOT NULL
 ON CONFLICT (chat_id, user_id) DO UPDATE SET
     last_active_at = GREATEST(chat_active_users.last_active_at, EXCLUDED.last_active_at)
@@ -725,6 +732,7 @@ SELECT
     observed_at, observed_at
 FROM telegram_files_stage
 WHERE bot_id = $1
+  AND (stream_ms, stream_seq) <= ($2, $3)
 ON CONFLICT (file_unique_id) DO UPDATE SET
     latest_file_id = EXCLUDED.latest_file_id,
     media_kind = EXCLUDED.media_kind,
@@ -768,8 +776,7 @@ WHERE EXCLUDED.telegram_observed_at
 "#;
 
 const SQL_STAGE_FLUSH_CUTOFF: &str = r#"
-SELECT stream_ms, stream_seq
-FROM (
+WITH staged AS (
     SELECT stream_ms, stream_seq FROM telegram_users_stage WHERE bot_id = $1
     UNION ALL
     SELECT stream_ms, stream_seq FROM telegram_chats_stage WHERE bot_id = $1
@@ -779,9 +786,37 @@ FROM (
     SELECT stream_ms, stream_seq FROM telegram_activity_stage WHERE bot_id = $1
     UNION ALL
     SELECT stream_ms, stream_seq FROM telegram_files_stage WHERE bot_id = $1
-) AS staged
+),
+bounded AS (
+    SELECT stream_ms, stream_seq
+    FROM staged
+    ORDER BY stream_ms, stream_seq
+    LIMIT $2
+)
+SELECT stream_ms, stream_seq
+FROM bounded
 ORDER BY stream_ms DESC, stream_seq DESC
 LIMIT 1
+"#;
+
+const SQL_COUNT_ORPHANED_MEMBERS: &str = r#"
+SELECT count(*)
+FROM telegram_chat_members_stage AS staged
+LEFT JOIN chats ON chats.id = staged.chat_id
+LEFT JOIN users ON users.id = staged.user_id
+WHERE staged.bot_id = $1
+  AND (staged.stream_ms, staged.stream_seq) <= ($2, $3)
+  AND (chats.id IS NULL OR users.id IS NULL)
+"#;
+
+const SQL_COUNT_ORPHANED_ACTIVITY: &str = r#"
+SELECT count(*)
+FROM telegram_activity_stage AS staged
+LEFT JOIN chats ON chats.id = staged.chat_id
+LEFT JOIN users ON users.id = staged.user_id
+WHERE staged.bot_id = $1
+  AND (staged.stream_ms, staged.stream_seq) <= ($2, $3)
+  AND (chats.id IS NULL OR users.id IS NULL)
 "#;
 
 const SQL_DELETE_USERS_STAGE: &str = r#"
@@ -901,6 +936,8 @@ pub struct TelegramProjectionFlushReport {
     pub member_activity: u64,
     pub active_users: u64,
     pub files: u64,
+    pub orphaned_members: u64,
+    pub orphaned_activity: u64,
     pub deleted_stage_rows: u64,
 }
 
@@ -944,14 +981,17 @@ impl PostgresTelegramProjectionStore {
     pub async fn flush_staged_projections(
         &self,
         bot_id: i64,
+        max_mutations: usize,
     ) -> Result<TelegramProjectionFlushReport, StorageError> {
         let mut tx = self.pool.begin().await?;
+        let max_mutations = i64::try_from(max_mutations.max(1)).unwrap_or(i64::MAX);
         // The ingestion task stages one monotonically ordered Redis Stream
         // batch at a time. Delete only versions visible at this boundary so a
         // concurrent newer upsert remains staged for the next flush.
         let Some((cutoff_stream_ms, cutoff_stream_seq)) =
             sqlx::query_as::<_, (i64, i64)>(SQL_STAGE_FLUSH_CUTOFF)
                 .bind(bot_id)
+                .bind(max_mutations)
                 .fetch_optional(&mut *tx)
                 .await?
         else {
@@ -960,31 +1000,55 @@ impl PostgresTelegramProjectionStore {
         };
         let users = sqlx::query(SQL_APPLY_USERS_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
         let chats = sqlx::query(SQL_APPLY_CHATS_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let orphaned_members = sqlx::query_scalar::<_, i64>(SQL_COUNT_ORPHANED_MEMBERS)
+            .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
+            .fetch_one(&mut *tx)
+            .await?;
         let members = sqlx::query(SQL_APPLY_MEMBERS_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
         let member_activity = sqlx::query(SQL_APPLY_MEMBER_ACTIVITY_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let orphaned_activity = sqlx::query_scalar::<_, i64>(SQL_COUNT_ORPHANED_ACTIVITY)
+            .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
+            .fetch_one(&mut *tx)
+            .await?;
         let active_users = sqlx::query(SQL_APPLY_ACTIVE_USERS_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
         let files = sqlx::query(SQL_APPLY_FILES_FROM_STAGE)
             .bind(bot_id)
+            .bind(cutoff_stream_ms)
+            .bind(cutoff_stream_seq)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -1015,6 +1079,8 @@ impl PostgresTelegramProjectionStore {
             member_activity,
             active_users,
             files,
+            orphaned_members: u64::try_from(orphaned_members).unwrap_or_default(),
+            orphaned_activity: u64::try_from(orphaned_activity).unwrap_or_default(),
             deleted_stage_rows,
         })
     }
@@ -1552,7 +1618,7 @@ mod tests {
                 .await?
         );
 
-        let flushed = store.flush_staged_projections(bot_id).await?;
+        let flushed = store.flush_staged_projections(bot_id, usize::MAX).await?;
         assert_eq!(flushed.deleted_stage_rows, 5);
         assert_eq!(store.stage_stats(bot_id).await?.rows, 0);
         assert!(
@@ -1593,7 +1659,7 @@ mod tests {
                 "initial",
             )))
             .await?;
-        store.flush_staged_projections(bot_id).await?;
+        store.flush_staged_projections(bot_id, usize::MAX).await?;
         store
             .stage_projection_batch(&user_only_batch(sample_batch(
                 bot_id,
@@ -1613,8 +1679,11 @@ mod tests {
             .await?;
 
         let flushing_store = store.clone();
-        let flush =
-            tokio::spawn(async move { flushing_store.flush_staged_projections(bot_id).await });
+        let flush = tokio::spawn(async move {
+            flushing_store
+                .flush_staged_projections(bot_id, usize::MAX)
+                .await
+        });
         let mut flush_is_waiting = false;
         for _ in 0..100 {
             flush_is_waiting = sqlx::query_scalar(
@@ -1671,7 +1740,7 @@ mod tests {
             .await?
         );
 
-        store.flush_staged_projections(bot_id).await?;
+        store.flush_staged_projections(bot_id, usize::MAX).await?;
         assert!(
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND first_name = 'concurrent')",
@@ -1686,7 +1755,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_activity_does_not_block_valid_projection_flush() -> Result<(), Box<dyn Error>> {
+    async fn bounded_flush_applies_only_the_oldest_mutations() -> Result<(), Box<dyn Error>> {
+        let Some(pool) = migrated_test_pool().await? else {
+            return Ok(());
+        };
+        let suffix = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let bot_id = i64::try_from(suffix.rem_euclid(1_000_000_000))? + 16_000;
+        let first_user_id = bot_id + 1_600_000_000;
+        let second_user_id = bot_id + 1_700_000_000;
+        let chat_id = -(bot_id + 1_800_000_000);
+        let file_unique_id = format!("projection-bounded-flush-{suffix}");
+        cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
+        cleanup(&pool, bot_id, second_user_id, chat_id, &file_unique_id).await?;
+
+        let store = PostgresTelegramProjectionStore::new(pool.clone());
+        let observed_at = OffsetDateTime::now_utc();
+        store
+            .stage_projection_batch(&user_only_batch(sample_batch(
+                bot_id,
+                first_user_id,
+                chat_id,
+                file_unique_id.clone(),
+                observed_at,
+                160,
+                "first",
+            )))
+            .await?;
+        store
+            .stage_projection_batch(&user_only_batch(sample_batch(
+                bot_id,
+                second_user_id,
+                chat_id,
+                file_unique_id.clone(),
+                observed_at + Duration::seconds(1),
+                161,
+                "second",
+            )))
+            .await?;
+
+        let first_flush = store.flush_staged_projections(bot_id, 1).await?;
+        assert_eq!(first_flush.deleted_stage_rows, 1);
+        assert_eq!(store.stage_stats(bot_id).await?.rows, 1);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(first_user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(second_user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+
+        let second_flush = store.flush_staged_projections(bot_id, 1).await?;
+        assert_eq!(second_flush.deleted_stage_rows, 1);
+        assert_eq!(store.stage_stats(bot_id).await?.rows, 0);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+                .bind(second_user_id)
+                .fetch_one(&pool)
+                .await?
+        );
+
+        cleanup(&pool, bot_id, first_user_id, chat_id, &file_unique_id).await?;
+        cleanup(&pool, bot_id, second_user_id, chat_id, &file_unique_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_rows_do_not_block_valid_projection_flush() -> Result<(), Box<dyn Error>> {
         let Some(pool) = migrated_test_pool().await? else {
             return Ok(());
         };
@@ -1702,7 +1841,7 @@ mod tests {
         let store = PostgresTelegramProjectionStore::new(pool.clone());
         let observed_at = OffsetDateTime::now_utc();
         store
-            .stage_projection_batch(&activity_only_batch(sample_batch(
+            .stage_projection_batch(&member_and_activity_only_batch(sample_batch(
                 bot_id,
                 orphan_user_id,
                 orphan_chat_id,
@@ -1724,7 +1863,9 @@ mod tests {
             ))
             .await?;
 
-        let flushed = store.flush_staged_projections(bot_id).await?;
+        let flushed = store.flush_staged_projections(bot_id, usize::MAX).await?;
+        assert_eq!(flushed.orphaned_members, 1);
+        assert_eq!(flushed.orphaned_activity, 1);
         assert_eq!(flushed.active_users, 1);
         assert_eq!(store.stage_stats(bot_id).await?.rows, 0);
         assert!(
@@ -1846,7 +1987,7 @@ mod tests {
                 .await?;
         assert_eq!(effective_name, "newer");
 
-        let flushed = store.flush_staged_projections(bot_id).await?;
+        let flushed = store.flush_staged_projections(bot_id, usize::MAX).await?;
         assert_eq!(flushed.users, 0);
         assert_eq!(flushed.chats, 0);
         assert_eq!(flushed.members, 0);
@@ -2022,10 +2163,11 @@ mod tests {
         batch
     }
 
-    fn activity_only_batch(mut batch: TelegramProjectionBatch) -> TelegramProjectionBatch {
+    fn member_and_activity_only_batch(
+        mut batch: TelegramProjectionBatch,
+    ) -> TelegramProjectionBatch {
         batch.users.clear();
         batch.chats.clear();
-        batch.members.clear();
         batch.files.clear();
         batch
     }

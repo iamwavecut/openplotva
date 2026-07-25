@@ -5,8 +5,11 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use carapax::types::{
@@ -347,6 +350,29 @@ pub struct WebhookUpdateSender {
     bot_id: i64,
     send_timeout: Duration,
     ingress_guard: Option<Arc<openplotva_updates::UpdateIngressGuard>>,
+    metrics: Arc<WebhookIngressMetrics>,
+}
+
+#[derive(Debug, Default)]
+struct WebhookIngressMetrics {
+    append_attempts: AtomicU64,
+    append_succeeded: AtomicU64,
+    append_failed: AtomicU64,
+    append_timed_out: AtomicU64,
+    append_in_flight: AtomicU64,
+    last_append_latency_ms: AtomicU64,
+    last_failure_unix_ms: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WebhookIngressSnapshot {
+    pub append_attempts: u64,
+    pub append_succeeded: u64,
+    pub append_failed: u64,
+    pub append_timed_out: u64,
+    pub append_in_flight: u64,
+    pub last_append_latency_ms: u64,
+    pub last_failure_unix_ms: Option<u64>,
 }
 
 /// Error returned while durably appending a webhook update to Redis Streams.
@@ -388,10 +414,25 @@ pub fn webhook_update_stream(stream: RedisUpdateStream, bot_id: i64) -> WebhookU
         bot_id,
         send_timeout: WEBHOOK_STREAM_APPEND_TIMEOUT,
         ingress_guard: None,
+        metrics: Arc::new(WebhookIngressMetrics::default()),
     }
 }
 
 impl WebhookUpdateSender {
+    #[must_use]
+    pub fn ingress_snapshot(&self) -> WebhookIngressSnapshot {
+        let last_failure_unix_ms = self.metrics.last_failure_unix_ms.load(Ordering::Relaxed);
+        WebhookIngressSnapshot {
+            append_attempts: self.metrics.append_attempts.load(Ordering::Relaxed),
+            append_succeeded: self.metrics.append_succeeded.load(Ordering::Relaxed),
+            append_failed: self.metrics.append_failed.load(Ordering::Relaxed),
+            append_timed_out: self.metrics.append_timed_out.load(Ordering::Relaxed),
+            append_in_flight: self.metrics.append_in_flight.load(Ordering::Relaxed),
+            last_append_latency_ms: self.metrics.last_append_latency_ms.load(Ordering::Relaxed),
+            last_failure_unix_ms: (last_failure_unix_ms != 0).then_some(last_failure_unix_ms),
+        }
+    }
+
     pub fn with_send_timeout(mut self, send_timeout: Duration) -> Self {
         self.send_timeout = send_timeout;
         self
@@ -485,6 +526,11 @@ impl WebhookUpdateSender {
         update_id: Option<i64>,
         body: &[u8],
     ) -> Result<(), WebhookUpdateSendError> {
+        let started = Instant::now();
+        self.metrics.append_attempts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .append_in_flight
+            .fetch_add(1, Ordering::Relaxed);
         let received_at_unix_ms = unix_millis_now();
         let append = UpdateStreamAppend {
             bot_id: self.bot_id,
@@ -493,19 +539,49 @@ impl WebhookUpdateSender {
             received_at_unix_ms,
             raw_payload: body.to_vec(),
         };
-        timeout(self.send_timeout, self.stream.append(&append))
-            .await
-            .map_err(|_| WebhookUpdateSendError::Timeout)?
-            .map(|_| ())
-            .map_err(|error| {
+        let result = match timeout(self.send_timeout, self.stream.append(&append)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
                 tracing::warn!(
                     bot_id = self.bot_id,
                     update_id,
                     error = %error,
                     "failed to append Telegram webhook update to Redis Stream"
                 );
-                WebhookUpdateSendError::Stream
-            })
+                Err(WebhookUpdateSendError::Stream)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    bot_id = self.bot_id,
+                    update_id,
+                    timeout_ms = self.send_timeout.as_millis(),
+                    "timed out appending Telegram webhook update to Redis Stream"
+                );
+                self.metrics
+                    .append_timed_out
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(WebhookUpdateSendError::Timeout)
+            }
+        };
+        self.metrics
+            .append_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics.last_append_latency_ms.store(
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if result.is_ok() {
+            self.metrics
+                .append_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.append_failed.fetch_add(1, Ordering::Relaxed);
+            self.metrics.last_failure_unix_ms.store(
+                unix_millis_now().try_into().unwrap_or_default(),
+                Ordering::Relaxed,
+            );
+        }
+        result
     }
 }
 
@@ -769,6 +845,32 @@ mod tests {
             TELEGRAM_WEBHOOK_SECRET_HEADER,
             "X-Telegram-Bot-Api-Secret-Token"
         );
+        assert_eq!(sender.ingress_snapshot(), Default::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_ingress_metrics_record_append_timeouts() -> Result<(), Box<dyn Error>> {
+        let client = redis::Client::open("redis://127.0.0.1:1/0")?;
+        let stream = openplotva_updates::RedisUpdateStream::with_key(
+            client,
+            "openplotva:webhook-metrics-test",
+        );
+        let sender = super::webhook_update_stream(stream, 77).with_send_timeout(Duration::ZERO);
+
+        let error = sender
+            .handle_webhook_request("POST", Some("secret"), "secret", b"{}")
+            .await
+            .expect_err("zero timeout must fail");
+
+        assert_eq!(error, WebhookUpdateRequestError::ServiceUnavailable);
+        let snapshot = sender.ingress_snapshot();
+        assert_eq!(snapshot.append_attempts, 1);
+        assert_eq!(snapshot.append_succeeded, 0);
+        assert_eq!(snapshot.append_failed, 1);
+        assert_eq!(snapshot.append_timed_out, 1);
+        assert_eq!(snapshot.append_in_flight, 0);
+        assert!(snapshot.last_failure_unix_ms.is_some());
         Ok(())
     }
 

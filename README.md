@@ -12,9 +12,10 @@ It provides:
 ## Requirements
 
 - Rust 1.95.0
-- Docker with Compose for local Postgres and Dragonfly
+- Docker with Compose for local Postgres, Dragonfly, and Valkey
 - PostgreSQL with pgvector for persistent deployments
-- Redis-compatible storage, such as Dragonfly or Redis
+- Dragonfly for primary Redis-compatible state and Valkey with AOF for durable
+  Telegram ingress
 
 ## Local development
 
@@ -55,7 +56,8 @@ The app reads `.env` files and environment variables. Important groups:
 
 - `WEBAPP_*` for HTTP binding and public WebApp URL.
 - `DB_POSTGRES_*` for Postgres.
-- `REDIS_*` for Redis or Dragonfly.
+- `REDIS_*` for Dragonfly.
+- `UPDATE_STREAM_REDIS_URL` for the dedicated Valkey ingress stream.
 - `BOT_*` for Telegram Bot API configuration.
 - `ADMINS_ADMIN_IDS` for administrative Telegram users.
 - `RUNTIME_API_*` for the optional diagnostic API.

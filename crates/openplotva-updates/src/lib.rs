@@ -6,7 +6,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -294,15 +297,24 @@ pub struct RedisUpdateQueue {
 #[derive(Clone, Debug)]
 struct RedisUpdateConnections {
     client: RedisClient,
+    appends: Arc<RedisAppendConnectionPool>,
     commands: Arc<OnceCell<ConnectionManager>>,
     leases: Arc<OnceCell<ConnectionManager>>,
+}
+
+#[derive(Debug)]
+struct RedisAppendConnectionPool {
+    connections: Box<[OnceCell<ConnectionManager>]>,
+    next: AtomicUsize,
 }
 
 /// Margin added to the client-side response timeout of a blocking read so the
 /// server-side `BLPOP` timeout always fires first.
 const BLOCKING_RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS: usize = 4;
 const REDIS_UPDATE_COMMAND_CLIENT_NAME: &str = "openplotva:updates:commands";
+const REDIS_UPDATE_APPEND_CLIENT_NAME_PREFIX: &str = "openplotva:updates:appends";
 const REDIS_UPDATE_LEASE_CLIENT_NAME: &str = "openplotva:updates:leases";
 const REDIS_UPDATE_BLOCKING_CLIENT_NAME: &str = "openplotva:updates:blocking";
 /// Cap on retained enqueue-error strings per producer run so a sustained queue
@@ -331,11 +343,42 @@ fn blocking_response_timeout(timeout: Duration) -> Option<Duration> {
 
 impl RedisUpdateConnections {
     fn new(client: RedisClient) -> Self {
+        Self::with_append_connection_count(client, DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS)
+    }
+
+    fn with_append_connection_count(client: RedisClient, append_connection_count: usize) -> Self {
+        let append_connection_count = append_connection_count.max(1);
         Self {
             client,
+            appends: Arc::new(RedisAppendConnectionPool {
+                connections: (0..append_connection_count)
+                    .map(|_| OnceCell::new())
+                    .collect(),
+                next: AtomicUsize::new(0),
+            }),
             commands: Arc::new(OnceCell::new()),
             leases: Arc::new(OnceCell::new()),
         }
+    }
+
+    async fn append_connection(&self) -> redis::RedisResult<ConnectionManager> {
+        let index =
+            self.appends.next.fetch_add(1, Ordering::Relaxed) % self.appends.connections.len();
+        self.appends.connections[index]
+            .get_or_try_init(|| async {
+                let mut connection = self
+                    .client
+                    .get_connection_manager_with_config(command_connection_config())
+                    .await?;
+                set_redis_client_name(
+                    &mut connection,
+                    &format!("{REDIS_UPDATE_APPEND_CLIENT_NAME_PREFIX}:{index}"),
+                )
+                .await?;
+                Ok(connection)
+            })
+            .await
+            .cloned()
     }
 
     async fn lease_connection(&self) -> redis::RedisResult<ConnectionManager> {
@@ -390,6 +433,16 @@ impl RedisUpdateConnections {
     #[cfg(test)]
     fn shares_command_manager_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.commands, &other.commands)
+    }
+
+    #[cfg(test)]
+    fn shares_append_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.appends, &other.appends)
+    }
+
+    #[cfg(test)]
+    fn append_connection_count(&self) -> usize {
+        self.appends.connections.len()
     }
 }
 

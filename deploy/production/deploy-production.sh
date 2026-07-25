@@ -7,7 +7,7 @@ env_file="${deploy_root}/.env.production"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"
 image="${OPENPLOTVA_DEPLOY_IMAGE:?OPENPLOTVA_DEPLOY_IMAGE is required}"
 dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
-update_stream_redis_image="${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}"
+update_stream_valkey_image="${UPDATE_STREAM_VALKEY_IMAGE:-${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
 
 log() {
@@ -22,7 +22,7 @@ fail() {
 compose() {
   local db_password
   db_password="$(effective_db_postgres_password)"
-  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_REDIS_IMAGE="$update_stream_redis_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
+  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
 }
 
 env_file_has_key() {
@@ -76,6 +76,19 @@ validate_env() {
   fi
 }
 
+validate_runtime_store_images() {
+  case "$dragonfly_image" in
+    *dragonflydb/dragonfly:*) ;;
+    *) fail "DRAGONFLY_IMAGE must use the Dragonfly server image, got ${dragonfly_image}" ;;
+  esac
+  case "$update_stream_valkey_image" in
+    valkey/valkey:*|docker.io/valkey/valkey:*) ;;
+    *)
+      fail "UPDATE_STREAM_VALKEY_IMAGE must use Valkey for durable ingress, got ${update_stream_valkey_image}"
+      ;;
+  esac
+}
+
 docker_login_and_pull() {
   [[ -n "${GHCR_PULL_TOKEN:-}" ]] || fail "GHCR_PULL_TOKEN is required"
   [[ -n "${GHCR_USERNAME:-}" ]] || fail "GHCR_USERNAME is required"
@@ -86,6 +99,17 @@ docker_login_and_pull() {
 
 compose_config() {
   compose config --quiet
+}
+
+create_predeploy_backup() {
+  local backup_script="${deploy_root}/backup-production.sh"
+  [[ -x "$backup_script" ]] || fail "production backup script is missing or not executable"
+  OPENPLOTVA_BACKUP_COMPOSE_FILE="$compose_file" \
+    OPENPLOTVA_BACKUP_ENV_FILE="$env_file" \
+    OPENPLOTVA_DEPLOY_IMAGE="$image" \
+    DRAGONFLY_IMAGE="$dragonfly_image" \
+    UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" \
+    "$backup_script"
 }
 
 volume_exists() {
@@ -221,6 +245,17 @@ log_dragonfly_info() {
   done <<<"$info"
 }
 
+verify_dragonfly_engine() {
+  local container
+  local info
+  container="$(compose ps -q dragonfly)"
+  [[ -n "$container" ]] || fail "dragonfly container is missing"
+  info="$(docker exec "$container" redis-cli INFO server 2>/dev/null | tr -d '\r')"
+  grep -q '^dragonfly_version:' <<<"$info" ||
+    fail "primary Redis-compatible state service is not Dragonfly"
+  log "primary Redis-compatible state service verified as Dragonfly"
+}
+
 ensure_dragonfly() {
   local container="${project}-dragonfly-1"
   local running_image
@@ -237,18 +272,30 @@ ensure_dragonfly() {
     ensure_service dragonfly
   fi
   wait_for_service_health dragonfly
+  verify_dragonfly_engine
   log_dragonfly_info
 }
 
 verify_update_stream_persistence() {
   local container
   local persistence
+  local server
+  local appendfsync
+  local memory
   container="$(compose ps -q redis-ingress)"
   [[ -n "$container" ]] || fail "redis-ingress container is missing"
+  server="$(docker exec "$container" valkey-cli INFO server 2>/dev/null | tr -d '\r')"
+  grep -q '^server_name:valkey$' <<<"$server" ||
+    fail "durable ingress service is not Valkey"
   persistence="$(docker exec "$container" valkey-cli INFO persistence 2>/dev/null | tr -d '\r')"
   grep -q '^aof_enabled:1$' <<<"$persistence" || fail "redis-ingress AOF is disabled"
   grep -q '^aof_last_write_status:ok$' <<<"$persistence" || fail "redis-ingress AOF last write failed"
-  log "redis-ingress AOF enabled and writable"
+  appendfsync="$(docker exec "$container" valkey-cli CONFIG GET appendfsync 2>/dev/null | tr -d '\r')"
+  grep -qx 'always' <<<"$appendfsync" || fail "redis-ingress appendfsync is not always"
+  memory="$(docker exec "$container" valkey-cli INFO memory 2>/dev/null | tr -d '\r')"
+  grep -q '^maxmemory_policy:noeviction$' <<<"$memory" ||
+    fail "redis-ingress maxmemory policy is not noeviction"
+  log "durable ingress verified as Valkey with writable AOF, appendfsync always, and noeviction"
 }
 
 wait_for_service_health() {
@@ -437,8 +484,10 @@ main() {
   install_layout
   bootstrap_env
   validate_env
-  docker_login_and_pull
+  validate_runtime_store_images
   compose_config
+  create_predeploy_backup
+  docker_login_and_pull
 
   local postgres_mode
   postgres_mode="$(legacy_postgres_import_mode)"

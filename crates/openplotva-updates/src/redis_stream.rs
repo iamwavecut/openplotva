@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::RedisUpdateConnections;
+use super::{DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS, RedisUpdateConnections};
 
 /// Prefix used for per-bot durable ingress streams.
 pub const DEFAULT_UPDATE_STREAM_KEY_PREFIX: &str = "plotva:updates:stream:v1";
@@ -418,10 +418,25 @@ pub struct RedisUpdateStream {
 impl RedisUpdateStream {
     #[must_use]
     pub fn new(client: redis::Client, bot_id: i64) -> Self {
-        Self::with_key_and_group(
+        Self::with_key_group_and_append_connections(
             client,
             update_stream_key(bot_id),
             DEFAULT_UPDATE_STREAM_CONSUMER_GROUP,
+            DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS,
+        )
+    }
+
+    #[must_use]
+    pub fn with_append_connection_count(
+        client: redis::Client,
+        bot_id: i64,
+        append_connection_count: usize,
+    ) -> Self {
+        Self::with_key_group_and_append_connections(
+            client,
+            update_stream_key(bot_id),
+            DEFAULT_UPDATE_STREAM_CONSUMER_GROUP,
+            append_connection_count,
         )
     }
 
@@ -436,9 +451,26 @@ impl RedisUpdateStream {
         key: impl Into<String>,
         group: impl Into<String>,
     ) -> Self {
+        Self::with_key_group_and_append_connections(
+            client,
+            key,
+            group,
+            DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS,
+        )
+    }
+
+    fn with_key_group_and_append_connections(
+        client: redis::Client,
+        key: impl Into<String>,
+        group: impl Into<String>,
+        append_connection_count: usize,
+    ) -> Self {
         let key = key.into();
         Self {
-            connections: RedisUpdateConnections::new(client),
+            connections: RedisUpdateConnections::with_append_connection_count(
+                client,
+                append_connection_count,
+            ),
             long_poll_cursor_key: format!("{key}:long-poll-cursor"),
             materializer_lease_key: format!("{key}:materializer-lease"),
             key,
@@ -481,7 +513,7 @@ impl RedisUpdateStream {
         &self,
         update: &UpdateStreamAppend,
     ) -> Result<UpdateStreamId, UpdateStreamError> {
-        let mut connection = self.connections.command_connection().await?;
+        let mut connection = self.connections.append_connection().await?;
         let id: String = build_append_command(&self.key, update)
             .query_async(&mut connection)
             .await?;
@@ -516,7 +548,7 @@ impl RedisUpdateStream {
             .arg(&self.long_poll_cursor_key)
             .arg(next_cursor)
             .ignore();
-        let mut connection = self.connections.command_connection().await?;
+        let mut connection = self.connections.append_connection().await?;
         let ids: Vec<String> = pipeline.query_async(&mut connection).await?;
         ids.into_iter()
             .map(|id| id.parse().map_err(UpdateStreamError::from))
@@ -932,23 +964,41 @@ mod tests {
         env,
         error::Error,
         io,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    use tokio::task::JoinSet;
 
     use super::{
         DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS,
         DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT, DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT,
-        MAX_UPDATE_MATERIALIZER_BATCH_ROWS, RawUpdateStreamEntry, RedisUpdateStream,
-        STREAM_FIELD_BOT_ID, STREAM_FIELD_PAYLOAD, STREAM_FIELD_PAYLOAD_SHA256,
-        STREAM_FIELD_RECEIVED_AT, STREAM_FIELD_SCHEMA_VERSION, STREAM_FIELD_SOURCE,
-        STREAM_FIELD_UPDATE_ID, UPDATE_STREAM_SCHEMA_VERSION, UpdateStreamAppend,
-        UpdateStreamConfigError, UpdateStreamId, UpdateStreamMaterializerConfig,
-        UpdateStreamSource, build_append_command, info_u64, info_value, update_stream_key,
+        DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS, MAX_UPDATE_MATERIALIZER_BATCH_ROWS,
+        RawUpdateStreamEntry, RedisUpdateStream, STREAM_FIELD_BOT_ID, STREAM_FIELD_PAYLOAD,
+        STREAM_FIELD_PAYLOAD_SHA256, STREAM_FIELD_RECEIVED_AT, STREAM_FIELD_SCHEMA_VERSION,
+        STREAM_FIELD_SOURCE, STREAM_FIELD_UPDATE_ID, UPDATE_STREAM_SCHEMA_VERSION,
+        UpdateStreamAppend, UpdateStreamConfigError, UpdateStreamId,
+        UpdateStreamMaterializerConfig, UpdateStreamSource, build_append_command, info_u64,
+        info_value, update_stream_key,
     };
 
     #[test]
     fn stream_key_is_partitioned_by_bot_identity() {
         assert_eq!(update_stream_key(12345), "plotva:updates:stream:v1:12345");
+    }
+
+    #[test]
+    fn stream_clones_share_the_configured_append_pool() -> Result<(), Box<dyn Error>> {
+        let client = redis::Client::open("redis://127.0.0.1/0")?;
+        let stream = RedisUpdateStream::with_append_connection_count(client, 12345, 8);
+        let clone = stream.clone();
+
+        assert_eq!(stream.connections.append_connection_count(), 8);
+        assert!(
+            stream
+                .connections
+                .shares_append_pool_with(&clone.connections)
+        );
+        Ok(())
     }
 
     #[test]
@@ -1154,6 +1204,86 @@ mod tests {
             .group
             .ok_or_else(|| io::Error::other("expected consumer group stats"))?;
         assert_eq!(group.pending, 0);
+
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_stream_handles_concurrent_webhook_burst_when_url_is_set()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+
+        const TOTAL_UPDATES: usize = 5_000;
+        const WEBHOOK_CONCURRENCY: usize = 40;
+
+        let client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:updates:webhook-burst:{suffix}");
+        let stream = RedisUpdateStream::with_key(client.clone(), key.clone());
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut appends = JoinSet::new();
+            for update_id in 0..TOTAL_UPDATES {
+                while appends.len() >= WEBHOOK_CONCURRENCY {
+                    let result = appends
+                        .join_next()
+                        .await
+                        .ok_or_else(|| io::Error::other("append task set stopped early"))?;
+                    result??;
+                }
+                let stream = stream.clone();
+                appends.spawn(async move {
+                    let update_id = i64::try_from(update_id)?;
+                    stream
+                        .append(&UpdateStreamAppend {
+                            bot_id: 42,
+                            update_id: Some(update_id),
+                            source: UpdateStreamSource::Webhook,
+                            received_at_unix_ms: 1_710_000_000_000 + update_id,
+                            raw_payload: format!(r#"{{"update_id":{update_id}}}"#).into_bytes(),
+                        })
+                        .await?;
+                    Ok::<(), Box<dyn Error + Send + Sync>>(())
+                });
+            }
+            while let Some(result) = appends.join_next().await {
+                result??;
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        })
+        .await
+        .map_err(|_| io::Error::other("concurrent webhook burst exceeded 30 seconds"))??;
+
+        let elapsed = started.elapsed();
+        let stats = stream.stats().await?;
+        assert_eq!(stats.length, TOTAL_UPDATES);
+        let clients: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(&mut connection)
+            .await?;
+        for index in 0..DEFAULT_UPDATE_STREAM_APPEND_CONNECTIONS {
+            assert!(
+                clients.contains(&format!("name=openplotva:updates:appends:{index}")),
+                "missing dedicated append connection {index}"
+            );
+        }
+        eprintln!(
+            "webhook-burst-ok updates={TOTAL_UPDATES} concurrency={WEBHOOK_CONCURRENCY} elapsed_ms={} updates_per_second={:.1}",
+            elapsed.as_millis(),
+            TOTAL_UPDATES as f64 / elapsed.as_secs_f64()
+        );
 
         let _: usize = redis::cmd("DEL")
             .arg(&key)
