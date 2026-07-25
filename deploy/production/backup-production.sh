@@ -95,10 +95,9 @@ snapshot_dragonfly_service() {
   [[ -n "$data_volume" ]] || fail "${service} /data mount is not a named volume"
   docker run --rm \
     -v "${data_volume}:/from:ro" \
-    -v "$(dirname "$output"):/backup" \
     "$alpine_image" \
-    sh -c 'archive="$2"; cd /from; set -- "$1"-*.dfs; test -f "$1"; tar czf "/backup/$archive" "$@"' \
-    sh "$snapshot_prefix" "$(basename "$output")"
+    sh -c 'cd /from; set -- "$1"-*.dfs; test -f "$1"; tar czf - "$@"' \
+    sh "$snapshot_prefix" >"$output"
   require_nonempty_file "$output"
   tar -tzf "$output" | grep -Fxq "$last_saved_file" ||
     fail "${service} archive does not contain ${last_saved_file}"
@@ -115,7 +114,7 @@ snapshot_valkey_service() {
   [[ -n "$container" ]] || fail "${service} container is missing"
   log "creating consistent ${service} RDB snapshot"
   docker exec "$container" valkey-cli SAVE >/dev/null
-  docker cp "${container}:/data/dump.rdb" "$output" >/dev/null
+  docker exec "$container" cat /data/dump.rdb >"$output"
   require_nonempty_file "$output"
   header="$(head -c 5 "$output")"
   [[ "$header" == "REDIS" ]] || fail "${service} snapshot has an invalid RDB header"
@@ -166,6 +165,7 @@ main() {
   local timestamp
   local temporary_dir
   local final_dir
+  local cleanup_command
   db_user="$(env_file_value DB_POSTGRES_USER)"
   db_user="${db_user:-plotva}"
   db_name="$(env_file_value DB_POSTGRES_DB)"
@@ -175,7 +175,8 @@ main() {
   install -d -m 700 "$backup_root"
   temporary_dir="$(mktemp -d "${backup_root}/.predeploy-${timestamp}.XXXXXX")"
   final_dir="${backup_root}/predeploy-${timestamp}"
-  trap 'rm -rf -- "$temporary_dir"' EXIT
+  printf -v cleanup_command 'rm -rf -- %q' "$temporary_dir"
+  trap "$cleanup_command" EXIT
 
   log "dumping PostgreSQL database ${db_name}"
   compose exec -T "$postgres_service" \
@@ -195,9 +196,9 @@ main() {
     log "archiving application state volume"
     docker run --rm \
       -v "${state_volume}:/from:ro" \
-      -v "${temporary_dir}:/backup" \
       "$alpine_image" \
-      sh -c 'cd /from && tar czf /backup/openplotva-state.tar.gz .'
+      sh -c 'cd /from && tar czf - .' \
+      >"${temporary_dir}/openplotva-state.tar.gz"
     require_nonempty_file "${temporary_dir}/openplotva-state.tar.gz"
     tar -tzf "${temporary_dir}/openplotva-state.tar.gz" >/dev/null
     chmod 600 "${temporary_dir}/openplotva-state.tar.gz"
