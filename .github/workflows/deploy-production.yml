@@ -134,7 +134,10 @@ jobs:
           printf -v token_q '%q' "$GHCR_PULL_TOKEN"
           printf -v actor_q '%q' "$GITHUB_ACTOR"
           printf -v env_q '%q' "${OPENPLOTVA_PRODUCTION_ENV_B64:-}"
-          ssh "$GETA_SSH_TARGET" \
+          ssh \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            "$GETA_SSH_TARGET" \
             "OPENPLOTVA_DEPLOY_IMAGE=$image_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q OPENPLOTVA_PRODUCTION_ENV_B64=$env_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
       - name: Cleanup old GHCR images
