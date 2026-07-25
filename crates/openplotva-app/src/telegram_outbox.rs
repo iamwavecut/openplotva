@@ -10,6 +10,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -237,6 +238,41 @@ pub struct TelegramOutboxWorkerReport {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TelegramOutboxWorkerMetrics {
+    inner: Arc<Mutex<TelegramOutboxWorkerMetricsSnapshot>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TelegramOutboxWorkerMetricsSnapshot {
+    pub running: bool,
+    pub report: TelegramOutboxWorkerReport,
+    pub last_error_unix_ms: Option<u64>,
+}
+
+impl TelegramOutboxWorkerMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> TelegramOutboxWorkerMetricsSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish(&self, running: bool, report: &TelegramOutboxWorkerReport) {
+        let mut snapshot = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if report.errors > snapshot.report.errors {
+            snapshot.last_error_unix_ms =
+                u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).ok();
+        }
+        snapshot.running = running;
+        snapshot.report = report.clone();
+    }
+}
+
 /// Run a crash-recovering outbox worker until shutdown is requested.
 ///
 /// Shutdown is observed between operations. Once `request_started_at` is
@@ -252,6 +288,7 @@ pub async fn run_telegram_outbox_worker_until<Transport, Jobs>(
     worker_id: &str,
     expected_bot_id: i64,
     config: TelegramOutboxWorkerConfig,
+    metrics: TelegramOutboxWorkerMetrics,
     stop: impl Future<Output = ()>,
 ) -> TelegramOutboxWorkerReport
 where
@@ -259,6 +296,7 @@ where
     Jobs: TelegramOutboxJobResolver,
 {
     let mut report = TelegramOutboxWorkerReport::default();
+    metrics.publish(true, &report);
     let mut last_maintenance = None;
     tokio::pin!(stop);
 
@@ -267,6 +305,7 @@ where
             .is_none_or(|last: Instant| last.elapsed() >= config.maintenance_interval)
         {
             run_outbox_maintenance(&store, &history, &jobs, &mut report).await;
+            metrics.publish(true, &report);
             last_maintenance = Some(Instant::now());
         }
 
@@ -281,6 +320,7 @@ where
             Ok(operations) => operations,
             Err(error) => {
                 record_worker_error(&mut report, format!("claim Telegram outbox: {error}"));
+                metrics.publish(true, &report);
                 tokio::select! {
                     () = &mut stop => break,
                     () = tokio::time::sleep(config.idle_poll_interval) => {}
@@ -357,8 +397,10 @@ where
         for operation_report in operation_reports {
             merge_worker_report(&mut report, operation_report);
         }
+        metrics.publish(true, &report);
     }
 
+    metrics.publish(false, &report);
     report
 }
 
@@ -1611,6 +1653,25 @@ fn merge_worker_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_metrics_publish_liveness_and_recent_errors() {
+        let metrics = TelegramOutboxWorkerMetrics::default();
+        let mut report = TelegramOutboxWorkerReport::default();
+
+        metrics.publish(true, &report);
+        assert!(metrics.snapshot().running);
+        assert_eq!(metrics.snapshot().last_error_unix_ms, None);
+
+        report.errors = 1;
+        report.last_error = Some("database unavailable".to_owned());
+        metrics.publish(true, &report);
+        assert!(metrics.snapshot().last_error_unix_ms.is_some());
+        assert_eq!(metrics.snapshot().report, report);
+
+        metrics.publish(false, &report);
+        assert!(!metrics.snapshot().running);
+    }
 
     #[test]
     fn method_kind_parser_accepts_storage_and_bot_api_labels() {

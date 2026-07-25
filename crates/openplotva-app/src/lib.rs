@@ -8947,6 +8947,43 @@ fn telegram_webhook_ingress_readiness(
     }
 }
 
+fn telegram_outbox_readiness(
+    metrics: &telegram_outbox::TelegramOutboxWorkerMetrics,
+) -> ReadinessCheck {
+    const RECENT_FAILURE_WINDOW_MS: u64 = 30_000;
+
+    let snapshot = metrics.snapshot();
+    if !snapshot.running {
+        return ReadinessCheck::error(
+            "telegram_outbox_live",
+            "durable Telegram outbox worker is not running",
+        );
+    }
+    let now_unix_ms = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .unwrap_or_default();
+    let recent_error = snapshot
+        .last_error_unix_ms
+        .is_some_and(|failed_at| now_unix_ms.saturating_sub(failed_at) <= RECENT_FAILURE_WINDOW_MS);
+    let report = snapshot.report;
+    let detail = format!(
+        "{} claimed, {} delivered, {} retried, {} ambiguous, {} dead-lettered, {} errors",
+        report.claimed,
+        report.delivered,
+        report.retried,
+        report.ambiguous,
+        report.dead_lettered,
+        report.errors,
+    );
+    if recent_error {
+        ReadinessCheck::error(
+            "telegram_outbox_live",
+            format!("recent worker error; {detail}"),
+        )
+    } else {
+        ReadinessCheck::ok("telegram_outbox_live", detail)
+    }
+}
+
 fn record_dialog_tool_mode_readiness(
     config: &AppConfig,
     readiness_checks: &mut Vec<ReadinessCheck>,
@@ -11303,6 +11340,11 @@ async fn start_runtime_workers(
     );
     let telegram_outbox_worker_id =
         format!("telegram-outbox-{}-{}", bot_identity.id, std::process::id());
+    let telegram_outbox_metrics = telegram_outbox::TelegramOutboxWorkerMetrics::default();
+    let readiness_telegram_outbox_metrics = telegram_outbox_metrics.clone();
+    workers.readiness_probes.push(Arc::new(move || {
+        telegram_outbox_readiness(&readiness_telegram_outbox_metrics)
+    }));
     let telegram_outbox_bot_id = bot_identity.id;
     let telegram_outbox_history = history_store.clone();
     let telegram_outbox_stop = stop.subscribe();
@@ -11315,6 +11357,7 @@ async fn start_runtime_workers(
             &telegram_outbox_worker_id,
             telegram_outbox_bot_id,
             telegram_outbox::TelegramOutboxWorkerConfig::default(),
+            telegram_outbox_metrics,
             wait_for_runtime_stop(telegram_outbox_stop),
         )
         .await;
@@ -13849,6 +13892,13 @@ mod tests {
         assert!(!super::postgres_capacity_is_exhausted(7, 8, 0));
         assert!(!super::postgres_capacity_is_exhausted(8, 8, 1));
         assert!(super::postgres_capacity_is_exhausted(8, 8, 0));
+    }
+
+    #[test]
+    fn telegram_outbox_readiness_fails_before_worker_start() {
+        let metrics = super::telegram_outbox::TelegramOutboxWorkerMetrics::default();
+
+        assert_eq!(super::telegram_outbox_readiness(&metrics).status, "error");
     }
 
     #[tokio::test]
