@@ -68,13 +68,16 @@ pub use telegram_projection::{
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "storage";
 
-const POSTGRES_MAX_CONNECTIONS: u32 = 50;
-const POSTGRES_MIN_CONNECTIONS: u32 = 10;
+pub const POSTGRES_GENERAL_MAX_CONNECTIONS: u32 = 42;
+const POSTGRES_GENERAL_MIN_CONNECTIONS: u32 = 8;
+pub const POSTGRES_CRITICAL_MAX_CONNECTIONS: u32 = 8;
+const POSTGRES_CRITICAL_MIN_CONNECTIONS: u32 = 2;
 const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
 /// Max wait for a pooled connection before the caller gets an error instead of
 /// hanging. Kept below the dispatcher send budget so connection starvation surfaces
 /// as a fast, observable failure rather than a silent stall in the send path.
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+const POSTGRES_CRITICAL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Recycle connections that have sat idle this long so the pool heals after a
 /// database restart/failover instead of pinning dead sockets.
 const POSTGRES_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1572,8 +1575,10 @@ struct LegacyMigrationBridgeEntry<'a> {
 /// Connected service clients kept alive by the application shell.
 #[derive(Clone, Debug)]
 pub struct ServiceClients {
-    /// SQLx Postgres pool.
+    /// General SQLx Postgres pool for application and operator workloads.
     pub postgres: PgPool,
+    /// Reserved SQLx Postgres pool for Telegram materialization and delivery.
+    pub critical_postgres: PgPool,
     /// Redis client that has passed a startup ping.
     pub redis: RedisStore,
     /// Whether SQLx migrations were applied during startup.
@@ -8457,10 +8462,12 @@ pub async fn connect_service_clients(
     if run_migrations {
         run_migrations_on(&postgres).await?;
     }
+    let critical_postgres = connect_critical_postgres(postgres.connect_options().as_ref()).await?;
     let redis = connect_redis(redis).await?;
 
     Ok(ServiceClients {
         postgres,
+        critical_postgres,
         redis,
         migrations_applied: run_migrations,
     })
@@ -8468,12 +8475,26 @@ pub async fn connect_service_clients(
 
 pub async fn connect_postgres(config: &PostgresConfig) -> Result<PgPool, StorageError> {
     PgPoolOptions::new()
-        .max_connections(POSTGRES_MAX_CONNECTIONS)
-        .min_connections(POSTGRES_MIN_CONNECTIONS)
+        .max_connections(POSTGRES_GENERAL_MAX_CONNECTIONS)
+        .min_connections(POSTGRES_GENERAL_MIN_CONNECTIONS)
         .max_lifetime(POSTGRES_MAX_CONNECTION_LIFETIME)
         .acquire_timeout(POSTGRES_ACQUIRE_TIMEOUT)
         .idle_timeout(POSTGRES_IDLE_TIMEOUT)
         .connect(&config.startup_dsn())
+        .await
+        .map_err(StorageError::from)
+}
+
+async fn connect_critical_postgres(
+    options: &sqlx::postgres::PgConnectOptions,
+) -> Result<PgPool, StorageError> {
+    PgPoolOptions::new()
+        .max_connections(POSTGRES_CRITICAL_MAX_CONNECTIONS)
+        .min_connections(POSTGRES_CRITICAL_MIN_CONNECTIONS)
+        .max_lifetime(POSTGRES_MAX_CONNECTION_LIFETIME)
+        .acquire_timeout(POSTGRES_CRITICAL_ACQUIRE_TIMEOUT)
+        .idle_timeout(POSTGRES_IDLE_TIMEOUT)
+        .connect_with(options.clone())
         .await
         .map_err(StorageError::from)
 }
@@ -9238,6 +9259,41 @@ mod tests {
     use openplotva_config::{DEFAULT_REDIS_DB, RedisConfig};
     use redis::ConnectionAddr;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn postgres_capacity_reserves_critical_slots_without_increasing_total() {
+        assert_eq!(
+            super::POSTGRES_GENERAL_MAX_CONNECTIONS + super::POSTGRES_CRITICAL_MAX_CONNECTIONS,
+            50
+        );
+        assert_eq!(super::POSTGRES_GENERAL_MAX_CONNECTIONS, 42);
+        assert_eq!(super::POSTGRES_CRITICAL_MAX_CONNECTIONS, 8);
+    }
+
+    #[tokio::test]
+    async fn critical_postgres_pool_uses_its_reserved_capacity() -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let general = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let critical = super::connect_critical_postgres(general.connect_options().as_ref()).await?;
+
+        assert_eq!(
+            critical.options().get_max_connections(),
+            super::POSTGRES_CRITICAL_MAX_CONNECTIONS
+        );
+        assert!(critical.size() >= super::POSTGRES_CRITICAL_MIN_CONNECTIONS);
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(&critical)
+                .await?,
+            1
+        );
+        Ok(())
+    }
 
     #[test]
     fn taskman_asr_job_type_is_persisted_with_stable_name() {

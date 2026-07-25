@@ -8863,7 +8863,11 @@ async fn connect_services(
     .context("connect Postgres and Redis")?;
     readiness_checks.push(ReadinessCheck::ok(
         "postgres",
-        "startup connection established",
+        format!(
+            "startup connections established; {} general and {} critical slots",
+            openplotva_storage::POSTGRES_GENERAL_MAX_CONNECTIONS,
+            openplotva_storage::POSTGRES_CRITICAL_MAX_CONNECTIONS,
+        ),
     ));
     if clients.migrations_applied {
         readiness_checks.push(ReadinessCheck::ok(
@@ -8878,6 +8882,69 @@ async fn connect_services(
     }
     readiness_checks.push(ReadinessCheck::ok("redis", "startup ping succeeded"));
     Ok(Some(clients))
+}
+
+fn postgres_capacity_is_exhausted(size: u32, max_connections: u32, idle: usize) -> bool {
+    size >= max_connections && idle == 0
+}
+
+fn postgres_pool_is_exhausted(pool: &PgPool) -> bool {
+    postgres_capacity_is_exhausted(
+        pool.size(),
+        pool.options().get_max_connections(),
+        pool.num_idle(),
+    )
+}
+
+fn postgres_pool_readiness(general: &PgPool, critical: &PgPool) -> ReadinessCheck {
+    if general.is_closed() || critical.is_closed() {
+        return ReadinessCheck::error("postgres_pools_live", "a Postgres pool is closed");
+    }
+    let general_exhausted = postgres_pool_is_exhausted(general);
+    let critical_exhausted = postgres_pool_is_exhausted(critical);
+    let detail = format!(
+        "general size={}/{} idle={}; critical size={}/{} idle={}",
+        general.size(),
+        general.options().get_max_connections(),
+        general.num_idle(),
+        critical.size(),
+        critical.options().get_max_connections(),
+        critical.num_idle(),
+    );
+    if general_exhausted || critical_exhausted {
+        ReadinessCheck::error("postgres_pools_live", format!("pool exhausted; {detail}"))
+    } else {
+        ReadinessCheck::ok("postgres_pools_live", detail)
+    }
+}
+
+fn telegram_webhook_ingress_readiness(
+    sender: &openplotva_telegram::WebhookUpdateSender,
+) -> ReadinessCheck {
+    const RECENT_FAILURE_WINDOW_MS: u64 = 30_000;
+
+    let snapshot = sender.ingress_snapshot();
+    let now_unix_ms = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .unwrap_or_default();
+    let recent_failure = snapshot
+        .last_failure_unix_ms
+        .is_some_and(|failed_at| now_unix_ms.saturating_sub(failed_at) <= RECENT_FAILURE_WINDOW_MS);
+    let detail = format!(
+        "{} succeeded, {} failed ({} timeouts), {} in flight, last latency {} ms",
+        snapshot.append_succeeded,
+        snapshot.append_failed,
+        snapshot.append_timed_out,
+        snapshot.append_in_flight,
+        snapshot.last_append_latency_ms,
+    );
+    if recent_failure {
+        ReadinessCheck::error(
+            "telegram_webhook_ingress_live",
+            format!("recent durable append failure; {detail}"),
+        )
+    } else {
+        ReadinessCheck::ok("telegram_webhook_ingress_live", detail)
+    }
 }
 
 fn record_dialog_tool_mode_readiness(
@@ -9785,6 +9852,11 @@ async fn start_runtime_workers(
         dialog_worker_gauge: None,
         readiness_probes: Vec::new(),
     };
+    let readiness_general_postgres = service_clients.postgres.clone();
+    let readiness_critical_postgres = service_clients.critical_postgres.clone();
+    workers.readiness_probes.push(Arc::new(move || {
+        postgres_pool_readiness(&readiness_general_postgres, &readiness_critical_postgres)
+    }));
     let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
     let (routing_event_recorder, routing_event_recorder_worker) =
         runtime_routing::PostgresRoutingEventRecorder::spawn(
@@ -11220,8 +11292,9 @@ async fn start_runtime_workers(
     ));
     workers.handles.push(shared_task_queue_placeholder_worker);
     workers.shared_task_queue = Some(shared_task_queue.clone());
-    let telegram_outbox_store =
-        openplotva_storage::PostgresTelegramOutboxStore::new(service_clients.postgres.clone());
+    let telegram_outbox_store = openplotva_storage::PostgresTelegramOutboxStore::new(
+        service_clients.critical_postgres.clone(),
+    );
     let telegram_outbox_transport =
         telegram_outbox::TelegramApiOutboxTransport::new(telegram.clone(), rich_api.clone());
     let telegram_outbox_jobs = telegram_outbox::RunAwareTelegramOutboxJobResolver::new(
@@ -11879,7 +11952,7 @@ async fn start_runtime_workers(
                 dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
                     .with_durable_outbox(
                         openplotva_storage::PostgresTelegramOutboxStore::new(
-                            service_clients.postgres.clone(),
+                            service_clients.critical_postgres.clone(),
                         ),
                         bot_identity.id,
                     );
@@ -12556,12 +12629,15 @@ async fn start_runtime_workers(
             .set_webhook(&webhook_setup)
             .await
             .map_err(|error| anyhow::anyhow!("set Telegram webhook: {error}"))?;
+        let webhook_sender =
+            openplotva_telegram::webhook_update_stream(update_stream.clone(), bot_identity.id)
+                .with_ingress_guard(Arc::clone(&update_ingress_guard));
+        let readiness_webhook_sender = webhook_sender.clone();
+        workers.readiness_probes.push(Arc::new(move || {
+            telegram_webhook_ingress_readiness(&readiness_webhook_sender)
+        }));
         workers.webhook_route = Some(TelegramWebhookRoute {
-            sender: openplotva_telegram::webhook_update_stream(
-                update_stream.clone(),
-                bot_identity.id,
-            )
-            .with_ingress_guard(Arc::clone(&update_ingress_guard)),
+            sender: webhook_sender,
             secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
         });
         readiness_checks.push(ReadinessCheck::ok(
@@ -12621,7 +12697,7 @@ async fn start_runtime_workers(
             };
         let materializer_stream = update_stream.clone();
         let materializer_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
-            service_clients.postgres.clone(),
+            service_clients.critical_postgres.clone(),
         );
         let materializer_metrics = update_materializer::UpdateMaterializerMetrics::default();
         let readiness_metrics = materializer_metrics.clone();
@@ -13060,7 +13136,7 @@ async fn start_runtime_workers(
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
         let update_consumer_stop = stop.subscribe();
         let delivery_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
-            service_clients.postgres.clone(),
+            service_clients.critical_postgres.clone(),
         );
         let mut update_consumer_config = openplotva_updates::UpdateConsumerConfig::default();
         update_consumer_config.worker_limit = update_consumer_config
@@ -13767,6 +13843,13 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    #[test]
+    fn postgres_readiness_only_fails_at_full_active_capacity() {
+        assert!(!super::postgres_capacity_is_exhausted(7, 8, 0));
+        assert!(!super::postgres_capacity_is_exhausted(8, 8, 1));
+        assert!(super::postgres_capacity_is_exhausted(8, 8, 0));
+    }
 
     #[tokio::test]
     async fn admin_user_delete_clears_pending_projections_before_they_can_flush()
@@ -14494,6 +14577,10 @@ mod tests {
         );
         let sender = openplotva_telegram::webhook_update_stream(stream, 77)
             .with_send_timeout(Duration::ZERO);
+        assert_eq!(
+            super::telegram_webhook_ingress_readiness(&sender).status,
+            "ok"
+        );
         let body = serde_json::to_vec(&sample_message_update(30)?)?;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -14529,6 +14616,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            super::telegram_webhook_ingress_readiness(&sender).status,
+            "error"
+        );
         Ok(())
     }
 
