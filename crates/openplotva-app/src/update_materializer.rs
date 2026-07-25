@@ -744,6 +744,7 @@ where
                 flush_staged_projections(
                     &projection_store,
                     bot_id,
+                    projection_config.flush_max_mutations,
                     &metrics,
                     &mut startup_flush_state,
                 ),
@@ -751,7 +752,8 @@ where
         };
         match flush {
             None => break,
-            Some(Ok(Ok(()))) => break,
+            Some(Ok(Ok(()))) if startup_flush_state.staged_mutations_since_flush == 0 => break,
+            Some(Ok(Ok(()))) => continue,
             Some(Ok(Err(error))) => {
                 report.db_failures = report.db_failures.saturating_add(1);
                 metrics.record_db_failure();
@@ -1407,34 +1409,47 @@ async fn run_projection_flush_worker(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
 
+    let mut shutdown = false;
     loop {
-        let mut shutdown = false;
-        let flush_requested = tokio::select! {
-            _ = interval.tick() => true,
-            command = commands.recv() => match command {
-                Some(ProjectionFlushCommand::Staged(mutations)) => {
-                    state.staged_mutations_since_flush = state
-                        .staged_mutations_since_flush
-                        .saturating_add(mutations);
-                    state.staged_mutations_since_flush >= config.flush_max_mutations
-                }
-                Some(ProjectionFlushCommand::FlushNow) => true,
-                Some(ProjectionFlushCommand::Shutdown) | None => {
-                    shutdown = true;
-                    true
-                }
-            },
+        let flush_requested = if state.staged_mutations_since_flush >= config.flush_max_mutations
+            || (shutdown && state.staged_mutations_since_flush > 0)
+        {
+            true
+        } else {
+            tokio::select! {
+                _ = interval.tick() => true,
+                command = commands.recv() => match command {
+                    Some(ProjectionFlushCommand::Staged(mutations)) => {
+                        state.staged_mutations_since_flush = state
+                            .staged_mutations_since_flush
+                            .saturating_add(mutations);
+                        state.staged_mutations_since_flush >= config.flush_max_mutations
+                    }
+                    Some(ProjectionFlushCommand::FlushNow) => true,
+                    Some(ProjectionFlushCommand::Shutdown) | None => {
+                        shutdown = true;
+                        true
+                    }
+                },
+            }
         };
 
         if flush_requested {
             let result = tokio::time::timeout(
                 db_timeout,
-                flush_staged_projections(&store, bot_id, &metrics, &mut state),
+                flush_staged_projections(
+                    &store,
+                    bot_id,
+                    config.flush_max_mutations,
+                    &metrics,
+                    &mut state,
+                ),
             )
             .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
+                    state.staged_mutations_since_flush = 0;
                     report.db_failures = report.db_failures.saturating_add(1);
                     report.last_error = Some(error.to_string());
                     metrics.record_db_failure();
@@ -1442,6 +1457,7 @@ async fn run_projection_flush_worker(
                     tracing::warn!(%error, "failed to flush staged Telegram projections");
                 }
                 Err(error) => {
+                    state.staged_mutations_since_flush = 0;
                     report.db_failures = report.db_failures.saturating_add(1);
                     report.last_error = Some(error.to_string());
                     metrics.record_db_failure();
@@ -1451,7 +1467,7 @@ async fn run_projection_flush_worker(
             }
         }
 
-        if shutdown {
+        if shutdown && state.staged_mutations_since_flush == 0 {
             return report;
         }
     }
@@ -1460,13 +1476,24 @@ async fn run_projection_flush_worker(
 async fn flush_staged_projections(
     store: &PostgresTelegramProjectionStore,
     bot_id: i64,
+    max_mutations: usize,
     metrics: &UpdateMaterializerMetrics,
     state: &mut ProjectionFlushState,
 ) -> Result<(), StorageError> {
     let started = Instant::now();
-    let report = store.flush_staged_projections(bot_id).await?;
+    let report = store
+        .flush_staged_projections(bot_id, max_mutations)
+        .await?;
     let stats = store.stage_stats(bot_id).await?;
-    state.staged_mutations_since_flush = 0;
+    state.staged_mutations_since_flush = usize::try_from(stats.rows.max(0)).unwrap_or(usize::MAX);
+    if report.orphaned_members > 0 || report.orphaned_activity > 0 {
+        tracing::warn!(
+            bot_id,
+            orphaned_members = report.orphaned_members,
+            orphaned_activity = report.orphaned_activity,
+            "discarded orphaned Telegram projection rows without blocking the flush"
+        );
+    }
     metrics.record_projection_flush(started.elapsed(), report.deleted_stage_rows, stats.rows);
     Ok(())
 }
@@ -2801,7 +2828,9 @@ mod tests {
             checkin_elapsed < Duration::from_secs(2),
             "midstream /checkin waited {checkin_elapsed:?}"
         );
-        let flushed = projection_store.flush_staged_projections(bot_id).await?;
+        let flushed = projection_store
+            .flush_staged_projections(bot_id, usize::MAX)
+            .await?;
         assert_eq!(flushed.members, MEMBERS as u64);
         let durable_members: i64 =
             sqlx::query_scalar("SELECT count(*) FROM chat_members WHERE chat_id = $1")
@@ -2833,7 +2862,9 @@ mod tests {
         projection_store
             .stage_projection_batch(&repeated.deferred_projections)
             .await?;
-        let repeated_flush = projection_store.flush_staged_projections(bot_id).await?;
+        let repeated_flush = projection_store
+            .flush_staged_projections(bot_id, usize::MAX)
+            .await?;
         assert_eq!(repeated_flush.users, 0);
         assert_eq!(repeated_flush.chats, 0);
         assert_eq!(repeated_flush.members, 0);

@@ -13856,7 +13856,7 @@ mod tests {
         );
 
         let flush = openplotva_storage::PostgresTelegramProjectionStore::new(pool.clone())
-            .flush_staged_projections(bot_id)
+            .flush_staged_projections(bot_id, usize::MAX)
             .await?;
         assert_eq!(flush.users, 0);
         assert_eq!(flush.members, 0);
