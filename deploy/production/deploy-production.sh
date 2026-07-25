@@ -101,6 +101,17 @@ compose_config() {
   compose config --quiet
 }
 
+create_predeploy_backup() {
+  local backup_script="${deploy_root}/backup-production.sh"
+  [[ -x "$backup_script" ]] || fail "production backup script is missing or not executable"
+  OPENPLOTVA_BACKUP_COMPOSE_FILE="$compose_file" \
+    OPENPLOTVA_BACKUP_ENV_FILE="$env_file" \
+    OPENPLOTVA_DEPLOY_IMAGE="$image" \
+    DRAGONFLY_IMAGE="$dragonfly_image" \
+    UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" \
+    "$backup_script"
+}
+
 volume_exists() {
   docker volume inspect "$1" >/dev/null 2>&1
 }
@@ -474,8 +485,9 @@ main() {
   bootstrap_env
   validate_env
   validate_runtime_store_images
-  docker_login_and_pull
   compose_config
+  create_predeploy_backup
+  docker_login_and_pull
 
   local postgres_mode
   postgres_mode="$(legacy_postgres_import_mode)"
