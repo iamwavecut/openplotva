@@ -726,6 +726,21 @@ impl PostgresDialogInputMaterializer {
             .await
         {
             Ok(memory) => {
+                let card_ids = memory.cards.iter().map(|card| card.id).collect::<Vec<_>>();
+                if let Some(store) = self.memory.as_ref() {
+                    if let Err(error) = store
+                        .record_card_retrieval(&card_ids, OffsetDateTime::now_utc())
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            chat_id = params.chat_id,
+                            user_id = params.user_id,
+                            card_count = card_ids.len(),
+                            "failed to record recalled memory cards"
+                        );
+                    }
+                }
                 let captured = captured_memories_from_retrieval(&memory);
                 (
                     dialog_reference_context_from_memory(&format_memory_context(&memory)),

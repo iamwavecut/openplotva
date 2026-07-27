@@ -132,6 +132,8 @@ pub struct MemoryCardUpsertParams {
     pub thread_id: i32,
     /// Scoped user ID.
     pub user_id: i64,
+    /// Earliest source timestamp at which the fact became valid.
+    pub valid_from: OffsetDateTime,
     /// Last observed timestamp.
     pub last_observed_at: OffsetDateTime,
     /// Whether the card may travel across audiences (see `ObservationScope::portable`).
@@ -168,8 +170,8 @@ pub struct MemorySourceBatchParams {
     pub entry_ids: Vec<String>,
     /// Source Telegram message IDs.
     pub message_ids: Vec<i32>,
-    /// Occurrence timestamp.
-    pub occurred_at: OffsetDateTime,
+    /// Occurrence timestamps aligned with the source ids.
+    pub occurred_ats: Vec<OffsetDateTime>,
     /// Confidence.
     pub confidence: f64,
 }
@@ -182,7 +184,7 @@ impl Default for MemorySourceBatchParams {
             thread_id: 0,
             entry_ids: Vec::new(),
             message_ids: Vec::new(),
-            occurred_at: openplotva_memory::memory_zero_time(),
+            occurred_ats: Vec::new(),
             confidence: 0.0,
         }
     }
@@ -329,6 +331,7 @@ pub fn memory_card_upsert_params_at(
         chat_id,
         thread_id,
         user_id,
+        valid_from: observed_memory_time(card.valid_from, last_observed_at),
         last_observed_at,
         portable: card.observation_scope.portable,
         expires_at: card.expires_at,
@@ -391,7 +394,7 @@ pub fn memory_source_batch_params_at(
         thread_id,
         entry_ids: Vec::with_capacity(source_count),
         message_ids: Vec::with_capacity(source_count),
-        occurred_at: observed_memory_time(card.observed_at, fallback_observed_at),
+        occurred_ats: Vec::with_capacity(source_count),
         confidence: card.confidence,
     };
     let mut seen = HashMap::<MemorySourceKey, ()>::with_capacity(source_count);
@@ -403,6 +406,13 @@ pub fn memory_source_batch_params_at(
         seen.insert(key.clone(), ());
         params.entry_ids.push(key.entry_id);
         params.message_ids.push(key.message_id);
+        params.occurred_ats.push(observed_memory_time(
+            card.source_occurred_ats
+                .get(index)
+                .copied()
+                .unwrap_or(card.observed_at),
+            fallback_observed_at,
+        ));
     }
     let ok = !params.entry_ids.is_empty();
     (params, ok)
@@ -921,11 +931,13 @@ pub const SQL_INSERT_HISTORY_SUMMARY_SOURCE: &str = "INSERT INTO chat_history_su
 
 pub const SQL_INSERT_CHAT_HISTORY_EVENT: &str = "INSERT INTO chat_history_events (summary_id, chat_id, thread_id, scope, event_order, title, description, actors, occurred_at, range_start_at, range_end_at, source_summary_ids, confidence) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10, $11, $12, $13)";
 
-pub const SQL_UPSERT_MEMORY_CARD_LEXICAL: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, last_observed_at, portable, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), expires_at = CASE WHEN EXCLUDED.expires_at IS NULL OR memory_cards.expires_at IS NULL THEN NULL ELSE GREATEST(memory_cards.expires_at, EXCLUDED.expires_at) END, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
+pub const SQL_UPSERT_MEMORY_CARD_LEXICAL: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, valid_from, last_observed_at, portable, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, valid_from = LEAST(memory_cards.valid_from, EXCLUDED.valid_from), last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), expires_at = CASE WHEN EXCLUDED.expires_at IS NULL OR memory_cards.expires_at IS NULL THEN NULL ELSE GREATEST(memory_cards.expires_at, EXCLUDED.expires_at) END, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
-pub const SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, last_observed_at, embedding, portable, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::vector, $18, $19) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), embedding = COALESCE(EXCLUDED.embedding, memory_cards.embedding), expires_at = CASE WHEN EXCLUDED.expires_at IS NULL OR memory_cards.expires_at IS NULL THEN NULL ELSE GREATEST(memory_cards.expires_at, EXCLUDED.expires_at) END, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
+pub const SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, valid_from, last_observed_at, embedding, portable, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::vector, $19, $20) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, valid_from = LEAST(memory_cards.valid_from, EXCLUDED.valid_from), last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), embedding = COALESCE(EXCLUDED.embedding, memory_cards.embedding), expires_at = CASE WHEN EXCLUDED.expires_at IS NULL OR memory_cards.expires_at IS NULL THEN NULL ELSE GREATEST(memory_cards.expires_at, EXCLUDED.expires_at) END, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
-pub const SQL_INSERT_MEMORY_SOURCES: &str = "WITH input AS (SELECT unnest($4::text[]) AS entry_id, unnest($5::integer[]) AS message_id) INSERT INTO memory_sources (card_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, $6, $7 FROM input WHERE NOT EXISTS (SELECT 1 FROM memory_sources WHERE card_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
+pub const SQL_INSERT_MEMORY_SOURCES: &str = "WITH input AS (SELECT * FROM unnest($4::text[], $5::integer[], $6::timestamptz[]) AS source(entry_id, message_id, occurred_at)) INSERT INTO memory_sources (card_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, input.occurred_at, $7 FROM input WHERE NOT EXISTS (SELECT 1 FROM memory_sources WHERE card_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
+
+pub const SQL_INSERT_MEMORY_EPISODE_SOURCES: &str = "WITH input AS (SELECT * FROM unnest($4::text[], $5::integer[], $6::timestamptz[]) AS source(entry_id, message_id, occurred_at)) INSERT INTO memory_sources (episode_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, input.occurred_at, 1.0 FROM input WHERE (input.entry_id <> '' OR input.message_id <> 0) AND NOT EXISTS (SELECT 1 FROM memory_sources WHERE episode_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
 
 pub const SQL_INSERT_MEMORY_EPISODE_LEXICAL: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
@@ -935,17 +947,25 @@ pub const SQL_UPSERT_MEMORY_LINKS: &str = "INSERT INTO memory_links (from_card_i
 
 pub const SQL_SUPERSEDE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'superseded', valid_until = CURRENT_TIMESTAMP, superseded_by = $1, updated_at = CURRENT_TIMESTAMP, retracted_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = 'active'";
 
+pub const SQL_COPY_MEMORY_CARD_SOURCES: &str = "INSERT INTO memory_sources (card_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, source.chat_id, source.thread_id, source.entry_id, source.message_id, source.occurred_at, source.confidence FROM memory_sources source WHERE source.card_id = $2 AND NOT EXISTS (SELECT 1 FROM memory_sources existing WHERE existing.card_id = $1 AND existing.entry_id = source.entry_id AND existing.message_id = source.message_id)";
+
+pub const SQL_COPY_MEMORY_CARD_LINKS: &str = "INSERT INTO memory_links (from_card_id, to_card_id, relation, confidence) SELECT CASE WHEN link.from_card_id = $2 THEN $1 ELSE link.from_card_id END, CASE WHEN link.to_card_id = $2 THEN $1 ELSE link.to_card_id END, link.relation, link.confidence FROM memory_links link WHERE (link.from_card_id = $2 OR link.to_card_id = $2) AND CASE WHEN link.from_card_id = $2 THEN $1 ELSE link.from_card_id END <> CASE WHEN link.to_card_id = $2 THEN $1 ELSE link.to_card_id END ON CONFLICT (from_card_id, to_card_id, relation) DO UPDATE SET confidence = GREATEST(memory_links.confidence, EXCLUDED.confidence)";
+
+pub const SQL_MERGE_MEMORY_CARD_STATE: &str = "UPDATE memory_cards survivor SET confidence = GREATEST(survivor.confidence, absorbed.confidence), salience = GREATEST(survivor.salience, absorbed.salience), observation_count = survivor.observation_count + absorbed.observation_count, valid_from = LEAST(survivor.valid_from, absorbed.valid_from), last_observed_at = GREATEST(survivor.last_observed_at, absorbed.last_observed_at), last_used_at = CASE WHEN survivor.last_used_at IS NULL THEN absorbed.last_used_at WHEN absorbed.last_used_at IS NULL THEN survivor.last_used_at ELSE GREATEST(survivor.last_used_at, absorbed.last_used_at) END, use_count = LEAST(survivor.use_count::bigint + absorbed.use_count::bigint, 2147483647)::integer, portable = survivor.portable OR absorbed.portable, expires_at = CASE WHEN survivor.expires_at IS NULL OR absorbed.expires_at IS NULL THEN NULL ELSE GREATEST(survivor.expires_at, absorbed.expires_at) END, updated_at = CURRENT_TIMESTAMP FROM memory_cards absorbed WHERE survivor.id = $1 AND absorbed.id = $2 AND survivor.status IN ('active', 'competing')";
+
 pub const SQL_MARK_COMPETING_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'competing', conflict_group = LEAST($1, $2), updated_at = CURRENT_TIMESTAMP WHERE id IN ($1, $2) AND status IN ('active', 'competing')";
 
 pub const SQL_UPDATE_MEMORY_CARD_TEXT: &str = "UPDATE memory_cards SET fact_text = $2, subject = COALESCE(NULLIF(btrim($3), ''), subject), embedding = COALESCE($4::vector, embedding), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
-pub const SQL_REINFORCE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = LEAST(1.0, confidence + $2), salience = LEAST(1.0, salience + $3), observation_count = observation_count + 1, last_observed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
+pub const SQL_REINFORCE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = LEAST(1.0, confidence + $2), salience = LEAST(1.0, salience + $3), observation_count = observation_count + 1, last_observed_at = GREATEST(last_observed_at, $4), expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
+
+pub const SQL_RECORD_MEMORY_CARD_USAGE: &str = "UPDATE memory_cards SET last_used_at = CASE WHEN last_used_at IS NULL THEN $2 ELSE GREATEST(last_used_at, $2) END, use_count = LEAST(use_count::bigint + 1, 2147483647)::integer, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1::bigint[]) AND status IN ('active', 'competing')";
 
 pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = GREATEST(0.0, confidence - $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
 pub const SQL_ARCHIVE_EXPIRED_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'expired', retracted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NOT NULL AND expires_at <= now() ORDER BY expires_at LIMIT $1)";
 
-pub const SQL_EXPIRE_COLD_MEMORY_CARDS: &str = "UPDATE memory_cards SET expires_at = now() + ($1 * interval '1 day'), updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NULL AND NOT portable AND valid_until IS NULL AND salience < $2 AND created_at < now() - ($3 * interval '1 day') AND (last_used_at IS NULL OR last_used_at < now() - ($3 * interval '1 day')) ORDER BY salience ASC, created_at ASC LIMIT $4)";
+pub const SQL_EXPIRE_COLD_MEMORY_CARDS: &str = "UPDATE memory_cards SET expires_at = now() + ($1 * interval '1 day'), updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND card_type IN ('event', 'joke', 'recurring_topic') AND expires_at IS NULL AND NOT portable AND valid_until IS NULL AND salience < $2 AND created_at < now() - ($3 * interval '1 day') AND (last_used_at IS NULL OR last_used_at < now() - ($3 * interval '1 day')) ORDER BY salience ASC, created_at ASC LIMIT $4)";
 
 pub const SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS: &str = "SELECT min(id) AS keep_id, array_remove(array_agg(id ORDER BY id), min(id)) AS dup_ids, sum(observation_count)::bigint AS total_obs FROM memory_cards WHERE status = 'active' AND btrim(fact_text) <> '' GROUP BY visibility, chat_id, thread_id, user_id, lower(btrim(fact_text)) HAVING count(*) > 1 LIMIT $1";
 
@@ -4997,6 +5017,34 @@ pub struct PostgresMemoryStore {
     pool: PgPool,
 }
 
+async fn merge_memory_card_into_on(
+    tx: &mut Transaction<'_, Postgres>,
+    old_id: i64,
+    survivor_id: i64,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_COPY_MEMORY_CARD_SOURCES)
+        .bind(survivor_id)
+        .bind(old_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_COPY_MEMORY_CARD_LINKS)
+        .bind(survivor_id)
+        .bind(old_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_MERGE_MEMORY_CARD_STATE)
+        .bind(survivor_id)
+        .bind(old_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_SUPERSEDE_MEMORY_CARD)
+        .bind(survivor_id)
+        .bind(old_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 impl PostgresMemoryStore {
     /// Build a memory store over an existing pool.
     #[must_use]
@@ -5061,6 +5109,7 @@ impl PostgresMemoryStore {
                 .bind(params.chat_id)
                 .bind(params.thread_id)
                 .bind(params.user_id)
+                .bind(params.valid_from)
                 .bind(params.last_observed_at)
                 .bind(embedding)
                 .bind(params.portable)
@@ -5096,7 +5145,7 @@ impl PostgresMemoryStore {
         model: &str,
         prompt_version: &str,
     ) -> Result<(i64, bool), StorageError> {
-        self.insert_episode_with_embedding(episode, model, prompt_version, None)
+        self.insert_episode_with_embedding(episode, model, prompt_version, None, &[])
             .await
     }
 
@@ -5107,6 +5156,7 @@ impl PostgresMemoryStore {
         model: &str,
         prompt_version: &str,
         embedding: Option<&PgEmbeddingVector>,
+        source_messages: &[openplotva_memory::Message],
     ) -> Result<(i64, bool), StorageError> {
         let summary_text = episode.summary_text.trim().to_owned();
         if summary_text.is_empty() || episode.chat_id == 0 {
@@ -5119,6 +5169,7 @@ impl PostgresMemoryStore {
             );
         }
         let embedding = pgvector_literal(embedding);
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING)
             .bind(&episode.visibility)
             .bind(episode.chat_id)
@@ -5135,9 +5186,43 @@ impl PostgresMemoryStore {
             .bind(episode.cursor_message_id)
             .bind(episode.cursor_entry_id.trim())
             .bind(embedding)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-        Ok((row.try_get("id")?, row.try_get("inserted")?))
+        let episode_id: i64 = row.try_get("id")?;
+        let inserted: bool = row.try_get("inserted")?;
+
+        let mut source_keys = HashSet::with_capacity(source_messages.len());
+        let mut entry_ids = Vec::with_capacity(source_messages.len());
+        let mut message_ids = Vec::with_capacity(source_messages.len());
+        let mut occurred_ats = Vec::with_capacity(source_messages.len());
+        for message in source_messages {
+            let key = MemorySourceKey {
+                entry_id: message.entry_id.trim().to_owned(),
+                message_id: message.message_id,
+            };
+            if key == MemorySourceKey::default()
+                || openplotva_memory::is_memory_zero_time(message.occurred_at)
+                || !source_keys.insert(key.clone())
+            {
+                continue;
+            }
+            entry_ids.push(key.entry_id);
+            message_ids.push(key.message_id);
+            occurred_ats.push(message.occurred_at);
+        }
+        if episode_id != 0 && !entry_ids.is_empty() {
+            sqlx::query(SQL_INSERT_MEMORY_EPISODE_SOURCES)
+                .bind(episode_id)
+                .bind(episode.chat_id)
+                .bind(episode.thread_id)
+                .bind(&entry_ids)
+                .bind(&message_ids)
+                .bind(&occurred_ats)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok((episode_id, inserted))
     }
 
     pub async fn insert_links(
@@ -5167,6 +5252,18 @@ impl PostgresMemoryStore {
             .bind(old_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Fold one card into a survivor while preserving its provenance, links,
+    /// observation history, and retrieval usage.
+    pub async fn merge_card(&self, old_id: i64, survivor_id: i64) -> Result<(), StorageError> {
+        if old_id == 0 || survivor_id == 0 || old_id == survivor_id {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        merge_memory_card_into_on(&mut tx, old_id, survivor_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5215,6 +5312,7 @@ impl PostgresMemoryStore {
         id: i64,
         confidence_delta: f64,
         salience_delta: f64,
+        observed_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
         if id == 0 {
             return Ok(());
@@ -5223,6 +5321,7 @@ impl PostgresMemoryStore {
             .bind(id)
             .bind(confidence_delta.max(0.0))
             .bind(salience_delta.max(0.0))
+            .bind(observed_at)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5252,11 +5351,10 @@ impl PostgresMemoryStore {
             .rows_affected())
     }
 
-    /// Give cold cards a grace TTL so forgetting is bounded even when extraction
-    /// marked them permanent: low-salience, non-portable, never-expiring cards
-    /// that are old and unused get `expires_at = now + grace_days`. Reinforcing
-    /// such a card before then clears the TTL again, so only truly stale facts
-    /// forget. Returns the number of cards given a TTL this batch.
+    /// Give cold episodic cards a grace TTL so forgetting is bounded even when
+    /// extraction marked them permanent. Durable personality, preference,
+    /// relationship, project, decision, warning, and technical-fact cards are
+    /// never selected by this worker. Reinforcement clears a pending TTL.
     pub async fn expire_cold_cards(
         &self,
         grace_days: i32,
@@ -5299,11 +5397,7 @@ impl PostgresMemoryStore {
             // is the survivor; the retired card is matched by id ($2).
             let mut tx = self.pool.begin().await?;
             for dup_id in &dup_ids {
-                sqlx::query(SQL_SUPERSEDE_MEMORY_CARD)
-                    .bind(keep_id)
-                    .bind(*dup_id)
-                    .execute(&mut *tx)
-                    .await?;
+                merge_memory_card_into_on(&mut tx, *dup_id, keep_id).await?;
             }
             sqlx::query(SQL_SET_MEMORY_CARD_OBSERVATION_COUNT)
                 .bind(keep_id)
@@ -5393,11 +5487,7 @@ impl PostgresMemoryStore {
                 if *absorbed == 0 || *absorbed == cluster.survivor_id {
                     continue;
                 }
-                sqlx::query(SQL_SUPERSEDE_MEMORY_CARD)
-                    .bind(cluster.survivor_id)
-                    .bind(*absorbed)
-                    .execute(&mut *tx)
-                    .await?;
+                merge_memory_card_into_on(&mut tx, *absorbed, cluster.survivor_id).await?;
                 counts.superseded += 1;
             }
             let text = cluster.merged_fact_text.trim();
@@ -6045,6 +6135,31 @@ impl PostgresMemoryStore {
         Ok(())
     }
 
+    /// Record cards that were actually included in a dialog context.
+    pub async fn record_card_retrieval(
+        &self,
+        card_ids: &[i64],
+        used_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        let mut card_ids = card_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != 0)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        card_ids.sort_unstable();
+        if card_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(SQL_RECORD_MEMORY_CARD_USAGE)
+            .bind(&card_ids)
+            .bind(used_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn retrieve_lexical(
         &self,
         req: &openplotva_memory::RetrievalRequest,
@@ -6170,7 +6285,7 @@ impl PostgresMemoryStore {
             .bind(params.thread_id)
             .bind(&params.entry_ids)
             .bind(&params.message_ids)
-            .bind(params.occurred_at)
+            .bind(&params.occurred_ats)
             .bind(params.confidence)
             .execute(&mut **tx)
             .await?;
@@ -9678,6 +9793,7 @@ mod tests {
         assert_eq!(params.chat_id, 0);
         assert_eq!(params.thread_id, 0);
         assert_eq!(params.user_id, 42);
+        assert_eq!(params.valid_from, observed);
         assert_eq!(params.last_observed_at, observed);
         assert_eq!(
             params.dedup_hash,
@@ -9691,6 +9807,9 @@ mod tests {
     fn memory_source_batch_params_preserve_go_dedupe_and_empty_shape() -> Result<(), Box<dyn Error>>
     {
         let observed = time::OffsetDateTime::from_unix_timestamp(1_770_000_000)?;
+        let source_times = (0..5)
+            .map(|offset| observed - time::Duration::hours(5 - offset))
+            .collect::<Vec<_>>();
         let card = openplotva_memory::CardInput {
             source_entry_ids: vec![
                 " entry-a ".to_owned(),
@@ -9699,6 +9818,7 @@ mod tests {
                 "entry-b".to_owned(),
             ],
             source_message_ids: vec![10, 0, 10, 0, 99],
+            source_occurred_ats: source_times.clone(),
             observed_at: observed,
             confidence: 0.73,
             ..openplotva_memory::CardInput::default()
@@ -9712,7 +9832,10 @@ mod tests {
         assert_eq!(params.thread_id, 7);
         assert_eq!(params.entry_ids, vec!["entry-a", "entry-b", ""]);
         assert_eq!(params.message_ids, vec![10, 0, 99]);
-        assert_eq!(params.occurred_at, observed);
+        assert_eq!(
+            params.occurred_ats,
+            vec![source_times[0], source_times[3], source_times[4]]
+        );
         assert_eq!(params.confidence, 0.73);
 
         let (blank, blank_ok) = super::memory_source_batch_params(
@@ -9947,8 +10070,15 @@ mod tests {
             super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING
                 .contains("embedding = COALESCE(EXCLUDED.embedding, memory_cards.embedding)")
         );
-        assert!(super::SQL_INSERT_MEMORY_SOURCES.contains("unnest($4::text[])"));
+        assert!(
+            super::SQL_INSERT_MEMORY_SOURCES
+                .contains("unnest($4::text[], $5::integer[], $6::timestamptz[])")
+        );
         assert!(super::SQL_INSERT_MEMORY_SOURCES.contains("WHERE NOT EXISTS"));
+        assert!(
+            super::SQL_INSERT_MEMORY_EPISODE_SOURCES
+                .contains("INSERT INTO memory_sources (episode_id")
+        );
         assert!(super::SQL_INSERT_MEMORY_EPISODE_LEXICAL.contains("ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id)"));
         assert!(
             super::SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING
@@ -10093,11 +10223,24 @@ mod tests {
             super::SQL_LIST_VISIBLE_MEMORY_CARDS
                 .contains("(expires_at IS NULL OR expires_at > now())")
         );
-        assert!(super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING.contains("$17::vector, $18, $19)"));
+        assert!(super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING.contains("$18::vector, $19, $20)"));
         // Consolidation op-set + archival exist and only touch live cards.
         assert!(super::SQL_UPDATE_MEMORY_CARD_TEXT.contains("fact_text = $2"));
         assert!(
             super::SQL_REINFORCE_MEMORY_CARD.contains("observation_count = observation_count + 1")
+        );
+        assert!(
+            super::SQL_REINFORCE_MEMORY_CARD
+                .contains("last_observed_at = GREATEST(last_observed_at, $4)")
+        );
+        assert!(super::SQL_REINFORCE_MEMORY_CARD.contains("expires_at = NULL"));
+        assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("last_used_at = CASE"));
+        assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("use_count::bigint + 1"));
+        assert!(super::SQL_COPY_MEMORY_CARD_SOURCES.contains("source.card_id = $2"));
+        assert!(super::SQL_COPY_MEMORY_CARD_LINKS.contains("ON CONFLICT"));
+        assert!(
+            super::SQL_MERGE_MEMORY_CARD_STATE
+                .contains("use_count = LEAST(survivor.use_count::bigint")
         );
         assert!(super::SQL_DEMOTE_MEMORY_CARD.contains("GREATEST(0.0, confidence - $2)"));
         assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("status = 'expired'"));
@@ -10106,6 +10249,10 @@ mod tests {
         // old-and-unused cards, giving them a grace TTL rather than deleting.
         assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("expires_at IS NULL"));
         assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("NOT portable"));
+        assert!(
+            super::SQL_EXPIRE_COLD_MEMORY_CARDS
+                .contains("card_type IN ('event', 'joke', 'recurring_topic')")
+        );
         assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("salience < $2"));
         assert!(
             super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("last_used_at IS NULL OR last_used_at <")
@@ -10408,6 +10555,8 @@ mod tests {
                     salience: 0.8,
                     source_entry_ids: vec!["msg:a".to_owned()],
                     source_message_ids: vec![10],
+                    source_occurred_ats: vec![observed],
+                    valid_from: observed,
                     observed_at: observed,
                     expires_at: None,
                 },
@@ -10422,6 +10571,8 @@ mod tests {
                     salience: 0.9,
                     source_entry_ids: vec!["msg:b".to_owned()],
                     source_message_ids: vec![11],
+                    source_occurred_ats: vec![observed],
+                    valid_from: observed,
                     observed_at: observed,
                     expires_at: None,
                 },
@@ -10443,8 +10594,22 @@ mod tests {
                 }])
                 .await?;
 
+            let episode_sources = vec![
+                openplotva_memory::Message {
+                    entry_id: "msg:a".to_owned(),
+                    message_id: 10,
+                    occurred_at: observed - time::Duration::minutes(2),
+                    ..openplotva_memory::Message::default()
+                },
+                openplotva_memory::Message {
+                    entry_id: "msg:b".to_owned(),
+                    message_id: 11,
+                    occurred_at: observed - time::Duration::minutes(1),
+                    ..openplotva_memory::Message::default()
+                },
+            ];
             let (episode_id, episode_inserted) = store
-                .insert_episode_lexical(
+                .insert_episode_with_embedding(
                     openplotva_memory::Episode {
                         chat_id,
                         range_start_at: observed - time::Duration::hours(1),
@@ -10458,10 +10623,18 @@ mod tests {
                     },
                     "model",
                     "prompt",
+                    None,
+                    &episode_sources,
                 )
                 .await?;
             assert!(episode_id > 0);
             assert!(episode_inserted);
+            let episode_source_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM memory_sources WHERE episode_id = $1")
+                    .bind(episode_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(episode_source_count, 2);
 
             let retrieval_scope = openplotva_memory::RetrievalScope {
                 chat_id,
@@ -10481,6 +10654,20 @@ mod tests {
             assert!(!retrieved.cards.is_empty());
             assert_eq!(retrieved.episodes.len(), 1);
             assert_eq!(retrieved.episodes[0].id, episode_id);
+            store
+                .record_card_retrieval(
+                    &retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+                    observed + time::Duration::hours(1),
+                )
+                .await?;
+            let used_cards: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM memory_cards WHERE id = ANY($1::bigint[]) AND use_count = 1 AND last_used_at = $2",
+            )
+            .bind(&retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>())
+            .bind(observed + time::Duration::hours(1))
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(used_cards, retrieved.cards.len() as i64);
 
             let listed = store
                 .list_cards(&openplotva_memory::CardFilter {
@@ -10490,6 +10677,20 @@ mod tests {
                 })
                 .await?;
             assert_eq!(listed.len(), 2);
+
+            store.merge_card(ids[1], ids[0]).await?;
+            let survivor_source_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM memory_sources WHERE card_id = $1")
+                    .bind(ids[0])
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(survivor_source_count, 2);
+            let absorbed_status: String =
+                sqlx::query_scalar("SELECT status FROM memory_cards WHERE id = $1")
+                    .bind(ids[1])
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(absorbed_status, openplotva_memory::CARD_STATUS_SUPERSEDED);
             Ok(())
         }
         .await;

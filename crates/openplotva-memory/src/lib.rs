@@ -739,6 +739,10 @@ pub struct CardInput {
     pub source_entry_ids: Vec<String>,
     /// Source Telegram message IDs.
     pub source_message_ids: Vec<i32>,
+    /// Source occurrence timestamps, aligned with the source id arrays.
+    pub source_occurred_ats: Vec<OffsetDateTime>,
+    /// Earliest source timestamp at which the fact became valid.
+    pub valid_from: OffsetDateTime,
     /// Observation timestamp.
     pub observed_at: OffsetDateTime,
     /// When this fact should be forgotten (archived); `None` means durable.
@@ -758,6 +762,8 @@ impl Default for CardInput {
             salience: 0.0,
             source_entry_ids: Vec::new(),
             source_message_ids: Vec::new(),
+            source_occurred_ats: Vec::new(),
+            valid_from: go_zero_time(),
             observed_at: go_zero_time(),
             expires_at: None,
         }
@@ -2756,7 +2762,25 @@ fn card_from_candidate(
     }
     let kind = candidate_scope_kind(input, candidate)?;
     let card_type = normalize_card_type(&candidate.card_type);
-    let observed_at = observed_at_from_messages_at(&input.messages, fallback_observed_at);
+    let matched_source_times = input
+        .messages
+        .iter()
+        .filter(|message| message_matches_candidate_source(message, candidate))
+        .filter_map(|message| {
+            (message.occurred_at != go_zero_time()).then_some(message.occurred_at)
+        })
+        .collect::<Vec<_>>();
+    let valid_from = matched_source_times
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(fallback_observed_at);
+    let observed_at = matched_source_times
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(fallback_observed_at);
+    let source_occurred_ats = candidate_source_occurred_ats(input, candidate, observed_at);
     let expires_at = expires_at_from_durability(&candidate.durability, &card_type, observed_at);
 
     Some(CardInput {
@@ -2779,9 +2803,48 @@ fn card_from_candidate(
         salience: candidate.salience,
         source_entry_ids: candidate.source_entry_ids.clone(),
         source_message_ids: candidate.source_message_ids.clone(),
+        source_occurred_ats,
+        valid_from,
         observed_at,
         expires_at,
     })
+}
+
+fn candidate_source_occurred_ats(
+    input: &ExtractInput,
+    candidate: &CandidateCard,
+    fallback_observed_at: OffsetDateTime,
+) -> Vec<OffsetDateTime> {
+    let source_count = candidate
+        .source_entry_ids
+        .len()
+        .max(candidate.source_message_ids.len());
+    (0..source_count)
+        .map(|index| {
+            let entry_id = candidate
+                .source_entry_ids
+                .get(index)
+                .map(|value| value.trim())
+                .unwrap_or_default();
+            let message_id = candidate
+                .source_message_ids
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+            input
+                .messages
+                .iter()
+                .filter(|message| {
+                    (!entry_id.is_empty() && message.entry_id.trim() == entry_id)
+                        || (message_id != 0 && message.message_id == message_id)
+                })
+                .filter_map(|message| {
+                    (message.occurred_at != go_zero_time()).then_some(message.occurred_at)
+                })
+                .max()
+                .unwrap_or(fallback_observed_at)
+        })
+        .collect()
 }
 
 fn candidate_scope_kind(input: &ExtractInput, candidate: &CandidateCard) -> Option<CardKind> {
@@ -3946,7 +4009,59 @@ mod tests {
         assert_eq!(cards[0].observation_scope.kind, CARD_KIND_USER);
         assert_eq!(cards[0].observation_scope.chat_id, -100);
         assert_eq!(cards[0].observation_scope.user_id, 42);
+        assert_eq!(cards[0].valid_from, observed);
         assert_eq!(cards[0].observed_at, observed);
+        assert_eq!(cards[0].source_occurred_ats, vec![observed]);
+    }
+
+    #[test]
+    fn card_temporal_bounds_come_only_from_its_declared_sources() {
+        let first = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("first");
+        let second = first + time::Duration::hours(2);
+        let unrelated = second + time::Duration::days(30);
+        let input = ExtractInput {
+            run: Run {
+                chat_id: -100,
+                ..Run::default()
+            },
+            messages: vec![
+                Message {
+                    entry_id: "source:first".to_owned(),
+                    message_id: 1,
+                    occurred_at: first,
+                    ..Message::default()
+                },
+                Message {
+                    entry_id: "source:second".to_owned(),
+                    message_id: 2,
+                    occurred_at: second,
+                    ..Message::default()
+                },
+                Message {
+                    entry_id: "unrelated".to_owned(),
+                    message_id: 3,
+                    occurred_at: unrelated,
+                    ..Message::default()
+                },
+            ],
+            ..ExtractInput::default()
+        };
+        let output = ExtractOutput {
+            candidate_cards: vec![CandidateCard {
+                fact_text: "A durable fact".to_owned(),
+                source_entry_ids: vec!["source:first".to_owned(), "source:second".to_owned()],
+                source_message_ids: vec![1, 2],
+                ..CandidateCard::default()
+            }],
+            ..ExtractOutput::default()
+        };
+
+        let cards = cards_from_extraction_at(&input, &output, unrelated);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].valid_from, first);
+        assert_eq!(cards[0].observed_at, second);
+        assert_eq!(cards[0].source_occurred_ats, vec![first, second]);
     }
 
     #[test]
