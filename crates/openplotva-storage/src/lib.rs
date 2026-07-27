@@ -1174,8 +1174,13 @@ pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 
 
 pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing')";
 
-pub const SQL_COUNT_MEMORY_RUNS_CREATED_SINCE: &str =
-    "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND created_at >= $2";
+pub const SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE: &str = r#"SELECT count(*)::bigint
+FROM memory_runs
+WHERE prompt_version = $1
+  AND created_at >= $2
+  AND cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz
+  AND cursor_after_message_id = 0
+  AND cursor_after_entry_id = ''"#;
 
 pub const SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE: &str = r#"WITH dims AS (
     SELECT jsonb_build_object(
@@ -1235,8 +1240,33 @@ pub const SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS: &str = r#"WITH grouped_windows AS (
 ranked_windows AS (
     SELECT
         *,
-        row_number() OVER (
-            ORDER BY message_count DESC, range_start_at ASC, chat_id ASC, canonical_thread_id ASC
+        EXISTS (
+            SELECT 1
+            FROM memory_runs r
+            WHERE r.chat_id = grouped_windows.chat_id
+              AND r.thread_id = grouped_windows.canonical_thread_id
+              AND r.range_start_at = grouped_windows.range_start_at
+              AND r.range_end_at = grouped_windows.range_end_at
+              AND r.prompt_version = $1
+              AND r.cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz
+              AND r.cursor_after_message_id = 0
+              AND r.cursor_after_entry_id = ''
+        ) AS already_enqueued,
+        sum(
+            CASE WHEN message_count >= $5 AND NOT EXISTS (
+                SELECT 1
+                FROM memory_runs r
+                WHERE r.chat_id = grouped_windows.chat_id
+                  AND r.thread_id = grouped_windows.canonical_thread_id
+                  AND r.range_start_at = grouped_windows.range_start_at
+                  AND r.range_end_at = grouped_windows.range_end_at
+                  AND r.prompt_version = $1
+                  AND r.cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz
+                  AND r.cursor_after_message_id = 0
+                  AND r.cursor_after_entry_id = ''
+            ) THEN 1 ELSE 0 END
+        ) OVER (
+            ORDER BY range_start_at DESC, message_count DESC, chat_id ASC, canonical_thread_id ASC
         ) AS enqueue_rank
     FROM grouped_windows
 ),
@@ -1244,6 +1274,7 @@ classified AS (
     SELECT
         CASE
             WHEN message_count < $5 THEN 'below_threshold'
+            WHEN already_enqueued THEN 'already_enqueued'
             WHEN enqueue_rank <= $8 THEN 'enqueued'
             ELSE 'daily_cap'
         END AS decision,
@@ -1328,8 +1359,20 @@ active_windows AS (
         range_start_at,
         LEAST(range_start_at + interval '1 hour', $3::timestamptz) AS range_end_at,
         message_count
-    FROM grouped_windows
-    ORDER BY message_count DESC, range_start_at ASC, chat_id ASC, canonical_thread_id ASC
+    FROM grouped_windows AS grouped
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM memory_runs r
+        WHERE r.chat_id = grouped.chat_id
+          AND r.thread_id = grouped.canonical_thread_id
+          AND r.range_start_at = grouped.range_start_at
+          AND r.range_end_at = LEAST(grouped.range_start_at + interval '1 hour', $3::timestamptz)
+          AND r.prompt_version = $1
+          AND r.cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz
+          AND r.cursor_after_message_id = 0
+          AND r.cursor_after_entry_id = ''
+    )
+    ORDER BY range_start_at DESC, message_count DESC, chat_id ASC, canonical_thread_id ASC
     LIMIT $6
 )
 INSERT INTO memory_runs (
@@ -5534,28 +5577,36 @@ impl PostgresMemoryStore {
         let now = now.to_offset(time::UtcOffset::UTC);
         let day_end = now.date().midnight().assume_utc();
         let earliest = now - duration_to_time(retention);
-        let mut day_start = earliest.date().midnight().assume_utc();
+        let earliest_day_start = earliest.date().midnight().assume_utc();
+        let mut window_end = day_end;
         let mut total = 0;
         let active_queue_depth = self.active_memory_run_count().await?;
-        let enqueued_today = self.memory_run_count_created_since(day_end).await?;
-        if memory_enqueue_remaining_capacity(policy, active_queue_depth, enqueued_today).is_none() {
-            self.record_memory_enqueue_backpressure(day_start, day_end, active_queue_depth, policy)
-                .await?;
+        let base_runs_enqueued_today = self.base_memory_run_count_created_since(day_end).await?;
+        if memory_enqueue_remaining_capacity(policy, active_queue_depth, base_runs_enqueued_today)
+            .is_none()
+        {
+            self.record_memory_enqueue_backpressure(
+                earliest_day_start,
+                day_end,
+                active_queue_depth,
+                policy,
+            )
+            .await?;
             self.skip_superseded_runs().await?;
             return Ok(total);
         }
-        while day_start < day_end {
-            let next_day = day_start + time::Duration::days(1);
+        while window_end > earliest_day_start {
+            let window_start = window_end - time::Duration::days(1);
             let Some(limit) = memory_enqueue_remaining_capacity(
                 policy,
-                active_queue_depth,
-                enqueued_today.saturating_add(total),
+                active_queue_depth.saturating_add(i64::try_from(total).unwrap_or(i64::MAX)),
+                base_runs_enqueued_today.saturating_add(total),
             ) else {
                 break;
             };
             self.record_memory_enqueue_rollups(
-                day_start,
-                next_day,
+                window_start,
+                window_end,
                 earliest,
                 active_queue_depth,
                 policy,
@@ -5563,9 +5614,9 @@ impl PostgresMemoryStore {
             )
             .await?;
             total += self
-                .ensure_daily_run_window(day_start, next_day, earliest, policy, limit)
+                .ensure_daily_run_window(window_start, window_end, earliest, policy, limit)
                 .await?;
-            day_start = next_day;
+            window_end = window_start;
         }
         self.skip_superseded_runs().await?;
         Ok(total)
@@ -5578,11 +5629,11 @@ impl PostgresMemoryStore {
             .await?)
     }
 
-    async fn memory_run_count_created_since(
+    async fn base_memory_run_count_created_since(
         &self,
         created_since: OffsetDateTime,
     ) -> Result<u64, StorageError> {
-        let count: i64 = sqlx::query_scalar(SQL_COUNT_MEMORY_RUNS_CREATED_SINCE)
+        let count: i64 = sqlx::query_scalar(SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE)
             .bind(openplotva_memory::PROMPT_VERSION)
             .bind(created_since)
             .fetch_one(&self.pool)
@@ -9947,16 +9998,33 @@ mod tests {
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("COALESCE(c.is_forum, false)"));
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("canonical_thread_id"));
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("HAVING count(*) >= $5"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("ORDER BY message_count DESC"));
+        assert!(
+            super::SQL_ENSURE_DAILY_MEMORY_RUNS
+                .contains("ORDER BY range_start_at DESC, message_count DESC")
+        );
+        assert!(
+            super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("WHERE NOT EXISTS (\n        SELECT 1")
+        );
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("LIMIT $6"));
         assert!(
             super::SQL_SELECT_MEMORY_RUN_MESSAGES
                 .contains("WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0")
         );
         assert!(super::SQL_COUNT_ACTIVE_MEMORY_RUNS.contains("status IN ('queued', 'processing')"));
-        assert!(super::SQL_COUNT_MEMORY_RUNS_CREATED_SINCE.contains("created_at >= $2"));
+        assert!(super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("created_at >= $2"));
+        assert!(
+            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE
+                .contains("cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz")
+        );
+        assert!(
+            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("cursor_after_message_id = 0")
+        );
+        assert!(
+            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("cursor_after_entry_id = ''")
+        );
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("message_count_bucket"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'below_threshold'"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'already_enqueued'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'backpressure'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'min_range_start'"));
         assert!(super::SQL_LIST_MEMORY_ENQUEUE_ROLLUPS.contains("kind = 'consolidation_enqueue'"));
