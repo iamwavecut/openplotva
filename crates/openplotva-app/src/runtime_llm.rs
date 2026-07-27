@@ -1180,27 +1180,81 @@ struct LlmRequestEvent {
     raw_response: Option<Value>,
 }
 
+#[derive(Debug)]
+struct RawBodyCapture {
+    body: Option<Value>,
+    serialized_bytes: Option<usize>,
+    status: &'static str,
+}
+
 /// A raw body is persisted only under the policy and only when its serialized
-/// size fits the cap; oversized bodies degrade to NULL, not truncated JSON.
-fn raw_body_within_policy(value: Option<&Value>, policy: RawBodyPolicy) -> Option<Value> {
+/// size fits the cap. The caller still records size/status metadata when the
+/// body is omitted, so a NULL body is never ambiguous in diagnostics.
+fn capture_raw_body(value: Option<&Value>, policy: RawBodyPolicy) -> RawBodyCapture {
     if !policy.enabled {
-        return None;
+        return RawBodyCapture {
+            body: None,
+            serialized_bytes: value
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map(|json| json.len()),
+            status: "disabled",
+        };
     }
-    let value = value?;
-    if value.is_null() {
-        return None;
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return RawBodyCapture {
+            body: None,
+            serialized_bytes: None,
+            status: "absent",
+        };
+    };
+    let Ok(serialized) = serde_json::to_vec(value) else {
+        return RawBodyCapture {
+            body: None,
+            serialized_bytes: None,
+            status: "serialization_error",
+        };
+    };
+    let serialized_bytes = serialized.len();
+    if serialized_bytes > policy.max_bytes {
+        return RawBodyCapture {
+            body: None,
+            serialized_bytes: Some(serialized_bytes),
+            status: "oversized",
+        };
     }
-    let size = serde_json::to_string(value).map(|json| json.len()).ok()?;
-    (size <= policy.max_bytes).then(|| value.clone())
+    RawBodyCapture {
+        body: Some(value.clone()),
+        serialized_bytes: Some(serialized_bytes),
+        status: "captured",
+    }
 }
 
 impl LlmRequestEvent {
     fn from_trace(trace: &RuntimeLlmRequestData, raw_bodies: RawBodyPolicy) -> Self {
-        let inference_params = trace
+        let mut inference_params = trace
             .inference_params
             .clone()
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}));
+        let raw_request = capture_raw_body(trace.raw_request.as_ref(), raw_bodies);
+        let raw_response = capture_raw_body(trace.raw_response.as_ref(), raw_bodies);
+        if let Some(params) = inference_params.as_object_mut() {
+            params.insert(
+                "raw_request_capture".to_owned(),
+                Value::String(raw_request.status.to_owned()),
+            );
+            params.insert(
+                "raw_response_capture".to_owned(),
+                Value::String(raw_response.status.to_owned()),
+            );
+            if let Some(bytes) = raw_request.serialized_bytes {
+                params.insert("raw_request_bytes".to_owned(), json!(bytes));
+            }
+            if let Some(bytes) = raw_response.serialized_bytes {
+                params.insert("raw_response_bytes".to_owned(), json!(bytes));
+            }
+        }
         let usage = trace.usage.as_ref();
         let timings = trace.timings.as_ref();
         let duration_ms = if trace.result.duration_ms > 0 {
@@ -1256,8 +1310,8 @@ impl LlmRequestEvent {
             error: non_empty_opt(trace.result.error.as_deref()),
             run_id: trace.run_id.clone(),
             run_seq: trace.run_seq,
-            raw_request: raw_body_within_policy(trace.raw_request.as_ref(), raw_bodies),
-            raw_response: raw_body_within_policy(trace.raw_response.as_ref(), raw_bodies),
+            raw_request: raw_request.body,
+            raw_response: raw_response.body,
         }
     }
 }
@@ -1969,6 +2023,12 @@ mod tests {
         let event = LlmRequestEvent::from_trace(&trace, RawBodyPolicy::default());
         assert_eq!(event.raw_request.as_ref(), Some(&body));
         assert_eq!(event.raw_response.as_ref(), Some(&body));
+        assert_eq!(event.inference_params["raw_request_capture"], "captured");
+        assert!(
+            event.inference_params["raw_request_bytes"]
+                .as_u64()
+                .is_some()
+        );
 
         let disabled = LlmRequestEvent::from_trace(
             &trace,
@@ -1979,6 +2039,12 @@ mod tests {
         );
         assert_eq!(disabled.raw_request, None);
         assert_eq!(disabled.raw_response, None);
+        assert_eq!(disabled.inference_params["raw_request_capture"], "disabled");
+        assert!(
+            disabled.inference_params["raw_request_bytes"]
+                .as_u64()
+                .is_some()
+        );
 
         let capped = LlmRequestEvent::from_trace(
             &trace,
@@ -1989,6 +2055,12 @@ mod tests {
         );
         assert_eq!(capped.raw_request, None, "oversized bodies degrade to NULL");
         assert_eq!(capped.raw_response, None);
+        assert_eq!(capped.inference_params["raw_request_capture"], "oversized");
+        assert!(
+            capped.inference_params["raw_request_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 8)
+        );
     }
 
     #[test]

@@ -8,11 +8,12 @@ use openplotva_core::{
     ToolCall, filter_non_terminator_tool_calls,
 };
 use openplotva_dialog::{
-    CapturedMemory, DialogContext, DialogInput, DialogMessage, DialogUser, HistoryMessage,
-    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, MultimodalImage,
-    Persona, PersonaSnapshot, ROLE_MODEL, ROLE_TOOL, ROLE_USER, SettingKv, TurnContextArtifact,
-    daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
-    is_dialog_history_noise_tool_call_name,
+    CapturedMemory, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogContext, DialogInput, DialogMessage,
+    DialogUser, HistoryMessage, MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST,
+    MESSAGE_KIND_TOOL_RESPONSE, MultimodalImage, Persona, PersonaSnapshot, ROLE_MODEL, ROLE_TOOL,
+    ROLE_USER, SettingKv, TurnContextArtifact, daily_persona_for_unix_timestamp,
+    filter_dialog_tool_calls_for_history, is_dialog_history_noise_tool_call_name,
+    normalize_history_message_kind, select_llm_history_messages_for_context,
 };
 use openplotva_memory::{CARD_STATUS_COMPETING, format_context as format_memory_context};
 use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchRequest};
@@ -1031,14 +1032,44 @@ fn turn_context_artifact(
         .map(|line| line.chars().count())
         .sum::<usize>()
         .min(i32::MAX as usize) as i32;
+    let selected_history = select_llm_history_messages_for_context(
+        &input.history,
+        DEFAULT_CONTEXT_HISTORY_LIMIT.saturating_sub(1),
+        input.message.id,
+        input.context.thread_id.unwrap_or_default(),
+    );
+    let (history_len, tool_history_len) =
+        selected_history
+            .iter()
+            .fold((0usize, 0usize), |(history, tools), item| {
+                if item.tool_call.as_ref().is_some_and(|tool_call| {
+                    is_dialog_history_noise_tool_call_name(&tool_call.name)
+                }) {
+                    return (history, tools);
+                }
+                if normalize_history_message_kind(item) == MESSAGE_KIND_TEXT {
+                    (history + 1, tools)
+                } else {
+                    (history, tools + 1)
+                }
+            });
+    let media_payload_chars = input
+        .multimodal_images
+        .iter()
+        .map(|image| image.data_url.chars().count())
+        .sum::<usize>();
     TurnContextArtifact {
         memories,
         persona: Some(persona),
         settings: chat_settings_context_kv(settings),
-        history_len: i32::try_from(input.history.len()).unwrap_or(i32::MAX),
+        history_len: i32::try_from(history_len).unwrap_or(i32::MAX),
+        materialized_history_len: i32::try_from(input.history.len()).unwrap_or(i32::MAX),
+        tool_history_len: i32::try_from(tool_history_len).unwrap_or(i32::MAX),
         tools_offered: !input.disable_tools,
         shield_on: !input.shield_context.trim().is_empty(),
         reference_context_chars,
+        media_count: i32::try_from(input.multimodal_images.len()).unwrap_or(i32::MAX),
+        media_payload_chars: i32::try_from(media_payload_chars).unwrap_or(i32::MAX),
     }
 }
 
@@ -1579,12 +1610,44 @@ mod context_artifact_tests {
     #[test]
     fn artifact_snapshots_persona_settings_and_counts() {
         let mut input = DialogInput::default();
+        input.message.id = 100;
         input.persona.mood = "playful".to_owned();
         input.persona.custom_persona = "be terse".to_owned();
         input.persona.profanity = true;
         input.reference_context = vec!["mem a".to_owned(), "mem b".to_owned()];
         input.disable_tools = false;
         input.shield_context = "flag".to_owned();
+        input.history = (1..=20)
+            .rev()
+            .map(|message_id| HistoryMessage {
+                message_id,
+                kind: MESSAGE_KIND_TEXT.to_owned(),
+                text: format!("message {message_id}"),
+                ..HistoryMessage::default()
+            })
+            .collect();
+        input.history.extend([
+            HistoryMessage {
+                message_id: 20,
+                kind: MESSAGE_KIND_TOOL_REQUEST.to_owned(),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 20,
+                kind: MESSAGE_KIND_TOOL_RESPONSE.to_owned(),
+                ..HistoryMessage::default()
+            },
+        ]);
+        input.multimodal_images = vec![
+            MultimodalImage {
+                data_url: "data:image/png;base64,abcd".to_owned(),
+                ..MultimodalImage::default()
+            },
+            MultimodalImage {
+                data_url: "data:image/jpeg;base64,xyz".to_owned(),
+                ..MultimodalImage::default()
+            },
+        ];
         let settings = ChatSettings {
             reactivity_percentage: 30,
             enable_profanity: true,
@@ -1598,6 +1661,21 @@ mod context_artifact_tests {
         assert!(artifact.tools_offered);
         assert!(artifact.shield_on);
         assert_eq!(artifact.reference_context_chars, 10);
+        assert_eq!(artifact.history_len, 14);
+        assert_eq!(artifact.materialized_history_len, 22);
+        assert_eq!(artifact.tool_history_len, 2);
+        assert_eq!(artifact.media_count, 2);
+        assert_eq!(
+            artifact.media_payload_chars,
+            i32::try_from(
+                input
+                    .multimodal_images
+                    .iter()
+                    .map(|image| image.data_url.chars().count())
+                    .sum::<usize>()
+            )
+            .expect("media chars")
+        );
         assert!(
             artifact
                 .settings
