@@ -5134,11 +5134,25 @@
             const memories = (ctx.memories || []).slice()
                 .sort((a, b) => (b.salience || 0) - (a.salience || 0));
             chips.append(PL.badge(memories.length + ' memories', 'neutral'));
-            chips.append(PL.badge('history ' + (ctx.history_len || 0), 'neutral'));
+            const selectedHistory = ctx.history_len || 0;
+            const loadedHistory = ctx.materialized_history_len || 0;
+            const historyLabel = loadedHistory
+                ? 'history ' + selectedHistory + ' selected · ' + loadedHistory + ' loaded'
+                : 'history ' + selectedHistory;
+            chips.append(PL.badge(historyLabel, 'neutral'));
+            if (ctx.tool_history_len) {
+                chips.append(PL.badge('tool history ' + ctx.tool_history_len, 'neutral'));
+            }
             chips.append(PL.badge(ctx.tools_offered ? 'tools on' : 'tools off', ctx.tools_offered ? 'info' : 'neutral'));
             chips.append(PL.badge(ctx.shield_on ? 'shield on' : 'shield off', ctx.shield_on ? 'success' : 'neutral'));
             if (ctx.reference_context_chars) {
                 chips.append(PL.badge('injected ' + formatAnalyticsCount(ctx.reference_context_chars) + ' chars', 'neutral'));
+            }
+            if (ctx.media_count) {
+                chips.append(PL.badge(
+                    'media ' + ctx.media_count + ' · ' + formatAnalyticsCount(ctx.media_payload_chars || 0) + ' chars',
+                    'neutral',
+                ));
             }
             section.append(chips);
 

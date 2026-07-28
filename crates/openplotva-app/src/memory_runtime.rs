@@ -148,6 +148,13 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         new_id: i64,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
+    /// Fold one card into a survivor, preserving provenance and usage.
+    fn merge_card<'a>(
+        &'a self,
+        old_id: i64,
+        survivor_id: i64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
     /// Flag two contradictory cards as competing (both kept so the bot hedges).
     fn mark_cards_competing<'a>(
         &'a self,
@@ -171,6 +178,7 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         id: i64,
         confidence_delta: f64,
         salience_delta: f64,
+        observed_at: OffsetDateTime,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
     /// Weaken an existing card by lowering its confidence.
@@ -187,6 +195,7 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         model: &'a str,
         prompt_version: &'a str,
         embedding: Option<PgEmbeddingVector>,
+        source_messages: &'a [openplotva_memory::Message],
     ) -> MemoryWriteStoreFuture<'a, (i64, bool), Self::Error>;
 }
 
@@ -304,6 +313,14 @@ impl MemoryWriteStore for PostgresMemoryStore {
         Box::pin(async move { PostgresMemoryStore::supersede_card(self, old_id, new_id).await })
     }
 
+    fn merge_card<'a>(
+        &'a self,
+        old_id: i64,
+        survivor_id: i64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { PostgresMemoryStore::merge_card(self, old_id, survivor_id).await })
+    }
+
     fn mark_cards_competing<'a>(
         &'a self,
         old_id: i64,
@@ -332,9 +349,17 @@ impl MemoryWriteStore for PostgresMemoryStore {
         id: i64,
         confidence_delta: f64,
         salience_delta: f64,
+        observed_at: OffsetDateTime,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            PostgresMemoryStore::reinforce_card(self, id, confidence_delta, salience_delta).await
+            PostgresMemoryStore::reinforce_card(
+                self,
+                id,
+                confidence_delta,
+                salience_delta,
+                observed_at,
+            )
+            .await
         })
     }
 
@@ -352,6 +377,7 @@ impl MemoryWriteStore for PostgresMemoryStore {
         model: &'a str,
         prompt_version: &'a str,
         embedding: Option<PgEmbeddingVector>,
+        source_messages: &'a [openplotva_memory::Message],
     ) -> MemoryWriteStoreFuture<'a, (i64, bool), Self::Error> {
         Box::pin(async move {
             PostgresMemoryStore::insert_episode_with_embedding(
@@ -360,6 +386,7 @@ impl MemoryWriteStore for PostgresMemoryStore {
                 model,
                 prompt_version,
                 embedding.as_ref(),
+                source_messages,
             )
             .await
         })
@@ -1615,23 +1642,22 @@ where
         state.add_card_report(card_report);
     }
     state.finalize_output_metadata();
-    if state.card_input_count > 0 {
-        let episode = episode_from_run(run, &state.report.output, filtered.len());
-        insert_memory_episode(
-            store,
-            embedder,
-            episode,
-            MemoryExtractionBatchConfig {
-                episode_model: &cfg.episode_model,
-                prompt_version: run.prompt_version.trim(),
-                embedding_dimension: cfg.embedding_dimension,
-                fallback_observed_at,
-                batch_input_tokens: state.report.stats.input_tokens,
-            },
-            &mut state.report,
-        )
-        .await?;
-    }
+    let episode = episode_from_run(run, &state.report.output, filtered.len());
+    insert_memory_episode(
+        store,
+        embedder,
+        episode,
+        &filtered,
+        MemoryExtractionBatchConfig {
+            episode_model: &cfg.episode_model,
+            prompt_version: run.prompt_version.trim(),
+            embedding_dimension: cfg.embedding_dimension,
+            fallback_observed_at,
+            batch_input_tokens: state.report.stats.input_tokens,
+        },
+        &mut state.report,
+    )
+    .await?;
     let write = state.report;
     let stats = write.stats.clone();
     report.write = Some(write);
@@ -1658,7 +1684,6 @@ struct ExtractionBatch {
 #[derive(Debug, Default)]
 struct RunExtractionState {
     report: MemoryExtractionWriteReport,
-    card_input_count: usize,
     episode_summary_parts: Vec<String>,
     topics: Vec<String>,
     participants: Vec<String>,
@@ -1701,7 +1726,6 @@ impl RunExtractionState {
     }
 
     fn add_card_report(&mut self, card_report: CardExtractionWriteReport) {
-        self.card_input_count += card_report.card_input_count;
         merge_card_report(&mut self.report, card_report);
     }
 
@@ -2313,14 +2337,10 @@ where
     };
     let card_report =
         write_memory_extraction_cards(store, embedder, input, &report.output, cfg).await?;
-    let card_input_count = card_report.card_input_count;
     merge_card_report(&mut report, card_report);
-    if card_input_count == 0 {
-        return Ok(report);
-    }
 
     let episode = episode_from_extraction_batch(input, &report.output);
-    insert_memory_episode(store, embedder, episode, cfg, &mut report).await?;
+    insert_memory_episode(store, embedder, episode, &input.messages, cfg, &mut report).await?;
 
     Ok(report)
 }
@@ -2331,7 +2351,6 @@ struct CardExtractionWriteReport {
     card_ids: Vec<i64>,
     links_inserted: usize,
     superseded: Vec<(i64, i64)>,
-    card_input_count: usize,
     card_embedding_error: Option<String>,
     link_error: Option<String>,
     supersession_errors: Vec<String>,
@@ -2429,11 +2448,10 @@ pub struct MemoryCardDecayReport {
     pub errors: u64,
 }
 
-/// Periodically give cold, never-expiring cards a grace TTL so the active set
-/// stays bounded even when extraction over-marked facts as permanent. Only
-/// low-salience, non-portable, old-and-unused cards are touched, and a
-/// reinforcement before the grace elapses clears the TTL again, so only truly
-/// stale facts forget. Runs until `stop` resolves; each tick drains in batches.
+/// Periodically give cold episodic cards a grace TTL so the active set stays
+/// bounded. Durable personality and factual card types are excluded; only
+/// low-salience, non-portable, old-and-unused events, jokes, and recurring
+/// topics are touched. Reinforcement before the grace elapses clears the TTL.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_memory_card_decay_worker_until<Stop>(
     store: PostgresMemoryStore,
@@ -2835,7 +2853,6 @@ where
     let mut report = CardExtractionWriteReport::default();
     let cards =
         openplotva_memory::cards_from_extraction_at(input, output, cfg.fallback_observed_at);
-    report.card_input_count = cards.len();
     if cards.is_empty() {
         return Ok(report);
     }
@@ -3009,9 +3026,9 @@ where
             resolution_embed_idx += 1;
             embedding
         };
-        // Retire the folded card (old_id) into the survivor (into_id):
-        // supersede_card's first arg is the card that gets superseded.
-        match store.supersede_card(*old_id, *into_id).await {
+        // Retire the folded card into the survivor while carrying provenance,
+        // links, temporal state, and retrieval usage.
+        match store.merge_card(*old_id, *into_id).await {
             Ok(()) => {
                 report.stats.cards_superseded += 1;
                 report.merged.push((*old_id, *into_id));
@@ -3033,8 +3050,13 @@ where
                 .push(format!("merge {old_id}->{into_id}: {error}")),
         }
     }
+    let reinforcement_observed_at =
+        openplotva_memory::observed_at_from_messages_at(&input.messages, cfg.fallback_observed_at);
     for old_id in &reinforce_ids {
-        match store.reinforce_card(*old_id, 0.1, 0.05).await {
+        match store
+            .reinforce_card(*old_id, 0.1, 0.05, reinforcement_observed_at)
+            .await
+        {
             Ok(()) => report.stats.cards_updated += 1,
             Err(error) => report
                 .resolution_errors
@@ -3085,6 +3107,7 @@ async fn insert_memory_episode<ExtractorError, Store, Embedder>(
     store: &Store,
     embedder: Option<&Embedder>,
     episode: Episode,
+    source_messages: &[openplotva_memory::Message],
     cfg: MemoryExtractionBatchConfig<'_>,
     report: &mut MemoryExtractionWriteReport,
 ) -> Result<(), MemoryExtractionWriteError<ExtractorError, Store::Error>>
@@ -3119,6 +3142,7 @@ where
             cfg.episode_model,
             cfg.prompt_version,
             episode_embedding,
+            source_messages,
         )
         .await
         .map_err(|source| MemoryExtractionWriteError::StoreEpisode { source })?;
@@ -4348,6 +4372,20 @@ mod tests {
             })
         }
 
+        fn merge_card<'a>(
+            &'a self,
+            old_id: i64,
+            survivor_id: i64,
+        ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.superseded
+                    .lock()
+                    .expect("superseded")
+                    .push((old_id, survivor_id));
+                Ok(())
+            })
+        }
+
         fn mark_cards_competing<'a>(
             &'a self,
             _old_id: i64,
@@ -4380,6 +4418,7 @@ mod tests {
             id: i64,
             _confidence_delta: f64,
             _salience_delta: f64,
+            _observed_at: OffsetDateTime,
         ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
             Box::pin(async move {
                 self.resolution_ops
@@ -4410,6 +4449,7 @@ mod tests {
             _model: &'a str,
             _prompt_version: &'a str,
             embedding: Option<PgEmbeddingVector>,
+            _source_messages: &'a [openplotva_memory::Message],
         ) -> MemoryWriteStoreFuture<'a, (i64, bool), Self::Error> {
             Box::pin(async move {
                 self.episodes.lock().expect("episodes").push(episode);
@@ -5247,6 +5287,51 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].2, MEMORY_CARD_EMBEDDING_TASK);
         assert_eq!(calls[2].2, MEMORY_EPISODE_EMBEDDING_TASK);
+    }
+
+    #[tokio::test]
+    async fn write_memory_extraction_batch_keeps_episode_without_cards() {
+        let source = openplotva_memory::Message {
+            entry_id: "msg:episode".to_owned(),
+            message_id: 7,
+            occurred_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7),
+            ..openplotva_memory::Message::default()
+        };
+        let input = ExtractInput {
+            run: openplotva_memory::Run {
+                chat_id: 42,
+                range_start_at: OffsetDateTime::UNIX_EPOCH,
+                range_end_at: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(5),
+                ..openplotva_memory::Run::default()
+            },
+            messages: vec![source],
+            ..ExtractInput::default()
+        };
+        let store = FakeMemoryWriteStore::default();
+
+        let report = write_memory_extraction_batch(
+            &store,
+            Option::<&FakeEmbedder>::None,
+            &input,
+            ExtractOutput {
+                episode_summary: "A moment worth remembering".to_owned(),
+                ..ExtractOutput::default()
+            },
+            MemoryExtractionBatchConfig {
+                episode_model: "model",
+                prompt_version: "pv",
+                embedding_dimension: 2,
+                fallback_observed_at: OffsetDateTime::UNIX_EPOCH,
+                batch_input_tokens: 3,
+            },
+        )
+        .await
+        .expect("write report");
+
+        assert!(report.episode_inserted);
+        assert_eq!(report.stats.episodes_inserted, 1);
+        assert_eq!(store.cards.lock().expect("cards").len(), 0);
+        assert_eq!(store.episodes.lock().expect("episodes").len(), 1);
     }
 
     #[tokio::test]

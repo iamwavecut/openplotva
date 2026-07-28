@@ -293,10 +293,19 @@ pub struct TurnContextArtifact {
     pub memories: Vec<CapturedMemory>,
     pub persona: Option<PersonaSnapshot>,
     pub settings: Vec<SettingKv>,
+    /// Visible historical messages selected for the provider (current turn excluded).
     pub history_len: i32,
+    /// Raw canonical history rows materialized before provider selection.
+    pub materialized_history_len: i32,
+    /// Selected tool request/response rows associated with the visible history.
+    pub tool_history_len: i32,
     pub tools_offered: bool,
     pub shield_on: bool,
     pub reference_context_chars: i32,
+    /// Number of multimodal image payloads attached to the turn.
+    pub media_count: i32,
+    /// Serialized data-URL characters carried by those image payloads.
+    pub media_payload_chars: i32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
