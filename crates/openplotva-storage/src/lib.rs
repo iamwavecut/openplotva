@@ -10654,16 +10654,18 @@ mod tests {
             assert!(!retrieved.cards.is_empty());
             assert_eq!(retrieved.episodes.len(), 1);
             assert_eq!(retrieved.episodes[0].id, episode_id);
+            let retrieved_card_ids =
+                retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>();
             store
                 .record_card_retrieval(
-                    &retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+                    &retrieved_card_ids,
                     observed + time::Duration::hours(1),
                 )
                 .await?;
             let used_cards: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM memory_cards WHERE id = ANY($1::bigint[]) AND use_count = 1 AND last_used_at = $2",
             )
-            .bind(&retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>())
+            .bind(&retrieved_card_ids)
             .bind(observed + time::Duration::hours(1))
             .fetch_one(&pool)
             .await?;
