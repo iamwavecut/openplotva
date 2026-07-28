@@ -49,6 +49,11 @@ if ! command -v shasum >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required for signed admin session smoke" >&2
+  exit 1
+fi
+
 free_port_from() {
   local port="$1"
   while nc -z 127.0.0.1 "$port" >/dev/null 2>&1; do
@@ -85,6 +90,7 @@ memory_delete_file="${log_dir}/settings-memory-delete.json"
 memory_after_file="${log_dir}/settings-memory-after.json"
 admin_safety_file="${log_dir}/admin-safety.json"
 admin_analytics_file="${log_dir}/admin-analytics.json"
+admin_memory_runs_file="${log_dir}/admin-memory-runs.json"
 admin_chat_update_file="${log_dir}/admin-chat-update.json"
 admin_chat_after_update_file="${log_dir}/admin-chat-after-update.json"
 admin_chat_block_file="${log_dir}/admin-chat-block.json"
@@ -99,6 +105,13 @@ runtime_unauth_file="${log_dir}/runtime-unauthorized.txt"
 runtime_method_file="${log_dir}/runtime-method.txt"
 runtime_graphql_file="${log_dir}/runtime-graphql.json"
 app_pid=""
+smoke_admin_id="1001"
+smoke_admin_signature="$(
+  printf '%s' "$smoke_admin_id" \
+    | openssl dgst -sha256 -hmac '' \
+    | awk '{print $NF}'
+)"
+admin_cookie_header="Cookie: admin_session=${smoke_admin_id}.${smoke_admin_signature}"
 
 compose() {
   OPENPLOTVA_DEV_POSTGRES_PORT="$pg_port" \
@@ -176,6 +189,7 @@ start_app() {
     REDIS_PASSWORD="" \
     REDIS_DB="0" \
     BOT_USERNAME="SmokePlotvaBot" \
+    ADMINS_ADMIN_IDS="${ADMINS_ADMIN_IDS:-1001}" \
     OPENPLOTVA_LOG_FILTER="${OPENPLOTVA_LOG_FILTER:-openplotva=warn,tower_http=warn}" \
     cargo run -p openplotva-app >>"$app_log" 2>&1 &
   app_pid="$!"
@@ -192,14 +206,31 @@ stop_app() {
 seed_existing_migration_history() {
   local bridge_sql="${log_dir}/existing-migration-history.sql"
   {
-    echo "DROP TABLE IF EXISTS gorp_migrations;"
-    echo "CREATE TABLE gorp_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());"
-    for migration in migrations/*.up.sql; do
+    echo "DROP SCHEMA public CASCADE;"
+    echo "CREATE SCHEMA public;"
+    while IFS= read -r migration; do
       local stem
       stem="$(basename "$migration" .up.sql)"
+      local version="${stem%%_*}"
+      if (( 10#${version} > 110 )); then
+        continue
+      fi
+      printf '\n-- service-smoke legacy schema: %s\n' "$stem"
+      cat "$migration"
+      printf '\n'
+    done < <(printf '%s\n' migrations/*.up.sql | sort -V)
+    echo "CREATE TABLE gorp_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+    while IFS= read -r migration; do
+      local stem
+      stem="$(basename "$migration" .up.sql)"
+      local version="${stem%%_*}"
+      # The Go migration ledger ended at version 110. Later migrations are
+      # SQLx-native and must remain pending so the bridge can apply them.
+      if (( 10#${version} > 110 )); then
+        continue
+      fi
       printf "INSERT INTO gorp_migrations (id, applied_at) VALUES ('%s.sql', now()) ON CONFLICT (id) DO NOTHING;\n" "$stem"
-    done
-    echo "DROP TABLE IF EXISTS _sqlx_migrations;"
+    done < <(printf '%s\n' migrations/*.up.sql | sort -V)
   } >"$bridge_sql"
   compose exec -T postgres psql -v ON_ERROR_STOP=1 -U plotva -d plotva <"$bridge_sql" >/dev/null
 }
@@ -571,7 +602,7 @@ echo "+ /admin/api/state ok"
 
 curl -fsS "${base_url}/admin/api/auth_check" >"$auth_file"
 expect_jq_equals "$auth_file" '.authenticated' "false"
-curl -fsS -H "Cookie: admin_session=1001" "${base_url}/admin/api/auth_check" >"$auth_cookie_file"
+curl -fsS -H "$admin_cookie_header" "${base_url}/admin/api/auth_check" >"$auth_cookie_file"
 expect_jq_equals "$auth_cookie_file" '.authenticated' "true"
 expect_jq_equals "$auth_cookie_file" '.user_id' "1001"
 echo "+ /admin/api/auth_check ok"
@@ -641,14 +672,14 @@ curl -fsS "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b
 expect_jq_equals "$memory_after_file" '.count' "0"
 echo "+ /api/settings side APIs real-db ok"
 
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/safety/checks?q=wc-smoke-ext&flagged=true&limit=10" >"$admin_safety_file"
 expect_jq_equals "$admin_safety_file" '.count' "1"
 expect_jq_equals "$admin_safety_file" '.checks[0].external_session_id' "wc-smoke-ext"
 expect_jq_equals "$admin_safety_file" '.checks[0].flagged' "true"
 expect_jq_equals "$admin_safety_file" '.checks[0].request_messages[0].content' "smoke risky text"
 
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/analytics/llm/summary?range=24h" >"$admin_analytics_file"
 expect_jq_equals "$admin_analytics_file" '.totals.total_count' "2"
 expect_jq_equals "$admin_analytics_file" '.totals.error_count' "1"
@@ -656,18 +687,22 @@ expect_jq_equals "$admin_analytics_file" '.providers[] | select(.provider == "AI
 expect_jq_equals "$admin_analytics_file" '.models[] | select(.model == "smoke-model-a") | .output_tokens' "40"
 expect_jq_equals "$admin_analytics_file" '.inference_params[] | select(.model == "smoke-model-a") | .max_tokens' "512"
 expect_jq_equals "$admin_analytics_file" '.top_chats[] | select(.chat_id == -100777) | .title' "Smoke Group"
-expect_jq_equals "$admin_analytics_file" '.memory_runs.completed_count' "1"
-expect_jq_equals "$admin_analytics_file" '.memory_runs.statuses[] | select(.status == "completed") | .message_count' "12"
+curl -fsS -H "$admin_cookie_header" \
+  "${base_url}/admin/api/memory/runs?limit=10" >"$admin_memory_runs_file"
+expect_jq_equals "$admin_memory_runs_file" \
+  '.runs[] | select(.prompt_version == "service-smoke-memory") | .status' "completed"
+expect_jq_equals "$admin_memory_runs_file" \
+  '.runs[] | select(.prompt_version == "service-smoke-memory") | .message_count' "12"
 echo "+ admin safety/analytics seeded telemetry ok"
 
 curl -fsS \
   -X POST \
-  -H "Cookie: admin_session=1001" \
+  -H "$admin_cookie_header" \
   -H "Content-Type: application/json" \
   --data '{"chat_id":-100777,"mood_alignment":"admin-smoke-mood","custom_persona":"admin smoke persona","reactivity_percentage":77,"proactivity_percentage":23,"enable_global_text_reply":true,"enable_global_draw_reply":true,"enable_obscenifier":true,"enable_profanity":false,"enable_greet_joiners":false,"enable_daily_game":false,"daily_game_theme":"admin-smoke-theme","greeting_html":"<b>hello smoke</b>"}' \
   "${base_url}/admin/api/chat/settings" >"$admin_chat_update_file"
 expect_jq_equals "$admin_chat_update_file" '.ok' "true"
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/chat?chat_id=-100777" >"$admin_chat_after_update_file"
 expect_jq_equals "$admin_chat_after_update_file" '.settings.mood_alignment' "admin-smoke-mood"
 expect_jq_equals "$admin_chat_after_update_file" '.settings.custom_persona' "admin smoke persona"
@@ -677,29 +712,29 @@ expect_jq_equals "$admin_chat_after_update_file" '.settings.daily_game_theme' "a
 
 curl -fsS \
   -X POST \
-  -H "Cookie: admin_session=1001" \
+  -H "$admin_cookie_header" \
   "${base_url}/admin/api/chat/block?chat_id=-100777&minutes=10" >"$admin_chat_block_file"
 expect_jq_equals "$admin_chat_block_file" '.ok' "true"
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/chat?chat_id=-100777" >"$admin_chat_blocked_file"
 expect_jq_equals "$admin_chat_blocked_file" '.blocked' "true"
 curl -fsS \
   -X DELETE \
-  -H "Cookie: admin_session=1001" \
+  -H "$admin_cookie_header" \
   "${base_url}/admin/api/chat/unblock?chat_id=-100777" >"$admin_chat_unblock_file"
 expect_jq_equals "$admin_chat_unblock_file" '.ok' "true"
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/chat?chat_id=-100777" >"$admin_chat_unblocked_file"
 expect_jq_equals "$admin_chat_unblocked_file" '.blocked' "false"
 
 curl -fsS \
   -X POST \
-  -H "Cookie: admin_session=1001" \
+  -H "$admin_cookie_header" \
   -H "Content-Type: application/json" \
   --data '{"user_id":7,"days":3,"reason":"service smoke vip","vip":true}' \
   "${base_url}/admin/api/user/grant_vip" >"$admin_vip_grant_file"
 expect_jq_equals "$admin_vip_grant_file" '.ok' "true"
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/user?id=7" >"$admin_vip_after_grant_file"
 expect_jq_equals "$admin_vip_after_grant_file" '.vip_summary.active' "true"
 expect_jq_equals "$admin_vip_after_grant_file" '.vip_summary.latest_event_type' "admin_adjustment"
@@ -707,11 +742,11 @@ expect_jq_equals "$admin_vip_after_grant_file" '.vip_summary.latest_reason' "ser
 expect_jq_equals "$admin_vip_after_grant_file" '.vip_events[0].reason' "service smoke vip"
 curl -fsS \
   -X DELETE \
-  -H "Cookie: admin_session=1001" \
+  -H "$admin_cookie_header" \
   "${base_url}/admin/api/user/revoke_vip?user_id=7&reason=service%20smoke%20revoke" >"$admin_vip_revoke_file"
 expect_jq_equals "$admin_vip_revoke_file" '.ok' "true"
 expect_jq_equals "$admin_vip_revoke_file" '.revoked' "true"
-curl -fsS -H "Cookie: admin_session=1001" \
+curl -fsS -H "$admin_cookie_header" \
   "${base_url}/admin/api/user?id=7" >"$admin_vip_after_revoke_file"
 expect_jq_equals "$admin_vip_after_revoke_file" '.vip_summary.latest_event_type' "admin_revoke"
 expect_jq_equals "$admin_vip_after_revoke_file" '.vip_summary.latest_reason' "service smoke revoke"
