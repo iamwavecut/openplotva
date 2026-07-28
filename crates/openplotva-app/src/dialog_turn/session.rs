@@ -152,8 +152,12 @@ impl SentLog {
         }
     }
 
-    fn contains(&self, text: &str) -> bool {
-        self.texts.contains(&normalize_sent_text(text))
+    /// Match either one delivery or the model's whitespace-only concatenation
+    /// of every delivery made so far.
+    fn matches_delivery(&self, text: &str) -> bool {
+        let normalized = normalize_sent_text(text);
+        self.texts.contains(&normalized)
+            || (self.texts.len() > 1 && self.texts.join(" ") == normalized)
     }
 
     fn record(&mut self, text: &str, intermediate: bool) {
@@ -344,6 +348,9 @@ where
     let mut recorded_tool_calls: Vec<ToolCall> = Vec::new();
     let mut regenerations: i32 = 0;
     let mut anti_loop = false;
+    let mut repeated_final_repair = false;
+    // After a work tool, progress messages alone cannot satisfy the answer.
+    let mut requires_novel_final = false;
     let mut draws_scheduled: i32 = 0;
     let mut songs_scheduled: i32 = 0;
     let mut reacted_message_ids: BTreeSet<i64> = BTreeSet::new();
@@ -377,6 +384,7 @@ where
                     successful_web_search = false;
                     web_source_urls.clear();
                     search_citation_repairs = 0;
+                    repeated_final_repair = false;
                 }
                 Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
                     ..
@@ -410,7 +418,7 @@ where
         let force_final = iteration == max_iterations;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
-        } else if force_final || search_citation_repairs > 0 {
+        } else if force_final || search_citation_repairs > 0 || repeated_final_repair {
             ToolsMode::FinalOnly
         } else {
             ToolsMode::Native(native_tools.clone())
@@ -602,11 +610,37 @@ where
                 };
             }
 
-            let (duplicate_message_id, duplicate) =
-                should_suppress_duplicate_bot_reply(&duplicate_guard_history, &sanitized);
-            if sent.contains(&sanitized) {
-                // A final round may repeat successful send_message content as confirmation.
-                // It terminates the turn without delivering the same Telegram text twice.
+            if sent.matches_delivery(&sanitized) {
+                if requires_novel_final {
+                    if regenerations < ctx.max_regenerations.max(0)
+                        && iteration < max_iterations
+                        && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
+                    {
+                        regenerations += 1;
+                        report.regenerations = regenerations;
+                        anti_loop = true;
+                        repeated_final_repair = true;
+                        append_repeated_final_regeneration_event(
+                            queue,
+                            ctx.item_id,
+                            regenerations,
+                            failure_now,
+                        )
+                        .await;
+                        continue;
+                    }
+                    let error = format!(
+                        "dialog final answer only replayed intermediate messages after {regenerations} regeneration(s)"
+                    );
+                    return TurnResolution {
+                        outcome: TurnOutcome::TerminalFailed {
+                            reason: "repeated_final_after_partial",
+                            error: error.clone(),
+                            user_signal: UserSignalPlan::React,
+                        },
+                        disposition: JobDisposition::Fail(error),
+                    };
+                }
                 report.sent_answer = true;
                 if let Some(runs) = ctx.llm_runs {
                     runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
@@ -622,6 +656,8 @@ where
                     disposition: JobDisposition::Complete,
                 };
             }
+            let (duplicate_message_id, duplicate) =
+                should_suppress_duplicate_bot_reply(&duplicate_guard_history, &sanitized);
             if duplicate {
                 if regenerations < ctx.max_regenerations.max(0)
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
@@ -809,6 +845,12 @@ where
         let mut parallel_media_results = BTreeMap::new();
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
         for (call_index, call) in step.tool_calls.iter().enumerate() {
+            if !matches!(
+                call.step.step.as_str(),
+                STEP_SEND_MESSAGE | STEP_REACT_TO_MESSAGE
+            ) {
+                requires_novel_final = true;
+            }
             if call.step.step == STEP_UNDERSTAND_MEDIA
                 && !parallel_media_results.contains_key(&call_index)
             {
@@ -1380,7 +1422,7 @@ where
             "per-turn message limit reached; write your final answer",
         );
     }
-    if sent.contains(sanitized) {
+    if sent.matches_delivery(sanitized) {
         return ToolResult::failed("duplicate_message", "this text was already sent this turn");
     }
     if let Err(validation) = validate_dialog_answer_deliverable(sanitized) {
@@ -1518,6 +1560,27 @@ async fn append_session_regeneration_event<Queue>(
         attempt,
         message: "session final answer duplicated a sent message; regenerating".to_owned(),
         data,
+        ..TaskQueueJobEvent::default()
+    };
+    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
+        tracing::debug!(error = %error, job_id, "failed to append session regeneration event");
+    }
+}
+
+async fn append_repeated_final_regeneration_event<Queue>(
+    queue: &Queue,
+    job_id: i64,
+    attempt: i32,
+    at: OffsetDateTime,
+) where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let event = TaskQueueJobEvent {
+        level: "info".to_owned(),
+        stage: DIALOG_TURN_REGENERATE_STAGE.to_owned(),
+        attempt,
+        message: "session final answer replayed intermediate messages; regenerating".to_owned(),
+        data: BTreeMap::from([("reason".to_owned(), "session_replay_regenerate".to_owned())]),
         ..TaskQueueJobEvent::default()
     };
     if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {

@@ -4500,16 +4500,28 @@ async fn session_accepts_final_text_already_delivered_by_send_message() -> Resul
     let provider = StepProviderStub::with_steps(vec![
         Ok(step_tools(
             "",
-            vec![(
-                "send-1",
-                openplotva_dialog::ToolStep {
-                    step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
-                    text: "в видео говорят о контексте".to_owned(),
-                    ..openplotva_dialog::ToolStep::default()
-                },
-            )],
+            vec![
+                (
+                    "send-1",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                        text: "В видео говорят о контексте.".to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+                (
+                    "send-2",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                        text: "Собеседники спорят о его значении.".to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+            ],
         )),
-        Ok(step_text("в видео говорят о контексте")),
+        Ok(step_text(
+            "В видео говорят о контексте.\n\nСобеседники спорят о его значении.",
+        )),
     ]);
     let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
         Arc::new(SessionToolboxStub::default());
@@ -4533,11 +4545,11 @@ async fn session_accepts_final_text_already_delivered_by_send_message() -> Resul
     assert!(report.sent_answer, "{report:?}");
     assert!(!report.failed, "{report:?}");
     assert_eq!(report.regenerations, 0);
-    assert_eq!(provider.calls(), 2, "the tool result reached the model");
-    assert_eq!(effects.intermediates().len(), 1);
+    assert_eq!(provider.calls(), 2, "the tool results reached the model");
+    assert_eq!(effects.intermediates().len(), 2);
     assert!(
         effects.sent().is_empty(),
-        "the final must not be sent twice"
+        "already delivered answer parts must not be sent twice"
     );
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     let record = queue.record(job_id).expect("job record");
@@ -4549,7 +4561,111 @@ async fn session_accepts_final_text_already_delivered_by_send_message() -> Resul
     );
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
-    assert_eq!(rows[0].sent_message_parts, Some(1));
+    assert_eq!(rows[0].sent_message_parts, Some(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_suppresses_replayed_intermediate_batch_and_requires_new_final()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("расскажи сказку"), now),
+    );
+    let first = "Ой, какая милая идея! 🥹🩷";
+    let second = "Сейчас попробую сочинить что-нибудь такое... с огоньком! ✨";
+    let replay = format!("{first}\n\n{second}");
+    let song = || openplotva_dialog::ToolStep {
+        step: openplotva_dialog::STEP_GENERATE_SONG.to_owned(),
+        topic: "эротическая сказка в сумерках".to_owned(),
+        ..openplotva_dialog::ToolStep::default()
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![
+                (
+                    "send-1",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                        text: first.to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+                (
+                    "send-2",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                        text: second.to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+                ("song-1", song()),
+            ],
+        )),
+        Ok(step_tools(&replay, vec![("song-2", song())])),
+        Ok(step_text(&replay)),
+        Ok(step_text(
+            "В сумерках она открыла дверь — и история наконец началась.",
+        )),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert!(!report.failed, "{report:?}");
+    assert_eq!(report.regenerations, 1);
+    assert_eq!(provider.calls(), 4);
+    assert_eq!(
+        effects.intermediates(),
+        vec![(first.to_owned(), 1, true), (second.to_owned(), 2, false),],
+        "the concatenated replay must not become a third Telegram message"
+    );
+    assert_eq!(
+        effects.sent(),
+        vec![(
+            "расскажи сказку".to_owned(),
+            "В сумерках она открыла дверь — и история наконец началась.".to_owned(),
+        )]
+    );
+    let requests = provider.requests();
+    assert!(matches!(
+        requests[3].tools,
+        openplotva_dialog::ToolsMode::FinalOnly
+    ));
+    assert!(
+        requests[3]
+            .input
+            .reference_context
+            .contains(&openplotva_dialog::turn::ANTI_LOOP_HINT.to_owned())
+    );
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    let record = queue.record(job_id).expect("job record");
+    assert!(record.events.iter().any(|event| {
+        event.stage == crate::dialog_turn::DIALOG_TURN_REGENERATE_STAGE
+            && event.data.get("reason").map(String::as_str) == Some("session_replay_regenerate")
+    }));
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "sent");
+    assert_eq!(rows[0].sent_message_parts, Some(3));
     Ok(())
 }
 

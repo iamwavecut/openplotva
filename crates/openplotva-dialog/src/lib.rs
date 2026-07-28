@@ -631,7 +631,10 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: STEP_GENERATE_SONG,
         summary: "Generate a song from a topic or idea.",
-        when_to_use: "Use when the latest user message asks for a song, track, lyrics-based song, or music generation.",
+        when_to_use: "Use only when the latest user message explicitly asks for a song, track, \
+                      lyrics-based song, or music generation. Never use it for stories, fairy \
+                      tales, prose, poems, roleplay, or other text-only creative writing unless \
+                      the user explicitly asks to turn that writing into a song.",
         result: "Schedules music generation and ENDS your turn; the song arrives asynchronously. \
                  Anything you want to tell the chat, say it before or together with this call.",
         args: GENERATE_SONG_ARGS,
@@ -3327,6 +3330,15 @@ mod tests {
         assert!(properties.contains_key("prompt"));
         assert!(properties.contains_key("negative_prompt"));
         assert_eq!(draw.function.parameters["required"], json!(["prompt"]));
+        let song = tools
+            .iter()
+            .find(|tool| tool.function.name == STEP_GENERATE_SONG)
+            .expect("song tool");
+        assert!(
+            song.function
+                .description
+                .contains("Never use it for stories")
+        );
 
         let translate = tools
             .iter()
