@@ -36,7 +36,10 @@ impl GeminiExplicitCachePurger {
         Some(Self {
             api_key: api_key.to_owned(),
             base_url: GEMINI_API_BASE_URL.to_owned(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Gemini cache reqwest client configuration is valid"),
         })
     }
 
@@ -66,8 +69,14 @@ impl GeminiExplicitCachePurger {
     }
 
     async fn list_page(&self, page_token: &str) -> Result<GeminiCachedContentPage, String> {
-        let url = gemini_list_cached_contents_url(&self.base_url, &self.api_key, page_token)?;
-        let response = self.http.get(url).send().await.map_err(error_text)?;
+        let url = gemini_list_cached_contents_url(&self.base_url, page_token)?;
+        let response = self
+            .http
+            .get(url)
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await
+            .map_err(error_text)?;
         let status = response.status();
         if !status.is_success() {
             let body = limited_response_body(response).await;
@@ -80,8 +89,14 @@ impl GeminiExplicitCachePurger {
     }
 
     async fn delete_cache(&self, name: &str) -> Result<(), String> {
-        let url = gemini_delete_cached_content_url(&self.base_url, &self.api_key, name)?;
-        let response = self.http.delete(url).send().await.map_err(error_text)?;
+        let url = gemini_delete_cached_content_url(&self.base_url, name)?;
+        let response = self
+            .http
+            .delete(url)
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await
+            .map_err(error_text)?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -317,11 +332,7 @@ struct CacheKey {
     fingerprint: String,
 }
 
-fn gemini_list_cached_contents_url(
-    base_url: &str,
-    api_key: &str,
-    page_token: &str,
-) -> Result<String, String> {
+fn gemini_list_cached_contents_url(base_url: &str, page_token: &str) -> Result<String, String> {
     let mut url = parse_base_url(base_url)?;
     url.path_segments_mut()
         .map_err(|_| "invalid Gemini API base URL".to_owned())?
@@ -329,7 +340,6 @@ fn gemini_list_cached_contents_url(
         .push("cachedContents");
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("key", api_key);
         query.append_pair("pageSize", GEMINI_CACHE_PAGE_SIZE);
         if !page_token.trim().is_empty() {
             query.append_pair("pageToken", page_token.trim());
@@ -338,11 +348,7 @@ fn gemini_list_cached_contents_url(
     Ok(url.to_string())
 }
 
-fn gemini_delete_cached_content_url(
-    base_url: &str,
-    api_key: &str,
-    name: &str,
-) -> Result<String, String> {
+fn gemini_delete_cached_content_url(base_url: &str, name: &str) -> Result<String, String> {
     let mut url = parse_base_url(base_url)?;
     let name = name.trim();
     if name.is_empty() {
@@ -359,7 +365,6 @@ fn gemini_delete_cached_content_url(
             segments.push(name);
         }
     }
-    url.query_pairs_mut().append_pair("key", api_key);
     Ok(url.to_string())
 }
 
@@ -524,18 +529,19 @@ mod tests {
         assert_eq!(
             gemini_list_cached_contents_url(
                 "https://generativelanguage.googleapis.com/v1beta/",
-                "key 1",
                 "next token"
             ),
-            Ok("https://generativelanguage.googleapis.com/v1beta/cachedContents?key=key+1&pageSize=100&pageToken=next+token".to_owned())
+            Ok("https://generativelanguage.googleapis.com/v1beta/cachedContents?pageSize=100&pageToken=next+token".to_owned())
         );
         assert_eq!(
             gemini_delete_cached_content_url(
                 "https://generativelanguage.googleapis.com/v1beta",
-                "key 1",
                 "cachedContents/cache/1"
             ),
-            Ok("https://generativelanguage.googleapis.com/v1beta/cachedContents/cache%2F1?key=key+1".to_owned())
+            Ok(
+                "https://generativelanguage.googleapis.com/v1beta/cachedContents/cache%2F1"
+                    .to_owned()
+            )
         );
     }
 

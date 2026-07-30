@@ -312,9 +312,10 @@ impl GeminiYouTubeSummarizer {
     pub fn new(cfg: YouTubeSummaryConfig) -> Self {
         let cfg = cfg.with_defaults();
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(cfg.request_timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("YouTube reqwest client configuration is valid");
         Self { cfg, http }
     }
 
@@ -362,8 +363,9 @@ impl GeminiYouTubeSummarizer {
         let tracks = select_caption_tracks(&player, &["ru", "en"])?;
         let mut transcripts = Vec::with_capacity(tracks.len());
         for track in tracks {
+            let caption_url = validated_caption_url(&track.base_url)?;
             let xml = self
-                .get_text(&transcript_url(&track.base_url), consent_cookie.as_deref())
+                .get_text(&caption_url, consent_cookie.as_deref())
                 .await?;
             let lines = parse_transcript_xml(&xml)?;
             transcripts.push(Transcript {
@@ -517,9 +519,10 @@ impl OpenAiCompatibleYouTubeSummarizer {
     ) -> Self {
         let cfg = cfg.with_defaults();
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(cfg.request_timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("OpenAI-compatible YouTube reqwest client configuration is valid");
         let provider = if cfg.direct_url.contains("openrouter.ai") {
             "openrouter"
         } else {
@@ -602,9 +605,10 @@ async fn generate_youtube_summary_with_attempt(
     })?;
     let timeout = routed_attempt_timeout(config, &attempt);
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("routed YouTube reqwest client configuration is valid");
     let mut builder = http
         .post(endpoint)
         .bearer_auth(api_key.trim())
@@ -930,8 +934,25 @@ fn select_caption_tracks(
     Ok(selected)
 }
 
-fn transcript_url(base_url: &str) -> String {
-    base_url.replace("&fmt=srv3", "")
+fn validated_caption_url(base_url: &str) -> Result<String, YouTubeSummaryError> {
+    let normalized = base_url.replace("&fmt=srv3", "");
+    let url = Url::parse(&normalized)
+        .map_err(|_| YouTubeSummaryError::Transcript("invalid caption URL".to_owned()))?;
+    let approved_host = matches!(
+        url.host_str(),
+        Some("www.youtube.com" | "youtube.com" | "m.youtube.com")
+    );
+    if url.scheme() != "https"
+        || !approved_host
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(YouTubeSummaryError::Transcript(
+            "caption URL is outside approved YouTube origins".to_owned(),
+        ));
+    }
+    Ok(url.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1261,7 +1282,7 @@ struct OpenAiError {
 }
 
 fn http_error_text(error: reqwest::Error) -> YouTubeSummaryError {
-    YouTubeSummaryError::Http(error.to_string())
+    YouTubeSummaryError::Http(error.without_url().to_string())
 }
 
 #[cfg(test)]
@@ -1312,6 +1333,23 @@ mod tests {
             out,
             "Language: Russian\n0.000000: Hello & hi\n2.250000: world\n"
         );
+    }
+
+    #[test]
+    fn caption_urls_are_restricted_to_youtube_https_origins() {
+        assert_eq!(
+            validated_caption_url("https://www.youtube.com/api/timedtext?v=abc&fmt=srv3")
+                .expect("approved caption URL"),
+            "https://www.youtube.com/api/timedtext?v=abc"
+        );
+        for url in [
+            "http://www.youtube.com/api/timedtext?v=abc",
+            "https://127.0.0.1/private",
+            "https://www.youtube.com.evil.test/caption",
+            "https://user@www.youtube.com/api/timedtext",
+        ] {
+            assert!(validated_caption_url(url).is_err(), "{url}");
+        }
     }
 
     #[test]

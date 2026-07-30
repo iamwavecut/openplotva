@@ -6206,7 +6206,7 @@
             row.addEventListener('click', () => toggleLogDetails(row));
 
             const attrsPre = PL.el('pre', { class: 'log-attrs' });
-            if (entry.attrs) attrsPre.innerHTML = highlightJSON(entry.attrs);
+            if (entry.attrs) attrsPre.textContent = JSON.stringify(entry.attrs, null, 2);
             else attrsPre.textContent = 'No attributes';
             const details = PL.el('div', { class: 'log-details' }, attrsPre);
 
@@ -6250,25 +6250,6 @@
         function updateLogsCount() {
             const el = document.getElementById('logs-count');
             if (el) el.textContent = `${logsBuffer.length} entries`;
-        }
-
-        function highlightJSON(obj) {
-            const json = JSON.stringify(obj, null, 2);
-            return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g, function (match) {
-                let cls = 'json-number';
-                if (/^"/.test(match)) {
-                    if (/:$/.test(match)) {
-                        cls = 'json-key';
-                    } else {
-                        cls = 'json-string';
-                    }
-                } else if (/true|false/.test(match)) {
-                    cls = 'json-boolean';
-                } else if (/null/.test(match)) {
-                    cls = 'json-null';
-                }
-                return '<span class="' + cls + '">' + match + '</span>';
-            });
         }
 
         function escapeHtml(text) {

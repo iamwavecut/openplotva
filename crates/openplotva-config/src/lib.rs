@@ -123,7 +123,7 @@ pub const MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS: i32 = 1_000;
 
 pub const DEFAULT_ADMINS_ADMIN_IDS: &str = "";
 
-pub const DEFAULT_VIP_CHAT_ID: i64 = -1001998670656;
+pub const DEFAULT_VIP_CHAT_ID: i64 = 0;
 
 pub const DEFAULT_SUBSCRIPTION_SYNC_ENABLED: bool = true;
 
@@ -4212,15 +4212,15 @@ mod tests {
     #[test]
     fn vip_config_accepts_legacy_go_chat_id() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
-            legacy_vip_chat_id: Some("-1001998670656".to_owned()),
+            legacy_vip_chat_id: Some("-1004242".to_owned()),
             ..RawConfig::default()
         })?;
 
-        assert_eq!(config.vip.chat_id, -1001998670656);
+        assert_eq!(config.vip.chat_id, -1004242);
 
         let config = AppConfig::from_raw(RawConfig {
             vip_chat_id: Some("-10042".to_owned()),
-            legacy_vip_chat_id: Some("-1001998670656".to_owned()),
+            legacy_vip_chat_id: Some("-1004242".to_owned()),
             ..RawConfig::default()
         })?;
 

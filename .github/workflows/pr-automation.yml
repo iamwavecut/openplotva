@@ -33,8 +33,11 @@ jobs:
       pull-requests: write
       statuses: write
     steps:
-      - name: Checkout
+      - name: Checkout trusted base revision
         uses: actions/checkout@v7 # v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v7 # v6
@@ -55,41 +58,48 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-      checks: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7 # v5
-
       - name: Resolve PR target
         id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PULL_REQUEST_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
           PULL_REQUEST_DELETIONS: ${{ github.event.pull_request.deletions || 0 }}
           PULL_REQUEST_CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            pr_json="$(gh pr view "$PR_NUMBER" --json url,additions,deletions,changedFiles)"
+            pr_json="$(gh pr view "$PR_NUMBER" --json url,baseRefOid,additions,deletions,changedFiles)"
             pr_url="$(jq -r .url <<< "$pr_json")"
+            base_sha="$(jq -r .baseRefOid <<< "$pr_json")"
             additions="$(jq -r .additions <<< "$pr_json")"
             deletions="$(jq -r .deletions <<< "$pr_json")"
             changed_files="$(jq -r .changedFiles <<< "$pr_json")"
           else
             pr_url="$PULL_REQUEST_URL"
+            base_sha="$PULL_REQUEST_BASE_SHA"
             additions="$PULL_REQUEST_ADDITIONS"
             deletions="$PULL_REQUEST_DELETIONS"
             changed_files="$PULL_REQUEST_CHANGED_FILES"
           fi
           test -n "$pr_url"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
           changed_lines="$(( additions + deletions ))"
           {
             echo "pr_url=$pr_url"
+            echo "base_sha=$base_sha"
             echo "changed_lines=$changed_lines"
             echo "changed_files=$changed_files"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout trusted base revision
+        uses: actions/checkout@v7 # v5
+        with:
+          ref: ${{ steps.target.outputs.base_sha }}
+          persist-credentials: false
 
       - name: Run PR-Agent review and suggestions
         env:
@@ -106,6 +116,7 @@ jobs:
           PR_AGENT_IMPROVE_MAX_CHANGED_LINES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_LINES || '800' }}
           PR_AGENT_IMPROVE_MAX_CHANGED_FILES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_FILES || '12' }}
           PR_AGENT_PUBLISH_NO_FINDINGS: ${{ vars.PR_AGENT_PUBLISH_NO_FINDINGS || 'false' }}
+          PR_AGENT_CONFIG_BRANCH: ${{ steps.target.outputs.base_sha }}
           PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS: >-
             Report only concrete, evidence-backed defects that materially affect
             correctness, security boundaries, async/concurrency safety, external

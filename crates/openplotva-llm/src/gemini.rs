@@ -392,9 +392,10 @@ impl GeminiDialogProvider<ReqwestAifarmTransport> {
     pub fn new(cfg: GeminiDialogConfig) -> Self {
         let cfg = cfg.with_defaults();
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(cfg.request_timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("Gemini reqwest client configuration is valid");
         Self {
             cache: GeminiExplicitCacheStore::for_config(&cfg),
             cfg,

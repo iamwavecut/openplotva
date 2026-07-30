@@ -50,9 +50,9 @@ pub use outbound::{
     GUEST_INLINE_TRUNCATE_LIMIT, GuestHtmlAnswerRequest, GuestQueryAnswerRequest,
     InlineArticleRequest, InlineQueryAnswerRequest, MAX_DONATION_STARS, MESSAGE_TYPE_RICH,
     MESSAGE_TYPE_TEXT, MIN_DONATION_STARS, MediaGroupMessagePlan, MediaGroupMessageRequest,
-    MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PaymentPayloadKind,
-    PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-    RichMessageRequest, SETTINGS_BUTTON_TEXT, SUBSCRIPTION_DURATION_DAYS,
+    MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PaymentPayload,
+    PaymentPayloadKind, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
+    ReplyParametersPlan, RichMessageRequest, SETTINGS_BUTTON_TEXT, SUBSCRIPTION_DURATION_DAYS,
     SUBSCRIPTION_PERIOD_SECONDS, SUBSCRIPTION_PRICE_STARS, StickerMessagePlan,
     StickerMessageRequest, SubscriptionInvoiceLinkRequest, TELEGRAM_STARS_CURRENCY,
     TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest, VIP_SUBSCRIPTION_DESCRIPTION,
@@ -69,9 +69,10 @@ pub use outbound::{
     build_inline_query_answer_method, build_inline_query_result_article,
     build_media_group_message_method, build_media_group_message_plan,
     build_message_reaction_clear_method, build_message_reaction_method, build_photo_message_method,
-    build_photo_message_plan, build_pre_checkout_ok_method, build_private_settings_keyboard,
-    build_refund_star_payment_method, build_rich_message_method, build_sticker_message_method,
-    build_sticker_message_plan, build_subscription_invoice_link_method, build_text_message_method,
+    build_photo_message_plan, build_pre_checkout_error_method, build_pre_checkout_ok_method,
+    build_private_settings_keyboard, build_refund_star_payment_method, build_rich_message_method,
+    build_sticker_message_method, build_sticker_message_plan,
+    build_subscription_invoice_link_method, build_text_message_method,
     build_text_message_method_without_link_preview, build_text_message_methods,
     build_text_message_methods_without_link_previews, classify_payment_payload,
     donation_invoice_payload, fingerprint_audio_message_plan, fingerprint_message_reaction,
@@ -79,8 +80,9 @@ pub use outbound::{
     fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
     guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
     guest_unsupported_feature_html, hash_content, message_target_chat, parse_mode_from_go,
-    prepare_guest_html, subscription_invoice_payload, subscription_invoice_price_stars,
-    telegram_member_can_open_group_settings, validate_text_message_text,
+    parse_payment_payload, prepare_guest_html, subscription_invoice_payload,
+    subscription_invoice_price_stars, telegram_member_can_open_group_settings,
+    validate_text_message_text,
 };
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
@@ -792,7 +794,7 @@ mod tests {
                     "language_code": "en",
                     "is_premium": true
                 },
-                "invoice_payload": "subscription_42",
+                "invoice_payload": "subscription_v1_42_300",
                 "subscription_period": 2592000
             }
         });
@@ -801,7 +803,7 @@ mod tests {
 
         assert_eq!(payment.telegram_payment_charge_id, "stx-charge");
         assert_eq!(payment.user_id, 42);
-        assert_eq!(payment.invoice_payload, "subscription_42");
+        assert_eq!(payment.invoice_payload, "subscription_v1_42_300");
         assert_eq!(payment.amount_stars, 300);
         assert_eq!(payment.paid_at_unix, 1_779_193_800);
         assert_eq!(payment.subscription_period_seconds, 2_592_000);

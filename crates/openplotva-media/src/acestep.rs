@@ -144,6 +144,7 @@ impl AceStepClient {
     pub fn new(cfg: AceStepConfig) -> Result<Self, AceStepError> {
         let cfg = cfg.with_defaults();
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(cfg.request_timeout)
             .build()
             .map_err(AceStepError::BuildHttpClient)?;
@@ -1247,21 +1248,33 @@ fn build_audio_url(base_url: &str, file: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return trimmed.to_owned();
-    }
     let base_url = base_url.trim_end_matches('/');
-    if trimmed.starts_with('/') {
-        return format!("{base_url}{trimmed}");
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_owned()
+    } else if trimmed.starts_with('/') {
+        format!("{base_url}{trimmed}")
+    } else if trimmed.starts_with("v1/") || trimmed.contains('?') || trimmed.contains('/') {
+        format!("{base_url}/{}", trimmed.trim_start_matches('/'))
+    } else {
+        let encoded: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+        format!("{base_url}/v1/audio?path={encoded}")
+    };
+    let Ok(base) = url::Url::parse(base_url) else {
+        return String::new();
+    };
+    let Ok(candidate) = url::Url::parse(&candidate) else {
+        return String::new();
+    };
+    if !matches!(candidate.scheme(), "http" | "https")
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.scheme() != base.scheme()
+        || candidate.host_str() != base.host_str()
+        || candidate.port_or_known_default() != base.port_or_known_default()
+    {
+        return String::new();
     }
-    if trimmed.starts_with("v1/") {
-        return format!("{base_url}/{trimmed}");
-    }
-    if trimmed.contains('?') || trimmed.contains('/') {
-        return format!("{base_url}/{}", trimmed.trim_start_matches('/'));
-    }
-    let encoded: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
-    format!("{base_url}/v1/audio?path={encoded}")
+    candidate.to_string()
 }
 
 fn filename_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1897,7 +1910,12 @@ mod tests {
     fn audio_url_builder_matches_go_branches() {
         let base = "http://127.0.0.1:8001";
         assert_eq!(build_audio_url(base, ""), "");
-        assert_eq!(build_audio_url(base, "https://x/a.mp3"), "https://x/a.mp3");
+        assert_eq!(build_audio_url(base, "https://x/a.mp3"), "");
+        assert_eq!(
+            build_audio_url(base, "http://127.0.0.1:8001/a.mp3"),
+            "http://127.0.0.1:8001/a.mp3"
+        );
+        assert_eq!(build_audio_url(base, "http://127.0.0.1:8002/a.mp3"), "");
         assert_eq!(
             build_audio_url(base, "/v1/a.mp3"),
             format!("{base}/v1/a.mp3")

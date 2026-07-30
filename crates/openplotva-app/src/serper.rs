@@ -1,6 +1,11 @@
 //! Serper.dev web search adapter for dialog tools.
 
-use std::{fmt, sync::Arc, time::Duration as StdDuration};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use openplotva_config::{AppConfig, DEFAULT_SERPER_TIMEOUT_SECONDS, SerperConfig};
 use serde::Serialize;
@@ -22,6 +27,7 @@ pub struct SerperClient {
     http: reqwest::Client,
     api_key: Arc<str>,
     base_url: Arc<str>,
+    timeout: StdDuration,
 }
 
 impl fmt::Debug for SerperClient {
@@ -55,14 +61,17 @@ impl SerperClient {
         } else {
             DEFAULT_SERPER_TIMEOUT_SECONDS
         };
+        let timeout = StdDuration::from_secs(timeout_seconds as u64);
         let http = reqwest::Client::builder()
-            .timeout(StdDuration::from_secs(timeout_seconds as u64))
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
             .build()
             .map_err(SerperError::HttpClient)?;
         Ok(Some(Self {
             http,
             api_key: Arc::from(api_key),
             base_url: Arc::from(base_url.trim_end_matches('/')),
+            timeout,
         }))
     }
 
@@ -91,12 +100,20 @@ impl SerperClient {
         if crawl_url.is_empty() {
             return Err(SerperError::EmptyUrl);
         }
-        let response = self
-            .http
-            .get(crawl_url)
+        let destination = validate_public_crawl_url(crawl_url).await?;
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout);
+        if let Some(host) = &destination.resolved_host {
+            builder = builder.resolve_to_addrs(host, &destination.addresses);
+        }
+        let http = builder.build().map_err(SerperError::HttpClient)?;
+        let response = http
+            .get(destination.url)
             .send()
             .await
-            .map_err(SerperError::Request)?;
+            .map_err(|error| SerperError::Request(error.without_url()))?;
         let status = response.status();
         if !status.is_success() {
             return Err(SerperError::message(format!(
@@ -107,7 +124,7 @@ impl SerperClient {
         let body = response
             .bytes()
             .await
-            .map_err(SerperError::ReadResponseBody)?;
+            .map_err(|error| SerperError::ReadResponseBody(error.without_url()))?;
         let body = String::from_utf8_lossy(&body).trim().to_owned();
         if body.is_empty() {
             return Err(SerperError::message("empty response body".to_owned()));
@@ -227,6 +244,122 @@ impl SerperError {
     fn message(message: String) -> Self {
         Self::Message(message)
     }
+}
+
+struct ValidatedPublicUrl {
+    url: Url,
+    resolved_host: Option<String>,
+    addresses: Vec<SocketAddr>,
+}
+
+async fn validate_public_crawl_url(raw: &str) -> Result<ValidatedPublicUrl, SerperError> {
+    let url = Url::parse(raw).map_err(|_| SerperError::message("invalid crawl URL".to_owned()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(SerperError::message(
+            "crawl URL is not a permitted public HTTP(S) destination".to_owned(),
+        ));
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| SerperError::message("crawl URL has no host".to_owned()))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| SerperError::message("crawl URL has no usable port".to_owned()))?;
+    match host {
+        url::Host::Ipv4(address) => {
+            let address = IpAddr::V4(address);
+            if !is_public_destination_ip(address) {
+                return Err(SerperError::message(
+                    "crawl URL resolves to a non-public address".to_owned(),
+                ));
+            }
+            Ok(ValidatedPublicUrl {
+                url,
+                resolved_host: None,
+                addresses: vec![SocketAddr::new(address, port)],
+            })
+        }
+        url::Host::Ipv6(address) => {
+            let address = IpAddr::V6(address);
+            if !is_public_destination_ip(address) {
+                return Err(SerperError::message(
+                    "crawl URL resolves to a non-public address".to_owned(),
+                ));
+            }
+            Ok(ValidatedPublicUrl {
+                url,
+                resolved_host: None,
+                addresses: vec![SocketAddr::new(address, port)],
+            })
+        }
+        url::Host::Domain(host) => {
+            let host = host.to_owned();
+            let addresses = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| SerperError::message("crawl host lookup failed".to_owned()))?
+                .collect::<Vec<_>>();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| !is_public_destination_ip(address.ip()))
+            {
+                return Err(SerperError::message(
+                    "crawl URL resolves to a non-public address".to_owned(),
+                ));
+            }
+            Ok(ValidatedPublicUrl {
+                url,
+                resolved_host: Some(host),
+                addresses,
+            })
+        }
+    }
+}
+
+fn is_public_destination_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    !(first == 0
+        || first == 10
+        || first == 127
+        || first >= 224
+        || first == 100 && (64..=127).contains(&second)
+        || first == 169 && second == 254
+        || first == 172 && (16..=31).contains(&second)
+        || first == 192 && second == 0 && third == 0
+        || first == 192 && second == 0 && third == 2
+        || first == 192 && second == 88 && third == 99
+        || first == 192 && second == 168
+        || first == 198 && (second == 18 || second == 19)
+        || first == 198 && second == 51 && third == 100
+        || first == 203 && second == 0 && third == 113)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    if segments[..5] == [0, 0, 0, 0, 0] && matches!(segments[5], 0 | 0xffff) {
+        let octets = address.octets();
+        return is_public_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    let first = segments[0];
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || first & 0xfe00 == 0xfc00
+        || first & 0xffc0 == 0xfe80
+        || first & 0xffc0 == 0xfec0
+        || segments[0..2] == [0x2001, 0x0db8])
 }
 
 #[derive(Debug, Serialize)]
@@ -415,22 +548,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crawl_fetches_plain_text_like_go_fallback() -> Result<(), Box<dyn Error>> {
-        let fixture = spawn_fixture_server().await?;
+    async fn crawl_rejects_private_and_loopback_destinations() -> Result<(), Box<dyn Error>> {
         let config = AppConfig::from_raw(RawConfig {
             serper_api_key: Some("serper-test-key".to_owned()),
             serper_timeout_seconds: Some("1".to_owned()),
             ..RawConfig::default()
         })?;
-        let client = SerperClient::from_config_with_base_url(&config.serper, &fixture.base_url)?
-            .ok_or_else(|| std::io::Error::other("Serper client was not built"))?;
+        let client =
+            SerperClient::from_config_with_base_url(&config.serper, "https://google.serper.dev")?
+                .ok_or_else(|| std::io::Error::other("Serper client was not built"))?;
 
-        let result = client
-            .crawl_url(&format!("{}/page", fixture.base_url))
-            .await?;
-
-        assert_eq!(result, "Hello Plotva & fish");
+        for url in [
+            "http://127.0.0.1/private",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1/internal",
+            "http://[::1]/private",
+        ] {
+            let error = client.crawl_url(url).await.expect_err("URL must be denied");
+            assert!(error.to_string().contains("non-public"));
+        }
         Ok(())
+    }
+
+    #[test]
+    fn crawl_url_policy_accepts_only_public_addresses() {
+        assert!(is_public_destination_ip(
+            "93.184.216.34".parse().expect("public IPv4")
+        ));
+        assert!(is_public_destination_ip(
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse()
+                .expect("public IPv6")
+        ));
+        assert!(!is_public_destination_ip(
+            "0.0.0.0".parse().expect("unspecified IPv4")
+        ));
+        assert!(!is_public_destination_ip(
+            "192.168.1.1".parse().expect("private IPv4")
+        ));
+        assert!(!is_public_destination_ip(
+            "fc00::1".parse().expect("private IPv6")
+        ));
+        assert!(!is_public_destination_ip(
+            "2001:db8::1".parse().expect("documentation IPv6")
+        ));
+        assert!(!is_public_destination_ip(
+            "::ffff:127.0.0.1".parse().expect("mapped loopback IPv6")
+        ));
+        assert_eq!(
+            html_body_to_plain_text("<html><body>Hello <b>Plotva</b> &amp; fish</body></html>"),
+            "Hello Plotva & fish"
+        );
     }
 
     #[test]

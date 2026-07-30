@@ -552,6 +552,24 @@ where
         request: DirectDrawApiRequest,
     ) -> DirectDrawApiFuture<'a> {
         Box::pin(async move {
+            if let Some(rate_limits) = self.rate_limits.as_ref() {
+                let report = rate_limits
+                    .is_direct_draw_api_rate_limited(request.chat_id, OffsetDateTime::now_utc())
+                    .await;
+                if let Some(load_error) = report.load_error.as_deref() {
+                    tracing::debug!(
+                        chat_id = request.chat_id,
+                        %load_error,
+                        "failed to load Telegram rate-limit state before direct draw-api generation"
+                    );
+                }
+                if report.rate_limited {
+                    return DirectDrawApiResult {
+                        sent: false,
+                        error: Some("rate limited".to_owned()),
+                    };
+                }
+            }
             let generation = ImageGenerationRequest {
                 chat_id: request.chat_id,
                 message_id: request.message_id,
@@ -583,24 +601,6 @@ where
                     error: Some("draw-api returned empty result".to_owned()),
                 };
             };
-            if let Some(rate_limits) = self.rate_limits.as_ref() {
-                let report = rate_limits
-                    .is_direct_draw_api_rate_limited(request.chat_id, OffsetDateTime::now_utc())
-                    .await;
-                if let Some(load_error) = report.load_error.as_deref() {
-                    tracing::debug!(
-                        chat_id = request.chat_id,
-                        %load_error,
-                        "failed to load Telegram rate-limit state before direct draw-api photo send"
-                    );
-                }
-                if report.rate_limited {
-                    return DirectDrawApiResult {
-                        sent: false,
-                        error: Some("rate limited".to_owned()),
-                    };
-                }
-            }
             match self.sender.send_direct_draw_api_photo(photo).await {
                 Ok(message) => {
                     if let Some(error) = self.record_sent_history(message).await {
@@ -6076,7 +6076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_draw_api_runtime_preserves_go_rate_limit_skip_after_generation()
+    async fn direct_draw_api_runtime_checks_rate_limit_before_generation()
     -> Result<(), Box<dyn std::error::Error>> {
         let generator = DirectImageGeneratorStub::success(ImageGenerationResult {
             image_bytes: vec![b"png".to_vec()],
@@ -6107,7 +6107,7 @@ mod tests {
                 error: Some("rate limited".to_owned()),
             }
         );
-        assert_eq!(generator.requests().len(), 1);
+        assert!(generator.requests().is_empty());
         assert!(sender.requests().is_empty());
         assert_eq!(rate_limits.checks(), vec![-100]);
         assert!(rate_limits.sets().is_empty());

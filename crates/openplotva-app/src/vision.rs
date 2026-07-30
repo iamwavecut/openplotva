@@ -4,7 +4,7 @@ use std::{fmt, future::Future, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
-use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
+use image::{GenericImageView, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use openplotva_config::AppConfig;
 use openplotva_core::ChatAttachment;
 use openplotva_dialog::{DialogInput, MultimodalImage, ToolboxError};
@@ -48,6 +48,10 @@ pub const LEGACY_VISION_ENDPOINT_NAME: &str = "generate";
 pub const VISION_MAX_SIDE: u32 = 512;
 pub const VISION_MAX_PIXELS: u64 = VISION_MAX_SIDE as u64 * VISION_MAX_SIDE as u64;
 pub const VISION_MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
+const VISION_MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const VISION_MAX_SOURCE_SIDE: u32 = 16_384;
+const VISION_MAX_SOURCE_PIXELS: u64 = 64 * 1024 * 1024;
+const VISION_MAX_DECODER_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 const TELEGRAM_DOWNLOAD_UNAVAILABLE_VISION_NOTE: &str =
     "Визуальное описание недоступно: файл превышает лимит скачивания Telegram Bot API.";
 
@@ -653,6 +657,9 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
                 if video && data.len().saturating_add(chunk.len()) > VISION_MAX_VIDEO_BYTES {
                     return Err(TelegramVisionDataUrlError::VideoTooLarge);
                 }
+                if !video && data.len().saturating_add(chunk.len()) > VISION_MAX_IMAGE_BYTES {
+                    return Err(TelegramVisionDataUrlError::ImageTooLarge);
+                }
                 data.extend_from_slice(&chunk);
             }
             if video {
@@ -684,6 +691,9 @@ pub enum TelegramVisionDataUrlError {
     /// Video exceeded the Bot API download contract and local memory bound.
     #[error("telegram video exceeds 20 MiB")]
     VideoTooLarge,
+    /// Image exceeded the encoded input bound.
+    #[error("telegram image exceeds 20 MiB")]
+    ImageTooLarge,
     /// Downloaded bytes were not usable as a vision image payload.
     #[error("build vision data url: {0}")]
     Build(#[source] TelegramVisionDataUrlBuildError),
@@ -927,7 +937,7 @@ where
             return Err(VisionDescribeError::EmptyFileId);
         }
 
-        if let Some(record) = self.lookup_file(input).await? {
+        if let Some(record) = self.lookup_file(input, request.chat_id).await? {
             return resolved_record(record);
         }
 
@@ -938,7 +948,7 @@ where
             if candidate.is_empty() || candidate == input {
                 continue;
             }
-            if let Some(record) = self.lookup_file(&candidate).await? {
+            if let Some(record) = self.lookup_file(&candidate, request.chat_id).await? {
                 return resolved_record(record);
             }
         }
@@ -995,7 +1005,11 @@ where
     async fn lookup_file(
         &self,
         candidate: &str,
+        chat_id: i64,
     ) -> Result<Option<TelegramFileRecord>, VisionDescribeError> {
+        if chat_id == 0 {
+            return Ok(None);
+        }
         if let Some(record) =
             self.store
                 .get_file(candidate)
@@ -1004,14 +1018,16 @@ where
                     message: error.to_string(),
                 })?
         {
-            return Ok(Some(record));
+            return Ok(telegram_file_seen_in_chat(&record, chat_id).then_some(record));
         }
-        self.store
+        let record = self
+            .store
             .get_file_by_latest_file_id(candidate)
             .await
             .map_err(|error| VisionDescribeError::Storage {
                 message: error.to_string(),
-            })
+            })?;
+        Ok(record.filter(|record| telegram_file_seen_in_chat(record, chat_id)))
     }
 
     async fn mark_processing(
@@ -1105,6 +1121,11 @@ where
             }
         }
     }
+}
+
+fn telegram_file_seen_in_chat(record: &TelegramFileRecord, chat_id: i64) -> bool {
+    chat_id != 0
+        && (record.first_seen_chat_id == Some(chat_id) || record.last_seen_chat_id == Some(chat_id))
 }
 
 impl<Store, Captioner, History, DataUrl> DialogVisionInputMaterializer
@@ -1690,6 +1711,9 @@ fn telegram_understand_media_mime(data: &[u8]) -> Option<&'static str> {
 }
 
 fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
+    if data.len() > VISION_MAX_IMAGE_BYTES {
+        return Err(TelegramVisionDataUrlBuildError::UnsupportedImageData);
+    }
     let reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .map_err(|_| TelegramVisionDataUrlBuildError::UnsupportedImageData)?;
@@ -1702,6 +1726,22 @@ fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionData
     ) {
         return Err(TelegramVisionDataUrlBuildError::UnsupportedImageData);
     }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(VISION_MAX_SOURCE_SIDE);
+    limits.max_image_height = Some(VISION_MAX_SOURCE_SIDE);
+    limits.max_alloc = Some(VISION_MAX_DECODER_ALLOC_BYTES);
+    let mut dimension_reader = reader;
+    dimension_reader.limits(limits.clone());
+    let (source_width, source_height) = dimension_reader
+        .into_dimensions()
+        .map_err(|_| TelegramVisionDataUrlBuildError::UnsupportedImageData)?;
+    if !vision_source_dimensions_allowed(source_width, source_height) {
+        return Err(TelegramVisionDataUrlBuildError::UnsupportedImageData);
+    }
+    let mut reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|_| TelegramVisionDataUrlBuildError::UnsupportedImageData)?;
+    reader.limits(limits);
     let img = reader
         .decode()
         .map_err(|_| TelegramVisionDataUrlBuildError::UnsupportedImageData)?;
@@ -1715,6 +1755,14 @@ fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionData
     }
     let resized = img.resize_exact(new_width, new_height, FilterType::CatmullRom);
     encode_normalized_understand_media(&resized, format)
+}
+
+fn vision_source_dimensions_allowed(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= VISION_MAX_SOURCE_SIDE
+        && height <= VISION_MAX_SOURCE_SIDE
+        && u64::from(width) * u64::from(height) <= VISION_MAX_SOURCE_PIXELS
 }
 
 fn normalized_vision_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -2370,6 +2418,24 @@ mod tests {
         assert_eq!(normalized_vision_dimensions(512, 512), (512, 512));
         assert_eq!(normalized_vision_dimensions(1024, 768), (512, 384));
         assert_eq!(normalized_vision_dimensions(2000, 100), (512, 26));
+    }
+
+    #[test]
+    fn vision_source_dimensions_are_bounded_before_decode() {
+        assert!(vision_source_dimensions_allowed(8_192, 8_192));
+        assert!(!vision_source_dimensions_allowed(8_193, 8_192));
+        assert!(!vision_source_dimensions_allowed(16_385, 1));
+        assert!(!vision_source_dimensions_allowed(0, 512));
+    }
+
+    #[test]
+    fn telegram_file_lookup_is_scoped_to_observed_chat() -> Result<(), Box<dyn std::error::Error>> {
+        let record = file_record("unique", "latest", unix_time(1_700_000_000)?);
+
+        assert!(telegram_file_seen_in_chat(&record, 42));
+        assert!(!telegram_file_seen_in_chat(&record, 99));
+        assert!(!telegram_file_seen_in_chat(&record, 0));
+        Ok(())
     }
 
     #[test]

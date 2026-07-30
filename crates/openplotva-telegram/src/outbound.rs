@@ -254,6 +254,12 @@ pub enum PaymentPayloadKind {
     Donation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaymentPayload {
+    Subscription { user_id: i64, amount_stars: i64 },
+    Donation { user_id: i64, amount_stars: i64 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionInvoiceLinkRequest {
     /// Telegram user ID that becomes the payment payload suffix.
@@ -802,23 +808,54 @@ pub fn build_pre_checkout_ok_method(
 }
 
 #[must_use]
-pub fn subscription_invoice_payload(user_id: i64) -> String {
-    format!("subscription_{user_id}")
+pub fn build_pre_checkout_error_method(
+    pre_checkout_query_id: impl Into<String>,
+    message: impl Into<String>,
+) -> AnswerPreCheckoutQuery {
+    AnswerPreCheckoutQuery::error(pre_checkout_query_id, message)
+}
+
+#[must_use]
+pub fn subscription_invoice_payload(user_id: i64, amount_stars: i64) -> String {
+    format!("subscription_v1_{user_id}_{amount_stars}")
 }
 
 #[must_use]
 pub fn donation_invoice_payload(user_id: i64, amount_stars: i64) -> String {
-    format!("donation_{user_id}_{amount_stars}")
+    format!("donation_v1_{user_id}_{amount_stars}")
+}
+
+#[must_use]
+pub fn parse_payment_payload(payload: &str) -> Option<PaymentPayload> {
+    let mut parts = payload.split('_');
+    let kind = parts.next()?;
+    if parts.next()? != "v1" {
+        return None;
+    }
+    let user_id = parts.next()?.parse::<i64>().ok()?;
+    let amount_stars = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || user_id <= 0 || amount_stars <= 0 {
+        return None;
+    }
+    match kind {
+        "subscription" => Some(PaymentPayload::Subscription {
+            user_id,
+            amount_stars,
+        }),
+        "donation" => Some(PaymentPayload::Donation {
+            user_id,
+            amount_stars,
+        }),
+        _ => None,
+    }
 }
 
 #[must_use]
 pub fn classify_payment_payload(payload: &str) -> PaymentPayloadKind {
-    if payload.starts_with("subscription") {
-        PaymentPayloadKind::Subscription
-    } else if payload.starts_with("donation") {
-        PaymentPayloadKind::Donation
-    } else {
-        PaymentPayloadKind::Unknown
+    match parse_payment_payload(payload) {
+        Some(PaymentPayload::Subscription { .. }) => PaymentPayloadKind::Subscription,
+        Some(PaymentPayload::Donation { .. }) => PaymentPayloadKind::Donation,
+        None => PaymentPayloadKind::Unknown,
     }
 }
 
@@ -838,15 +875,13 @@ pub fn subscription_invoice_price_stars(req: &SubscriptionInvoiceLinkRequest) ->
 pub fn build_subscription_invoice_link_method(
     req: &SubscriptionInvoiceLinkRequest,
 ) -> CreateInvoiceLink {
+    let amount_stars = subscription_invoice_price_stars(req);
     CreateInvoiceLink::new(
         VIP_SUBSCRIPTION_TITLE,
         VIP_SUBSCRIPTION_DESCRIPTION,
-        subscription_invoice_payload(req.user_id),
+        subscription_invoice_payload(req.user_id, amount_stars),
         TELEGRAM_STARS_CURRENCY,
-        [LabeledPrice::new(
-            subscription_invoice_price_stars(req),
-            VIP_SUBSCRIPTION_TITLE,
-        )],
+        [LabeledPrice::new(amount_stars, VIP_SUBSCRIPTION_TITLE)],
     )
     .with_parameters(InvoiceParameters::default().with_provider_token(""))
     .with_subscription_period(SUBSCRIPTION_PERIOD_SECONDS)
@@ -1768,12 +1803,13 @@ mod tests {
         EditReplyMarkupMessageRequest, EditTextMessageRequest, GuestHtmlAnswerRequest,
         GuestQueryAnswerRequest, InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT,
         MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
-        OutboundBuildError, PaymentPayloadKind, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, ReplyParametersPlan, RichMessageRequest, StickerMessagePlan,
-        StickerMessageRequest, SubscriptionInvoiceLinkRequest, TextMessageRequest,
-        allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
-        build_callback_answer_method, build_cancel_star_subscription_method,
-        build_chat_action_method, build_delete_message_method, build_donation_invoice_link_method,
+        OutboundBuildError, PaymentPayload, PaymentPayloadKind, PhotoMessagePlan,
+        PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, RichMessageRequest,
+        StickerMessagePlan, StickerMessageRequest, SubscriptionInvoiceLinkRequest,
+        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
+        build_audio_message_plan, build_callback_answer_method,
+        build_cancel_star_subscription_method, build_chat_action_method,
+        build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_reply_markup_message_method,
         build_edit_text_message_method, build_get_chat_administrators_method,
@@ -1784,15 +1820,16 @@ mod tests {
         build_inline_keyboard_row, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-        build_pre_checkout_ok_method, build_private_settings_keyboard,
-        build_refund_star_payment_method, build_rich_message_method, build_sticker_message_method,
-        build_sticker_message_plan, build_subscription_invoice_link_method,
-        build_text_message_method, build_text_message_methods,
-        build_text_message_methods_without_link_previews, classify_payment_payload,
-        donation_invoice_payload, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
-        fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
-        guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
-        guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
+        build_pre_checkout_error_method, build_pre_checkout_ok_method,
+        build_private_settings_keyboard, build_refund_star_payment_method,
+        build_rich_message_method, build_sticker_message_method, build_sticker_message_plan,
+        build_subscription_invoice_link_method, build_text_message_method,
+        build_text_message_methods, build_text_message_methods_without_link_previews,
+        classify_payment_payload, donation_invoice_payload, fingerprint_audio_message_plan,
+        fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
+        fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
+        guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
+        guest_unsupported_feature_html, hash_content, message_target_chat, parse_payment_payload,
         prepare_guest_html, subscription_invoice_payload, telegram_member_can_open_group_settings,
         validate_text_message_text,
     };
@@ -2976,21 +3013,31 @@ mod tests {
     }
 
     #[test]
-    fn payment_payload_helpers_match_go_prefix_and_payload_rules() {
-        assert_eq!(subscription_invoice_payload(42), "subscription_42");
-        assert_eq!(donation_invoice_payload(42, 600), "donation_42_600");
+    fn payment_payload_helpers_bind_user_and_amount() {
+        assert_eq!(
+            subscription_invoice_payload(42, 300),
+            "subscription_v1_42_300"
+        );
+        assert_eq!(donation_invoice_payload(42, 600), "donation_v1_42_600");
 
         assert_eq!(
-            classify_payment_payload("subscription_42"),
+            classify_payment_payload("subscription_v1_42_300"),
             PaymentPayloadKind::Subscription
         );
         assert_eq!(
-            classify_payment_payload("donation_42_100"),
+            classify_payment_payload("donation_v1_42_100"),
             PaymentPayloadKind::Donation
         );
         assert_eq!(
             classify_payment_payload("donation"),
-            PaymentPayloadKind::Donation
+            PaymentPayloadKind::Unknown
+        );
+        assert_eq!(
+            parse_payment_payload("subscription_v1_42_300"),
+            Some(PaymentPayload::Subscription {
+                user_id: 42,
+                amount_stars: 300,
+            })
         );
         assert_eq!(
             classify_payment_payload("other"),
@@ -3011,7 +3058,10 @@ mod tests {
             subscription_payload["title"],
             json!("VIP Подписка на 30 дней")
         );
-        assert_eq!(subscription_payload["payload"], json!("subscription_42"));
+        assert_eq!(
+            subscription_payload["payload"],
+            json!("subscription_v1_42_300")
+        );
         assert_eq!(subscription_payload["provider_token"], json!(""));
         assert_eq!(subscription_payload["currency"], json!("XTR"));
         assert_eq!(
@@ -3032,6 +3082,10 @@ mod tests {
             });
         let wavecut_payload = serde_json::to_value(wavecut_subscription)?;
         assert_eq!(wavecut_payload["prices"][0]["amount"], json!(1));
+        assert_eq!(
+            wavecut_payload["payload"],
+            json!("subscription_v1_1717359759_1")
+        );
 
         let donation = build_donation_invoice_link_method(&DonationInvoiceLinkRequest {
             user_id: 42,
@@ -3039,7 +3093,7 @@ mod tests {
         });
         let donation_payload = serde_json::to_value(donation)?;
         assert_eq!(donation_payload["title"], json!("Донат разработчику"));
-        assert_eq!(donation_payload["payload"], json!("donation_42_600"));
+        assert_eq!(donation_payload["payload"], json!("donation_v1_42_600"));
         assert_eq!(donation_payload["provider_token"], json!(""));
         assert_eq!(donation_payload["currency"], json!("XTR"));
         assert!(donation_payload.get("subscription_period").is_none());
@@ -3054,6 +3108,15 @@ mod tests {
         );
         assert_eq!(pre_checkout_payload["ok"], json!(true));
         assert!(pre_checkout_payload.get("error_message").is_none());
+
+        let pre_checkout_error =
+            build_pre_checkout_error_method("pre-checkout-id", "Invoice mismatch");
+        let pre_checkout_error_payload = serde_json::to_value(pre_checkout_error)?;
+        assert_eq!(pre_checkout_error_payload["ok"], json!(false));
+        assert_eq!(
+            pre_checkout_error_payload["error_message"],
+            json!("Invoice mismatch")
+        );
 
         let refund = build_refund_star_payment_method(42, "charge-id");
         let refund_payload = serde_json::to_value(refund)?;

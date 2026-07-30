@@ -3654,6 +3654,8 @@ pub struct ChatMemberRecord {
     pub can_add_web_page_previews: Option<bool>,
     /// Optional restricted/kicked expiration.
     pub until_date: Option<OffsetDateTime>,
+    /// Time at which Telegram last supplied this membership state.
+    pub telegram_observed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -9288,6 +9290,7 @@ fn chat_member_from_row(row: PgRow) -> Result<ChatMemberRecord, sqlx::Error> {
         can_send_other_messages: row.try_get("can_send_other_messages")?,
         can_add_web_page_previews: row.try_get("can_add_web_page_previews")?,
         until_date: row.try_get("until_date")?,
+        telegram_observed_at: row.try_get("telegram_observed_at")?,
     })
 }
 
