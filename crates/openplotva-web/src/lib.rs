@@ -12,7 +12,7 @@ pub const ADMIN_SESSION_COOKIE_NAME: &str = "admin_session";
 
 pub const ADMIN_SESSION_COOKIE_PATH: &str = "/admin/";
 
-pub const ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 86_400 * 7;
+pub const ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 86_400;
 
 pub const CUSTOM_PERSONA_MAX_CHARS: usize = 1_000;
 
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "067d8c91d90062ce9f189c050c752a59cf45cb06cc1c29e0fb62a553bbef882f",
+        sha256: "bf92c6a9dd32b691c29db56c53284e5f6fdfba665889898baa84c1fcca29649c",
     },
     StaticAsset {
         path: "login.html",
@@ -94,7 +94,7 @@ const SETTINGS_ASSETS: &[StaticAsset] = &[
         path: "index.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../web/settings/index.js"),
-        sha256: "8c798715212832b795e3c347714e734f0bfdc896dec9b15ed842c46f796661fd",
+        sha256: "eeb1bdb73dad8da034183e339749f48f2aa31f7311b7be21e633fc56cc0eb7e5",
     },
     StaticAsset {
         path: "landing.html",
@@ -172,15 +172,50 @@ pub fn admin_session_signature(user_id: i64, secret: &str) -> String {
     hmac_sha256_hex(secret.as_bytes(), user_id.to_string().as_bytes())
 }
 
-/// Verify a signed admin-session cookie value of the form `<user_id>.<hex_sig>`.
-/// Returns the user id only when the signature verifies. Rejects unsigned legacy
-/// values (no `.`), tamper, and malformed input.
+fn admin_session_v1_signature(
+    user_id: i64,
+    issued_at: i64,
+    expires_at: i64,
+    secret: &str,
+) -> String {
+    let message = format!("v1.{user_id}.{issued_at}.{expires_at}");
+    hmac_sha256_hex(secret.as_bytes(), message.as_bytes())
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Verify a signed, time-bounded admin-session cookie value.
 #[must_use]
 pub fn verify_admin_session_value(value: &str, secret: &str) -> Option<i64> {
-    let (user_part, sig) = value.split_once('.')?;
-    let user_id = user_part.parse::<i64>().ok()?;
-    let expected = admin_session_signature(user_id, secret);
-    if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
+    verify_admin_session_value_at(value, secret, current_unix_timestamp())
+}
+
+fn verify_admin_session_value_at(value: &str, secret: &str, now_unix: i64) -> Option<i64> {
+    let mut parts = value.split('.');
+    if parts.next()? != "v1" {
+        return None;
+    }
+    let user_id = parts.next()?.parse::<i64>().ok()?;
+    let issued_at = parts.next()?.parse::<i64>().ok()?;
+    let expires_at = parts.next()?.parse::<i64>().ok()?;
+    let signature = parts.next()?;
+    if parts.next().is_some()
+        || user_id <= 0
+        || issued_at <= 0
+        || issued_at > now_unix.saturating_add(60)
+        || expires_at <= now_unix
+        || expires_at <= issued_at
+        || expires_at.saturating_sub(issued_at) > ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS
+    {
+        return None;
+    }
+    let expected = admin_session_v1_signature(user_id, issued_at, expires_at, secret);
+    if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         Some(user_id)
     } else {
         None
@@ -239,7 +274,10 @@ pub fn validate_webapp_init_data(
 
     let provided_hash = provided_hash?;
     let auth_date = auth_date?;
-    if now_unix.saturating_sub(auth_date) > max_age_seconds as i64 {
+    if auth_date <= 0
+        || auth_date > now_unix.saturating_add(60)
+        || now_unix.saturating_sub(auth_date) > max_age_seconds as i64
+    {
         return None;
     }
     let user_field = user_field?;
@@ -263,9 +301,14 @@ pub fn validate_webapp_init_data(
 
 #[must_use]
 pub fn admin_session_cookie(user_id: i64, secret: &str) -> String {
-    let sig = admin_session_signature(user_id, secret);
+    admin_session_cookie_at(user_id, secret, current_unix_timestamp())
+}
+
+fn admin_session_cookie_at(user_id: i64, secret: &str, issued_at: i64) -> String {
+    let expires_at = issued_at.saturating_add(ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS);
+    let signature = admin_session_v1_signature(user_id, issued_at, expires_at, secret);
     format!(
-        "{ADMIN_SESSION_COOKIE_NAME}={user_id}.{sig}; Path={ADMIN_SESSION_COOKIE_PATH}; Max-Age={ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax"
+        "{ADMIN_SESSION_COOKIE_NAME}=v1.{user_id}.{issued_at}.{expires_at}.{signature}; Path={ADMIN_SESSION_COOKIE_PATH}; Max-Age={ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS}; Secure; HttpOnly; SameSite=Lax"
     )
 }
 
@@ -385,12 +428,13 @@ fn normalize_static_asset_path(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StaticAssetGroup, admin_session_cookie, constant_time_eq, hmac_sha256_hex,
-        private_settings_web_app_url, settings_button_url, settings_selection_base_url,
-        settings_selection_chat_url, settings_selection_personal_url, settings_signature,
-        static_asset, static_asset_sha256_hex, static_assets, telegram_auth_hash,
-        truncate_custom_persona, validate_settings_access_signature, validate_telegram_auth,
-        validate_webapp_init_data, verify_admin_session_value,
+        ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS, StaticAssetGroup, admin_session_cookie_at,
+        constant_time_eq, hmac_sha256_hex, private_settings_web_app_url, settings_button_url,
+        settings_selection_base_url, settings_selection_chat_url, settings_selection_personal_url,
+        settings_signature, static_asset, static_asset_sha256_hex, static_assets,
+        telegram_auth_hash, truncate_custom_persona, validate_settings_access_signature,
+        validate_telegram_auth, validate_webapp_init_data, verify_admin_session_value,
+        verify_admin_session_value_at,
     };
 
     #[test]
@@ -593,19 +637,26 @@ mod tests {
     #[test]
     fn admin_session_cookie_is_signed_and_round_trips() {
         let secret = "123:ABC";
-        let cookie = admin_session_cookie(7, secret);
-        // value is "7.<64 hex chars>"
+        let now = 1_700_000_000;
+        let cookie = admin_session_cookie_at(7, secret, now);
         let value = cookie
             .split(';')
             .next()
             .expect("cookie pair")
             .strip_prefix("admin_session=")
             .expect("name prefix");
-        assert_eq!(verify_admin_session_value(value, secret), Some(7));
-        // tamper / wrong secret / legacy unsigned are rejected
+        assert_eq!(verify_admin_session_value_at(value, secret, now), Some(7));
+        assert_eq!(
+            verify_admin_session_value_at(
+                value,
+                secret,
+                now + ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS
+            ),
+            None
+        );
         assert_eq!(verify_admin_session_value("7", secret), None);
-        assert_eq!(verify_admin_session_value(value, "wrong"), None);
-        assert!(cookie.contains("HttpOnly; SameSite=Lax"));
+        assert_eq!(verify_admin_session_value_at(value, "wrong", now), None);
+        assert!(cookie.contains("Secure; HttpOnly; SameSite=Lax"));
     }
 
     #[test]

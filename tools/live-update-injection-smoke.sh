@@ -624,13 +624,44 @@ enable_aifarm_pool_if_requested() {
     echo "OPENPLOTVA_LIVE_UPDATE_SMOKE_AIFARM_POOL requires ADMINS_ADMIN_IDS or OPENPLOTVA_SMOKE_USER_ID" >&2
     exit 1
   }
+  local auth_query
+  auth_query="$(
+    OPENPLOTVA_SMOKE_ADMIN_ID="$admin_id" python3 - <<'PY'
+import hashlib
+import hmac
+import os
+import time
+import urllib.parse
+
+values = {
+    "auth_date": str(int(time.time())),
+    "first_name": "OpenPlotva Smoke",
+    "id": os.environ["OPENPLOTVA_SMOKE_ADMIN_ID"],
+}
+check = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+secret = hashlib.sha256(os.environ["BOT_KEY"].encode()).digest()
+values["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+print(urllib.parse.urlencode(values))
+PY
+  )"
+  local session_cookie
+  session_cookie="$(
+    curl -fsS -D - -o /dev/null "${base_url}/admin/api/auth?${auth_query}" \
+      | sed -n 's/^[Ss]et-[Cc]ookie: \([^;]*\).*/\1/p' \
+      | tr -d '\r'
+  )"
+  if [[ "$session_cookie" != admin_session=* ]]; then
+    echo "failed to establish a signed admin session for AIFarm pool smoke" >&2
+    exit 1
+  fi
   local output="${log_dir}/aifarm-pool-enable.json"
   curl -fsS \
     -X POST \
     -H "Content-Type: application/json" \
-    -H "X-Telegram-User-ID: ${admin_id}" \
+    -H "Cookie: ${session_cookie}" \
     --data '{"enabled":true}' \
     "${base_url}/admin/api/aifarm/pool" >"$output"
+  unset auth_query session_cookie
   jq -e '.ok == true and .enabled == true' "$output" >/dev/null
   echo "+ runtime AIFarm pool enabled through admin API"
 }

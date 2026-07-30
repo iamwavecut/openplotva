@@ -173,6 +173,8 @@ pub enum SuccessfulPaymentOutcome {
     UnsupportedCurrency,
     /// Payment was ignored because the invoice payload prefix is unknown.
     UnknownPayload,
+    /// Payment fields did not match the user and amount bound into the invoice payload.
+    InvalidInvoice,
     /// VIP subscription payment was persisted and acknowledged.
     SubscriptionProcessed,
     /// VIP subscription duplicate was loaded and acknowledged.
@@ -247,6 +249,8 @@ pub enum PaymentInvoiceCommandUpdateRoute {
 pub enum PreCheckoutOutcome {
     /// Telegram accepted the successful pre-checkout answer.
     Acknowledged,
+    /// Telegram received an explicit rejection for mismatched invoice fields.
+    Rejected,
     AcknowledgementError,
 }
 
@@ -1081,10 +1085,11 @@ pub trait PreCheckoutPaymentEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Answer a Telegram pre-checkout query with `ok=true`.
+    /// Answer a Telegram pre-checkout query, approving only when no error is supplied.
     fn answer_pre_checkout_query<'a>(
         &'a self,
         pre_checkout_query_id: &'a str,
+        error_message: Option<&'a str>,
     ) -> PreCheckoutFuture<'a, Self::Error>;
 }
 
@@ -1875,13 +1880,19 @@ impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
     fn answer_pre_checkout_query<'a>(
         &'a self,
         pre_checkout_query_id: &'a str,
+        error_message: Option<&'a str>,
     ) -> PreCheckoutFuture<'a, Self::Error> {
         Box::pin(async move {
-            self.execute(openplotva_telegram::build_pre_checkout_ok_method(
-                pre_checkout_query_id.to_owned(),
-            ))
-            .await
-            .map(|_: bool| ())
+            let method = match error_message {
+                Some(message) => openplotva_telegram::build_pre_checkout_error_method(
+                    pre_checkout_query_id.to_owned(),
+                    message.to_owned(),
+                ),
+                None => openplotva_telegram::build_pre_checkout_ok_method(
+                    pre_checkout_query_id.to_owned(),
+                ),
+            };
+            self.execute(method).await.map(|_: bool| ())
         })
     }
 }
@@ -2550,10 +2561,11 @@ impl PreCheckoutPaymentEffects for RichPaymentEffects {
     fn answer_pre_checkout_query<'a>(
         &'a self,
         pre_checkout_query_id: &'a str,
+        error_message: Option<&'a str>,
     ) -> PreCheckoutFuture<'a, Self::Error> {
         Box::pin(async move {
             self.inner
-                .answer_pre_checkout_query(pre_checkout_query_id)
+                .answer_pre_checkout_query(pre_checkout_query_id, error_message)
                 .await
                 .map_err(|error| error.to_string())
         })
@@ -3802,17 +3814,45 @@ where
         return SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::UnsupportedCurrency);
     }
 
-    match openplotva_telegram::classify_payment_payload(&message.payment.invoice_payload) {
-        openplotva_telegram::PaymentPayloadKind::Subscription => {
+    let Some(payload) =
+        openplotva_telegram::parse_payment_payload(&message.payment.invoice_payload)
+    else {
+        return SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::UnknownPayload);
+    };
+    if !payment_payload_matches_user_and_amount(
+        payload,
+        message.user.id,
+        message.payment.total_amount,
+    ) {
+        return SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::InvalidInvoice);
+    }
+
+    match payload {
+        openplotva_telegram::PaymentPayload::Subscription { .. } => {
             process_subscription_payment(store, effects, message, now).await
         }
-        openplotva_telegram::PaymentPayloadKind::Donation => {
+        openplotva_telegram::PaymentPayload::Donation { .. } => {
             process_donation_payment(store, effects, message).await
         }
-        openplotva_telegram::PaymentPayloadKind::Unknown => {
-            SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::UnknownPayload)
-        }
     }
+}
+
+fn payment_payload_matches_user_and_amount(
+    payload: openplotva_telegram::PaymentPayload,
+    user_id: i64,
+    total_amount: i64,
+) -> bool {
+    let (target_user_id, expected_amount) = match payload {
+        openplotva_telegram::PaymentPayload::Subscription {
+            user_id,
+            amount_stars,
+        }
+        | openplotva_telegram::PaymentPayload::Donation {
+            user_id,
+            amount_stars,
+        } => (user_id, amount_stars),
+    };
+    user_id > 0 && total_amount > 0 && target_user_id == user_id && expected_amount == total_amount
 }
 
 #[must_use]
@@ -4558,10 +4598,12 @@ where
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
 {
-    if let Some(pre_checkout_query_id) = pre_checkout_query_id_from_update(&update) {
+    if let Some(query) = pre_checkout_query_from_update(&update) {
+        let pre_checkout_query_id = pre_checkout_query_id(query);
+        let error_message = pre_checkout_error_message(query);
         tracing::info!(pre_checkout_query_id, "pre-checkout answer requested");
         let outcome = match effects
-            .answer_pre_checkout_query(pre_checkout_query_id)
+            .answer_pre_checkout_query(pre_checkout_query_id, error_message)
             .await
         {
             Ok(()) => {
@@ -4570,7 +4612,11 @@ where
                     answer_failed = false,
                     "pre-checkout answer completed"
                 );
-                PreCheckoutOutcome::Acknowledged
+                if error_message.is_some() {
+                    PreCheckoutOutcome::Rejected
+                } else {
+                    PreCheckoutOutcome::Acknowledged
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -6244,14 +6290,35 @@ fn parse_payment_timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
 
 #[must_use]
 pub fn pre_checkout_query_id_from_update(update: &TelegramUpdate) -> Option<&str> {
+    pre_checkout_query_from_update(update).map(pre_checkout_query_id)
+}
+
+fn pre_checkout_query_from_update(update: &TelegramUpdate) -> Option<&TelegramPreCheckoutQuery> {
     let TelegramUpdateType::PreCheckoutQuery(query) = &update.update_type else {
         return None;
     };
-    Some(pre_checkout_query_id(query))
+    Some(query)
 }
 
 fn pre_checkout_query_id(query: &TelegramPreCheckoutQuery) -> &str {
     &query.id
+}
+
+fn pre_checkout_error_message(query: &TelegramPreCheckoutQuery) -> Option<&'static str> {
+    if query.currency != openplotva_telegram::TELEGRAM_STARS_CURRENCY {
+        return Some("Invoice currency is invalid. Please create a new invoice.");
+    }
+    let Some(payload) = openplotva_telegram::parse_payment_payload(&query.invoice_payload) else {
+        return Some("Invoice has expired. Please create a new invoice.");
+    };
+    if !payment_payload_matches_user_and_amount(
+        payload,
+        i64::from(query.from.id),
+        query.total_amount,
+    ) {
+        return Some("Invoice details do not match. Please create a new invoice.");
+    }
+    None
 }
 
 /// Handle only pre-checkout query updates and delegate all other updates to the caller.
@@ -6265,14 +6332,16 @@ where
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
 {
-    let Some(pre_checkout_query_id) = pre_checkout_query_id_from_update(&update) else {
+    let Some(query) = pre_checkout_query_from_update(&update) else {
         handle_other(update).await?;
         return Ok(PreCheckoutUpdateRoute::Delegated);
     };
+    let pre_checkout_query_id = pre_checkout_query_id(query);
+    let error_message = pre_checkout_error_message(query);
 
     tracing::info!(pre_checkout_query_id, "pre-checkout answer requested");
     match effects
-        .answer_pre_checkout_query(pre_checkout_query_id)
+        .answer_pre_checkout_query(pre_checkout_query_id, error_message)
         .await
     {
         Ok(()) => {
@@ -6282,7 +6351,11 @@ where
                 "pre-checkout answer completed"
             );
             Ok(PreCheckoutUpdateRoute::Processed(
-                PreCheckoutOutcome::Acknowledged,
+                if error_message.is_some() {
+                    PreCheckoutOutcome::Rejected
+                } else {
+                    PreCheckoutOutcome::Acknowledged
+                },
             ))
         }
         Err(error) => {
@@ -6871,7 +6944,7 @@ mod tests {
         let report = process_successful_payment_at(
             &store,
             &effects,
-            &sample_message("subscription_42", 300),
+            &sample_message("subscription_v1_42_300", 300),
             now,
         )
         .await;
@@ -6920,6 +6993,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_payment_rejects_forwarded_or_mismatched_invoice()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+
+        let forwarded = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_v1_99_300", 300),
+            now,
+        )
+        .await;
+        let wrong_amount = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_v1_42_300", 1),
+            now,
+        )
+        .await;
+        let legacy = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_42", 300),
+            now,
+        )
+        .await;
+
+        assert_eq!(forwarded.outcome, SuccessfulPaymentOutcome::InvalidInvoice);
+        assert_eq!(
+            wrong_amount.outcome,
+            SuccessfulPaymentOutcome::InvalidInvoice
+        );
+        assert_eq!(legacy.outcome, SuccessfulPaymentOutcome::UnknownPayload);
+        assert!(store.subscriptions().is_empty());
+        assert!(store.vip_events().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn subscription_payment_uses_payment_time_for_delayed_processing()
     -> Result<(), Box<dyn Error>> {
         let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -6937,7 +7050,7 @@ mod tests {
             created_at: now,
         });
         let effects = EffectsStub::default();
-        let mut message = sample_message("subscription_42", 300);
+        let mut message = sample_message("subscription_v1_42_300", 300);
         message.payment.paid_at = Some(paid_at);
         message.payment.subscription_period_seconds =
             Some(openplotva_telegram::SUBSCRIPTION_PERIOD_SECONDS);
@@ -7003,7 +7116,7 @@ mod tests {
                 created_at: now,
             });
         let effects = EffectsStub::default();
-        let mut message = sample_message("subscription_42", 300);
+        let mut message = sample_message("subscription_v1_42_300", 300);
         message.payment.paid_at = Some(now);
         message.payment.subscription_period_seconds =
             Some(openplotva_telegram::SUBSCRIPTION_PERIOD_SECONDS);
@@ -7050,7 +7163,7 @@ mod tests {
         let report = process_successful_payment_at(
             &store,
             &effects,
-            &sample_message("subscription_42", 300),
+            &sample_message("subscription_v1_42_300", 300),
             now,
         )
         .await;
@@ -7085,7 +7198,7 @@ mod tests {
         let report = process_successful_payment_at(
             &store,
             &effects,
-            &sample_message("donation_42_600", 600),
+            &sample_message("donation_v1_42_600", 600),
             now,
         )
         .await;
@@ -7142,7 +7255,7 @@ mod tests {
         let report = process_successful_payment_at(
             &store,
             &effects,
-            &sample_message("subscription_42", 300),
+            &sample_message("subscription_v1_42_300", 300),
             now,
         )
         .await;
@@ -7180,7 +7293,7 @@ mod tests {
         let report = process_successful_payment_at(
             &store,
             &effects,
-            &sample_message("subscription_42", 300),
+            &sample_message("subscription_v1_42_300", 300),
             now,
         )
         .await;
@@ -7210,7 +7323,7 @@ mod tests {
         let store = StoreStub::new();
         let effects = EffectsStub::default();
 
-        let mut unsupported = sample_message("subscription_42", 300);
+        let mut unsupported = sample_message("subscription_v1_42_300", 300);
         unsupported.payment.currency = "USD".to_owned();
         let unsupported_report =
             process_successful_payment_at(&store, &effects, &unsupported, now).await;
@@ -7243,7 +7356,7 @@ mod tests {
     fn successful_payment_message_from_update_extracts_go_message_context()
     -> Result<(), Box<dyn Error>> {
         let message = successful_payment_message_from_update(&sample_successful_payment_update(
-            "subscription_42",
+            "subscription_v1_42_300",
             300,
         )?)
         .expect("successful payment should be extracted");
@@ -7263,7 +7376,7 @@ mod tests {
         );
         assert_eq!(message.payment.currency, "XTR");
         assert_eq!(message.payment.total_amount, 300);
-        assert_eq!(message.payment.invoice_payload, "subscription_42");
+        assert_eq!(message.payment.invoice_payload, "subscription_v1_42_300");
         assert_eq!(
             message.payment.telegram_payment_charge_id,
             "telegram-charge"
@@ -7298,7 +7411,7 @@ mod tests {
         let route = handle_successful_payment_update_or_else_at(
             &store,
             &effects,
-            sample_successful_payment_update("subscription_42", 300)?,
+            sample_successful_payment_update("subscription_v1_42_300", 300)?,
             now,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
@@ -7331,7 +7444,8 @@ mod tests {
     #[test]
     fn successful_payment_update_builds_go_taskman_control_job() -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let update = sample_successful_payment_update_with_thread("subscription_42", 300, 77)?;
+        let update =
+            sample_successful_payment_update_with_thread("subscription_v1_42_300", 300, 77)?;
 
         let job = successful_payment_control_job_from_update_at(&update, created)
             .expect("successful payment should build a control job");
@@ -7360,7 +7474,7 @@ mod tests {
             Some(ControlPayment {
                 currency: "XTR".to_owned(),
                 total_amount: 300,
-                invoice_payload: "subscription_42".to_owned(),
+                invoice_payload: "subscription_v1_42_300".to_owned(),
                 telegram_payment_charge_id: "telegram-charge".to_owned(),
                 provider_payment_charge_id: "provider-charge".to_owned(),
                 paid_at: Some("2024-03-09T16:00:00Z".to_owned()),
@@ -7373,7 +7487,7 @@ mod tests {
     #[test]
     fn successful_payment_update_preserves_recurring_subscription_metadata()
     -> Result<(), Box<dyn Error>> {
-        let update = sample_recurring_successful_payment_update("subscription_42", 300)?;
+        let update = sample_recurring_successful_payment_update("subscription_v1_42_300", 300)?;
 
         let message = successful_payment_message_from_update(&update)
             .expect("successful payment should be extracted");
@@ -7423,7 +7537,7 @@ mod tests {
 
         let route = enqueue_successful_payment_update_or_else_at(
             &queue,
-            sample_successful_payment_update("subscription_42", 300)?,
+            sample_successful_payment_update("subscription_v1_42_300", 300)?,
             created,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
@@ -7500,7 +7614,7 @@ mod tests {
 
         let route = enqueue_successful_payment_update_or_else_at(
             &queue,
-            sample_successful_payment_update("subscription_42", 300)?,
+            sample_successful_payment_update("subscription_v1_42_300", 300)?,
             created,
             |_update| async { Ok::<(), std::io::Error>(()) },
         )
@@ -9455,7 +9569,7 @@ mod tests {
             &queue,
             &store,
             &effects,
-            sample_successful_payment_update("subscription_42", 300)?,
+            sample_successful_payment_update("subscription_v1_42_300", 300)?,
             created,
             now,
             move |update| {
@@ -10270,12 +10384,12 @@ mod tests {
         let checker = super::VipStatusWithExternalMembership::new(
             store.clone(),
             membership.clone(),
-            -1001998670656,
+            -1004242,
         );
 
         assert!(super::VipStatusChecker::is_vip_at(&checker, 42, now).await);
 
-        assert_eq!(membership.calls(), vec![(-1001998670656, 42)]);
+        assert_eq!(membership.calls(), vec![(-1004242, 42)]);
         assert_eq!(
             store.calls(),
             vec![
@@ -10363,6 +10477,31 @@ mod tests {
         assert_eq!(
             effects.answered_pre_checkout_queries(),
             vec!["pre-checkout-id".to_owned()]
+        );
+        assert_eq!(effects.pre_checkout_error_messages(), vec![None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_checkout_rejects_payer_and_amount_mismatch() -> Result<(), Box<dyn Error>> {
+        let effects = EffectsStub::default();
+
+        let route = handle_pre_checkout_update_or_else(
+            &effects,
+            sample_pre_checkout_update_with(42, 1, "subscription_v1_42_300", "XTR")?,
+            |_| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PreCheckoutUpdateRoute::Processed(PreCheckoutOutcome::Rejected)
+        );
+        assert_eq!(
+            effects.pre_checkout_error_messages(),
+            vec![Some(
+                "Invoice details do not match. Please create a new invoice.".to_owned()
+            )]
         );
         Ok(())
     }
@@ -10465,7 +10604,8 @@ mod tests {
             Arc::clone(&effects),
             Arc::clone(&next),
         );
-        let update = sample_successful_payment_update_with_thread("subscription_42", 300, 77)?;
+        let update =
+            sample_successful_payment_update_with_thread("subscription_v1_42_300", 300, 77)?;
         update_queue.enqueue_update(&update).await?;
         let decoded = update_queue
             .dequeue_update(StdDuration::from_secs(1))
@@ -10525,7 +10665,7 @@ mod tests {
                 .payment
                 .as_ref()
                 .map(|payment| payment.invoice_payload.as_str()),
-            Some("subscription_42")
+            Some("subscription_v1_42_300")
         );
         assert_eq!(update_queue.len().await?, 0);
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
@@ -11709,7 +11849,7 @@ mod tests {
             .expect("payment control job should build a message");
 
         assert_eq!(message.user.first_name, "Alice Smith");
-        assert_eq!(message.payment.invoice_payload, "subscription_42");
+        assert_eq!(message.payment.invoice_payload, "subscription_v1_42_300");
     }
 
     #[tokio::test]
@@ -12310,7 +12450,7 @@ mod tests {
         params.data.payment = Some(ControlPayment {
             currency: "XTR".to_owned(),
             total_amount: 300,
-            invoice_payload: "subscription_42".to_owned(),
+            invoice_payload: "subscription_v1_42_300".to_owned(),
             telegram_payment_charge_id: "telegram-charge".to_owned(),
             provider_payment_charge_id: "provider-charge".to_owned(),
             ..ControlPayment::default()
@@ -12570,19 +12710,28 @@ mod tests {
     }
 
     fn sample_pre_checkout_update() -> Result<TelegramUpdate, serde_json::Error> {
+        sample_pre_checkout_update_with(42, 300, "subscription_v1_42_300", "XTR")
+    }
+
+    fn sample_pre_checkout_update_with(
+        user_id: i64,
+        total_amount: i64,
+        invoice_payload: &str,
+        currency: &str,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 999,
             "pre_checkout_query": {
                 "id": "pre-checkout-id",
                 "from": {
-                    "id": 42,
+                    "id": user_id,
                     "is_bot": false,
                     "first_name": "Alice",
                     "username": "alice"
                 },
-                "currency": "XTR",
-                "total_amount": 300,
-                "invoice_payload": "subscription_42"
+                "currency": currency,
+                "total_amount": total_amount,
+                "invoice_payload": invoice_payload
             }
         }))
     }
@@ -13361,6 +13510,7 @@ mod tests {
         sent_texts: Vec<SentPaymentText>,
         invalidated_vip_users: Vec<i64>,
         answered_pre_checkout_queries: Vec<String>,
+        pre_checkout_error_messages: Vec<Option<String>>,
         next_pre_checkout_error: Option<StubError>,
         subscription_invoice_requests: Vec<openplotva_telegram::SubscriptionInvoiceLinkRequest>,
         donation_invoice_requests: Vec<openplotva_telegram::DonationInvoiceLinkRequest>,
@@ -13420,6 +13570,10 @@ mod tests {
 
         fn answered_pre_checkout_queries(&self) -> Vec<String> {
             self.lock().answered_pre_checkout_queries.clone()
+        }
+
+        fn pre_checkout_error_messages(&self) -> Vec<Option<String>> {
+            self.lock().pre_checkout_error_messages.clone()
         }
 
         fn subscription_invoice_requests(
@@ -13671,12 +13825,16 @@ mod tests {
         fn answer_pre_checkout_query<'a>(
             &'a self,
             pre_checkout_query_id: &'a str,
+            error_message: Option<&'a str>,
         ) -> PaymentEffectsFuture<'a, Self::Error> {
             Box::pin(async move {
                 let mut state = self.lock();
                 state
                     .answered_pre_checkout_queries
                     .push(pre_checkout_query_id.to_owned());
+                state
+                    .pre_checkout_error_messages
+                    .push(error_message.map(str::to_owned));
                 match state.next_pre_checkout_error.take() {
                     Some(error) => Err(error),
                     None => Ok(()),

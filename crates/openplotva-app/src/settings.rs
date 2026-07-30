@@ -60,6 +60,7 @@ const ADMIN_COMMAND_UNAUTHORIZED_DELETE_AFTER: Duration = Duration::from_secs(60
 const ADMIN_CHAT_SETTINGS_USAGE_TEXT: &str = "Usage: /admin_chat_settings [chat_id или @username]";
 const ADMIN_CHAT_SETTINGS_WEBAPP_MISSING_TEXT: &str = "WebApp URL is not configured.";
 const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const GROUP_SETTINGS_MEMBERSHIP_MAX_AGE_SECONDS: i64 = 5 * 60;
 
 /// Boxed future returned by settings taskman assignment calls.
 pub type SettingsControlJobQueueFuture<'a, E> =
@@ -2992,9 +2993,7 @@ where
     }
 
     match store.get_chat_member(chat_id, user_id).await {
-        Ok(member)
-            if openplotva_storage::stored_member_can_open_group_settings(member.as_ref()) =>
-        {
+        Ok(member) if cached_group_settings_permission_is_fresh(member.as_ref()) => {
             return Ok(true);
         }
         Ok(_) => {}
@@ -3023,6 +3022,20 @@ where
     }
 
     Ok(openplotva_telegram::telegram_member_can_open_group_settings(&member))
+}
+
+fn cached_group_settings_permission_is_fresh(member: Option<&ChatMemberRecord>) -> bool {
+    let now = OffsetDateTime::now_utc();
+    member.is_some_and(|member| {
+        openplotva_storage::stored_member_can_open_group_settings(Some(member))
+            && member.telegram_observed_at.is_some_and(|observed_at| {
+                observed_at <= now
+                    && now
+                        .unix_timestamp()
+                        .saturating_sub(observed_at.unix_timestamp())
+                        <= GROUP_SETTINGS_MEMBERSHIP_MAX_AGE_SECONDS
+            })
+    })
 }
 
 #[must_use]
@@ -5327,6 +5340,7 @@ mod tests {
             chat_id: -10042,
             user_id: 42,
             status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            telegram_observed_at: Some(OffsetDateTime::now_utc()),
             ..ChatMemberRecord::default()
         });
         let telegram = GroupSettingsMemberApiStub::failing();
@@ -5347,6 +5361,7 @@ mod tests {
             chat_id: -10042,
             user_id: 42,
             status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            telegram_observed_at: Some(OffsetDateTime::now_utc()),
             ..ChatMemberRecord::default()
         });
         let member_api = GroupSettingsMemberApiStub::failing();
@@ -5424,6 +5439,26 @@ mod tests {
         assert_eq!(upsert.can_promote_members, Some(true));
         assert_eq!(upsert.can_delete_messages, Some(true));
         assert_eq!(upsert.can_send_media_messages, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_permission_rechecks_stale_cached_grant() -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            telegram_observed_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(6)),
+            ..ChatMemberRecord::default()
+        });
+        let telegram =
+            GroupSettingsMemberApiStub::with_member(restricted_member_with_send_permissions(42));
+
+        let allowed = can_open_group_settings_with_sources(&store, &telegram, -10042, 42).await?;
+
+        assert!(!allowed);
+        assert_eq!(telegram.calls(), vec![(-10042, 42)]);
+        assert_eq!(store.upserts().len(), 1);
         Ok(())
     }
 

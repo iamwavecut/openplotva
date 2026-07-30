@@ -783,16 +783,13 @@ pub const SQL_LIST_USER_CHATS: &str = "SELECT c.id, c.type, c.title, c.username,
 
 pub const SQL_GET_DIALOG_MEMORY_CHAT_META: &str = "SELECT type, username, COALESCE(active_usernames::text, '') AS active_usernames FROM telegram_chats_effective WHERE id = $1";
 
-pub const SQL_GET_CHAT_MEMBER: &str =
-    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = $2";
+pub const SQL_GET_CHAT_MEMBER: &str = "SELECT effective.*, GREATEST(durable.telegram_observed_at, staged.observed_at) AS telegram_observed_at FROM telegram_chat_members_effective effective LEFT JOIN chat_members durable ON durable.chat_id = effective.chat_id AND durable.user_id = effective.user_id LEFT JOIN telegram_chat_members_stage_latest staged ON staged.chat_id = effective.chat_id AND staged.user_id = effective.user_id WHERE effective.chat_id = $1 AND effective.user_id = $2";
 
-pub const SQL_LIST_CHAT_MEMBERS: &str =
-    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1";
+pub const SQL_LIST_CHAT_MEMBERS: &str = "SELECT effective.*, GREATEST(durable.telegram_observed_at, staged.observed_at) AS telegram_observed_at FROM telegram_chat_members_effective effective LEFT JOIN chat_members durable ON durable.chat_id = effective.chat_id AND durable.user_id = effective.user_id LEFT JOIN telegram_chat_members_stage_latest staged ON staged.chat_id = effective.chat_id AND staged.user_id = effective.user_id WHERE effective.chat_id = $1";
 
-pub const SQL_LIST_CHAT_MEMBERS_BY_USER_IDS: &str = "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = ANY($2::bigint[])";
+pub const SQL_LIST_CHAT_MEMBERS_BY_USER_IDS: &str = "SELECT effective.*, GREATEST(durable.telegram_observed_at, staged.observed_at) AS telegram_observed_at FROM telegram_chat_members_effective effective LEFT JOIN chat_members durable ON durable.chat_id = effective.chat_id AND durable.user_id = effective.user_id LEFT JOIN telegram_chat_members_stage_latest staged ON staged.chat_id = effective.chat_id AND staged.user_id = effective.user_id WHERE effective.chat_id = $1 AND effective.user_id = ANY($2::bigint[])";
 
-pub const SQL_LIST_USER_CHAT_MEMBERSHIPS: &str =
-    "SELECT * FROM telegram_chat_members_effective WHERE user_id = $1";
+pub const SQL_LIST_USER_CHAT_MEMBERSHIPS: &str = "SELECT effective.*, GREATEST(durable.telegram_observed_at, staged.observed_at) AS telegram_observed_at FROM telegram_chat_members_effective effective LEFT JOIN chat_members durable ON durable.chat_id = effective.chat_id AND durable.user_id = effective.user_id LEFT JOIN telegram_chat_members_stage_latest staged ON staged.chat_id = effective.chat_id AND staged.user_id = effective.user_id WHERE effective.user_id = $1";
 
 pub const SQL_LIST_CHAT_DEPUTY_IDS: &str =
     "SELECT user_id FROM chat_deputies WHERE chat_id = $1 ORDER BY user_id";
@@ -3654,6 +3651,8 @@ pub struct ChatMemberRecord {
     pub can_add_web_page_previews: Option<bool>,
     /// Optional restricted/kicked expiration.
     pub until_date: Option<OffsetDateTime>,
+    /// Time at which Telegram last supplied this membership state.
+    pub telegram_observed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -9288,6 +9287,7 @@ fn chat_member_from_row(row: PgRow) -> Result<ChatMemberRecord, sqlx::Error> {
         can_send_other_messages: row.try_get("can_send_other_messages")?,
         can_add_web_page_previews: row.try_get("can_add_web_page_previews")?,
         until_date: row.try_get("until_date")?,
+        telegram_observed_at: row.try_get("telegram_observed_at")?,
     })
 }
 
@@ -11534,14 +11534,24 @@ mod tests {
 
     #[test]
     fn chat_member_sql_matches_go_query_contracts() {
-        assert_eq!(
+        for query in [
             super::SQL_GET_CHAT_MEMBER,
-            "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1 AND user_id = $2"
-        );
-        assert_eq!(
             super::SQL_LIST_CHAT_MEMBERS,
-            "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1"
+            super::SQL_LIST_CHAT_MEMBERS_BY_USER_IDS,
+            super::SQL_LIST_USER_CHAT_MEMBERSHIPS,
+        ] {
+            assert!(query.contains("FROM telegram_chat_members_effective effective"));
+            assert!(query.contains("LEFT JOIN chat_members durable"));
+            assert!(query.contains("LEFT JOIN telegram_chat_members_stage_latest staged"));
+            assert!(query.contains(
+                "GREATEST(durable.telegram_observed_at, staged.observed_at) AS telegram_observed_at"
+            ));
+        }
+        assert!(
+            super::SQL_GET_CHAT_MEMBER
+                .ends_with("WHERE effective.chat_id = $1 AND effective.user_id = $2")
         );
+        assert!(super::SQL_LIST_CHAT_MEMBERS.ends_with("WHERE effective.chat_id = $1"));
         assert_eq!(
             super::SQL_DELETE_CHAT_MEMBER,
             "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2"

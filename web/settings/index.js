@@ -1113,7 +1113,7 @@
                 <input type="${item.inputType}" name="${item.inputName}" value="${escapeAttr(item.value)}" ${item.selected ? 'checked' : ''}>
                 <i class="icon icon-${item.inputType}"></i>
                 <div class="item-inner">
-                  <div class="item-title">${item.text}</div>
+                  <div class="item-title">${escapeHTML(item.text)}</div>
                   ${meta.length ? `<div class="item-text autocomplete-deputy-meta">${meta.join(' • ')}</div>` : ''}
                 </div>
               </label>

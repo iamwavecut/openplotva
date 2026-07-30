@@ -471,7 +471,13 @@ impl WebhookUpdateSender {
         if method != "POST" {
             return Err(WebhookUpdateRequestError::MethodNotAllowed);
         }
-        if provided_secret.unwrap_or_default() != secret_token {
+        let Some(provided_secret) = provided_secret else {
+            return Err(WebhookUpdateRequestError::Unauthorized);
+        };
+        if secret_token.is_empty()
+            || provided_secret.is_empty()
+            || !constant_time_secret_eq(provided_secret.as_bytes(), secret_token.as_bytes())
+        {
             return Err(WebhookUpdateRequestError::Unauthorized);
         }
 
@@ -583,6 +589,17 @@ impl WebhookUpdateSender {
         }
         result
     }
+}
+
+fn constant_time_secret_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 fn raw_update_id(body: &[u8]) -> Option<i64> {
@@ -836,11 +853,21 @@ mod tests {
             .handle_webhook_request("POST", Some("wrong"), "secret", b"{}")
             .await
             .expect_err("secret rejected");
+        let missing_secret = sender
+            .handle_webhook_request("POST", None, "secret", b"{}")
+            .await
+            .expect_err("missing secret rejected");
+        let empty_secret = sender
+            .handle_webhook_request("POST", Some(""), "", b"{}")
+            .await
+            .expect_err("empty configured secret rejected");
 
         assert_eq!(wrong_method, WebhookUpdateRequestError::MethodNotAllowed);
         assert_eq!(wrong_method.http_status(), 405);
         assert_eq!(wrong_secret, WebhookUpdateRequestError::Unauthorized);
         assert_eq!(wrong_secret.http_status(), 401);
+        assert_eq!(missing_secret, WebhookUpdateRequestError::Unauthorized);
+        assert_eq!(empty_secret, WebhookUpdateRequestError::Unauthorized);
         assert_eq!(
             TELEGRAM_WEBHOOK_SECRET_HEADER,
             "X-Telegram-Bot-Api-Secret-Token"

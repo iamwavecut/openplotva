@@ -83,6 +83,8 @@ pub struct DeleteMessageCallbackTarget {
     pub message_id: i64,
     /// Replied-to chat ID used for the membership lookup.
     pub reply_chat_id: i64,
+    /// Telegram user who authored the message to which the control message replies.
+    pub reply_author_user_id: Option<i64>,
 }
 
 /// Result of one generic delete callback update.
@@ -214,14 +216,14 @@ where
 
     let requester_id = i64::from(query.from.id);
     let member = match member_api
-        .get_chat_member(target.reply_chat_id, requester_id)
+        .get_chat_member(target.message_chat.id, requester_id)
         .await
     {
         Ok(member) => member,
         Err(error) => {
             tracing::warn!(
                 message = %error,
-                chat_id = target.reply_chat_id,
+                chat_id = target.message_chat.id,
                 user_id = requester_id,
                 "failed to authorize generic delete callback"
             );
@@ -238,7 +240,7 @@ where
         }
     };
 
-    if delete_callback_allows_delete(&target, &member) {
+    if delete_callback_allows_delete(&target, requester_id, &member) {
         try_delete_message(
             effects,
             target.message_chat.id,
@@ -264,9 +266,12 @@ where
 
 fn delete_callback_allows_delete(
     target: &DeleteMessageCallbackTarget,
+    requester_id: i64,
     member: &TelegramChatMember,
 ) -> bool {
-    target.reply_chat_id != 0 || telegram_member_can_delete_message(member)
+    target.reply_chat_id == target.message_chat.id
+        && (target.reply_author_user_id == Some(requester_id)
+            || telegram_member_can_delete_message(member))
 }
 
 #[must_use]
@@ -307,6 +312,7 @@ fn delete_message_callback_target(
         },
         message_id: message.id,
         reply_chat_id: reply_to.chat.get_id().into(),
+        reply_author_user_id: reply_to.sender.get_user().map(|user| i64::from(user.id)),
     })
 }
 
@@ -397,6 +403,15 @@ mod tests {
         include_reply: bool,
         from_user_id: i64,
     ) -> Result<TelegramUpdate, serde_json::Error> {
+        delete_callback_update_with_reply(include_reply, from_user_id, from_user_id, -10042)
+    }
+
+    fn delete_callback_update_with_reply(
+        include_reply: bool,
+        from_user_id: i64,
+        reply_author_user_id: i64,
+        reply_chat_id: i64,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
         let mut message = serde_json::json!({
             "message_id": 77,
             "date": 1_710_000_000,
@@ -407,7 +422,12 @@ mod tests {
             message["reply_to_message"] = serde_json::json!({
                 "message_id": 55,
                 "date": 1_710_000_000,
-                "chat": {"id": -42, "type": "supergroup", "title": "Source"},
+                "chat": {"id": reply_chat_id, "type": "supergroup", "title": "Source"},
+                "from": {
+                    "id": reply_author_user_id,
+                    "is_bot": false,
+                    "first_name": "Author"
+                },
                 "text": "source"
             });
         }
@@ -465,7 +485,7 @@ mod tests {
         .await?;
 
         assert_eq!(outcome, DeleteMessageCallbackOutcome::LookupErrorAck);
-        assert_eq!(member_api.calls(), vec![(-42, 7)]);
+        assert_eq!(member_api.calls(), vec![(-10042, 7)]);
         let methods = effects.methods();
         assert_eq!(methods[0].0, "answerCallbackQuery");
         assert!(methods[0].1.get("text").is_none());
@@ -497,6 +517,34 @@ mod tests {
         assert_eq!(methods[0].1["chat_id"], -10042);
         assert_eq!(methods[0].1["message_id"], 77);
         assert_eq!(methods[1].1["cache_time"], 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_message_callback_rejects_non_author_and_cross_chat_reply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for update in [
+            delete_callback_update_with_reply(true, 8, 7, -10042)?,
+            delete_callback_update_with_reply(true, 7, 7, -42)?,
+        ] {
+            let member_api = MemberApiStub::with_member(member(8));
+            let effects = EffectsStub::default();
+            let next = UpdateHandlerStub::default();
+
+            let outcome = handle_delete_message_callback_update_or_else(
+                &member_api,
+                &effects,
+                update,
+                |update| next.handle_update(update),
+            )
+            .await?;
+
+            assert_eq!(outcome, DeleteMessageCallbackOutcome::Unauthorized);
+            assert_eq!(
+                method_names(&effects.methods()),
+                vec!["answerCallbackQuery"]
+            );
+        }
         Ok(())
     }
 

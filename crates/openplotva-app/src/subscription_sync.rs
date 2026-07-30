@@ -808,7 +808,7 @@ mod tests {
                 Some("en".to_owned()),
                 Some(true),
             ),
-            invoice_payload: "subscription_42".to_owned(),
+            invoice_payload: "subscription_v1_42_300".to_owned(),
             amount_stars: 300,
             paid_at,
             subscription_period_seconds: TimeDuration::days(30).whole_seconds(),
