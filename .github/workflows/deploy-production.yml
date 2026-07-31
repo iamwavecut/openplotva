@@ -26,7 +26,7 @@ jobs:
           fi
 
   build-and-deploy:
-    name: Build image and deploy
+    name: Reuse or build image and deploy
     needs: authorize
     runs-on: ubuntu-22.04
     permissions:
@@ -35,8 +35,70 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Select GHCR image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_name="ghcr.io/${GITHUB_REPOSITORY}"
+          image_name="$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')"
+          echo "OPENPLOTVA_IMAGE_NAME=$image_name" >> "$GITHUB_ENV"
+          echo "OPENPLOTVA_IMAGE=${image_name}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Reuse exact-tree PR image when available
+        id: release_image
+        shell: bash
+        run: |
+          set -euo pipefail
+          use_fallback() {
+            echo "mode=build" >> "$GITHUB_OUTPUT"
+            echo "Release candidate unavailable: $1; building exact main"
+            exit 0
+          }
+
+          read -r -a revision <<<"$(git rev-list --parents -n 1 "$GITHUB_SHA")"
+          [[ "${#revision[@]}" == "3" ]] || use_fallback "main revision is not a two-parent merge"
+          candidate_sha="${revision[2]}"
+          main_tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          candidate_tree="$(git rev-parse "${candidate_sha}^{tree}")"
+          [[ "$candidate_tree" == "$main_tree" ]] || use_fallback "merge tree differs from PR head"
+
+          candidate_image="${OPENPLOTVA_IMAGE_NAME}:candidate-${candidate_sha}"
+          if ! candidate_digest="$(docker buildx imagetools inspect "$candidate_image" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+            use_fallback "candidate image is missing"
+          fi
+          candidate_digest="$(printf '%s' "$candidate_digest" | tr -d '[:space:]')"
+          [[ "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || use_fallback "candidate digest is invalid"
+
+          if ! docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$OPENPLOTVA_IMAGE" \
+            "$candidate_image"; then
+            use_fallback "candidate promotion failed"
+          fi
+          if ! published_digest="$(docker buildx imagetools inspect "$OPENPLOTVA_IMAGE" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+            use_fallback "promoted image is unreadable"
+          fi
+          published_digest="$(printf '%s' "$published_digest" | tr -d '[:space:]')"
+          [[ "$published_digest" == "$candidate_digest" ]] || use_fallback "promoted digest mismatch"
+          echo "mode=reuse" >> "$GITHUB_OUTPUT"
+          echo "Reused ${candidate_image} for exact main tree ${main_tree}"
+
+      - name: Set up Docker Buildx for exact-main fallback
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Cache Rust toolchain
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         uses: actions/cache@v6 # v4
         with:
           path: |
@@ -45,43 +107,31 @@ jobs:
           key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-deploy-v1
 
       - name: Install Rust
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
           rustup default "$RUST_VERSION"
 
       - name: Cache Rust build artifacts
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         uses: Swatinem/rust-cache@v2 # v2
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-deploy
 
       - name: Check Rust formatting
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         run: cargo fmt --all -- --check
 
       - name: Check Rust workspace
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         run: cargo check --workspace --all-targets --all-features
 
       - name: Build release binary
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         run: cargo build --locked --release -p openplotva-app
 
-      - name: Select GHCR image tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_SHA}"
-          image="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
-          echo "OPENPLOTVA_IMAGE=$image" >> "$GITHUB_ENV"
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4 # v3
-
       - name: Build and push GHCR image
+        if: ${{ steps.release_image.outputs.mode != 'reuse' }}
         uses: docker/build-push-action@v7 # v6
         env:
           DOCKER_BUILD_RECORD_UPLOAD: "false"
@@ -115,12 +165,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2029
           ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
-          scp deploy/production/backup-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/backup-production.sh"
+          # shellcheck disable=SC2029
           tar -C tools/token-estimator -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/token-estimator'"
-          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh' '$GETA_DEPLOY_ROOT/backup-production.sh'"
+          # shellcheck disable=SC2029
+          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
       - name: Apply production deployment
         shell: bash
@@ -140,7 +192,7 @@ jobs:
             "$GETA_SSH_TARGET" \
             "OPENPLOTVA_DEPLOY_IMAGE=$image_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q OPENPLOTVA_PRODUCTION_ENV_B64=$env_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
-      - name: Cleanup old GHCR images
+      - name: Remove non-current GHCR images
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -155,28 +207,18 @@ jobs:
           package="${GITHUB_REPOSITORY#*/}"
           package="${package,,}"
           current_tag="${GITHUB_SHA}"
-          deployed_image="$(ssh "$GETA_SSH_TARGET" "docker inspect -f '{{.Config.Image}}' openplotva-openplotva-1 2>/dev/null || true")"
-          deployed_tag="${deployed_image##*:}"
-          cutoff_epoch="$(date -u -d '1 day ago' +%s)"
           versions_file="$(mktemp)"
 
-          echo "Cleaning GHCR package ${owner}/${package}; keeping current tag ${current_tag} and deployed tag ${deployed_tag}"
+          echo "Cleaning GHCR package ${owner}/${package}; keeping only current tag ${current_tag}"
           gh api --paginate --slurp "/users/${owner}/packages/container/${package}/versions?per_page=100" > "$versions_file"
 
           deleted=0
           while IFS= read -r version; do
             id="$(jq -r '.id' <<<"$version")"
             created_at="$(jq -r '.created_at' <<<"$version")"
-            created_epoch="$(date -u -d "$created_at" +%s)"
             tags="$(jq -r '[.metadata.container.tags[]?] | join(",")' <<<"$version")"
 
-            if (( created_epoch >= cutoff_epoch )); then
-              continue
-            fi
             if jq -e --arg tag "$current_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
-              continue
-            fi
-            if [[ -n "$deployed_tag" ]] && jq -e --arg tag "$deployed_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
               continue
             fi
 

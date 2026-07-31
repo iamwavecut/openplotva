@@ -103,6 +103,77 @@ jobs:
             tools/rust-fast-gate.sh
           fi
 
+  release-candidate:
+    name: Release candidate image
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Cache Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-deploy-v1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-deploy
+
+      - name: Build release binary
+        run: cargo build --locked --release -p openplotva-app
+
+      - name: Select candidate image
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}:candidate-${CANDIDATE_SHA}"
+          image="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+          echo "OPENPLOTVA_CANDIDATE_IMAGE=$image" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build and push candidate image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          target: runtime-prebuilt
+          build-args: RUST_VERSION=${{ env.RUST_VERSION }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: ${{ env.OPENPLOTVA_CANDIDATE_IMAGE }}
+          push: true
+          cache-from: type=gha,scope=openplotva-runtime-prebuilt
+          cache-to: type=gha,mode=min,scope=openplotva-runtime-prebuilt
+
   postgres-integration:
     name: PostgreSQL integration
     runs-on: ubuntu-22.04

@@ -1,7 +1,18 @@
 # Production operations
 
-`deploy-production.sh` creates a verified pre-deploy backup before pulling or
-recreating runtime containers. The backup is stored under
+Production deployment and backup are independent operations. The deployment
+workflow never starts, waits for, or checks a backup. It pulls the selected image,
+recreates the application, and succeeds after `/api/health` and `/api/ready` pass.
+
+The normal fast path reuses the release image built by the successful same-repository
+PR CI run when the merged `main` Git tree exactly matches that PR head. A missing or
+non-matching candidate falls back to building exact `main`, so artifact reuse cannot
+silently deploy different source content.
+After a successful deploy, local Docker and GHCR cleanup keep only the current
+main-SHA image; they do not maintain rollback image history.
+
+`.github/workflows/backup-production.yml` runs separately on a daily schedule or by
+manual dispatch. Its backup is stored under
 `${OPENPLOTVA_BACKUP_ROOT:-/home/wavecut/openplotva/backups}` and contains:
 
 - `postgres.dump` — PostgreSQL custom-format logical dump;
@@ -10,7 +21,7 @@ recreating runtime containers. The backup is stored under
 - `openplotva-state.tar.gz` — runtime TLS/application state when the volume exists;
 - `SHA256SUMS` — checksums verified before the backup is accepted.
 
-The default retention is the newest 14 complete `predeploy-*` directories.
+The default retention is the newest 14 complete `scheduled-*` directories.
 Override it with `OPENPLOTVA_BACKUP_KEEP`.
 
 Before restore, stop OpenPlotva and the affected dependency. Validate the

@@ -11,7 +11,7 @@ postgres_service="${OPENPLOTVA_BACKUP_POSTGRES_SERVICE:-postgresql}"
 dragonfly_service="${OPENPLOTVA_BACKUP_DRAGONFLY_SERVICE:-dragonfly}"
 ingress_service="${OPENPLOTVA_BACKUP_INGRESS_SERVICE:-redis-ingress}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
-runtime_image="${OPENPLOTVA_DEPLOY_IMAGE:-openplotva:backup-placeholder}"
+runtime_image="${OPENPLOTVA_BACKUP_RUNTIME_IMAGE:-openplotva:backup-placeholder}"
 dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
 update_stream_valkey_image="${UPDATE_STREAM_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}"
 
@@ -134,7 +134,7 @@ prune_old_backups() {
   first_stale=$((backup_keep + 1))
   while IFS= read -r path; do
     case "$path" in
-      "${backup_root}"/predeploy-*)
+      "${backup_root}"/scheduled-*|"${backup_root}"/predeploy-*)
         rm -rf -- "$path"
         log "pruned ${path}"
         ;;
@@ -143,7 +143,8 @@ prune_old_backups() {
         ;;
     esac
   done < <(
-    find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name 'predeploy-*' -print |
+    find "$backup_root" -mindepth 1 -maxdepth 1 -type d \
+      \( -name 'scheduled-*' -o -name 'predeploy-*' \) -print |
       sort -r |
       tail -n "+${first_stale}"
   )
@@ -156,7 +157,7 @@ main() {
   local postgres_container
   postgres_container="$(service_container "$postgres_service")"
   if [[ -z "$postgres_container" ]]; then
-    log "no current PostgreSQL container; pre-deploy backup skipped"
+    log "no current PostgreSQL container; backup skipped"
     return 0
   fi
 
@@ -173,9 +174,11 @@ main() {
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
   install -d -m 700 "$backup_root"
-  temporary_dir="$(mktemp -d "${backup_root}/.predeploy-${timestamp}.XXXXXX")"
-  final_dir="${backup_root}/predeploy-${timestamp}"
+  temporary_dir="$(mktemp -d "${backup_root}/.scheduled-${timestamp}.XXXXXX")"
+  final_dir="${backup_root}/scheduled-${timestamp}"
   printf -v cleanup_command 'rm -rf -- %q' "$temporary_dir"
+  # The trap command is intentionally expanded now after printf %q escapes the path.
+  # shellcheck disable=SC2064
   trap "$cleanup_command" EXIT
 
   log "dumping PostgreSQL database ${db_name}"
