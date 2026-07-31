@@ -127,6 +127,9 @@ const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
 const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 4;
+const REGULAR_IMAGE_GENERATION_WORKFLOW_KEY: &str =
+    image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY;
+const VIP_IMAGE_EDITOR_WORKFLOW_KEY: &str = image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY;
 
 #[derive(Default)]
 struct RuntimeWorkers {
@@ -12342,20 +12345,12 @@ async fn start_runtime_workers(
 
     let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
     let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
-        image_jobs::ParallelImageEditor::new(
-            image_jobs::RoutedImageEditor::new(
-                image_attempt_walker.clone(),
-                vision_data_urls.clone(),
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
-            )
-            .with_workflow_key(image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY),
-            image_jobs::RoutedImageEditor::new(
-                image_attempt_walker.clone(),
-                vision_data_urls.clone(),
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
-            )
-            .with_workflow_key(image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY),
-        ),
+        image_jobs::RoutedImageEditor::new(
+            image_attempt_walker.clone(),
+            vision_data_urls.clone(),
+            image_jobs::aifarm_draw_api_config_from_app_config(config),
+        )
+        .with_workflow_key(VIP_IMAGE_EDITOR_WORKFLOW_KEY),
         media_prompt_optimizer.clone(),
     );
     let mut vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
@@ -12390,7 +12385,8 @@ async fn start_runtime_workers(
         image_jobs::RoutedImageGenerator::new(
             image_attempt_walker,
             image_jobs::aifarm_draw_api_config_from_app_config(config),
-        ),
+        )
+        .with_workflow_key(REGULAR_IMAGE_GENERATION_WORKFLOW_KEY),
         media_prompt_optimizer,
     );
     let regular_image_generator = agent_runtime::ImageAgentImageGenerator::new(
@@ -12428,7 +12424,7 @@ async fn start_runtime_workers(
     workers.handles.push(regular_image_worker);
     readiness_checks.push(ReadinessCheck::ok(
         "image_jobs",
-        "Image taskman workers started for VIP generation/edit and regular generation queues with draw-api providers and optional Boogu add-ons",
+        "Image taskman workers started for VIP Flux+Boogu generation, Flux-only editing, and regular Boogu generation",
     ));
     for queue_name in image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES {
         shared_taskman_worker_counts
@@ -13896,6 +13892,18 @@ mod tests {
         let metrics = super::telegram_outbox::TelegramOutboxWorkerMetrics::default();
 
         assert_eq!(super::telegram_outbox_readiness(&metrics).status, "error");
+    }
+
+    #[test]
+    fn image_worker_workflows_keep_free_generation_on_boogu_and_editor_on_flux() {
+        assert_eq!(
+            super::REGULAR_IMAGE_GENERATION_WORKFLOW_KEY,
+            super::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
+        );
+        assert_eq!(
+            super::VIP_IMAGE_EDITOR_WORKFLOW_KEY,
+            super::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY
+        );
     }
 
     #[tokio::test]
