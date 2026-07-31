@@ -4772,7 +4772,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_extractor_config_routes_vibethinker_to_qwen_service() {
+    fn memory_extractor_config_keeps_vibethinker_on_shared_gpu2_service() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             memory_consolidation_model: Some("vibethinker-3b".to_owned()),
             memory_aifarm_service_name: Some("llm-openai-qwen27b-gguf".to_owned()),

@@ -698,7 +698,7 @@ fn canonical_provider_for_model(model: &str, flow: &str) -> Option<&'static str>
         return Some("vram-cloud");
     }
     match model {
-        "vibethinker-3b" | "qwen3.6-27b-moq" => Some("aifarm-llamacpp-gpu2"),
+        "vibethinker-3b" | "qwen3.6-27b-moq" | "ternary-bonsai-27b" => Some("aifarm-llamacpp-gpu2"),
         "Gemma 4 26B Heretic" => Some(if flow.eq_ignore_ascii_case("vision") {
             "aifarm-vision"
         } else {
@@ -1671,6 +1671,14 @@ mod tests {
             canonical_provider_for_model("vibethinker-3b", "memory_extraction"),
             Some("aifarm-llamacpp-gpu2")
         );
+        assert_eq!(
+            canonical_provider_for_model("ternary-bonsai-27b", "dialog"),
+            Some("aifarm-llamacpp-gpu2")
+        );
+        assert_eq!(
+            canonical_provider_for_model("qwen3.6-27b-moq", "dialog"),
+            Some("aifarm-llamacpp-gpu2")
+        );
         // Gemma is registered under two providers; flow disambiguates.
         assert_eq!(
             canonical_provider_for_model("Gemma 4 26B Heretic", "dialog"),
@@ -1700,6 +1708,7 @@ mod tests {
             ("vram.cloud/qwen3.6-35b-a3b", "memory_extraction"),
             ("vibethinker-3b", "memory_extraction"),
             ("qwen3.6-27b-moq", "dialog"),
+            ("ternary-bonsai-27b", "dialog"),
             ("Gemma 4 26B Heretic", "dialog"),
             ("Gemma 4 26B Heretic", "vision"),
         ] {

@@ -562,12 +562,17 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
 const GPU_BACKFILL_KEY: &str = "llm.routing.gpu_backfilled";
 const DIALOG_QWEN_FALLBACK_KEY: &str = "llm.routing.dialog_qwen_fallback";
 
-/// Provider name for a discovery service: the default dialog service stays on the
-/// existing `aifarm` provider; other services (the GPU2 llama.cpp Qwen multiserver)
-/// get a deterministic `aifarm-<service>` provider so their models are collision-free.
+/// Provider name for a Discovery service. The default dialog service and the
+/// legacy-named shared GPU2 llama.cpp service retain their persisted provider ids;
+/// other services get a deterministic `aifarm-<service>` name.
 fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
+    let service = service.trim();
     if service == config.llm.dialog.discovery_service_name {
         "aifarm".to_owned()
+    } else if service
+        .eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME)
+    {
+        crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME.to_owned()
     } else {
         format!(
             "aifarm-{}",
@@ -597,7 +602,7 @@ fn assignment_input_from_record(
     }
 }
 
-/// Lift the GPU-served Qwen/llama.cpp models that the agentic reasoner and the memory
+/// Lift the GPU-served llama.cpp models that the agentic reasoner and the memory
 /// pipeline actually use into managed DB rows, and repoint those config-only workflows
 /// at them. The initial seed flattened these to the dialog Gemma model; this corrects an
 /// already-seeded database (idempotent via the `gpu_backfilled` flag) so the GPU2 models
@@ -710,13 +715,13 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
     }
 
     mark_app_setting(pool, GPU_BACKFILL_KEY).await?;
-    tracing::info!("backfilled GPU Qwen models and repointed config-only workflows");
+    tracing::info!("backfilled GPU llama.cpp models and repointed config-only workflows");
     Ok(true)
 }
 
-/// Add the GPU2 Qwen reasoner as an ordered dialog fallback. The route can then
+/// Add the GPU2 local reasoner as an ordered dialog fallback. The route can then
 /// use a live local chat/tools model before probing dead external primaries.
-pub async fn backfill_dialog_qwen_fallback(
+pub async fn backfill_dialog_local_reasoner_fallback(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
@@ -724,7 +729,7 @@ pub async fn backfill_dialog_qwen_fallback(
         return Ok(false);
     }
 
-    let reasoner = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    let reasoner = crate::agent_runtime::local_reasoner_named_provider_config(config);
     if reasoner.discovery_service_name.trim().is_empty() || reasoner.model.trim().is_empty() {
         return Ok(false);
     }
@@ -791,8 +796,17 @@ pub async fn backfill_dialog_qwen_fallback(
     .await?;
 
     mark_app_setting(pool, DIALOG_QWEN_FALLBACK_KEY).await?;
-    tracing::info!("backfilled dialog GPU Qwen fallback");
+    tracing::info!("backfilled dialog GPU local-reasoner fallback");
     Ok(true)
+}
+
+/// Legacy Rust API alias; the persisted setting key remains unchanged.
+#[deprecated(note = "use backfill_dialog_local_reasoner_fallback")]
+pub async fn backfill_dialog_qwen_fallback(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    backfill_dialog_local_reasoner_fallback(pool, config).await
 }
 
 const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
@@ -2429,6 +2443,21 @@ mod tests {
     }
 
     #[test]
+    fn gpu_provider_name_preserves_shared_llamacpp_provider_identity() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+
+        assert_eq!(
+            gpu_provider_name("llm-openai-qwen27b-gguf", &config),
+            "aifarm-llamacpp-gpu2"
+        );
+        assert_eq!(gpu_provider_name("llm-openai", &config), "aifarm");
+        assert_eq!(
+            gpu_provider_name("llm-openai-another-model", &config),
+            "aifarm-another-model"
+        );
+    }
+
+    #[test]
     fn derive_protocol_classifies_every_seeded_provider() {
         // (kind, name, has_discovery) -> protocol, over the exact seeded rows.
         let cases = [
@@ -2439,7 +2468,7 @@ mod tests {
             ("chat", "openrouter", false, PROTOCOL_OPENAI_COMPAT),
             ("chat", "nvidia", false, PROTOCOL_OPENAI_COMPAT),
             ("chat", "vmlx", false, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "aifarm-qwen27b-gguf", true, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "aifarm-llamacpp-gpu2", true, PROTOCOL_OPENAI_COMPAT),
             ("vision", "aifarm-vision", true, PROTOCOL_OPENAI_COMPAT),
             ("embedding", "aifarm-embed", true, PROTOCOL_DISCOVERY_JOBS),
             ("image", "aifarm-draw", true, PROTOCOL_DISCOVERY_DRAW),

@@ -50,13 +50,20 @@ const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
 
-/// Default Discovery service the auto-registered `qwen-reasoner` provider targets.
-pub const DEFAULT_QWEN_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
-/// Default model id sent to the qwen llama.cpp router. The router exposes this
-/// model under the `[model.qwen3.6-27b-moq]` section in `llamacpp.ini`; override
-/// via `LLM_PROVIDERS_MODELS`. (Underlying GGUF: Qwen3.6-27B, kaitchup MoQ-4.75 —
-/// higher bits-per-weight than the prior 35B-A3B Q3_K_XL at a comparable file size.)
-pub const DEFAULT_QWEN_MODEL: &str = "qwen3.6-27b-moq";
+/// Stable provider id for the shared GPU2 llama.cpp service.
+pub const LOCAL_REASONER_PROVIDER_NAME: &str = "aifarm-llamacpp-gpu2";
+/// Legacy Discovery service name targeted by the auto-registered `qwen-reasoner`
+/// compatibility key. The service now hosts Ternary Bonsai and VibeThinker.
+pub const DEFAULT_LOCAL_REASONER_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
+/// Canonical model id sent to the shared GPU2 llama.cpp router.
+pub const DEFAULT_BONSAI_MODEL: &str = "ternary-bonsai-27b";
+
+/// Legacy Rust API alias; use [`DEFAULT_LOCAL_REASONER_SERVICE_NAME`].
+#[deprecated(note = "use DEFAULT_LOCAL_REASONER_SERVICE_NAME")]
+pub const DEFAULT_QWEN_SERVICE_NAME: &str = DEFAULT_LOCAL_REASONER_SERVICE_NAME;
+/// Legacy Rust API alias; use [`DEFAULT_BONSAI_MODEL`].
+#[deprecated(note = "use DEFAULT_BONSAI_MODEL")]
+pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_BONSAI_MODEL;
 
 /// System prompt for the song-writing agent.
 pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
@@ -139,11 +146,12 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
         );
     }
 
-    // Auto-register the default qwen reasoner so the search agent works out of the
-    // box; an explicit `LLM_PROVIDERS_*` entry of the same name takes precedence.
+    // Auto-register the local Bonsai reasoner so the search agent works out of the
+    // box. The persisted `qwen-reasoner` key stays stable; an explicit
+    // `LLM_PROVIDERS_*` entry of the same name takes precedence.
     let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
     if let std::collections::hash_map::Entry::Vacant(entry) = by_name.entry(default_reasoner) {
-        let spec = qwen_reasoner_named_provider_config(config);
+        let spec = local_reasoner_named_provider_config(config);
         let client_config = agent_client_config_from_named_provider(config, &spec);
         entry.insert(Arc::new(AgentProviderClient {
             client: AifarmHttpClient::new(client_config),
@@ -176,7 +184,7 @@ pub fn build_routed_agent_provider_registry(
 }
 
 #[must_use]
-pub fn qwen_reasoner_named_provider_config(
+pub fn local_reasoner_named_provider_config(
     config: &AppConfig,
 ) -> openplotva_config::NamedProviderConfig {
     let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
@@ -189,9 +197,9 @@ pub fn qwen_reasoner_named_provider_config(
         .unwrap_or_else(|| openplotva_config::NamedProviderConfig {
             name: openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER.to_owned(),
             kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
-            discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
+            discovery_service_name: DEFAULT_LOCAL_REASONER_SERVICE_NAME.to_owned(),
             discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
-            model: DEFAULT_QWEN_MODEL.to_owned(),
+            model: DEFAULT_BONSAI_MODEL.to_owned(),
             base_url: String::new(),
             url: String::new(),
             api_key: String::new(),
@@ -201,6 +209,15 @@ pub fn qwen_reasoner_named_provider_config(
             temperature: None,
             task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
         })
+}
+
+/// Legacy Rust API alias; use [`local_reasoner_named_provider_config`].
+#[deprecated(note = "use local_reasoner_named_provider_config")]
+#[must_use]
+pub fn qwen_reasoner_named_provider_config(
+    config: &AppConfig,
+) -> openplotva_config::NamedProviderConfig {
+    local_reasoner_named_provider_config(config)
 }
 
 /// `Reasoner` adapter that performs one chat round-trip via the AIFarm client.
@@ -1608,12 +1625,40 @@ mod tests {
     }
 
     #[test]
-    fn registry_auto_registers_qwen_reasoner_by_default() {
+    fn registry_auto_registers_bonsai_under_legacy_reasoner_key() {
         let config =
             openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig::default())
                 .expect("default config");
         let registry = build_agent_provider_registry(&config);
         assert!(registry.contains(CONVERSATIONAL_PROVIDER));
         assert!(registry.contains(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER));
+        let reasoner = registry
+            .get(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER)
+            .expect("local reasoner");
+        assert_eq!(reasoner.model, DEFAULT_BONSAI_MODEL);
+        let spec = local_reasoner_named_provider_config(&config);
+        assert_eq!(
+            spec.discovery_service_name,
+            DEFAULT_LOCAL_REASONER_SERVICE_NAME
+        );
+        assert_eq!(reasoner.include_reasoning, Some(false));
+        assert_eq!(reasoner.enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn explicit_legacy_reasoner_config_still_takes_precedence() {
+        let config = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            llm_provider_names: Some("qwen-reasoner".to_owned()),
+            llm_provider_discovery_service_names: Some("custom-local-llm".to_owned()),
+            llm_provider_models: Some("custom-model".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("explicit config");
+
+        let spec = local_reasoner_named_provider_config(&config);
+
+        assert_eq!(spec.name, "qwen-reasoner");
+        assert_eq!(spec.discovery_service_name, "custom-local-llm");
+        assert_eq!(spec.model, "custom-model");
     }
 }
