@@ -12933,6 +12933,7 @@ async fn start_runtime_workers(
         let reset_handler = Arc::new(reset::ResetCommandUpdateHandler::new(
             Arc::clone(&history_store_for_updates),
             Arc::clone(&dispatcher_queue_for_updates),
+            Arc::new(telegram.clone()),
             bot_identity.username.clone(),
             text_reply_settings_gate,
         ));
