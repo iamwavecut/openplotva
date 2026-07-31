@@ -3,8 +3,8 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
-    Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
-    Text as TelegramText, TextEntity as TelegramTextEntity,
+    Chat as TelegramChat, ChatMember as TelegramChatMember, Message as TelegramMessage,
+    MessageData as TelegramMessageData, Text as TelegramText, TextEntity as TelegramTextEntity,
     TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType,
 };
@@ -23,6 +23,19 @@ const RESET_CONFIRMATION_TEXT: &str = "Все забыто!";
 const RESET_CONFIRMATION_DELETE_AFTER: Duration = Duration::from_secs(60);
 
 pub type ResetHistoryFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+pub type ResetAdminMemberFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<TelegramChatMember, E>> + Send + 'a>>;
+
+pub trait ResetAdminMemberApi {
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ResetAdminMemberFuture<'a, Self::Error>;
+}
 
 pub trait ResetHistoryStore {
     /// Concrete storage error.
@@ -68,6 +81,8 @@ pub enum ResetCommandOutcome {
         history_error: Option<String>,
         confirmation: QueueTextReport,
     },
+    /// A group reset command was addressed to this bot by a non-administrator.
+    Unauthorized,
     ConfirmationError {
         scope: ResetScope,
         history_error: Option<String>,
@@ -87,11 +102,13 @@ pub enum ResetCommandError {
 }
 
 /// Boundaries used by one reset-command update pass.
-#[derive(Clone, Copy, Debug)]
-pub struct ResetCommandPorts<'a, History> {
+#[derive(Clone, Copy)]
+pub struct ResetCommandPorts<'a, History, AdminApi> {
     pub history: &'a History,
     /// Outbound dispatcher queue for the confirmation.
     pub dispatcher_queue: &'a DispatcherQueue,
+    /// Telegram API used to verify group command permissions.
+    pub admin_api: &'a AdminApi,
 }
 
 /// Runtime context for one reset-command update pass.
@@ -104,25 +121,28 @@ pub struct ResetCommandContext<'a> {
 }
 
 #[derive(Clone)]
-pub struct ResetCommandUpdateHandler<History, Next> {
+pub struct ResetCommandUpdateHandler<History, AdminApi, Next> {
     history: Arc<History>,
     dispatcher_queue: Arc<DispatcherQueue>,
+    admin_api: Arc<AdminApi>,
     bot_username: String,
     next_virtual_id: VirtualIdFactory,
     next: Arc<Next>,
 }
 
-impl<History, Next> ResetCommandUpdateHandler<History, Next> {
+impl<History, AdminApi, Next> ResetCommandUpdateHandler<History, AdminApi, Next> {
     /// Build a reset handler around the real downstream update handler.
     pub fn new(
         history: Arc<History>,
         dispatcher_queue: Arc<DispatcherQueue>,
+        admin_api: Arc<AdminApi>,
         bot_username: impl Into<String>,
         next: Arc<Next>,
     ) -> Self {
         Self {
             history,
             dispatcher_queue,
+            admin_api,
             bot_username: bot_username.into(),
             next_virtual_id: monotonic_virtual_id_factory("reset-vmsg"),
             next,
@@ -137,9 +157,10 @@ impl<History, Next> ResetCommandUpdateHandler<History, Next> {
     }
 }
 
-impl<History, Next> UpdateHandler for ResetCommandUpdateHandler<History, Next>
+impl<History, AdminApi, Next> UpdateHandler for ResetCommandUpdateHandler<History, AdminApi, Next>
 where
     History: ResetHistoryStore + Send + Sync,
+    AdminApi: ResetAdminMemberApi + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = ResetCommandError;
@@ -150,6 +171,7 @@ where
                 ResetCommandPorts {
                     history: self.history.as_ref(),
                     dispatcher_queue: self.dispatcher_queue.as_ref(),
+                    admin_api: self.admin_api.as_ref(),
                 },
                 update,
                 ResetCommandContext {
@@ -167,12 +189,13 @@ where
 
 pub async fn handle_reset_command_update_or_else_at<
     History,
+    AdminApi,
     NextId,
     HandleFn,
     HandleFuture,
     HandleError,
 >(
-    ports: ResetCommandPorts<'_, History>,
+    ports: ResetCommandPorts<'_, History, AdminApi>,
     update: TelegramUpdate,
     context: ResetCommandContext<'_>,
     next_virtual_id: NextId,
@@ -180,6 +203,7 @@ pub async fn handle_reset_command_update_or_else_at<
 ) -> Result<ResetCommandOutcome, ResetCommandError>
 where
     History: ResetHistoryStore + Sync,
+    AdminApi: ResetAdminMemberApi + Sync,
     NextId: FnMut() -> String,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -201,6 +225,12 @@ where
                 message: error.to_string(),
             })?;
         return Ok(ResetCommandOutcome::Delegated);
+    }
+
+    if !telegram_chat_is_private(&message.chat)
+        && !is_group_reset_authorized(ports.admin_api, message).await
+    {
+        return Ok(ResetCommandOutcome::Unauthorized);
     }
 
     let scope = reset_scope(message);
@@ -236,7 +266,45 @@ pub fn is_reset_command_for_bot(message: &TelegramMessage, bot_username: &str) -
     if telegram_chat_is_private(&message.chat) {
         return true;
     }
+    if !telegram_chat_is_group(&message.chat) {
+        return false;
+    }
     command.target.as_deref() == Some(bot_username)
+}
+
+async fn is_group_reset_authorized<AdminApi>(api: &AdminApi, message: &TelegramMessage) -> bool
+where
+    AdminApi: ResetAdminMemberApi + Sync,
+{
+    let chat_id = i64::from(message.chat.get_id());
+    if message
+        .sender
+        .get_chat()
+        .is_some_and(|sender_chat| i64::from(sender_chat.get_id()) == chat_id)
+    {
+        return true;
+    }
+
+    let Some(user_id) = message.sender.get_user().map(|user| i64::from(user.id)) else {
+        return false;
+    };
+    if user_id == 0 {
+        return false;
+    }
+
+    match api.get_chat_member(chat_id, user_id).await {
+        Ok(member) => {
+            i64::from(member.get_user().id) == user_id
+                && matches!(
+                    member,
+                    TelegramChatMember::Administrator(_) | TelegramChatMember::Creator(_)
+                )
+        }
+        Err(error) => {
+            tracing::debug!(%error, chat_id, user_id, "failed to verify reset command group administrator");
+            false
+        }
+    }
 }
 
 #[must_use]
@@ -303,6 +371,10 @@ fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Private(_))
 }
 
+fn telegram_chat_is_group(chat: &TelegramChat) -> bool {
+    matches!(chat, TelegramChat::Group(_) | TelegramChat::Supergroup(_))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BotCommandInMessage {
     command: String,
@@ -363,6 +435,23 @@ impl ResetHistoryStore for openplotva_storage::PostgresHistoryStore {
             self.reset_history_at(chat_id, thread_id, reset_at)
                 .await
                 .map(|_| ())
+        })
+    }
+}
+
+impl ResetAdminMemberApi for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ResetAdminMemberFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_get_chat_member_method(
+                chat_id, user_id,
+            ))
+            .await
         })
     }
 }
@@ -514,11 +603,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let history = HistoryStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let admin_api = ResetAdminApiStub::default();
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
                 dispatcher_queue: &queue,
+                admin_api: &admin_api,
             },
             update_from_message(private_reset_message()?)?,
             ResetCommandContext {
@@ -562,11 +653,13 @@ mod tests {
             ..HistoryStub::default()
         };
         let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let admin_api = ResetAdminApiStub::default();
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
                 dispatcher_queue: &queue,
+                admin_api: &admin_api,
             },
             update_from_message(group_reset_message("/reset@PlotvaBot", 16, Some(9))?)?,
             ResetCommandContext {
@@ -596,15 +689,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_reset_accepts_anonymous_admin_message_from_the_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let history = HistoryStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let admin_api = ResetAdminApiStub::default();
+        let outcome = handle_reset_command_update_or_else_at(
+            ResetCommandPorts {
+                history: &history,
+                dispatcher_queue: &queue,
+                admin_api: &admin_api,
+            },
+            update_from_message(anonymous_group_reset_message()?)?,
+            ResetCommandContext {
+                bot_username: "PlotvaBot",
+                now: OffsetDateTime::now_utc(),
+            },
+            fixed_virtual_id("reset-anonymous"),
+            |_| async { Ok::<(), io::Error>(()) },
+        )
+        .await?;
+
+        assert!(matches!(outcome, ResetCommandOutcome::Reset { .. }));
+        assert_eq!(history.resets().len(), 1);
+        assert!(admin_api.calls.lock().expect("admin API calls").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_reset_is_consumed_without_effect_for_regular_members()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let history = HistoryStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let admin_api = ResetAdminApiStub {
+            member: regular_member(5),
+            ..ResetAdminApiStub::default()
+        };
+
+        let outcome = handle_reset_command_update_or_else_at(
+            ResetCommandPorts {
+                history: &history,
+                dispatcher_queue: &queue,
+                admin_api: &admin_api,
+            },
+            update_from_message(group_reset_message("/reset@PlotvaBot", 16, None)?)?,
+            ResetCommandContext {
+                bot_username: "PlotvaBot",
+                now: OffsetDateTime::now_utc(),
+            },
+            fixed_virtual_id("unused"),
+            |_| async { Ok::<(), io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(outcome, ResetCommandOutcome::Unauthorized);
+        assert!(history.resets().is_empty());
+        assert!(queue.snapshot().immediate.is_empty());
+        assert_eq!(
+            admin_api.calls.lock().expect("admin API calls").as_slice(),
+            &[(-42, 5)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reset_update_delegates_non_reset_messages() -> Result<(), Box<dyn std::error::Error>> {
         let history = HistoryStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let admin_api = ResetAdminApiStub::default();
         let delegated = Arc::new(Mutex::new(0usize));
         let delegated_for_handler = Arc::clone(&delegated);
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
                 dispatcher_queue: &queue,
+                admin_api: &admin_api,
             },
             update_from_message(group_reset_message("/reset", 6, None)?)?,
             ResetCommandContext {
@@ -635,10 +796,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let history = Arc::new(HistoryStub::default());
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let admin_api = Arc::new(ResetAdminApiStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = ResetCommandUpdateHandler::new(
             Arc::clone(&history),
             Arc::clone(&queue),
+            Arc::clone(&admin_api),
             "PlotvaBot",
             Arc::clone(&next),
         )
@@ -672,10 +835,12 @@ mod tests {
         let state_store = UpdateStateStoreStub::default();
         let history = Arc::new(HistoryStub::default());
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let admin_api = Arc::new(ResetAdminApiStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = ResetCommandUpdateHandler::new(
             Arc::clone(&history),
             Arc::clone(&queue),
+            Arc::clone(&admin_api),
             "PlotvaBot",
             Arc::clone(&next),
         )
@@ -761,6 +926,67 @@ mod tests {
 
     fn fixed_virtual_id(value: &'static str) -> impl FnMut() -> String {
         move || value.to_owned()
+    }
+
+    fn anonymous_group_reset_message() -> Result<TelegramMessage, serde_json::Error> {
+        sample_message(serde_json::json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": {"id": -42, "type": "supergroup", "title": "Group"},
+            "sender_chat": {"id": -42, "type": "supergroup", "title": "Group"},
+            "text": "/reset@PlotvaBot",
+            "entities": [{"offset": 0, "length": 16, "type": "bot_command"}]
+        }))
+    }
+
+    #[derive(Clone)]
+    struct ResetAdminApiStub {
+        member: TelegramChatMember,
+        error: Option<String>,
+        calls: Arc<Mutex<Vec<(i64, i64)>>>,
+    }
+
+    impl Default for ResetAdminApiStub {
+        fn default() -> Self {
+            Self {
+                member: TelegramChatMember::Administrator(
+                    carapax::types::ChatMemberAdministrator::new(carapax::types::User::new(
+                        5, "Ada", false,
+                    )),
+                ),
+                error: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ResetAdminMemberApi for ResetAdminApiStub {
+        type Error = io::Error;
+
+        fn get_chat_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> ResetAdminMemberFuture<'a, Self::Error> {
+            self.calls
+                .lock()
+                .expect("admin API calls")
+                .push((chat_id, user_id));
+            let member = self.member.clone();
+            let result = self
+                .error
+                .as_ref()
+                .map_or_else(|| Ok(member), |error| Err(io::Error::other(error.clone())));
+            Box::pin(async move { result })
+        }
+    }
+
+    fn regular_member(user_id: i64) -> TelegramChatMember {
+        TelegramChatMember::Member {
+            user: carapax::types::User::new(user_id, "Ada", false),
+            tag: None,
+            until_date: None,
+        }
     }
 
     #[derive(Default)]

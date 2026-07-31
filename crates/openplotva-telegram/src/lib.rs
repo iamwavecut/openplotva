@@ -368,10 +368,6 @@ pub const PRIVATE_COMMANDS: &[CommandSpec] = &[
 
 pub const GROUP_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        command: "reset",
-        description: "Сбросить контекст диалога",
-    },
-    CommandSpec {
         command: HELP_COMMAND,
         description: "Краткая справка о возможностях",
     },
@@ -748,15 +744,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command)
                 .collect::<Vec<_>>(),
-            [
-                "reset",
-                "help",
-                "vip",
-                "song",
-                "donate",
-                "checkin",
-                "delete_drawing"
-            ]
+            ["help", "vip", "song", "donate", "checkin", "delete_drawing"]
         );
         assert_eq!(
             GROUP_ADMIN_COMMANDS
