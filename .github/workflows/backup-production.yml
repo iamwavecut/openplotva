@@ -1,0 +1,74 @@
+name: Production Backup
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: production-backup
+  cancel-in-progress: false
+
+env:
+  GETA_SSH_TARGET: wavecut@geta.moe
+  GETA_DEPLOY_ROOT: /home/wavecut/openplotva
+
+permissions: {}
+
+jobs:
+  backup:
+    name: Back up production state
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Require repository owner for manual runs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.actor }}" != "iamwavecut" || "${{ github.triggering_actor }}" != "iamwavecut" ]]; then
+            echo "Production backup can only be started or re-run manually by iamwavecut" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7 # v5
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          GETA_SSH_PRIVATE_KEY: ${{ secrets.GETA_SSH_PRIVATE_KEY }}
+          GETA_SSH_KNOWN_HOSTS: ${{ secrets.GETA_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$GETA_SSH_PRIVATE_KEY"
+          test -n "$GETA_SSH_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GETA_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$GETA_SSH_PRIVATE_KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+      - name: Upload backup script
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2029
+          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT'"
+          scp deploy/production/backup-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/backup-production.sh"
+          # shellcheck disable=SC2029
+          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/backup-production.sh'"
+
+      - name: Create production backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120 \
+            "$GETA_SSH_TARGET" \
+            "'$GETA_DEPLOY_ROOT/backup-production.sh'"
