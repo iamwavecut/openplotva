@@ -217,6 +217,8 @@ pub const DEFAULT_AGENTIC_SONG_ENABLED: bool = true;
 
 pub const DEFAULT_AGENTIC_IMAGE_ENABLED: bool = true;
 
+/// Persisted compatibility key for the local agent reasoner, currently backed
+/// by Ternary Bonsai on the shared GPU2 llama.cpp service.
 pub const DEFAULT_AGENT_REASONER_PROVIDER: &str = "qwen-reasoner";
 
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
@@ -3936,8 +3938,8 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
-        // The song/image agents point at the qwen reasoner by default; the
-        // qwen provider itself is auto-registered by the app, so the
+        // The song/image agents point at the local reasoner through its stable
+        // compatibility key; the Bonsai-backed provider is auto-registered, so the
         // config-level providers list stays empty.
         assert_eq!(config.llm.agentic.reasoner_provider, "qwen-reasoner");
         assert!(config.llm.providers.is_empty());

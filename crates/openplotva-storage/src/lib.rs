@@ -9736,6 +9736,123 @@ mod tests {
     }
 
     #[test]
+    fn ternary_bonsai_migration_is_a_scoped_in_place_rename() {
+        const UP: &str =
+            include_str!("../../../migrations/178_ternary_bonsai_replace_qwen27b.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/178_ternary_bonsai_replace_qwen27b.down.sql");
+
+        for migration in [UP, DOWN] {
+            assert!(migration.contains("UPDATE provider_models AS model"));
+            assert!(migration.contains("provider.name = 'aifarm-llamacpp-gpu2'"));
+            assert!(
+                migration.contains("provider.discovery_service_name = 'llm-openai-qwen27b-gguf'")
+            );
+            assert!(!migration.contains("INSERT"));
+            assert!(!migration.contains("DELETE"));
+        }
+        assert!(UP.contains("SET model_name = 'ternary-bonsai-27b'"));
+        assert!(UP.contains("model.model_name = 'qwen3.6-27b-moq'"));
+        assert!(DOWN.contains("SET model_name = 'qwen3.6-27b-moq'"));
+        assert!(DOWN.contains("model.model_name = 'ternary-bonsai-27b'"));
+    }
+
+    #[tokio::test]
+    async fn live_ternary_bonsai_migration_preserves_model_and_assignment_ids()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::query(
+            "CREATE TEMP TABLE llm_providers (\
+                id BIGINT PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                discovery_service_name TEXT\
+             ) ON COMMIT DROP",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "CREATE TEMP TABLE provider_models (\
+                id BIGINT PRIMARY KEY, \
+                provider_id BIGINT NOT NULL, \
+                model_name TEXT NOT NULL\
+             ) ON COMMIT DROP",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "CREATE TEMP TABLE workflow_assignments (\
+                id BIGINT PRIMARY KEY, \
+                provider_model_id BIGINT NOT NULL\
+             ) ON COMMIT DROP",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO llm_providers (id, name, discovery_service_name) VALUES \
+             (9, 'aifarm-llamacpp-gpu2', 'llm-openai-qwen27b-gguf')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO provider_models (id, provider_id, model_name) VALUES \
+             (10, 9, 'vibethinker-3b'), \
+             (11, 9, 'qwen3.6-27b-moq')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workflow_assignments (id, provider_model_id) VALUES \
+             (8, 10), (10, 11), (21, 11)",
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(include_str!(
+            "../../../migrations/178_ternary_bonsai_replace_qwen27b.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let models: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, model_name FROM provider_models ORDER BY id")
+                .fetch_all(&mut *transaction)
+                .await?;
+        let assignments: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id, provider_model_id FROM workflow_assignments ORDER BY id")
+                .fetch_all(&mut *transaction)
+                .await?;
+        assert_eq!(
+            models,
+            vec![
+                (10, "vibethinker-3b".to_owned()),
+                (11, "ternary-bonsai-27b".to_owned())
+            ]
+        );
+        assert_eq!(assignments, vec![(8, 10), (10, 11), (21, 11)]);
+
+        sqlx::query(include_str!(
+            "../../../migrations/178_ternary_bonsai_replace_qwen27b.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        let reverted: (i64, String) =
+            sqlx::query_as("SELECT id, model_name FROM provider_models WHERE id = 11")
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert_eq!(reverted, (11, "qwen3.6-27b-moq".to_owned()));
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[test]
     fn runtime_api_token_sql_uses_stable_query_shapes() {
         assert_eq!(
             super::SQL_CREATE_RUNTIME_API_TOKEN,

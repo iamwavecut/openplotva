@@ -32,7 +32,8 @@ pub const MUSIC_VIP_QUEUE_NAME: &str = "music-vip";
 pub const ASR_GPU1_QUEUE_NAME: &str = "asr-gpu1";
 pub const DIALOG_AIFARM_QUEUE_NAME: &str = "dialog-aifarm";
 pub const MEMORY_CONSOLIDATION_QUEUE_NAME: &str = "memory-consolidation";
-/// Dedicated queue for agent-loop runs routed to the single-slot Qwen reasoner.
+/// Dedicated queue for agent-loop runs routed to the single-slot local reasoner.
+/// The persisted queue name remains stable across model replacements.
 pub const AGENT_QWEN_QUEUE_NAME: &str = "agent-qwen";
 
 pub const LLM_JOB_RETRY_STAGE: &str = "llm_job_retry";

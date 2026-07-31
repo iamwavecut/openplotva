@@ -9944,16 +9944,17 @@ async fn start_runtime_workers(
             "backfill_gpu_models",
             &error.to_string(),
         ));
-        tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
+        tracing::warn!(%error, "failed to backfill GPU llama.cpp models into routing tables");
     }
     if let Err(error) =
-        model_routing::backfill_dialog_qwen_fallback(&service_clients.postgres, config).await
+        model_routing::backfill_dialog_local_reasoner_fallback(&service_clients.postgres, config)
+            .await
     {
         routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
             "backfill_dialog_qwen_fallback",
             &error.to_string(),
         ));
-        tracing::warn!(%error, "failed to backfill dialog GPU Qwen fallback");
+        tracing::warn!(%error, "failed to backfill dialog GPU local-reasoner fallback");
     }
     if let Err(error) =
         model_routing::backfill_genkit_flash_model(&service_clients.postgres, config).await
