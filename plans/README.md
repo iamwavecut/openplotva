@@ -1,8 +1,8 @@
 # Implementation Plans
 
-## Whole-code simplification audit — 2026-08-02
+## Whole-repository simplification audit — 2026-08-02
 
-Audited at `ed2d8c1`: 473/473 tracked first-party code/config files, 311,489 lines. Baseline gates were green: formatting, workspace Clippy with warnings denied, and 2,036 workspace tests. These plans are proposals only; no production code was changed.
+Audited at `395bc46`: 523/523 tracked files, 320,241 lines, including source, configuration, documentation, plans, repository skills, and served assets. The original 473-file code/config audit and its green baseline (formatting, workspace Clippy with warnings denied, and 2,036 workspace tests) remain valid. The literal-scope pass additionally validated Markdown links, web asset hashes, runtime GraphQL tests, documentation drift, and the dead Taskman admin surface. These plans are proposals only; no production code was changed.
 
 | Plan | Title | Priority | Expected primary gain | Risk | Status |
 |---|---|---:|---|---:|---|
@@ -13,8 +13,10 @@ Audited at `ed2d8c1`: 473/473 tracked first-party code/config files, 311,489 lin
 | 016 | Named worker supervisor and one shutdown deadline | P0 | bounded deploy shutdown and safer queue persistence | HIGH | TODO, staged |
 | 017 | One redacted LLM trace without request clones | P0 | lower multimodal memory and privacy risk | MED-HIGH | TODO |
 | 018 | Canonical Telegram outbound command | P1 | 600–900 LOC potential | HIGH | TODO, staged |
+| 019 | Retire completed execution transcripts | P0 | at least 3,500 documentation lines | LOW-MED | TODO after shipped-state proof |
+| 020 | Retire broken duplicate Taskman admin facade | P1 | at least 700 net LOC and less operator/security surface | MED | TODO after live no-consumer proof |
 
-Recommended sequence: 012 → 013 after live proof → 017 → 014 → 016 → 015 → 018. Plans 015, 016, and 018 begin with characterization and must not combine in one PR.
+Recommended sequence: 012 → 019 → 013 after live proof → 020 after live proof → 017 → 014 → 016 → 015 → 018. Plans 015, 016, and 018 begin with characterization and must not combine in one PR.
 
 Validated secondary candidates, to schedule after the seven plans: bounded Redis admin cursors; owned task-WAL append plus DB bulk upsert; cached history token accounting; shared `BoundedRing<T>`; one routed-walker factory; command-target policy correction; trim optimizer/song prompts only after multilingual quality evaluation.
 
