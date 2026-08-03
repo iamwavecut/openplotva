@@ -52,6 +52,7 @@ pub struct ChatClientFactory {
     static_clients: HashMap<String, DialogProviderHandle>,
     default_client: DialogProviderHandle,
     cache: std::sync::Mutex<HashMap<i64, (u64, DialogProviderHandle)>>,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
 }
 
 impl ChatClientFactory {
@@ -61,6 +62,7 @@ impl ChatClientFactory {
         template: AifarmDialogConfig,
         static_clients: HashMap<String, DialogProviderHandle>,
         default_client: DialogProviderHandle,
+        prompt_store: Arc<openplotva_prompts::PromptStore>,
     ) -> Self {
         Self {
             handle,
@@ -68,6 +70,7 @@ impl ChatClientFactory {
             static_clients,
             default_client,
             cache: std::sync::Mutex::new(HashMap::new()),
+            prompt_store,
         }
     }
 
@@ -164,7 +167,9 @@ impl ChatClientFactory {
                 ));
             }
         }
-        Ok(Arc::new(AifarmDialogProvider::new(cfg)))
+        let provider =
+            AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(&self.prompt_store));
+        Ok(Arc::new(provider))
     }
 }
 
@@ -370,13 +375,18 @@ pub fn router_dialog_provider(
     pools: Arc<PoolRegistry>,
     genkit_fallback: Option<DialogProviderHandle>,
     routing_events: Option<crate::runtime_routing::RoutingEventReporter>,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
 ) -> DialogProviderHandle {
     // Env pool secondaries are first-class DB models routed through their own
     // `vram-cloud` client below, so admin weights control them without a hidden pool.
     let aifarm_cfg = aifarm_dialog_config_from_app_config(config);
-    let aifarm: DialogProviderHandle = Arc::new(AifarmDialogProvider::new(aifarm_cfg.clone()));
+    let aifarm =
+        AifarmDialogProvider::new(aifarm_cfg.clone()).with_prompt_store(Arc::clone(&prompt_store));
+    let aifarm: DialogProviderHandle = Arc::new(aifarm);
 
-    let genkit = genkit_fallback.or_else(|| genkit_dialog_provider_from_app_config(config));
+    let genkit = genkit_fallback.or_else(|| {
+        genkit_dialog_provider_from_app_config_with_prompt_store(config, Arc::clone(&prompt_store))
+    });
 
     let mut clients: HashMap<String, DialogProviderHandle> = HashMap::new();
     clients.insert(PROVIDER_AIFARM.to_owned(), Arc::clone(&aifarm));
@@ -384,10 +394,14 @@ pub fn router_dialog_provider(
         clients.insert(PROVIDER_GENKIT.to_owned(), Arc::clone(&genkit));
         clients.insert("gemini".to_owned(), genkit);
     }
-    if let Some(vram_cloud) = vram_cloud_dialog_provider(config, Arc::clone(&toolbox)) {
+    if let Some(vram_cloud) =
+        vram_cloud_dialog_provider(config, Arc::clone(&toolbox), &prompt_store)
+    {
         clients.insert(VRAM_CLOUD_PROVIDER_NAME.to_owned(), vram_cloud);
     }
-    if let Some(local_reasoner) = local_reasoner_dialog_provider(config, Arc::clone(&toolbox)) {
+    if let Some(local_reasoner) =
+        local_reasoner_dialog_provider(config, Arc::clone(&toolbox), &prompt_store)
+    {
         clients.insert(local_reasoner.provider_name().to_owned(), local_reasoner);
     }
 
@@ -396,6 +410,7 @@ pub fn router_dialog_provider(
         aifarm_cfg,
         clients,
         aifarm,
+        prompt_store,
     ));
     let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory);
     let provider = match routing_events {
@@ -414,9 +429,11 @@ pub const VRAM_CLOUD_PROVIDER_NAME: &str = "vram-cloud";
 fn vram_cloud_dialog_provider(
     config: &AppConfig,
     _toolbox: Arc<dyn DialogToolbox>,
+    prompt_store: &Arc<openplotva_prompts::PromptStore>,
 ) -> Option<DialogProviderHandle> {
     let cfg = vram_cloud_dialog_config(config)?;
-    Some(Arc::new(AifarmDialogProvider::new(cfg)))
+    let provider = AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+    Some(Arc::new(provider))
 }
 
 fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
@@ -438,12 +455,14 @@ fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
 fn local_reasoner_dialog_provider(
     config: &AppConfig,
     _toolbox: Arc<dyn DialogToolbox>,
+    prompt_store: &Arc<openplotva_prompts::PromptStore>,
 ) -> Option<DialogProviderHandle> {
     let cfg = local_reasoner_dialog_config_from_app_config(config);
     if cfg.provider_name.eq_ignore_ascii_case(PROVIDER_AIFARM) {
         return None;
     }
-    Some(Arc::new(AifarmDialogProvider::new(cfg)))
+    let provider = AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+    Some(Arc::new(provider))
 }
 
 fn local_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogConfig {
@@ -512,18 +531,31 @@ pub fn dialog_provider_from_app_config(
 }
 
 pub fn genkit_dialog_provider_from_app_config(config: &AppConfig) -> Option<DialogProviderHandle> {
-    genkit_dialog_provider_result_from_app_config(config).ok()
+    genkit_dialog_provider_result_from_app_config(config, None).ok()
+}
+
+pub fn genkit_dialog_provider_from_app_config_with_prompt_store(
+    config: &AppConfig,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
+) -> Option<DialogProviderHandle> {
+    genkit_dialog_provider_result_from_app_config(config, Some(prompt_store)).ok()
 }
 
 fn genkit_dialog_provider_result_from_app_config(
     config: &AppConfig,
+    prompt_store: Option<Arc<openplotva_prompts::PromptStore>>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     let api_key = resolve_google_ai_key(&config.google_ai);
     if api_key.trim().is_empty() {
         return Err(DialogProviderBuildError::GenkitGoogleAiKeyRequired);
     }
     if let Some(cfg) = genkit_openai_compatible_dialog_config_result_from_app_config(config)? {
-        return Ok(Arc::new(AifarmDialogProvider::new(cfg)));
+        let provider = AifarmDialogProvider::new(cfg);
+        let provider = match prompt_store {
+            Some(prompts) => provider.with_prompt_store(prompts),
+            None => provider,
+        };
+        return Ok(Arc::new(provider));
     }
     let model = genkit_dialog_model_from_app_config(config);
     let provider = GeminiDialogProvider::new(GeminiDialogConfig {
@@ -539,6 +571,10 @@ fn genkit_dialog_provider_result_from_app_config(
         cache: GeminiExplicitCacheConfig::chat_core_multi_turn(),
         ..GeminiDialogConfig::default()
     });
+    let provider = match prompt_store {
+        Some(prompts) => provider.with_prompt_store(prompts),
+        None => provider,
+    };
     Ok(Arc::new(provider))
 }
 
@@ -608,7 +644,7 @@ fn primary_dialog_provider_from_app_config(
         PROVIDER_AIFARM => Ok(Arc::new(aifarm_dialog_provider_from_app_config(config))),
         PROVIDER_NVIDIA => Ok(Arc::new(nvidia_dialog_provider_from_app_config(config))),
         PROVIDER_VMLX => Ok(Arc::new(vmlx_dialog_provider_from_app_config(config))),
-        PROVIDER_GENKIT => genkit_dialog_provider_result_from_app_config(config),
+        PROVIDER_GENKIT => genkit_dialog_provider_result_from_app_config(config, None),
         provider => Err(DialogProviderBuildError::Unsupported {
             provider: provider.to_owned(),
         }),
@@ -711,6 +747,25 @@ mod tests {
     struct EmptyToolbox;
 
     impl DialogToolbox for EmptyToolbox {}
+
+    #[test]
+    fn chat_client_factory_keeps_application_prompt_store() {
+        let prompts = Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store"));
+        let default_provider: DialogProviderHandle = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Ok(DialogOutput::default())],
+        ));
+
+        let factory = ChatClientFactory::new(
+            RouterHandle::new(openplotva_llm::router::RoutingTable::default()),
+            AifarmDialogConfig::default(),
+            HashMap::new(),
+            default_provider,
+            Arc::clone(&prompts),
+        );
+
+        assert!(Arc::ptr_eq(&factory.prompt_store, &prompts));
+    }
 
     #[test]
     fn configured_dialog_provider_name_matches_go_empty_to_genkit_fallback() {
@@ -1403,6 +1458,7 @@ mod tests {
             AifarmDialogConfig::default(),
             clients,
             default_provider,
+            Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store")),
         ))
     }
 

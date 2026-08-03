@@ -47,7 +47,7 @@ use crate::{
         TelegramActivityAction, TelegramActivityEffects, TelegramActivityReport,
         TelegramActivityRuntimeEffects,
     },
-    updates::{UpdateHandler, UpdateHandlerFuture},
+    updates::UpdateHandler,
     virtual_messages::{
         QueueStickerRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
         queue_sticker_message, queue_text_message_parts,
@@ -1432,28 +1432,26 @@ where
 {
     type Error = DialogMessageUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let route = handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
-                (
-                    self.scheduler.as_ref(),
-                    self.image_scheduler.as_deref(),
-                    self.song_scheduler.as_deref(),
-                    self.direct_draw_api_effects.as_deref(),
-                ),
-                self.settings.as_ref(),
-                self.effects.as_ref(),
-                self.rng.as_ref(),
-                &self.config,
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await?;
-            if let Some(counters) = &self.gate_counters {
-                counters.record_route(&route);
-            }
-            Ok(())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        let route = handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
+            (
+                self.scheduler.as_ref(),
+                self.image_scheduler.as_deref(),
+                self.song_scheduler.as_deref(),
+                self.direct_draw_api_effects.as_deref(),
+            ),
+            self.settings.as_ref(),
+            self.effects.as_ref(),
+            self.rng.as_ref(),
+            &self.config,
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await?;
+        if let Some(counters) = &self.gate_counters {
+            counters.record_route(&route);
+        }
+        Ok(())
     }
 }
 
@@ -4969,6 +4967,7 @@ mod tests {
             vec![
                 "file:audio-unique".to_owned(),
                 "file:audio-unique".to_owned(),
+                "file:video-unique".to_owned(),
                 "file:sticker-unique".to_owned(),
             ]
         );
@@ -5060,6 +5059,7 @@ mod tests {
             vec![
                 "chat:-100:supergroup:Group:".to_owned(),
                 "user:99:Ada:ada_l".to_owned(),
+                "file:captioned-video-1".to_owned(),
             ]
         );
         assert_eq!(
@@ -5326,7 +5326,7 @@ mod tests {
                 thread_id: None,
                 prompt: "neon cat".to_owned(),
                 caption_text: "neon cat".to_owned(),
-                prompt_variants: Vec::new(),
+                prompt_variants: vec!["neon cat".to_owned()],
                 is_nsfw: false,
                 negative_prompt: String::new(),
                 aspect_ratio: String::new(),
@@ -7669,7 +7669,11 @@ mod tests {
         );
         assert_eq!(
             *lock(&second_route),
-            Some(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger)
+            Some(DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            })
         );
 
         let captures = image_scheduler.capture_calls();
@@ -7687,7 +7691,7 @@ mod tests {
         assert_eq!(calls[0].prompt, "contrast");
         assert_eq!(calls[0].edit_media_group_id, "album-1");
         assert_eq!(calls[0].attachments[0].file_unique_id, "photo-1");
-        assert!(scheduler.calls().is_empty());
+        assert_eq!(scheduler.calls(), vec![String::new()]);
         assert!(effects.sent_texts().is_empty());
 
         let state_calls = state_store.calls();

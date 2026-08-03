@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
@@ -28,8 +27,8 @@ pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const DEFAULT_MEMORY_REDACTION_SERVICE_NAME: &str = "privacy-filter";
 pub const DEFAULT_MEMORY_REDACTION_ENDPOINT_NAME: &str = "redact";
 pub const EXTRACTION_PROMPT_OVERHEAD_TOKENS: i32 = 256;
+pub const MEMORY_TOKEN_ESTIMATOR_SOURCE: &str = "heuristic";
 pub const MAX_FACT_TEXT_LEN: usize = 700;
-pub const DEFAULT_TOKEN_ESTIMATOR_FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(30);
 pub const DEFAULT_MEMORY_REDACTION_TIMEOUT: StdDuration = StdDuration::from_secs(35);
 pub const DEFAULT_MEMORY_REDACTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const DEFAULT_MEMORY_REDACTION_CAPACITY_WAIT: StdDuration = StdDuration::from_secs(30);
@@ -944,7 +943,7 @@ impl Default for RunAnalytics {
             failed_count: 0,
             completed_count: 0,
             processing_count: 0,
-            token_estimator: String::new(),
+            token_estimator: MEMORY_TOKEN_ESTIMATOR_SOURCE.to_owned(),
             max_input_tokens: 0,
             max_messages_per_run: 0,
             latest_completed_at: None,
@@ -1158,17 +1157,6 @@ pub enum DecodeExtractionError {
     /// Response did not contain a decodable object.
     #[error("decode memory extractor response")]
     Decode,
-}
-
-/// Memory token-estimation error.
-#[derive(Debug, Error)]
-pub enum TokenEstimatorError {
-    /// Request failed.
-    #[error("estimate tokens: {0}")]
-    Request(reqwest::Error),
-    /// Remote returned an unusable token count.
-    #[error("token estimator returned {0} tokens")]
-    InvalidTokenCount(i32),
 }
 
 /// Memory redaction transport error.
@@ -1809,230 +1797,6 @@ pub fn estimate_memory_tokens(value: &str) -> i32 {
         0
     } else {
         (runes / 4).max(1) as i32
-    }
-}
-
-#[must_use]
-pub fn approximate_token_count(text: &str) -> i32 {
-    let text = text.trim();
-    if text.is_empty() {
-        return 0;
-    }
-    let byte_count = text.len();
-    let rune_count = text.chars().count();
-    let mut estimate = byte_count.div_ceil(3);
-    if rune_count > 0 {
-        estimate = estimate.max(rune_count.div_ceil(2));
-    }
-    estimate.max(1) as i32
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeuristicTokenEstimator {
-    source: String,
-}
-
-impl HeuristicTokenEstimator {
-    #[must_use]
-    pub fn new(source: impl Into<String>) -> Self {
-        let source = source.into();
-        let source = source.trim();
-        Self {
-            source: if source.is_empty() {
-                "heuristic".to_owned()
-            } else {
-                source.to_owned()
-            },
-        }
-    }
-
-    #[must_use]
-    pub fn estimate_text(&self, text: &str) -> i32 {
-        approximate_token_count(text)
-    }
-
-    #[must_use]
-    pub fn estimate_extraction_input(
-        &self,
-        input: &ExtractInput,
-        extraction_system_prompt: &str,
-    ) -> i32 {
-        estimate_extraction_input_with(input, extraction_system_prompt, |text| {
-            self.estimate_text(text)
-        })
-    }
-
-    #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-}
-
-impl Default for HeuristicTokenEstimator {
-    fn default() -> Self {
-        Self::new("heuristic")
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct HttpTokenEstimatorConfig {
-    /// Base URL for the token-estimator service.
-    pub base_url: String,
-    /// Tokenizer model.
-    pub model: String,
-    /// HTTP timeout.
-    pub timeout: StdDuration,
-    /// Remote-failure cooldown.
-    pub failure_cooldown: StdDuration,
-    /// Fallback source label.
-    pub fallback_source: String,
-}
-
-impl Default for HttpTokenEstimatorConfig {
-    fn default() -> Self {
-        Self {
-            base_url: String::new(),
-            model: String::new(),
-            timeout: StdDuration::from_secs(2),
-            failure_cooldown: DEFAULT_TOKEN_ESTIMATOR_FAILURE_COOLDOWN,
-            fallback_source: "heuristic-fallback".to_owned(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TokenEstimateRequest {
-    /// Text to estimate.
-    pub text: String,
-    /// Model name.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model: String,
-    /// Add special tokens.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub add_special_tokens: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TokenEstimateResponse {
-    /// Token count.
-    pub tokens: i32,
-    /// Model name.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model: String,
-}
-
-#[derive(Debug)]
-pub struct HttpTokenEstimator {
-    endpoint: String,
-    model: String,
-    client: reqwest::Client,
-    fallback: HeuristicTokenEstimator,
-    failure_cooldown: StdDuration,
-    suppress_remote_until: Mutex<Option<Instant>>,
-}
-
-impl HttpTokenEstimator {
-    /// Build an HTTP estimator, or return `None` when the base URL is blank.
-    pub fn new(cfg: HttpTokenEstimatorConfig) -> Result<Option<Self>, reqwest::Error> {
-        let base_url = cfg.base_url.trim().trim_end_matches('/');
-        if base_url.is_empty() {
-            return Ok(None);
-        }
-        let timeout = if cfg.timeout.is_zero() {
-            StdDuration::from_secs(2)
-        } else {
-            cfg.timeout
-        };
-        let failure_cooldown = if cfg.failure_cooldown.is_zero() {
-            DEFAULT_TOKEN_ESTIMATOR_FAILURE_COOLDOWN
-        } else {
-            cfg.failure_cooldown
-        };
-        let client = reqwest::Client::builder().timeout(timeout).build()?;
-        Ok(Some(Self {
-            endpoint: format!("{base_url}/estimate"),
-            model: cfg.model.trim().to_owned(),
-            client,
-            fallback: HeuristicTokenEstimator::new(cfg.fallback_source),
-            failure_cooldown,
-            suppress_remote_until: Mutex::new(None),
-        }))
-    }
-
-    pub async fn estimate_text(&self, text: &str) -> i32 {
-        if text.trim().is_empty() {
-            return 0;
-        }
-        match self.estimate_remote(text).await {
-            Ok(Some(tokens)) => tokens,
-            Ok(None) | Err(_) => self.fallback.estimate_text(text),
-        }
-    }
-
-    pub async fn estimate_extraction_input(
-        &self,
-        input: &ExtractInput,
-        extraction_system_prompt: &str,
-    ) -> i32 {
-        let payload = match serde_json::to_string_pretty(input) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return self
-                    .fallback
-                    .estimate_extraction_input(input, extraction_system_prompt);
-            }
-        };
-        self.estimate_text(extraction_system_prompt).await
-            + self.estimate_text(&payload).await
-            + EXTRACTION_PROMPT_OVERHEAD_TOKENS
-    }
-
-    #[must_use]
-    pub fn source(&self) -> String {
-        format!("http-token-estimator:{}", self.endpoint)
-    }
-
-    async fn estimate_remote(&self, text: &str) -> Result<Option<i32>, TokenEstimatorError> {
-        if self.remote_suppressed() {
-            return Ok(None);
-        }
-        let req = TokenEstimateRequest {
-            text: text.to_owned(),
-            model: self.model.clone(),
-            add_special_tokens: false,
-        };
-        let result = self
-            .client
-            .post(&self.endpoint)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&req)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-            .map_err(TokenEstimatorError::Request)?;
-        let out = result
-            .json::<TokenEstimateResponse>()
-            .await
-            .map_err(TokenEstimatorError::Request)?;
-        if out.tokens <= 0 {
-            self.suppress_remote();
-            return Err(TokenEstimatorError::InvalidTokenCount(out.tokens));
-        }
-        Ok(Some(out.tokens))
-    }
-
-    fn remote_suppressed(&self) -> bool {
-        self.suppress_remote_until
-            .lock()
-            .map(|deadline| deadline.is_some_and(|deadline| Instant::now() < deadline))
-            .unwrap_or(false)
-    }
-
-    fn suppress_remote(&self) {
-        if let Ok(mut deadline) = self.suppress_remote_until.lock() {
-            *deadline = Some(Instant::now() + self.failure_cooldown);
-        }
     }
 }
 
@@ -4190,13 +3954,13 @@ mod tests {
     }
 
     #[test]
-    fn token_estimators_match_go_fallback_math_and_shapes() {
-        assert_eq!(approximate_token_count(""), 0);
-        assert_eq!(approximate_token_count("abc"), 2);
-        assert_eq!(approximate_token_count("abcdef"), 3);
-        assert_eq!(approximate_token_count("привет"), 4);
+    fn active_token_estimator_matches_go_fallback_math_and_shape() {
+        assert_eq!(MEMORY_TOKEN_ESTIMATOR_SOURCE, "heuristic");
+        assert_eq!(estimate_memory_tokens(""), 0);
+        assert_eq!(estimate_memory_tokens("abc"), 1);
+        assert_eq!(estimate_memory_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_memory_tokens("привет"), 1);
 
-        let estimator = HeuristicTokenEstimator::new("");
         let input = ExtractInput {
             run: Run {
                 id: 1,
@@ -4206,23 +3970,13 @@ mod tests {
             ..ExtractInput::default()
         };
         let payload = serde_json::to_string_pretty(&input).expect("payload");
-        let expected = approximate_token_count("system prompt")
-            + approximate_token_count(&payload)
+        let expected = estimate_memory_tokens("system prompt")
+            + estimate_memory_tokens(&payload)
             + EXTRACTION_PROMPT_OVERHEAD_TOKENS;
 
-        assert_eq!(estimator.source(), "heuristic");
         assert_eq!(
-            estimator.estimate_extraction_input(&input, "system prompt"),
+            estimate_extraction_input_with(&input, "system prompt", estimate_memory_tokens),
             expected
-        );
-        assert_eq!(
-            serde_json::to_value(TokenEstimateRequest {
-                text: "abc".to_owned(),
-                model: "tok".to_owned(),
-                add_special_tokens: false,
-            })
-            .expect("json"),
-            serde_json::json!({"text": "abc", "model": "tok"})
         );
     }
 

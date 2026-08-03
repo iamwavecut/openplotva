@@ -25,7 +25,6 @@ services:
       UPDATE_PROJECTION_FLUSH_INTERVAL_MS: ${UPDATE_PROJECTION_FLUSH_INTERVAL_MS:-10000}
       UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS: ${UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS:-10000}
       UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS: ${UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS:-1000000}
-      MEMORY_TOKEN_ESTIMATOR_URL: http://token-estimator:12600
       RUNTIME_API_ENABLED: "true"
       RUNTIME_API_HOST: 0.0.0.0
       RUNTIME_API_PORT: 9091
@@ -46,8 +45,6 @@ services:
       dragonfly:
         condition: service_healthy
       redis-ingress:
-        condition: service_healthy
-      token-estimator:
         condition: service_healthy
     networks:
       - plotva-net
@@ -159,31 +156,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  token-estimator:
-    build:
-      context: ./tools/token-estimator
-    env_file:
-      - .env.production
-    environment:
-      TOKEN_ESTIMATOR_MODEL: google/gemma-4-26B-A4B-it
-      TOKEN_ESTIMATOR_MAX_TEXT_CHARS: 1000000
-    volumes:
-      - token-estimator-cache:/models
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12600/health', timeout=5).read()"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    restart: unless-stopped
-    networks:
-      - plotva-net
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 networks:
   plotva-net:
     driver: bridge
@@ -193,4 +165,3 @@ volumes:
   postgres-data:
   dragonfly-data:
   redis-ingress-data:
-  token-estimator-cache:

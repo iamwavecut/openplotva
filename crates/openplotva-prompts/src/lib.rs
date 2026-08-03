@@ -29,13 +29,15 @@ pub enum PromptError {
         source: io::Error,
     },
     /// Template registration failed.
-    #[error("register prompt {name:?}: {source}")]
+    #[error("register prompt {name:?} from {path:?}: {source}")]
     Register {
         /// Template name.
         name: String,
+        /// Source prompt path.
+        path: PathBuf,
         /// Source error.
         #[source]
-        source: handlebars::TemplateError,
+        source: Box<handlebars::TemplateError>,
     },
     /// Data conversion failed.
     #[error("convert prompt data {name:?}: {source}")]
@@ -68,6 +70,77 @@ pub struct PromptMessage {
 
 /// Leading dotprompt YAML front matter as string key/value pairs.
 pub type PromptMetadata = BTreeMap<String, String>;
+
+/// Immutable, fully compiled prompt tree.
+///
+/// Build one store during application startup and share it between prompt consumers.
+/// Prompt files are intentionally reloaded only on process restart.
+pub struct PromptStore {
+    root: PathBuf,
+    registry: Handlebars<'static>,
+}
+
+impl std::fmt::Debug for PromptStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PromptStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PromptStore {
+    /// Compile the configured prompt tree.
+    pub fn load() -> Result<Self, PromptError> {
+        Self::from_root(prompt_root())
+    }
+
+    /// Compile a prompt tree rooted at an explicit path.
+    pub fn from_root(root: impl AsRef<Path>) -> Result<Self, PromptError> {
+        let root = root.as_ref().to_path_buf();
+        let mut registry = registry_with_role(RoleRenderMode::Marker);
+        register_prompt_tree(&mut registry, &root)?;
+        Ok(Self { root, registry })
+    }
+
+    /// Root whose templates were compiled into this store.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Render a prompt by name with JSON-like data.
+    pub fn render<T>(&self, name: &str, data: &T) -> Result<String, PromptError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let name = prompt_name(name);
+        let data = prompt_data(&name, data)?;
+        let rendered = self
+            .registry
+            .render(&name, &data)
+            .map_err(|source| PromptError::Render { name, source })?;
+        Ok(render_text_parts(&rendered))
+    }
+
+    /// Render a dotprompt-like prompt into role-scoped messages.
+    pub fn render_messages<T>(
+        &self,
+        name: &str,
+        data: &T,
+    ) -> Result<Vec<PromptMessage>, PromptError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let name = prompt_name(name);
+        let data = prompt_data(&name, data)?;
+        let rendered = self
+            .registry
+            .render(&name, &data)
+            .map_err(|source| PromptError::Render { name, source })?;
+        Ok(parse_role_messages(&rendered))
+    }
+}
 
 const ROLE_MARKER_PREFIX: &str = "@@OPENPLOTVA_ROLE:";
 const ROLE_MARKER_SUFFIX: &str = "@@";
@@ -121,18 +194,7 @@ pub fn render<T>(name: &str, data: &T) -> Result<String, PromptError>
 where
     T: Serialize + ?Sized,
 {
-    let prompt_root = prompt_root();
-    let mut registry = registry_with_role(RoleRenderMode::Marker);
-    register_prompt_tree(&mut registry, &prompt_root)?;
-    let name = prompt_name(name);
-    let data = serde_json::to_value(data).map_err(|source| PromptError::Data {
-        name: name.clone(),
-        source,
-    })?;
-    let rendered = registry
-        .render(&name, &data)
-        .map_err(|source| PromptError::Render { name, source })?;
-    Ok(render_text_parts(&rendered))
+    PromptStore::load()?.render(name, data)
 }
 
 /// Render a dotprompt-like prompt into role-scoped messages.
@@ -140,18 +202,17 @@ pub fn render_messages<T>(name: &str, data: &T) -> Result<Vec<PromptMessage>, Pr
 where
     T: Serialize + ?Sized,
 {
-    let prompt_root = prompt_root();
-    let mut registry = registry_with_role(RoleRenderMode::Marker);
-    register_prompt_tree(&mut registry, &prompt_root)?;
-    let name = prompt_name(name);
-    let data = serde_json::to_value(data).map_err(|source| PromptError::Data {
-        name: name.clone(),
+    PromptStore::load()?.render_messages(name, data)
+}
+
+fn prompt_data<T>(name: &str, data: &T) -> Result<Value, PromptError>
+where
+    T: Serialize + ?Sized,
+{
+    serde_json::to_value(data).map_err(|source| PromptError::Data {
+        name: name.to_owned(),
         source,
-    })?;
-    let rendered = registry
-        .render(&name, &data)
-        .map_err(|source| PromptError::Render { name, source })?;
-    Ok(parse_role_messages(&rendered))
+    })
 }
 
 fn register_prompt_tree(
@@ -171,14 +232,16 @@ fn register_prompt_tree(
             .register_template_string(&name, source.clone())
             .map_err(|source| PromptError::Register {
                 name: name.clone(),
-                source,
+                path: path.clone(),
+                source: Box::new(source),
             })?;
         if let Some(partial) = partial_name(path) {
             registry
                 .register_template_string(&partial, source)
                 .map_err(|source| PromptError::Register {
                     name: partial,
-                    source,
+                    path: path.clone(),
+                    source: Box::new(source),
                 })?;
         }
     }
@@ -459,9 +522,79 @@ fn push_prompt_message(messages: &mut Vec<PromptMessage>, role: &str, content: &
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use super::{load_registry, prompt_metadata, prompt_root, read, render, render_messages};
+    use super::{
+        PromptError, PromptMessage, PromptStore, RoleRenderMode, load_registry,
+        parse_role_messages, prompt_entries, prompt_entry_name, prompt_metadata, prompt_name,
+        prompt_root, read, register_prompt_tree, registry_with_role, render, render_messages,
+        render_text_parts,
+    };
+
+    struct TestPromptRoot(PathBuf);
+
+    impl TestPromptRoot {
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("openplotva-prompts-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&root)?;
+            Ok(Self(root))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, name: &str, source: &str) -> Result<PathBuf, std::io::Error> {
+            let path = self.0.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, source)?;
+            Ok(path)
+        }
+    }
+
+    impl Drop for TestPromptRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn legacy_render(
+        root: &Path,
+        name: &str,
+        data: &serde_json::Value,
+    ) -> Result<String, PromptError> {
+        let mut registry = registry_with_role(RoleRenderMode::Marker);
+        register_prompt_tree(&mut registry, root)?;
+        let name = prompt_name(name);
+        let rendered = registry
+            .render(&name, data)
+            .map_err(|source| PromptError::Render { name, source })?;
+        Ok(render_text_parts(&rendered))
+    }
+
+    fn legacy_render_messages(
+        root: &Path,
+        name: &str,
+        data: &serde_json::Value,
+    ) -> Result<Vec<PromptMessage>, PromptError> {
+        let mut registry = registry_with_role(RoleRenderMode::Marker);
+        register_prompt_tree(&mut registry, root)?;
+        let name = prompt_name(name);
+        let rendered = registry
+            .render(&name, data)
+            .map_err(|source| PromptError::Render { name, source })?;
+        Ok(parse_role_messages(&rendered))
+    }
 
     #[test]
     fn reads_prompt_with_or_without_suffix() -> Result<(), Box<dyn std::error::Error>> {
@@ -540,6 +673,102 @@ mod tests {
         let registry = load_registry(Path::new(&prompt_root()))?;
         assert!(registry.has_template("aifarm/system"));
         assert!(registry.has_template("shared_core"));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_store_matches_legacy_rendering_for_every_prompt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = prompt_root();
+        let store = PromptStore::from_root(&root)?;
+        let data = serde_json::json!({});
+
+        for path in prompt_entries(&root)? {
+            let name = prompt_entry_name(&root, &path);
+            assert_eq!(
+                store.render(&name, &data)?,
+                legacy_render(&root, &name, &data)?,
+                "text rendering changed for {name}"
+            );
+            assert_eq!(
+                store.render_messages(&name, &data)?,
+                legacy_render_messages(&root, &name, &data)?,
+                "role rendering changed for {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_store_resolves_custom_root_and_partials() -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestPromptRoot::new()?;
+        root.write("nested/_shared.prompt", "shared={{value}}")?;
+        root.write(
+            "nested/main.prompt",
+            "---\nmodel: test-model\n---\n{{role \"system\"}}{{> shared}}",
+        )?;
+
+        let store = PromptStore::from_root(root.path())?;
+        assert_eq!(
+            store.render("nested/main", &serde_json::json!({ "value": "ok" }))?,
+            "shared=ok"
+        );
+        assert_eq!(
+            store.render_messages("nested/main", &serde_json::json!({ "value": "ok" }))?,
+            vec![super::PromptMessage {
+                role: "system".to_owned(),
+                content: "shared=ok".to_owned(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_store_reports_invalid_template_name_and_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestPromptRoot::new()?;
+        let expected_path = root.write("broken.prompt", "{{#if}}")?;
+
+        let error = PromptStore::from_root(root.path()).expect_err("invalid prompt must fail");
+        match error {
+            PromptError::Register { name, path, .. } => {
+                assert_eq!(name, "broken");
+                assert_eq!(path, expected_path);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_store_renders_concurrently() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(PromptStore::load()?);
+        let expected = store.render(
+            "aifarm/last_message_wrapper",
+            &serde_json::json!({ "message": "<message>hello</message>" }),
+        )?;
+        let handles = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let expected = expected.clone();
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(
+                            store
+                                .render(
+                                    "aifarm/last_message_wrapper",
+                                    &serde_json::json!({ "message": "<message>hello</message>" }),
+                                )
+                                .expect("concurrent prompt render"),
+                            expected
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("prompt render thread");
+        }
         Ok(())
     }
 }

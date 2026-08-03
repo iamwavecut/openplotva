@@ -112,6 +112,131 @@ pub enum TelegramOutboundMethodKind {
     SetMessageReaction,
 }
 
+impl TelegramOutboundMethodKind {
+    /// Return the Bot API method name used by durable outbox storage and transport.
+    pub const fn method_name(self) -> &'static str {
+        match self {
+            Self::SendMessage => "sendMessage",
+            Self::SendRichMessage => "sendRichMessage",
+            Self::SendSticker => "sendSticker",
+            Self::SendPhoto => "sendPhoto",
+            Self::SendAudio => "sendAudio",
+            Self::SendMediaGroup => "sendMediaGroup",
+            Self::SendChatAction => "sendChatAction",
+            Self::AnswerCallbackQuery => "answerCallbackQuery",
+            Self::AnswerInlineQuery => "answerInlineQuery",
+            Self::AnswerGuestQuery => "answerGuestQuery",
+            Self::AnswerPreCheckoutQuery => "answerPreCheckoutQuery",
+            Self::CreateInvoiceLink => "createInvoiceLink",
+            Self::RefundStarPayment => "refundStarPayment",
+            Self::EditUserStarSubscription => "editUserStarSubscription",
+            Self::EditMessageText => "editMessageText",
+            Self::EditMessageCaption => "editMessageCaption",
+            Self::EditMessageReplyMarkup => "editMessageReplyMarkup",
+            Self::EditMessageMedia => "editMessageMedia",
+            Self::DeleteMessage => "deleteMessage",
+            Self::SetMessageReaction => "setMessageReaction",
+        }
+    }
+
+    /// Decode Bot API names, Rust debug labels, and the legacy Go queue labels.
+    pub fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "sendMessage"
+            | "SendMessage"
+            | "*tgbotapi.MessageConfig"
+            | "*api.MessageConfig"
+            | "tgbotapi.MessageConfig"
+            | "api.MessageConfig" => Some(Self::SendMessage),
+            "sendRichMessage" | "SendRichMessage" | "openplotva.RichMessageConfig" => {
+                Some(Self::SendRichMessage)
+            }
+            "sendSticker"
+            | "SendSticker"
+            | "*tgbotapi.StickerConfig"
+            | "*api.StickerConfig"
+            | "tgbotapi.StickerConfig"
+            | "api.StickerConfig" => Some(Self::SendSticker),
+            "sendPhoto"
+            | "SendPhoto"
+            | "*tgbotapi.PhotoConfig"
+            | "*api.PhotoConfig"
+            | "tgbotapi.PhotoConfig"
+            | "api.PhotoConfig" => Some(Self::SendPhoto),
+            "sendAudio"
+            | "SendAudio"
+            | "*tgbotapi.AudioConfig"
+            | "*api.AudioConfig"
+            | "tgbotapi.AudioConfig"
+            | "api.AudioConfig" => Some(Self::SendAudio),
+            "sendMediaGroup"
+            | "SendMediaGroup"
+            | "*tgbotapi.MediaGroupConfig"
+            | "*api.MediaGroupConfig"
+            | "tgbotapi.MediaGroupConfig"
+            | "api.MediaGroupConfig" => Some(Self::SendMediaGroup),
+            "sendChatAction"
+            | "SendChatAction"
+            | "*tgbotapi.ChatActionConfig"
+            | "*api.ChatActionConfig"
+            | "tgbotapi.ChatActionConfig"
+            | "api.ChatActionConfig" => Some(Self::SendChatAction),
+            "answerCallbackQuery"
+            | "AnswerCallbackQuery"
+            | "*tgbotapi.CallbackConfig"
+            | "*api.CallbackConfig"
+            | "tgbotapi.CallbackConfig"
+            | "api.CallbackConfig" => Some(Self::AnswerCallbackQuery),
+            "answerInlineQuery"
+            | "AnswerInlineQuery"
+            | "api.InlineConfig"
+            | "tgbotapi.InlineConfig" => Some(Self::AnswerInlineQuery),
+            "answerGuestQuery"
+            | "AnswerGuestQuery"
+            | "api.AnswerGuestQueryConfig"
+            | "tgbotapi.AnswerGuestQueryConfig" => Some(Self::AnswerGuestQuery),
+            "answerPreCheckoutQuery" | "AnswerPreCheckoutQuery" | "api.PreCheckoutConfig" => {
+                Some(Self::AnswerPreCheckoutQuery)
+            }
+            "createInvoiceLink" | "CreateInvoiceLink" | "api.CreateInvoiceLinkConfig" => {
+                Some(Self::CreateInvoiceLink)
+            }
+            "refundStarPayment" | "RefundStarPayment" | "api.RefundStarPaymentConfig" => {
+                Some(Self::RefundStarPayment)
+            }
+            "editUserStarSubscription"
+            | "EditUserStarSubscription"
+            | "api.EditUserStarSubscriptionConfig" => Some(Self::EditUserStarSubscription),
+            "editMessageText"
+            | "EditMessageText"
+            | "*api.EditMessageTextConfig"
+            | "api.EditMessageTextConfig" => Some(Self::EditMessageText),
+            "editMessageCaption"
+            | "EditMessageCaption"
+            | "*api.EditMessageCaptionConfig"
+            | "api.EditMessageCaptionConfig" => Some(Self::EditMessageCaption),
+            "editMessageReplyMarkup"
+            | "EditMessageReplyMarkup"
+            | "*api.EditMessageReplyMarkupConfig"
+            | "api.EditMessageReplyMarkupConfig" => Some(Self::EditMessageReplyMarkup),
+            "editMessageMedia"
+            | "EditMessageMedia"
+            | "*api.EditMessageMediaConfig"
+            | "api.EditMessageMediaConfig" => Some(Self::EditMessageMedia),
+            "deleteMessage"
+            | "DeleteMessage"
+            | "*tgbotapi.DeleteMessageConfig"
+            | "*api.DeleteMessageConfig"
+            | "tgbotapi.DeleteMessageConfig"
+            | "api.DeleteMessageConfig" => Some(Self::DeleteMessage),
+            "setMessageReaction" | "SetMessageReaction" | "openplotva.SetMessageReactionConfig" => {
+                Some(Self::SetMessageReaction)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Response shape returned by a concrete Telegram outbound method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TelegramOutboundResponseKind {
@@ -322,28 +447,7 @@ impl TelegramOutboundMethod {
 
     /// Return the Bot API method name used by `tgbot::api::Method::into_payload`.
     pub fn method_name(&self) -> &'static str {
-        match self {
-            Self::SendMessage(_) => "sendMessage",
-            Self::SendRichMessage(_) => "sendRichMessage",
-            Self::SendSticker(_) => "sendSticker",
-            Self::SendPhoto(_) => "sendPhoto",
-            Self::SendAudio(_) => "sendAudio",
-            Self::SendMediaGroup(_) => "sendMediaGroup",
-            Self::SendChatAction(_) => "sendChatAction",
-            Self::AnswerCallbackQuery(_) => "answerCallbackQuery",
-            Self::AnswerInlineQuery(_) => "answerInlineQuery",
-            Self::AnswerGuestQuery(_) => "answerGuestQuery",
-            Self::AnswerPreCheckoutQuery(_) => "answerPreCheckoutQuery",
-            Self::CreateInvoiceLink(_) => "createInvoiceLink",
-            Self::RefundStarPayment(_) => "refundStarPayment",
-            Self::EditUserStarSubscription(_) => "editUserStarSubscription",
-            Self::EditMessageText(_) => "editMessageText",
-            Self::EditMessageCaption(_) => "editMessageCaption",
-            Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
-            Self::EditMessageMedia(_) => "editMessageMedia",
-            Self::DeleteMessage(_) => "deleteMessage",
-            Self::SetMessageReaction(_) => "setMessageReaction",
-        }
+        self.kind().method_name()
     }
 
     /// Return the expected successful response shape.
@@ -1151,6 +1255,83 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn every_method_kind_round_trips_bot_api_and_debug_storage_labels() {
+        let cases = [
+            (TelegramOutboundMethodKind::SendMessage, "sendMessage"),
+            (
+                TelegramOutboundMethodKind::SendRichMessage,
+                "sendRichMessage",
+            ),
+            (TelegramOutboundMethodKind::SendSticker, "sendSticker"),
+            (TelegramOutboundMethodKind::SendPhoto, "sendPhoto"),
+            (TelegramOutboundMethodKind::SendAudio, "sendAudio"),
+            (TelegramOutboundMethodKind::SendMediaGroup, "sendMediaGroup"),
+            (TelegramOutboundMethodKind::SendChatAction, "sendChatAction"),
+            (
+                TelegramOutboundMethodKind::AnswerCallbackQuery,
+                "answerCallbackQuery",
+            ),
+            (
+                TelegramOutboundMethodKind::AnswerInlineQuery,
+                "answerInlineQuery",
+            ),
+            (
+                TelegramOutboundMethodKind::AnswerGuestQuery,
+                "answerGuestQuery",
+            ),
+            (
+                TelegramOutboundMethodKind::AnswerPreCheckoutQuery,
+                "answerPreCheckoutQuery",
+            ),
+            (
+                TelegramOutboundMethodKind::CreateInvoiceLink,
+                "createInvoiceLink",
+            ),
+            (
+                TelegramOutboundMethodKind::RefundStarPayment,
+                "refundStarPayment",
+            ),
+            (
+                TelegramOutboundMethodKind::EditUserStarSubscription,
+                "editUserStarSubscription",
+            ),
+            (
+                TelegramOutboundMethodKind::EditMessageText,
+                "editMessageText",
+            ),
+            (
+                TelegramOutboundMethodKind::EditMessageCaption,
+                "editMessageCaption",
+            ),
+            (
+                TelegramOutboundMethodKind::EditMessageReplyMarkup,
+                "editMessageReplyMarkup",
+            ),
+            (
+                TelegramOutboundMethodKind::EditMessageMedia,
+                "editMessageMedia",
+            ),
+            (TelegramOutboundMethodKind::DeleteMessage, "deleteMessage"),
+            (
+                TelegramOutboundMethodKind::SetMessageReaction,
+                "setMessageReaction",
+            ),
+        ];
+
+        for (kind, bot_api_name) in cases {
+            assert_eq!(kind.method_name(), bot_api_name);
+            assert_eq!(
+                TelegramOutboundMethodKind::from_storage_name(bot_api_name),
+                Some(kind)
+            );
+            assert_eq!(
+                TelegramOutboundMethodKind::from_storage_name(&format!("{kind:?}")),
+                Some(kind)
+            );
+        }
     }
 
     #[test]

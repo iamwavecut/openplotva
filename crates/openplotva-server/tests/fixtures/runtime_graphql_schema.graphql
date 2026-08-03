@@ -1,0 +1,1001 @@
+type AifarmCapacitySnapshot {
+	service: String!
+	maxConcurrentJobs: Int!
+	running: Int!
+	queued: Int!
+	available: Int!
+	locked: Boolean!
+	ready: Boolean!
+	observedAt: String!
+	error: String
+}
+
+type CacheStats {
+	size: Int!
+	capacity: Int!
+	hits: String!
+	misses: String!
+	memSize: String!
+}
+
+type Chat {
+	id: ID!
+	type: String!
+	title: String
+	username: String
+	firstName: String
+	lastName: String
+	isForum: Boolean
+	description: String
+	inviteLink: String
+	discoveredAt: String
+	updatedAt: String
+}
+
+type ChatConnection {
+	count: Int!
+	offset: Int!
+	limit: Int!
+	items: [Chat!]!
+}
+
+type ChatMember {
+	chatID: ID!
+	userID: ID!
+	status: String!
+	isAnonymous: Boolean
+	customTitle: String
+	canBeEdited: Boolean
+	canManageChat: Boolean
+	canDeleteMessages: Boolean
+	canManageVideoChats: Boolean
+	canRestrictMembers: Boolean
+	canPromoteMembers: Boolean
+	canChangeInfo: Boolean
+	canInviteUsers: Boolean
+	canPostMessages: Boolean
+	canEditMessages: Boolean
+	canPinMessages: Boolean
+	canManageTopics: Boolean
+	createdAt: String
+	updatedAt: String
+	lastMessageAt: String
+}
+
+type ChatMemberWithUser {
+	member: ChatMember!
+	user: User
+}
+
+input ChatsFilterInput {
+	q: String
+	offset: Int
+	limit: Int
+	memberUsername: String
+	memberUserID: ID
+}
+
+type ConfigSnapshot {
+	logLevel: String!
+	webHost: String!
+	webPort: Int!
+	runtimeApiEnabled: Boolean!
+	runtimeApiHost: String!
+	runtimeApiPort: Int!
+	discoveryBaseURL: String
+	embedderEnabled: Boolean!
+	embedderURL: String
+	shieldEnabled: Boolean!
+	shieldEmbedderURL: String
+	shieldMaxMatches: Int!
+	shieldVectorMinScore: Float!
+	shieldLexicalMinScore: Float!
+	shieldRetrievalTimeoutSeconds: Int!
+	shieldHistoryTailMessages: Int!
+	whiteCircleEnabled: Boolean!
+	aceStepEnabled: Boolean!
+	aceStepBaseURL: String
+	dialogProvider: String!
+	dialogFallbackProvider: String
+	persistentQueueEnabled: Boolean!
+	activeDrawProviders: [String!]!
+	sqlTimeoutMs: Int!
+	sqlRowLimit: Int!
+	sqlResultBytesLimit: Int!
+}
+
+type DependencyHealth {
+	status: String!
+	error: String
+	latencyMs: Int
+	details: JSON
+}
+
+type DialogTurnOutcome {
+	id: ID!
+	at: String!
+	jobID: ID!
+	queueName: String!
+	chatID: ID
+	threadID: Int
+	userID: ID
+	triggerMessageID: Int
+	attempt: Int!
+	outcome: String!
+	reason: String
+	provider: String
+	model: String
+	elapsedMs: Int
+	budgetMs: Int
+	userSignal: String
+	sentMessageParts: Int
+	sideEffectTicketID: ID
+	detail: JSON!
+}
+
+input DialogTurnOutcomesFilterInput {
+	chatID: ID
+	jobID: ID
+	outcome: String
+	limit: Int
+}
+
+type DispatcherSendFailure {
+	at: String!
+	virtualID: String!
+	chatID: ID!
+	methodKind: String!
+	error: String!
+	class: String!
+	protected: Boolean!
+	replyToMessageID: Int
+}
+
+type DispatcherStats {
+	regularQueueSize: Int!
+	immediateQueueSize: Int!
+	processedTotal: String!
+	dedupedTotal: String!
+	oldestRegularAgeMs: Int!
+	oldestImmediateAgeMs: Int!
+}
+
+type GeminiExplicitCachePurgeResult {
+	ok: Boolean!
+	scanned: Int!
+	matched: Int!
+	deleted: Int!
+	failed: Int!
+}
+
+type HealthSnapshot {
+	db: DependencyHealth!
+	redis: DependencyHealth!
+	dispatcher: DependencyHealth!
+	aiHandler: DependencyHealth!
+	shield: DependencyHealth!
+	rag: DependencyHealth!
+	aceStep: DependencyHealth!
+	updatesQueueLength: Int!
+}
+
+type IngestionGates {
+	taskRateLimited: Int!
+	debounceCoalesced: Int!
+	botSamplingSkipped: Int!
+	emptyTriggerSkipped: Int!
+	invalidMessage: Int!
+	randomSkippedRoll: Int!
+	randomSkippedReactivityOff: Int!
+	randomSkippedGate: Int!
+	randomSkippedUserDisabled: Int!
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type LlmAnalytics {
+	range: String!
+	bucket: String!
+	since: String!
+	totals: LlmAnalyticsTotals!
+	series: [LlmAnalyticsSeriesPoint!]!
+	topChats: [LlmAnalyticsTopChat!]!
+	models: [LlmAnalyticsModelStat!]!
+	providers: [LlmAnalyticsProviderStat!]!
+	stageMetrics: [LlmAnalyticsStageMetric!]!
+	runtimeJobs: [RuntimeJobAnalyticsStat!]!
+	runtimeJobsError: String
+	aiFarmCapacity: AifarmCapacitySnapshot
+}
+
+type LlmAnalyticsModelStat {
+	model: String!
+	requestCount: Int!
+	errorCount: Int!
+	avgDurationMs: Int!
+	p50DurationMs: Int!
+	p95DurationMs: Int!
+}
+
+type LlmAnalyticsProviderStat {
+	provider: String!
+	source: String!
+	requestCount: Int!
+	errorCount: Int!
+	avgDurationMs: Int!
+	p50DurationMs: Int!
+	p95DurationMs: Int!
+}
+
+type LlmAnalyticsSeriesPoint {
+	ts: String!
+	totalCount: Int!
+	errorCount: Int!
+	avgDurationMs: Int!
+}
+
+type LlmAnalyticsStageMetric {
+	stage: String!
+	source: String!
+	requestCount: Int!
+	errorCount: Int!
+	avgDurationMs: Int!
+	p50DurationMs: Int!
+	p95DurationMs: Int!
+	avgIteration: Int!
+	maxIteration: Int!
+}
+
+type LlmAnalyticsTopChat {
+	chatID: ID!
+	title: String
+	username: String
+	requestCount: Int!
+}
+
+type LlmAnalyticsTotals {
+	totalCount: Int!
+	errorCount: Int!
+	avgDurationMs: Int!
+}
+
+type LlmGenConfig {
+	maxOutputTokens: Int!
+	temperature: Float!
+	topP: Float!
+	topK: Int!
+	safetySettings: JSON
+}
+
+type LlmRequest {
+	id: ID!
+	at: String!
+	provider: String
+	requestKind: String
+	source: String!
+	mode: String
+	flow: String
+	iteration: Int!
+	model: String
+	chat: LlmRequestChat!
+	user: LlmRequestUser!
+	message: LlmRequestMessage!
+	genConfig: LlmGenConfig!
+	docs: JSON
+	messages: JSON
+	rawRequest: JSON
+	resolvedCacheContent: JSON
+	rawResponse: JSON
+	transport: JSON
+	inferenceParams: JSON
+	usage: JSON
+	timings: JSON
+	promptChars: Int!
+	promptMessages: Int!
+	docsChars: Int!
+	durationMs: Int!
+	result: LlmRequestResult!
+}
+
+type LlmRequestChat {
+	chatID: ID!
+	threadID: Int
+	chatTitle: String
+}
+
+type LlmRequestMessage {
+	messageID: Int!
+}
+
+type LlmRequestResult {
+	durationMs: Int!
+	error: String
+	responseTextPreview: String
+}
+
+type LlmRequestUser {
+	userID: ID!
+	fullName: String
+}
+
+input LlmRequestsFilterInput {
+	q: String
+	source: String
+	model: String
+	chatID: ID
+	userID: ID
+	messageID: Int
+	errorOnly: Boolean
+	emptyOnly: Boolean
+	limit: Int
+}
+
+input LlmRunsFilterInput {
+	kind: String
+	chatID: ID
+	errorsOnly: Boolean
+	q: String
+	limit: Int
+}
+
+type LogEntry {
+	seq: ID!
+	time: String
+	level: String!
+	message: String!
+	attrs: JSON
+}
+
+type LogsResult {
+	count: Int!
+	lastSeq: ID
+	items: [LogEntry!]!
+}
+
+type MemoryRestartResult {
+	ok: Boolean!
+	runID: ID
+	retriedFailedRuns: Int!
+	queuedRuns: Int!
+	started: Boolean!
+	override: Boolean!
+	provider: String
+	model: String
+}
+
+type RoutingEvent {
+	id: ID!
+	at: String!
+	severity: String!
+	eventType: String!
+	workflowKey: String!
+	providerID: ID
+	modelID: ID
+	queueName: String
+	jobID: ID
+	chatID: ID
+	threadID: Int
+	messageID: Int
+	dedupeKey: String!
+	summary: String!
+	detail: JSON!
+}
+
+input RoutingEventsFilterInput {
+	q: String
+	workflowKey: String
+	eventType: String
+	limit: Int
+}
+
+type RuntimeJobAnalyticsStat {
+	jobType: String!
+	queueName: String!
+	provider: String!
+	createdCount: Int!
+	completedCount: Int!
+	failedCount: Int!
+	avgWaitMs: Int!
+	p95WaitMs: Int!
+	avgProcessingMs: Int!
+	p95ProcessingMs: Int!
+}
+
+type RuntimeMutation {
+	retryTelegramOutbox(operationID: ID!, acceptDuplicateRisk: Boolean): TelegramOutboxMutationResult!
+	cancelTelegramOutbox(operationID: ID!): TelegramOutboxMutationResult!
+	restartMemory(runID: ID): MemoryRestartResult!
+	purgeGeminiExplicitCaches: GeminiExplicitCachePurgeResult!
+	startVirtualDialog(input: StartVirtualDialogInput!): VirtualDialog!
+	sendVirtualDialogMessage(input: SendVirtualDialogMessageInput!): VirtualDialogMessage!
+	deleteVirtualDialog(sessionID: String!): VirtualDialogDeleteResult!
+}
+
+type RuntimeQuery {
+	runtimeState: RuntimeState!
+	healthSnapshot: HealthSnapshot!
+	configSnapshot: ConfigSnapshot!
+	users(filter: UsersFilterInput): UserConnection!
+	user(id: ID, username: String): UserDetails
+	chats(filter: ChatsFilterInput): ChatConnection!
+	chat(id: ID!): Chat
+	chatMembers(chatID: ID!): [ChatMemberWithUser!]!
+	taskmanJobs(filter: TaskmanJobsFilterInput): TaskmanJobListResult!
+	taskmanJob(id: ID!): TaskmanJobDetails
+	taskmanQueueDiagnostics(queues: [String!], priority: Int): TaskmanDiagnostics!
+	safetyChecks(filter: SafetyChecksFilterInput): SafetyCheckConnection!
+	llmRequests(filter: LlmRequestsFilterInput): [LlmRequest!]!
+	llmRuns(filter: LlmRunsFilterInput): [JSON!]!
+	dialogTurnOutcomes(filter: DialogTurnOutcomesFilterInput): [DialogTurnOutcome!]!
+	dispatcherSendFailures(limit: Int): [DispatcherSendFailure!]!
+	llmRoutingEvents(filter: RoutingEventsFilterInput): [RoutingEvent!]!
+	llmAnalytics(range: String): LlmAnalytics!
+	virtualDialog(sessionID: String!): VirtualDialog
+	updatesRuntime: UpdatesRuntime!
+	telegramUpdateInboxStats: TelegramUpdateInboxStats!
+	telegramUpdateInbox(id: ID!): TelegramUpdateInboxItem
+	telegramUpdateInboxItems(beforeID: ID, state: String, limit: Int): [TelegramUpdateInboxItem!]!
+	telegramUpdateInboxAttempts(inboxID: ID!, limit: Int): [TelegramUpdateAttempt!]!
+	telegramOutboxStats: TelegramOutboxStats!
+	telegramOutbox(operationID: ID!): TelegramOutboxItem
+	telegramOutboxItems(beforeID: ID, state: String, limit: Int): [TelegramOutboxItem!]!
+	telegramOutboxAttempts(outboxID: ID!, limit: Int): [TelegramOutboxAttempt!]!
+	logs(afterSeq: ID, limit: Int, level: String, search: String): LogsResult!
+	redisPrefixes(prefix: String): [RuntimeRedisPrefixGroup!]!
+	redisKeys(pattern: String!, limit: Int!): [String!]!
+	redisValue(key: String!): RuntimeRedisValue
+	sqlRead(input: SqlReadInput!): SqlReadResult!
+}
+
+"""
+Redis prefix group returned by runtime API diagnostics.
+"""
+type RuntimeRedisPrefixGroup {
+	prefix: String!
+	count: Int!
+}
+
+"""
+Redis value returned by runtime API diagnostics.
+"""
+type RuntimeRedisValue {
+	key: String!
+	value: String!
+	truncated: Boolean!
+}
+
+type RuntimeState {
+	logLevel: String!
+	dispatcher: DispatcherStats!
+	cache: CacheStats!
+	plannerCache: CacheStats!
+}
+
+"""
+Runtime virtual-dialog tool mode.
+"""
+enum RuntimeVirtualDialogToolMode {
+	"""
+	Use a cleanup-friendly toolbox that does not run side-effect tools.
+	"""
+	SAFE
+	"""
+	Use the normal toolbox; external side effects may start.
+	"""
+	REAL
+}
+
+type SafetyCheck {
+	id: ID!
+	createdAt: String!
+	source: String!
+	flow: String
+	mode: String
+	chatID: ID
+	threadID: Int
+	messageID: Int
+	userID: ID
+	deploymentID: String!
+	externalSessionID: String
+	requestMessages: JSON
+	flagged: Boolean
+	internalSessionID: String
+	policies: JSON
+	responseJSON: JSON
+	durationMs: Int!
+	error: String
+}
+
+type SafetyCheckConnection {
+	count: Int!
+	offset: Int!
+	limit: Int!
+	items: [SafetyCheck!]!
+}
+
+input SafetyChecksFilterInput {
+	q: String
+	flagged: Boolean
+	offset: Int
+	limit: Int
+}
+
+input SendVirtualDialogMessageInput {
+	sessionID: String!
+	text: String!
+	toolMode: RuntimeVirtualDialogToolMode
+}
+
+input SqlReadInput {
+	sql: String!
+	args: [JSON!]
+	timeoutMs: Int
+}
+
+type SqlReadResult {
+	columns: [String!]!
+	rows: [JSON!]!
+	rowCount: Int!
+	elapsedMs: Int!
+	truncated: Boolean!
+}
+
+input StartVirtualDialogInput {
+	sessionID: String!
+	replaceExisting: Boolean
+}
+
+type Subscription {
+	id: ID!
+	userID: ID!
+	telegramPaymentChargeID: String!
+	providerPaymentChargeID: String!
+	expiresAt: String
+	createdAt: String
+	updatedAt: String
+	canceledAt: String
+	refundedAt: String
+	status: String!
+}
+
+type TaskmanDiagnostics {
+	running: Boolean!
+	active: Int!
+	started1m: Int!
+	completed1m: Int!
+	workerCount: Int!
+	queueSignalCount: Int!
+	slowJobCount: Int!
+	queues: [TaskmanQueueDiagnostics!]!
+}
+
+type TaskmanJob {
+	id: ID!
+	queueName: String!
+	priority: Int!
+	title: String!
+	payload: JSON
+	status: String!
+	userID: ID!
+	chatID: ID!
+	triggerMessageID: Int!
+	threadMessageID: Int
+	progressMessageID: Int
+	resultMessageID: Int
+	workerID: String
+	createdAt: String!
+	startedAt: String
+	completedAt: String
+	errorMessage: String
+	processingTimeoutSeconds: Int!
+	promptHash: String
+	estimatedProcessingTime: Int
+	actualProcessingTime: Int
+}
+
+type TaskmanJobDetails {
+	job: TaskmanJob!
+	messages: [TaskmanJobMessage!]!
+	events: JSON
+}
+
+type TaskmanJobListEntry {
+	id: ID!
+	queueName: String!
+	priority: Int!
+	title: String!
+	jobType: String!
+	status: String!
+	userID: ID!
+	chatID: ID!
+	triggerMessageID: Int!
+	threadMessageID: Int
+	progressMessageID: Int
+	resultMessageID: Int
+	workerID: String
+	createdAt: String!
+	startedAt: String
+	completedAt: String
+	errorMessage: String
+	processingTimeoutSeconds: Int!
+	promptHash: String
+	estimatedProcessingTime: Int
+	actualProcessingTime: Int
+	preview: String
+}
+
+type TaskmanJobListResult {
+	total: Int!
+	offset: Int!
+	limit: Int!
+	summary: TaskmanJobSummary!
+	items: [TaskmanJobListEntry!]!
+}
+
+type TaskmanJobMessage {
+	id: ID!
+	jobID: ID!
+	messageType: String!
+	chatID: ID!
+	messageID: Int!
+	createdAt: String!
+	status: String!
+}
+
+type TaskmanJobSummary {
+	byStatus: JSON!
+	byQueue: JSON!
+}
+
+input TaskmanJobsFilterInput {
+	q: String
+	status: [String!]
+	queue: [String!]
+	userID: ID
+	chatID: ID
+	timeField: String
+	from: String
+	to: String
+	sortBy: String
+	sortDir: String
+	offset: Int
+	limit: Int
+}
+
+type TaskmanQueueDiagnostics {
+	queueName: String!
+	priority: Int!
+	pending: Int!
+	pendingOrHigher: Int!
+	active: Int!
+	workerCount: Int!
+	etaSeconds: Int!
+}
+
+type TelegramOutboxAttempt {
+	attempt: Int!
+	leaseToken: ID!
+	workerID: String!
+	claimedAt: String!
+	requestStartedAt: String
+	responseReceivedAt: String
+	finishedAt: String
+	outcome: String
+	httpStatus: Int
+	latencyMs: Int
+	errorClass: String
+	error: String
+}
+
+type TelegramOutboxItem {
+	id: ID!
+	operationID: ID!
+	batchID: ID!
+	partIndex: Int!
+	botID: ID!
+	chatID: ID
+	threadID: Int
+	orderingKey: String!
+	causationUpdateID: ID
+	dialogJobID: ID
+	triggerMessageID: ID
+	methodKind: String!
+	deliveryPolicy: String!
+	protected: Boolean!
+	priority: Int!
+	state: String!
+	availableAt: String!
+	expiresAt: String
+	attemptCount: Int!
+	leaseOwner: String
+	leasedUntil: String
+	lastErrorClass: String
+	lastError: String
+	responseKind: String
+	telegramMessageIDs: [ID!]!
+	hasReceipt: Boolean!
+	confirmedAt: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+type TelegramOutboxMutationResult {
+	operationID: ID!
+	changed: Boolean!
+	state: String
+}
+
+type TelegramOutboxStats {
+	pending: Int!
+	leased: Int!
+	retryWait: Int!
+	delivered: Int!
+	ambiguous: Int!
+	deadLetter: Int!
+	expired: Int!
+	cancelled: Int!
+	protectedUnresolved: Int!
+	oldestPendingAt: String
+	oldestLeaseExpiry: String
+}
+
+type TelegramUpdateAttempt {
+	attempt: Int!
+	leaseToken: ID!
+	workerID: String!
+	claimedAt: String!
+	stateStartedAt: String
+	stateCompletedAt: String
+	handlerStartedAt: String
+	handlerCompletedAt: String
+	finishedAt: String
+	outcome: String
+	errorClass: String
+	error: String
+}
+
+type TelegramUpdateInboxItem {
+	id: ID!
+	botID: ID!
+	updateID: ID!
+	schemaVersion: Int!
+	source: String!
+	streamMs: ID!
+	streamSeq: ID!
+	lastStreamMs: ID!
+	lastStreamSeq: ID!
+	payloadSizeBytes: Int!
+	payloadSha256: String!
+	payloadConflict: Boolean!
+	updateType: String
+	telegramEventAt: String
+	firstReceivedAt: String!
+	lastReceivedAt: String!
+	materializedAt: String!
+	deliveryCount: Int!
+	orderingKey: String!
+	priority: Int!
+	chatID: ID
+	threadID: Int
+	userID: ID
+	status: String!
+	availableAt: String!
+	attemptCount: Int!
+	leaseOwner: String
+	leasedUntil: String
+	processingStartedAt: String
+	stateAppliedAt: String
+	handlerCompletedAt: String
+	completedAt: String
+	outcome: String
+	ignoredReason: String
+	lastErrorClass: String
+	lastError: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+type TelegramUpdateInboxStats {
+	pending: Int!
+	processing: Int!
+	retryWait: Int!
+	completed: Int!
+	ignored: Int!
+	deadLetter: Int!
+	payloadConflicts: Int!
+	quarantined: Int!
+	totalDeliveries: Int!
+	oldestPendingAt: String
+	oldestRetryAt: String
+	oldestLeaseExpiry: String
+}
+
+type UpdatesRuntime {
+	active: Int!
+	stateActive: Int!
+	handleActive: Int!
+	queueLen: Int!
+	queueError: String
+	started1m: Int!
+	completed1m: Int!
+	timeouts1m: Int!
+	oldestActiveMs: Int!
+	lastStallAt: String
+	tasks: [UpdatesTask!]!
+	gates: IngestionGates
+	streamLen: Int!
+	streamGroupLag: Int!
+	streamPending: Int!
+	oldestUnmaterializedMs: Int!
+	ingressUsedMemoryBytes: Int!
+	ingressMaxmemoryBytes: Int!
+	ingressMaxmemoryPolicy: String!
+	ingressAofEnabled: Boolean!
+	ingressAofCurrentSizeBytes: Int!
+	ingressAofRewriteInProgress: Boolean!
+	ingressAofLastWriteStatus: String!
+	ingressAofLastRewriteStatus: String!
+	materializerSupervisorRunning: Boolean!
+	materializerLeaseHeld: Boolean!
+	materializerSupervisorRestarts: Int!
+	materializerBatchRows: Int!
+	materializerBatchBytes: Int!
+	materializerBatchFillRatio: Float!
+	bulkTransactionLatencyMs: Int!
+	materializedBatches: Int!
+	inboxInsertStatements: Int!
+	quarantineInsertStatements: Int!
+	materializedInserted: Int!
+	materializedDuplicates: Int!
+	materializedConflicted: Int!
+	materializedQuarantined: Int!
+	materializerReclaims: Int!
+	ackDeleteMismatches: Int!
+	materializerDbFailures: Int!
+	materializerRedisFailures: Int!
+	projectionStageRows: Int!
+	projectionOldestStageAgeMs: Int!
+	projectionLastFlushLatencyMs: Int!
+	projectionStagedMutations: Int!
+	projectionFlushedRows: Int!
+	projectionFlushErrors: Int!
+	postgresPending: Int!
+	postgresRetryWait: Int!
+	postgresDeadLetter: Int!
+	eventToRedisAvgMs: Int!
+	redisToPostgresAvgMs: Int!
+	materializationToClaimAvgMs: Int!
+	claimToTaskmanAvgMs: Int!
+}
+
+type UpdatesTask {
+	stage: String!
+	startedAt: String!
+	ageMs: Int!
+	chatID: ID
+	userID: ID
+	update: String!
+}
+
+type User {
+	id: ID!
+	isPremium: Boolean
+	firstName: String!
+	lastName: String
+	username: String
+	languageCode: String
+	isVip: Boolean
+	discoveredAt: String
+	updatedAt: String
+}
+
+type UserConnection {
+	count: Int!
+	offset: Int!
+	limit: Int!
+	items: [User!]!
+}
+
+type UserDetails {
+	id: ID!
+	isPremium: Boolean
+	firstName: String!
+	lastName: String
+	username: String
+	languageCode: String
+	isVip: Boolean
+	discoveredAt: String
+	updatedAt: String
+	subscription: Subscription
+	vip: VipCache
+	vipSummary: VipSummary
+	vipEvents: [VipEvent!]!
+	subscriptions: [Subscription!]!
+}
+
+input UsersFilterInput {
+	q: String
+	offset: Int
+	limit: Int
+}
+
+type VipCache {
+	userID: ID!
+	isVip: Boolean!
+	expiresAt: String
+	createdAt: String
+	updatedAt: String
+}
+
+type VipEvent {
+	id: ID!
+	eventType: String!
+	deltaSeconds: String!
+	deltaDays: Float!
+	effectiveExpiresAt: String
+	actorUserID: ID
+	actorLabel: String
+	reason: String
+	createdAt: String
+	subscriptionID: ID
+	telegramPaymentChargeID: String
+	providerPaymentChargeID: String
+	subscriptionStatus: String
+}
+
+type VipSummary {
+	active: Boolean!
+	hasHistory: Boolean!
+	expiresAt: String
+	remainingSeconds: String!
+	remainingDays: Int!
+	latestEventID: ID
+	latestEventType: String
+	latestReason: String
+	latestCreatedAt: String
+}
+
+type VirtualDialog {
+	sessionID: String!
+	chatID: ID!
+	userID: ID!
+	nextMessageID: Int!
+	messageCount: Int!
+	lastActivityAt: String
+	expiresAt: String
+	messages: [VirtualDialogMessage!]!
+}
+
+type VirtualDialogDeleteResult {
+	found: Boolean!
+	deleted: Boolean!
+	historyDeleted: Int!
+	taskmanDeleted: Int!
+	llmTracesDeleted: Int!
+}
+
+type VirtualDialogMessage {
+	messageID: Int!
+	role: String!
+	text: String!
+	at: String!
+	provider: String
+	toolMode: RuntimeVirtualDialogToolMode
+	toolCalls: JSON
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: RuntimeQuery
+	mutation: RuntimeMutation
+}

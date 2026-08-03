@@ -25,6 +25,247 @@ pub const DEFAULT_DISPATCHER_QUEUE_KEY: &str = "plotva:message_queue";
 
 pub const DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Current durable Telegram command payload version.
+pub const OUTBOUND_COMMAND_PAYLOAD_VERSION: i16 = 1;
+
+/// Failure to encode or decode a durable Telegram command.
+#[derive(Debug, Error)]
+pub enum OutboundCommandCodecError {
+    #[error("unsupported Telegram outbound command payload version {0}")]
+    UnsupportedVersion(i16),
+    #[error("unsupported Telegram outbound command method kind {0}")]
+    UnsupportedMethodKind(String),
+    #[error("Telegram outbound command {method_kind} payload is not serializable")]
+    UnsupportedPayload { method_kind: String },
+    #[error("failed to serialize Telegram outbound command {method_kind}: {source}")]
+    SerializePayload {
+        method_kind: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to decode Telegram outbound command {method_kind}: {source}")]
+    MalformedPayload {
+        method_kind: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Telegram payload cannot replay as {method_kind}")]
+    PayloadNotReplayable { method_kind: String },
+}
+
+/// Versioned, typed Telegram command plus the exact payload bytes that produced it.
+///
+/// Keeping the original bytes is intentional: Redis queue snapshots are an external
+/// compatibility contract even when their JSON field order or legacy labels differ.
+#[derive(Debug)]
+pub struct OutboundCommand {
+    method: TelegramOutboundMethod,
+    payload: OutboundCommandPayload,
+}
+
+#[derive(Debug)]
+enum OutboundCommandPayload {
+    Encoded {
+        storage_name: String,
+        value: Value,
+        bytes: Vec<u8>,
+    },
+    /// Preserve an explicitly supplied legacy sidecar without parsing or rewriting it.
+    OpaqueLegacy {
+        storage_name: String,
+        bytes: Vec<u8>,
+    },
+    /// Non-persistable methods still remain valid commands for the live transport.
+    Deferred,
+}
+
+impl OutboundCommand {
+    /// Capture any live method. Replayable methods retain their deterministic payload;
+    /// unsupported ones remain transport-only and are skipped by queue persistence.
+    pub fn from_method(method: TelegramOutboundMethod) -> Self {
+        let payload = encode_method_payload(&method).unwrap_or(OutboundCommandPayload::Deferred);
+        Self { method, payload }
+    }
+
+    /// Pair a validated live method with the exact legacy queue payload built from
+    /// the same typed plan.
+    pub fn from_method_and_legacy_payload(
+        method: TelegramOutboundMethod,
+        payload: DispatcherPersistencePayload,
+    ) -> Self {
+        Self::from_method(method).with_legacy_payload(payload)
+    }
+
+    /// Capture a replayable method using the current deterministic encoder.
+    pub fn try_from_method(
+        method: TelegramOutboundMethod,
+    ) -> Result<Self, OutboundCommandCodecError> {
+        let payload = encode_method_payload(&method)?;
+        Ok(Self { method, payload })
+    }
+
+    /// Decode current Postgres or legacy Redis storage labels without rewriting bytes.
+    pub fn decode(
+        payload_version: i16,
+        method_kind: &str,
+        payload_bytes: &[u8],
+    ) -> Result<Self, OutboundCommandCodecError> {
+        if payload_version != OUTBOUND_COMMAND_PAYLOAD_VERSION {
+            return Err(OutboundCommandCodecError::UnsupportedVersion(
+                payload_version,
+            ));
+        }
+        let kind = TelegramOutboundMethodKind::from_storage_name(method_kind).ok_or_else(|| {
+            OutboundCommandCodecError::UnsupportedMethodKind(method_kind.to_owned())
+        })?;
+        let payload: Value = serde_json::from_slice(payload_bytes).map_err(|source| {
+            OutboundCommandCodecError::MalformedPayload {
+                method_kind: method_kind.to_owned(),
+                source,
+            }
+        })?;
+        let method = replay_method_from_value(kind, &payload).ok_or_else(|| {
+            OutboundCommandCodecError::PayloadNotReplayable {
+                method_kind: method_kind.to_owned(),
+            }
+        })?;
+        Ok(Self {
+            method,
+            payload: OutboundCommandPayload::Encoded {
+                storage_name: method_kind.to_owned(),
+                value: payload,
+                bytes: payload_bytes.to_vec(),
+            },
+        })
+    }
+
+    /// Attach exact legacy queue bytes to an already typed live command.
+    pub(crate) fn with_legacy_payload(mut self, payload: DispatcherPersistencePayload) -> Self {
+        self.payload = OutboundCommandPayload::OpaqueLegacy {
+            storage_name: payload.message_type,
+            bytes: payload.message,
+        };
+        self
+    }
+
+    pub fn payload_version(&self) -> i16 {
+        OUTBOUND_COMMAND_PAYLOAD_VERSION
+    }
+
+    pub fn method_kind(&self) -> TelegramOutboundMethodKind {
+        self.method.kind()
+    }
+
+    pub fn method_name(&self) -> &'static str {
+        self.method.method_name()
+    }
+
+    pub fn response_kind(&self) -> crate::TelegramOutboundResponseKind {
+        self.method.response_kind()
+    }
+
+    pub fn payload(&self) -> Option<&Value> {
+        match &self.payload {
+            OutboundCommandPayload::Encoded { value, .. } => Some(value),
+            OutboundCommandPayload::OpaqueLegacy { .. } | OutboundCommandPayload::Deferred => None,
+        }
+    }
+
+    pub fn payload_bytes(&self) -> Option<&[u8]> {
+        match &self.payload {
+            OutboundCommandPayload::Encoded { bytes, .. }
+            | OutboundCommandPayload::OpaqueLegacy { bytes, .. } => Some(bytes),
+            OutboundCommandPayload::Deferred => None,
+        }
+    }
+
+    pub fn method(&self) -> &TelegramOutboundMethod {
+        &self.method
+    }
+
+    pub fn into_method(self) -> TelegramOutboundMethod {
+        self.method
+    }
+
+    /// Consume the command into the canonical Postgres outbox envelope.
+    pub fn into_storage_parts(
+        self,
+    ) -> Result<(&'static str, i16, Value), OutboundCommandCodecError> {
+        let method_kind = self.method.method_name();
+        let value = match self.payload {
+            OutboundCommandPayload::Encoded { value, .. } => value,
+            OutboundCommandPayload::OpaqueLegacy { bytes, .. } => serde_json::from_slice(&bytes)
+                .map_err(|source| OutboundCommandCodecError::MalformedPayload {
+                    method_kind: method_kind.to_owned(),
+                    source,
+                })?,
+            OutboundCommandPayload::Deferred => {
+                let encoded = encode_method_payload(&self.method)?;
+                let OutboundCommandPayload::Encoded { value, .. } = encoded else {
+                    return Err(OutboundCommandCodecError::UnsupportedPayload {
+                        method_kind: method_kind.to_owned(),
+                    });
+                };
+                value
+            }
+        };
+        Ok((method_kind, OUTBOUND_COMMAND_PAYLOAD_VERSION, value))
+    }
+
+    pub(crate) fn into_legacy_parts(
+        self,
+    ) -> Result<(TelegramOutboundMethod, Option<DispatcherPersistencePayload>), serde_json::Error>
+    {
+        let kind = self.method.kind();
+        let payload = match self.payload {
+            OutboundCommandPayload::Encoded {
+                storage_name,
+                bytes,
+                ..
+            }
+            | OutboundCommandPayload::OpaqueLegacy {
+                storage_name,
+                bytes,
+            } => Some(DispatcherPersistencePayload::new(
+                if storage_name.contains("Config") {
+                    storage_name
+                } else {
+                    go_message_type(kind).to_owned()
+                },
+                bytes,
+            )),
+            OutboundCommandPayload::Deferred => serialize_outbound_method(&self.method)?
+                .map(|bytes| DispatcherPersistencePayload::new(go_message_type(kind), bytes)),
+        };
+        Ok((self.method, payload))
+    }
+}
+
+fn encode_method_payload(
+    method: &TelegramOutboundMethod,
+) -> Result<OutboundCommandPayload, OutboundCommandCodecError> {
+    let method_kind = method.method_name().to_owned();
+    let bytes = serialize_outbound_method(method)
+        .map_err(|source| OutboundCommandCodecError::SerializePayload {
+            method_kind: method_kind.clone(),
+            source,
+        })?
+        .ok_or_else(|| OutboundCommandCodecError::UnsupportedPayload {
+            method_kind: method_kind.clone(),
+        })?;
+    let value = serde_json::from_slice(&bytes).map_err(|source| {
+        OutboundCommandCodecError::MalformedPayload {
+            method_kind,
+            source,
+        }
+    })?;
+    Ok(OutboundCommandPayload::Encoded {
+        storage_name: method.method_name().to_owned(),
+        value,
+        bytes,
+    })
+}
+
 /// Error returned while saving, loading, or converting dispatcher queue persistence.
 #[derive(Debug, Error)]
 pub enum DispatcherPersistenceError {
@@ -72,19 +313,17 @@ impl PersistentDispatcherItem {
         item: DispatcherWorkItem,
     ) -> Result<Option<Self>, DispatcherPersistenceError> {
         let bypass_chat_restrictions = item.bypasses_chat_restrictions();
-        let (metadata, method, persistence_payload, ephemeral_delete_after) =
-            item.into_persistence_parts();
-        let Some(method) = method else {
+        let (metadata, command, ephemeral_delete_after) = item.into_persistence_parts();
+        let Some(command) = command else {
             return Ok(None);
         };
-        let method_kind = method.kind();
-        let (message_type, message) = if let Some(payload) = persistence_payload {
-            (payload.message_type, payload.message)
-        } else {
-            let Some(message) = serialize_outbound_method(&method)? else {
-                return Ok(None);
-            };
-            (go_message_type(method_kind).to_owned(), message)
+        let (_, persistence_payload) = command.into_legacy_parts()?;
+        let Some(DispatcherPersistencePayload {
+            message_type,
+            message,
+        }) = persistence_payload
+        else {
+            return Ok(None);
         };
 
         Ok(Some(Self {
@@ -297,13 +536,16 @@ fn replay_item_from_persistent(
     item: PersistentDispatcherItem,
 ) -> Option<DispatcherRestoredMessage> {
     let method_kind = item.method_kind()?;
-    let value: Value = serde_json::from_slice(&item.message).ok()?;
-    let method = replay_method_from_value(method_kind, &value)?;
+    let command = OutboundCommand::decode(
+        OUTBOUND_COMMAND_PAYLOAD_VERSION,
+        &item.message_type,
+        &item.message,
+    )
+    .ok()?;
+    let value = command.payload()?;
     let fingerprint = parse_fingerprint_key(&item.fingerprint)
-        .unwrap_or_else(|| fingerprint_from_value(method_kind, &value, item.chat_id));
+        .unwrap_or_else(|| fingerprint_from_value(method_kind, value, item.chat_id));
     let enqueued_at = parse_system_time(&item.enqueued_at)?;
-    let persistence_payload =
-        DispatcherPersistencePayload::new(item.message_type.clone(), item.message.clone());
 
     Some(DispatcherRestoredMessage {
         fingerprint,
@@ -311,8 +553,7 @@ fn replay_item_from_persistent(
         virtual_id: item.virtual_id,
         immediate: item.immediate,
         enqueued_at,
-        method,
-        persistence_payload: Some(persistence_payload),
+        command,
         bypass_chat_restrictions: item.bypass_chat_restrictions,
         ephemeral_delete_after: item
             .ephemeral_delete_after_ms
@@ -362,8 +603,9 @@ pub fn replay_outbound_method(
     kind: TelegramOutboundMethodKind,
     bytes: &[u8],
 ) -> Option<TelegramOutboundMethod> {
-    let value: Value = serde_json::from_slice(bytes).ok()?;
-    replay_method_from_value(kind, &value)
+    OutboundCommand::decode(OUTBOUND_COMMAND_PAYLOAD_VERSION, kind.method_name(), bytes)
+        .ok()
+        .map(OutboundCommand::into_method)
 }
 
 /// Rebuild a create-message operation without its reply target. This is used
@@ -843,63 +1085,7 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
 }
 
 fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethodKind> {
-    match message_type {
-        "*tgbotapi.MessageConfig"
-        | "*api.MessageConfig"
-        | "tgbotapi.MessageConfig"
-        | "api.MessageConfig" => Some(TelegramOutboundMethodKind::SendMessage),
-        "openplotva.RichMessageConfig" => Some(TelegramOutboundMethodKind::SendRichMessage),
-        "*tgbotapi.StickerConfig"
-        | "*api.StickerConfig"
-        | "tgbotapi.StickerConfig"
-        | "api.StickerConfig" => Some(TelegramOutboundMethodKind::SendSticker),
-        "*tgbotapi.PhotoConfig"
-        | "*api.PhotoConfig"
-        | "tgbotapi.PhotoConfig"
-        | "api.PhotoConfig" => Some(TelegramOutboundMethodKind::SendPhoto),
-        "*tgbotapi.AudioConfig"
-        | "*api.AudioConfig"
-        | "tgbotapi.AudioConfig"
-        | "api.AudioConfig" => Some(TelegramOutboundMethodKind::SendAudio),
-        "*tgbotapi.MediaGroupConfig"
-        | "*api.MediaGroupConfig"
-        | "tgbotapi.MediaGroupConfig"
-        | "api.MediaGroupConfig" => Some(TelegramOutboundMethodKind::SendMediaGroup),
-        "*tgbotapi.ChatActionConfig"
-        | "*api.ChatActionConfig"
-        | "tgbotapi.ChatActionConfig"
-        | "api.ChatActionConfig" => Some(TelegramOutboundMethodKind::SendChatAction),
-        "*tgbotapi.CallbackConfig"
-        | "*api.CallbackConfig"
-        | "tgbotapi.CallbackConfig"
-        | "api.CallbackConfig" => Some(TelegramOutboundMethodKind::AnswerCallbackQuery),
-        "api.InlineConfig" | "tgbotapi.InlineConfig" => {
-            Some(TelegramOutboundMethodKind::AnswerInlineQuery)
-        }
-        "api.AnswerGuestQueryConfig" | "tgbotapi.AnswerGuestQueryConfig" => {
-            Some(TelegramOutboundMethodKind::AnswerGuestQuery)
-        }
-        "*api.EditMessageTextConfig" | "api.EditMessageTextConfig" => {
-            Some(TelegramOutboundMethodKind::EditMessageText)
-        }
-        "*api.EditMessageCaptionConfig" | "api.EditMessageCaptionConfig" => {
-            Some(TelegramOutboundMethodKind::EditMessageCaption)
-        }
-        "*api.EditMessageReplyMarkupConfig" | "api.EditMessageReplyMarkupConfig" => {
-            Some(TelegramOutboundMethodKind::EditMessageReplyMarkup)
-        }
-        "*api.EditMessageMediaConfig" | "api.EditMessageMediaConfig" => {
-            Some(TelegramOutboundMethodKind::EditMessageMedia)
-        }
-        "*tgbotapi.DeleteMessageConfig"
-        | "*api.DeleteMessageConfig"
-        | "tgbotapi.DeleteMessageConfig"
-        | "api.DeleteMessageConfig" => Some(TelegramOutboundMethodKind::DeleteMessage),
-        "openplotva.SetMessageReactionConfig" => {
-            Some(TelegramOutboundMethodKind::SetMessageReaction)
-        }
-        _ => None,
-    }
+    TelegramOutboundMethodKind::from_storage_name(message_type)
 }
 
 fn format_system_time(value: SystemTime) -> Result<String, time::error::Format> {
@@ -943,12 +1129,14 @@ mod tests {
         DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DebouncerConfig, DispatcherConfig, DispatcherMessage,
         DispatcherPersistenceError, DispatcherQueue, DispatcherRestoredMessage,
         EditMediaMessagePlan, EnqueueOutcome, MESSAGE_TYPE_RICH, MESSAGE_TYPE_TEXT,
-        MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
-        PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
-        RichSendOptions, SendRichMessage, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML,
-        TelegramOutboundMethod, TelegramOutboundMethodKind, build_message_reaction_clear_method,
-        build_message_reaction_method, fingerprint_message_reaction, hash_content,
-        persistent_queue_from_drain, persistent_queue_redis_value_from_items,
+        MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
+        OUTBOUND_COMMAND_PAYLOAD_VERSION, OutboundCommand, OutboundCommandCodecError,
+        PersistentDispatcherItem, PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource,
+        ReplyParametersPlan, RichSendOptions, SendRichMessage, StickerMessagePlan,
+        TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, TelegramOutboundMethodKind,
+        build_message_reaction_clear_method, build_message_reaction_method,
+        fingerprint_message_reaction, hash_content, persistent_queue_from_drain,
+        persistent_queue_redis_value_from_items, persistent_queue_replay_from_items,
         persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
         replay_outbound_method, replay_outbound_method_without_reply,
         restore_persistent_queue_replay, snapshot_outbound_method,
@@ -1014,8 +1202,7 @@ mod tests {
             virtual_id: virtual_id.to_owned(),
             immediate,
             enqueued_at: std::time::SystemTime::now(),
-            method: text_method(chat_id, text),
-            persistence_payload: None,
+            command: OutboundCommand::from_method(text_method(chat_id, text)),
             bypass_chat_restrictions: false,
             ephemeral_delete_after: None,
         }
@@ -1168,10 +1355,11 @@ mod tests {
         assert_eq!(replay.skipped, 0);
         assert_eq!(replay.items.len(), 1);
         assert_eq!(
-            replay.items[0].method.kind(),
+            replay.items[0].command.method_kind(),
             TelegramOutboundMethodKind::SendRichMessage
         );
-        let TelegramOutboundMethod::SendRichMessage(method) = &replay.items[0].method else {
+        let TelegramOutboundMethod::SendRichMessage(method) = replay.items[0].command.method()
+        else {
             panic!("expected sendRichMessage method");
         };
         assert_eq!(method.chat_id, 42);
@@ -1218,7 +1406,8 @@ mod tests {
         let replay = persistent_queue_replay_from_json(&raw)?;
         assert_eq!(replay.skipped, 0);
         assert_eq!(replay.items.len(), 1);
-        let TelegramOutboundMethod::SetMessageReaction(method) = &replay.items[0].method else {
+        let TelegramOutboundMethod::SetMessageReaction(method) = replay.items[0].command.method()
+        else {
             panic!("expected setMessageReaction method");
         };
         let replayed_payload = serde_json::to_value(method.as_ref())?;
@@ -1318,6 +1507,63 @@ mod tests {
     }
 
     #[test]
+    fn outbound_command_v1_owns_the_current_deterministic_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = OutboundCommand::try_from_method(text_method(42, "hello"))?;
+
+        assert_eq!(command.payload_version(), OUTBOUND_COMMAND_PAYLOAD_VERSION);
+        assert_eq!(
+            command.method_kind(),
+            TelegramOutboundMethodKind::SendMessage
+        );
+        assert_eq!(command.method_name(), "sendMessage");
+        assert_eq!(
+            command.payload_bytes(),
+            Some(br#"{"chat_id":42,"text":"hello"}"#.as_slice())
+        );
+        assert_eq!(
+            command.payload(),
+            Some(&json!({"chat_id": 42, "text": "hello"}))
+        );
+
+        let replayed = OutboundCommand::decode(
+            OUTBOUND_COMMAND_PAYLOAD_VERSION,
+            "sendMessage",
+            command.payload_bytes().expect("encoded payload"),
+        )?;
+        assert_eq!(replayed.payload_bytes(), command.payload_bytes());
+        assert_eq!(replayed.method_kind(), command.method_kind());
+        assert_eq!(replayed.into_method().kind(), command.method_kind());
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_command_v1_decodes_legacy_labels_and_rejects_invalid_envelopes() {
+        let legacy = br#"{"ChatID":42,"Text":"hello"}"#;
+        let command = OutboundCommand::decode(
+            OUTBOUND_COMMAND_PAYLOAD_VERSION,
+            "*api.MessageConfig",
+            legacy,
+        )
+        .expect("legacy Redis label must remain replayable");
+        assert_eq!(command.payload_bytes(), Some(legacy.as_slice()));
+        assert_eq!(command.method_name(), "sendMessage");
+
+        assert!(matches!(
+            OutboundCommand::decode(2, "sendMessage", legacy),
+            Err(OutboundCommandCodecError::UnsupportedVersion(2))
+        ));
+        assert!(matches!(
+            OutboundCommand::decode(OUTBOUND_COMMAND_PAYLOAD_VERSION, "unknown", legacy),
+            Err(OutboundCommandCodecError::UnsupportedMethodKind(kind)) if kind == "unknown"
+        ));
+        assert!(matches!(
+            OutboundCommand::decode(OUTBOUND_COMMAND_PAYLOAD_VERSION, "sendMessage", b"not-json",),
+            Err(OutboundCommandCodecError::MalformedPayload { .. })
+        ));
+    }
+
+    #[test]
     fn reply_missing_fallback_replays_create_methods_without_reply_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let text = carapax::types::SendMessage::new(42, "hello").with_reply_parameters(
@@ -1387,6 +1633,39 @@ mod tests {
             payload["ReplyParameters"]["allow_sending_without_reply"],
             json!(true)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatcher_persists_a_form_backed_canonical_command_without_a_sidecar()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let command = StickerMessagePlan {
+            chat_id: 42,
+            file_id: "sticker-file-id".to_owned(),
+            message_thread_id: None,
+            disable_notification: true,
+            reply_parameters: None,
+        }
+        .to_persistence_payload()?
+        .into_command()?;
+        queue.enqueue(
+            text_message(42, "sticker", "sticker-command").with_command(command),
+            false,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(persisted.items[0].message_type, "*api.StickerConfig");
+        assert_eq!(
+            persisted.items[0].method_kind(),
+            Some(TelegramOutboundMethodKind::SendSticker)
+        );
+        let payload: Value = serde_json::from_slice(&persisted.items[0].message)?;
+        assert_eq!(payload["ChatID"], 42);
+        assert_eq!(payload["File"], "sticker-file-id");
         Ok(())
     }
 
@@ -1505,8 +1784,10 @@ mod tests {
             text.method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
         );
-        let (_, method, payload, _) = text.into_persistence_parts();
-        let Some(TelegramOutboundMethod::SendMessage(method)) = method else {
+        let (_, command, _) = text.into_persistence_parts();
+        let Some(TelegramOutboundMethod::SendMessage(method)) =
+            command.map(OutboundCommand::into_method)
+        else {
             panic!("expected sendMessage method");
         };
         let method_payload = serde_json::to_value(method.as_ref())?;
@@ -1518,22 +1799,48 @@ mod tests {
             method_payload["reply_parameters"]["allow_sending_without_reply"],
             json!(true)
         );
-        assert_eq!(
-            payload.expect("text payload preserved").message_type,
-            "*api.MessageConfig"
-        );
 
         let sticker = queue.dequeue_immediate().expect("sticker item restored");
         assert_eq!(
             sticker.method_kind(),
             Some(TelegramOutboundMethodKind::SendSticker)
         );
-        let (_, _, payload, _) = sticker.into_persistence_parts();
+        let (_, command, _) = sticker.into_persistence_parts();
+        let (_, payload) = command
+            .expect("sticker command preserved")
+            .into_legacy_parts()?;
         assert_eq!(
             payload.expect("sticker payload preserved").message_type,
             "*api.StickerConfig"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_replay_resaves_the_exact_original_label_and_payload_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let message = br#"{ "Text":"hello", "ChatID":42 }"#.to_vec();
+        let replay = persistent_queue_replay_from_items(vec![PersistentDispatcherItem {
+            message: message.clone(),
+            message_type: "*tgbotapi.MessageConfig".to_owned(),
+            immediate: false,
+            enqueued_at: "2026-05-19T17:00:00Z".to_owned(),
+            fingerprint: String::new(),
+            chat_id: 42,
+            virtual_id: "legacy-exact".to_owned(),
+            bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
+        }]);
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let report = restore_persistent_queue_replay(&queue, replay);
+        assert_eq!(report.restored, 1);
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(persisted.items[0].message_type, "*tgbotapi.MessageConfig");
+        assert_eq!(persisted.items[0].message, message);
         Ok(())
     }
 
@@ -1558,10 +1865,10 @@ mod tests {
         assert_eq!(replay.skipped, 0);
         assert_eq!(replay.items.len(), 1);
         assert_eq!(
-            replay.items[0].method.kind(),
+            replay.items[0].command.method_kind(),
             TelegramOutboundMethodKind::DeleteMessage
         );
-        let TelegramOutboundMethod::DeleteMessage(method) = &replay.items[0].method else {
+        let TelegramOutboundMethod::DeleteMessage(method) = replay.items[0].command.method() else {
             panic!("expected deleteMessage method");
         };
         let payload = serde_json::to_value(method.as_ref())?;
@@ -1618,7 +1925,7 @@ mod tests {
         assert_eq!(replay.skipped, 2);
         assert_eq!(replay.items[0].virtual_id, "kept");
         assert_eq!(
-            replay.items[0].method.kind(),
+            replay.items[0].command.method_kind(),
             TelegramOutboundMethodKind::SendMessage
         );
 
@@ -1700,7 +2007,7 @@ mod tests {
             replay
                 .items
                 .iter()
-                .map(|item| item.method.kind())
+                .map(|item| item.command.method_kind())
                 .collect::<Vec<_>>(),
             vec![
                 TelegramOutboundMethodKind::SendPhoto,

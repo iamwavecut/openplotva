@@ -25,6 +25,11 @@ export PATH="/opt/homebrew/bin:$PATH"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required for signed admin session smoke" >&2
+  exit 1
+fi
+
 port="${OPENPLOTVA_SMOKE_PORT:-18080}"
 while nc -z 127.0.0.1 "$port" >/dev/null 2>&1; do
   port=$((port + 1))
@@ -36,6 +41,16 @@ log_file="${log_dir}/openplotva-app.log"
 health_file="${log_dir}/health.json"
 ready_file="${log_dir}/ready.json"
 state_file="${log_dir}/admin-state.json"
+smoke_admin_id="1001"
+smoke_bot_key="123:ABC"
+smoke_admin_issued_at="$(date +%s)"
+smoke_admin_expires_at="$((smoke_admin_issued_at + 86400))"
+smoke_admin_signature="$(
+  printf 'v1.%s.%s.%s' "$smoke_admin_id" "$smoke_admin_issued_at" "$smoke_admin_expires_at" \
+    | openssl dgst -sha256 -hmac "$smoke_bot_key" \
+    | awk '{print $NF}'
+)"
+admin_cookie_header="Cookie: admin_session=v1.${smoke_admin_id}.${smoke_admin_issued_at}.${smoke_admin_expires_at}.${smoke_admin_signature}"
 
 pid=""
 cleanup() {
@@ -56,6 +71,8 @@ env \
   OPENPLOTVA_RUN_MIGRATIONS="false" \
   OPENPLOTVA_CONSUME_UPDATES="false" \
   RUNTIME_API_ENABLED="false" \
+  BOT_KEY="$smoke_bot_key" \
+  ADMINS_ADMIN_IDS="$smoke_admin_id" \
   OPENPLOTVA_LOG_FILTER="${OPENPLOTVA_LOG_FILTER:-openplotva=warn,tower_http=warn}" \
   cargo run -p openplotva-app >"$log_file" 2>&1 &
 pid="$!"
@@ -88,14 +105,17 @@ expect_body_contains() {
 }
 
 status_code() {
-  curl -sS -o /dev/null -w '%{http_code}' "${base_url}${1}"
+  local path="$1"
+  shift
+  curl "$@" -sS -o /dev/null -w '%{http_code}' "${base_url}${path}"
 }
 
 expect_status() {
   local path="$1"
   local expected="$2"
+  shift 2
   local got
-  got="$(status_code "$path")"
+  got="$(status_code "$path" "$@")"
   if [[ "$got" != "$expected" ]]; then
     echo "expected ${path} -> ${expected}, got ${got}" >&2
     tail -n 80 "$log_file" >&2 || true
@@ -116,12 +136,11 @@ echo "+ /api/ready ok"
 expect_status "/settings" "301"
 expect_status "/settings/" "200"
 expect_status "/admin/login.html" "200"
-expect_status "/admin/api/state" "200"
+expect_status "/admin/api/state" "200" -H "$admin_cookie_header"
 
-curl -fsS "${base_url}/admin/api/state" >"$state_file"
+curl -fsS -H "$admin_cookie_header" "${base_url}/admin/api/state" >"$state_file"
 expect_body_contains "$state_file" '"log_level":"info"'
 expect_body_contains "$state_file" '"queue":'
-expect_body_contains "$state_file" '"aifarm_pool_enabled":'
 
 echo "local-smoke-ok"
 echo "log: ${log_file}"

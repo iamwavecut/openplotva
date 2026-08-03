@@ -7,6 +7,7 @@ Usage:
   tools/rust-fast-gate.sh [--skip-clippy]
 
 Runs the fast blocking Rust quality gate used by CI and local development:
+  - completed documentation records contain no unchecked tasks
   - cargo fmt --all -- --check
   - cargo clippy --workspace --all-targets --all-features -- -D warnings
   - cargo test --workspace
@@ -47,6 +48,18 @@ run() {
   "$@"
 }
 
+check_completed_records() {
+  if [[ ! -d docs/decisions ]]; then
+    echo "missing completed-record directory: docs/decisions" >&2
+    return 1
+  fi
+  if rg -n -- '- \[ \]' docs/decisions; then
+    echo "completed decision records must not contain unchecked task boxes" >&2
+    return 1
+  fi
+}
+
+run check_completed_records
 run cargo fmt --all -- --check
 if [[ "$skip_clippy" == false ]]; then
   run cargo clippy --workspace --all-targets --all-features -- -D warnings

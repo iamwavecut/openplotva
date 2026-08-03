@@ -15,7 +15,7 @@ use openplotva_telegram::{
 };
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 
 const DELETE_LYRICS_AUTH_ALERT_TEXT: &str = "Удаление доступно только автору или администраторам.";
 const DELETE_LYRICS_DELETED_TEXT: &str = "✅ Текст удалён";
@@ -144,17 +144,15 @@ where
 {
     type Error = DeleteLyricsCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_delete_lyrics_callback_update_or_else(
-                self.member_api.as_ref(),
-                self.effects.as_ref(),
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_delete_lyrics_callback_update_or_else(
+            self.member_api.as_ref(),
+            self.effects.as_ref(),
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -831,14 +829,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

@@ -308,8 +308,6 @@ pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 
 pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
-pub const DEFAULT_MEMORY_TOKEN_ESTIMATOR_URL: &str = "http://token-estimator:12600";
-
 /// Discovery service name the embedder registers under on the AI Farm.
 pub const DEFAULT_EMBEDDER_DISCOVERY_SERVICE_NAME: &str = "embedder";
 /// Discovery endpoint name the embedder exposes (`POST /encode`).
@@ -927,8 +925,6 @@ pub struct MemoryConfig {
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
     pub tokenizer_file: String,
-    pub token_estimator_url: String,
-    pub token_estimator_timeout_seconds: i32,
     pub embedder_service_name: String,
     pub embedder_endpoint_name: String,
     pub embedding_model: String,
@@ -1433,10 +1429,6 @@ pub struct RawConfig {
     pub memory_tokenizer_model: Option<String>,
     /// `MEMORY_TOKENIZER_FILE`.
     pub memory_tokenizer_file: Option<String>,
-    /// `MEMORY_TOKEN_ESTIMATOR_URL`.
-    pub memory_token_estimator_url: Option<String>,
-    /// `MEMORY_TOKEN_ESTIMATOR_TIMEOUT_SECONDS`.
-    pub memory_token_estimator_timeout_seconds: Option<String>,
     /// `MEMORY_EMBEDDER_DISCOVERY_SERVICE_NAME`.
     pub memory_embedder_service_name: Option<String>,
     /// `MEMORY_EMBEDDER_DISCOVERY_ENDPOINT_NAME`.
@@ -2738,14 +2730,6 @@ impl AppConfig {
                     .memory_tokenizer_model
                     .unwrap_or_else(|| DEFAULT_MEMORY_TOKENIZER_MODEL.to_owned()),
                 tokenizer_file: raw.memory_tokenizer_file.unwrap_or_default(),
-                token_estimator_url: raw
-                    .memory_token_estimator_url
-                    .unwrap_or_else(|| DEFAULT_MEMORY_TOKEN_ESTIMATOR_URL.to_owned()),
-                token_estimator_timeout_seconds: parse_i32(
-                    "MEMORY_TOKEN_ESTIMATOR_TIMEOUT_SECONDS",
-                    raw.memory_token_estimator_timeout_seconds,
-                    2,
-                )?,
                 embedder_service_name: raw
                     .memory_embedder_service_name
                     .unwrap_or_else(|| DEFAULT_EMBEDDER_DISCOVERY_SERVICE_NAME.to_owned()),
@@ -3208,8 +3192,6 @@ impl RawConfig {
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
-            memory_token_estimator_url: env("MEMORY_TOKEN_ESTIMATOR_URL"),
-            memory_token_estimator_timeout_seconds: env("MEMORY_TOKEN_ESTIMATOR_TIMEOUT_SECONDS"),
             memory_embedder_service_name: env("MEMORY_EMBEDDER_DISCOVERY_SERVICE_NAME"),
             memory_embedder_endpoint_name: env("MEMORY_EMBEDDER_DISCOVERY_ENDPOINT_NAME"),
             memory_embedding_model: env("MEMORY_EMBEDDING_MODEL"),
@@ -3993,11 +3975,6 @@ mod tests {
         );
         assert_eq!(config.memory.max_input_tokens, 10_000);
         assert_eq!(config.memory.tokenizer_model, "google/gemma-4-26B-A4B-it");
-        assert_eq!(
-            config.memory.token_estimator_url,
-            "http://token-estimator:12600"
-        );
-        assert_eq!(config.memory.token_estimator_timeout_seconds, 2);
         assert_eq!(config.memory.embedder_service_name, "embedder");
         assert_eq!(config.memory.embedder_endpoint_name, "encode");
         assert_eq!(
@@ -4657,8 +4634,6 @@ mod tests {
             memory_max_input_tokens: Some("6000".to_owned()),
             memory_tokenizer_model: Some("tokenizer".to_owned()),
             memory_tokenizer_file: Some("/tmp/tokenizer.json".to_owned()),
-            memory_token_estimator_url: Some("http://tokens.test".to_owned()),
-            memory_token_estimator_timeout_seconds: Some("4".to_owned()),
             memory_embedder_service_name: Some("memory-embedder".to_owned()),
             memory_embedding_model: Some("embedding".to_owned()),
             memory_embedding_dim: Some("512".to_owned()),
@@ -4699,8 +4674,6 @@ mod tests {
         assert_eq!(config.memory.max_input_tokens, 6000);
         assert_eq!(config.memory.tokenizer_model, "tokenizer");
         assert_eq!(config.memory.tokenizer_file, "/tmp/tokenizer.json");
-        assert_eq!(config.memory.token_estimator_url, "http://tokens.test");
-        assert_eq!(config.memory.token_estimator_timeout_seconds, 4);
         assert_eq!(config.memory.embedder_service_name, "memory-embedder");
         assert_eq!(config.memory.embedding_model, "embedding");
         assert_eq!(config.memory.embedding_dim, 512);

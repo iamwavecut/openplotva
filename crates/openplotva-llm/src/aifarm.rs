@@ -243,6 +243,209 @@ impl ChatCompletionRequest {
     }
 }
 
+struct RedactedChatCompletionRequest<'a>(&'a ChatCompletionRequest);
+
+impl Serialize for RedactedChatCompletionRequest<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let request = self.0;
+        let mut state = serializer.serialize_struct("ChatCompletionRequest", 22)?;
+        state.serialize_field("model", &request.model)?;
+        state.serialize_field("messages", &RedactedChatMessages(&request.messages))?;
+        state.serialize_field("stream", &request.stream)?;
+        if let Some(value) = &request.response_format {
+            state.serialize_field("response_format", value)?;
+        }
+        if !request.tools.is_empty() {
+            state.serialize_field("tools", &request.tools)?;
+        }
+        if let Some(value) = &request.tool_choice {
+            state.serialize_field("tool_choice", value)?;
+        }
+        if let Some(value) = request.parallel_tool_calls {
+            state.serialize_field("parallel_tool_calls", &value)?;
+        }
+        if request.max_tokens != 0 {
+            state.serialize_field("max_tokens", &request.max_tokens)?;
+        }
+        serialize_optional_field(&mut state, "temperature", request.temperature)?;
+        serialize_optional_field(&mut state, "top_p", request.top_p)?;
+        serialize_optional_field(&mut state, "top_k", request.top_k)?;
+        serialize_optional_field(&mut state, "repeat_penalty", request.repeat_penalty)?;
+        serialize_optional_field(&mut state, "repetition_penalty", request.repetition_penalty)?;
+        serialize_optional_field(&mut state, "frequency_penalty", request.frequency_penalty)?;
+        serialize_optional_field(&mut state, "presence_penalty", request.presence_penalty)?;
+        serialize_optional_field(&mut state, "dry_multiplier", request.dry_multiplier)?;
+        serialize_optional_field(&mut state, "dry_base", request.dry_base)?;
+        if request.dry_allowed_length != 0 {
+            state.serialize_field("dry_allowed_length", &request.dry_allowed_length)?;
+        }
+        if let Some(value) = request.include_reasoning {
+            state.serialize_field("include_reasoning", &value)?;
+        }
+        if let Some(value) = &request.chat_template_kwargs {
+            state.serialize_field("chat_template_kwargs", value)?;
+        }
+        if let Some(value) = &request.extra_body {
+            state.serialize_field("extra_body", value)?;
+        }
+        state.end()
+    }
+}
+
+fn serialize_optional_field<S>(
+    state: &mut S,
+    name: &'static str,
+    value: Option<f64>,
+) -> Result<(), S::Error>
+where
+    S: serde::ser::SerializeStruct,
+{
+    if let Some(value) = value {
+        state.serialize_field(name, &value)?;
+    }
+    Ok(())
+}
+
+struct RedactedChatMessages<'a>(&'a [ChatMessage]);
+
+impl Serialize for RedactedChatMessages<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for message in self.0 {
+            sequence.serialize_element(&RedactedChatMessage(message))?;
+        }
+        sequence.end()
+    }
+}
+
+struct RedactedChatMessage<'a>(&'a ChatMessage);
+
+impl Serialize for RedactedChatMessage<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let message = self.0;
+        let extra_fields = usize::from(message.tool_calls.is_some())
+            + usize::from(message.tool_call_id.is_some())
+            + usize::from(message.name.is_some());
+        let mut state = serializer.serialize_struct("ChatMessage", 2 + extra_fields)?;
+        state.serialize_field("role", &message.role)?;
+        if message.content_parts.is_empty() {
+            state.serialize_field("content", &message.content)?;
+        } else {
+            state.serialize_field("content", &RedactedChatContentParts(&message.content_parts))?;
+        }
+        if let Some(value) = &message.tool_calls {
+            state.serialize_field("tool_calls", value)?;
+        }
+        if let Some(value) = &message.tool_call_id {
+            state.serialize_field("tool_call_id", value)?;
+        }
+        if let Some(value) = &message.name {
+            state.serialize_field("name", value)?;
+        }
+        state.end()
+    }
+}
+
+struct RedactedChatContentParts<'a>(&'a [ChatContentPart]);
+
+impl Serialize for RedactedChatContentParts<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for part in self.0 {
+            sequence.serialize_element(&RedactedChatContentPart(part))?;
+        }
+        sequence.end()
+    }
+}
+
+struct RedactedChatContentPart<'a>(&'a ChatContentPart);
+
+impl Serialize for RedactedChatContentPart<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let part = self.0;
+        let mut state = serializer.serialize_struct("ChatContentPart", 4)?;
+        state.serialize_field("type", &part.part_type)?;
+        if !part.text.is_empty() {
+            state.serialize_field("text", &part.text)?;
+        }
+        if let Some(value) = &part.image_url {
+            state.serialize_field("image_url", &RedactedChatImageUrl(value))?;
+        }
+        if let Some(value) = &part.video_url {
+            state.serialize_field("video_url", &RedactedChatVideoUrl(value))?;
+        }
+        state.end()
+    }
+}
+
+struct RedactedChatImageUrl<'a>(&'a ChatImageUrlPart);
+
+impl Serialize for RedactedChatImageUrl<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ChatImageUrlPart", 2)?;
+        let url = if self.0.url.trim_start().starts_with("data:") {
+            "data:<redacted-image>"
+        } else {
+            self.0.url.as_str()
+        };
+        state.serialize_field("url", url)?;
+        if !self.0.detail.is_empty() {
+            state.serialize_field("detail", &self.0.detail)?;
+        }
+        state.end()
+    }
+}
+
+struct RedactedChatVideoUrl<'a>(&'a ChatVideoUrlPart);
+
+impl Serialize for RedactedChatVideoUrl<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ChatVideoUrlPart", 1)?;
+        let url = if self.0.url.trim_start().starts_with("data:") {
+            "data:<redacted-video>"
+        } else {
+            self.0.url.as_str()
+        };
+        state.serialize_field("url", url)?;
+        state.end()
+    }
+}
+
 /// AIFarm completion error.
 pub type CompletionError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -622,6 +825,18 @@ pub struct AifarmHttpClient<T = ReqwestAifarmTransport> {
     cfg: AifarmClientConfig,
     transport: T,
     trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    prompt_store: Option<Arc<openplotva_prompts::PromptStore>>,
+}
+
+struct AifarmTracedCompletion {
+    result: Result<CompletionResult, CompletionError>,
+    artifact: Option<DialogTraceArtifacts>,
+}
+
+struct PendingAifarmTrace {
+    context: crate::trace::LlmCallContext,
+    artifact: DialogTraceArtifacts,
+    tools_offered: bool,
 }
 
 impl AifarmHttpClient<ReqwestAifarmTransport> {
@@ -632,6 +847,7 @@ impl AifarmHttpClient<ReqwestAifarmTransport> {
             cfg,
             transport: ReqwestAifarmTransport::default(),
             trace_registry: crate::trace::global_registry(),
+            prompt_store: None,
         }
     }
 }
@@ -647,7 +863,18 @@ where
             cfg: cfg.with_defaults(),
             transport,
             trace_registry: crate::trace::global_registry(),
+            prompt_store: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_prompt_store(mut self, prompt_store: Arc<openplotva_prompts::PromptStore>) -> Self {
+        self.prompt_store = Some(prompt_store);
+        self
+    }
+
+    fn prompt_store(&self) -> Option<&openplotva_prompts::PromptStore> {
+        self.prompt_store.as_deref()
     }
 
     /// Override the trace registry (production uses the global one by default; tests
@@ -704,78 +931,68 @@ where
         request: ChatCompletionRequest,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
-        let request = request_with_default_model(&request, &self.cfg.default_model);
+        self.complete_traced(request, on_status).await.result
+    }
+
+    async fn complete_traced(
+        &self,
+        mut request: ChatCompletionRequest,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> AifarmTracedCompletion {
+        if request.model.trim().is_empty() {
+            request.model = self.cfg.default_model.clone();
+        }
+        let pending_trace = pending_aifarm_trace(&request);
         let started = std::time::Instant::now();
         let result = if self.uses_direct_endpoint() {
-            self.complete_direct_with_job_id(request.clone(), &generated_dialog_job_id(), on_status)
+            self.complete_direct_with_job_id(request, &generated_dialog_job_id(), on_status)
                 .await
         } else {
-            self.complete_discovery_with_job_id(
-                request.clone(),
-                &generated_dialog_job_id(),
-                on_status,
-            )
-            .await
+            self.complete_discovery_with_job_id(request, &generated_dialog_job_id(), on_status)
+                .await
         };
-        self.emit_call_trace(&request, &result, started.elapsed());
-        result
+        let artifact = self.finish_call_trace(pending_trace, &result, started.elapsed());
+        AifarmTracedCompletion { result, artifact }
     }
 
     /// Emit one trace record per model round-trip when the request carries trace
     /// metadata. Fires on success and error.
-    fn emit_call_trace(
+    fn finish_call_trace(
         &self,
-        request: &ChatCompletionRequest,
+        pending: Option<PendingAifarmTrace>,
         result: &Result<CompletionResult, CompletionError>,
         elapsed: StdDuration,
-    ) {
-        let Some(trace) = request.trace.as_ref() else {
-            return;
-        };
-        let tags = TraceTags {
-            provider: &trace.tags.provider,
-            source: &trace.tags.source,
-            flow: &trace.tags.flow,
-            mode: &trace.tags.mode,
-            request_kind: &trace.tags.request_kind,
-            iteration: trace.tags.iteration,
-        };
-        let mut artifact = match result {
+    ) -> Option<DialogTraceArtifacts> {
+        let PendingAifarmTrace {
+            context,
+            mut artifact,
+            tools_offered,
+        } = pending?;
+        match result {
             Ok(completion) => {
-                let mut artifact =
-                    aifarm_call_trace_artifacts(request, completion, trace.tags.docs_chars, tags);
-                if trace.tags.flow == "dialog"
+                apply_aifarm_trace_result(&mut artifact, completion);
+                if artifact.flow == "dialog"
                     && let Some(error) = dialog_response_semantic_error(
                         completion.response.as_ref(),
-                        &trace.tags.provider,
-                        !request.tools.is_empty(),
+                        &artifact.provider,
+                        tools_offered,
                     )
                 {
                     artifact.error = error;
                 }
-                artifact
             }
             Err(error) => {
-                let mut artifact = aifarm_call_trace_artifacts(
-                    request,
-                    &CompletionResult::default(),
-                    trace.tags.docs_chars,
-                    tags,
-                );
                 artifact.error = error.to_string();
-                artifact
             }
-        };
-        if artifact.model.trim().is_empty() {
-            artifact.model = request.model.trim().to_owned();
         }
         let duration_ms = i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX);
         self.trace_registry.observe(crate::trace::LlmCallRecord {
-            context: trace.context.clone(),
-            artifact,
+            context,
+            artifact: artifact.clone(),
             duration_ms,
             run: None,
         });
+        Some(artifact)
     }
 
     pub async fn complete_discovery_with_job_id(
@@ -1785,6 +2002,12 @@ where
         Self { cfg, client }
     }
 
+    #[must_use]
+    pub fn with_prompt_store(mut self, prompt_store: Arc<openplotva_prompts::PromptStore>) -> Self {
+        self.client = self.client.with_prompt_store(prompt_store);
+        self
+    }
+
     /// Generate one structured JSON response.
     pub async fn generate_json(
         &self,
@@ -1819,7 +2042,12 @@ where
             return Err(AifarmMediaOptimizerError::EmptyText);
         }
         let variant_count = openplotva_media::normalize_variant_count(options.variant_count);
-        let prompt = openplotva_media::render_image_optimizer_prompt(variant_count)?;
+        let prompt = match self.client.prompt_store() {
+            Some(prompts) => {
+                openplotva_media::render_image_optimizer_prompt_with(prompts, variant_count)?
+            }
+            None => openplotva_media::render_image_optimizer_prompt(variant_count)?,
+        };
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let content = self
             .generate_json(
@@ -1853,7 +2081,12 @@ where
             return Err(AifarmMediaOptimizerError::EmptyText);
         }
         let variant_count = openplotva_media::normalize_variant_count(options.variant_count);
-        let prompt = openplotva_media::render_image_edit_optimizer_prompt(variant_count)?;
+        let prompt = match self.client.prompt_store() {
+            Some(prompts) => {
+                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, variant_count)?
+            }
+            None => openplotva_media::render_image_edit_optimizer_prompt(variant_count)?,
+        };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
         let content = self
             .generate_json(
@@ -1883,13 +2116,18 @@ where
     ) -> Result<openplotva_media::acestep::SongPromptResult, AifarmMediaOptimizerError> {
         let (topic, language) = openplotva_media::acestep::normalize_song_prompt_input(&request)
             .map_err(|source| AifarmMediaOptimizerError::SongPrompt { source })?;
-        let messages = openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?
-            .into_iter()
-            .map(|message| AifarmStructuredJsonMessage {
-                role: message.role,
-                content: message.content,
-            })
-            .collect();
+        let messages = match self.client.prompt_store() {
+            Some(prompts) => openplotva_media::acestep::render_song_reprompt_messages_with(
+                prompts, &topic, &language,
+            )?,
+            None => openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?,
+        }
+        .into_iter()
+        .map(|message| AifarmStructuredJsonMessage {
+            role: message.role,
+            content: message.content,
+        })
+        .collect();
         let tool = openplotva_media::acestep::optimize_song_prompt_terminator_definition();
         let content = self
             .generate_json(
@@ -2491,6 +2729,12 @@ where
         }
     }
 
+    #[must_use]
+    pub fn with_prompt_store(mut self, prompt_store: Arc<openplotva_prompts::PromptStore>) -> Self {
+        self.client = self.client.with_prompt_store(prompt_store);
+        self
+    }
+
     /// Stable provider name.
     #[must_use]
     pub fn provider(&self) -> &str {
@@ -2517,29 +2761,26 @@ where
             )
             .map_err(|error| Box::new(error) as CompletionError)?;
         let model = completion_request.model.clone();
-        let trace_request = redacted_chat_completion_request(&completion_request);
-        let result = match self.client.complete(completion_request, on_status).await {
+        let traced = self
+            .client
+            .complete_traced(completion_request, on_status)
+            .await;
+        let trace = traced.artifact.unwrap_or_else(|| DialogTraceArtifacts {
+            provider: self.provider().to_owned(),
+            source: self.provider().to_owned(),
+            flow: "dialog".to_owned(),
+            mode: "tools".to_owned(),
+            request_kind: "openai.chat.completions".to_owned(),
+            iteration: i32::try_from(iteration).unwrap_or(i32::MAX),
+            model: model.clone(),
+            ..DialogTraceArtifacts::default()
+        });
+        let result = match traced.result {
             Ok(result) => result,
             Err(error) => {
-                let message = error.to_string();
-                let mut trace = aifarm_dialog_trace_artifacts(
-                    &trace_request,
-                    &CompletionResult::default(),
-                    &request.input,
-                    self.provider(),
-                    iteration,
-                );
-                trace.error = message;
                 return Err(aifarm_step_error_with_trace(error, trace));
             }
         };
-        let trace = aifarm_dialog_trace_artifacts(
-            &trace_request,
-            &result,
-            &request.input,
-            self.provider(),
-            iteration,
-        );
         let Some(response) = result.response.as_ref() else {
             let error = Box::new(AifarmDialogError::Response(
                 "chat completion response is nil".to_owned(),
@@ -2665,7 +2906,8 @@ where
         // roles only when the request carries a tools array (FinalOnly keeps
         // the tool-aware prompt but renders tool activity as text blocks).
         let native = matches!(tools, ToolsMode::Native(_));
-        let mut messages = build_initial_messages_with_tool_prompt(input, history, mode)?;
+        let mut messages =
+            build_initial_messages(input, history, mode, self.client.prompt_store())?;
         messages.extend(transcript_chat_messages(transcript, native));
         let mut request = ChatCompletionRequest {
             model,
@@ -2791,13 +3033,24 @@ pub(crate) struct TraceTags<'a> {
 
 /// Build a trace artifact for any aifarm completion (dialog or auxiliary). `docs_chars`
 /// is passed explicitly (0 for non-dialog flows).
+#[cfg(test)]
 pub(crate) fn aifarm_call_trace_artifacts(
     request: &ChatCompletionRequest,
     result: &CompletionResult,
     docs_chars: i32,
     tags: TraceTags<'_>,
 ) -> DialogTraceArtifacts {
-    DialogTraceArtifacts {
+    let mut artifact = aifarm_request_trace_artifacts(request, docs_chars, tags);
+    apply_aifarm_trace_result(&mut artifact, result);
+    artifact
+}
+
+fn aifarm_request_trace_artifacts(
+    request: &ChatCompletionRequest,
+    docs_chars: i32,
+    tags: TraceTags<'_>,
+) -> DialogTraceArtifacts {
+    let artifact = DialogTraceArtifacts {
         provider: tags.provider.trim().to_owned(),
         request_kind: tags.request_kind.to_owned(),
         source: tags.source.trim().to_owned(),
@@ -2805,52 +3058,53 @@ pub(crate) fn aifarm_call_trace_artifacts(
         flow: tags.flow.to_owned(),
         iteration: i32::try_from(tags.iteration).unwrap_or(i32::MAX),
         model: request.model.trim().to_owned(),
-        raw_request: serde_json::to_value(request).ok(),
-        raw_response: aifarm_trace_raw_response(result),
-        transport: aifarm_trace_transport(result),
         inference_params: aifarm_trace_inference_params(request),
-        usage: result.response.as_ref().and_then(aifarm_trace_usage),
-        timings: result.response.as_ref().and_then(aifarm_trace_timings),
-        prompt_chars: json_size(&request.messages),
+        prompt_chars: crate::trace::serialized_size(&request.messages),
         prompt_messages: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
         docs_chars,
         ..DialogTraceArtifacts::default()
-    }
+    };
+    crate::trace::RedactedTraceArtifact::from_request(
+        &RedactedChatCompletionRequest(request),
+        artifact,
+    )
+    .into_inner()
 }
 
-fn aifarm_dialog_trace_artifacts(
-    request: &ChatCompletionRequest,
-    result: &CompletionResult,
-    input: &DialogInput,
-    provider: &str,
-    iteration: usize,
-) -> DialogTraceArtifacts {
-    let docs_chars = input
-        .reference_context
-        .iter()
-        .map(String::len)
-        .sum::<usize>()
-        .min(i32::MAX as usize) as i32;
-    aifarm_call_trace_artifacts(
+fn pending_aifarm_trace(request: &ChatCompletionRequest) -> Option<PendingAifarmTrace> {
+    let trace = request.trace.as_ref()?;
+    let artifact = aifarm_request_trace_artifacts(
         request,
-        result,
-        docs_chars,
+        trace.tags.docs_chars,
         TraceTags {
-            provider,
-            source: provider,
-            flow: "dialog",
-            mode: "tools",
-            request_kind: "openai.chat.completions",
-            iteration,
+            provider: &trace.tags.provider,
+            source: &trace.tags.source,
+            flow: &trace.tags.flow,
+            mode: &trace.tags.mode,
+            request_kind: &trace.tags.request_kind,
+            iteration: trace.tags.iteration,
         },
-    )
+    );
+    Some(PendingAifarmTrace {
+        context: trace.context.clone(),
+        artifact,
+        tools_offered: !request.tools.is_empty(),
+    })
+}
+
+fn apply_aifarm_trace_result(artifact: &mut DialogTraceArtifacts, result: &CompletionResult) {
+    artifact.raw_response = aifarm_trace_raw_response(result);
+    artifact.transport = aifarm_trace_transport(result);
+    artifact.usage = result.response.as_ref().and_then(aifarm_trace_usage);
+    artifact.timings = result.response.as_ref().and_then(aifarm_trace_timings);
 }
 
 #[cfg(test)]
 mod call_trace_artifact_tests {
     use super::{
-        ChatCompletionRequest, CompletionResult, TraceTags, aifarm_call_trace_artifacts,
-        aux_llm_call_trace,
+        ChatCompletionRequest, ChatContentPart, ChatImageUrlPart, ChatMessage, ChatVideoUrlPart,
+        CompletionResult, RedactedChatCompletionRequest, TraceTags, aifarm_call_trace_artifacts,
+        aifarm_request_trace_artifacts, aux_llm_call_trace, request_with_default_model,
     };
 
     #[test]
@@ -2887,6 +3141,196 @@ mod call_trace_artifact_tests {
         assert_eq!(artifact.model, "vram.cloud/qwen3.6-27b");
         assert_eq!(artifact.request_kind, "openai.chat.completions");
         assert_eq!(artifact.provider, "aifarm");
+        assert_eq!(
+            artifact.raw_request,
+            serde_json::to_value(&request).ok(),
+            "redacted view must preserve the wire JSON shape without inline media"
+        );
+    }
+
+    #[test]
+    fn aifarm_call_trace_artifacts_redact_inline_media_but_keep_remote_urls() {
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content_parts: vec![
+                    ChatContentPart {
+                        part_type: "image_url".to_owned(),
+                        text: String::new(),
+                        image_url: Some(ChatImageUrlPart {
+                            url: "data:image/png;base64,user-image-secret".to_owned(),
+                            detail: "auto".to_owned(),
+                        }),
+                        video_url: None,
+                    },
+                    ChatContentPart {
+                        part_type: "video_url".to_owned(),
+                        text: String::new(),
+                        image_url: None,
+                        video_url: Some(ChatVideoUrlPart {
+                            url: "data:video/mp4;base64,user-video-secret".to_owned(),
+                        }),
+                    },
+                    ChatContentPart {
+                        part_type: "image_url".to_owned(),
+                        text: String::new(),
+                        image_url: Some(ChatImageUrlPart {
+                            url: "https://cdn.example/image.png".to_owned(),
+                            detail: "auto".to_owned(),
+                        }),
+                        video_url: None,
+                    },
+                ],
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+
+        let result = CompletionResult {
+            raw_body: serde_json::json!({
+                "echo": "data:image/png;base64,response-secret",
+                "inlineData": {"data": "response-inline-secret", "mimeType": "image/png"}
+            })
+            .to_string(),
+            ..CompletionResult::default()
+        };
+        let artifact = aifarm_call_trace_artifacts(
+            &request,
+            &result,
+            0,
+            TraceTags {
+                provider: "aifarm",
+                source: "aifarm",
+                flow: "dialog",
+                mode: "tools",
+                request_kind: "openai.chat.completions",
+                iteration: 1,
+            },
+        );
+        let raw = artifact.raw_request.expect("raw request");
+        let encoded = raw.to_string();
+
+        assert!(!encoded.contains("user-image-secret"));
+        assert!(!encoded.contains("user-video-secret"));
+        assert_eq!(
+            raw["messages"][0]["content"][0]["image_url"]["url"],
+            "data:<redacted-image>"
+        );
+        assert_eq!(
+            raw["messages"][0]["content"][1]["video_url"]["url"],
+            "data:<redacted-video>"
+        );
+        assert_eq!(
+            raw["messages"][0]["content"][2]["image_url"]["url"],
+            "https://cdn.example/image.png"
+        );
+        let response = artifact.raw_response.expect("raw response");
+        assert_eq!(response["echo"], "data:<redacted-media>");
+        assert_eq!(response["inlineData"]["data"], "<redacted-inline-data>");
+        assert!(!response.to_string().contains("response-secret"));
+        assert!(!response.to_string().contains("response-inline-secret"));
+    }
+
+    fn large_multimodal_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content_parts: vec![
+                    ChatContentPart {
+                        part_type: "image_url".to_owned(),
+                        text: String::new(),
+                        image_url: Some(ChatImageUrlPart {
+                            url: format!("data:image/png;base64,{}", "A".repeat(16 * 1024 * 1024)),
+                            detail: "auto".to_owned(),
+                        }),
+                        video_url: None,
+                    },
+                    ChatContentPart {
+                        part_type: "video_url".to_owned(),
+                        text: String::new(),
+                        image_url: None,
+                        video_url: Some(ChatVideoUrlPart {
+                            url: format!("data:video/mp4;base64,{}", "V".repeat(16 * 1024 * 1024)),
+                        }),
+                    },
+                ],
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "manual peak-RSS baseline for plan 017"]
+    fn benchmark_legacy_multimodal_trace_clones() {
+        let request = large_multimodal_request();
+        let started = std::time::Instant::now();
+        let defaulted = request_with_default_model(&request, "benchmark-model");
+        let routed = defaulted.clone();
+        let mut high_level_trace_request = defaulted.clone();
+        let image_url = high_level_trace_request.messages[0].content_parts[0]
+            .image_url
+            .as_mut()
+            .expect("image url");
+        image_url.url = "data:<redacted-image>".to_owned();
+        let video_url = high_level_trace_request.messages[0].content_parts[1]
+            .video_url
+            .as_mut()
+            .expect("video url");
+        video_url.url = "data:<redacted-video>".to_owned();
+        let high_level_trace = serde_json::to_value(&high_level_trace_request).expect("high trace");
+        let low_level_trace = serde_json::to_value(&defaulted).expect("low trace");
+        let wire = serde_json::to_vec(&routed).expect("wire");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "legacy elapsed_ns={} wire_bytes={} low_trace_bytes={}",
+            elapsed.as_nanos(),
+            wire.len(),
+            low_level_trace.to_string().len()
+        );
+        std::hint::black_box((
+            request,
+            defaulted,
+            routed,
+            high_level_trace_request,
+            high_level_trace,
+            low_level_trace,
+            wire,
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual peak-RSS benchmark for plan 017"]
+    fn benchmark_borrowed_redacted_multimodal_trace() {
+        let mut request = large_multimodal_request();
+        request.model = "benchmark-model".to_owned();
+        let started = std::time::Instant::now();
+        let artifact = aifarm_request_trace_artifacts(
+            &request,
+            0,
+            TraceTags {
+                provider: "aifarm",
+                source: "aifarm",
+                flow: "dialog",
+                mode: "tools",
+                request_kind: "openai.chat.completions",
+                iteration: 1,
+            },
+        );
+        let wire = serde_json::to_vec(&request).expect("wire");
+        let elapsed = started.elapsed();
+        let raw = artifact.raw_request.as_ref().expect("raw request");
+        eprintln!(
+            "borrowed elapsed_ns={} wire_bytes={} raw_trace_bytes={}",
+            elapsed.as_nanos(),
+            wire.len(),
+            raw.to_string().len()
+        );
+        assert_eq!(
+            serde_json::to_value(RedactedChatCompletionRequest(&request)).ok(),
+            artifact.raw_request
+        );
+        std::hint::black_box((request, artifact, wire));
     }
 }
 
@@ -3000,33 +3444,17 @@ pub(crate) fn transcript_chat_messages(
     messages
 }
 
-fn redacted_chat_completion_request(request: &ChatCompletionRequest) -> ChatCompletionRequest {
-    let mut out = request.clone();
-    for message in &mut out.messages {
-        for part in &mut message.content_parts {
-            if let Some(image_url) = part.image_url.as_mut()
-                && image_url.url.trim_start().starts_with("data:")
-            {
-                image_url.url = "data:<redacted-image>".to_owned();
-            }
-            if let Some(video_url) = part.video_url.as_mut()
-                && video_url.url.trim_start().starts_with("data:")
-            {
-                video_url.url = "data:<redacted-video>".to_owned();
-            }
-        }
-    }
-    out
-}
-
 fn aifarm_trace_raw_response(result: &CompletionResult) -> Option<Value> {
     let raw = result.raw_body.trim();
     if !raw.is_empty() {
-        return Some(
-            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
-        );
+        let mut value =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        crate::trace::redact_json_media(&mut value);
+        return Some(value);
     }
-    result.response.clone()
+    let mut response = result.response.clone()?;
+    crate::trace::redact_json_media(&mut response);
+    Some(response)
 }
 
 fn aifarm_trace_transport(result: &CompletionResult) -> Option<Value> {
@@ -3202,12 +3630,6 @@ fn json_i32(value: &Value, field: &str) -> i32 {
 
 fn json_f64(value: &Value, field: &str) -> f64 {
     value.get(field).and_then(Value::as_f64).unwrap_or_default()
-}
-
-fn json_size<T: Serialize>(value: &T) -> i32 {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len().min(i32::MAX as usize) as i32)
-        .unwrap_or_default()
 }
 
 pub const STATUS_SUBMITTED: &str = "SUBMITTED";
@@ -3557,10 +3979,28 @@ pub fn build_initial_messages_with_tool_prompt(
     history: &[HistoryMessage],
     mode: ToolPromptMode,
 ) -> Result<Vec<ChatMessage>, AifarmMessageError> {
+    build_initial_messages(input, history, mode, None)
+}
+
+pub fn build_initial_messages_with_prompt_store(
+    prompts: &openplotva_prompts::PromptStore,
+    input: &DialogInput,
+    history: &[HistoryMessage],
+    mode: ToolPromptMode,
+) -> Result<Vec<ChatMessage>, AifarmMessageError> {
+    build_initial_messages(input, history, mode, Some(prompts))
+}
+
+fn build_initial_messages(
+    input: &DialogInput,
+    history: &[HistoryMessage],
+    mode: ToolPromptMode,
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<Vec<ChatMessage>, AifarmMessageError> {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(ChatMessage {
         role: "system".to_owned(),
-        content: build_system_prompt_with_tool_prompt(input, mode)?,
+        content: build_system_prompt(input, mode, prompts)?,
         content_parts: Vec::new(),
         ..ChatMessage::default()
     });
@@ -3574,7 +4014,9 @@ pub fn build_initial_messages_with_tool_prompt(
     for turn in history {
         let is_current =
             turn.role == ROLE_USER && turn.message_id != 0 && turn.message_id == input.message.id;
-        if let Some(message) = format_history_message(turn, is_current, &input.multimodal_images)? {
+        if let Some(message) =
+            format_history_message_with_store(turn, is_current, &input.multimodal_images, prompts)?
+        {
             messages.push(message);
         }
     }
@@ -3585,17 +4027,26 @@ pub fn build_system_prompt_with_tool_prompt(
     input: &DialogInput,
     mode: ToolPromptMode,
 ) -> Result<String, AifarmMessageError> {
+    build_system_prompt(input, mode, None)
+}
+
+fn build_system_prompt(
+    input: &DialogInput,
+    mode: ToolPromptMode,
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<String, AifarmMessageError> {
     let locale = input.context.locale.trim();
-    let rendered = openplotva_prompts::render(
-        "aifarm/system",
-        &json!({
-            "toolMode": mode.as_prompt_value(),
-            "hasTools": mode.has_tools(),
-            "guestMode": input.guest_mode,
-            "toolCatalog": render_alternative_tool_catalog(),
-            "locale": xml_text(locale),
-        }),
-    )?;
+    let data = json!({
+        "toolMode": mode.as_prompt_value(),
+        "hasTools": mode.has_tools(),
+        "guestMode": input.guest_mode,
+        "toolCatalog": render_alternative_tool_catalog(),
+        "locale": xml_text(locale),
+    });
+    let rendered = match prompts {
+        Some(prompts) => prompts.render("aifarm/system", &data)?,
+        None => openplotva_prompts::render("aifarm/system", &data)?,
+    };
     Ok(rendered.trim().to_owned())
 }
 
@@ -3824,9 +4275,12 @@ pub fn build_discovery_job_request(
     job_id: &str,
     request: &ChatCompletionRequest,
 ) -> Result<DiscoveryJobRequest, AifarmRequestError> {
-    let request = request_with_default_model(request, &cfg.default_model);
-    let payload =
-        serde_json::to_vec(&request).map_err(AifarmRequestError::ChatCompletionRequest)?;
+    let payload = if request.model.trim().is_empty() {
+        serde_json::to_vec(&request_with_default_model(request, &cfg.default_model))
+    } else {
+        serde_json::to_vec(request)
+    }
+    .map_err(AifarmRequestError::ChatCompletionRequest)?;
     build_discovery_json_payload_job_request(cfg, job_id, &payload)
 }
 
@@ -5031,6 +5485,15 @@ pub fn format_history_message(
     is_current: bool,
     images: &[openplotva_dialog::MultimodalImage],
 ) -> Result<Option<ChatMessage>, AifarmMessageError> {
+    format_history_message_with_store(turn, is_current, images, None)
+}
+
+fn format_history_message_with_store(
+    turn: &HistoryMessage,
+    is_current: bool,
+    images: &[openplotva_dialog::MultimodalImage],
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<Option<ChatMessage>, AifarmMessageError> {
     let normalized = normalize_history_message(turn.clone());
     match normalized.kind.as_str() {
         MESSAGE_KIND_TOOL_REQUEST => Ok(None),
@@ -5062,7 +5525,7 @@ pub fn format_history_message(
                     ..ChatMessage::default()
                 }));
             }
-            let content = format_turn(&normalized, is_current)?;
+            let content = format_turn(&normalized, is_current, prompts)?;
             let content_parts = if is_current {
                 multimodal_content_parts(&content, images)
             } else {
@@ -5127,7 +5590,11 @@ fn sanitize_assistant_history_turn(mut turn: HistoryMessage) -> Option<HistoryMe
     Some(turn)
 }
 
-fn format_turn(turn: &HistoryMessage, is_current: bool) -> Result<String, AifarmMessageError> {
+fn format_turn(
+    turn: &HistoryMessage,
+    is_current: bool,
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<String, AifarmMessageError> {
     let message = format_message_body(turn);
     if message.is_empty() {
         return Ok(String::new());
@@ -5135,10 +5602,11 @@ fn format_turn(turn: &HistoryMessage, is_current: bool) -> Result<String, Aifarm
     if !is_current {
         return Ok(message);
     }
-    let rendered = openplotva_prompts::render(
-        "aifarm/last_message_wrapper",
-        &json!({ "message": message }),
-    )?;
+    let data = json!({ "message": message });
+    let rendered = match prompts {
+        Some(prompts) => prompts.render("aifarm/last_message_wrapper", &data)?,
+        None => openplotva_prompts::render("aifarm/last_message_wrapper", &data)?,
+    };
     Ok(rendered.trim().to_owned())
 }
 
@@ -5528,7 +5996,9 @@ fn is_zero_i32(value: &i32) -> bool {
 mod tests {
     use std::{
         collections::VecDeque,
+        fs,
         sync::{Arc, Mutex, MutexGuard},
+        time::SystemTime,
     };
 
     use serde_json::json;
@@ -5565,6 +6035,28 @@ mod tests {
             },
             ..DialogInput::default()
         }
+    }
+
+    fn prompt_store_with(files: &[(&str, &str)]) -> Arc<openplotva_prompts::PromptStore> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openplotva-aifarm-prompts-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create prompt root");
+        for (name, source) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("prompt parent"))
+                .expect("create prompt directory");
+            fs::write(path, source).expect("write prompt");
+        }
+        let store =
+            openplotva_prompts::PromptStore::from_root(&root).expect("compile prompt store");
+        fs::remove_dir_all(root).expect("remove prompt root");
+        Arc::new(store)
     }
 
     fn completion_text(result: &CompletionResult) -> Option<&str> {
@@ -5817,6 +6309,7 @@ mod tests {
             body: serde_json::to_vec(&response).expect("serialize response"),
             ..AifarmHttpResponse::default()
         })]);
+        let probe = transport.clone();
         let sink = Arc::new(Mutex::new(Vec::new()));
         let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
         assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
@@ -5831,6 +6324,19 @@ mod tests {
         .with_trace_registry(registry);
         let request = ChatCompletionRequest {
             model: "vram.cloud/qwen3.6-27b".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content_parts: vec![ChatContentPart {
+                    part_type: "image_url".to_owned(),
+                    text: String::new(),
+                    image_url: Some(ChatImageUrlPart {
+                        url: "data:image/png;base64,registry-secret".to_owned(),
+                        detail: "auto".to_owned(),
+                    }),
+                    video_url: None,
+                }],
+                ..ChatMessage::default()
+            }],
             trace: Some(crate::trace::LlmCallTrace {
                 context: crate::trace::LlmCallContext {
                     chat_id: -100,
@@ -5861,6 +6367,23 @@ mod tests {
         assert_eq!(records[0].context.chat_id, -100);
         assert_eq!(records[0].context.user_id, 7);
         assert!(records[0].artifact.error.is_empty());
+        let raw_request = records[0]
+            .artifact
+            .raw_request
+            .as_ref()
+            .expect("raw request");
+        assert_eq!(
+            raw_request["messages"][0]["content"][0]["image_url"]["url"],
+            "data:<redacted-image>"
+        );
+        assert!(!raw_request.to_string().contains("registry-secret"));
+        let wire = probe.requests();
+        let wire_request: Value = serde_json::from_slice(&wire[0].body).expect("wire request JSON");
+        assert_eq!(
+            wire_request["messages"][0]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,registry-secret",
+            "trace redaction must not change the provider request"
+        );
     }
 
     #[tokio::test]
@@ -5915,6 +6438,104 @@ mod tests {
             "semantic failure was not recorded: {}",
             records[0].artifact.error
         );
+    }
+
+    #[tokio::test]
+    async fn aifarm_complete_discovery_emits_exactly_one_trace_record() {
+        let completion_payload = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let transport = FakeTransport::new(vec![
+            Ok(json_response(
+                json!({"job_id":"job-1","state":"JOB_STATE_QUEUED"}),
+            )),
+            Ok(json_response(json!({
+                "job": {
+                    "job_id": "job-1",
+                    "state": "JOB_STATE_SUCCEEDED",
+                    "result": {
+                        "response": {
+                            "status_code": 200,
+                            "body": general_purpose::STANDARD.encode(completion_payload)
+                        }
+                    }
+                }
+            }))),
+        ]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                base_url: "https://discovery.example.test".to_owned(),
+                poll_interval: StdDuration::from_nanos(1),
+                task_timeout: StdDuration::from_secs(1),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+        let request = ChatCompletionRequest {
+            trace: Some(crate::trace::LlmCallTrace {
+                tags: crate::trace::LlmCallTags {
+                    provider: PROVIDER_AIFARM.to_owned(),
+                    source: PROVIDER_AIFARM.to_owned(),
+                    flow: "dialog".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    iteration: 1,
+                    ..crate::trace::LlmCallTags::default()
+                },
+                ..crate::trace::LlmCallTrace::default()
+            }),
+            ..ChatCompletionRequest::default()
+        };
+
+        let result = client.complete(request, &mut |_status| {}).await;
+
+        assert!(result.is_ok(), "discovery completion: {result:?}");
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].artifact.transport,
+            Some(json!({"job_id": "job-1"}))
+        );
+        assert!(records[0].artifact.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aifarm_complete_transport_error_emits_exactly_one_trace_record() {
+        let transport = FakeTransport::new(vec![Err(Box::new(std::io::Error::other(
+            "transport-secret-free-error",
+        )) as CompletionError)]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+        let request = ChatCompletionRequest {
+            trace: Some(crate::trace::LlmCallTrace {
+                tags: crate::trace::LlmCallTags {
+                    provider: PROVIDER_AIFARM.to_owned(),
+                    source: PROVIDER_AIFARM.to_owned(),
+                    flow: "memory_extraction".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    ..crate::trace::LlmCallTags::default()
+                },
+                ..crate::trace::LlmCallTrace::default()
+            }),
+            ..ChatCompletionRequest::default()
+        };
+
+        let result = client.complete(request, &mut |_status| {}).await;
+
+        assert!(result.is_err());
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].artifact.error, "transport-secret-free-error");
     }
 
     #[tokio::test]
@@ -6512,7 +7133,17 @@ mod tests {
                 ..AifarmStructuredJsonConfig::default()
             },
             transport.clone(),
-        );
+        )
+        .with_prompt_store(prompt_store_with(&[
+            (
+                "image/optimizer.prompt",
+                "custom image variants={{variant_count}}",
+            ),
+            (
+                "image/edit_optimizer.prompt",
+                "custom edit variants={{variant_count}}",
+            ),
+        ]));
         let mut statuses = Vec::new();
 
         let image = generator
@@ -6553,11 +7184,9 @@ mod tests {
             image_body["response_format"]["json_schema"]["schema"]["properties"]["aspect_ratio"]["type"],
             "string"
         );
-        assert!(
-            image_body["messages"][0]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("optimize_prompt_terminator")
+        assert_eq!(
+            image_body["messages"][0]["content"],
+            "custom image variants=2"
         );
         assert_eq!(image_body["messages"][1]["content"], "cat");
         assert_eq!(image_body["max_tokens"], 2048);
@@ -6572,11 +7201,9 @@ mod tests {
             edit_body["response_format"]["json_schema"]["schema"]["properties"]["aspect_ratio"]
                 .is_null()
         );
-        assert!(
-            edit_body["messages"][0]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("optimize_edit_prompt_terminator")
+        assert_eq!(
+            edit_body["messages"][0]["content"],
+            "custom edit variants=2"
         );
         assert_eq!(edit_body["messages"][1]["content"], "edit it");
         assert_eq!(edit_body["max_tokens"], 2048);
@@ -6639,7 +7266,11 @@ mod tests {
                 ..AifarmStructuredJsonConfig::default()
             },
             transport.clone(),
-        );
+        )
+        .with_prompt_store(prompt_store_with(&[(
+            "music/song_reprompt.prompt",
+            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{vocalLanguage}}",
+        )]));
 
         let result = generator
             .optimize_song_prompt(
@@ -6668,17 +7299,12 @@ mod tests {
             json!(["title", "input_topic", "style", "vocal_language", "lyrics"])
         );
         assert_eq!(body["messages"][0]["role"], "system");
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("optimize_song_prompt_terminator")
+        assert_eq!(
+            body["messages"][0]["content"],
+            "custom song system night city"
         );
         assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(
-            body["messages"][1]["content"],
-            "Topic: night city\nVocal language: en"
-        );
+        assert_eq!(body["messages"][1]["content"], "custom song user en");
         assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["temperature"], 0.5);
         Ok(())
@@ -6867,62 +7493,6 @@ mod tests {
             transport,
             FakeToolbox::new(Vec::new()),
         )
-    }
-
-    #[test]
-    fn aifarm_trace_request_redacts_data_url_media() {
-        let request = ChatCompletionRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content_parts: vec![
-                    ChatContentPart {
-                        part_type: "image_url".to_owned(),
-                        text: String::new(),
-                        image_url: Some(ChatImageUrlPart {
-                            url: "data:image/png;base64,secret".to_owned(),
-                            detail: "auto".to_owned(),
-                        }),
-                        video_url: None,
-                    },
-                    ChatContentPart {
-                        part_type: "video_url".to_owned(),
-                        text: String::new(),
-                        image_url: None,
-                        video_url: Some(ChatVideoUrlPart {
-                            url: "data:video/mp4;base64,video-secret".to_owned(),
-                        }),
-                    },
-                    ChatContentPart {
-                        part_type: "image_url".to_owned(),
-                        text: String::new(),
-                        image_url: Some(ChatImageUrlPart {
-                            url: "https://example.test/image.png".to_owned(),
-                            detail: "auto".to_owned(),
-                        }),
-                        video_url: None,
-                    },
-                ],
-                ..ChatMessage::default()
-            }],
-            ..ChatCompletionRequest::default()
-        };
-
-        let redacted = redacted_chat_completion_request(&request);
-        let value = serde_json::to_value(redacted).expect("serialized request");
-
-        assert_eq!(
-            value["messages"][0]["content"][0]["image_url"]["url"],
-            "data:<redacted-image>"
-        );
-        assert_eq!(
-            value["messages"][0]["content"][2]["image_url"]["url"],
-            "https://example.test/image.png"
-        );
-        assert_eq!(
-            value["messages"][0]["content"][1]["video_url"]["url"],
-            "data:<redacted-video>"
-        );
-        assert!(!value.to_string().contains("video-secret"));
     }
 
     #[test]
@@ -8793,6 +9363,55 @@ mod tests {
         assert_eq!(
             request.chat_template_kwargs,
             Some(json!({ "enable_thinking": true }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dialog_provider_uses_injected_prompt_store() -> Result<(), AifarmDialogError> {
+        let prompts = prompt_store_with(&[
+            (
+                "aifarm/system.prompt",
+                "custom system locale={{locale}} mode={{toolMode}}",
+            ),
+            (
+                "aifarm/last_message_wrapper.prompt",
+                "custom wrapper {{{message}}}",
+            ),
+        ]);
+        let provider = AifarmDialogProvider::with_transport(
+            AifarmDialogConfig::default(),
+            FakeTransport::new(Vec::new()),
+        )
+        .with_prompt_store(prompts);
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 17,
+            text: "hello".to_owned(),
+            original_text: "hello".to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let history = build_session_history_with_limit(&input, provider.cfg.max_history);
+        let request = provider.step_request_with_history(
+            &input,
+            &history,
+            &[],
+            &openplotva_dialog::ToolsMode::FinalOnly,
+            1,
+        )?;
+
+        assert_eq!(
+            request.messages[0].content,
+            "custom system locale=ru mode=native"
+        );
+        assert!(
+            request
+                .messages
+                .last()
+                .expect("current user message")
+                .content
+                .starts_with("custom wrapper ")
         );
         Ok(())
     }

@@ -5,7 +5,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 use carapax::types::{AnswerInlineQuery, Update as TelegramUpdate, UpdateType};
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 
 /// Boxed future returned by inline-query side effects.
 pub type InlineQueryFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -79,14 +79,12 @@ where
 {
     type Error = InlineQueryUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_inline_query_update_or_else(self.effects.as_ref(), update, |update| {
-                self.next.handle_update(update)
-            })
-            .await
-            .map(|_| ())
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_inline_query_update_or_else(self.effects.as_ref(), update, |update| {
+            self.next.handle_update(update)
         })
+        .await
+        .map(|_| ())
     }
 }
 
@@ -189,8 +187,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
 
     use super::{
@@ -465,17 +463,12 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .push(update.id);
+            Ok(())
         }
     }
 

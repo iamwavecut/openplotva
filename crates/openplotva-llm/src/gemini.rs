@@ -31,8 +31,8 @@ use crate::{
     ChatProvider, ChatProviderError, ContentBlockedError,
     aifarm::{
         AifarmHttpMethod, AifarmHttpRequest, AifarmHttpResponse, AifarmHttpTransport,
-        ReqwestAifarmTransport, build_initial_messages_with_tool_prompt,
-        build_session_history_with_limit,
+        ReqwestAifarmTransport, build_initial_messages_with_prompt_store,
+        build_initial_messages_with_tool_prompt, build_session_history_with_limit,
     },
     retry::{FailureReason, ProviderError, retryable_reason},
 };
@@ -234,6 +234,7 @@ pub struct GeminiDialogProvider<T = ReqwestAifarmTransport> {
     transport: T,
     cache: Option<Arc<GeminiExplicitCacheStore>>,
     trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    prompt_store: Option<Arc<openplotva_prompts::PromptStore>>,
 }
 
 #[derive(Debug)]
@@ -401,6 +402,7 @@ impl GeminiDialogProvider<ReqwestAifarmTransport> {
             cfg,
             transport: ReqwestAifarmTransport::new(client),
             trace_registry: crate::trace::global_registry(),
+            prompt_store: None,
         }
     }
 }
@@ -418,7 +420,14 @@ where
             cfg,
             transport,
             trace_registry: crate::trace::global_registry(),
+            prompt_store: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_prompt_store(mut self, prompt_store: Arc<openplotva_prompts::PromptStore>) -> Self {
+        self.prompt_store = Some(prompt_store);
+        self
     }
 
     /// Attach the provider-neutral local dialog toolbox for text-mode tool calls.
@@ -473,12 +482,20 @@ where
         let iteration = request.iteration.max(1);
         let history = build_session_history_with_limit(input, self.cfg.max_history);
         let model = self.cfg.model_for_input(input);
-        let mut messages = build_initial_messages_with_tool_prompt(
-            input,
-            &history,
-            crate::aifarm::ToolPromptMode::None,
-        )
-        .map_err(|error| Box::new(error) as ChatProviderError)?;
+        let messages = match self.prompt_store.as_deref() {
+            Some(prompts) => build_initial_messages_with_prompt_store(
+                prompts,
+                input,
+                &history,
+                crate::aifarm::ToolPromptMode::None,
+            ),
+            None => build_initial_messages_with_tool_prompt(
+                input,
+                &history,
+                crate::aifarm::ToolPromptMode::None,
+            ),
+        };
+        let mut messages = messages.map_err(|error| Box::new(error) as ChatProviderError)?;
         messages.extend(crate::aifarm::transcript_chat_messages(
             &request.transcript,
             false,
@@ -858,6 +875,139 @@ pub struct GeminiInlineData {
     pub data: String,
 }
 
+struct RedactedGeminiGenerateContentRequest<'a>(&'a GeminiGenerateContentRequest);
+
+impl Serialize for RedactedGeminiGenerateContentRequest<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let request = self.0;
+        let mut state = serializer.serialize_struct("GeminiGenerateContentRequest", 7)?;
+        if let Some(value) = &request.cached_content {
+            state.serialize_field("cachedContent", value)?;
+        }
+        if let Some(value) = &request.system_instruction {
+            state.serialize_field("systemInstruction", &RedactedGeminiContent(value))?;
+        }
+        state.serialize_field("contents", &RedactedGeminiContents(&request.contents))?;
+        state.serialize_field("generationConfig", &request.generation_config)?;
+        if !request.safety_settings.is_empty() {
+            state.serialize_field("safetySettings", &request.safety_settings)?;
+        }
+        if !request.tools.is_empty() {
+            state.serialize_field("tools", &request.tools)?;
+        }
+        if let Some(value) = &request.tool_config {
+            state.serialize_field("toolConfig", value)?;
+        }
+        state.end()
+    }
+}
+
+struct RedactedGeminiContents<'a>(&'a [GeminiContent]);
+
+impl Serialize for RedactedGeminiContents<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for content in self.0 {
+            sequence.serialize_element(&RedactedGeminiContent(content))?;
+        }
+        sequence.end()
+    }
+}
+
+struct RedactedGeminiContent<'a>(&'a GeminiContent);
+
+impl Serialize for RedactedGeminiContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("GeminiContent", 2)?;
+        if !self.0.role.is_empty() {
+            state.serialize_field("role", &self.0.role)?;
+        }
+        state.serialize_field("parts", &RedactedGeminiParts(&self.0.parts))?;
+        state.end()
+    }
+}
+
+struct RedactedGeminiParts<'a>(&'a [GeminiPart]);
+
+impl Serialize for RedactedGeminiParts<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for part in self.0 {
+            sequence.serialize_element(&RedactedGeminiPart(part))?;
+        }
+        sequence.end()
+    }
+}
+
+struct RedactedGeminiPart<'a>(&'a GeminiPart);
+
+impl Serialize for RedactedGeminiPart<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let part = self.0;
+        let mut state = serializer.serialize_struct("GeminiPart", 6)?;
+        if part.thought {
+            state.serialize_field("thought", &part.thought)?;
+        }
+        if !part.text.is_empty() {
+            state.serialize_field("text", &part.text)?;
+        }
+        if let Some(value) = &part.inline_data {
+            state.serialize_field("inlineData", &RedactedGeminiInlineData(value))?;
+        }
+        if let Some(value) = &part.file_data {
+            state.serialize_field("fileData", value)?;
+        }
+        if let Some(value) = &part.function_call {
+            state.serialize_field("functionCall", value)?;
+        }
+        if let Some(value) = &part.function_response {
+            state.serialize_field("functionResponse", value)?;
+        }
+        state.end()
+    }
+}
+
+struct RedactedGeminiInlineData<'a>(&'a GeminiInlineData);
+
+impl Serialize for RedactedGeminiInlineData<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("GeminiInlineData", 2)?;
+        state.serialize_field("mimeType", &self.0.mime_type)?;
+        state.serialize_field("data", "<redacted-inline-data>")?;
+        state.end()
+    }
+}
+
 /// Gemini remote file part.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1033,6 +1183,7 @@ pub struct GeminiMediaPromptOptimizer<T = ReqwestAifarmTransport> {
     edit_cache: Arc<GeminiExplicitCacheStore>,
     song_cache: Arc<GeminiExplicitCacheStore>,
     trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    prompt_store: Option<Arc<openplotva_prompts::PromptStore>>,
 }
 
 impl GeminiMediaPromptOptimizer<ReqwestAifarmTransport> {
@@ -1061,7 +1212,14 @@ where
             cfg,
             transport,
             trace_registry: crate::trace::global_registry(),
+            prompt_store: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_prompt_store(mut self, prompt_store: Arc<openplotva_prompts::PromptStore>) -> Self {
+        self.prompt_store = Some(prompt_store);
+        self
     }
 
     /// Override the trace registry (production uses the global one; tests inject an
@@ -1081,7 +1239,12 @@ where
         options: openplotva_media::OptimizePromptOptions,
     ) -> Result<openplotva_media::ImageOptimize, GeminiMediaPromptOptimizerError> {
         let (text, variant_count) = optimizer_text_and_count(text, options)?;
-        let prompt = openplotva_media::render_image_optimizer_prompt(variant_count)?;
+        let prompt = match self.prompt_store.as_deref() {
+            Some(prompts) => {
+                openplotva_media::render_image_optimizer_prompt_with(prompts, variant_count)?
+            }
+            None => openplotva_media::render_image_optimizer_prompt(variant_count)?,
+        };
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let payload = self
             .run_optimizer(&text, &prompt, &tool, &self.image_cache, "optimize_prompt")
@@ -1101,7 +1264,12 @@ where
         options: openplotva_media::OptimizePromptOptions,
     ) -> Result<openplotva_media::ImageEditOptimize, GeminiMediaPromptOptimizerError> {
         let (text, variant_count) = optimizer_text_and_count(text, options)?;
-        let prompt = openplotva_media::render_image_edit_optimizer_prompt(variant_count)?;
+        let prompt = match self.prompt_store.as_deref() {
+            Some(prompts) => {
+                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, variant_count)?
+            }
+            None => openplotva_media::render_image_edit_optimizer_prompt(variant_count)?,
+        };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
         let payload = self
             .run_optimizer(
@@ -1127,7 +1295,12 @@ where
     ) -> Result<openplotva_media::acestep::SongPromptResult, GeminiMediaPromptOptimizerError> {
         let (topic, language) = openplotva_media::acestep::normalize_song_prompt_input(&request)
             .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()))?;
-        let messages = openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?;
+        let messages = match self.prompt_store.as_deref() {
+            Some(prompts) => openplotva_media::acestep::render_song_reprompt_messages_with(
+                prompts, &topic, &language,
+            )?,
+            None => openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?,
+        };
         let tool = openplotva_media::acestep::optimize_song_prompt_terminator_definition();
         let model = self.cfg.model.clone();
         let mut gemini_request = gemini_song_prompt_request(messages, &tool, &model)
@@ -2420,14 +2593,16 @@ fn gemini_dialog_trace_artifacts(
     iteration: usize,
     cache_snapshot: Option<&GeminiCacheTraceSnapshot>,
 ) -> DialogTraceArtifacts {
-    let raw_response =
-        response.and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+    let raw_response = gemini_trace_raw_response(response);
     let usage = raw_response
         .as_ref()
         .and_then(gemini_trace_usage_from_response);
-    let resolved_cache_content =
-        cache_snapshot.and_then(|snapshot| serde_json::to_value(snapshot).ok());
-    DialogTraceArtifacts {
+    let resolved_cache_content = cache_snapshot.and_then(|snapshot| {
+        let mut value = serde_json::to_value(snapshot).ok()?;
+        crate::trace::redact_json_media(&mut value);
+        Some(value)
+    });
+    let artifact = DialogTraceArtifacts {
         provider: PROVIDER_GENKIT.to_owned(),
         request_kind: "gemini.generateContent".to_owned(),
         source: PROVIDER_GENKIT.to_owned(),
@@ -2435,14 +2610,11 @@ fn gemini_dialog_trace_artifacts(
         flow: "dialog".to_owned(),
         iteration: i32::try_from(iteration).unwrap_or(i32::MAX),
         model: model.trim().to_owned(),
-        raw_request: serde_json::to_value(request).ok(),
         raw_response,
         resolved_cache_content,
         inference_params: Some(gemini_trace_inference_params(request, cache_snapshot)),
         usage,
-        prompt_chars: serde_json::to_vec(request)
-            .map(|bytes| bytes.len().min(i32::MAX as usize) as i32)
-            .unwrap_or_default(),
+        prompt_chars: crate::trace::serialized_size(request),
         prompt_messages: i32::try_from(
             request
                 .contents
@@ -2458,7 +2630,12 @@ fn gemini_dialog_trace_artifacts(
             .saturating_add(input.shield_context.len())
             .min(i32::MAX as usize) as i32,
         ..DialogTraceArtifacts::default()
-    }
+    };
+    crate::trace::RedactedTraceArtifact::from_request(
+        &RedactedGeminiGenerateContentRequest(request),
+        artifact,
+    )
+    .into_inner()
 }
 
 /// Build a trace artifact for an auxiliary gemini round-trip (memory/history/optimizers).
@@ -2468,12 +2645,11 @@ fn gemini_aux_trace_artifacts(
     model: &str,
     flow: &str,
 ) -> DialogTraceArtifacts {
-    let raw_response =
-        response.and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+    let raw_response = gemini_trace_raw_response(response);
     let usage = raw_response
         .as_ref()
         .and_then(gemini_trace_usage_from_response);
-    DialogTraceArtifacts {
+    let artifact = DialogTraceArtifacts {
         provider: PROVIDER_GENKIT.to_owned(),
         request_kind: "gemini.generateContent".to_owned(),
         source: PROVIDER_GENKIT.to_owned(),
@@ -2481,13 +2657,10 @@ fn gemini_aux_trace_artifacts(
         flow: flow.to_owned(),
         iteration: 1,
         model: model.trim().to_owned(),
-        raw_request: serde_json::to_value(request).ok(),
         raw_response,
         inference_params: Some(gemini_trace_inference_params(request, None)),
         usage,
-        prompt_chars: serde_json::to_vec(request)
-            .map(|bytes| bytes.len().min(i32::MAX as usize) as i32)
-            .unwrap_or_default(),
+        prompt_chars: crate::trace::serialized_size(request),
         prompt_messages: i32::try_from(
             request
                 .contents
@@ -2496,7 +2669,18 @@ fn gemini_aux_trace_artifacts(
         )
         .unwrap_or(i32::MAX),
         ..DialogTraceArtifacts::default()
-    }
+    };
+    crate::trace::RedactedTraceArtifact::from_request(
+        &RedactedGeminiGenerateContentRequest(request),
+        artifact,
+    )
+    .into_inner()
+}
+
+fn gemini_trace_raw_response(response: Option<&AifarmHttpResponse>) -> Option<Value> {
+    let mut value = response.and_then(|response| serde_json::from_slice(&response.body).ok())?;
+    crate::trace::redact_json_media(&mut value);
+    Some(value)
 }
 
 /// Emit one trace record for an auxiliary gemini round-trip via the registry.
@@ -2878,7 +3062,11 @@ struct GeminiErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::{
+        fs,
+        sync::{Arc, Mutex, MutexGuard},
+        time::SystemTime,
+    };
 
     use serde_json::{Value, json};
 
@@ -2917,6 +3105,62 @@ mod tests {
                 state.responses.remove(0)
             })
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(Arc<Mutex<Vec<crate::trace::LlmCallRecord>>>);
+
+    impl crate::trace::LlmCallObserver for RecordingObserver {
+        fn observe(&self, record: crate::trace::LlmCallRecord) {
+            self.0.lock().expect("observer mutex").push(record);
+        }
+    }
+
+    fn gemini_step_request() -> openplotva_dialog::ChatStepRequest {
+        openplotva_dialog::ChatStepRequest {
+            input: openplotva_dialog::DialogInput {
+                context: openplotva_dialog::DialogContext {
+                    locale: "ru".to_owned(),
+                    ..openplotva_dialog::DialogContext::default()
+                },
+                user: openplotva_dialog::DialogUser {
+                    id: 42,
+                    full_name: "Alice".to_owned(),
+                },
+                message: openplotva_dialog::DialogMessage {
+                    id: 17,
+                    text: "hello".to_owned(),
+                    original_text: "hello".to_owned(),
+                    ..openplotva_dialog::DialogMessage::default()
+                },
+                ..openplotva_dialog::DialogInput::default()
+            },
+            transcript: Vec::new(),
+            tools: openplotva_dialog::ToolsMode::FinalOnly,
+            iteration: 1,
+        }
+    }
+
+    fn prompt_store_with(files: &[(&str, &str)]) -> Arc<openplotva_prompts::PromptStore> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openplotva-gemini-prompts-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create prompt root");
+        for (name, source) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("prompt parent"))
+                .expect("create prompt directory");
+            fs::write(path, source).expect("write prompt");
+        }
+        let store =
+            openplotva_prompts::PromptStore::from_root(&root).expect("compile prompt store");
+        fs::remove_dir_all(root).expect("remove prompt root");
+        Arc::new(store)
     }
 
     #[test]
@@ -2980,6 +3224,224 @@ mod tests {
         assert_eq!(artifact.source, PROVIDER_GENKIT);
         assert_eq!(artifact.request_kind, "gemini.generateContent");
         assert_eq!(artifact.model, "gemini-2.5-flash-lite");
+        assert_eq!(
+            artifact.raw_request,
+            serde_json::to_value(&request).ok(),
+            "redacted view must preserve the wire JSON shape without inline media"
+        );
+    }
+
+    #[test]
+    fn gemini_trace_artifacts_redact_inline_data_before_persistence() {
+        let request = GeminiGenerateContentRequest {
+            cached_content: None,
+            system_instruction: None,
+            contents: vec![GeminiContent {
+                role: "user".to_owned(),
+                parts: vec![GeminiPart {
+                    inline_data: Some(GeminiInlineData {
+                        mime_type: "image/png".to_owned(),
+                        data: "user-inline-secret".to_owned(),
+                    }),
+                    ..GeminiPart::default()
+                }],
+            }],
+            generation_config: GeminiGenerationConfig {
+                max_output_tokens: 0,
+                temperature: 0.0,
+                top_p: 0.0,
+                top_k: None,
+            },
+            safety_settings: Vec::new(),
+            tools: Vec::new(),
+            tool_config: None,
+        };
+
+        let response = json_response(json!({
+            "echo": "data:image/png;base64,response-secret",
+            "inlineData": {"data": "response-inline-secret", "mimeType": "image/png"}
+        }));
+        let artifact = gemini_aux_trace_artifacts(
+            &request,
+            Some(&response),
+            "gemini-2.5-flash-lite",
+            "memory_extraction",
+        );
+        let raw = artifact.raw_request.expect("raw request");
+
+        assert!(!raw.to_string().contains("user-inline-secret"));
+        assert_eq!(
+            raw["contents"][0]["parts"][0]["inlineData"]["data"],
+            "<redacted-inline-data>"
+        );
+        assert_eq!(
+            raw["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        let raw_response = artifact.raw_response.expect("raw response");
+        assert_eq!(raw_response["echo"], "data:<redacted-media>");
+        assert_eq!(raw_response["inlineData"]["data"], "<redacted-inline-data>");
+        assert!(!raw_response.to_string().contains("response-secret"));
+        assert!(!raw_response.to_string().contains("response-inline-secret"));
+    }
+
+    #[tokio::test]
+    async fn gemini_dialog_success_emits_exactly_one_trace_record() {
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Привет."}]},
+                "finishReason": "STOP"
+            }]
+        })))]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let provider = GeminiDialogProvider::with_transport(
+            GeminiDialogConfig {
+                api_key: "key".to_owned(),
+                ..GeminiDialogConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+
+        let output = provider.run_step(gemini_step_request()).await;
+
+        assert!(output.is_ok(), "gemini dialog: {output:?}");
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].artifact.error.is_empty());
+        assert_eq!(records[0].artifact.flow, "dialog");
+    }
+
+    #[tokio::test]
+    async fn gemini_dialog_transport_failure_emits_exactly_one_trace_record() {
+        let transport = FakeTransport::new(vec![Err(Box::new(std::io::Error::other(
+            "gemini transport failure",
+        )) as ChatProviderError)]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let provider = GeminiDialogProvider::with_transport(
+            GeminiDialogConfig {
+                api_key: "key".to_owned(),
+                ..GeminiDialogConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+
+        let output = provider.run_step(gemini_step_request()).await;
+
+        assert!(output.is_err());
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .artifact
+                .error
+                .contains("gemini transport failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_dialog_semantic_failure_emits_exactly_one_trace_record() {
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "candidates": []
+        })))]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let provider = GeminiDialogProvider::with_transport(
+            GeminiDialogConfig {
+                api_key: "key".to_owned(),
+                ..GeminiDialogConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+
+        let output = provider.run_step(gemini_step_request()).await;
+
+        assert!(output.is_err());
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].artifact.error.contains("empty model response"));
+    }
+
+    #[tokio::test]
+    async fn gemini_dialog_provider_uses_injected_prompt_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Привет."}]
+                },
+                "finishReason": "STOP"
+            }]
+        })))]);
+        let provider = GeminiDialogProvider::with_transport(
+            GeminiDialogConfig {
+                api_key: " key ".to_owned(),
+                ..GeminiDialogConfig::default()
+            },
+            transport.clone(),
+        )
+        .with_prompt_store(prompt_store_with(&[
+            (
+                "aifarm/system.prompt",
+                "custom gemini dialog locale={{locale}}",
+            ),
+            (
+                "aifarm/last_message_wrapper.prompt",
+                "custom gemini wrapper {{{message}}}",
+            ),
+        ]));
+        let input = openplotva_dialog::DialogInput {
+            context: openplotva_dialog::DialogContext {
+                locale: "ru".to_owned(),
+                ..openplotva_dialog::DialogContext::default()
+            },
+            user: openplotva_dialog::DialogUser {
+                id: 42,
+                full_name: "Alice".to_owned(),
+            },
+            message: openplotva_dialog::DialogMessage {
+                id: 17,
+                text: "hello".to_owned(),
+                original_text: "hello".to_owned(),
+                ..openplotva_dialog::DialogMessage::default()
+            },
+            ..openplotva_dialog::DialogInput::default()
+        };
+
+        let output = provider
+            .run_step(openplotva_dialog::ChatStepRequest {
+                input,
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::FinalOnly,
+                iteration: 1,
+            })
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+        assert_eq!(output.text, "Привет.");
+        let state = transport.state();
+        assert_eq!(state.requests.len(), 1);
+        let body: Value = serde_json::from_slice(&state.requests[0].body)?;
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "custom gemini dialog locale=ru"
+        );
+        assert!(
+            body["contents"]
+                .as_array()
+                .and_then(|contents| contents.last())
+                .and_then(|content| content["parts"][0]["text"].as_str())
+                .is_some_and(|text| text.starts_with("custom gemini wrapper "))
+        );
+        Ok(())
     }
 
     #[test]
@@ -3026,7 +3488,11 @@ mod tests {
                 ..GeminiMediaPromptOptimizerConfig::default()
             },
             transport.clone(),
-        );
+        )
+        .with_prompt_store(prompt_store_with(&[(
+            "image/optimizer.prompt",
+            "custom gemini image variants={{variant_count}}",
+        )]));
 
         let got = optimizer
             .optimize_image_prompt(
@@ -3056,11 +3522,9 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("pv|1|optimize_prompt_core_v2|"))
         );
-        assert!(
-            cache_body["systemInstruction"]["parts"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("optimize_prompt_terminator")
+        assert_eq!(
+            cache_body["systemInstruction"]["parts"][0]["text"],
+            "custom gemini image variants=2"
         );
         assert_eq!(
             cache_body["tools"][0]["functionDeclarations"][0]["name"],
@@ -3155,7 +3619,11 @@ mod tests {
                 ..GeminiMediaPromptOptimizerConfig::default()
             },
             transport.clone(),
-        );
+        )
+        .with_prompt_store(prompt_store_with(&[(
+            "music/song_reprompt.prompt",
+            "{{role \"system\"}}custom gemini song {{topic}}{{role \"user\"}}custom gemini user {{vocalLanguage}}",
+        )]));
 
         let got = optimizer
             .optimize_song_prompt(openplotva_media::acestep::SongPromptRequest {
@@ -3178,11 +3646,9 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("pv|1|chat_core_song_reprompt|"))
         );
-        assert!(
-            cache_body["systemInstruction"]["parts"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("optimize_song_prompt_terminator")
+        assert_eq!(
+            cache_body["systemInstruction"]["parts"][0]["text"],
+            "custom gemini song night city"
         );
         assert_eq!(
             cache_body["tools"][0]["functionDeclarations"][0]["name"],
@@ -3204,7 +3670,7 @@ mod tests {
         assert_eq!(generate_body["contents"][0]["role"], "user");
         assert_eq!(
             generate_body["contents"][0]["parts"][0]["text"],
-            "Topic: night city\nVocal language: en"
+            "custom gemini user en"
         );
         assert_eq!(generate_body["generationConfig"]["maxOutputTokens"], 1024);
         assert_eq!(generate_body["generationConfig"]["temperature"], 0.5);

@@ -166,11 +166,9 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC2029
-          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
+          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
-          # shellcheck disable=SC2029
-          tar -C tools/token-estimator -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           # shellcheck disable=SC2029
           ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 

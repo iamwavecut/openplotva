@@ -17,8 +17,7 @@ use carapax::types::{
     Chat as TelegramChat, MaybeInaccessibleMessage, Message as TelegramMessage,
     MessageData as TelegramMessageData, MessageOrigin as TelegramMessageOrigin, PollAnswerVoter,
     ReplyTo as TelegramReplyTo, Text as TelegramText, TextEntity as TelegramTextEntity,
-    TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
-    UpdateType as TelegramUpdateType, User as TelegramUser,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_core::{
     ChatAttachment, ChatMessageMeta, ChatState, MessageSender, SENDER_TYPE_CHANNEL,
@@ -1616,6 +1615,87 @@ pub struct ParsedAddressedMessage {
     pub is_addressed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedBotCommand<'a> {
+    pub command: &'a str,
+    pub target: Option<&'a str>,
+    pub arguments: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedUpdateKind {
+    Message,
+    EditedMessage,
+    GuestMessage,
+    CallbackQuery,
+    InlineQuery,
+    MemberState,
+    PreCheckoutQuery,
+    Skipped,
+}
+
+impl ParsedUpdateKind {
+    #[must_use]
+    pub fn from_update(update: &TelegramUpdate) -> Self {
+        match &update.update_type {
+            TelegramUpdateType::Message(_) => Self::Message,
+            TelegramUpdateType::EditedMessage(_) => Self::EditedMessage,
+            TelegramUpdateType::GuestMessage(_) => Self::GuestMessage,
+            TelegramUpdateType::CallbackQuery(_) => Self::CallbackQuery,
+            TelegramUpdateType::InlineQuery(_) => Self::InlineQuery,
+            TelegramUpdateType::BotStatus(_) | TelegramUpdateType::UserStatus(_) => {
+                Self::MemberState
+            }
+            TelegramUpdateType::PreCheckoutQuery(_) => Self::PreCheckoutQuery,
+            TelegramUpdateType::BusinessConnection(_)
+            | TelegramUpdateType::BusinessMessage(_)
+            | TelegramUpdateType::ChannelPost(_)
+            | TelegramUpdateType::ChatBoostRemoved(_)
+            | TelegramUpdateType::ChatBoostUpdated(_)
+            | TelegramUpdateType::ChatJoinRequest(_)
+            | TelegramUpdateType::ChosenInlineResult(_)
+            | TelegramUpdateType::DeletedBusinessMessages(_)
+            | TelegramUpdateType::EditedBusinessMessage(_)
+            | TelegramUpdateType::EditedChannelPost(_)
+            | TelegramUpdateType::ManagedBot(_)
+            | TelegramUpdateType::MessageReaction(_)
+            | TelegramUpdateType::MessageReactionCount(_)
+            | TelegramUpdateType::Poll(_)
+            | TelegramUpdateType::PollAnswer(_)
+            | TelegramUpdateType::PurchasedPaidMedia(_)
+            | TelegramUpdateType::ShippingQuery(_)
+            | TelegramUpdateType::Unknown(_) => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ParsedUpdate<'a> {
+    pub raw: &'a TelegramUpdate,
+    pub kind: ParsedUpdateKind,
+    pub command: Option<ParsedBotCommand<'a>>,
+}
+
+impl<'a> ParsedUpdate<'a> {
+    #[must_use]
+    pub fn new(raw: &'a TelegramUpdate) -> Self {
+        let kind = ParsedUpdateKind::from_update(raw);
+        let command = match &raw.update_type {
+            TelegramUpdateType::Message(message) => parse_leading_bot_command(message),
+            _ => None,
+        };
+        Self { raw, kind, command }
+    }
+}
+
+#[must_use]
+pub fn parse_leading_bot_command(message: &TelegramMessage) -> Option<ParsedBotCommand<'_>> {
+    let TelegramMessageData::Text(text) = &message.data else {
+        return None;
+    };
+    parse_leading_bot_command_from_text(text)
+}
+
 #[must_use]
 pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> ParsedAddressedMessage {
     let (message_text, text_for_parsing) = addressable_message_text(message);
@@ -1662,7 +1742,7 @@ pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> Pars
 
 #[must_use]
 pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str) -> bool {
-    let Some(command) = leading_bot_command(message) else {
+    let Some(command) = parse_leading_bot_command(message) else {
         return false;
     };
     if !command.command.eq_ignore_ascii_case("settings") {
@@ -1673,7 +1753,6 @@ pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str
     }
     command
         .target
-        .as_deref()
         .is_none_or(|target| target.eq_ignore_ascii_case(bot_username))
 }
 
@@ -3186,20 +3265,7 @@ fn addressed_by_bot_reply(message: &TelegramMessage, bot: &TelegramUser) -> bool
     reply.id != thread_id
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BotCommandInMessage {
-    command: String,
-    target: Option<String>,
-}
-
-fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_bot_command_from_text(text)
-}
-
-fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
+fn parse_leading_bot_command_from_text(text: &TelegramText) -> Option<ParsedBotCommand<'_>> {
     let first = text.entities.as_ref()?.into_iter().next()?;
     let TelegramTextEntity::BotCommand(position) = first else {
         return None;
@@ -3208,27 +3274,38 @@ fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMess
         return None;
     }
 
-    let command_with_slash = text_entity_content(&text.data, *position);
+    let command_end = utf16_units_to_byte_index(&text.data, position.length as usize)?;
+    let command_with_slash = text.data.get(..command_end)?;
     let command_with_target = command_with_slash.strip_prefix('/')?;
     let (command, target) = match command_with_target.split_once('@') {
-        Some((command, target)) => (command, Some(target.to_owned())),
+        Some((command, target)) => (command, Some(target)),
         None => (command_with_target, None),
     };
+    let tail = text.data.get(command_end..)?;
+    let arguments = tail
+        .char_indices()
+        .nth(1)
+        .map_or("", |(argument_start, _)| &tail[argument_start..]);
 
-    Some(BotCommandInMessage {
-        command: command.to_owned(),
+    Some(ParsedBotCommand {
+        command,
         target,
+        arguments,
     })
 }
 
-fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> String {
-    String::from_utf16_lossy(
-        &text
-            .encode_utf16()
-            .skip(position.offset as usize)
-            .take(position.length as usize)
-            .collect::<Vec<u16>>(),
-    )
+fn utf16_units_to_byte_index(text: &str, units: usize) -> Option<usize> {
+    let mut consumed = 0;
+    for (byte_index, character) in text.char_indices() {
+        if consumed == units {
+            return Some(byte_index);
+        }
+        consumed = consumed.checked_add(character.len_utf16())?;
+        if consumed > units {
+            return None;
+        }
+    }
+    (consumed == units).then_some(text.len())
 }
 
 fn is_equal_transliterated(name: &str, given: &str) -> bool {
@@ -3583,10 +3660,10 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GoUpdateType, GuestChainMessage, GuestChainRole,
-        MAX_ENQUEUE_ERRORS, RedisUpdateQueue, TelegramMessageAttachmentOptions,
-        UPDATE_CLAIM_RETRY_AFTER, UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT,
-        UPDATE_STALL_AGE, UpdateCodecError, UpdateConsumerConfig, UpdateIngressDecision,
-        UpdateIngressGuard, UpdateIngressGuardConfig, UpdateProducerQueue,
+        MAX_ENQUEUE_ERRORS, ParsedUpdate, ParsedUpdateKind, RedisUpdateQueue,
+        TelegramMessageAttachmentOptions, UPDATE_CLAIM_RETRY_AFTER, UPDATE_CLAIM_SLOW_LOG_AFTER,
+        UPDATE_CLAIM_TIMEOUT, UPDATE_STALL_AGE, UpdateCodecError, UpdateConsumerConfig,
+        UpdateIngressDecision, UpdateIngressGuard, UpdateIngressGuardConfig, UpdateProducerQueue,
         UpdateProducerQueueFuture, UpdateProducerSource, UpdateProducerSourceFuture, UpdateStage,
         UpdateStageOutcome, UpdateStageReport, UpdateStageTracker, blocking_response_timeout,
         blpop_timeout_arg, build_guest_dialog_text, build_guest_shield_query_text,
@@ -3595,9 +3672,10 @@ mod tests {
         guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
         guest_request_has_visible_text, guest_visible_text, is_guest_unsupported_feature_request,
         is_settings_command_message, looks_like_guest_history_summary_request,
-        normalize_guest_command_word, parse_edit_command, parse_if_addressed, process_update_at,
-        process_update_with_stage_tracker_at, producer_update_name, producer_update_type,
-        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
+        normalize_guest_command_word, parse_edit_command, parse_if_addressed,
+        parse_leading_bot_command, process_update_at, process_update_with_stage_tracker_at,
+        producer_update_name, producer_update_type, react_message_words,
+        resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
@@ -6065,6 +6143,61 @@ mod tests {
         assert!(!is_settings_command_message(&wrong_bot, "plotvabot"));
         assert!(is_settings_command_message(&group_settings, ""));
         assert!(!is_settings_command_message(&embedded_command, "plotvabot"));
+        Ok(())
+    }
+
+    #[test]
+    fn leading_bot_command_borrows_utf16_entity_target_and_arguments() -> Result<(), Box<dyn Error>>
+    {
+        let message = sample_message_from_value(json!({
+            "message_id": 9,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "/help@PlotvaBot привет 😀",
+            "entities": [{
+                "type": "bot_command",
+                "offset": 0,
+                "length": 15
+            }]
+        }))?;
+
+        let parsed = parse_leading_bot_command(&message).expect("leading bot command");
+
+        assert_eq!(parsed.command, "help");
+        assert_eq!(parsed.target, Some("PlotvaBot"));
+        assert_eq!(parsed.arguments, "привет 😀");
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_update_route_matrix_borrows_raw_and_command_once() -> Result<(), Box<dyn Error>> {
+        let command_message = sample_message_from_value(json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "/help@PlotvaBot привет",
+            "entities": [{
+                "type": "bot_command",
+                "offset": 0,
+                "length": 15
+            }]
+        }))?;
+        let command_update =
+            TelegramUpdate::new(100, TelegramUpdateType::Message(Box::new(command_message)));
+        let callback = sample_callback_update_with_id(101)?;
+        let poll = sample_poll_update_with_id(102)?;
+
+        let parsed = ParsedUpdate::new(&command_update);
+        assert!(std::ptr::eq(parsed.raw, &command_update));
+        assert_eq!(parsed.kind, ParsedUpdateKind::Message);
+        assert_eq!(parsed.command.map(|command| command.command), Some("help"));
+        assert_eq!(
+            ParsedUpdate::new(&callback).kind,
+            ParsedUpdateKind::CallbackQuery
+        );
+        assert_eq!(ParsedUpdate::new(&poll).kind, ParsedUpdateKind::Skipped);
         Ok(())
     }
 

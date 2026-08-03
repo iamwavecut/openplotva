@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::rate_limit::DEFAULT_RATE_LIMITER_MAX_IDLE;
 use crate::{
-    ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, RichApiClient,
+    ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, OutboundCommand, RichApiClient,
     TelegramOutboundMethod, TelegramOutboundMethodKind, send_telegram_method_status,
     send_telegram_method_status_with_rich,
 };
@@ -82,8 +82,7 @@ pub struct DispatcherMessage {
     pub fingerprint: MessageFingerprint,
     /// Virtual message ID used for cancellation and future real-ID mapping.
     pub virtual_id: String,
-    method: Option<TelegramOutboundMethod>,
-    persistence_payload: Option<DispatcherPersistencePayload>,
+    command: Option<OutboundCommand>,
     bypass_chat_restrictions: bool,
     ephemeral_delete_after: Option<Duration>,
     protected: bool,
@@ -95,8 +94,7 @@ impl DispatcherMessage {
         Self {
             fingerprint,
             virtual_id: virtual_id.into(),
-            method: None,
-            persistence_payload: None,
+            command: None,
             bypass_chat_restrictions: false,
             ephemeral_delete_after: None,
             protected: false,
@@ -105,12 +103,20 @@ impl DispatcherMessage {
 
     /// Attach the concrete Telegram method that the worker should send.
     pub fn with_method(mut self, method: TelegramOutboundMethod) -> Self {
-        self.method = Some(method);
+        self.command = Some(OutboundCommand::from_method(method));
+        self
+    }
+
+    /// Attach a canonical versioned command, including its exact persistence bytes.
+    pub fn with_command(mut self, command: OutboundCommand) -> Self {
+        self.command = Some(command);
         self
     }
 
     pub fn with_persistence_payload(mut self, payload: DispatcherPersistencePayload) -> Self {
-        self.persistence_payload = Some(payload);
+        if let Some(command) = self.command.take() {
+            self.command = Some(command.with_legacy_payload(payload));
+        }
         self
     }
 
@@ -161,6 +167,15 @@ impl DispatcherPersistencePayload {
     ) -> Result<Self, serde_json::Error> {
         Ok(Self::new(message_type, serde_json::to_vec(&value)?))
     }
+
+    /// Decode this legacy queue payload into the canonical command model.
+    pub fn into_command(self) -> Result<OutboundCommand, crate::OutboundCommandCodecError> {
+        OutboundCommand::decode(
+            crate::OUTBOUND_COMMAND_PAYLOAD_VERSION,
+            &self.message_type,
+            &self.message,
+        )
+    }
 }
 
 /// Result of trying to enqueue a message.
@@ -174,6 +189,8 @@ pub enum EnqueueOutcome {
 
 /// Result of taking a regular queue item for worker processing.
 #[derive(Debug)]
+// `Ready` is the hot path; boxing it would add an allocation to every dequeue.
+#[allow(clippy::large_enum_variant)]
 pub enum RegularDequeueOutcome {
     /// The regular queue was empty.
     Empty,
@@ -238,8 +255,7 @@ pub struct DispatcherQueuedMessage {
 #[derive(Debug)]
 pub struct DispatcherWorkItem {
     metadata: DispatcherQueuedMessage,
-    method: Option<TelegramOutboundMethod>,
-    persistence_payload: Option<DispatcherPersistencePayload>,
+    command: Option<OutboundCommand>,
     bypass_chat_restrictions: bool,
     ephemeral_delete_after: Option<Duration>,
 }
@@ -251,7 +267,7 @@ impl DispatcherWorkItem {
 
     /// Return the Telegram method kind without consuming the queued payload.
     pub fn method_kind(&self) -> Option<TelegramOutboundMethodKind> {
-        self.method.as_ref().map(TelegramOutboundMethod::kind)
+        self.command.as_ref().map(OutboundCommand::method_kind)
     }
 
     /// Return whether this queued item should skip chat permission settings.
@@ -265,12 +281,20 @@ impl DispatcherWorkItem {
 
     /// Consume the worker item and return only the concrete Telegram method payload.
     pub fn into_method(self) -> Option<TelegramOutboundMethod> {
-        self.method
+        self.command.map(OutboundCommand::into_method)
+    }
+
+    /// Consume the worker item and return its canonical command.
+    pub fn into_command(self) -> Option<OutboundCommand> {
+        self.command
     }
 
     /// Consume the worker item and return both metadata and the concrete payload.
     pub fn into_parts(self) -> (DispatcherQueuedMessage, Option<TelegramOutboundMethod>) {
-        (self.metadata, self.method)
+        (
+            self.metadata,
+            self.command.map(OutboundCommand::into_method),
+        )
     }
 
     /// Consume the worker item and return metadata, payload, and persistence payload.
@@ -278,16 +302,10 @@ impl DispatcherWorkItem {
         self,
     ) -> (
         DispatcherQueuedMessage,
-        Option<TelegramOutboundMethod>,
-        Option<DispatcherPersistencePayload>,
+        Option<OutboundCommand>,
         Option<Duration>,
     ) {
-        (
-            self.metadata,
-            self.method,
-            self.persistence_payload,
-            self.ephemeral_delete_after,
-        )
+        (self.metadata, self.command, self.ephemeral_delete_after)
     }
 }
 
@@ -302,9 +320,8 @@ pub struct DispatcherRestoredMessage {
     pub immediate: bool,
     /// Original enqueue wall-clock time from persistent storage.
     pub enqueued_at: SystemTime,
-    /// Concrete Telegram method to replay.
-    pub method: TelegramOutboundMethod,
-    pub persistence_payload: Option<DispatcherPersistencePayload>,
+    /// Canonical Telegram command to replay without rewriting its persisted bytes.
+    pub command: OutboundCommand,
     pub bypass_chat_restrictions: bool,
     pub ephemeral_delete_after: Option<Duration>,
 }
@@ -374,8 +391,7 @@ struct DispatcherQueueState {
 #[derive(Debug)]
 struct DispatcherQueueItem {
     metadata: DispatcherQueuedMessage,
-    method: Option<TelegramOutboundMethod>,
-    persistence_payload: Option<DispatcherPersistencePayload>,
+    command: Option<OutboundCommand>,
     bypass_chat_restrictions: bool,
     ephemeral_delete_after: Option<Duration>,
 }
@@ -384,8 +400,7 @@ impl DispatcherQueueItem {
     fn into_work_item(self) -> DispatcherWorkItem {
         DispatcherWorkItem {
             metadata: self.metadata,
-            method: self.method,
-            persistence_payload: self.persistence_payload,
+            command: self.command,
             bypass_chat_restrictions: self.bypass_chat_restrictions,
             ephemeral_delete_after: self.ephemeral_delete_after,
         }
@@ -765,8 +780,7 @@ impl DispatcherQueue {
     pub fn requeue_regular_front(&self, message: DispatcherWorkItem) {
         self.state().regular.push_front(DispatcherQueueItem {
             metadata: message.metadata,
-            method: message.method,
-            persistence_payload: message.persistence_payload,
+            command: message.command,
             bypass_chat_restrictions: message.bypass_chat_restrictions,
             ephemeral_delete_after: message.ephemeral_delete_after,
         });
@@ -826,8 +840,7 @@ impl DispatcherQueue {
         let DispatcherMessage {
             fingerprint,
             virtual_id,
-            method,
-            persistence_payload,
+            command,
             bypass_chat_restrictions,
             ephemeral_delete_after,
             protected,
@@ -855,8 +868,7 @@ impl DispatcherQueue {
                 ephemeral_delete_after,
                 protected,
             },
-            method,
-            persistence_payload,
+            command,
             bypass_chat_restrictions,
             ephemeral_delete_after,
         };
@@ -881,8 +893,7 @@ impl DispatcherQueue {
             virtual_id,
             immediate,
             enqueued_at,
-            method,
-            persistence_payload,
+            command,
             bypass_chat_restrictions,
             ephemeral_delete_after,
         } = message;
@@ -906,8 +917,7 @@ impl DispatcherQueue {
                 ephemeral_delete_after,
                 protected: false,
             },
-            method: Some(method),
-            persistence_payload,
+            command: Some(command),
             bypass_chat_restrictions,
             ephemeral_delete_after,
         };
@@ -1226,7 +1236,7 @@ mod tests {
         RegularDequeueOutcome, run_limiter_cleanup_until,
     };
     use crate::{
-        ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint,
+        ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint, OutboundCommand,
         TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
     };
 
@@ -1264,8 +1274,7 @@ mod tests {
             virtual_id: virtual_id.to_owned(),
             immediate,
             enqueued_at: std::time::SystemTime::now(),
-            method: text_method(chat_id, text),
-            persistence_payload: None,
+            command: OutboundCommand::from_method(text_method(chat_id, text)),
             bypass_chat_restrictions: false,
             ephemeral_delete_after: None,
         }

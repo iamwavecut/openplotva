@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 
 use crate::{
     permissions::{ChatPermissionContext, ChatPermissionStore},
-    updates::{UpdateHandler, UpdateHandlerFuture},
+    updates::UpdateHandler,
 };
 
 /// Boxed future returned by chat-communication effects.
@@ -529,17 +529,15 @@ where
 {
     type Error = LeftChatMemberUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_left_chat_member_update_or_else(
-                self.effects.as_ref(),
-                self.bot_id,
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_left_chat_member_update_or_else(
+            self.effects.as_ref(),
+            self.bot_id,
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -551,19 +549,17 @@ where
 {
     type Error = ChatMemberStateUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_chat_member_state_update_or_else_at(
-                self.queue.as_ref(),
-                self.effects.as_ref(),
-                self.bot_id,
-                update,
-                OffsetDateTime::now_utc(),
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_chat_member_state_update_or_else_at(
+            self.queue.as_ref(),
+            self.effects.as_ref(),
+            self.bot_id,
+            update,
+            OffsetDateTime::now_utc(),
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1139,7 +1135,7 @@ mod tests {
         },
         permissions::{ChatPermissionContext, ChatPermissionStore, ChatPermissionStoreFuture},
         updates::{
-            TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+            TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore,
             UpdateStateStoreFuture, process_update_with_state_store_at,
         },
     };
@@ -1678,14 +1674,14 @@ mod tests {
             );
         }
 
-        assert_eq!(queue.jobs().len(), 2);
+        assert_eq!(queue.jobs().len(), 1);
         assert_eq!(
             queue
                 .jobs()
                 .iter()
                 .filter_map(|job| job.data.control_data.as_ref().map(|data| data.kind))
                 .collect::<Vec<_>>(),
-            vec![ControlKind::ChatMemberSync, ControlKind::ChatAdminsSync]
+            vec![ControlKind::ChatAdminsSync]
         );
         assert_eq!(effects.enabled(), vec![-10042]);
         assert_eq!(effects.disabled(), vec![-10042]);
@@ -2479,17 +2475,12 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .push(update.id);
+            Ok(())
         }
     }
 

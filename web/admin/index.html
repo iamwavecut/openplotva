@@ -173,6 +173,14 @@
                     <div id="taskman" class="tab-pane">
                         <div class="split-pane" id="pane-taskman">
                             <div class="pane-list">
+                                <form data-action="loadTaskmanJobByInput" role="search"
+                                    class="d-flex gap-2 mb-4 align-center">
+                                    <pl-field-group label="Open job by ID">
+                                        <pl-input id="taskman-job-id" placeholder="Job ID"></pl-input>
+                                    </pl-field-group>
+                                    <pl-button type="submit" variant="outline"
+                                        data-action="loadTaskmanJobByInput">Open</pl-button>
+                                </form>
                                 <form data-action="loadTaskmanJobs" role="search">
                                     <div class="card">
                                         <div class="card-header">
@@ -292,22 +300,16 @@
                                         <span>Job Details</span>
                                         <pl-button-group>
                                             <pl-button variant="outline" size="sm"
-                                                data-action="copyTaskmanSelectedJob">Copy JSON</pl-button>
+                                                data-action="copyTaskmanSelectedJob" disabled>Copy JSON</pl-button>
                                             <pl-button variant="danger" size="sm"
-                                                data-action="cancelTaskmanSelectedJob">Cancel</pl-button>
+                                                data-action="cancelTaskmanSelectedJob" disabled>Cancel</pl-button>
                                             <pl-button variant="primary" size="sm"
-                                                data-action="restartTaskmanSelectedJob">Restart</pl-button>
+                                                data-action="restartTaskmanSelectedJob" disabled>Restart</pl-button>
                                             <pl-button variant="outline" size="sm"
                                                 data-action="toggleTaskmanDetails">Close</pl-button>
                                         </pl-button-group>
                                     </div>
                                     <div class="card-body">
-                                        <div class="d-flex gap-2 mb-4 align-center">
-                                            <pl-input id="taskman-job-id" placeholder="Job ID"></pl-input>
-                                            <pl-button variant="outline"
-                                                data-action="loadTaskmanJobByInput">Load</pl-button>
-                                        </div>
-
                                         <div class="card card-inset">
                                             <div class="card-header">Details</div>
                                             <div class="card-body">
@@ -1243,6 +1245,403 @@
                 if (loader) loader.classList.remove('active');
                 searchButtons.forEach(btn => btn.disabled = false);
             }
+        }
+
+        // --- Taskman ---
+        const taskmanState = {
+            list: null,
+            offset: 0,
+            limit: 200,
+            selected: null,
+            selectedID: null,
+            filterKey: null,
+            listGeneration: 0,
+            detailGeneration: 0,
+        };
+
+        function taskmanValue(id) {
+            return (document.getElementById(id)?.value || '').trim();
+        }
+
+        function taskmanISOTime(id) {
+            const value = taskmanValue(id);
+            if (!value) return '';
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+        }
+
+        function taskmanPositiveID(value) {
+            if (!/^\d+$/.test(value)) return null;
+            const id = Number(value);
+            return Number.isSafeInteger(id) && id > 0 ? id : null;
+        }
+
+        function taskmanFilterParams(includePage) {
+            const params = new URLSearchParams();
+            const fields = [
+                ['q', taskmanValue('taskman-search-input')],
+                ['queue', taskmanValue('taskman-queue')],
+                ['status', taskmanValue('taskman-status')],
+                ['chat_id', taskmanValue('taskman-chat-id')],
+                ['user_id', taskmanValue('taskman-user-id')],
+                ['time_field', taskmanValue('taskman-time-field')],
+                ['from', taskmanISOTime('taskman-from')],
+                ['to', taskmanISOTime('taskman-to')],
+                ['sort_by', taskmanValue('taskman-sort-by')],
+                ['sort_dir', taskmanValue('taskman-sort-dir')],
+            ];
+            fields.forEach(([key, value]) => { if (value) params.set(key, value); });
+            if (includePage) {
+                params.set('offset', String(taskmanState.offset));
+                params.set('limit', String(taskmanState.limit));
+            }
+            return params;
+        }
+
+        function taskmanStatusTone(status) {
+            const tones = {
+                pending: 'neutral',
+                processing: 'info',
+                completed: 'success',
+                failed: 'danger',
+                cancelled: 'warning',
+            };
+            return tones[String(status || '').toLowerCase()] || 'neutral';
+        }
+
+        function taskmanTime(value) {
+            if (!value) return '—';
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+        }
+
+        function taskmanCellValue(value) {
+            if (value === null || value === undefined) return '—';
+            return typeof value === 'object' ? JSON.stringify(value) : String(value);
+        }
+
+        function taskmanSetActionsEnabled(enabled) {
+            [
+                'copyTaskmanSelectedJob',
+                'cancelTaskmanSelectedJob',
+                'restartTaskmanSelectedJob',
+            ].forEach(action => {
+                const button = document.querySelector(`#pane-taskman-details [data-action="${action}"]`);
+                if (button) button.disabled = !enabled;
+            });
+        }
+
+        function taskmanJobsTable() {
+            const container = document.getElementById('taskman-jobs-list');
+            if (!container) return null;
+            let table = container.querySelector('pl-table');
+            if (table) return table;
+            table = PL.el('pl-table', { dense: true, 'row-clickable': true, 'skeleton-rows': '6' });
+            table.columns = [
+                { key: 'id', label: 'ID', mono: true },
+                { key: 'status', label: 'Status', render: row => PL.badge(row.status || 'unknown', taskmanStatusTone(row.status)) },
+                { key: 'queue_name', label: 'Queue', mono: true },
+                {
+                    key: 'title', label: 'Job', render: row => {
+                        const cell = PL.el('div');
+                        cell.append(PL.el('div', { class: 'cell-strong' }, row.title || row.job_type || 'Untitled job'));
+                        if (row.preview) cell.append(PL.el('div', { class: 'text-muted' }, row.preview));
+                        return cell;
+                    }
+                },
+                {
+                    key: 'scope', label: 'Chat / user', mono: true,
+                    render: row => `${row.chat_id ?? '—'} / ${row.user_id ?? '—'}`,
+                },
+                { key: 'created_at', label: 'Created', render: row => taskmanTime(row.created_at) },
+            ];
+            table.emptyTitle = 'No Taskman jobs';
+            table.emptyDesc = 'No jobs match the current filters.';
+            table.onRetry = () => loadTaskmanJobs(false);
+            table.addEventListener('pl:row-click', event => {
+                const id = event.detail?.row?.id;
+                if (id !== undefined && id !== null) taskmanLoadJob(id);
+            });
+            container.replaceChildren(table);
+            return table;
+        }
+
+        function taskmanRenderSummary(data) {
+            const summary = document.getElementById('taskman-summary');
+            if (!summary) return;
+            const total = Number(data.total) || 0;
+            const offset = Number(data.offset) || 0;
+            const count = Array.isArray(data.items) ? data.items.length : 0;
+            const windowText = count ? `${offset + 1}–${offset + count}` : '0';
+            const byStatus = Object.entries(data.summary?.by_status || {})
+                .map(([status, value]) => `${status}:${value}`).join(' ');
+            const byQueue = Object.entries(data.summary?.by_queue || {})
+                .map(([queue, value]) => `${queue}:${value}`).join(' ');
+            summary.textContent = [`Showing ${windowText} of ${total}`, byStatus, byQueue]
+                .filter(Boolean).join(' · ');
+        }
+
+        function taskmanUpdatePager() {
+            const total = Number(taskmanState.list?.total) || 0;
+            const prev = document.querySelector('[data-action="taskmanPrevPage"]');
+            const next = document.querySelector('[data-action="taskmanNextPage"]');
+            if (prev) prev.disabled = taskmanState.offset <= 0;
+            if (next) next.disabled = taskmanState.offset + taskmanState.limit >= total;
+        }
+
+        async function loadTaskmanJobs(reset) {
+            const submitted = typeof HTMLFormElement !== 'undefined' && this instanceof HTMLFormElement;
+            if (reset === true || submitted) taskmanState.offset = 0;
+            const requestedLimit = Number(taskmanValue('taskman-limit'));
+            taskmanState.limit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? requestedLimit : 200;
+
+            const generation = ++taskmanState.listGeneration;
+            const table = taskmanJobsTable();
+            if (table) table.state = 'loading';
+            const params = taskmanFilterParams(true);
+            const filterKey = taskmanFilterParams(false).toString();
+            taskmanState.filterKey = null;
+            const data = await apiCall(`/taskman/jobs?${params.toString()}`);
+            if (generation !== taskmanState.listGeneration) return;
+            if (!data) {
+                if (table) table.showError('Could not load Taskman jobs.');
+                return;
+            }
+
+            const responseLimit = Number(data.limit);
+            const responseOffset = Number(data.offset);
+            taskmanState.limit = Number.isInteger(responseLimit) && responseLimit > 0
+                ? responseLimit : taskmanState.limit;
+            taskmanState.offset = Number.isInteger(responseOffset) && responseOffset >= 0
+                ? responseOffset : taskmanState.offset;
+            taskmanState.list = data;
+            taskmanState.filterKey = filterKey;
+            if (table) table.rows = Array.isArray(data.items) ? data.items : [];
+            taskmanRenderSummary(data);
+            taskmanUpdatePager();
+        }
+
+        async function taskmanPrevPage() {
+            if (taskmanState.offset <= 0) return;
+            taskmanState.offset = Math.max(0, taskmanState.offset - taskmanState.limit);
+            await loadTaskmanJobs(false);
+        }
+
+        async function taskmanNextPage() {
+            const total = Number(taskmanState.list?.total) || 0;
+            if (taskmanState.offset + taskmanState.limit >= total) return;
+            taskmanState.offset += taskmanState.limit;
+            await loadTaskmanJobs(false);
+        }
+
+        function taskmanOpenDetails() {
+            const detailsPane = document.getElementById('pane-taskman-details');
+            const resizer = document.getElementById('resizer-taskman');
+            if (detailsPane) detailsPane.classList.remove('hidden');
+            if (resizer) resizer.classList.remove('hidden');
+        }
+
+        function toggleTaskmanDetails() {
+            const detailsPane = document.getElementById('pane-taskman-details');
+            const resizer = document.getElementById('resizer-taskman');
+            if (!detailsPane || !resizer) return;
+            if (detailsPane.classList.contains('hidden') && taskmanState.selected) {
+                taskmanOpenDetails();
+            } else {
+                detailsPane.classList.add('hidden');
+                resizer.classList.add('hidden');
+            }
+        }
+
+        function taskmanRenderRecords(containerID, rows, emptyTitle, preferredColumns) {
+            const container = document.getElementById(containerID);
+            if (!container) return;
+            const records = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+            const table = PL.el('pl-table', { dense: true });
+            const keys = preferredColumns || Array.from(records.reduce((all, record) => {
+                if (record && typeof record === 'object') Object.keys(record).forEach(key => all.add(key));
+                return all;
+            }, new Set())).slice(0, 8);
+            table.columns = keys.map(key => ({
+                key,
+                label: key.replaceAll('_', ' '),
+                mono: /(^id$|_id$|_at$)/.test(key),
+                render: record => taskmanCellValue(record?.[key]),
+            }));
+            table.emptyTitle = emptyTitle;
+            table.rows = records;
+            container.replaceChildren(table);
+        }
+
+        function taskmanRenderDetails(data) {
+            const job = data.job || {};
+            const details = document.getElementById('taskman-job-details');
+            if (details) {
+                details.removeAttribute('aria-busy');
+                details.textContent = JSON.stringify(job, null, 2);
+            }
+
+            const artifacts = document.getElementById('taskman-job-artifacts');
+            if (artifacts) {
+                artifacts.hidden = false;
+                artifacts.replaceChildren(
+                    PL.badge(job.status || 'unknown', taskmanStatusTone(job.status)),
+                    PL.badge(job.queue_name || 'unknown queue', 'neutral'),
+                );
+                const jobType = job.payload?.type || job.job_type;
+                if (jobType) artifacts.append(PL.badge(jobType, 'info'));
+            }
+
+            taskmanRenderRecords('taskman-job-events', data.events, 'No job events');
+            taskmanRenderRecords(
+                'taskman-job-messages',
+                data.messages,
+                'No job messages',
+                ['id', 'message_type', 'chat_id', 'message_id', 'status', 'created_at'],
+            );
+        }
+
+        async function taskmanLoadJob(rawID) {
+            const id = taskmanPositiveID(String(rawID));
+            if (id === null) {
+                PL.toast('Enter a positive Taskman job ID.', 'warning');
+                return;
+            }
+
+            const generation = ++taskmanState.detailGeneration;
+            taskmanState.selected = null;
+            taskmanState.selectedID = id;
+            taskmanSetActionsEnabled(false);
+            taskmanOpenDetails();
+            const details = document.getElementById('taskman-job-details');
+            const events = document.getElementById('taskman-job-events');
+            const messages = document.getElementById('taskman-job-messages');
+            const artifacts = document.getElementById('taskman-job-artifacts');
+            if (artifacts) {
+                artifacts.hidden = true;
+                artifacts.replaceChildren();
+            }
+            if (details) PL.skeleton(details, { rows: 8 });
+            if (events) PL.skeleton(events, { rows: 3 });
+            if (messages) PL.skeleton(messages, { rows: 3 });
+
+            const data = await apiCall(`/taskman/job?id=${encodeURIComponent(id)}`);
+            if (generation !== taskmanState.detailGeneration) return;
+            if (!data || !data.job) {
+                taskmanState.selectedID = null;
+                if (details) PL.error(details, { message: `Could not load Taskman job ${id}.`, onRetry: () => taskmanLoadJob(id) });
+                if (events) PL.error(events, { message: 'Job events unavailable.' });
+                if (messages) PL.error(messages, { message: 'Job messages unavailable.' });
+                return;
+            }
+
+            taskmanState.selected = data;
+            taskmanState.selectedID = taskmanPositiveID(String(data.job.id)) || id;
+            const input = document.getElementById('taskman-job-id');
+            if (input) input.value = String(taskmanState.selectedID);
+            taskmanRenderDetails(data);
+            taskmanSetActionsEnabled(true);
+        }
+
+        async function loadTaskmanJobByInput() {
+            await taskmanLoadJob(taskmanValue('taskman-job-id'));
+        }
+
+        async function copyTaskmanSelectedJob() {
+            if (!taskmanState.selected) {
+                PL.toast('Select a Taskman job first.', 'warning');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(JSON.stringify(taskmanState.selected, null, 2));
+                PL.toast('Job JSON copied.', 'success');
+            } catch (error) {
+                console.error(error);
+                PL.toast('Could not copy job JSON.', 'error');
+            }
+        }
+
+        async function cancelTaskmanSelectedJob() {
+            const id = taskmanState.selectedID;
+            if (!id) {
+                PL.toast('Select a Taskman job first.', 'warning');
+                return;
+            }
+            const confirmed = await PL.confirm({
+                title: `Cancel job ${id}`,
+                body: 'Cancel this job? A worker that already started may observe cancellation asynchronously.',
+                danger: true,
+                okLabel: 'Cancel job',
+            });
+            if (!confirmed) return;
+            const result = await apiCall(`/taskman/job/cancel?job_id=${encodeURIComponent(id)}`, { method: 'POST' });
+            if (!result) return;
+            PL.toast(`Job ${id} cancelled.`, 'success');
+            await loadTaskmanJobs(false);
+            await taskmanLoadJob(id);
+        }
+
+        async function restartTaskmanSelectedJob() {
+            const id = taskmanState.selectedID;
+            if (!id) {
+                PL.toast('Select a Taskman job first.', 'warning');
+                return;
+            }
+            const confirmed = await PL.confirm({
+                title: `Restart job ${id}`,
+                body: 'Create a new pending job from this job payload?',
+                okLabel: 'Restart job',
+            });
+            if (!confirmed) return;
+            const result = await apiCall(`/taskman/job/restart?job_id=${encodeURIComponent(id)}`, { method: 'POST' });
+            if (!result) return;
+            const newID = taskmanPositiveID(String(result.new_job_id));
+            if (!newID) {
+                PL.toast('The restart response did not include a valid new job ID.', 'error');
+                return;
+            }
+            PL.toast(`Job ${id} restarted as ${newID}.`, 'success');
+            await loadTaskmanJobs(false);
+            await taskmanLoadJob(newID);
+        }
+
+        function taskmanFilterDescription(params) {
+            const entries = Array.from(params.entries());
+            return entries.length
+                ? entries.map(([key, value]) => `${key}=${value}`).join(', ')
+                : 'all jobs';
+        }
+
+        async function clearTaskmanJobsByFilter() {
+            const params = taskmanFilterParams(false);
+            if (taskmanState.filterKey !== params.toString()) {
+                PL.toast('Apply the current filters before clearing jobs.', 'warning');
+                return;
+            }
+            const status = params.get('status') || '';
+            const activeRisk = !status || status === 'pending' || status === 'processing';
+            const matched = Number(taskmanState.list?.total) || 0;
+            const risk = activeRisk
+                ? ' This can delete pending or processing jobs.'
+                : '';
+            const confirmed = await PL.confirm({
+                title: 'Clear filtered Taskman jobs',
+                body: `Delete ${matched} matching jobs (${taskmanFilterDescription(params)})?${risk} This cannot be undone.`,
+                danger: true,
+                okLabel: 'Clear filtered',
+            });
+            if (!confirmed) return;
+            const suffix = params.toString();
+            const result = await apiCall(`/taskman/jobs/clear${suffix ? `?${suffix}` : ''}`, { method: 'DELETE' });
+            if (!result) return;
+            const active = Number(result.deleted_active) || 0;
+            const activeText = active ? ` (${active} active)` : '';
+            PL.toast(`Deleted ${result.deleted || 0} of ${result.matched || 0} jobs${activeText}.`, 'success');
+            taskmanState.offset = 0;
+            taskmanState.selected = null;
+            taskmanState.selectedID = null;
+            taskmanSetActionsEnabled(false);
+            await loadTaskmanJobs(true);
         }
 
         // --- Model Providers — Routing Ops (cockpit / board / catalog / pools / graph) ---
@@ -5839,7 +6238,7 @@
             if (anState.wired) return;
             anState.wired = true;
             const range = document.getElementById('an-range');
-            if (range) range.addEventListener('pl:change', () => loadAnalytics(true));
+            if (range) range.addEventListener('change', () => loadAnalytics(true));
         }
 
         function anRenderAll(data) {

@@ -299,14 +299,20 @@ where
 pub struct RoutedSongPromptGenerator {
     walker: RoutedAttemptWalker,
     config: AppConfig,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
 }
 
 impl RoutedSongPromptGenerator {
     #[must_use]
-    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+    pub fn new(
+        walker: RoutedAttemptWalker,
+        config: &AppConfig,
+        prompt_store: Arc<openplotva_prompts::PromptStore>,
+    ) -> Self {
         Self {
             walker,
             config: config.clone(),
+            prompt_store,
         }
     }
 }
@@ -315,25 +321,33 @@ impl SongPromptGenerator for RoutedSongPromptGenerator {
     fn build_song_prompt<'a>(&'a self, request: SongPromptRequest) -> SongPromptFuture<'a> {
         Box::pin(async move {
             let config = self.config.clone();
-            let result =
-                self.walker
-                    .run(
-                        RoutedRequestContext {
-                            workflow_key: "media_prompt_optimizer".to_owned(),
-                            queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
-                            message_id: (request.message_id != 0).then_some(request.message_id),
-                            ..RoutedRequestContext::default()
-                        },
-                        move |attempt| {
-                            let config = config.clone();
-                            let request = request.clone();
-                            async move {
-                                build_song_prompt_with_attempt(&config, attempt, request).await
-                            }
-                        },
-                        song_prompt_retryable_reason,
-                    )
-                    .await;
+            let prompt_store = Arc::clone(&self.prompt_store);
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "media_prompt_optimizer".to_owned(),
+                        queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
+                        message_id: (request.message_id != 0).then_some(request.message_id),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let config = config.clone();
+                        let prompt_store = prompt_store.clone();
+                        let request = request.clone();
+                        async move {
+                            build_song_prompt_with_attempt_and_prompt_store(
+                                &config,
+                                attempt,
+                                request,
+                                &prompt_store,
+                            )
+                            .await
+                        }
+                    },
+                    song_prompt_retryable_reason,
+                )
+                .await;
             match result {
                 Ok(result) => Ok(result),
                 Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
@@ -345,10 +359,11 @@ impl SongPromptGenerator for RoutedSongPromptGenerator {
     }
 }
 
-async fn build_song_prompt_with_attempt(
+async fn build_song_prompt_with_attempt_and_prompt_store(
     config: &AppConfig,
     attempt: RoutedAttempt,
     request: SongPromptRequest,
+    prompt_store: &Arc<openplotva_prompts::PromptStore>,
 ) -> Result<SongPromptResult, MusicGenerationError> {
     if media::routed_attempt_is_genkit(&attempt) {
         let model = media::genkit_model_for_attempt(&attempt);
@@ -357,9 +372,9 @@ async fn build_song_prompt_with_attempt(
                 config, &model,
             )
         {
-            return AifarmStructuredJsonGenerator::new(cfg)
-                .build_song_prompt(request)
-                .await;
+            let generator =
+                AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+            return generator.build_song_prompt(request).await;
         }
         let Some(gemini) =
             media::gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
@@ -369,13 +384,14 @@ async fn build_song_prompt_with_attempt(
                 attempt.provider_name
             )));
         };
+        let gemini = gemini.with_prompt_store(Arc::clone(prompt_store));
         return gemini.build_song_prompt(request).await;
     }
 
     let cfg = media::aifarm_structured_json_config_for_attempt(config, &attempt);
-    AifarmStructuredJsonGenerator::new(cfg)
-        .build_song_prompt(request)
-        .await
+    let generator =
+        AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+    generator.build_song_prompt(request).await
 }
 
 fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
@@ -1836,6 +1852,30 @@ mod tests {
         build_song_caption_with_support, build_song_release_prompt, execute_music_gen_job,
         music_job_topic, run_music_queue_once, run_music_queue_once_with_max_attempts,
     };
+
+    fn test_walker() -> crate::routed_attempts::RoutedAttemptWalker {
+        crate::routed_attempts::RoutedAttemptWalker::new(
+            openplotva_llm::router::RouterHandle::new(
+                openplotva_llm::router::RoutingTable::default(),
+            ),
+            Arc::new(openplotva_llm::router::BreakerSet::new()),
+            Arc::new(openplotva_llm::router::TriggerState::new()),
+            Arc::new(openplotva_llm::router::PoolRegistry::new()),
+        )
+    }
+
+    #[test]
+    fn routed_song_generator_keeps_application_prompt_store() {
+        let prompts = Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store"));
+        let config =
+            openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig::default())
+                .expect("config");
+
+        let generator =
+            super::RoutedSongPromptGenerator::new(test_walker(), &config, Arc::clone(&prompts));
+
+        assert!(Arc::ptr_eq(&generator.prompt_store, &prompts));
+    }
 
     #[derive(Debug)]
     struct RecordingActivityEffects {

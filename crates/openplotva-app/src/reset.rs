@@ -4,15 +4,14 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, Message as TelegramMessage,
-    MessageData as TelegramMessageData, Text as TelegramText, TextEntity as TelegramTextEntity,
-    TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
-    UpdateType as TelegramUpdateType,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{ChatRef, DispatcherQueue, ReplyMessageRef, TextMessageRequest};
+use openplotva_updates::parse_leading_bot_command;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::{
     QueueTextReport, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
     queue_text_message_parts,
@@ -165,25 +164,23 @@ where
 {
     type Error = ResetCommandError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_reset_command_update_or_else_at(
-                ResetCommandPorts {
-                    history: self.history.as_ref(),
-                    dispatcher_queue: self.dispatcher_queue.as_ref(),
-                    admin_api: self.admin_api.as_ref(),
-                },
-                update,
-                ResetCommandContext {
-                    bot_username: &self.bot_username,
-                    now: OffsetDateTime::now_utc(),
-                },
-                || (self.next_virtual_id)(),
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_reset_command_update_or_else_at(
+            ResetCommandPorts {
+                history: self.history.as_ref(),
+                dispatcher_queue: self.dispatcher_queue.as_ref(),
+                admin_api: self.admin_api.as_ref(),
+            },
+            update,
+            ResetCommandContext {
+                bot_username: &self.bot_username,
+                now: OffsetDateTime::now_utc(),
+            },
+            || (self.next_virtual_id)(),
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -257,7 +254,7 @@ where
 
 #[must_use]
 pub fn is_reset_command_for_bot(message: &TelegramMessage, bot_username: &str) -> bool {
-    let Some(command) = leading_bot_command(message) else {
+    let Some(command) = parse_leading_bot_command(message) else {
         return false;
     };
     if command.command != RESET_COMMAND {
@@ -269,7 +266,7 @@ pub fn is_reset_command_for_bot(message: &TelegramMessage, bot_username: &str) -
     if !telegram_chat_is_group(&message.chat) {
         return false;
     }
-    command.target.as_deref() == Some(bot_username)
+    command.target == Some(bot_username)
 }
 
 async fn is_group_reset_authorized<AdminApi>(api: &AdminApi, message: &TelegramMessage) -> bool
@@ -373,53 +370,6 @@ fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
 
 fn telegram_chat_is_group(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Group(_) | TelegramChat::Supergroup(_))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BotCommandInMessage {
-    command: String,
-    target: Option<String>,
-}
-
-fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_bot_command_from_text(text)
-}
-
-fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
-    let first = text.entities.as_ref()?.into_iter().next()?;
-    let TelegramTextEntity::BotCommand(position) = first else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-
-    let command_with_slash = text_entity_content(&text.data, *position)?;
-    let command_with_target = command_with_slash.strip_prefix('/')?;
-    let (command, target) = match command_with_target.split_once('@') {
-        Some((command, target)) => (command, Some(target.to_owned())),
-        None => (command_with_target, None),
-    };
-
-    Some(BotCommandInMessage {
-        command: command.to_owned(),
-        target,
-    })
-}
-
-fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> Option<String> {
-    let offset = usize::try_from(position.offset).ok()?;
-    let length = usize::try_from(position.length).ok()?;
-    Some(String::from_utf16_lossy(
-        &text
-            .encode_utf16()
-            .skip(offset)
-            .take(length)
-            .collect::<Vec<u16>>(),
-    ))
 }
 
 impl ResetHistoryStore for openplotva_storage::PostgresHistoryStore {
@@ -1102,14 +1052,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

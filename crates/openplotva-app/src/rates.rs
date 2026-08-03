@@ -29,7 +29,7 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::{
     QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
@@ -1486,20 +1486,18 @@ where
 {
     type Error = RatesCommandError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_rates_command_update_or_else(
-                &self.bot,
-                self.permission.as_ref(),
-                self.fetcher.as_deref(),
-                self.header.as_ref(),
-                self.effects.as_ref(),
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_rates_command_update_or_else(
+            &self.bot,
+            self.permission.as_ref(),
+            self.fetcher.as_deref(),
+            self.header.as_ref(),
+            self.effects.as_ref(),
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1922,7 +1920,7 @@ fn user_full_name(user: &TelegramUser) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::updates::UpdateHandler;
     use serde_json::json;
     use std::{
         io::{self, Read, Write},
@@ -2832,14 +2830,9 @@ mod tests {
     impl UpdateHandler for NextStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls.lock().expect("next calls").push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls.lock().expect("next calls").push(update.id);
+            Ok(())
         }
     }
 }

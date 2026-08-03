@@ -545,6 +545,20 @@ pub fn render_song_reprompt_messages(
     )
 }
 
+pub fn render_song_reprompt_messages_with(
+    prompts: &openplotva_prompts::PromptStore,
+    topic: &str,
+    vocal_language: &str,
+) -> Result<Vec<openplotva_prompts::PromptMessage>, openplotva_prompts::PromptError> {
+    prompts.render_messages(
+        "music/song_reprompt",
+        &json!({
+            "topic": topic,
+            "vocalLanguage": vocal_language,
+        }),
+    )
+}
+
 #[must_use]
 pub fn optimize_song_prompt_terminator_definition() -> SongPromptTerminatorDefinition {
     SongPromptTerminatorDefinition {
@@ -1525,10 +1539,11 @@ fn first_non_empty<const N: usize>(values: [&str; N]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         thread,
-        time::Duration,
+        time::{Duration, SystemTime},
     };
 
     use serde_json::json;
@@ -1540,8 +1555,30 @@ mod tests {
         has_song_minimum_structure, normalize_song_language, normalize_song_lyrics,
         normalize_song_prompt_input, normalize_song_prompt_payload, normalize_song_style,
         parse_completion_response, parse_query_items, query_result_items, release_task_id,
-        render_song_reprompt_messages,
+        render_song_reprompt_messages, render_song_reprompt_messages_with,
     };
+
+    fn prompt_store_with(files: &[(&str, &str)]) -> openplotva_prompts::PromptStore {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openplotva-acestep-prompts-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create prompt root");
+        for (name, source) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("prompt parent"))
+                .expect("create prompt directory");
+            fs::write(path, source).expect("write prompt");
+        }
+        let store =
+            openplotva_prompts::PromptStore::from_root(&root).expect("compile prompt store");
+        fs::remove_dir_all(root).expect("remove prompt root");
+        store
+    }
 
     #[derive(Debug)]
     struct CapturedHttpRequest {
@@ -2002,6 +2039,23 @@ mod tests {
             messages[1].content,
             "Topic: ночной город\nVocal language: ru"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn song_reprompt_messages_use_injected_store() -> Result<(), Box<dyn std::error::Error>> {
+        let store = prompt_store_with(&[(
+            "music/song_reprompt.prompt",
+            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{vocalLanguage}}",
+        )]);
+
+        let messages = render_song_reprompt_messages_with(&store, "night city", "en")?;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "custom song system night city");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "custom song user en");
         Ok(())
     }
 

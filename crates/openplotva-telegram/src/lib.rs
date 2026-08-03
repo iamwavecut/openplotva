@@ -86,6 +86,7 @@ pub use outbound::{
 };
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
+    OUTBOUND_COMMAND_PAYLOAD_VERSION, OutboundCommand, OutboundCommandCodecError,
     PersistentDispatcherItem, PersistentDispatcherQueue, PersistentDispatcherReplay,
     PersistentDispatcherRestoreReport, RedisDispatcherQueueStore, persistent_queue_from_drain,
     persistent_queue_redis_value_from_items, persistent_queue_replay_from_items,

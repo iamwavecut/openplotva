@@ -14,9 +14,8 @@ use openplotva_updates::{
 use thiserror::Error;
 
 use crate::{
-    dialog_debounce::InMemoryDialogDebounce,
-    dialog_messages::DialogTaskDurabilityBarrier,
-    updates::{UpdateHandler, UpdateHandlerFuture},
+    dialog_debounce::InMemoryDialogDebounce, dialog_messages::DialogTaskDurabilityBarrier,
+    updates::UpdateHandler,
 };
 
 /// Boxed future returned by edited-message side effects.
@@ -321,17 +320,15 @@ where
 {
     type Error = EditedMessageUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_edited_message_update_or_else(
-                self.effects.as_ref(),
-                &self.bot_user,
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_edited_message_update_or_else(
+            self.effects.as_ref(),
+            &self.bot_user,
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -488,8 +485,8 @@ mod tests {
 
     use crate::dialog_debounce::{DialogDebounceKey, InMemoryDialogDebounce};
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
 
     use super::{
@@ -1102,14 +1099,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

@@ -7,6 +7,7 @@
 - Risk: LOW-MED
 - Planned at: whole-repository audit, 2026-08-02
 - Depends on: per-document shipped-state proof
+- Execution: complete locally on 2026-08-02; links, docs gate, workspace gate, and smokes pass
 
 ## Why
 

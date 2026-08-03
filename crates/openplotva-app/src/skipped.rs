@@ -3,7 +3,7 @@ use std::{fmt, future::Future, sync::Arc};
 use carapax::types::{Update as TelegramUpdate, UpdateType};
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SkippedUpdateRoute {
@@ -40,12 +40,10 @@ where
 {
     type Error = SkippedUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_skipped_update_or_else(update, |update| self.next.handle_update(update))
-                .await
-                .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_skipped_update_or_else(update, |update| self.next.handle_update(update))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -113,8 +111,8 @@ mod tests {
     use serde_json::json;
 
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
 
     use super::{SkippedUpdateHandler, SkippedUpdateRoute, handle_skipped_update_or_else};
@@ -258,14 +256,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 
@@ -437,7 +430,7 @@ mod tests {
         cases.extend(
             newer_go_skipped_update_cases()?
                 .into_iter()
-                .map(|(name, update_id, update)| (name, update_id, name, update)),
+                .map(|(_, update_id, update)| ("unknown", update_id, "unknown", update)),
         );
         Ok(cases)
     }

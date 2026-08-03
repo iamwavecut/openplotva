@@ -85,7 +85,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -118,23 +118,198 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::watch,
     task::JoinHandle,
-    time::{Interval, timeout},
+    time::{Instant, Interval, timeout, timeout_at},
 };
 
 const GO_DISPATCHER_MAX_QUEUE_SIZE: usize = 10_000;
 const GO_DISPATCHER_DEBOUNCE_WINDOW: Duration = Duration::from_secs(3);
 const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
 const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(50);
+const RUNTIME_PROCESSOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_PERSISTENCE_RESERVE: Duration = Duration::from_secs(8);
+const RUNTIME_FINALIZATION_RESERVE: Duration = Duration::from_secs(2);
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 4;
 const REGULAR_IMAGE_GENERATION_WORKFLOW_KEY: &str =
     image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY;
 const VIP_IMAGE_EDITOR_WORKFLOW_KEY: &str = image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeWorkerPhase {
+    Ingress,
+    Processor,
+    Outbound,
+    Ancillary,
+    Server,
+}
+
+struct NamedRuntimeWorker {
+    name: String,
+    phase: RuntimeWorkerPhase,
+    handle: JoinHandle<()>,
+}
+
+struct RuntimeWorkerGroup {
+    phase: RuntimeWorkerPhase,
+    workers: Vec<NamedRuntimeWorker>,
+}
+
+impl RuntimeWorkerGroup {
+    fn new(phase: RuntimeWorkerPhase) -> Self {
+        Self {
+            phase,
+            workers: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, name: impl Into<String>, handle: JoinHandle<()>) {
+        self.workers.push(NamedRuntimeWorker {
+            name: name.into(),
+            phase: self.phase,
+            handle,
+        });
+    }
+}
+
+impl Drop for RuntimeWorkerGroup {
+    fn drop(&mut self) {
+        for worker in self.workers.drain(..) {
+            worker.handle.abort();
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeWorkerRegistry {
+    workers: Mutex<Vec<NamedRuntimeWorker>>,
+}
+
+impl RuntimeWorkerRegistry {
+    fn install(&self, mut group: RuntimeWorkerGroup) {
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(std::mem::take(&mut group.workers));
+    }
+
+    fn register(&self, name: impl Into<String>, phase: RuntimeWorkerPhase, handle: JoinHandle<()>) {
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(NamedRuntimeWorker {
+                name: name.into(),
+                phase,
+                handle,
+            });
+    }
+
+    fn readiness_check(&self) -> ReadinessCheck {
+        let finished = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|worker| worker.handle.is_finished())
+            .map(|worker| worker.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if finished.is_empty() {
+            ReadinessCheck::ok(
+                "runtime_workers",
+                "all registered runtime workers are running",
+            )
+        } else {
+            ReadinessCheck::error(
+                "runtime_workers",
+                format!("runtime workers exited before shutdown: {finished}"),
+            )
+        }
+    }
+
+    fn take_phase(&self, phase: RuntimeWorkerPhase) -> Vec<NamedRuntimeWorker> {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (selected, remaining) = std::mem::take(&mut *workers)
+            .into_iter()
+            .partition(|worker| worker.phase == phase);
+        *workers = remaining;
+        selected
+    }
+
+    fn take_all(&self) -> Vec<NamedRuntimeWorker> {
+        std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+impl Drop for RuntimeWorkerRegistry {
+    fn drop(&mut self) {
+        for worker in self
+            .workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            worker.handle.abort();
+        }
+    }
+}
+
+struct RuntimeWorkerStops {
+    ingress: watch::Sender<bool>,
+    processor: watch::Sender<bool>,
+    outbound: watch::Sender<bool>,
+    ancillary: watch::Sender<bool>,
+    server: watch::Sender<bool>,
+}
+
+impl RuntimeWorkerStops {
+    fn new() -> Self {
+        Self {
+            ingress: watch::channel(false).0,
+            processor: watch::channel(false).0,
+            outbound: watch::channel(false).0,
+            ancillary: watch::channel(false).0,
+            server: watch::channel(false).0,
+        }
+    }
+
+    fn subscribe(&self, phase: RuntimeWorkerPhase) -> watch::Receiver<bool> {
+        self.sender(phase).subscribe()
+    }
+
+    fn signal(&self, phase: RuntimeWorkerPhase) {
+        let _ = self.sender(phase).send(true);
+    }
+
+    fn sender(&self, phase: RuntimeWorkerPhase) -> &watch::Sender<bool> {
+        match phase {
+            RuntimeWorkerPhase::Ingress => &self.ingress,
+            RuntimeWorkerPhase::Processor => &self.processor,
+            RuntimeWorkerPhase::Outbound => &self.outbound,
+            RuntimeWorkerPhase::Ancillary => &self.ancillary,
+            RuntimeWorkerPhase::Server => &self.server,
+        }
+    }
+}
+
+impl Default for RuntimeWorkerStops {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Default)]
 struct RuntimeWorkers {
-    handles: Vec<JoinHandle<()>>,
-    stop: Option<watch::Sender<bool>>,
+    worker_registry: Arc<RuntimeWorkerRegistry>,
+    worker_stops: Arc<RuntimeWorkerStops>,
     dispatcher: Option<DispatcherRuntime>,
     shared_task_queue: Option<task_queue::SharedTaskQueueRuntime>,
     dialog_debounce: Option<Arc<dialog_debounce::InMemoryDialogDebounce>>,
@@ -519,7 +694,7 @@ fn static_web_routes(
         ),
         memory_max_input_tokens: 0,
         memory_max_messages_per_run: 0,
-        memory_token_estimator_source: Arc::from(""),
+        memory_token_estimator_source: Arc::from(openplotva_memory::MEMORY_TOKEN_ESTIMATOR_SOURCE),
         memory_restart_trigger: None,
         memory_override_runtime: None,
         shield_store: None,
@@ -571,7 +746,8 @@ fn static_web_routes_from_config(
     routes.memory_consolidation_model = Arc::from(config.memory.consolidation_model.clone());
     routes.memory_max_input_tokens = memory_worker_config.process.max_input_tokens;
     routes.memory_max_messages_per_run = memory_worker_config.process.max_messages_per_run;
-    routes.memory_token_estimator_source = Arc::from(memory_token_estimator_source(config));
+    routes.memory_token_estimator_source =
+        Arc::from(openplotva_memory::MEMORY_TOKEN_ESTIMATOR_SOURCE);
     routes.memory_restart_trigger = runtime_workers.memory_restart_trigger.clone();
     routes.router_handle = runtime_workers.router_handle.clone();
     routes.router_breakers = runtime_workers.router_breakers.clone();
@@ -644,19 +820,6 @@ fn static_web_routes_from_config(
         }
     }
     routes
-}
-
-fn memory_token_estimator_source(config: &AppConfig) -> String {
-    let base = config
-        .memory
-        .token_estimator_url
-        .trim()
-        .trim_end_matches('/');
-    if base.is_empty() {
-        "heuristic".to_owned()
-    } else {
-        format!("http-token-estimator:{base}/estimate")
-    }
 }
 
 /// Build the HTTP router without binding a socket.
@@ -4034,6 +4197,7 @@ fn admin_memory_policy_json(routes: &StaticWebRoutes) -> serde_json::Value {
         "max_daily_enqueued_runs": routes.memory_enqueue_policy.max_daily_enqueued_runs,
         "max_messages_per_run": routes.memory_max_messages_per_run,
         "max_input_tokens": routes.memory_max_input_tokens,
+        "token_estimator": routes.memory_token_estimator_source.as_ref(),
         "consolidation_model": routes.memory_consolidation_model.as_ref(),
     })
 }
@@ -8764,6 +8928,8 @@ fn admin_session_user_ids(headers: &HeaderMap, secret: &str) -> Vec<i64> {
 /// Run the current OpenPlotva app shell.
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env().context("load configuration")?;
+    let prompt_store =
+        Arc::new(openplotva_prompts::PromptStore::load().context("compile prompt registry")?);
     let log_buffer = openplotva_observability::init_with_log_buffer_capacity(
         &config.observability,
         config.runtime_api.log_buffer_size,
@@ -8781,6 +8947,7 @@ pub async fn run() -> anyhow::Result<()> {
         service_clients.as_ref(),
         &mut readiness_checks,
         Arc::clone(&log_buffer),
+        prompt_store,
     )
     .await?;
 
@@ -9777,11 +9944,299 @@ async fn start_runtime_api_worker(
     Ok((worker, local_addr, tls_public_key_pin))
 }
 
+struct DispatcherWorkerGroupInputs {
+    history: PostgresHistoryStore,
+    telegram: openplotva_telegram::TelegramClient,
+    rich: openplotva_telegram::RichApiClient,
+    ephemeral: RedisEphemeralMessageStore,
+    rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
+    permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
+    queue: Arc<openplotva_telegram::DispatcherQueue>,
+    limiters: Arc<openplotva_telegram::ChatLimiters>,
+    failure_ring: Arc<DispatchFailureRing>,
+}
+
+fn build_dispatcher_worker_group(
+    inputs: DispatcherWorkerGroupInputs,
+    stops: &RuntimeWorkerStops,
+) -> RuntimeWorkerGroup {
+    let DispatcherWorkerGroupInputs {
+        history,
+        telegram,
+        rich,
+        ephemeral,
+        rate_limits,
+        permissions,
+        queue,
+        limiters,
+        failure_ring,
+    } = inputs;
+    let mut workers = RuntimeWorkerGroup::new(RuntimeWorkerPhase::Outbound);
+
+    let immediate_history = history.clone();
+    let immediate_telegram = telegram.clone();
+    let immediate_rich = rich.clone();
+    let immediate_ephemeral = ephemeral.clone();
+    let immediate_rate_limits = Arc::clone(&rate_limits);
+    let immediate_permissions = Arc::clone(&permissions);
+    let immediate_queue = Arc::clone(&queue);
+    let immediate_failure_ring = Arc::clone(&failure_ring);
+    let immediate_stop = stops.subscribe(RuntimeWorkerPhase::Outbound);
+    workers.register(
+        "dispatcher-immediate",
+        tokio::spawn(async move {
+            let outcome = immediate_queue
+                .run_immediate_worker_until(wait_for_runtime_stop(immediate_stop), |item| {
+                    send_dispatcher_work_item(
+                        immediate_history.clone(),
+                        immediate_telegram.clone(),
+                        immediate_rich.clone(),
+                        immediate_ephemeral.clone(),
+                        Arc::clone(&immediate_rate_limits),
+                        Arc::clone(&immediate_permissions),
+                        Some(Arc::clone(&immediate_failure_ring)),
+                        item,
+                    )
+                })
+                .await;
+
+            tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
+        }),
+    );
+
+    let regular_queue = queue;
+    let regular_limiters = Arc::clone(&limiters);
+    let regular_stop = stops.subscribe(RuntimeWorkerPhase::Outbound);
+    workers.register(
+        "dispatcher-regular",
+        tokio::spawn(async move {
+            let outcome = regular_queue
+                .run_regular_worker_until(
+                    &regular_limiters,
+                    wait_for_runtime_stop(regular_stop),
+                    |item| {
+                        send_dispatcher_work_item(
+                            history.clone(),
+                            telegram.clone(),
+                            rich.clone(),
+                            ephemeral.clone(),
+                            Arc::clone(&rate_limits),
+                            Arc::clone(&permissions),
+                            Some(Arc::clone(&failure_ring)),
+                            item,
+                        )
+                    },
+                )
+                .await;
+
+            tracing::info!(?outcome, "outbound regular dispatcher worker stopped");
+        }),
+    );
+
+    let cleanup_stop = stops.subscribe(RuntimeWorkerPhase::Outbound);
+    workers.register(
+        "dispatcher-limiter-cleanup",
+        tokio::spawn(async move {
+            let outcome = openplotva_telegram::run_limiter_cleanup_until(
+                &limiters,
+                openplotva_telegram::DispatcherRuntimeConfig::default(),
+                wait_for_runtime_stop(cleanup_stop),
+            )
+            .await;
+
+            tracing::info!(
+                ?outcome,
+                "outbound dispatcher limiter cleanup worker stopped"
+            );
+        }),
+    );
+
+    workers
+}
+
+struct SharedTaskQueueMaintenanceConfig {
+    recovery_interval: Duration,
+    cleanup_interval: Duration,
+    completed_retention: time::Duration,
+    placeholder_cleanup_interval: Duration,
+    placeholder_max_age: Duration,
+}
+
+fn build_shared_task_queue_maintenance_group(
+    runtime: &task_queue::SharedTaskQueueRuntime,
+    purge_store: openplotva_storage::PostgresTaskQueueStore,
+    placeholder_effects: openplotva_telegram::TelegramClient,
+    config: SharedTaskQueueMaintenanceConfig,
+    stops: &RuntimeWorkerStops,
+) -> (RuntimeWorkerGroup, Vec<ReadinessCheck>) {
+    let SharedTaskQueueMaintenanceConfig {
+        recovery_interval,
+        cleanup_interval,
+        completed_retention,
+        placeholder_cleanup_interval,
+        placeholder_max_age,
+    } = config;
+    let mut workers = RuntimeWorkerGroup::new(RuntimeWorkerPhase::Processor);
+    let mut readiness = Vec::with_capacity(6);
+
+    let db_journal = runtime
+        .db_journal()
+        .expect("Postgres taskman runtime should have a DB journal");
+    let db_sync_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-db-sync",
+        tokio::spawn(async move {
+            let report = task_queue::run_task_queue_db_sync_worker_until(
+                db_journal,
+                wait_for_runtime_stop(db_sync_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman Postgres sync worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_postgres_sync",
+        format!(
+            "Postgres sync after {}s dirty window or {} mutations",
+            task_queue::TASK_QUEUE_DB_SYNC_INTERVAL.as_secs(),
+            task_queue::TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD
+        ),
+    ));
+
+    let recovery_runtime = runtime.clone();
+    let recovery_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-recovery",
+        tokio::spawn(async move {
+            let report = task_queue::run_shared_task_queue_recovery_worker_until(
+                recovery_runtime,
+                recovery_interval,
+                wait_for_runtime_stop(recovery_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman recovery worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_recovery",
+        format!(
+            "stale processing recovery every {}s",
+            recovery_interval.as_secs()
+        ),
+    ));
+
+    let cleanup_runtime = runtime.clone();
+    let cleanup_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-terminal-cleanup",
+        tokio::spawn(async move {
+            let report = task_queue::run_shared_task_queue_terminal_cleanup_worker_until(
+                cleanup_runtime,
+                cleanup_interval,
+                completed_retention,
+                wait_for_runtime_stop(cleanup_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman terminal cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_terminal_cleanup",
+        format!(
+            "terminal cleanup every {}s, retention {}d",
+            cleanup_interval.as_secs(),
+            completed_retention.whole_days()
+        ),
+    ));
+
+    let purge_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-postgres-purge",
+        tokio::spawn(async move {
+            let report = task_queue::run_shared_task_queue_db_purge_worker_until(
+                purge_store,
+                cleanup_interval,
+                completed_retention,
+                wait_for_runtime_stop(purge_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman Postgres purge worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_postgres_purge",
+        format!(
+            "Postgres purge every {}s, retention {}d",
+            cleanup_interval.as_secs(),
+            completed_retention.whole_days()
+        ),
+    ));
+
+    let stuck_runtime = runtime.clone();
+    let stuck_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-stuck-cleanup",
+        tokio::spawn(async move {
+            let report = task_queue::run_shared_task_queue_stuck_cleanup_worker_until(
+                stuck_runtime,
+                task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL,
+                task_queue::SHARED_TASK_QUEUE_STUCK_DURATION,
+                wait_for_runtime_stop(stuck_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman stuck-job cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_stuck_cleanup",
+        format!(
+            "stuck-job cleanup every {}s, stuck after {}s",
+            task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL.as_secs(),
+            task_queue::SHARED_TASK_QUEUE_STUCK_DURATION.as_secs()
+        ),
+    ));
+
+    let placeholder_runtime = runtime.clone();
+    let placeholder_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-placeholder-cleanup",
+        tokio::spawn(async move {
+            let report = task_queue::run_shared_task_queue_placeholder_cleanup_worker_until(
+                placeholder_runtime,
+                placeholder_effects,
+                placeholder_cleanup_interval,
+                placeholder_max_age,
+                Duration::from_secs(1),
+                wait_for_runtime_stop(placeholder_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman placeholder cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_placeholder_cleanup",
+        format!(
+            "placeholder cleanup every {}s, max age {}s",
+            placeholder_cleanup_interval.as_secs(),
+            placeholder_max_age.as_secs()
+        ),
+    ));
+
+    (workers, readiness)
+}
+
 async fn start_runtime_workers(
     config: &AppConfig,
     service_clients: Option<&ServiceClients>,
     readiness_checks: &mut Vec<ReadinessCheck>,
     log_buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
 ) -> anyhow::Result<RuntimeWorkers> {
     let Some(service_clients) = service_clients else {
         if config.runtime_api.enabled {
@@ -9852,7 +10307,8 @@ async fn start_runtime_workers(
         return Ok(RuntimeWorkers::default());
     };
 
-    let (stop, _) = watch::channel(false);
+    let worker_registry = Arc::new(RuntimeWorkerRegistry::default());
+    let worker_stops = Arc::new(RuntimeWorkerStops::new());
     let taskman_inspector = runtime_taskman::RuntimeTaskmanInspectorHandle::default();
     let virtual_dialog_manager =
         runtime_virtual_dialog::RuntimeVirtualDialogManagerHandle::default();
@@ -9860,8 +10316,8 @@ async fn start_runtime_workers(
     let dispatch_failure_ring = Arc::new(DispatchFailureRing::default());
     let cache_inspector = runtime_cache::RuntimeCacheInspectorHandle::default();
     let mut workers = RuntimeWorkers {
-        handles: Vec::new(),
-        stop: Some(stop.clone()),
+        worker_registry: Arc::clone(&worker_registry),
+        worker_stops: Arc::clone(&worker_stops),
         dispatcher: None,
         shared_task_queue: None,
         dialog_debounce: None,
@@ -9893,13 +10349,21 @@ async fn start_runtime_workers(
     workers.readiness_probes.push(Arc::new(move || {
         postgres_pool_readiness(&readiness_general_postgres, &readiness_critical_postgres)
     }));
+    let readiness_worker_registry = Arc::clone(&worker_registry);
+    workers.readiness_probes.push(Arc::new(move || {
+        readiness_worker_registry.readiness_check()
+    }));
     let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
     let (routing_event_recorder, routing_event_recorder_worker) =
         runtime_routing::PostgresRoutingEventRecorder::spawn(
             service_clients.postgres.clone(),
-            stop.subscribe(),
+            worker_stops.subscribe(RuntimeWorkerPhase::Ancillary),
         );
-    workers.handles.push(routing_event_recorder_worker);
+    worker_registry.register(
+        "routing-event-recorder",
+        RuntimeWorkerPhase::Ancillary,
+        routing_event_recorder_worker,
+    );
     let mut routing_event_reporter = runtime_routing::RoutingEventReporter::new(
         routing_event_buffer.clone(),
         Some(routing_event_recorder.clone()),
@@ -10123,8 +10587,11 @@ async fn start_runtime_workers(
         let handle = Arc::clone(&router_handle);
         let pools = Arc::clone(&router_pools);
         let reporter = routing_event_reporter.clone();
-        let mut stop_rx = stop.subscribe();
-        workers.handles.push(tokio::spawn(async move {
+        let mut stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
+        worker_registry.register(
+            "openrouter-free-refresh",
+            RuntimeWorkerPhase::Ancillary,
+            tokio::spawn(async move {
             loop {
                 let pool_config = match openrouter_free_pool::load_pool_config(&pool).await {
                     Ok(config) => config,
@@ -10215,7 +10682,8 @@ async fn start_runtime_workers(
                     }
                 }
             }
-        }));
+            }),
+        );
     }
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
@@ -10233,21 +10701,29 @@ async fn start_runtime_workers(
     let (llm_event_recorder, llm_event_recorder_worker) =
         runtime_llm::PostgresRuntimeLlmEventRecorder::spawn(
             service_clients.postgres.clone(),
-            stop.subscribe(),
+            worker_stops.subscribe(RuntimeWorkerPhase::Ancillary),
             runtime_llm::RawBodyPolicy {
                 enabled: config.runtime_api.llm_raw_body_persist_enabled,
                 max_bytes: usize::try_from(config.runtime_api.llm_raw_body_max_bytes)
                     .unwrap_or(65_536),
             },
         );
-    workers.handles.push(llm_event_recorder_worker);
+    worker_registry.register(
+        "llm-event-recorder",
+        RuntimeWorkerPhase::Ancillary,
+        llm_event_recorder_worker,
+    );
     let turn_outcome_buffer = dialog_turn::RuntimeTurnOutcomeBuffer::default();
     let (turn_outcome_recorder, turn_outcome_recorder_worker) =
         dialog_turn::PostgresDialogTurnOutcomeRecorder::spawn(
             service_clients.postgres.clone(),
-            stop.subscribe(),
+            worker_stops.subscribe(RuntimeWorkerPhase::Ancillary),
         );
-    workers.handles.push(turn_outcome_recorder_worker);
+    worker_registry.register(
+        "turn-outcome-recorder",
+        RuntimeWorkerPhase::Ancillary,
+        turn_outcome_recorder_worker,
+    );
     let llm_run_buffer = runtime_llm_runs::RuntimeLlmRunBuffer::new(
         usize::try_from(config.runtime_api.llm_run_buffer_capacity)
             .unwrap_or(runtime_llm_runs::DEFAULT_LLM_RUN_BUFFER_CAPACITY)
@@ -10260,7 +10736,7 @@ async fn start_runtime_workers(
     )
     .with_run_buffer(llm_run_buffer.clone());
     let turn_outcome_cleanup_pool = service_clients.postgres.clone();
-    let turn_outcome_cleanup_stop = stop.subscribe();
+    let turn_outcome_cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
     let turn_outcome_cleanup_worker = tokio::spawn(async move {
         let obligation_store = openplotva_storage::PostgresDeliveryObligationStore::new(
             turn_outcome_cleanup_pool.clone(),
@@ -10307,11 +10783,15 @@ async fn start_runtime_workers(
             }
         }
     });
-    workers.handles.push(turn_outcome_cleanup_worker);
+    worker_registry.register(
+        "turn-outcome-cleanup",
+        RuntimeWorkerPhase::Ancillary,
+        turn_outcome_cleanup_worker,
+    );
     let llm_request_events_retention_days = config.runtime_api.llm_request_events_retention_days;
     if llm_request_events_retention_days > 0 {
         let llm_event_cleanup_pool = service_clients.postgres.clone();
-        let llm_event_cleanup_stop = stop.subscribe();
+        let llm_event_cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let llm_event_cleanup_interval = runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_INTERVAL;
         let llm_event_cleanup_worker = tokio::spawn(async move {
             let report = runtime_llm::run_llm_request_event_cleanup_worker_until(
@@ -10333,7 +10813,11 @@ async fn start_runtime_workers(
                 llm_request_events_retention_days
             ),
         ));
-        workers.handles.push(llm_event_cleanup_worker);
+        worker_registry.register(
+            "llm-event-cleanup",
+            RuntimeWorkerPhase::Ancillary,
+            llm_event_cleanup_worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "llm_request_events_cleanup",
@@ -10343,7 +10827,7 @@ async fn start_runtime_workers(
     let llm_raw_body_retention_hours = config.runtime_api.llm_raw_body_retention_hours;
     if config.runtime_api.llm_raw_body_persist_enabled && llm_raw_body_retention_hours > 0 {
         let llm_raw_scrub_pool = service_clients.postgres.clone();
-        let llm_raw_scrub_stop = stop.subscribe();
+        let llm_raw_scrub_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let llm_raw_scrub_worker = tokio::spawn(async move {
             let report = runtime_llm::run_llm_raw_body_scrub_worker_until(
                 llm_raw_scrub_pool,
@@ -10360,7 +10844,11 @@ async fn start_runtime_workers(
             "llm_raw_body_scrub",
             format!("LLM raw bodies scrubbed hourly, retention {llm_raw_body_retention_hours}h"),
         ));
-        workers.handles.push(llm_raw_scrub_worker);
+        worker_registry.register(
+            "llm-raw-body-scrub",
+            RuntimeWorkerPhase::Ancillary,
+            llm_raw_scrub_worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "llm_raw_body_scrub",
@@ -10370,7 +10858,7 @@ async fn start_runtime_workers(
     let chat_history_retention_days = config.llm.history_summary.chat_history_retention_days;
     if chat_history_retention_days > 0 {
         let pool = service_clients.postgres.clone();
-        let stop_rx = stop.subscribe();
+        let stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let worker = tokio::spawn(async move {
             let report = runtime_retention::run_chat_history_partition_retention_worker_until(
                 pool,
@@ -10387,7 +10875,11 @@ async fn start_runtime_workers(
                 "chat_history partitions dropped daily, retention {chat_history_retention_days}d"
             ),
         ));
-        workers.handles.push(worker);
+        worker_registry.register(
+            "chat-history-retention",
+            RuntimeWorkerPhase::Ancillary,
+            worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "chat_history_retention",
@@ -10396,7 +10888,7 @@ async fn start_runtime_workers(
     }
     let telegram_update_retention_store =
         openplotva_storage::PostgresTelegramDeliveryStore::new(service_clients.postgres.clone());
-    let telegram_update_retention_stop = stop.subscribe();
+    let telegram_update_retention_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
     let telegram_update_retention_worker = tokio::spawn(async move {
         let report = runtime_retention::run_telegram_update_retention_worker_until(
             telegram_update_retention_store,
@@ -10416,11 +10908,15 @@ async fn start_runtime_workers(
             runtime_retention::RETENTION_DELETE_BATCH_SIZE
         ),
     ));
-    workers.handles.push(telegram_update_retention_worker);
+    worker_registry.register(
+        "telegram-update-retention",
+        RuntimeWorkerPhase::Ancillary,
+        telegram_update_retention_worker,
+    );
     let telegram_files_retention_days = config.vision.telegram_files_retention_days;
     if telegram_files_retention_days > 0 {
         let pool = service_clients.postgres.clone();
-        let stop_rx = stop.subscribe();
+        let stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let worker = tokio::spawn(async move {
             let report = runtime_retention::run_telegram_files_retention_worker_until(
                 pool,
@@ -10439,7 +10935,11 @@ async fn start_runtime_workers(
                 "telegram_files deleted by last_seen_at daily, retention {telegram_files_retention_days}d"
             ),
         ));
-        workers.handles.push(worker);
+        worker_registry.register(
+            "telegram-files-retention",
+            RuntimeWorkerPhase::Ancillary,
+            worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "telegram_files_retention",
@@ -10449,7 +10949,7 @@ async fn start_runtime_workers(
     let whitecircle_checks_retention_days = config.white_circle.whitecircle_checks_retention_days;
     if whitecircle_checks_retention_days > 0 {
         let pool = service_clients.postgres.clone();
-        let stop_rx = stop.subscribe();
+        let stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let worker = tokio::spawn(async move {
             let report = runtime_retention::run_whitecircle_checks_retention_worker_until(
                 pool,
@@ -10468,7 +10968,11 @@ async fn start_runtime_workers(
                 "whitecircle_checks deleted by created_at daily, retention {whitecircle_checks_retention_days}d"
             ),
         ));
-        workers.handles.push(worker);
+        worker_registry.register(
+            "whitecircle-checks-retention",
+            RuntimeWorkerPhase::Ancillary,
+            worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "whitecircle_checks_retention",
@@ -10477,7 +10981,7 @@ async fn start_runtime_workers(
     }
     if llm_request_events_retention_days > 0 {
         let routing_event_cleanup_pool = service_clients.postgres.clone();
-        let routing_event_cleanup_stop = stop.subscribe();
+        let routing_event_cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let routing_event_cleanup_interval = runtime_routing::LLM_ROUTING_EVENTS_CLEANUP_INTERVAL;
         let routing_event_cleanup_worker = tokio::spawn(async move {
             let report = runtime_routing::run_llm_routing_event_cleanup_worker_until(
@@ -10499,7 +11003,11 @@ async fn start_runtime_workers(
                 llm_request_events_retention_days
             ),
         ));
-        workers.handles.push(routing_event_cleanup_worker);
+        worker_registry.register(
+            "routing-event-cleanup",
+            RuntimeWorkerPhase::Ancillary,
+            routing_event_cleanup_worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "llm_routing_events_cleanup",
@@ -10586,7 +11094,7 @@ async fn start_runtime_workers(
             &config.runtime_api,
             service_clients,
             diagnostics,
-            stop.subscribe(),
+            worker_stops.subscribe(RuntimeWorkerPhase::Server),
         )
         .await
         .context("start runtime API worker")?;
@@ -10598,7 +11106,7 @@ async fn start_runtime_workers(
             ),
         ));
         workers.runtime_api_tls_public_key_pin = Some(tls_public_key_pin);
-        workers.handles.push(worker);
+        worker_registry.register("runtime-api", RuntimeWorkerPhase::Server, worker);
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "runtime_api",
@@ -10640,7 +11148,7 @@ async fn start_runtime_workers(
         let memory_worker_store = memory_store.clone();
         let memory_worker_config =
             memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
-        let memory_worker_stop = stop.subscribe();
+        let memory_worker_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
         let memory_worker_trigger = Arc::clone(&memory_restart_trigger);
         let memory_worker = tokio::spawn(async move {
             let report = memory_runtime::run_memory_service_worker_with_trigger_until(
@@ -10660,7 +11168,11 @@ async fn start_runtime_workers(
             "Memory service worker started with daily-run ensure, queue drain, routed extraction, routed embeddings, and SQLx persistence",
         ));
         workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
-        workers.handles.push(memory_worker);
+        worker_registry.register(
+            "memory-service",
+            RuntimeWorkerPhase::Processor,
+            memory_worker,
+        );
     } else if !config.memory.enabled {
         readiness_checks.push(ReadinessCheck::skipped(
             "memory_service",
@@ -10670,7 +11182,7 @@ async fn start_runtime_workers(
 
     if config.memory.enabled {
         let archival_store = memory_store.clone();
-        let archival_stop = stop.subscribe();
+        let archival_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let worker = tokio::spawn(async move {
             let report = memory_runtime::run_memory_card_archival_worker_until(
                 archival_store,
@@ -10685,10 +11197,14 @@ async fn start_runtime_workers(
             "memory_card_archival",
             "Expired memory cards archived hourly (durability-based forgetting)",
         ));
-        workers.handles.push(worker);
+        worker_registry.register(
+            "memory-card-archival",
+            RuntimeWorkerPhase::Ancillary,
+            worker,
+        );
 
         let decay_store = memory_store.clone();
-        let decay_stop = stop.subscribe();
+        let decay_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let decay_worker = tokio::spawn(async move {
             let report = memory_runtime::run_memory_card_decay_worker_until(
                 decay_store,
@@ -10706,10 +11222,14 @@ async fn start_runtime_workers(
             "memory_card_decay",
             "Cold never-expiring cards given a grace TTL (bounded forgetting)",
         ));
-        workers.handles.push(decay_worker);
+        worker_registry.register(
+            "memory-card-decay",
+            RuntimeWorkerPhase::Ancillary,
+            decay_worker,
+        );
 
         let collapse_store = memory_store.clone();
-        let collapse_stop = stop.subscribe();
+        let collapse_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let collapse_worker = tokio::spawn(async move {
             let report = memory_runtime::run_memory_duplicate_collapse_worker_until(
                 collapse_store,
@@ -10724,7 +11244,11 @@ async fn start_runtime_workers(
             "memory_dup_collapse",
             "Exact-duplicate memory cards collapsed every 6h (off-hours backlog cleanup)",
         ));
-        workers.handles.push(collapse_worker);
+        worker_registry.register(
+            "memory-duplicate-collapse",
+            RuntimeWorkerPhase::Ancillary,
+            collapse_worker,
+        );
     }
 
     let Some(bot_key) = config.bot.key.as_deref() else {
@@ -10917,7 +11441,7 @@ async fn start_runtime_workers(
         let cleanup_taskman = taskman_inspector.clone();
         let cleanup_llm_traces = llm_trace_buffer.clone();
         let cleanup_llm_runs = llm_run_buffer.clone();
-        let cleanup_stop = stop.subscribe();
+        let cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
         let cleanup_interval = runtime_virtual_dialog::RUNTIME_VIRTUAL_DIALOG_CLEANUP_INTERVAL;
         let cleanup_worker = tokio::spawn(async move {
             let deleted = runtime_virtual_dialog::run_runtime_virtual_dialog_cleanup_worker_until(
@@ -10940,7 +11464,11 @@ async fn start_runtime_workers(
                 cleanup_interval.as_secs()
             ),
         ));
-        workers.handles.push(cleanup_worker);
+        worker_registry.register(
+            "runtime-virtual-dialog-cleanup",
+            RuntimeWorkerPhase::Processor,
+            cleanup_worker,
+        );
     }
     let ephemeral_store = service_clients.redis.ephemeral_message_store();
 
@@ -11005,7 +11533,7 @@ async fn start_runtime_workers(
     let chat_settings_store = PostgresChatSettingsStore::new(service_clients.postgres.clone());
     let chat_member_store = PostgresChatMemberStore::new(service_clients.postgres.clone());
     let stale_inactive_member_cleanup_store = chat_member_store.clone();
-    let stale_inactive_member_cleanup_stop = stop.subscribe();
+    let stale_inactive_member_cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
     let stale_inactive_member_cleanup_worker = tokio::spawn(async move {
         let report = members::run_stale_inactive_member_cleanup_worker_until(
             &stale_inactive_member_cleanup_store,
@@ -11025,7 +11553,11 @@ async fn start_runtime_workers(
             members::STALE_INACTIVE_MEMBER_MAX_AGE.as_secs()
         ),
     ));
-    workers.handles.push(stale_inactive_member_cleanup_worker);
+    worker_registry.register(
+        "stale-inactive-member-cleanup",
+        RuntimeWorkerPhase::Ancillary,
+        stale_inactive_member_cleanup_worker,
+    );
 
     let payment_store = payments::PostgresSuccessfulPaymentStore::new(
         store.clone(),
@@ -11054,7 +11586,7 @@ async fn start_runtime_workers(
             ),
             PostgresVipStore::new(service_clients.postgres.clone()),
         );
-        let subscription_sync_stop = stop.subscribe();
+        let subscription_sync_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let subscription_sync_worker = tokio::spawn(async move {
             let report = subscription_sync::run_subscription_sync_worker_until(
                 &subscription_sync_source,
@@ -11074,7 +11606,11 @@ async fn start_runtime_workers(
                 subscription_sync_config.dry_run
             ),
         ));
-        workers.handles.push(subscription_sync_worker);
+        worker_registry.register(
+            "subscription-sync",
+            RuntimeWorkerPhase::Ancillary,
+            subscription_sync_worker,
+        );
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "subscription_sync",
@@ -11194,140 +11730,22 @@ async fn start_runtime_workers(
         "shared_task_queue_restore",
         shared_task_queue_readiness,
     ));
-    let shared_task_queue_db_journal = shared_task_queue
-        .db_journal()
-        .expect("Postgres taskman runtime should have a DB journal");
-    let shared_task_queue_db_sync_stop = stop.subscribe();
-    let shared_task_queue_db_sync_worker = tokio::spawn(async move {
-        let report = task_queue::run_task_queue_db_sync_worker_until(
-            shared_task_queue_db_journal,
-            wait_for_runtime_stop(shared_task_queue_db_sync_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman Postgres sync worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_postgres_sync",
-        format!(
-            "Postgres sync after {}s dirty window or {} mutations",
-            task_queue::TASK_QUEUE_DB_SYNC_INTERVAL.as_secs(),
-            task_queue::TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD
-        ),
-    ));
-    workers.handles.push(shared_task_queue_db_sync_worker);
-    let shared_task_queue_recovery_runtime = shared_task_queue.clone();
-    let shared_task_queue_recovery_stop = stop.subscribe();
-    let shared_task_queue_recovery_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_recovery_worker_until(
-            shared_task_queue_recovery_runtime,
-            shared_task_queue_recovery_interval,
-            wait_for_runtime_stop(shared_task_queue_recovery_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman recovery worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_recovery",
-        format!(
-            "stale processing recovery every {}s",
-            shared_task_queue_recovery_interval.as_secs()
-        ),
-    ));
-    workers.handles.push(shared_task_queue_recovery_worker);
-    let shared_task_queue_cleanup_runtime = shared_task_queue.clone();
-    let shared_task_queue_cleanup_stop = stop.subscribe();
-    let shared_task_queue_cleanup_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_terminal_cleanup_worker_until(
-            shared_task_queue_cleanup_runtime,
-            shared_task_queue_cleanup_interval,
-            shared_task_queue_completed_retention,
-            wait_for_runtime_stop(shared_task_queue_cleanup_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman terminal cleanup worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_terminal_cleanup",
-        format!(
-            "terminal cleanup every {}s, retention {}d",
-            shared_task_queue_cleanup_interval.as_secs(),
-            shared_task_queue_completed_retention.whole_days()
-        ),
-    ));
-    workers.handles.push(shared_task_queue_cleanup_worker);
-    let shared_task_queue_purge_store =
-        openplotva_storage::PostgresTaskQueueStore::new(service_clients.postgres.clone());
-    let shared_task_queue_purge_stop = stop.subscribe();
-    let shared_task_queue_purge_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_db_purge_worker_until(
-            shared_task_queue_purge_store,
-            shared_task_queue_cleanup_interval,
-            shared_task_queue_completed_retention,
-            wait_for_runtime_stop(shared_task_queue_purge_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman Postgres purge worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_postgres_purge",
-        format!(
-            "Postgres purge every {}s, retention {}d",
-            shared_task_queue_cleanup_interval.as_secs(),
-            shared_task_queue_completed_retention.whole_days()
-        ),
-    ));
-    workers.handles.push(shared_task_queue_purge_worker);
-    let shared_task_queue_stuck_runtime = shared_task_queue.clone();
-    let shared_task_queue_stuck_stop = stop.subscribe();
-    let shared_task_queue_stuck_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_stuck_cleanup_worker_until(
-            shared_task_queue_stuck_runtime,
-            task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL,
-            task_queue::SHARED_TASK_QUEUE_STUCK_DURATION,
-            wait_for_runtime_stop(shared_task_queue_stuck_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman stuck-job cleanup worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_stuck_cleanup",
-        format!(
-            "stuck-job cleanup every {}s, stuck after {}s",
-            task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL.as_secs(),
-            task_queue::SHARED_TASK_QUEUE_STUCK_DURATION.as_secs()
-        ),
-    ));
-    workers.handles.push(shared_task_queue_stuck_worker);
-    let shared_task_queue_placeholder_runtime = shared_task_queue.clone();
-    let shared_task_queue_placeholder_effects = telegram.clone();
-    let shared_task_queue_placeholder_stop = stop.subscribe();
-    let shared_task_queue_placeholder_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_placeholder_cleanup_worker_until(
-            shared_task_queue_placeholder_runtime,
-            shared_task_queue_placeholder_effects,
-            shared_task_queue_placeholder_cleanup_interval,
-            shared_task_queue_placeholder_max_age,
-            std::time::Duration::from_secs(1),
-            wait_for_runtime_stop(shared_task_queue_placeholder_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "shared taskman placeholder cleanup worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_placeholder_cleanup",
-        format!(
-            "placeholder cleanup every {}s, max age {}s",
-            shared_task_queue_placeholder_cleanup_interval.as_secs(),
-            shared_task_queue_placeholder_max_age.as_secs()
-        ),
-    ));
-    workers.handles.push(shared_task_queue_placeholder_worker);
+    let (shared_task_queue_workers, shared_task_queue_checks) =
+        build_shared_task_queue_maintenance_group(
+            &shared_task_queue,
+            openplotva_storage::PostgresTaskQueueStore::new(service_clients.postgres.clone()),
+            telegram.clone(),
+            SharedTaskQueueMaintenanceConfig {
+                recovery_interval: shared_task_queue_recovery_interval,
+                cleanup_interval: shared_task_queue_cleanup_interval,
+                completed_retention: shared_task_queue_completed_retention,
+                placeholder_cleanup_interval: shared_task_queue_placeholder_cleanup_interval,
+                placeholder_max_age: shared_task_queue_placeholder_max_age,
+            },
+            worker_stops.as_ref(),
+        );
+    worker_registry.install(shared_task_queue_workers);
+    readiness_checks.extend(shared_task_queue_checks);
     workers.shared_task_queue = Some(shared_task_queue.clone());
     let telegram_outbox_store = openplotva_storage::PostgresTelegramOutboxStore::new(
         service_clients.critical_postgres.clone(),
@@ -11347,7 +11765,7 @@ async fn start_runtime_workers(
     }));
     let telegram_outbox_bot_id = bot_identity.id;
     let telegram_outbox_history = history_store.clone();
-    let telegram_outbox_stop = stop.subscribe();
+    let telegram_outbox_stop = worker_stops.subscribe(RuntimeWorkerPhase::Outbound);
     let telegram_outbox_worker = tokio::spawn(async move {
         let report = telegram_outbox::run_telegram_outbox_worker_until(
             telegram_outbox_store,
@@ -11363,7 +11781,11 @@ async fn start_runtime_workers(
         .await;
         tracing::info!(?report, "durable Telegram outbox worker stopped");
     });
-    workers.handles.push(telegram_outbox_worker);
+    worker_registry.register(
+        "telegram-outbox",
+        RuntimeWorkerPhase::Outbound,
+        telegram_outbox_worker,
+    );
     readiness_checks.push(ReadinessCheck::ok(
         "telegram_outbox",
         "durable Telegram outbox worker started with fenced leases and real receipt tracking",
@@ -11395,7 +11817,7 @@ async fn start_runtime_workers(
         let memory_scheduler_config =
             memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
         let memory_scheduler_trigger = Arc::clone(&memory_restart_trigger);
-        let memory_scheduler_stop = stop.subscribe();
+        let memory_scheduler_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ingress);
         let memory_scheduler = tokio::spawn(async move {
             let report =
                 memory_runtime::run_memory_consolidation_taskman_scheduler_with_trigger_until(
@@ -11409,7 +11831,11 @@ async fn start_runtime_workers(
 
             tracing::info!(?report, "memory-consolidation taskman scheduler stopped");
         });
-        workers.handles.push(memory_scheduler);
+        worker_registry.register(
+            "memory-consolidation-scheduler",
+            RuntimeWorkerPhase::Ingress,
+            memory_scheduler,
+        );
 
         let configured_memory_worker_count = config.persistent_queue.memory_consolidation_workers;
         let memory_workers_cap = config.persistent_queue.memory_workers_cap.max(1);
@@ -11460,7 +11886,8 @@ async fn start_runtime_workers(
                 interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
                 pipeline_target: usize::try_from(memory_worker_count).unwrap_or(1),
             };
-            let memory_worker_stop = stop.subscribe();
+            let memory_worker_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
+            let memory_worker_name = memory_worker_id.clone();
             let memory_worker = tokio::spawn(async move {
                 let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
                     memory_worker_queue.as_ref(),
@@ -11474,7 +11901,11 @@ async fn start_runtime_workers(
 
                 tracing::info!(?report, worker_id = %memory_worker_id, "memory-consolidation taskman worker stopped");
             });
-            workers.handles.push(memory_worker);
+            worker_registry.register(
+                memory_worker_name,
+                RuntimeWorkerPhase::Processor,
+                memory_worker,
+            );
         }
         if config.memory.subject_merge_enabled {
             let merge_merger = memory_runtime::subject_merger_from_app_config(config);
@@ -11490,7 +11921,7 @@ async fn start_runtime_workers(
                 embedding_dimension: config.memory.embedding_dim,
                 ..memory_runtime::MemorySubjectMergeConfig::default()
             };
-            let merge_stop = stop.subscribe();
+            let merge_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
             let merge_worker = tokio::spawn(async move {
                 let report = memory_runtime::run_memory_subject_merge_worker_until(
                     &merge_merger,
@@ -11506,7 +11937,11 @@ async fn start_runtime_workers(
                 "memory_subject_merge",
                 "Backlog over-extracted (scope,subject) card groups consolidated 24/7 via the LLM merge-pass",
             ));
-            workers.handles.push(merge_worker);
+            worker_registry.register(
+                "memory-subject-merge",
+                RuntimeWorkerPhase::Processor,
+                merge_worker,
+            );
         }
         readiness_checks.push(ReadinessCheck::ok(
             "memory_service",
@@ -11533,7 +11968,7 @@ async fn start_runtime_workers(
     let dispatcher_queue_for_updates = Arc::clone(&dispatcher_queue);
     let control_dispatcher_queue = Arc::clone(&dispatcher_queue);
     let dialog_translator = Arc::new(translator.clone());
-    let control_stop = stop.subscribe();
+    let control_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let control_worker = tokio::spawn(async move {
         let control_next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let control_next_virtual_id = {
@@ -11566,7 +12001,11 @@ async fn start_runtime_workers(
         tracing::info!(?report, "unified control-job worker stopped");
     });
     readiness_checks.push(ReadinessCheck::ok("control_jobs", control_queue_readiness));
-    workers.handles.push(control_worker);
+    worker_registry.register(
+        "control-job-worker",
+        RuntimeWorkerPhase::Processor,
+        control_worker,
+    );
 
     let music_service_available = config.music.acestep.enabled;
     let delivery_obligation_store = Arc::new(
@@ -11646,19 +12085,23 @@ async fn start_runtime_workers(
         );
         let watcher_interval =
             Duration::from_secs(config.llm.dialog.obligation_watch_interval_secs.max(1) as u64);
-        let watcher_stop = stop.subscribe();
-        workers.handles.push(tokio::spawn(async move {
-            dialog_turn::run_delivery_obligation_watcher(
-                watcher_store,
-                watcher_tickets,
-                watcher_notifier,
-                watcher_timeouts,
-                watcher_interval,
-                Some(watcher_dispatch_failures),
-                wait_for_runtime_stop(watcher_stop),
-            )
-            .await;
-        }));
+        let watcher_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
+        worker_registry.register(
+            "delivery-obligation-watcher",
+            RuntimeWorkerPhase::Processor,
+            tokio::spawn(async move {
+                dialog_turn::run_delivery_obligation_watcher(
+                    watcher_store,
+                    watcher_tickets,
+                    watcher_notifier,
+                    watcher_timeouts,
+                    watcher_interval,
+                    Some(watcher_dispatch_failures),
+                    wait_for_runtime_stop(watcher_stop),
+                )
+                .await;
+            }),
+        );
         readiness_checks.push(ReadinessCheck::ok(
             "dialog_delivery_obligations",
             format!(
@@ -11747,7 +12190,7 @@ async fn start_runtime_workers(
         ));
     let asr_task_queue = Arc::clone(&task_queue_for_updates);
     let asr_task_processor = Arc::clone(&dialog_context_asr_runtime);
-    let asr_task_stop = stop.subscribe();
+    let asr_task_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let asr_task_worker = tokio::spawn(async move {
         let report = asr::run_asr_worker_every_until(
             asr_task_queue.as_ref(),
@@ -11758,7 +12201,11 @@ async fn start_runtime_workers(
         .await;
         tracing::info!(?report, "priority ASR taskman worker stopped");
     });
-    workers.handles.push(asr_task_worker);
+    worker_registry.register(
+        "asr-task-worker",
+        RuntimeWorkerPhase::Processor,
+        asr_task_worker,
+    );
     shared_taskman_worker_counts.insert(openplotva_taskman::ASR_GPU1_QUEUE_NAME.to_owned(), 1);
     readiness_checks.push(ReadinessCheck::ok(
         "asr_jobs",
@@ -11936,26 +12383,33 @@ async fn start_runtime_workers(
         let poller_triggers = Arc::clone(&router_triggers);
         let poller_breakers = Arc::clone(&router_breakers);
         let poller_queue = Arc::clone(&task_queue_for_updates);
-        let poller_stop = stop.subscribe();
+        let poller_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
         let poller_interval = Duration::from_secs(
             config
                 .persistent_queue
                 .dialog_aifarm_fallback_poll_interval_seconds
                 .max(1) as u64,
         );
-        workers.handles.push(tokio::spawn(async move {
-            dialog_jobs::run_router_trigger_poller(
-                poller_handle,
-                poller_triggers,
-                poller_breakers,
-                poller_queue,
-                poller_interval,
-                wait_for_runtime_stop(poller_stop),
-            )
-            .await;
-        }));
+        worker_registry.register(
+            "router-trigger-poller",
+            RuntimeWorkerPhase::Ancillary,
+            tokio::spawn(async move {
+                dialog_jobs::run_router_trigger_poller(
+                    poller_handle,
+                    poller_triggers,
+                    poller_breakers,
+                    poller_queue,
+                    poller_interval,
+                    wait_for_runtime_stop(poller_stop),
+                )
+                .await;
+            }),
+        );
     }
-    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config(config);
+    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_prompt_store(
+        config,
+        Arc::clone(&prompt_store),
+    );
     let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
     match Ok::<_, dialog_runtime::DialogProviderBuildError>(dialog_runtime::router_dialog_provider(
         config,
@@ -11966,6 +12420,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_pools),
         genkit_fallback,
         Some(routing_event_reporter.clone()),
+        Arc::clone(&prompt_store),
     )) {
         Ok(mut dialog_provider) => {
             // One shared check-event recorder serves both the REAL and the
@@ -11976,9 +12431,13 @@ async fn start_runtime_workers(
                 let (recorder, recorder_worker) =
                     runtime_safety::PostgresWhiteCircleCheckEventRecorder::spawn(
                         service_clients.postgres.clone(),
-                        stop.subscribe(),
+                        worker_stops.subscribe(RuntimeWorkerPhase::Ancillary),
                     );
-                workers.handles.push(recorder_worker);
+                worker_registry.register(
+                    "white-circle-event-recorder",
+                    RuntimeWorkerPhase::Ancillary,
+                    recorder_worker,
+                );
                 Some(Arc::new(recorder))
             } else {
                 None
@@ -12102,7 +12561,7 @@ async fn start_runtime_workers(
                 let session_wiring = dialog_session_wiring.clone();
                 let llm_runs = llm_run_buffer.clone();
                 let activity_pulse = Arc::clone(&telegram_activity_pulse);
-                let stop_rx = stop.subscribe();
+                let stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
                 move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
                     let worker_queue = Arc::clone(&queue);
                     let worker_provider = Arc::clone(&provider);
@@ -12165,9 +12624,13 @@ async fn start_runtime_workers(
                 Arc::new(dialog_worker_spawner),
                 dialog_scale_rx,
                 Arc::clone(&dialog_worker_gauge),
-                stop.subscribe(),
+                worker_stops.subscribe(RuntimeWorkerPhase::Processor),
             );
-            workers.handles.push(dialog_supervisor);
+            worker_registry.register(
+                "dialog-worker-supervisor",
+                RuntimeWorkerPhase::Processor,
+                dialog_supervisor,
+            );
             workers.dialog_worker_gauge = Some(Arc::clone(&dialog_worker_gauge));
             workers.router_runtime = Some(Arc::new(model_routing::RouterRuntime {
                 handle: Arc::clone(&router_handle),
@@ -12223,6 +12686,7 @@ async fn start_runtime_workers(
             .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
             config,
+            Arc::clone(&prompt_store),
         ),
     )
         as media::AppMediaPromptOptimizer));
@@ -12323,7 +12787,7 @@ async fn start_runtime_workers(
         let reactions = &generation_reactions;
         vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
-    let vip_image_stop = stop.subscribe();
+    let vip_image_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let vip_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -12342,7 +12806,11 @@ async fn start_runtime_workers(
 
         tracing::info!(?report, "VIP image generation taskman worker stopped");
     });
-    workers.handles.push(vip_image_worker);
+    worker_registry.register(
+        "vip-image-generation-worker",
+        RuntimeWorkerPhase::Processor,
+        vip_image_worker,
+    );
 
     let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
     let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
@@ -12360,7 +12828,7 @@ async fn start_runtime_workers(
         let reactions = &generation_reactions;
         vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
     }
-    let vip_image_edit_stop = stop.subscribe();
+    let vip_image_edit_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let vip_image_edit_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
@@ -12379,7 +12847,11 @@ async fn start_runtime_workers(
 
         tracing::info!(?report, "VIP image edit taskman worker stopped");
     });
-    workers.handles.push(vip_image_edit_worker);
+    worker_registry.register(
+        "vip-image-edit-worker",
+        RuntimeWorkerPhase::Processor,
+        vip_image_edit_worker,
+    );
 
     let regular_image_queue = Arc::clone(&task_queue_for_updates);
     let regular_image_generator = image_jobs::OptimizingImageGenerator::new(
@@ -12403,7 +12875,7 @@ async fn start_runtime_workers(
         let reactions = &generation_reactions;
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
-    let regular_image_stop = stop.subscribe();
+    let regular_image_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let regular_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -12422,7 +12894,11 @@ async fn start_runtime_workers(
 
         tracing::info!(?report, "regular image generation taskman worker stopped");
     });
-    workers.handles.push(regular_image_worker);
+    worker_registry.register(
+        "regular-image-generation-worker",
+        RuntimeWorkerPhase::Processor,
+        regular_image_worker,
+    );
     readiness_checks.push(ReadinessCheck::ok(
         "image_jobs",
         "Image taskman workers started for VIP Flux+Boogu generation, Flux-only editing, and regular Boogu generation",
@@ -12452,6 +12928,7 @@ async fn start_runtime_workers(
                 .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 config,
+                Arc::clone(&prompt_store),
             ));
         let base_song_material: Arc<dyn music_jobs::SongMaterialProvider + Send + Sync> =
             Arc::new(music_jobs::AifarmSongMaterialProvider::new(
@@ -12524,7 +13001,7 @@ async fn start_runtime_workers(
             let reactions = &generation_reactions;
             music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
         }
-        let music_stop = stop.subscribe();
+        let music_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
         let music_activity_pulse = Arc::clone(&telegram_activity_pulse);
         let music_worker = tokio::spawn(async move {
             let report = music_jobs::run_music_worker_every_until_with_max_attempts(
@@ -12543,7 +13020,11 @@ async fn start_runtime_workers(
 
             tracing::info!(?report, "music generation taskman worker stopped");
         });
-        workers.handles.push(music_worker);
+        worker_registry.register(
+            "music-generation-worker",
+            RuntimeWorkerPhase::Processor,
+            music_worker,
+        );
         readiness_checks.push(ReadinessCheck::ok(
                     "music_jobs",
                     "Music taskman worker started for music-vip queue with routed song reprompt and routed ACE-Step provider",
@@ -12570,7 +13051,7 @@ async fn start_runtime_workers(
         service_clients.postgres.clone(),
     )));
     let shared_task_queue_heartbeat_runtime = shared_task_queue.clone();
-    let shared_task_queue_heartbeat_stop = stop.subscribe();
+    let shared_task_queue_heartbeat_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let shared_task_queue_heartbeat_worker_ids = shared_taskman_worker_ids.clone();
     let shared_task_queue_heartbeat_worker = tokio::spawn(async move {
         let report = task_queue::run_shared_task_queue_heartbeat_worker_until(
@@ -12591,11 +13072,15 @@ async fn start_runtime_workers(
             shared_taskman_worker_ids.len()
         ),
     ));
-    workers.handles.push(shared_task_queue_heartbeat_worker);
+    worker_registry.register(
+        "shared-task-queue-heartbeat",
+        RuntimeWorkerPhase::Processor,
+        shared_task_queue_heartbeat_worker,
+    );
 
     let ephemeral_cleanup_store = ephemeral_store.clone();
     let ephemeral_cleanup_telegram = telegram.clone();
-    let ephemeral_cleanup_stop = stop.subscribe();
+    let ephemeral_cleanup_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
     let ephemeral_cleanup_worker = tokio::spawn(async move {
         let report = virtual_messages::run_ephemeral_cleanup_worker_until(
             &ephemeral_cleanup_store,
@@ -12617,35 +13102,11 @@ async fn start_runtime_workers(
         "ephemeral_messages",
         "Telegram ephemeral message cleanup worker started",
     ));
-    workers.handles.push(ephemeral_cleanup_worker);
-
-    let immediate_history = history_store.clone();
-    let immediate_telegram = telegram.clone();
-    let immediate_rich = rich_api.clone();
-    let immediate_ephemeral = ephemeral_store.clone();
-    let immediate_rate_limits = Arc::clone(&rate_limit_policy);
-    let immediate_permissions = Arc::clone(&permission_policy);
-    let immediate_queue = Arc::clone(&dispatcher_queue);
-    let immediate_failure_ring = Arc::clone(&dispatch_failure_ring);
-    let immediate_stop = stop.subscribe();
-    let immediate_worker = tokio::spawn(async move {
-        let outcome = immediate_queue
-            .run_immediate_worker_until(wait_for_runtime_stop(immediate_stop), |item| {
-                send_dispatcher_work_item(
-                    immediate_history.clone(),
-                    immediate_telegram.clone(),
-                    immediate_rich.clone(),
-                    immediate_ephemeral.clone(),
-                    Arc::clone(&immediate_rate_limits),
-                    Arc::clone(&immediate_permissions),
-                    Some(Arc::clone(&immediate_failure_ring)),
-                    item,
-                )
-            })
-            .await;
-
-        tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
-    });
+    worker_registry.register(
+        "ephemeral-message-cleanup",
+        RuntimeWorkerPhase::Ancillary,
+        ephemeral_cleanup_worker,
+    );
 
     let update_ingress_guard = Arc::new(openplotva_updates::UpdateIngressGuard::with_defaults());
 
@@ -12685,7 +13146,7 @@ async fn start_runtime_workers(
         let update_source = telegram.clone();
         let update_stream = update_stream.clone();
         let update_ingress_guard = Arc::clone(&update_ingress_guard);
-        let update_stop = stop.subscribe();
+        let update_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ingress);
         let update_bot_id = bot_identity.id;
         let update_producer_worker = tokio::spawn(async move {
             if let Err(error) = update_startup.delete_webhook().await {
@@ -12703,7 +13164,11 @@ async fn start_runtime_workers(
                 .await;
             tracing::info!(?report, "Telegram long-poll Stream producer stopped");
         });
-        workers.handles.push(update_producer_worker);
+        worker_registry.register(
+            "telegram-update-producer",
+            RuntimeWorkerPhase::Ingress,
+            update_producer_worker,
+        );
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_producer",
             "Telegram long polling atomically appends batches and cursors to the durable Redis Stream",
@@ -12784,7 +13249,7 @@ async fn start_runtime_workers(
             materializer_metrics.clone(),
         );
         let materializer_bot_id = bot_identity.id;
-        let materializer_stop = stop.subscribe();
+        let materializer_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
         let materializer_worker = tokio::spawn(async move {
             match update_materializer::run_supervised_update_materializer_until(
                 materializer_stream,
@@ -12803,7 +13268,11 @@ async fn start_runtime_workers(
                 }
             }
         });
-        workers.handles.push(materializer_worker);
+        worker_registry.register(
+            "telegram-update-materializer",
+            RuntimeWorkerPhase::Processor,
+            materializer_worker,
+        );
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_materializer",
             format!(
@@ -12922,11 +13391,12 @@ async fn start_runtime_workers(
             Arc::clone(&telegram_effects),
             callbacks,
         ));
-        let text_reply_settings_gate =
-            Arc::new(message_gate::TextReplySettingsGateUpdateHandler::new(
+        let text_reply_settings_gate = Arc::new(updates::BoxedUpdateHandler::new(Arc::new(
+            message_gate::TextReplySettingsGateUpdateHandler::new(
                 Arc::new(chat_settings_store.clone()),
                 inline,
-            ));
+            ),
+        )));
         let reset_handler = Arc::new(reset::ResetCommandUpdateHandler::new(
             Arc::clone(&history_store_for_updates),
             Arc::clone(&dispatcher_queue_for_updates),
@@ -12983,16 +13453,18 @@ async fn start_runtime_workers(
             Arc::clone(&control_queue_for_updates),
             Arc::new(join_greeting_runtime.clone()),
         ));
-        let settings_handler = Arc::new(settings::SettingsUpdateHandler::new(
-            Arc::clone(&dispatcher_queue_for_updates),
-            settings_control_queue,
-            settings::SettingsUpdateHandlerConfig::new(
-                bot_identity.username.clone(),
-                bot_identity.id,
-                config.server.url.clone(),
+        let settings_handler = Arc::new(updates::BoxedUpdateHandler::new(Arc::new(
+            settings::SettingsUpdateHandler::new(
+                Arc::clone(&dispatcher_queue_for_updates),
+                settings_control_queue,
+                settings::SettingsUpdateHandlerConfig::new(
+                    bot_identity.username.clone(),
+                    bot_identity.id,
+                    config.server.url.clone(),
+                ),
+                post_service_blocked_gate,
             ),
-            post_service_blocked_gate,
-        ));
+        )));
         let chat_communication = Arc::new(members::ChatSettingsCommunicationEffects::new(
             chat_settings_store.clone(),
         ));
@@ -13090,19 +13562,21 @@ async fn start_runtime_workers(
         let admin_updates_inspector: Arc<dyn openplotva_server::RuntimeUpdatesInspector> =
             Arc::new(updates_inspector.clone());
         let admin_dialog_debounce = Arc::clone(&dialog_debounce);
-        let admin_queue_handler = Arc::new(admin::AdminQueueCommandUpdateHandler::new(
-            admin::AdminQueueRuntimeConfig::new(admin_queue_config_from_app_config(config))
-                .with_taskman(admin_taskman_inspector)
-                .with_dispatcher(admin_dispatcher_inspector)
-                .with_updates(admin_updates_inspector)
-                .with_dialog_debounce_len(Arc::new(move || admin_dialog_debounce.len())),
-            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
-                &dispatcher_queue_for_updates,
-            ))),
-            config.admins.admin_ids.clone(),
-            bot_identity.username.clone(),
-            admin_help_handler,
-        ));
+        let admin_queue_handler = Arc::new(updates::BoxedUpdateHandler::new(Arc::new(
+            admin::AdminQueueCommandUpdateHandler::new(
+                admin::AdminQueueRuntimeConfig::new(admin_queue_config_from_app_config(config))
+                    .with_taskman(admin_taskman_inspector)
+                    .with_dispatcher(admin_dispatcher_inspector)
+                    .with_updates(admin_updates_inspector)
+                    .with_dialog_debounce_len(Arc::new(move || admin_dialog_debounce.len())),
+                Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                    &dispatcher_queue_for_updates,
+                ))),
+                config.admins.admin_ids.clone(),
+                bot_identity.username.clone(),
+                admin_help_handler,
+            ),
+        )));
         let admin_vip_handler = Arc::new(payments::AdminVipCommandUpdateHandler::new(
             Arc::clone(&dispatcher_queue_for_updates),
             Arc::clone(&payment_store_for_updates),
@@ -13165,13 +13639,14 @@ async fn start_runtime_workers(
             bot_identity.username.clone(),
             edited,
         ));
+        let typed_router = Arc::new(updates::TypedUpdateRouter::new(gated_handler));
         let handler = Arc::new(updates::UpdateHandlerWithHistory::new(
             Arc::clone(&history_store_for_updates),
-            gated_handler,
+            typed_router,
             bot_identity.id,
         ));
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
-        let update_consumer_stop = stop.subscribe();
+        let update_consumer_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
         let delivery_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
             service_clients.critical_postgres.clone(),
         );
@@ -13190,7 +13665,11 @@ async fn start_runtime_workers(
             .await;
             tracing::info!(?report, "Postgres Telegram inbox consumer stopped");
         });
-        workers.handles.push(update_consumer_worker);
+        worker_registry.register(
+            "telegram-update-consumer",
+            RuntimeWorkerPhase::Processor,
+            update_consumer_worker,
+        );
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_consumer",
             "Postgres Telegram inbox consumer started with leased, fenced claims",
@@ -13202,62 +13681,24 @@ async fn start_runtime_workers(
         ));
     }
 
-    let regular_history = history_store;
-    let regular_telegram = telegram;
-    let regular_rich = rich_api;
-    let regular_ephemeral = ephemeral_store;
-    let regular_rate_limits = Arc::clone(&rate_limit_policy);
-    let regular_permissions = Arc::clone(&permission_policy);
-    let regular_queue = Arc::clone(&dispatcher_queue);
-    let regular_limiters = Arc::clone(&dispatcher_limiters);
-    let regular_failure_ring = Arc::clone(&dispatch_failure_ring);
-    let regular_stop = stop.subscribe();
-    let regular_worker = tokio::spawn(async move {
-        let outcome = regular_queue
-            .run_regular_worker_until(
-                &regular_limiters,
-                wait_for_runtime_stop(regular_stop),
-                |item| {
-                    send_dispatcher_work_item(
-                        regular_history.clone(),
-                        regular_telegram.clone(),
-                        regular_rich.clone(),
-                        regular_ephemeral.clone(),
-                        Arc::clone(&regular_rate_limits),
-                        Arc::clone(&regular_permissions),
-                        Some(Arc::clone(&regular_failure_ring)),
-                        item,
-                    )
-                },
-            )
-            .await;
-
-        tracing::info!(?outcome, "outbound regular dispatcher worker stopped");
-    });
-
-    let cleanup_limiters = Arc::clone(&dispatcher_limiters);
-    let cleanup_stop = stop.subscribe();
-    let cleanup_worker = tokio::spawn(async move {
-        let outcome = openplotva_telegram::run_limiter_cleanup_until(
-            &cleanup_limiters,
-            openplotva_telegram::DispatcherRuntimeConfig::default(),
-            wait_for_runtime_stop(cleanup_stop),
-        )
-        .await;
-
-        tracing::info!(
-            ?outcome,
-            "outbound dispatcher limiter cleanup worker stopped"
-        );
-    });
-
     readiness_checks.push(ReadinessCheck::ok(
         "outbound_dispatcher",
         "Telegram outbound dispatcher workers started",
     ));
-    workers.handles.push(immediate_worker);
-    workers.handles.push(regular_worker);
-    workers.handles.push(cleanup_worker);
+    worker_registry.install(build_dispatcher_worker_group(
+        DispatcherWorkerGroupInputs {
+            history: history_store,
+            telegram,
+            rich: rich_api,
+            ephemeral: ephemeral_store,
+            rate_limits: Arc::clone(&rate_limit_policy),
+            permissions: Arc::clone(&permission_policy),
+            queue: Arc::clone(&dispatcher_queue),
+            limiters: dispatcher_limiters,
+            failure_ring: dispatch_failure_ring,
+        },
+        worker_stops.as_ref(),
+    ));
     workers.dispatcher = Some(DispatcherRuntime {
         queue: dispatcher_queue,
         persistence: dispatcher_persistence,
@@ -13268,8 +13709,8 @@ async fn start_runtime_workers(
 
 async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
     let RuntimeWorkers {
-        handles,
-        stop,
+        worker_registry,
+        worker_stops,
         dispatcher,
         shared_task_queue,
         dialog_debounce,
@@ -13296,14 +13737,11 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         dialog_worker_gauge: _,
         readiness_probes: _,
     } = workers;
-
-    if let Some(stop) = stop {
-        let _ = stop.send(true);
-    }
-
-    if let Some(dispatcher) = dispatcher {
-        persist_dispatcher_queue_on_shutdown(dispatcher).await;
-    }
+    let started_at = Instant::now();
+    let deadline = started_at + RUNTIME_WORKER_SHUTDOWN_TIMEOUT;
+    let processor_deadline = started_at + RUNTIME_PROCESSOR_SHUTDOWN_TIMEOUT;
+    let outbound_deadline = deadline - RUNTIME_PERSISTENCE_RESERVE;
+    let persistence_deadline = deadline - RUNTIME_FINALIZATION_RESERVE;
 
     if let Some(dialog_debounce) = dialog_debounce {
         let stopped = dialog_debounce.stop_all();
@@ -13312,28 +13750,57 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         }
     }
 
-    for worker in handles {
-        await_runtime_worker_shutdown(worker).await;
-    }
-
-    if let Some(shared_task_queue) = shared_task_queue {
-        persist_shared_task_queue_on_shutdown(shared_task_queue).await;
+    let drained = shutdown_runtime_workers_before_persistence(
+        worker_registry.as_ref(),
+        worker_stops.as_ref(),
+        processor_deadline,
+        outbound_deadline,
+    )
+    .await;
+    if drained {
+        if let Some(dispatcher) = dispatcher {
+            persist_dispatcher_queue_on_shutdown(dispatcher, persistence_deadline).await;
+        }
+        if let Some(shared_task_queue) = shared_task_queue {
+            persist_shared_task_queue_on_shutdown(shared_task_queue, persistence_deadline).await;
+        }
+        worker_stops.signal(RuntimeWorkerPhase::Ancillary);
+        if !await_runtime_worker_phase_until(
+            worker_registry.as_ref(),
+            RuntimeWorkerPhase::Ancillary,
+            deadline,
+        )
+        .await
+        {
+            abort_runtime_workers(worker_registry.take_all());
+        }
+    } else {
+        tracing::warn!(
+            "runtime workers did not drain before the shutdown deadline; skipped queue persistence"
+        );
     }
 
     if delete_webhook_on_shutdown {
         match telegram {
-            Some(telegram) => match delete_webhook_on_shutdown_if_enabled(true, &telegram).await {
-                WebhookShutdownCleanupReport::Deleted => {
-                    tracing::debug!("Telegram webhook configuration deleted during shutdown");
+            Some(telegram) => {
+                match timeout_at(
+                    deadline,
+                    delete_webhook_on_shutdown_if_enabled(true, &telegram),
+                )
+                .await
+                {
+                    Ok(WebhookShutdownCleanupReport::Deleted) => {
+                        tracing::debug!("Telegram webhook configuration deleted during shutdown");
+                    }
+                    Ok(WebhookShutdownCleanupReport::Failed { error }) => {
+                        tracing::warn!(%error, "failed to delete Telegram webhook during shutdown");
+                    }
+                    Ok(WebhookShutdownCleanupReport::TimedOut) | Err(_) => {
+                        tracing::warn!("timed out deleting Telegram webhook during shutdown");
+                    }
+                    Ok(WebhookShutdownCleanupReport::SkippedDisabled) => {}
                 }
-                WebhookShutdownCleanupReport::Failed { error } => {
-                    tracing::warn!(%error, "failed to delete Telegram webhook during shutdown");
-                }
-                WebhookShutdownCleanupReport::TimedOut => {
-                    tracing::warn!("timed out deleting Telegram webhook during shutdown");
-                }
-                WebhookShutdownCleanupReport::SkippedDisabled => {}
-            },
+            }
             None => {
                 tracing::warn!("Telegram webhook cleanup was requested without a Telegram client");
             }
@@ -13341,9 +13808,84 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
     }
 }
 
-async fn persist_dispatcher_queue_on_shutdown(dispatcher: DispatcherRuntime) {
-    let save_result = timeout(
-        openplotva_telegram::DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT,
+async fn shutdown_runtime_workers_before_persistence(
+    registry: &RuntimeWorkerRegistry,
+    stops: &RuntimeWorkerStops,
+    processor_deadline: Instant,
+    outbound_deadline: Instant,
+) -> bool {
+    for phase in [RuntimeWorkerPhase::Server, RuntimeWorkerPhase::Ingress] {
+        stops.signal(phase);
+    }
+    for phase in [RuntimeWorkerPhase::Server, RuntimeWorkerPhase::Ingress] {
+        if !await_runtime_worker_phase_until(registry, phase, processor_deadline).await {
+            abort_runtime_workers(registry.take_all());
+            return false;
+        }
+    }
+
+    stops.signal(RuntimeWorkerPhase::Processor);
+    if !await_runtime_worker_phase_until(
+        registry,
+        RuntimeWorkerPhase::Processor,
+        processor_deadline,
+    )
+    .await
+    {
+        abort_runtime_workers(registry.take_all());
+        return false;
+    }
+
+    stops.signal(RuntimeWorkerPhase::Outbound);
+    if !await_runtime_worker_phase_until(registry, RuntimeWorkerPhase::Outbound, outbound_deadline)
+        .await
+    {
+        abort_runtime_workers(registry.take_all());
+        return false;
+    }
+
+    true
+}
+
+async fn await_runtime_worker_phase_until(
+    registry: &RuntimeWorkerRegistry,
+    phase: RuntimeWorkerPhase,
+    deadline: Instant,
+) -> bool {
+    let mut workers = registry.take_phase(phase).into_iter();
+    while let Some(NamedRuntimeWorker {
+        name,
+        phase: _,
+        mut handle,
+    }) = workers.next()
+    {
+        match timeout_at(deadline, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => {
+                tracing::warn!(worker = %name, %error, "runtime worker stopped with an error");
+            }
+            Err(_) => {
+                tracing::warn!(worker = %name, "runtime worker exceeded the shutdown deadline");
+                handle.abort();
+                abort_runtime_workers(workers);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn abort_runtime_workers(workers: impl IntoIterator<Item = NamedRuntimeWorker>) {
+    for worker in workers {
+        tracing::warn!(worker = %worker.name, "aborting runtime worker after shutdown deadline");
+        worker.handle.abort();
+    }
+}
+
+async fn persist_dispatcher_queue_on_shutdown(dispatcher: DispatcherRuntime, deadline: Instant) {
+    let save_result = timeout_at(
+        deadline,
         dispatcher
             .persistence
             .save_queue_on_shutdown(&dispatcher.queue),
@@ -13373,32 +13915,11 @@ async fn persist_dispatcher_queue_on_shutdown(dispatcher: DispatcherRuntime) {
     }
 }
 
-async fn await_runtime_worker_shutdown(mut worker: JoinHandle<()>) {
-    match timeout(
-        openplotva_telegram::DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT,
-        &mut worker,
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) if error.is_cancelled() => {}
-        Ok(Err(error)) => tracing::warn!(%error, "runtime worker stopped with an error"),
-        Err(_) => {
-            worker.abort();
-            match worker.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => tracing::warn!(%error, "runtime worker abort failed"),
-            }
-        }
-    }
-}
-
-async fn persist_shared_task_queue_on_shutdown(queue: task_queue::SharedTaskQueueRuntime) {
-    let save_result = timeout(task_queue::SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT, async {
-        queue.flush_dirty().await
-    })
-    .await;
+async fn persist_shared_task_queue_on_shutdown(
+    queue: task_queue::SharedTaskQueueRuntime,
+    deadline: Instant,
+) {
+    let save_result = timeout_at(deadline, async { queue.flush_dirty().await }).await;
 
     match save_result {
         Ok(Ok(flushed)) => {
@@ -13820,21 +14341,16 @@ enum RuntimeUnhandledUpdateError {
 impl updates::UpdateHandler for RuntimeUnhandledUpdateHandler {
     type Error = RuntimeUnhandledUpdateError;
 
-    fn handle_update<'a>(
-        &'a self,
-        update: carapax::types::Update,
-    ) -> updates::UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            if matches!(&update.update_type, carapax::types::UpdateType::Message(_)) {
-                tracing::debug!(
-                    update_id = update.id,
-                    "residual message update consumed at quiet terminal"
-                );
-                return Ok(());
-            }
-            Err(RuntimeUnhandledUpdateError::Unported {
-                update_name: openplotva_updates::update_name(&update),
-            })
+    async fn handle_update(&self, update: carapax::types::Update) -> Result<(), Self::Error> {
+        if matches!(&update.update_type, carapax::types::UpdateType::Message(_)) {
+            tracing::debug!(
+                update_id = update.id,
+                "residual message update consumed at quiet terminal"
+            );
+            return Ok(());
+        }
+        Err(RuntimeUnhandledUpdateError::Unported {
+            update_name: openplotva_updates::update_name(&update),
         })
     }
 }
@@ -13880,6 +14396,197 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    #[tokio::test]
+    async fn runtime_worker_readiness_names_an_early_exit() {
+        let registry = Arc::new(super::RuntimeWorkerRegistry::default());
+        registry.register(
+            "early-exit-worker",
+            super::RuntimeWorkerPhase::Ancillary,
+            tokio::spawn(async {}),
+        );
+        tokio::task::yield_now().await;
+
+        let readiness = registry.readiness_check();
+
+        assert_eq!(readiness.status, "error");
+        assert!(readiness.detail.contains("early-exit-worker"));
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_readiness_names_a_panicked_worker() {
+        let registry = Arc::new(super::RuntimeWorkerRegistry::default());
+        registry.register(
+            "panicked-worker",
+            super::RuntimeWorkerPhase::Ancillary,
+            tokio::spawn(async { panic!("expected worker panic") }),
+        );
+        tokio::task::yield_now().await;
+
+        let readiness = registry.readiness_check();
+
+        assert_eq!(readiness.status, "error");
+        assert!(readiness.detail.contains("panicked-worker"));
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_worker_registry_cancels_registered_workers() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let registry = super::RuntimeWorkerRegistry::default();
+        registry.register(
+            "startup-worker",
+            super::RuntimeWorkerPhase::Ancillary,
+            tokio::spawn({
+                let cancelled = Arc::clone(&cancelled);
+                let started = Arc::clone(&started);
+                async move {
+                    let _drop_signal = DropSignal(cancelled);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }),
+        );
+        started.notified().await;
+
+        drop(registry);
+        tokio::task::yield_now().await;
+
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_registry_installs_an_owned_worker_group() {
+        let registry = super::RuntimeWorkerRegistry::default();
+        let mut group = super::RuntimeWorkerGroup::new(super::RuntimeWorkerPhase::Processor);
+        group.register("group-worker", tokio::spawn(async {}));
+
+        registry.install(group);
+        tokio::task::yield_now().await;
+
+        let readiness = registry.readiness_check();
+        assert_eq!(readiness.status, "error");
+        assert!(readiness.detail.contains("group-worker"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_worker_shutdown_uses_one_deadline_for_forty_eight_hung_tasks() {
+        let registry = Arc::new(super::RuntimeWorkerRegistry::default());
+        for index in 0..48 {
+            registry.register(
+                format!("hung-worker-{index}"),
+                super::RuntimeWorkerPhase::Processor,
+                tokio::spawn(std::future::pending()),
+            );
+        }
+        let timeout = Duration::from_secs(10);
+        let started_at = tokio::time::Instant::now();
+
+        let completed = super::await_runtime_worker_phase_until(
+            &registry,
+            super::RuntimeWorkerPhase::Processor,
+            started_at + timeout,
+        )
+        .await;
+
+        assert!(!completed);
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_shutdown_drains_outbound_after_processors() {
+        let registry = Arc::new(super::RuntimeWorkerRegistry::default());
+        let stops = super::RuntimeWorkerStops::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for (name, phase) in [
+            ("ingress", super::RuntimeWorkerPhase::Ingress),
+            ("processor", super::RuntimeWorkerPhase::Processor),
+            ("outbound", super::RuntimeWorkerPhase::Outbound),
+        ] {
+            let stop = stops.subscribe(phase);
+            let order = Arc::clone(&order);
+            registry.register(
+                name,
+                phase,
+                tokio::spawn(async move {
+                    super::wait_for_runtime_stop(stop).await;
+                    order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name);
+                }),
+            );
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let completed = super::shutdown_runtime_workers_before_persistence(
+            &registry, &stops, deadline, deadline,
+        )
+        .await;
+        order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push("persistence");
+
+        assert!(completed);
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ["ingress", "processor", "outbound", "persistence"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_worker_shutdown_reserves_a_later_deadline_for_outbound() {
+        let registry = Arc::new(super::RuntimeWorkerRegistry::default());
+        let stops = super::RuntimeWorkerStops::new();
+        for (name, phase, drain_time) in [
+            (
+                "processor",
+                super::RuntimeWorkerPhase::Processor,
+                Duration::from_secs(1),
+            ),
+            (
+                "outbound",
+                super::RuntimeWorkerPhase::Outbound,
+                Duration::from_secs(2),
+            ),
+        ] {
+            let stop = stops.subscribe(phase);
+            registry.register(
+                name,
+                phase,
+                tokio::spawn(async move {
+                    super::wait_for_runtime_stop(stop).await;
+                    tokio::time::sleep(drain_time).await;
+                }),
+            );
+        }
+        let started_at = tokio::time::Instant::now();
+
+        let completed = super::shutdown_runtime_workers_before_persistence(
+            &registry,
+            &stops,
+            started_at + Duration::from_millis(1_500),
+            started_at + Duration::from_secs(4),
+        )
+        .await;
+
+        assert!(completed);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_secs(3)
+        );
+    }
 
     #[test]
     fn postgres_readiness_only_fails_at_full_active_capacity() {
@@ -14191,6 +14898,62 @@ mod tests {
             config.dedupe_config.max_cache_size,
             GO_DISPATCHER_DEBOUNCE_CACHE_SIZE
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_stop_mid_send_accounts_for_sent_and_persisted_items()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        for (virtual_id, content_hash) in [("sending", 1), ("queued", 2)] {
+            queue.enqueue(
+                DispatcherMessage::new(
+                    MessageFingerprint {
+                        chat_id: 42,
+                        message_type: "test".to_owned(),
+                        content_hash,
+                        debounce_key: None,
+                    },
+                    virtual_id,
+                )
+                .with_method(TelegramOutboundMethod::from(SendMessage::new(
+                    42, virtual_id,
+                ))),
+                true,
+            );
+        }
+        let send_started = Arc::new(tokio::sync::Notify::new());
+        let release_send = Arc::new(tokio::sync::Notify::new());
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            let send_started = Arc::clone(&send_started);
+            let release_send = Arc::clone(&release_send);
+            async move {
+                queue
+                    .run_immediate_worker_until(super::wait_for_runtime_stop(stop_rx), move |_| {
+                        let send_started = Arc::clone(&send_started);
+                        let release_send = Arc::clone(&release_send);
+                        async move {
+                            send_started.notify_one();
+                            release_send.notified().await;
+                            DispatcherSendStatus::Sent
+                        }
+                    })
+                    .await
+            }
+        });
+
+        send_started.notified().await;
+        stop.send(true)?;
+        release_send.notify_one();
+        worker.await?;
+
+        assert_eq!(queue.stats().processed_total, 1);
+        let persisted =
+            openplotva_telegram::persistent_queue_from_drain(queue.drain_for_shutdown(), 10)?;
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(persisted.items[0].virtual_id, "queued");
+        Ok(())
     }
 
     #[test]
@@ -15366,6 +16129,7 @@ mod tests {
         assert_eq!(value["policy"]["min_messages_per_run"], 20);
         assert_eq!(value["policy"]["max_queued_runs"], 5000);
         assert_eq!(value["policy"]["max_daily_enqueued_runs"], 2000);
+        assert_eq!(value["policy"]["token_estimator"], "heuristic");
         assert!(value["enqueue_rollups"].is_null());
 
         let response =
