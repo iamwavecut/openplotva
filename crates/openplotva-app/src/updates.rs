@@ -22,7 +22,7 @@ use openplotva_storage::{
     TelegramFileMetadataUpsert,
 };
 use openplotva_updates::{
-    HistoryTextEntry, NoopUpdateStageTracker, UPDATE_CLAIM_RETRY_AFTER,
+    HistoryTextEntry, NoopUpdateStageTracker, ParsedUpdateKind, UPDATE_CLAIM_RETRY_AFTER,
     UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT, UpdateConsumerConfig, UpdateProcessReport,
     UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
     build_fetcher_message_context, build_history_text_entry, build_history_text_entry_with_text,
@@ -41,8 +41,6 @@ pub type UpdateSourceFuture<'a, E> =
 pub type UpdateSourceBatchFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<Vec<TelegramUpdate>, E>> + Send + 'a>>;
 
-/// Boxed future returned by update handlers.
-pub type UpdateHandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 type UpdateProcessorFuture = Pin<Box<dyn Future<Output = UpdateProcessReport> + Send>>;
 type UpdateProcessor = Arc<
     dyn Fn(TelegramUpdate, UpdateConsumerConfig, SystemTime) -> UpdateProcessorFuture + Send + Sync,
@@ -117,7 +115,69 @@ pub trait UpdateHandler {
     type Error: fmt::Display + Send;
 
     /// Handle one decoded update after the state stage has been scheduled.
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error>;
+    fn handle_update(
+        &self,
+        update: TelegramUpdate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Explicitly erases one segment of a statically composed handler chain.
+///
+/// One allocation at a composition boundary keeps release-codegen depth bounded while the
+/// individual handlers and the common short routes retain allocation-free futures.
+#[derive(Clone, Debug)]
+pub struct BoxedUpdateHandler<Handler> {
+    handler: Arc<Handler>,
+}
+
+impl<Handler> BoxedUpdateHandler<Handler> {
+    pub fn new(handler: Arc<Handler>) -> Self {
+        Self { handler }
+    }
+}
+
+impl<Handler> UpdateHandler for BoxedUpdateHandler<Handler>
+where
+    Handler: UpdateHandler + Send + Sync,
+{
+    type Error = Handler::Error;
+
+    fn handle_update(
+        &self,
+        update: TelegramUpdate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let future: Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> =
+            Box::pin(self.handler.handle_update(update));
+        future
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TypedUpdateRouter<Next> {
+    next: Arc<Next>,
+}
+
+impl<Next> TypedUpdateRouter<Next> {
+    pub fn new(next: Arc<Next>) -> Self {
+        Self { next }
+    }
+}
+
+impl<Next> UpdateHandler for TypedUpdateRouter<Next>
+where
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = Next::Error;
+
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        if ParsedUpdateKind::from_update(&update) == ParsedUpdateKind::Skipped {
+            let update_name = crate::skipped::go_skipped_update_name(&update.update_type)
+                .unwrap_or_else(|| openplotva_updates::update_name(&update));
+            tracing::debug!(update_name, "skipping accepted update without processor");
+            return Ok(());
+        }
+        self.next.handle_update(update).await
+    }
 }
 
 /// Storage capability needed by the app-level update consumer state stage.
@@ -523,14 +583,12 @@ where
 {
     type Error = UpdateHandleWithHistoryError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_update_with_history(self.history_store.as_ref(), update, self.bot_id, |update| {
-                self.handler.handle_update(update)
-            })
-            .await
-            .map(|_| ())
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_update_with_history(self.history_store.as_ref(), update, self.bot_id, |update| {
+            self.handler.handle_update(update)
         })
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1960,9 +2018,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
+        BoxedUpdateHandler, EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
         InboundHistoryStoreFuture, InboundHistoryUpsert, TelegramFileMetadataStoreFuture,
-        UpdateHandler, UpdateHandlerFuture, UpdateHandlerWithHistory, UpdateSource,
+        TypedUpdateRouter, UpdateHandler, UpdateHandlerWithHistory, UpdateSource,
         UpdateSourceBatchFuture, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
         decode_telegram_update_payload, persist_update_state,
         process_update_with_state_and_history_store_at, process_update_with_state_store_at,
@@ -3209,19 +3267,46 @@ mod tests {
     impl UpdateHandler for HandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(update.id);
-                self.notify.notify_waiters();
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .push(update.id);
+            self.notify.notify_waiters();
+            Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn boxed_update_handler_erases_one_segment_and_preserves_delegation()
+    -> Result<(), Box<dyn Error>> {
+        let handler = HandlerStub::default();
+        let erased = BoxedUpdateHandler::new(Arc::new(handler.clone()));
+
+        erased
+            .handle_update(sample_message_update_with_id(44)?)
+            .await?;
+
+        assert_eq!(handler.calls(), vec![44]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_update_router_short_circuits_skipped_and_delegates_message_once()
+    -> Result<(), Box<dyn Error>> {
+        let next = HandlerStub::default();
+        let router = TypedUpdateRouter::new(Arc::new(next.clone()));
+
+        router
+            .handle_update(sample_poll_update_with_id(43)?)
+            .await?;
+        assert!(next.calls().is_empty());
+
+        router
+            .handle_update(sample_message_update_with_id(44)?)
+            .await?;
+        assert_eq!(next.calls(), vec![44]);
+        Ok(())
     }
 
     #[derive(Clone, Debug)]
@@ -3230,16 +3315,11 @@ mod tests {
     impl UpdateHandler for FailingUpdateHandler {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                Err(io::Error::other(format!(
-                    "unexpected delegated update {}",
-                    update.id
-                )))
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            Err(io::Error::other(format!(
+                "unexpected delegated update {}",
+                update.id
+            )))
         }
     }
 

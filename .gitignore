@@ -8,3 +8,5 @@
 !.env.example
 *.log
 .DS_Store
+/.lab/
+/run.log

@@ -185,14 +185,20 @@ where
 pub struct RoutedMediaPromptOptimizer {
     walker: RoutedAttemptWalker,
     config: AppConfig,
+    prompt_store: Arc<openplotva_prompts::PromptStore>,
 }
 
 impl RoutedMediaPromptOptimizer {
     #[must_use]
-    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+    pub fn new(
+        walker: RoutedAttemptWalker,
+        config: &AppConfig,
+        prompt_store: Arc<openplotva_prompts::PromptStore>,
+    ) -> Self {
         Self {
             walker,
             config: config.clone(),
+            prompt_store,
         }
     }
 }
@@ -205,6 +211,7 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
     ) -> ImagePromptOptimizeFuture<'a> {
         Box::pin(async move {
             let config = self.config.clone();
+            let prompt_store = Arc::clone(&self.prompt_store);
             let text = text.to_owned();
             let result = self
                 .walker
@@ -212,9 +219,14 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
                     routed_media_context(),
                     move |attempt| {
                         let config = config.clone();
+                        let prompt_store = prompt_store.clone();
                         let text = text.clone();
                         async move {
-                            let optimizer = media_optimizer_for_attempt(&config, &attempt)?;
+                            let optimizer = media_optimizer_for_attempt_with_prompt_store(
+                                &config,
+                                &attempt,
+                                &prompt_store,
+                            )?;
                             optimizer.optimize_image_prompt(&text, options).await
                         }
                     },
@@ -238,6 +250,7 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
     ) -> ImageEditPromptOptimizeFuture<'a> {
         Box::pin(async move {
             let config = self.config.clone();
+            let prompt_store = Arc::clone(&self.prompt_store);
             let text = text.to_owned();
             let result = self
                 .walker
@@ -245,9 +258,14 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
                     routed_media_context(),
                     move |attempt| {
                         let config = config.clone();
+                        let prompt_store = prompt_store.clone();
                         let text = text.clone();
                         async move {
-                            let optimizer = media_optimizer_for_attempt(&config, &attempt)?;
+                            let optimizer = media_optimizer_for_attempt_with_prompt_store(
+                                &config,
+                                &attempt,
+                                &prompt_store,
+                            )?;
                             optimizer.optimize_image_edit_prompt(&text, options).await
                         }
                     },
@@ -274,18 +292,22 @@ fn routed_media_context() -> RoutedRequestContext {
     }
 }
 
-pub(crate) fn media_optimizer_for_attempt(
+fn media_optimizer_for_attempt_with_prompt_store(
     config: &AppConfig,
     attempt: &RoutedAttempt,
+    prompt_store: &Arc<openplotva_prompts::PromptStore>,
 ) -> Result<AppMediaPromptOptimizer, MediaPromptOptimizerError> {
     if routed_attempt_is_genkit(attempt) {
         let model = genkit_model_for_attempt(attempt);
         if let Some((cfg, _)) =
             genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(config, &model)
         {
-            return Ok(Arc::new(AifarmStructuredJsonGenerator::new(cfg)) as AppMediaPromptOptimizer);
+            let optimizer =
+                AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+            return Ok(Arc::new(optimizer) as AppMediaPromptOptimizer);
         }
         return gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
+            .map(|optimizer| optimizer.with_prompt_store(Arc::clone(prompt_store)))
             .map(|optimizer| Arc::new(optimizer) as AppMediaPromptOptimizer)
             .ok_or_else(|| {
                 MediaPromptOptimizerError::Provider(format!(
@@ -296,7 +318,9 @@ pub(crate) fn media_optimizer_for_attempt(
     }
 
     let cfg = aifarm_structured_json_config_for_attempt(config, attempt);
-    Ok(Arc::new(AifarmStructuredJsonGenerator::new(cfg)) as AppMediaPromptOptimizer)
+    let optimizer =
+        AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
+    Ok(Arc::new(optimizer) as AppMediaPromptOptimizer)
 }
 
 pub(crate) fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
@@ -807,9 +831,31 @@ fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a st
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    fn test_walker() -> RoutedAttemptWalker {
+        RoutedAttemptWalker::new(
+            openplotva_llm::router::RouterHandle::new(
+                openplotva_llm::router::RoutingTable::default(),
+            ),
+            Arc::new(openplotva_llm::router::BreakerSet::new()),
+            Arc::new(openplotva_llm::router::TriggerState::new()),
+            Arc::new(openplotva_llm::router::PoolRegistry::new()),
+        )
+    }
+
+    #[test]
+    fn routed_optimizer_keeps_application_prompt_store() {
+        let prompts = Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store"));
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+
+        let optimizer =
+            RoutedMediaPromptOptimizer::new(test_walker(), &config, Arc::clone(&prompts));
+
+        assert!(Arc::ptr_eq(&optimizer.prompt_store, &prompts));
+    }
 
     #[derive(Default)]
     struct FakeOptimizer {

@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     rate_limits::TaskEnqueueRateLimit,
-    updates::{UpdateHandler, UpdateHandlerFuture},
+    updates::UpdateHandler,
     virtual_messages::{
         QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
     },
@@ -18,8 +18,8 @@ use carapax::types::{
     CallbackQuery as TelegramCallbackQuery, Chat as TelegramChat, ChatMember as TelegramChatMember,
     MaybeInaccessibleMessage, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, ReplyTo as TelegramReplyTo,
-    SuccessfulPayment as TelegramSuccessfulPayment, TextEntity as TelegramTextEntity,
-    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
+    SuccessfulPayment as TelegramSuccessfulPayment, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_core::{
     UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
@@ -37,6 +37,7 @@ use openplotva_taskman::{
     TaskQueueIdAllocator, TaskQueueRecord, TaskQueueSchedule,
     control_job_params_from_stateless_job, new_control_job_at,
 };
+use openplotva_updates::parse_leading_bot_command;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -2825,18 +2826,16 @@ where
 {
     type Error = VipCancellationCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_vip_cancellation_callback_update_or_else_at(
-                self.store.as_ref(),
-                self.effects.as_ref(),
-                update,
-                OffsetDateTime::now_utc(),
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_vip_cancellation_callback_update_or_else_at(
+            self.store.as_ref(),
+            self.effects.as_ref(),
+            update,
+            OffsetDateTime::now_utc(),
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -4298,36 +4297,32 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            if non_private_payment_command_targets_other_bot(&update, &self.bot_username) {
-                self.next.handle_update(update).await?;
-                return Ok(());
-            }
-            let redirect = payment_redirect_message_from_update(&update, &self.bot_username);
-            let now = OffsetDateTime::now_utc();
-            let route = handle_payment_update_or_else_at(
-                self.queue.as_ref(),
-                self.vip.as_ref(),
-                self.effects.as_ref(),
-                update,
-                now,
-                now,
-                |update| self.next.handle_update(update),
-            )
-            .await?;
-            if matches!(
-                route,
-                PaymentUpdateRoute::InvoiceCommand(
-                    PaymentInvoiceCommandUpdateRoute::NonPrivateChat
-                )
-            ) && let Some(message) = redirect
-                && let Err(error) = self.effects.send_payment_redirect_message(message).await
-            {
-                tracing::warn!(%error, "failed to send payment redirect message");
-            }
-            Ok(())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        if non_private_payment_command_targets_other_bot(&update, &self.bot_username) {
+            self.next.handle_update(update).await?;
+            return Ok(());
+        }
+        let redirect = payment_redirect_message_from_update(&update, &self.bot_username);
+        let now = OffsetDateTime::now_utc();
+        let route = handle_payment_update_or_else_at(
+            self.queue.as_ref(),
+            self.vip.as_ref(),
+            self.effects.as_ref(),
+            update,
+            now,
+            now,
+            |update| self.next.handle_update(update),
+        )
+        .await?;
+        if matches!(
+            route,
+            PaymentUpdateRoute::InvoiceCommand(PaymentInvoiceCommandUpdateRoute::NonPrivateChat)
+        ) && let Some(message) = redirect
+            && let Err(error) = self.effects.send_payment_redirect_message(message).await
+        {
+            tracing::warn!(%error, "failed to send payment redirect message");
+        }
+        Ok(())
     }
 }
 
@@ -4398,24 +4393,22 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_vip_command_update_or_else_at(
-                AdminVipCommandUpdateRuntime {
-                    queue: self.queue.as_ref(),
-                    vip: self.vip.as_ref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                    next_virtual_id: &self.next_virtual_id,
-                    now: OffsetDateTime::now_utc(),
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_vip_command_update_or_else_at(
+            AdminVipCommandUpdateRuntime {
+                queue: self.queue.as_ref(),
+                vip: self.vip.as_ref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+                next_virtual_id: &self.next_virtual_id,
+                now: OffsetDateTime::now_utc(),
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -4799,57 +4792,12 @@ async fn send_admin_command_ephemeral_text(
 }
 
 fn payment_command_from_message(message: &TelegramMessage) -> Option<PaymentCommand<'_>> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    let mut entities = text.entities.as_ref()?.into_iter();
-    let TelegramTextEntity::BotCommand(position) = entities.next()? else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-
-    let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
-    let command_with_slash = text.data.get(..command_end)?;
-    let command_with_at = command_with_slash.strip_prefix('/')?;
-    let (name, target) = command_with_at
-        .split_once('@')
-        .map_or((command_with_at, None), |(name, target)| {
-            (name, Some(target))
-        });
-    let arguments = command_arguments_after_command(&text.data, command_end)?;
+    let command = parse_leading_bot_command(message)?;
     Some(PaymentCommand {
-        name,
-        target,
-        arguments,
+        name: command.command,
+        target: command.target,
+        arguments: command.arguments,
     })
-}
-
-fn command_arguments_after_command(text: &str, command_end: usize) -> Option<&str> {
-    let after_command = text.get(command_end..)?;
-    let Some(separator) = after_command.chars().next() else {
-        return Some("");
-    };
-    after_command.get(separator.len_utf8()..)
-}
-
-fn utf16_index_to_byte_index(text: &str, utf16_units: u32) -> Option<usize> {
-    let mut consumed = 0_u32;
-    for (byte_index, ch) in text.char_indices() {
-        if consumed == utf16_units {
-            return Some(byte_index);
-        }
-        consumed = consumed.checked_add(u32::try_from(ch.len_utf16()).ok()?)?;
-        if consumed > utf16_units {
-            return None;
-        }
-    }
-    if consumed == utf16_units {
-        Some(text.len())
-    } else {
-        None
-    }
 }
 
 fn subscription_price_stars_for_user(user: &TelegramUser) -> i64 {
@@ -6869,7 +6817,7 @@ mod tests {
         },
         help::{HelpBotIdentity, HelpCommandUpdateHandler, HelpDispatcherEffects},
         updates::{
-            TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+            TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore,
             UpdateStateStoreFuture, process_update_with_state_store_at,
         },
         virtual_messages::VirtualIdFactory,
@@ -14032,17 +13980,12 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .push(update.id);
+            Ok(())
         }
     }
 

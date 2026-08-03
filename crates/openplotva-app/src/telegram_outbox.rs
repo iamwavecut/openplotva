@@ -23,10 +23,10 @@ use openplotva_storage::{
     TelegramReceiptHistoryEntry,
 };
 use openplotva_telegram::{
-    OutboundSendErrorClass, RichApiClient, RichApiError, TelegramClient,
+    OutboundCommand, OutboundSendErrorClass, RichApiClient, RichApiError, TelegramClient,
     TelegramOutboundExecuteError, TelegramOutboundMethod, TelegramOutboundMethodKind,
     TelegramOutboundResponse, build_message_reaction_method, execute_telegram_method_with_rich,
-    replay_outbound_method, replay_outbound_method_without_reply, snapshot_outbound_method,
+    replay_outbound_method_without_reply, snapshot_outbound_method,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -61,7 +61,7 @@ pub type TelegramOutboxTransportFuture<'a> = Pin<
 
 /// Injectable network boundary used by the durable worker.
 pub trait TelegramOutboxTransport: Send + Sync {
-    fn execute<'a>(&'a self, method: TelegramOutboundMethod) -> TelegramOutboxTransportFuture<'a>;
+    fn execute<'a>(&'a self, command: OutboundCommand) -> TelegramOutboxTransportFuture<'a>;
 }
 
 /// Real Telegram transport, including the rich-message endpoint.
@@ -79,9 +79,10 @@ impl TelegramApiOutboxTransport {
 }
 
 impl TelegramOutboxTransport for TelegramApiOutboxTransport {
-    fn execute<'a>(&'a self, method: TelegramOutboundMethod) -> TelegramOutboxTransportFuture<'a> {
+    fn execute<'a>(&'a self, command: OutboundCommand) -> TelegramOutboxTransportFuture<'a> {
         Box::pin(async move {
-            execute_telegram_method_with_rich(&self.telegram, &self.rich, method).await
+            execute_telegram_method_with_rich(&self.telegram, &self.rich, command.into_method())
+                .await
         })
     }
 }
@@ -416,8 +417,8 @@ async fn process_claimed_operation<Transport, Jobs>(
     Transport: TelegramOutboxTransport,
     Jobs: TelegramOutboxJobResolver,
 {
-    let method = match replay_claimed_operation(&operation) {
-        Ok(method) => method,
+    let command = match replay_claimed_operation(&operation) {
+        Ok(command) => command,
         Err(error) => {
             match store
                 .dead_letter_operation(
@@ -443,8 +444,9 @@ async fn process_claimed_operation<Transport, Jobs>(
         }
     };
 
-    let response_kind = response_kind_name(method.response_kind());
-    let reply_missing_replacement = reply_missing_replacement_payload(&method, &operation.payload);
+    let response_kind = response_kind_name(command.response_kind());
+    let reply_missing_replacement =
+        reply_missing_replacement_payload(command.method(), &operation.payload);
     match store
         .mark_request_started(operation.id, operation.lease_token)
         .await
@@ -464,7 +466,7 @@ async fn process_claimed_operation<Transport, Jobs>(
         store,
         transport,
         &operation,
-        method,
+        command,
         config.lease_renew_interval,
         config.send_timeout(),
         report,
@@ -564,7 +566,7 @@ async fn execute_with_lease_renewal<Transport>(
     store: &PostgresTelegramOutboxStore,
     transport: &Transport,
     operation: &ClaimedTelegramOutboxOperation,
-    method: TelegramOutboundMethod,
+    command: OutboundCommand,
     renew_interval: Duration,
     send_timeout: Duration,
     report: &mut TelegramOutboxWorkerReport,
@@ -572,7 +574,7 @@ async fn execute_with_lease_renewal<Transport>(
 where
     Transport: TelegramOutboxTransport,
 {
-    let response = enforce_send_deadline(send_timeout, transport.execute(method));
+    let response = enforce_send_deadline(send_timeout, transport.execute(command));
     tokio::pin!(response);
     let mut ticker = tokio::time::interval(renew_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -989,74 +991,12 @@ fn telegram_error_status(error: &TelegramOutboundExecuteError) -> Option<i32> {
 
 fn replay_claimed_operation(
     operation: &ClaimedTelegramOutboxOperation,
-) -> Result<TelegramOutboundMethod, String> {
-    if operation.payload_version != 1 {
-        return Err(format!(
-            "unsupported Telegram outbox payload version {}",
-            operation.payload_version
-        ));
-    }
-    let kind = telegram_method_kind_from_storage(&operation.method_kind)
-        .ok_or_else(|| format!("unsupported Telegram method kind {}", operation.method_kind))?;
+) -> Result<OutboundCommand, String> {
     let payload = payload_with_blob(operation)?;
     let bytes = serde_json::to_vec(&payload)
         .map_err(|error| format!("serialize Telegram outbox payload: {error}"))?;
-    replay_outbound_method(kind, &bytes).ok_or_else(|| {
-        format!(
-            "Telegram payload cannot replay as {}",
-            operation.method_kind
-        )
-    })
-}
-
-/// Decode both Bot API names and the existing debug-style discriminator.
-#[must_use]
-pub fn telegram_method_kind_from_storage(value: &str) -> Option<TelegramOutboundMethodKind> {
-    match value {
-        "sendMessage" | "SendMessage" => Some(TelegramOutboundMethodKind::SendMessage),
-        "sendRichMessage" | "SendRichMessage" => Some(TelegramOutboundMethodKind::SendRichMessage),
-        "sendSticker" | "SendSticker" => Some(TelegramOutboundMethodKind::SendSticker),
-        "sendPhoto" | "SendPhoto" => Some(TelegramOutboundMethodKind::SendPhoto),
-        "sendAudio" | "SendAudio" => Some(TelegramOutboundMethodKind::SendAudio),
-        "sendMediaGroup" | "SendMediaGroup" => Some(TelegramOutboundMethodKind::SendMediaGroup),
-        "sendChatAction" | "SendChatAction" => Some(TelegramOutboundMethodKind::SendChatAction),
-        "answerCallbackQuery" | "AnswerCallbackQuery" => {
-            Some(TelegramOutboundMethodKind::AnswerCallbackQuery)
-        }
-        "answerInlineQuery" | "AnswerInlineQuery" => {
-            Some(TelegramOutboundMethodKind::AnswerInlineQuery)
-        }
-        "answerGuestQuery" | "AnswerGuestQuery" => {
-            Some(TelegramOutboundMethodKind::AnswerGuestQuery)
-        }
-        "answerPreCheckoutQuery" | "AnswerPreCheckoutQuery" => {
-            Some(TelegramOutboundMethodKind::AnswerPreCheckoutQuery)
-        }
-        "createInvoiceLink" | "CreateInvoiceLink" => {
-            Some(TelegramOutboundMethodKind::CreateInvoiceLink)
-        }
-        "refundStarPayment" | "RefundStarPayment" => {
-            Some(TelegramOutboundMethodKind::RefundStarPayment)
-        }
-        "editUserStarSubscription" | "EditUserStarSubscription" => {
-            Some(TelegramOutboundMethodKind::EditUserStarSubscription)
-        }
-        "editMessageText" | "EditMessageText" => Some(TelegramOutboundMethodKind::EditMessageText),
-        "editMessageCaption" | "EditMessageCaption" => {
-            Some(TelegramOutboundMethodKind::EditMessageCaption)
-        }
-        "editMessageReplyMarkup" | "EditMessageReplyMarkup" => {
-            Some(TelegramOutboundMethodKind::EditMessageReplyMarkup)
-        }
-        "editMessageMedia" | "EditMessageMedia" => {
-            Some(TelegramOutboundMethodKind::EditMessageMedia)
-        }
-        "deleteMessage" | "DeleteMessage" => Some(TelegramOutboundMethodKind::DeleteMessage),
-        "setMessageReaction" | "SetMessageReaction" => {
-            Some(TelegramOutboundMethodKind::SetMessageReaction)
-        }
-        _ => None,
-    }
+    OutboundCommand::decode(operation.payload_version, &operation.method_kind, &bytes)
+        .map_err(|error| error.to_string())
 }
 
 fn payload_with_blob(operation: &ClaimedTelegramOutboxOperation) -> Result<Value, String> {
@@ -1085,7 +1025,7 @@ fn payload_with_blob(operation: &ClaimedTelegramOutboxOperation) -> Result<Value
     let object = payload
         .as_object_mut()
         .ok_or_else(|| "outbox payload with a blob must be a JSON object".to_owned())?;
-    let field = match telegram_method_kind_from_storage(&operation.method_kind) {
+    let field = match TelegramOutboundMethodKind::from_storage_name(&operation.method_kind) {
         Some(TelegramOutboundMethodKind::SendPhoto) => {
             existing_field(object, &["File", "photo"]).unwrap_or("photo")
         }
@@ -1177,10 +1117,10 @@ async fn enqueue_ambiguity_reaction_fields(
 ) -> Result<bool, String> {
     let method =
         build_message_reaction_method(chat_id, trigger_message_id, AMBIGUITY_REACTION_EMOJI);
-    let (_, bytes) = snapshot_outbound_method(&method)
-        .ok_or_else(|| "setMessageReaction is not snapshot-replayable".to_owned())?;
-    let payload: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("decode setMessageReaction snapshot: {error}"))?;
+    let command = OutboundCommand::try_from_method(method).map_err(|error| error.to_string())?;
+    let (method_kind, payload_version, payload) = command
+        .into_storage_parts()
+        .map_err(|error| error.to_string())?;
     let batch_id = format!("{AMBIGUITY_REACTION_BATCH_PREFIX}{source_operation_id}");
     let queued = store
         .enqueue_batch(&TelegramOutboxBatchInput {
@@ -1196,8 +1136,8 @@ async fn enqueue_ambiguity_reaction_fields(
             protected: true,
             priority: i32::MAX,
             parts: vec![TelegramOutboxPartInput {
-                method_kind: method.method_name().to_owned(),
-                payload_version: 1,
+                method_kind: method_kind.to_owned(),
+                payload_version,
                 payload,
                 blob: None,
                 available_at: OffsetDateTime::now_utc(),
@@ -1676,14 +1616,17 @@ mod tests {
     #[test]
     fn method_kind_parser_accepts_storage_and_bot_api_labels() {
         assert_eq!(
-            telegram_method_kind_from_storage("sendMessage"),
+            TelegramOutboundMethodKind::from_storage_name("sendMessage"),
             Some(TelegramOutboundMethodKind::SendMessage)
         );
         assert_eq!(
-            telegram_method_kind_from_storage("SetMessageReaction"),
+            TelegramOutboundMethodKind::from_storage_name("SetMessageReaction"),
             Some(TelegramOutboundMethodKind::SetMessageReaction)
         );
-        assert_eq!(telegram_method_kind_from_storage("unknown"), None);
+        assert_eq!(
+            TelegramOutboundMethodKind::from_storage_name("unknown"),
+            None
+        );
     }
 
     #[test]

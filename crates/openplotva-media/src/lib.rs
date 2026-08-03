@@ -216,10 +216,30 @@ pub fn render_image_optimizer_prompt(
     )
 }
 
+pub fn render_image_optimizer_prompt_with(
+    prompts: &openplotva_prompts::PromptStore,
+    variant_count: usize,
+) -> Result<String, openplotva_prompts::PromptError> {
+    prompts.render(
+        IMAGE_OPTIMIZER_PROMPT_NAME,
+        &json!({ "variant_count": normalize_variant_count(variant_count) }),
+    )
+}
+
 pub fn render_image_edit_optimizer_prompt(
     variant_count: usize,
 ) -> Result<String, openplotva_prompts::PromptError> {
     openplotva_prompts::render(
+        IMAGE_EDIT_OPTIMIZER_PROMPT_NAME,
+        &json!({ "variant_count": normalize_variant_count(variant_count) }),
+    )
+}
+
+pub fn render_image_edit_optimizer_prompt_with(
+    prompts: &openplotva_prompts::PromptStore,
+    variant_count: usize,
+) -> Result<String, openplotva_prompts::PromptError> {
+    prompts.render(
         IMAGE_EDIT_OPTIMIZER_PROMPT_NAME,
         &json!({ "variant_count": normalize_variant_count(variant_count) }),
     )
@@ -519,7 +539,31 @@ fn compile_regex(pattern: &str) -> Regex {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::SystemTime};
+
     use super::*;
+
+    fn prompt_store_with(files: &[(&str, &str)]) -> openplotva_prompts::PromptStore {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openplotva-media-prompts-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create prompt root");
+        for (name, source) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("prompt parent"))
+                .expect("create prompt directory");
+            fs::write(path, source).expect("write prompt");
+        }
+        let store =
+            openplotva_prompts::PromptStore::from_root(&root).expect("compile prompt store");
+        fs::remove_dir_all(root).expect("remove prompt root");
+        store
+    }
 
     #[test]
     fn part_image_prompt_extracts_modifiers() {
@@ -656,6 +700,29 @@ mod tests {
             edit_tool.input_schema["properties"]["nsfw_result"]["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("minor sexual content only"))
+        );
+    }
+
+    #[test]
+    fn optimizer_prompt_renderers_use_injected_store() {
+        let store = prompt_store_with(&[
+            (
+                "image/optimizer.prompt",
+                "custom image variants={{variant_count}}",
+            ),
+            (
+                "image/edit_optimizer.prompt",
+                "custom edit variants={{variant_count}}",
+            ),
+        ]);
+
+        assert_eq!(
+            render_image_optimizer_prompt_with(&store, 0).expect("render image prompt"),
+            "custom image variants=1"
+        );
+        assert_eq!(
+            render_image_edit_optimizer_prompt_with(&store, 3).expect("render edit prompt"),
+            "custom edit variants=3"
         );
     }
 

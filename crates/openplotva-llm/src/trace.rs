@@ -3,11 +3,95 @@
 //! attempt are counted at the layer where the call actually happens.
 
 use std::{
-    fmt,
+    fmt, io,
     sync::{Arc, OnceLock},
 };
 
 use openplotva_dialog::DialogTraceArtifacts;
+use serde::Serialize;
+use serde_json::Value;
+
+/// Provider-neutral trace builder. Providers pass a borrowed serialization view
+/// that replaces inline media while it is serialized, so sensitive byte payloads
+/// never enter the trace JSON value.
+pub(crate) struct RedactedTraceArtifact {
+    artifact: DialogTraceArtifacts,
+}
+
+impl RedactedTraceArtifact {
+    pub(crate) fn from_request<T>(request: &T, mut artifact: DialogTraceArtifacts) -> Self
+    where
+        T: Serialize + ?Sized,
+    {
+        artifact.raw_request = serde_json::to_value(request).ok().map(|mut value| {
+            redact_json_media(&mut value);
+            value
+        });
+        Self { artifact }
+    }
+
+    pub(crate) fn into_inner(self) -> DialogTraceArtifacts {
+        self.artifact
+    }
+}
+
+/// Serialized size without allocating a second request-sized byte buffer.
+pub(crate) fn serialized_size<T>(value: &T) -> i32
+where
+    T: Serialize + ?Sized,
+{
+    let mut counter = CountingWriter::default();
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return 0;
+    }
+    i32::try_from(counter.bytes).unwrap_or(i32::MAX)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Redact media that arrived from a provider response before retaining the
+/// decoded JSON. Request-side redaction happens earlier through borrowed views.
+pub(crate) fn redact_json_media(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                redact_json_media(item);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "inlineData" | "inline_data") {
+                    if let Some(data) = value.get_mut("data") {
+                        *data = Value::String("<redacted-inline-data>".to_owned());
+                    }
+                } else {
+                    redact_json_media(value);
+                }
+            }
+        }
+        Value::String(text)
+            if text.trim_start().starts_with("data:")
+                && !text.trim_start().starts_with("data:<redacted-") =>
+        {
+            *text = "data:<redacted-media>".to_owned();
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
 
 /// Caller identity for a single model round-trip. Supplies the fields the low-level
 /// client cannot know on its own (chat/user/message); flow/source/model live on

@@ -36,8 +36,7 @@ env_file_value() {
 }
 
 install_layout() {
-  install -d -m 755 "$deploy_root" \
-    "${deploy_root}/tools/token-estimator"
+  install -d -m 755 "$deploy_root"
   cd "$deploy_root"
 }
 
@@ -144,8 +143,7 @@ effective_db_postgres_password() {
 
 legacy_import_needed() {
   legacy_volume_needs_import "go-plotva_postgres_data" "${project}_postgres-data" ||
-    legacy_volume_needs_import "go-plotva_dragonflydata" "${project}_dragonfly-data" ||
-    legacy_volume_needs_import "go-plotva_token_estimator_cache" "${project}_token-estimator-cache"
+    legacy_volume_needs_import "go-plotva_dragonflydata" "${project}_dragonfly-data"
 }
 
 stop_current_app_for_import() {
@@ -180,7 +178,6 @@ import_file_volumes() {
     fi
     copy_volume "go-plotva_dragonflydata" "${project}_dragonfly-data"
   fi
-  copy_volume "go-plotva_token_estimator_cache" "${project}_token-estimator-cache"
 }
 
 legacy_postgres_import_mode() {
@@ -361,8 +358,6 @@ start_dependencies() {
   ensure_service redis-ingress
   wait_for_service_health redis-ingress
   verify_update_stream_persistence
-  ensure_service token-estimator
-  wait_for_service_health token-estimator
 }
 
 start_app() {

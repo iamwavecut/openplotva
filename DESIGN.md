@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | Adopted — shipped to production (`geta.moe`) |
+| **Status** | Adopted |
 | **Scope** | `web/admin/` (the runtime admin console). The Settings WebApp (`web/settings/`, Framework7 + Telegram theme) is explicitly out of scope. |
 | **Owners** | OpenPlotva maintainers |
-| **Last updated** | 2026-07-02 |
+| **Last updated** | 2026-08-03 |
 | **Source of truth** | `web/admin/tokens.css`, `web/admin/components.css`, `web/admin/components.js` |
 | **Enforced by** | guard tests in `crates/openplotva-web/src/lib.rs`; the `openplotva-design-system-review` skill |
 | **Related** | `AGENTS.md` (§ Web UI / Design System), `docs/admin-ux-audit.md`, `skills/openplotva-design-system-review/SKILL.md` |
@@ -253,14 +253,18 @@ element IDs, routes, the login/cookie flow, Chart.js analytics, or the Settings 
 - **`data-action` delegation (chosen) vs per-element `addEventListener` wiring.** Delegation needs no
   re-binding for dynamically rendered content and keeps handlers as named, testable functions.
 
-## 13. Known limitations / future work
+## 13. Taskman operator surface
 
-- The **Tasks (Taskman)** tab's backing JS (`loadTaskmanJobs`, …) was never defined upstream; its markup
-  is on the library and `switchTab` is defensive, but the feature is non-functional until implemented.
-- A few detail-pane `toggle*Details()` handlers are referenced but undefined upstream.
-- The Analytics text panels remain "Loading…" on API error rather than rendering an error state.
-- Pre-existing on `main` and unrelated to this system: `cargo clippy --workspace --all-targets -- -D
-  warnings` is red (test-code `unwrap()` in `subscription_sync.rs`) and one `payments` unit test fails.
+- The **Tasks (Taskman)** tab is a required graphical operator workflow. It uses the signed-session
+  `/admin/api/taskman/*` REST facade for browser-safe authentication; the bearer-authenticated Runtime
+  GraphQL API remains the automation/operator API. Both adapters delegate to the same
+  `RuntimeTaskmanInspector`, so queue data and lifecycle semantics retain one source of truth.
+- The browser owns only presentation state: filters, offset paging, selection, request generations,
+  safe text rendering, and confirmed mutations. It must not receive a Runtime API bearer token or
+  bypass the shared inspector through direct database access.
+- Detail drawers have a unified close fallback, the External Requests dashboard renders retryable
+  error states, and current quality-gate status must be read from the gate rather than frozen in this
+  design document.
 
 ## 14. References
 

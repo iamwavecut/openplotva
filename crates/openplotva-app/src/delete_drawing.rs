@@ -4,9 +4,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
     CallbackQuery as TelegramCallbackQuery, ChatMember as TelegramChatMember,
-    MaybeInaccessibleMessage, Message as TelegramMessage, MessageData as TelegramMessageData,
-    Text as TelegramText, TextEntity as TelegramTextEntity,
-    TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
+    MaybeInaccessibleMessage, Message as TelegramMessage, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{
@@ -20,10 +18,11 @@ use openplotva_telegram::{
     build_edit_reply_markup_message_method, build_edit_text_message_method,
     build_get_chat_member_method, parse_callback_action, parse_callback_i64,
 };
+use openplotva_updates::parse_leading_bot_command;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::{
     QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
@@ -440,19 +439,17 @@ where
 {
     type Error = DeleteDrawingCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_delete_drawing_callback_update_or_else(
-                self.store.as_ref(),
-                self.member_api.as_ref(),
-                self.vip.as_ref(),
-                self.effects.as_ref(),
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_delete_drawing_callback_update_or_else(
+            self.store.as_ref(),
+            self.member_api.as_ref(),
+            self.vip.as_ref(),
+            self.effects.as_ref(),
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -482,17 +479,15 @@ where
 {
     type Error = DeleteDrawingCommandError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_delete_drawing_command_update_or_else(
-                self.store.as_ref(),
-                self.effects.as_ref(),
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_delete_drawing_command_update_or_else(
+            self.store.as_ref(),
+            self.effects.as_ref(),
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1278,7 +1273,8 @@ pub fn delete_drawing_command_plan(
 /// so group commands targeted at any bot are still consumed.
 #[must_use]
 pub fn is_delete_drawing_command(message: &TelegramMessage) -> bool {
-    leading_bot_command(message).is_some_and(|command| command.command == DELETE_DRAWING_COMMAND)
+    parse_leading_bot_command(message)
+        .is_some_and(|command| command.command == DELETE_DRAWING_COMMAND)
 }
 
 fn no_generation_plan(message: &TelegramMessage) -> DeleteDrawingTextPlan {
@@ -1353,50 +1349,6 @@ fn reply_ref(message: &TelegramMessage) -> ReplyMessageRef {
         is_topic_message: message.message_thread_id.is_some(),
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BotCommandInMessage {
-    command: String,
-}
-
-fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_bot_command_from_text(text)
-}
-
-fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
-    let first = text.entities.as_ref()?.into_iter().next()?;
-    let TelegramTextEntity::BotCommand(position) = first else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-
-    let command_with_slash = text_entity_content(&text.data, *position)?;
-    let command_with_target = command_with_slash.strip_prefix('/')?;
-    let command = command_with_target
-        .split_once('@')
-        .map_or(command_with_target, |(command, _)| command);
-
-    Some(BotCommandInMessage {
-        command: command.to_owned(),
-    })
-}
-
-fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> Option<String> {
-    let offset = usize::try_from(position.offset).ok()?;
-    let length = usize::try_from(position.length).ok()?;
-    Some(String::from_utf16_lossy(
-        &text
-            .encode_utf16()
-            .skip(offset)
-            .take(length)
-            .collect::<Vec<u16>>(),
-    ))
 }
 
 #[cfg(test)]
@@ -2452,14 +2404,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

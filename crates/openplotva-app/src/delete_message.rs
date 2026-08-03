@@ -13,7 +13,7 @@ use openplotva_telegram::{
 };
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 
 const DELETE_CALLBACK_ACTION: &str = "delete";
 const DELETE_CALLBACK_UNAUTHORIZED_TEXT: &str = "Я подчинюсь только автору или администраторам.";
@@ -138,17 +138,15 @@ where
 {
     type Error = DeleteMessageCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_delete_message_callback_update_or_else(
-                self.member_api.as_ref(),
-                self.effects.as_ref(),
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_delete_message_callback_update_or_else(
+            self.member_api.as_ref(),
+            self.effects.as_ref(),
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -645,7 +643,7 @@ mod tests {
             Some(DeleteMessageCallbackOutcome::Deleted)
         );
         assert!(callback_effects.methods().is_empty());
-        assert_eq!(member_api.calls(), vec![(-42, 7)]);
+        assert_eq!(member_api.calls(), vec![(-10042, 7)]);
         assert_eq!(next.handled_count(), 0);
 
         let methods = delete_effects.methods();
@@ -760,14 +758,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

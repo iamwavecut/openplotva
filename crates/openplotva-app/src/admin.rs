@@ -10,8 +10,7 @@ use std::{
 };
 
 use carapax::types::{
-    Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
-    Text as TelegramText, TextEntity as TelegramTextEntity, Update as TelegramUpdate,
+    Chat as TelegramChat, Message as TelegramMessage, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType,
 };
 use openplotva_server::{
@@ -24,6 +23,7 @@ use openplotva_telegram::{
     TELEGRAM_PARSE_MODE_HTML, TextMessageRequest, build_inline_keyboard_button_url,
     build_inline_keyboard_markup, build_inline_keyboard_row, escape_telegram_html_text,
 };
+use openplotva_updates::parse_leading_bot_command;
 use openplotva_web::settings_selection_base_url;
 use thiserror::Error;
 use time::{
@@ -33,7 +33,7 @@ use time::{
 use crate::members::ChatCommunicationEffects;
 use crate::runtime_api::{IssuedRuntimeToken, RuntimeTokenManager, RuntimeTokenStore};
 use crate::settings::{AdminChatSettingsTarget, AdminChatTargetResolver};
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::{
     QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
     queue_rich_message, queue_text_message_parts,
@@ -464,22 +464,20 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_enable_chat_command_update_or_else_at(
-                AdminEnableChatRuntime {
-                    resolver: self.resolver.as_ref(),
-                    communication: self.communication.as_ref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_enable_chat_command_update_or_else_at(
+            AdminEnableChatRuntime {
+                resolver: self.resolver.as_ref(),
+                communication: self.communication.as_ref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -668,21 +666,19 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_settings_command_update_or_else_at(
-                AdminSettingsRuntime {
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                    web_app_url: &self.web_app_url,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_settings_command_update_or_else_at(
+            AdminSettingsRuntime {
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+                web_app_url: &self.web_app_url,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -858,26 +854,24 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_queue_command_update_or_else_at(
-                AdminQueueRuntime {
-                    config: &self.runtime.config,
-                    taskman: self.runtime.taskman.as_deref(),
-                    dispatcher: self.runtime.dispatcher.as_deref(),
-                    updates: self.runtime.updates.as_deref(),
-                    dialog_debounce_len: self.runtime.dialog_debounce_len.as_deref(),
-                    media_gate_in_use: self.runtime.media_gate_in_use.as_ref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_queue_command_update_or_else_at(
+            AdminQueueRuntime {
+                config: &self.runtime.config,
+                taskman: self.runtime.taskman.as_deref(),
+                dispatcher: self.runtime.dispatcher.as_deref(),
+                updates: self.runtime.updates.as_deref(),
+                dialog_debounce_len: self.runtime.dialog_debounce_len.as_deref(),
+                media_gate_in_use: self.runtime.media_gate_in_use.as_ref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1059,20 +1053,18 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_help_command_update_or_else_at(
-                AdminHelpRuntime {
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_help_command_update_or_else_at(
+            AdminHelpRuntime {
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1230,22 +1222,20 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_runtime_token_command_update_or_else_at(
-                AdminRuntimeTokenRuntime {
-                    manager: self.manager.as_deref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                    tls_public_key_pin: &self.tls_public_key_pin,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_runtime_token_command_update_or_else_at(
+            AdminRuntimeTokenRuntime {
+                manager: self.manager.as_deref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+                tls_public_key_pin: &self.tls_public_key_pin,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1496,21 +1486,19 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_redis_cache_command_update_or_else_at(
-                AdminRedisCacheRuntime {
-                    flusher: self.flusher.as_ref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_redis_cache_command_update_or_else_at(
+            AdminRedisCacheRuntime {
+                flusher: self.flusher.as_ref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1667,21 +1655,19 @@ where
 {
     type Error = Next::Error;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_admin_gemini_cache_command_update_or_else_at(
-                AdminGeminiCacheRuntime {
-                    purger: self.purger.as_deref(),
-                    effects: self.effects.as_ref(),
-                    admin_ids: &self.admin_ids,
-                    bot_username: &self.bot_username,
-                },
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_admin_gemini_cache_command_update_or_else_at(
+            AdminGeminiCacheRuntime {
+                purger: self.purger.as_deref(),
+                effects: self.effects.as_ref(),
+                admin_ids: &self.admin_ids,
+                bot_username: &self.bot_username,
+            },
+            update,
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -2496,15 +2482,15 @@ fn admin_command_for_message<'a>(
     message: &'a TelegramMessage,
     bot_username: &str,
 ) -> Option<AdminCommand<'a>> {
-    let command = leading_command_from_message(message)?;
+    let command = parse_leading_bot_command(message)?;
     if matches!(message.chat, TelegramChat::Private(_)) {
         return Some(AdminCommand {
-            name: command.name,
+            name: command.command,
             arguments: command.arguments,
         });
     }
     (command.target == Some(bot_username)).then_some(AdminCommand {
-        name: command.name,
+        name: command.command,
         arguments: command.arguments,
     })
 }
@@ -2523,58 +2509,6 @@ fn admin_enable_chat_display_title(target: &AdminChatSettingsTarget) -> String {
         return target.first_name.clone();
     }
     target.id.to_string()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedCommand<'a> {
-    name: &'a str,
-    target: Option<&'a str>,
-    arguments: &'a str,
-}
-
-fn leading_command_from_message(message: &TelegramMessage) -> Option<ParsedCommand<'_>> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_command_from_text(text)
-}
-
-fn leading_command_from_text(text: &TelegramText) -> Option<ParsedCommand<'_>> {
-    let first = text.entities.as_ref()?.into_iter().next()?;
-    let TelegramTextEntity::BotCommand(position) = first else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-    let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
-    let command_with_slash = text.data.get(..command_end)?;
-    let command_with_at = command_with_slash.strip_prefix('/')?;
-    let arguments = text.data.get(command_end..)?;
-    let (name, target) = command_with_at
-        .split_once('@')
-        .map_or((command_with_at, None), |(name, target)| {
-            (name, Some(target))
-        });
-    Some(ParsedCommand {
-        name,
-        target,
-        arguments,
-    })
-}
-
-fn utf16_index_to_byte_index(text: &str, utf16_units: u32) -> Option<usize> {
-    let mut consumed = 0_u32;
-    for (byte_index, ch) in text.char_indices() {
-        if consumed == utf16_units {
-            return Some(byte_index);
-        }
-        consumed = consumed.checked_add(u32::try_from(ch.len_utf16()).ok()?)?;
-        if consumed > utf16_units {
-            return None;
-        }
-    }
-    (consumed == utf16_units).then_some(text.len())
 }
 
 fn go_duration_string(duration: Duration) -> String {
@@ -2638,8 +2572,8 @@ mod tests {
     };
 
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
 
@@ -4714,14 +4648,9 @@ mod tests {
     impl UpdateHandler for TerminalStub {
         type Error = Infallible;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.calls.lock().expect("terminal calls") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.calls.lock().expect("terminal calls") += 1;
+            Ok(())
         }
     }
 

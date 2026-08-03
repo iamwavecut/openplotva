@@ -1,11 +1,17 @@
 const { test, expect } = require('@playwright/test');
 
 const baseURL = process.env.OPENPLOTVA_WEB_UI_BASE_URL;
+const adminSessionCookie = process.env.OPENPLOTVA_WEB_UI_ADMIN_COOKIE;
+const settingsInitData42 = process.env.OPENPLOTVA_WEB_UI_SETTINGS_INIT_DATA_42 || '';
+const settingsInitData7 = process.env.OPENPLOTVA_WEB_UI_SETTINGS_INIT_DATA_7 || '';
 const browserPath = process.env.OPENPLOTVA_WEB_UI_BROWSER || '';
 const headless = process.env.OPENPLOTVA_WEB_UI_HEADLESS !== '0';
 
 if (!baseURL) {
   throw new Error('OPENPLOTVA_WEB_UI_BASE_URL is required');
+}
+if (!adminSessionCookie) {
+  throw new Error('OPENPLOTVA_WEB_UI_ADMIN_COOKIE is required');
 }
 
 test.use({
@@ -26,14 +32,18 @@ function watchPageErrors(page) {
   };
 }
 
-async function stubTelegramWebApp(page) {
+async function stubTelegramWebApp(page, userId, initData) {
+  if (!Number.isSafeInteger(userId) || !initData) {
+    throw new Error('settings UI smoke requires a user ID and signed Telegram initData');
+  }
   await page.route('https://telegram.org/js/telegram-web-app.js', async (route) => {
     await route.fulfill({
       contentType: 'application/javascript',
       body: `
         window.Telegram = {
           WebApp: {
-            initDataUnsafe: {},
+            initData: ${JSON.stringify(initData)},
+            initDataUnsafe: { user: { id: ${userId}, first_name: 'Smoke' } },
             colorScheme: 'light',
             platform: 'web',
             version: 'service-smoke',
@@ -93,11 +103,14 @@ test('admin login gate and authenticated shell render', async ({ page, context }
 
   await context.addCookies([{
     name: 'admin_session',
-    value: '1001',
+    value: adminSessionCookie,
     url: baseURL,
   }]);
   await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
   await expect(page.locator('.brand-title')).toHaveText('Plotva');
+  await expect(page.locator('#page-title')).toHaveText('Dashboard');
+  await expect(page.locator('#dashboard')).toBeVisible();
+  await page.locator('pl-button[data-tab="settings"]').click();
   await expect(page.locator('#page-title')).toHaveText('Settings');
   await expect(page.locator('#log-level')).toHaveValue('info');
   await expect(page.locator('#queue-stats')).toContainText('{');
@@ -237,6 +250,8 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   await expect(page.locator('.pl-toast', { hasText: 'Chat unblocked' })).toBeVisible();
   await chatReloadAfterUnblock;
   await expect(page.locator('#chat-details')).toContainText('"blocked": false');
+  await page.locator('#pane-chats-details pl-button', { hasText: 'Close' }).click();
+  await expect(page.locator('#pane-chats-details')).toBeHidden();
 
   const usersResponse = page.waitForResponse((response) => {
     return response.url().includes('/admin/api/users?q=owner')
@@ -291,6 +306,8 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   await userReloadAfterRevoke;
   await expect(page.locator('#user-vip-events')).toContainText('admin_revoke');
   await expect(page.locator('#user-vip-events')).toContainText('browser vip revoke');
+  await page.locator('#pane-users-details pl-button', { hasText: 'Close' }).click();
+  await expect(page.locator('#pane-users-details')).toBeHidden();
 
   const safetyResponse = page.waitForResponse((response) => {
     return response.url().includes('/admin/api/safety/checks?')
@@ -313,6 +330,8 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   await expect(page.locator('#safety-check-request')).toContainText('smoke risky text');
   await expect(page.locator('#safety-check-policies')).toContainText('"violence": true');
   await expect(page.locator('#safety-check-response')).toContainText('"flagged": true');
+  await page.locator('#pane-safety-details pl-button', { hasText: 'Close' }).click();
+  await expect(page.locator('#pane-safety-details')).toBeHidden();
 
   const analyticsResponse = page.waitForResponse((response) => {
     return response.url().includes('/admin/api/analytics/overview?')
@@ -338,16 +357,18 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/analytics/overview?range=7d')
       && response.request().method() === 'GET';
   });
-  await page.locator('#an-range select').selectOption('7d');
+  await page.locator('#an-range').selectOption('7d');
   await rangeRefetch;
 
   assertNoPageErrors();
 });
 
 test('admin LLM dialogs list and detail render agent runs', async ({ page, context }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubAdminExternalScripts(page);
   await context.addCookies([{
     name: 'admin_session',
-    value: '1001',
+    value: adminSessionCookie,
     url: baseURL,
   }]);
 
@@ -482,9 +503,167 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
   assertNoPageErrors();
 });
 
+test('admin Taskman supports filters paging details and mutations', async ({ page, context }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubAdminExternalScripts(page);
+  await context.addCookies([{
+    name: 'admin_session',
+    value: adminSessionCookie,
+    url: baseURL,
+  }]);
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseURL });
+
+  const listRequests = [];
+  const mutationRequests = [];
+  const job = (id, status = 'pending') => ({
+    id,
+    queue_name: id === 102 ? 'image-vip' : 'text',
+    priority: 10,
+    title: `Smoke job ${id}`,
+    job_type: 'dialog',
+    payload: { type: 'dialog', prompt: `prompt-${id}` },
+    status,
+    user_id: 42,
+    chat_id: -100777,
+    trigger_message_id: 77,
+    created_at: '2026-08-03T10:00:00Z',
+    processing_timeout_seconds: 90,
+    preview: `preview-${id}`,
+  });
+
+  await page.route('**/admin/api/taskman/jobs?*', async (route) => {
+    const url = new URL(route.request().url());
+    listRequests.push(Object.fromEntries(url.searchParams.entries()));
+    const offset = Number(url.searchParams.get('offset') || 0);
+    const item = job(offset >= 200 ? 102 : 101);
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        total: 201,
+        offset,
+        limit: 200,
+        summary: { by_status: { pending: 200, failed: 1 }, by_queue: { text: 200, 'image-vip': 1 } },
+        items: [item],
+      }),
+    });
+  });
+  await page.route('**/admin/api/taskman/job?id=*', async (route) => {
+    const url = new URL(route.request().url());
+    const id = Number(url.searchParams.get('id'));
+    if (id === 404) {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'smoke detail failed' }),
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job: job(id, id === 303 ? 'pending' : 'failed'),
+        events: [{ at: '2026-08-03T10:01:00Z', event: 'attempt', detail: `event-${id}` }],
+        messages: [{ id: 1, job_id: id, message_type: 'result', chat_id: -100777, message_id: 88, created_at: '2026-08-03T10:02:00Z', status: 'sent' }],
+      }),
+    });
+  });
+  await page.route('**/admin/api/taskman/job/cancel?*', async (route) => {
+    mutationRequests.push({ path: 'cancel', method: route.request().method() });
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await page.route('**/admin/api/taskman/job/restart?*', async (route) => {
+    mutationRequests.push({ path: 'restart', method: route.request().method() });
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, new_job_id: 303 }) });
+  });
+  await page.route('**/admin/api/taskman/jobs/clear?*', async (route) => {
+    mutationRequests.push({ path: 'clear', method: route.request().method() });
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, matched: 201, deleted: 200, deleted_active: 1, skipped_active: 0 }),
+    });
+  });
+
+  await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
+  await page.locator('pl-button[data-tab="taskman"]').click();
+  await expect(page.locator('#taskman-jobs-list')).toContainText('Smoke job 101');
+  await expect(page.locator('#taskman-summary')).toContainText('201');
+
+  await page.locator('#taskman-search-input').fill('needle');
+  await page.locator('#taskman-queue').selectOption('text');
+  await page.locator('#taskman-status').selectOption('pending');
+  await page.locator('#taskman-chat-id').fill('-100777');
+  await page.locator('#taskman-user-id').fill('42');
+  await page.locator('#btn-search-taskman').click();
+  await expect.poll(() => listRequests.length).toBeGreaterThan(1);
+  expect(listRequests.at(-1)).toMatchObject({
+    q: 'needle', queue: 'text', status: 'pending', chat_id: '-100777', user_id: '42', offset: '0', limit: '200',
+  });
+
+  await page.locator('pl-button[data-action="taskmanNextPage"]').click();
+  await expect(page.locator('#taskman-jobs-list')).toContainText('Smoke job 102');
+  expect(listRequests.at(-1)).toHaveProperty('offset', '200');
+  await page.locator('pl-button[data-action="taskmanPrevPage"]').click();
+  await expect(page.locator('#taskman-jobs-list')).toContainText('Smoke job 101');
+
+  await page.locator('#taskman-job-id').fill('202');
+  await page.locator('pl-button[data-action="loadTaskmanJobByInput"]').click();
+  await expect(page.locator('#pane-taskman-details')).toBeVisible();
+  await expect(page.locator('#taskman-job-details')).toContainText('"id": 202');
+
+  await page.locator('pl-button[data-action="copyTaskmanSelectedJob"]').click();
+  await expect(page.locator('.pl-toast', { hasText: 'Job JSON copied' })).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toContain('"id": 202');
+
+  await page.locator('#pane-taskman-details pl-button[data-action="toggleTaskmanDetails"]').click();
+  await expect(page.locator('#pane-taskman-details')).toBeHidden();
+  await page.locator('#taskman-jobs-list tbody tr').first().click();
+  await expect(page.locator('#pane-taskman-details')).toBeVisible();
+  await expect(page.locator('#taskman-job-details')).toContainText('"id": 101');
+  await expect(page.locator('#taskman-job-events')).toContainText('event-101');
+  await expect(page.locator('#taskman-job-messages')).toContainText('sent');
+
+  await page.locator('pl-button[data-action="cancelTaskmanSelectedJob"]').click();
+  await expect(page.locator('pl-modal')).toContainText('Cancel job 101');
+  await page.locator('pl-modal pl-button', { hasText: 'Cancel job' }).click();
+  await expect(page.locator('.pl-toast', { hasText: 'Job 101 cancelled' })).toBeVisible();
+
+  await page.locator('pl-button[data-action="restartTaskmanSelectedJob"]').click();
+  await expect(page.locator('pl-modal')).toContainText('Restart job 101');
+  await page.locator('pl-modal pl-button', { hasText: 'Restart job' }).click();
+  await expect(page.locator('#taskman-job-details')).toContainText('"id": 303');
+  await expect(page.locator('.pl-toast', { hasText: 'restarted as 303' })).toBeVisible();
+
+  await page.locator('#pane-taskman-details pl-button[data-action="toggleTaskmanDetails"]').click();
+  await expect(page.locator('#pane-taskman-details')).toBeHidden();
+  await page.locator('#taskman-status').selectOption('');
+  await page.locator('pl-button[data-action="clearTaskmanJobsByFilter"]').click();
+  await expect(page.locator('.pl-toast', { hasText: 'Apply the current filters before clearing' })).toBeVisible();
+  await expect(page.locator('pl-modal')).toHaveCount(0);
+  const requestsBeforeClearSearch = listRequests.length;
+  await page.locator('#btn-search-taskman').click();
+  await expect.poll(() => listRequests.length).toBeGreaterThan(requestsBeforeClearSearch);
+  await page.locator('pl-button[data-action="clearTaskmanJobsByFilter"]').click();
+  await expect(page.locator('pl-modal')).toContainText('pending or processing jobs');
+  await page.locator('pl-modal pl-button', { hasText: 'Clear filtered' }).click();
+  await expect(page.locator('.pl-toast', { hasText: 'Deleted 200 of 201 jobs' })).toBeVisible();
+
+  expect(mutationRequests).toEqual([
+    { path: 'cancel', method: 'POST' },
+    { path: 'restart', method: 'POST' },
+    { path: 'clear', method: 'DELETE' },
+  ]);
+
+  await page.locator('#taskman-job-id').fill('404');
+  await page.locator('pl-button[data-action="loadTaskmanJobByInput"]').click();
+  await expect(page.locator('#taskman-job-details')).toContainText('Could not load Taskman job 404');
+  await expect(page.locator('#taskman-job-artifacts')).toBeHidden();
+  await expect(page.locator('pl-button[data-action="copyTaskmanSelectedJob"]')).toBeDisabled();
+  assertNoPageErrors();
+});
+
 test('settings landing loads managed chats from real API', async ({ page }) => {
   const assertNoPageErrors = watchPageErrors(page);
-  await stubTelegramWebApp(page);
+  await stubTelegramWebApp(page, 7, settingsInitData7);
 
   await page.goto('/settings/index.html?user_id=7&signature=68b3a1ec', {
     waitUntil: 'domcontentloaded',
@@ -499,7 +678,7 @@ test('settings landing loads managed chats from real API', async ({ page }) => {
 
 test('settings general page renders persisted private settings', async ({ page }) => {
   const assertNoPageErrors = watchPageErrors(page);
-  await stubTelegramWebApp(page);
+  await stubTelegramWebApp(page, 42, settingsInitData42);
 
   await page.goto('/settings/index.html?user_id=42&signature=780e28cf&mode=general', {
     waitUntil: 'domcontentloaded',

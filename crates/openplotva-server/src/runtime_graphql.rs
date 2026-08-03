@@ -1,6 +1,8 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use async_graphql::{EmptySubscription, Enum, ID, InputObject, Json, Object, Schema, SimpleObject};
+use async_graphql::{
+    ComplexObject, EmptySubscription, Enum, ID, InputObject, Json, Object, Schema, SimpleObject,
+};
 use serde_json::{Value, json};
 
 /// Runtime API GraphQL schema type.
@@ -349,38 +351,78 @@ pub struct RuntimeLogEntry {
     pub attrs: Option<Value>,
 }
 
-/// Runtime API outbound dispatcher stats from a live inspector.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API outbound dispatcher stats from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "DispatcherStats")]
 pub struct RuntimeDispatcherStatsData {
     pub regular_queue_size: i32,
     pub immediate_queue_size: i32,
+    #[graphql(
+        derived(
+            owned,
+            name = "processed_total",
+            into = "String",
+            with = "graphql_i64_string"
+        ),
+        skip
+    )]
     pub processed_total: i64,
+    #[graphql(
+        derived(
+            owned,
+            name = "deduped_total",
+            into = "String",
+            with = "graphql_i64_string"
+        ),
+        skip
+    )]
     pub deduped_total: i64,
     pub oldest_regular_age_ms: i32,
     pub oldest_immediate_age_ms: i32,
 }
 
-/// Runtime API terminal outbound dispatcher send failure from a live inspector.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API terminal outbound dispatcher send failure from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "DispatcherSendFailure")]
 pub struct RuntimeDispatchFailureData {
     pub at: String,
+    #[graphql(name = "virtualID")]
     pub virtual_id: String,
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
     pub method_kind: String,
     pub error: String,
     pub class: String,
     pub protected: bool,
-    /// Trigger message id recovered from a reply-scoped debounce key, if any.
+    // Trigger message id recovered from a reply-scoped debounce key, if any.
+    #[graphql(name = "replyToMessageID")]
     pub reply_to_message_id: Option<i64>,
 }
 
-/// Runtime API cache stats from a live inspector.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API cache stats from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "CacheStats")]
 pub struct RuntimeCacheStatsData {
     pub size: i32,
     pub capacity: i32,
+    #[graphql(
+        derived(owned, name = "hits", into = "String", with = "graphql_u64_string"),
+        skip
+    )]
     pub hits: u64,
+    #[graphql(
+        derived(owned, name = "misses", into = "String", with = "graphql_u64_string"),
+        skip
+    )]
     pub misses: u64,
+    #[graphql(
+        derived(owned, name = "mem_size", into = "String", with = "graphql_u64_string"),
+        skip
+    )]
     pub mem_size: u64,
 }
 
@@ -438,12 +480,25 @@ pub struct RuntimeVirtualDialogSendRequest {
     pub tool_mode: RuntimeVirtualDialogToolMode,
 }
 
-/// Runtime virtual-dialog row returned by a live manager.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Runtime virtual-dialog row returned by a live manager.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "VirtualDialog")]
 pub struct RuntimeVirtualDialogData {
+    #[graphql(name = "sessionID")]
     pub session_id: String,
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
+    #[graphql(name = "nextMessageID")]
     pub next_message_id: i32,
     pub message_count: i32,
     pub last_activity_at: Option<String>,
@@ -451,20 +506,31 @@ pub struct RuntimeVirtualDialogData {
     pub messages: Vec<RuntimeVirtualDialogMessageData>,
 }
 
-/// Runtime virtual-dialog message returned by a live manager.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Runtime virtual-dialog message returned by a live manager.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "VirtualDialogMessage", complex)]
 pub struct RuntimeVirtualDialogMessageData {
+    #[graphql(name = "messageID")]
     pub message_id: i32,
     pub role: String,
     pub text: String,
     pub at: String,
     pub provider: Option<String>,
     pub tool_mode: Option<RuntimeVirtualDialogToolMode>,
+    #[graphql(skip)]
     pub tool_calls: Option<Value>,
 }
 
-/// Runtime virtual-dialog delete result returned by a live manager.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[ComplexObject]
+impl RuntimeVirtualDialogMessageData {
+    async fn tool_calls(&self) -> Option<Json<&Value>> {
+        self.tool_calls.as_ref().map(Json)
+    }
+}
+
+// Runtime virtual-dialog delete result returned by a live manager.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "VirtualDialogDeleteResult")]
 pub struct RuntimeVirtualDialogDeleteResultData {
     pub found: bool,
     pub deleted: bool,
@@ -490,8 +556,9 @@ pub struct RuntimeTaskmanJobsFilter {
     pub limit: i32,
 }
 
-/// Runtime API taskman list result from a live inspector.
-#[derive(Clone, Debug, PartialEq)]
+// Runtime API taskman list result from a live inspector.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "TaskmanJobListResult")]
 pub struct RuntimeTaskmanJobListResultData {
     pub total: i32,
     pub offset: i32,
@@ -500,28 +567,65 @@ pub struct RuntimeTaskmanJobListResultData {
     pub items: Vec<RuntimeTaskmanJobListEntryData>,
 }
 
-/// Runtime API taskman summary maps.
+// Runtime API taskman summary maps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeTaskmanJobSummaryData {
     pub by_status: Value,
     pub by_queue: Value,
 }
 
-/// Runtime API taskman job list row from a live inspector.
-#[derive(Clone, Debug, PartialEq)]
+#[Object(name = "TaskmanJobSummary")]
+impl RuntimeTaskmanJobSummaryData {
+    async fn by_status(&self) -> Json<&Value> {
+        Json(&self.by_status)
+    }
+
+    async fn by_queue(&self) -> Json<&Value> {
+        Json(&self.by_queue)
+    }
+}
+
+impl Default for RuntimeTaskmanJobSummaryData {
+    fn default() -> Self {
+        Self {
+            by_status: json!({}),
+            by_queue: json!({}),
+        }
+    }
+}
+
+// Runtime API taskman job list row from a live inspector.
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "TaskmanJobListEntry")]
 pub struct RuntimeTaskmanJobListEntryData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
     pub queue_name: String,
     pub priority: i32,
     pub title: String,
     pub job_type: String,
     pub status: String,
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
+    #[graphql(name = "triggerMessageID")]
     pub trigger_message_id: i32,
+    #[graphql(name = "threadMessageID")]
     pub thread_message_id: Option<i32>,
+    #[graphql(name = "progressMessageID")]
     pub progress_message_id: Option<i32>,
+    #[graphql(name = "resultMessageID")]
     pub result_message_id: Option<i32>,
+    #[graphql(name = "workerID")]
     pub worker_id: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -534,7 +638,7 @@ pub struct RuntimeTaskmanJobListEntryData {
     pub preview: Option<String>,
 }
 
-/// Runtime API taskman job details from a live inspector.
+// Runtime API taskman job details from a live inspector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeTaskmanJobDetailsData {
     pub job: RuntimeTaskmanJobData,
@@ -542,7 +646,7 @@ pub struct RuntimeTaskmanJobDetailsData {
     pub events: Option<Value>,
 }
 
-/// Runtime API taskman full job row from a live inspector.
+// Runtime API taskman full job row from a live inspector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeTaskmanJobData {
     pub id: i64,
@@ -568,20 +672,34 @@ pub struct RuntimeTaskmanJobData {
     pub actual_processing_time: Option<i32>,
 }
 
-/// Runtime API taskman message row from a live inspector.
-#[derive(Clone, Debug, PartialEq)]
+// Runtime API taskman message row from a live inspector.
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "TaskmanJobMessage")]
 pub struct RuntimeTaskmanJobMessageData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
+    #[graphql(
+        derived(owned, name = "job_id", into = "ID", with = "graphql_id"),
+        name = "jobID",
+        skip
+    )]
     pub job_id: i64,
     pub message_type: String,
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
+    #[graphql(name = "messageID")]
     pub message_id: i32,
     pub created_at: String,
     pub status: String,
 }
 
-/// Runtime API taskman diagnostics from a live inspector.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API taskman diagnostics from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "TaskmanDiagnostics")]
 pub struct RuntimeTaskmanDiagnosticsData {
     pub running: bool,
     pub active: i32,
@@ -593,8 +711,9 @@ pub struct RuntimeTaskmanDiagnosticsData {
     pub queues: Vec<RuntimeTaskmanQueueDiagnosticsData>,
 }
 
-/// Runtime API taskman queue diagnostics from a live inspector.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Runtime API taskman queue diagnostics from a live inspector.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "TaskmanQueueDiagnostics")]
 pub struct RuntimeTaskmanQueueDiagnosticsData {
     pub queue_name: String,
     pub priority: i32,
@@ -605,8 +724,9 @@ pub struct RuntimeTaskmanQueueDiagnosticsData {
     pub eta_seconds: i32,
 }
 
-/// Runtime API decoded-update runtime snapshot from a live inspector.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API decoded-update runtime snapshot from a live inspector.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "UpdatesRuntime")]
 pub struct RuntimeUpdatesRuntimeData {
     pub active: i32,
     pub state_active: i32,
@@ -665,9 +785,10 @@ pub struct RuntimeUpdatesRuntimeData {
     pub claim_to_taskman_avg_ms: i64,
 }
 
-/// Process-lifetime counters for the ingestion gates that consume a message
-/// before any dialog job exists (rate limits, debounce coalescing, sampling).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Process-lifetime counters for the ingestion gates that consume a message
+// before any dialog job exists (rate limits, debounce coalescing, sampling).
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "IngestionGates")]
 pub struct RuntimeIngestionGatesData {
     pub task_rate_limited: i64,
     pub debounce_coalesced: i64,
@@ -680,13 +801,34 @@ pub struct RuntimeIngestionGatesData {
     pub random_skipped_user_disabled: i64,
 }
 
-/// Runtime API decoded-update task row from a live inspector.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Runtime API decoded-update task row from a live inspector.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "UpdatesTask")]
 pub struct RuntimeUpdatesTaskData {
     pub stage: String,
     pub started_at: String,
     pub age_ms: i32,
+    #[graphql(
+        derived(
+            owned,
+            name = "chat_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: Option<i64>,
+    #[graphql(
+        derived(
+            owned,
+            name = "user_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "userID",
+        skip
+    )]
     pub user_id: Option<i64>,
     pub update: String,
 }
@@ -906,9 +1048,11 @@ pub struct RuntimeChatsFilter {
     pub member_user_id: Option<i64>,
 }
 
-/// Runtime API user row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API user row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "User")]
 pub struct RuntimeUserData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
     pub is_premium: Option<bool>,
     pub first_name: String,
@@ -920,8 +1064,9 @@ pub struct RuntimeUserData {
     pub updated_at: Option<String>,
 }
 
-/// Runtime API users connection from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API users connection from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "UserConnection")]
 pub struct RuntimeUserConnectionData {
     pub count: i32,
     pub offset: i32,
@@ -929,9 +1074,11 @@ pub struct RuntimeUserConnectionData {
     pub items: Vec<RuntimeUserData>,
 }
 
-/// Runtime API user details from a live entity reader.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API user details from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "UserDetails")]
 pub struct RuntimeUserDetailsData {
+    #[graphql(flatten)]
     pub user: RuntimeUserData,
     pub subscription: Option<RuntimeSubscriptionData>,
     pub vip: Option<RuntimeVipCacheData>,
@@ -940,12 +1087,21 @@ pub struct RuntimeUserDetailsData {
     pub subscriptions: Vec<RuntimeSubscriptionData>,
 }
 
-/// Runtime API subscription row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API subscription row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "Subscription")]
 pub struct RuntimeSubscriptionData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
+    #[graphql(name = "telegramPaymentChargeID")]
     pub telegram_payment_charge_id: String,
+    #[graphql(name = "providerPaymentChargeID")]
     pub provider_payment_charge_id: String,
     pub expires_at: Option<String>,
     pub created_at: Option<String>,
@@ -955,9 +1111,15 @@ pub struct RuntimeSubscriptionData {
     pub status: String,
 }
 
-/// Runtime API VIP cache row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API VIP cache row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "VipCache")]
 pub struct RuntimeVipCacheData {
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
     pub is_vip: bool,
     pub expires_at: Option<String>,
@@ -965,42 +1127,80 @@ pub struct RuntimeVipCacheData {
     pub updated_at: Option<String>,
 }
 
-/// Runtime API VIP summary from a live entity reader.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API VIP summary from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "VipSummary")]
 pub struct RuntimeVipSummaryData {
     pub active: bool,
     pub has_history: bool,
     pub expires_at: Option<String>,
     pub remaining_seconds: String,
     pub remaining_days: i32,
+    #[graphql(
+        derived(
+            owned,
+            name = "latest_event_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "latestEventID",
+        skip
+    )]
     pub latest_event_id: Option<i64>,
     pub latest_event_type: Option<String>,
     pub latest_reason: Option<String>,
     pub latest_created_at: Option<String>,
 }
 
-/// Runtime API VIP event row from a live entity reader.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API VIP event row from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "VipEvent")]
 pub struct RuntimeVipEventData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
     pub event_type: String,
     pub delta_seconds: String,
     pub delta_days: f64,
     pub effective_expires_at: Option<String>,
+    #[graphql(
+        derived(
+            owned,
+            name = "actor_user_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "actorUserID",
+        skip
+    )]
     pub actor_user_id: Option<i64>,
     pub actor_label: Option<String>,
     pub reason: Option<String>,
     pub created_at: Option<String>,
+    #[graphql(
+        derived(
+            owned,
+            name = "subscription_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "subscriptionID",
+        skip
+    )]
     pub subscription_id: Option<i64>,
+    #[graphql(name = "telegramPaymentChargeID")]
     pub telegram_payment_charge_id: Option<String>,
+    #[graphql(name = "providerPaymentChargeID")]
     pub provider_payment_charge_id: Option<String>,
     pub subscription_status: Option<String>,
 }
 
-/// Runtime API chat row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API chat row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "Chat")]
 pub struct RuntimeChatData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
+    #[graphql(name = "type")]
     pub chat_type: String,
     pub title: Option<String>,
     pub username: Option<String>,
@@ -1013,8 +1213,9 @@ pub struct RuntimeChatData {
     pub updated_at: Option<String>,
 }
 
-/// Runtime API chats connection from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API chats connection from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "ChatConnection")]
 pub struct RuntimeChatConnectionData {
     pub count: i32,
     pub offset: i32,
@@ -1022,10 +1223,21 @@ pub struct RuntimeChatConnectionData {
     pub items: Vec<RuntimeChatData>,
 }
 
-/// Runtime API chat-member row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API chat-member row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "ChatMember")]
 pub struct RuntimeChatMemberData {
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
     pub status: String,
     pub is_anonymous: Option<bool>,
@@ -1047,8 +1259,9 @@ pub struct RuntimeChatMemberData {
     pub last_message_at: Option<String>,
 }
 
-/// Runtime API chat-member plus optional user row from a live entity reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API chat-member plus optional user row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "ChatMemberWithUser")]
 pub struct RuntimeChatMemberWithUserData {
     pub member: RuntimeChatMemberData,
     pub user: Option<RuntimeUserData>,
@@ -1121,24 +1334,76 @@ pub struct RuntimeRoutingEventsFilter {
     pub limit: i32,
 }
 
-/// Runtime API LLM routing event.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API LLM routing event.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "RoutingEvent", complex)]
 pub struct RuntimeRoutingEventData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
     pub at: String,
     pub severity: String,
     pub event_type: String,
     pub workflow_key: String,
+    #[graphql(
+        derived(
+            owned,
+            name = "provider_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "providerID",
+        skip
+    )]
     pub provider_id: Option<i64>,
+    #[graphql(
+        derived(
+            owned,
+            name = "model_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "modelID",
+        skip
+    )]
     pub model_id: Option<i64>,
     pub queue_name: Option<String>,
+    #[graphql(
+        derived(
+            owned,
+            name = "job_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "jobID",
+        skip
+    )]
     pub job_id: Option<i64>,
+    #[graphql(
+        derived(
+            owned,
+            name = "chat_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: Option<i64>,
+    #[graphql(name = "threadID")]
     pub thread_id: Option<i32>,
+    #[graphql(name = "messageID")]
     pub message_id: Option<i32>,
     pub dedupe_key: String,
     pub summary: String,
+    #[graphql(skip)]
     pub detail: Value,
+}
+
+#[ComplexObject]
+impl RuntimeRoutingEventData {
+    async fn detail(&self) -> Json<&Value> {
+        Json(&self.detail)
+    }
 }
 
 /// Runtime API LLM request trace.
@@ -1177,39 +1442,64 @@ pub struct RuntimeLlmRequestData {
     pub result: RuntimeLlmRequestResultData,
 }
 
-/// Runtime API LLM request chat metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM request chat metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmRequestChat")]
 pub struct RuntimeLlmRequestChatData {
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
+    #[graphql(name = "threadID")]
     pub thread_id: Option<i32>,
     pub chat_title: Option<String>,
 }
 
-/// Runtime API LLM request user metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM request user metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmRequestUser")]
 pub struct RuntimeLlmRequestUserData {
+    #[graphql(
+        derived(owned, name = "user_id", into = "ID", with = "graphql_id"),
+        name = "userID",
+        skip
+    )]
     pub user_id: i64,
     pub full_name: Option<String>,
 }
 
-/// Runtime API LLM request message metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM request message metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmRequestMessage")]
 pub struct RuntimeLlmRequestMessageData {
+    #[graphql(name = "messageID")]
     pub message_id: i32,
 }
 
-/// Runtime API LLM generation config.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API LLM generation config.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "LlmGenConfig", complex)]
 pub struct RuntimeLlmGenConfigData {
     pub max_output_tokens: i32,
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: i32,
+    #[graphql(skip)]
     pub safety_settings: Option<Value>,
 }
 
-/// Runtime API LLM request result.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[ComplexObject]
+impl RuntimeLlmGenConfigData {
+    async fn safety_settings(&self) -> Option<Json<&Value>> {
+        self.safety_settings.as_ref().map(Json)
+    }
+}
+
+// Runtime API LLM request result.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmRequestResult")]
 pub struct RuntimeLlmRequestResultData {
     pub duration_ms: i32,
     pub error: Option<String>,
@@ -1225,16 +1515,45 @@ pub struct RuntimeTurnOutcomesFilter {
     pub limit: i32,
 }
 
-/// Runtime API dialog turn outcome row.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API dialog turn outcome row.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "DialogTurnOutcome", complex)]
 pub struct RuntimeTurnOutcomeData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
     pub id: i64,
     pub at: String,
+    #[graphql(
+        derived(owned, name = "job_id", into = "ID", with = "graphql_id"),
+        name = "jobID",
+        skip
+    )]
     pub job_id: i64,
     pub queue_name: String,
+    #[graphql(
+        derived(
+            owned,
+            name = "chat_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: Option<i64>,
+    #[graphql(name = "threadID")]
     pub thread_id: Option<i32>,
+    #[graphql(
+        derived(
+            owned,
+            name = "user_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "userID",
+        skip
+    )]
     pub user_id: Option<i64>,
+    #[graphql(name = "triggerMessageID")]
     pub trigger_message_id: Option<i32>,
     pub attempt: i32,
     pub outcome: String,
@@ -1245,22 +1564,43 @@ pub struct RuntimeTurnOutcomeData {
     pub budget_ms: Option<i32>,
     pub user_signal: Option<String>,
     pub sent_message_parts: Option<i32>,
+    #[graphql(
+        derived(
+            owned,
+            name = "side_effect_ticket_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "sideEffectTicketID",
+        skip
+    )]
     pub side_effect_ticket_id: Option<i64>,
+    #[graphql(skip)]
     pub detail: Value,
 }
 
-/// Runtime API LLM analytics summary.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[ComplexObject]
+impl RuntimeTurnOutcomeData {
+    async fn detail(&self) -> Json<&Value> {
+        Json(&self.detail)
+    }
+}
+
+// Runtime API LLM analytics summary.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalytics")]
 pub struct RuntimeLlmAnalyticsData {
     pub range: String,
     pub bucket: String,
     pub since: String,
     pub totals: RuntimeLlmAnalyticsTotalsData,
     pub series: Vec<RuntimeLlmAnalyticsSeriesPointData>,
+    #[graphql(skip)]
     pub model_series: Vec<RuntimeLlmAnalyticsModelSeriesPointData>,
     pub top_chats: Vec<RuntimeLlmAnalyticsTopChatData>,
     pub models: Vec<RuntimeLlmAnalyticsModelStatData>,
     pub providers: Vec<RuntimeLlmAnalyticsProviderStatData>,
+    #[graphql(skip)]
     pub inference_params: Vec<RuntimeLlmAnalyticsInferenceParamStatData>,
     pub stage_metrics: Vec<RuntimeLlmAnalyticsStageMetricData>,
     pub runtime_jobs: Vec<RuntimeJobAnalyticsStatData>,
@@ -1281,16 +1621,18 @@ pub struct RuntimeLlmAnalyticsModelSeriesPointData {
     pub output_tokens: i64,
 }
 
-/// Runtime API LLM analytics totals.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM analytics totals.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsTotals")]
 pub struct RuntimeLlmAnalyticsTotalsData {
     pub total_count: i32,
     pub error_count: i32,
     pub avg_duration_ms: i32,
 }
 
-/// Runtime API LLM analytics series point.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM analytics series point.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsSeriesPoint")]
 pub struct RuntimeLlmAnalyticsSeriesPointData {
     pub ts: String,
     pub total_count: i32,
@@ -1298,17 +1640,24 @@ pub struct RuntimeLlmAnalyticsSeriesPointData {
     pub avg_duration_ms: i32,
 }
 
-/// Runtime API LLM analytics top chat.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM analytics top chat.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsTopChat")]
 pub struct RuntimeLlmAnalyticsTopChatData {
+    #[graphql(
+        derived(owned, name = "chat_id", into = "ID", with = "graphql_id"),
+        name = "chatID",
+        skip
+    )]
     pub chat_id: i64,
     pub title: Option<String>,
     pub username: Option<String>,
     pub request_count: i32,
 }
 
-/// Runtime API LLM analytics model stat.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API LLM analytics model stat.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsModelStat")]
 pub struct RuntimeLlmAnalyticsModelStatData {
     pub model: String,
     pub request_count: i32,
@@ -1316,17 +1665,25 @@ pub struct RuntimeLlmAnalyticsModelStatData {
     pub avg_duration_ms: i32,
     pub p50_duration_ms: i32,
     pub p95_duration_ms: i32,
+    #[graphql(skip)]
     pub input_tokens: i64,
+    #[graphql(skip)]
     pub output_tokens: i64,
+    #[graphql(skip)]
     pub total_tokens: i64,
+    #[graphql(skip)]
     pub avg_generation_tps: f64,
+    #[graphql(skip)]
     pub avg_effective_output_tps: f64,
+    #[graphql(skip)]
     pub p50_effective_output_tps: f64,
+    #[graphql(skip)]
     pub p95_effective_output_tps: f64,
 }
 
-/// Runtime API LLM analytics provider stat.
-#[derive(Clone, Debug, Default, PartialEq)]
+// Runtime API LLM analytics provider stat.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsProviderStat")]
 pub struct RuntimeLlmAnalyticsProviderStatData {
     pub provider: String,
     pub source: String,
@@ -1335,10 +1692,15 @@ pub struct RuntimeLlmAnalyticsProviderStatData {
     pub avg_duration_ms: i32,
     pub p50_duration_ms: i32,
     pub p95_duration_ms: i32,
+    #[graphql(skip)]
     pub input_tokens: i64,
+    #[graphql(skip)]
     pub output_tokens: i64,
+    #[graphql(skip)]
     pub total_tokens: i64,
+    #[graphql(skip)]
     pub avg_generation_tps: f64,
+    #[graphql(skip)]
     pub avg_effective_output_tps: f64,
 }
 
@@ -1361,8 +1723,9 @@ pub struct RuntimeLlmAnalyticsInferenceParamStatData {
     pub avg_effective_output_tps: f64,
 }
 
-/// Runtime API LLM analytics stage metric.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API LLM analytics stage metric.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "LlmAnalyticsStageMetric")]
 pub struct RuntimeLlmAnalyticsStageMetricData {
     pub stage: String,
     pub source: String,
@@ -1375,8 +1738,9 @@ pub struct RuntimeLlmAnalyticsStageMetricData {
     pub max_iteration: i32,
 }
 
-/// Runtime API task/job analytics stat.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API task/job analytics stat.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "RuntimeJobAnalyticsStat")]
 pub struct RuntimeJobAnalyticsStatData {
     pub job_type: String,
     pub queue_name: String,
@@ -1390,8 +1754,9 @@ pub struct RuntimeJobAnalyticsStatData {
     pub p95_processing_ms: i32,
 }
 
-/// Runtime API AI Farm capacity snapshot.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Runtime API AI Farm capacity snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq, SimpleObject)]
+#[graphql(name = "AifarmCapacitySnapshot")]
 pub struct RuntimeAifarmCapacitySnapshotData {
     pub service: String,
     pub max_concurrent_jobs: i32,
@@ -1404,7 +1769,8 @@ pub struct RuntimeAifarmCapacitySnapshotData {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "ConfigSnapshot")]
 pub struct RuntimeApiGraphqlSnapshot {
     pub log_level: String,
     pub web_host: String,
@@ -1412,25 +1778,36 @@ pub struct RuntimeApiGraphqlSnapshot {
     pub runtime_api_enabled: bool,
     pub runtime_api_host: String,
     pub runtime_api_port: i32,
+    #[graphql(name = "discoveryBaseURL")]
     pub discovery_base_url: Option<String>,
     pub embedder_enabled: bool,
+    #[graphql(name = "embedderURL")]
     pub embedder_url: Option<String>,
     pub shield_enabled: bool,
+    #[graphql(name = "shieldEmbedderURL")]
     pub shield_embedder_url: Option<String>,
     pub shield_max_matches: i32,
     pub shield_vector_min_score: f64,
     pub shield_lexical_min_score: f64,
     pub shield_retrieval_timeout_seconds: i32,
     pub shield_history_tail_messages: i32,
+    #[graphql(skip)]
     pub vision_discovery_service_name: String,
+    #[graphql(skip)]
     pub vision_discovery_endpoint_name: String,
+    #[graphql(skip)]
     pub vision_model: String,
+    #[graphql(skip)]
     pub vision_max_tokens: i32,
+    #[graphql(skip)]
     pub vision_temperature: f64,
+    #[graphql(skip)]
     pub vision_direct_image_limit: i32,
+    #[graphql(skip)]
     pub vision_request_timeout_seconds: i32,
     pub white_circle_enabled: bool,
     pub ace_step_enabled: bool,
+    #[graphql(name = "aceStepBaseURL")]
     pub ace_step_base_url: Option<String>,
     pub dialog_provider: String,
     pub dialog_fallback_provider: Option<String>,
@@ -1439,7 +1816,9 @@ pub struct RuntimeApiGraphqlSnapshot {
     pub sql_timeout_ms: i32,
     pub sql_row_limit: i32,
     pub sql_result_bytes_limit: i32,
+    #[graphql(skip)]
     pub db_status: String,
+    #[graphql(skip)]
     pub redis_status: String,
 }
 
@@ -1592,10 +1971,9 @@ impl RuntimeQuery {
                 .dispatcher_inspector
                 .as_deref()
                 .map(RuntimeDispatcherInspector::stats)
-                .map(DispatcherStats::from)
                 .unwrap_or_default(),
-            cache: CacheStats::from(cache_snapshot.cache),
-            planner_cache: CacheStats::from(cache_snapshot.planner_cache),
+            cache: cache_snapshot.cache,
+            planner_cache: cache_snapshot.planner_cache,
         }
     }
 
@@ -1631,21 +2009,20 @@ impl RuntimeQuery {
         }
     }
 
-    async fn config_snapshot(&self) -> ConfigSnapshot {
-        ConfigSnapshot::from(self.snapshot.clone())
+    async fn config_snapshot(&self) -> &RuntimeApiGraphqlSnapshot {
+        &self.snapshot
     }
 
     async fn users(
         &self,
         filter: Option<UsersFilterInput>,
-    ) -> async_graphql::Result<UserConnection> {
+    ) -> async_graphql::Result<RuntimeUserConnectionData> {
         let Some(reader) = self.entity_reader.as_deref() else {
             return Err("runtime entity reader is not configured".into());
         };
         reader
             .users(users_filter_from_input(filter))
             .await
-            .map(UserConnection::from)
             .map_err(async_graphql::Error::new)
     }
 
@@ -1653,48 +2030,39 @@ impl RuntimeQuery {
         &self,
         id: Option<ID>,
         username: Option<String>,
-    ) -> async_graphql::Result<Option<UserDetails>> {
+    ) -> async_graphql::Result<Option<RuntimeUserDetailsData>> {
         let Some(reader) = self.entity_reader.as_deref() else {
             return Err("runtime entity reader is not configured".into());
         };
         let lookup = user_lookup_from_input(id, username)?;
-        reader
-            .user(lookup)
-            .await
-            .map(|user| user.map(UserDetails::from))
-            .map_err(async_graphql::Error::new)
+        reader.user(lookup).await.map_err(async_graphql::Error::new)
     }
 
     async fn chats(
         &self,
         filter: Option<ChatsFilterInput>,
-    ) -> async_graphql::Result<ChatConnection> {
+    ) -> async_graphql::Result<RuntimeChatConnectionData> {
         let Some(reader) = self.entity_reader.as_deref() else {
             return Err("runtime entity reader is not configured".into());
         };
         reader
             .chats(chats_filter_from_input(filter)?)
             .await
-            .map(ChatConnection::from)
             .map_err(async_graphql::Error::new)
     }
 
-    async fn chat(&self, id: ID) -> async_graphql::Result<Option<Chat>> {
+    async fn chat(&self, id: ID) -> async_graphql::Result<Option<RuntimeChatData>> {
         let Some(reader) = self.entity_reader.as_deref() else {
             return Err("runtime entity reader is not configured".into());
         };
         let id = parse_id(id, "id")?;
-        reader
-            .chat(id)
-            .await
-            .map(|chat| chat.map(Chat::from))
-            .map_err(async_graphql::Error::new)
+        reader.chat(id).await.map_err(async_graphql::Error::new)
     }
 
     async fn chat_members(
         &self,
         #[graphql(name = "chatID")] chat_id: ID,
-    ) -> async_graphql::Result<Vec<ChatMemberWithUser>> {
+    ) -> async_graphql::Result<Vec<RuntimeChatMemberWithUserData>> {
         let Some(reader) = self.entity_reader.as_deref() else {
             return Err("runtime entity reader is not configured".into());
         };
@@ -1702,22 +2070,21 @@ impl RuntimeQuery {
         reader
             .chat_members(chat_id)
             .await
-            .map(|members| members.into_iter().map(ChatMemberWithUser::from).collect())
             .map_err(async_graphql::Error::new)
     }
 
     async fn taskman_jobs(
         &self,
         filter: Option<TaskmanJobsFilterInput>,
-    ) -> async_graphql::Result<TaskmanJobListResult> {
+    ) -> async_graphql::Result<RuntimeTaskmanJobListResultData> {
         let Some(inspector) = self.taskman_inspector.as_deref() else {
-            return Ok(TaskmanJobListResult::empty());
+            return Ok(RuntimeTaskmanJobListResultData::default());
         };
         let filter = taskman_jobs_filter_from_input(filter)?;
         let result = inspector
             .list_jobs(filter)
             .map_err(async_graphql::Error::new)?;
-        Ok(TaskmanJobListResult::from(result))
+        Ok(result)
     }
 
     async fn taskman_job(&self, id: ID) -> async_graphql::Result<Option<TaskmanJobDetails>> {
@@ -1739,16 +2106,15 @@ impl RuntimeQuery {
         &self,
         queues: Option<Vec<String>>,
         priority: Option<i32>,
-    ) -> async_graphql::Result<TaskmanDiagnostics> {
+    ) -> async_graphql::Result<RuntimeTaskmanDiagnosticsData> {
         let Some(inspector) = self.taskman_inspector.as_deref() else {
-            return Ok(TaskmanDiagnostics::default());
+            return Ok(RuntimeTaskmanDiagnosticsData::default());
         };
         inspector
             .queue_diagnostics(
                 queues.unwrap_or_default(),
                 priority.unwrap_or(RUNTIME_TASKMAN_LOWEST_PRIORITY),
             )
-            .map(TaskmanDiagnostics::from)
             .map_err(async_graphql::Error::new)
     }
 
@@ -1795,59 +2161,55 @@ impl RuntimeQuery {
     async fn dialog_turn_outcomes(
         &self,
         filter: Option<DialogTurnOutcomesFilterInput>,
-    ) -> async_graphql::Result<Vec<DialogTurnOutcome>> {
+    ) -> async_graphql::Result<Vec<RuntimeTurnOutcomeData>> {
         let Some(inspector) = self.turn_outcome_inspector.as_deref() else {
             return Ok(Vec::new());
         };
         inspector
             .turn_outcomes(turn_outcomes_filter_from_input(filter)?)
-            .map(|items| items.into_iter().map(DialogTurnOutcome::from).collect())
             .map_err(async_graphql::Error::new)
     }
 
     async fn dispatcher_send_failures(
         &self,
         limit: Option<i32>,
-    ) -> async_graphql::Result<Vec<DispatcherSendFailure>> {
+    ) -> async_graphql::Result<Vec<RuntimeDispatchFailureData>> {
         let Some(inspector) = self.dispatcher_failure_inspector.as_deref() else {
             return Ok(Vec::new());
         };
         let limit = clamp_positive_range_i32(limit.unwrap_or(0), 100, 1024);
-        Ok(inspector
-            .send_failures(limit)
-            .into_iter()
-            .map(DispatcherSendFailure::from)
-            .collect())
+        Ok(inspector.send_failures(limit))
     }
 
     async fn llm_routing_events(
         &self,
         filter: Option<RoutingEventsFilterInput>,
-    ) -> async_graphql::Result<Vec<RoutingEvent>> {
+    ) -> async_graphql::Result<Vec<RuntimeRoutingEventData>> {
         let Some(inspector) = self.routing_event_inspector.as_deref() else {
             return Ok(Vec::new());
         };
         inspector
             .routing_events(routing_events_filter_from_input(filter))
-            .map(|items| items.into_iter().map(RoutingEvent::from).collect())
             .map_err(async_graphql::Error::new)
     }
 
-    async fn llm_analytics(&self, range: Option<String>) -> async_graphql::Result<LlmAnalytics> {
+    async fn llm_analytics(
+        &self,
+        range: Option<String>,
+    ) -> async_graphql::Result<RuntimeLlmAnalyticsData> {
         let Some(reader) = self.llm_analytics_reader.as_deref() else {
             return Err("runtime LLM analytics reader is not configured".into());
         };
         reader
             .llm_analytics(range.as_deref().unwrap_or_default())
             .await
-            .map(LlmAnalytics::from)
             .map_err(async_graphql::Error::new)
     }
 
     async fn virtual_dialog(
         &self,
         #[graphql(name = "sessionID")] session_id: String,
-    ) -> async_graphql::Result<Option<VirtualDialog>> {
+    ) -> async_graphql::Result<Option<RuntimeVirtualDialogData>> {
         let Some(manager) = self.virtual_dialog_manager.as_deref() else {
             return Err("runtime virtual dialog manager is not configured".into());
         };
@@ -1855,18 +2217,16 @@ impl RuntimeQuery {
         manager
             .virtual_dialog(&session_id)
             .await
-            .map(|dialog| dialog.map(VirtualDialog::from))
             .map_err(async_graphql::Error::new)
     }
 
-    async fn updates_runtime(&self) -> async_graphql::Result<UpdatesRuntime> {
+    async fn updates_runtime(&self) -> async_graphql::Result<RuntimeUpdatesRuntimeData> {
         let Some(inspector) = self.updates_inspector.as_deref() else {
-            return Ok(UpdatesRuntime::default());
+            return Ok(RuntimeUpdatesRuntimeData::default());
         };
         inspector
             .snapshot()
             .await
-            .map(UpdatesRuntime::from)
             .map_err(async_graphql::Error::new)
     }
 
@@ -2272,6 +2632,22 @@ fn parse_optional_id(value: Option<ID>, name: &str) -> async_graphql::Result<Opt
     value.map(|value| parse_id(value, name)).transpose()
 }
 
+fn graphql_id(value: i64) -> ID {
+    ID(value.to_string())
+}
+
+fn graphql_optional_id(value: Option<i64>) -> Option<ID> {
+    value.map(graphql_id)
+}
+
+fn graphql_i64_string(value: i64) -> String {
+    value.to_string()
+}
+
+fn graphql_u64_string(value: u64) -> String {
+    value.to_string()
+}
+
 fn parse_id(value: ID, name: &str) -> async_graphql::Result<i64> {
     value
         .as_str()
@@ -2426,7 +2802,7 @@ impl RuntimeMutation {
     async fn start_virtual_dialog(
         &self,
         input: StartVirtualDialogInput,
-    ) -> async_graphql::Result<VirtualDialog> {
+    ) -> async_graphql::Result<RuntimeVirtualDialogData> {
         let Some(manager) = self.virtual_dialog_manager.as_deref() else {
             return Err("runtime virtual dialog manager is not configured".into());
         };
@@ -2437,14 +2813,13 @@ impl RuntimeMutation {
         manager
             .start_virtual_dialog(request)
             .await
-            .map(VirtualDialog::from)
             .map_err(async_graphql::Error::new)
     }
 
     async fn send_virtual_dialog_message(
         &self,
         input: SendVirtualDialogMessageInput,
-    ) -> async_graphql::Result<VirtualDialogMessage> {
+    ) -> async_graphql::Result<RuntimeVirtualDialogMessageData> {
         let Some(manager) = self.virtual_dialog_manager.as_deref() else {
             return Err("runtime virtual dialog manager is not configured".into());
         };
@@ -2456,14 +2831,13 @@ impl RuntimeMutation {
         manager
             .send_virtual_dialog_message(request)
             .await
-            .map(VirtualDialogMessage::from)
             .map_err(async_graphql::Error::new)
     }
 
     async fn delete_virtual_dialog(
         &self,
         #[graphql(name = "sessionID")] session_id: String,
-    ) -> async_graphql::Result<VirtualDialogDeleteResult> {
+    ) -> async_graphql::Result<RuntimeVirtualDialogDeleteResultData> {
         let Some(manager) = self.virtual_dialog_manager.as_deref() else {
             return Err("runtime virtual dialog manager is not configured".into());
         };
@@ -2471,7 +2845,6 @@ impl RuntimeMutation {
         manager
             .delete_virtual_dialog(&session_id)
             .await
-            .map(VirtualDialogDeleteResult::from)
             .map_err(async_graphql::Error::new)
     }
 }
@@ -2479,83 +2852,9 @@ impl RuntimeMutation {
 #[derive(Clone, SimpleObject)]
 struct RuntimeState {
     log_level: String,
-    dispatcher: DispatcherStats,
-    cache: CacheStats,
-    planner_cache: CacheStats,
-}
-
-#[derive(Clone, Default, SimpleObject)]
-struct CacheStats {
-    size: i32,
-    capacity: i32,
-    hits: String,
-    misses: String,
-    mem_size: String,
-}
-
-impl From<RuntimeCacheStatsData> for CacheStats {
-    fn from(stats: RuntimeCacheStatsData) -> Self {
-        Self {
-            size: stats.size,
-            capacity: stats.capacity,
-            hits: stats.hits.to_string(),
-            misses: stats.misses.to_string(),
-            mem_size: stats.mem_size.to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Default, SimpleObject)]
-struct DispatcherStats {
-    regular_queue_size: i32,
-    immediate_queue_size: i32,
-    processed_total: String,
-    deduped_total: String,
-    oldest_regular_age_ms: i32,
-    oldest_immediate_age_ms: i32,
-}
-
-impl From<RuntimeDispatcherStatsData> for DispatcherStats {
-    fn from(stats: RuntimeDispatcherStatsData) -> Self {
-        Self {
-            regular_queue_size: stats.regular_queue_size,
-            immediate_queue_size: stats.immediate_queue_size,
-            processed_total: stats.processed_total.to_string(),
-            deduped_total: stats.deduped_total.to_string(),
-            oldest_regular_age_ms: stats.oldest_regular_age_ms,
-            oldest_immediate_age_ms: stats.oldest_immediate_age_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct DispatcherSendFailure {
-    at: String,
-    #[graphql(name = "virtualID")]
-    virtual_id: String,
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    method_kind: String,
-    error: String,
-    class: String,
-    protected: bool,
-    #[graphql(name = "replyToMessageID")]
-    reply_to_message_id: Option<i64>,
-}
-
-impl From<RuntimeDispatchFailureData> for DispatcherSendFailure {
-    fn from(failure: RuntimeDispatchFailureData) -> Self {
-        Self {
-            at: failure.at,
-            virtual_id: failure.virtual_id,
-            chat_id: ID(failure.chat_id.to_string()),
-            method_kind: failure.method_kind,
-            error: failure.error,
-            class: failure.class,
-            protected: failure.protected,
-            reply_to_message_id: failure.reply_to_message_id,
-        }
-    }
+    dispatcher: RuntimeDispatcherStatsData,
+    cache: RuntimeCacheStatsData,
+    planner_cache: RuntimeCacheStatsData,
 }
 
 #[derive(Clone, SimpleObject)]
@@ -2587,74 +2886,6 @@ struct HealthSnapshot {
     rag: DependencyHealth,
     ace_step: DependencyHealth,
     updates_queue_length: i32,
-}
-
-#[derive(Clone, SimpleObject)]
-#[graphql(name = "ConfigSnapshot")]
-struct ConfigSnapshot {
-    log_level: String,
-    web_host: String,
-    web_port: i32,
-    runtime_api_enabled: bool,
-    runtime_api_host: String,
-    runtime_api_port: i32,
-    #[graphql(name = "discoveryBaseURL")]
-    discovery_base_url: Option<String>,
-    embedder_enabled: bool,
-    #[graphql(name = "embedderURL")]
-    embedder_url: Option<String>,
-    shield_enabled: bool,
-    #[graphql(name = "shieldEmbedderURL")]
-    shield_embedder_url: Option<String>,
-    shield_max_matches: i32,
-    shield_vector_min_score: f64,
-    shield_lexical_min_score: f64,
-    shield_retrieval_timeout_seconds: i32,
-    shield_history_tail_messages: i32,
-    white_circle_enabled: bool,
-    ace_step_enabled: bool,
-    #[graphql(name = "aceStepBaseURL")]
-    ace_step_base_url: Option<String>,
-    dialog_provider: String,
-    dialog_fallback_provider: Option<String>,
-    persistent_queue_enabled: bool,
-    active_draw_providers: Vec<String>,
-    sql_timeout_ms: i32,
-    sql_row_limit: i32,
-    sql_result_bytes_limit: i32,
-}
-
-impl From<RuntimeApiGraphqlSnapshot> for ConfigSnapshot {
-    fn from(snapshot: RuntimeApiGraphqlSnapshot) -> Self {
-        Self {
-            log_level: snapshot.log_level,
-            web_host: snapshot.web_host,
-            web_port: snapshot.web_port,
-            runtime_api_enabled: snapshot.runtime_api_enabled,
-            runtime_api_host: snapshot.runtime_api_host,
-            runtime_api_port: snapshot.runtime_api_port,
-            discovery_base_url: snapshot.discovery_base_url,
-            embedder_enabled: snapshot.embedder_enabled,
-            embedder_url: snapshot.embedder_url,
-            shield_enabled: snapshot.shield_enabled,
-            shield_embedder_url: snapshot.shield_embedder_url,
-            shield_max_matches: snapshot.shield_max_matches,
-            shield_vector_min_score: snapshot.shield_vector_min_score,
-            shield_lexical_min_score: snapshot.shield_lexical_min_score,
-            shield_retrieval_timeout_seconds: snapshot.shield_retrieval_timeout_seconds,
-            shield_history_tail_messages: snapshot.shield_history_tail_messages,
-            white_circle_enabled: snapshot.white_circle_enabled,
-            ace_step_enabled: snapshot.ace_step_enabled,
-            ace_step_base_url: snapshot.ace_step_base_url,
-            dialog_provider: snapshot.dialog_provider,
-            dialog_fallback_provider: snapshot.dialog_fallback_provider,
-            persistent_queue_enabled: snapshot.persistent_queue_enabled,
-            active_draw_providers: snapshot.active_draw_providers,
-            sql_timeout_ms: snapshot.sql_timeout_ms,
-            sql_row_limit: snapshot.sql_row_limit,
-            sql_result_bytes_limit: snapshot.sql_result_bytes_limit,
-        }
-    }
 }
 
 #[derive(InputObject)]
@@ -2775,548 +3006,9 @@ struct SendVirtualDialogMessageInput {
 }
 
 #[derive(Clone, SimpleObject)]
-struct VirtualDialog {
-    #[graphql(name = "sessionID")]
-    session_id: String,
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    #[graphql(name = "userID")]
-    user_id: ID,
-    #[graphql(name = "nextMessageID")]
-    next_message_id: i32,
-    message_count: i32,
-    last_activity_at: Option<String>,
-    expires_at: Option<String>,
-    messages: Vec<VirtualDialogMessage>,
-}
-
-impl From<RuntimeVirtualDialogData> for VirtualDialog {
-    fn from(data: RuntimeVirtualDialogData) -> Self {
-        Self {
-            session_id: data.session_id,
-            chat_id: ID(data.chat_id.to_string()),
-            user_id: ID(data.user_id.to_string()),
-            next_message_id: data.next_message_id,
-            message_count: data.message_count,
-            last_activity_at: data.last_activity_at,
-            expires_at: data.expires_at,
-            messages: data
-                .messages
-                .into_iter()
-                .map(VirtualDialogMessage::from)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct VirtualDialogMessage {
-    #[graphql(name = "messageID")]
-    message_id: i32,
-    role: String,
-    text: String,
-    at: String,
-    provider: Option<String>,
-    tool_mode: Option<RuntimeVirtualDialogToolMode>,
-    tool_calls: Option<Json<Value>>,
-}
-
-impl From<RuntimeVirtualDialogMessageData> for VirtualDialogMessage {
-    fn from(data: RuntimeVirtualDialogMessageData) -> Self {
-        Self {
-            message_id: data.message_id,
-            role: data.role,
-            text: data.text,
-            at: data.at,
-            provider: data.provider,
-            tool_mode: data.tool_mode,
-            tool_calls: data.tool_calls.map(Json),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct VirtualDialogDeleteResult {
-    found: bool,
-    deleted: bool,
-    history_deleted: i32,
-    taskman_deleted: i32,
-    llm_traces_deleted: i32,
-}
-
-impl From<RuntimeVirtualDialogDeleteResultData> for VirtualDialogDeleteResult {
-    fn from(data: RuntimeVirtualDialogDeleteResultData) -> Self {
-        Self {
-            found: data.found,
-            deleted: data.deleted,
-            history_deleted: data.history_deleted,
-            taskman_deleted: data.taskman_deleted,
-            llm_traces_deleted: data.llm_traces_deleted,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct User {
-    id: ID,
-    is_premium: Option<bool>,
-    first_name: String,
-    last_name: Option<String>,
-    username: Option<String>,
-    language_code: Option<String>,
-    is_vip: Option<bool>,
-    discovered_at: Option<String>,
-    updated_at: Option<String>,
-}
-
-impl From<RuntimeUserData> for User {
-    fn from(user: RuntimeUserData) -> Self {
-        Self {
-            id: ID(user.id.to_string()),
-            is_premium: user.is_premium,
-            first_name: user.first_name,
-            last_name: user.last_name,
-            username: user.username,
-            language_code: user.language_code,
-            is_vip: user.is_vip,
-            discovered_at: user.discovered_at,
-            updated_at: user.updated_at,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct UserConnection {
-    count: i32,
-    offset: i32,
-    limit: i32,
-    items: Vec<User>,
-}
-
-impl From<RuntimeUserConnectionData> for UserConnection {
-    fn from(connection: RuntimeUserConnectionData) -> Self {
-        Self {
-            count: connection.count,
-            offset: connection.offset,
-            limit: connection.limit,
-            items: connection.items.into_iter().map(User::from).collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct UserDetails {
-    id: ID,
-    is_premium: Option<bool>,
-    first_name: String,
-    last_name: Option<String>,
-    username: Option<String>,
-    language_code: Option<String>,
-    is_vip: Option<bool>,
-    discovered_at: Option<String>,
-    updated_at: Option<String>,
-    subscription: Option<Subscription>,
-    vip: Option<VipCache>,
-    vip_summary: Option<VipSummary>,
-    vip_events: Vec<VipEvent>,
-    subscriptions: Vec<Subscription>,
-}
-
-impl From<RuntimeUserDetailsData> for UserDetails {
-    fn from(details: RuntimeUserDetailsData) -> Self {
-        let user = details.user;
-        Self {
-            id: ID(user.id.to_string()),
-            is_premium: user.is_premium,
-            first_name: user.first_name,
-            last_name: user.last_name,
-            username: user.username,
-            language_code: user.language_code,
-            is_vip: user.is_vip,
-            discovered_at: user.discovered_at,
-            updated_at: user.updated_at,
-            subscription: details.subscription.map(Subscription::from),
-            vip: details.vip.map(VipCache::from),
-            vip_summary: details.vip_summary.map(VipSummary::from),
-            vip_events: details.vip_events.into_iter().map(VipEvent::from).collect(),
-            subscriptions: details
-                .subscriptions
-                .into_iter()
-                .map(Subscription::from)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct Subscription {
-    id: ID,
-    #[graphql(name = "userID")]
-    user_id: ID,
-    #[graphql(name = "telegramPaymentChargeID")]
-    telegram_payment_charge_id: String,
-    #[graphql(name = "providerPaymentChargeID")]
-    provider_payment_charge_id: String,
-    expires_at: Option<String>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    canceled_at: Option<String>,
-    refunded_at: Option<String>,
-    status: String,
-}
-
-impl From<RuntimeSubscriptionData> for Subscription {
-    fn from(subscription: RuntimeSubscriptionData) -> Self {
-        Self {
-            id: ID(subscription.id.to_string()),
-            user_id: ID(subscription.user_id.to_string()),
-            telegram_payment_charge_id: subscription.telegram_payment_charge_id,
-            provider_payment_charge_id: subscription.provider_payment_charge_id,
-            expires_at: subscription.expires_at,
-            created_at: subscription.created_at,
-            updated_at: subscription.updated_at,
-            canceled_at: subscription.canceled_at,
-            refunded_at: subscription.refunded_at,
-            status: subscription.status,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct VipCache {
-    #[graphql(name = "userID")]
-    user_id: ID,
-    is_vip: bool,
-    expires_at: Option<String>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-}
-
-impl From<RuntimeVipCacheData> for VipCache {
-    fn from(vip: RuntimeVipCacheData) -> Self {
-        Self {
-            user_id: ID(vip.user_id.to_string()),
-            is_vip: vip.is_vip,
-            expires_at: vip.expires_at,
-            created_at: vip.created_at,
-            updated_at: vip.updated_at,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct VipSummary {
-    active: bool,
-    has_history: bool,
-    expires_at: Option<String>,
-    remaining_seconds: String,
-    remaining_days: i32,
-    #[graphql(name = "latestEventID")]
-    latest_event_id: Option<ID>,
-    latest_event_type: Option<String>,
-    latest_reason: Option<String>,
-    latest_created_at: Option<String>,
-}
-
-impl From<RuntimeVipSummaryData> for VipSummary {
-    fn from(summary: RuntimeVipSummaryData) -> Self {
-        Self {
-            active: summary.active,
-            has_history: summary.has_history,
-            expires_at: summary.expires_at,
-            remaining_seconds: summary.remaining_seconds,
-            remaining_days: summary.remaining_days,
-            latest_event_id: summary.latest_event_id.map(|id| ID(id.to_string())),
-            latest_event_type: summary.latest_event_type,
-            latest_reason: summary.latest_reason,
-            latest_created_at: summary.latest_created_at,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct VipEvent {
-    id: ID,
-    event_type: String,
-    delta_seconds: String,
-    delta_days: f64,
-    effective_expires_at: Option<String>,
-    #[graphql(name = "actorUserID")]
-    actor_user_id: Option<ID>,
-    actor_label: Option<String>,
-    reason: Option<String>,
-    created_at: Option<String>,
-    #[graphql(name = "subscriptionID")]
-    subscription_id: Option<ID>,
-    #[graphql(name = "telegramPaymentChargeID")]
-    telegram_payment_charge_id: Option<String>,
-    #[graphql(name = "providerPaymentChargeID")]
-    provider_payment_charge_id: Option<String>,
-    subscription_status: Option<String>,
-}
-
-impl From<RuntimeVipEventData> for VipEvent {
-    fn from(event: RuntimeVipEventData) -> Self {
-        Self {
-            id: ID(event.id.to_string()),
-            event_type: event.event_type,
-            delta_seconds: event.delta_seconds,
-            delta_days: event.delta_days,
-            effective_expires_at: event.effective_expires_at,
-            actor_user_id: event.actor_user_id.map(|id| ID(id.to_string())),
-            actor_label: event.actor_label,
-            reason: event.reason,
-            created_at: event.created_at,
-            subscription_id: event.subscription_id.map(|id| ID(id.to_string())),
-            telegram_payment_charge_id: event.telegram_payment_charge_id,
-            provider_payment_charge_id: event.provider_payment_charge_id,
-            subscription_status: event.subscription_status,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct Chat {
-    id: ID,
-    #[graphql(name = "type")]
-    chat_type: String,
-    title: Option<String>,
-    username: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    is_forum: Option<bool>,
-    description: Option<String>,
-    invite_link: Option<String>,
-    discovered_at: Option<String>,
-    updated_at: Option<String>,
-}
-
-impl From<RuntimeChatData> for Chat {
-    fn from(chat: RuntimeChatData) -> Self {
-        Self {
-            id: ID(chat.id.to_string()),
-            chat_type: chat.chat_type,
-            title: chat.title,
-            username: chat.username,
-            first_name: chat.first_name,
-            last_name: chat.last_name,
-            is_forum: chat.is_forum,
-            description: chat.description,
-            invite_link: chat.invite_link,
-            discovered_at: chat.discovered_at,
-            updated_at: chat.updated_at,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct ChatConnection {
-    count: i32,
-    offset: i32,
-    limit: i32,
-    items: Vec<Chat>,
-}
-
-impl From<RuntimeChatConnectionData> for ChatConnection {
-    fn from(connection: RuntimeChatConnectionData) -> Self {
-        Self {
-            count: connection.count,
-            offset: connection.offset,
-            limit: connection.limit,
-            items: connection.items.into_iter().map(Chat::from).collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct ChatMember {
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    #[graphql(name = "userID")]
-    user_id: ID,
-    status: String,
-    is_anonymous: Option<bool>,
-    custom_title: Option<String>,
-    can_be_edited: Option<bool>,
-    can_manage_chat: Option<bool>,
-    can_delete_messages: Option<bool>,
-    can_manage_video_chats: Option<bool>,
-    can_restrict_members: Option<bool>,
-    can_promote_members: Option<bool>,
-    can_change_info: Option<bool>,
-    can_invite_users: Option<bool>,
-    can_post_messages: Option<bool>,
-    can_edit_messages: Option<bool>,
-    can_pin_messages: Option<bool>,
-    can_manage_topics: Option<bool>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    last_message_at: Option<String>,
-}
-
-impl From<RuntimeChatMemberData> for ChatMember {
-    fn from(member: RuntimeChatMemberData) -> Self {
-        Self {
-            chat_id: ID(member.chat_id.to_string()),
-            user_id: ID(member.user_id.to_string()),
-            status: member.status,
-            is_anonymous: member.is_anonymous,
-            custom_title: member.custom_title,
-            can_be_edited: member.can_be_edited,
-            can_manage_chat: member.can_manage_chat,
-            can_delete_messages: member.can_delete_messages,
-            can_manage_video_chats: member.can_manage_video_chats,
-            can_restrict_members: member.can_restrict_members,
-            can_promote_members: member.can_promote_members,
-            can_change_info: member.can_change_info,
-            can_invite_users: member.can_invite_users,
-            can_post_messages: member.can_post_messages,
-            can_edit_messages: member.can_edit_messages,
-            can_pin_messages: member.can_pin_messages,
-            can_manage_topics: member.can_manage_topics,
-            created_at: member.created_at,
-            updated_at: member.updated_at,
-            last_message_at: member.last_message_at,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct ChatMemberWithUser {
-    member: ChatMember,
-    user: Option<User>,
-}
-
-impl From<RuntimeChatMemberWithUserData> for ChatMemberWithUser {
-    fn from(value: RuntimeChatMemberWithUserData) -> Self {
-        Self {
-            member: ChatMember::from(value.member),
-            user: value.user.map(User::from),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct TaskmanJobListResult {
-    total: i32,
-    offset: i32,
-    limit: i32,
-    summary: TaskmanJobSummary,
-    items: Vec<TaskmanJobListEntry>,
-}
-
-impl TaskmanJobListResult {
-    fn empty() -> Self {
-        Self {
-            total: 0,
-            offset: 0,
-            limit: 0,
-            summary: TaskmanJobSummary::default(),
-            items: Vec::new(),
-        }
-    }
-}
-
-impl From<RuntimeTaskmanJobListResultData> for TaskmanJobListResult {
-    fn from(result: RuntimeTaskmanJobListResultData) -> Self {
-        Self {
-            total: result.total,
-            offset: result.offset,
-            limit: result.limit,
-            summary: TaskmanJobSummary {
-                by_status: Json(result.summary.by_status),
-                by_queue: Json(result.summary.by_queue),
-            },
-            items: result
-                .items
-                .into_iter()
-                .map(TaskmanJobListEntry::from)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct TaskmanJobSummary {
-    by_status: Json<Value>,
-    by_queue: Json<Value>,
-}
-
-impl Default for TaskmanJobSummary {
-    fn default() -> Self {
-        Self {
-            by_status: Json(json!({})),
-            by_queue: Json(json!({})),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct TaskmanJobListEntry {
-    id: ID,
-    queue_name: String,
-    priority: i32,
-    title: String,
-    job_type: String,
-    status: String,
-    #[graphql(name = "userID")]
-    user_id: ID,
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    #[graphql(name = "triggerMessageID")]
-    trigger_message_id: i32,
-    #[graphql(name = "threadMessageID")]
-    thread_message_id: Option<i32>,
-    #[graphql(name = "progressMessageID")]
-    progress_message_id: Option<i32>,
-    #[graphql(name = "resultMessageID")]
-    result_message_id: Option<i32>,
-    #[graphql(name = "workerID")]
-    worker_id: Option<String>,
-    created_at: String,
-    started_at: Option<String>,
-    completed_at: Option<String>,
-    error_message: Option<String>,
-    processing_timeout_seconds: i32,
-    prompt_hash: Option<String>,
-    estimated_processing_time: Option<i32>,
-    actual_processing_time: Option<i32>,
-    preview: Option<String>,
-}
-
-impl From<RuntimeTaskmanJobListEntryData> for TaskmanJobListEntry {
-    fn from(entry: RuntimeTaskmanJobListEntryData) -> Self {
-        Self {
-            id: ID(entry.id.to_string()),
-            queue_name: entry.queue_name,
-            priority: entry.priority,
-            title: entry.title,
-            job_type: entry.job_type,
-            status: entry.status,
-            user_id: ID(entry.user_id.to_string()),
-            chat_id: ID(entry.chat_id.to_string()),
-            trigger_message_id: entry.trigger_message_id,
-            thread_message_id: entry.thread_message_id,
-            progress_message_id: entry.progress_message_id,
-            result_message_id: entry.result_message_id,
-            worker_id: entry.worker_id,
-            created_at: entry.created_at,
-            started_at: entry.started_at,
-            completed_at: entry.completed_at,
-            error_message: entry.error_message,
-            processing_timeout_seconds: entry.processing_timeout_seconds,
-            prompt_hash: entry.prompt_hash,
-            estimated_processing_time: entry.estimated_processing_time,
-            actual_processing_time: entry.actual_processing_time,
-            preview: entry.preview,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
 struct TaskmanJobDetails {
     job: TaskmanJob,
-    messages: Vec<TaskmanJobMessage>,
+    messages: Vec<RuntimeTaskmanJobMessageData>,
     events: Option<Json<Value>>,
 }
 
@@ -3324,11 +3016,7 @@ impl From<RuntimeTaskmanJobDetailsData> for TaskmanJobDetails {
     fn from(details: RuntimeTaskmanJobDetailsData) -> Self {
         Self {
             job: TaskmanJob::from(details.job),
-            messages: details
-                .messages
-                .into_iter()
-                .map(TaskmanJobMessage::from)
-                .collect(),
+            messages: details.messages,
             events: details.events.map(Json),
         }
     }
@@ -3369,14 +3057,14 @@ struct TaskmanJob {
 impl From<RuntimeTaskmanJobData> for TaskmanJob {
     fn from(job: RuntimeTaskmanJobData) -> Self {
         Self {
-            id: ID(job.id.to_string()),
+            id: graphql_id(job.id),
             queue_name: job.queue_name,
             priority: job.priority,
             title: job.title,
             payload: job.payload.map(Json),
             status: job.status,
-            user_id: ID(job.user_id.to_string()),
-            chat_id: ID(job.chat_id.to_string()),
+            user_id: graphql_id(job.user_id),
+            chat_id: graphql_id(job.chat_id),
             trigger_message_id: job.trigger_message_id,
             thread_message_id: job.thread_message_id,
             progress_message_id: job.progress_message_id,
@@ -3390,91 +3078,6 @@ impl From<RuntimeTaskmanJobData> for TaskmanJob {
             prompt_hash: job.prompt_hash,
             estimated_processing_time: job.estimated_processing_time,
             actual_processing_time: job.actual_processing_time,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct TaskmanJobMessage {
-    id: ID,
-    #[graphql(name = "jobID")]
-    job_id: ID,
-    message_type: String,
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    #[graphql(name = "messageID")]
-    message_id: i32,
-    created_at: String,
-    status: String,
-}
-
-impl From<RuntimeTaskmanJobMessageData> for TaskmanJobMessage {
-    fn from(message: RuntimeTaskmanJobMessageData) -> Self {
-        Self {
-            id: ID(message.id.to_string()),
-            job_id: ID(message.job_id.to_string()),
-            message_type: message.message_type,
-            chat_id: ID(message.chat_id.to_string()),
-            message_id: message.message_id,
-            created_at: message.created_at,
-            status: message.status,
-        }
-    }
-}
-
-#[derive(Clone, Default, SimpleObject)]
-struct TaskmanDiagnostics {
-    running: bool,
-    active: i32,
-    started1m: i32,
-    completed1m: i32,
-    worker_count: i32,
-    queue_signal_count: i32,
-    slow_job_count: i32,
-    queues: Vec<TaskmanQueueDiagnostics>,
-}
-
-impl From<RuntimeTaskmanDiagnosticsData> for TaskmanDiagnostics {
-    fn from(diagnostics: RuntimeTaskmanDiagnosticsData) -> Self {
-        Self {
-            running: diagnostics.running,
-            active: diagnostics.active,
-            started1m: diagnostics.started1m,
-            completed1m: diagnostics.completed1m,
-            worker_count: diagnostics.worker_count,
-            queue_signal_count: diagnostics.queue_signal_count,
-            slow_job_count: diagnostics.slow_job_count,
-            queues: diagnostics
-                .queues
-                .into_iter()
-                .map(TaskmanQueueDiagnostics::from)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct TaskmanQueueDiagnostics {
-    queue_name: String,
-    priority: i32,
-    pending: i32,
-    pending_or_higher: i32,
-    active: i32,
-    worker_count: i32,
-    #[graphql(name = "etaSeconds")]
-    eta_seconds: i32,
-}
-
-impl From<RuntimeTaskmanQueueDiagnosticsData> for TaskmanQueueDiagnostics {
-    fn from(queue: RuntimeTaskmanQueueDiagnosticsData) -> Self {
-        Self {
-            queue_name: queue.queue_name,
-            priority: queue.priority,
-            pending: queue.pending,
-            pending_or_higher: queue.pending_or_higher,
-            active: queue.active,
-            worker_count: queue.worker_count,
-            eta_seconds: queue.eta_seconds,
         }
     }
 }
@@ -3568,10 +3171,10 @@ struct LlmRequest {
     flow: Option<String>,
     iteration: i32,
     model: Option<String>,
-    chat: LlmRequestChat,
-    user: LlmRequestUser,
-    message: LlmRequestMessage,
-    gen_config: LlmGenConfig,
+    chat: RuntimeLlmRequestChatData,
+    user: RuntimeLlmRequestUserData,
+    message: RuntimeLlmRequestMessageData,
+    gen_config: RuntimeLlmGenConfigData,
     docs: Option<Json<Value>>,
     messages: Option<Json<Value>>,
     raw_request: Option<Json<Value>>,
@@ -3585,7 +3188,7 @@ struct LlmRequest {
     prompt_messages: i32,
     docs_chars: i32,
     duration_ms: i32,
-    result: LlmRequestResult,
+    result: RuntimeLlmRequestResultData,
 }
 
 impl From<RuntimeLlmRequestData> for LlmRequest {
@@ -3600,10 +3203,10 @@ impl From<RuntimeLlmRequestData> for LlmRequest {
             flow: request.flow,
             iteration: request.iteration,
             model: request.model,
-            chat: LlmRequestChat::from(request.chat),
-            user: LlmRequestUser::from(request.user),
-            message: LlmRequestMessage::from(request.message),
-            gen_config: LlmGenConfig::from(request.gen_config),
+            chat: request.chat,
+            user: request.user,
+            message: request.message,
+            gen_config: request.gen_config,
             docs: request.docs.map(Json),
             messages: request.messages.map(Json),
             raw_request: request.raw_request.map(Json),
@@ -3617,623 +3220,7 @@ impl From<RuntimeLlmRequestData> for LlmRequest {
             prompt_messages: request.prompt_messages,
             docs_chars: request.docs_chars,
             duration_ms: request.duration_ms,
-            result: LlmRequestResult::from(request.result),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct DialogTurnOutcome {
-    id: ID,
-    at: String,
-    #[graphql(name = "jobID")]
-    job_id: ID,
-    queue_name: String,
-    #[graphql(name = "chatID")]
-    chat_id: Option<ID>,
-    #[graphql(name = "threadID")]
-    thread_id: Option<i32>,
-    #[graphql(name = "userID")]
-    user_id: Option<ID>,
-    #[graphql(name = "triggerMessageID")]
-    trigger_message_id: Option<i32>,
-    attempt: i32,
-    outcome: String,
-    reason: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    elapsed_ms: Option<i32>,
-    budget_ms: Option<i32>,
-    user_signal: Option<String>,
-    sent_message_parts: Option<i32>,
-    #[graphql(name = "sideEffectTicketID")]
-    side_effect_ticket_id: Option<ID>,
-    detail: Json<Value>,
-}
-
-impl From<RuntimeTurnOutcomeData> for DialogTurnOutcome {
-    fn from(outcome: RuntimeTurnOutcomeData) -> Self {
-        Self {
-            id: ID(outcome.id.to_string()),
-            at: outcome.at,
-            job_id: ID(outcome.job_id.to_string()),
-            queue_name: outcome.queue_name,
-            chat_id: outcome.chat_id.map(|id| ID(id.to_string())),
-            thread_id: outcome.thread_id,
-            user_id: outcome.user_id.map(|id| ID(id.to_string())),
-            trigger_message_id: outcome.trigger_message_id,
-            attempt: outcome.attempt,
-            outcome: outcome.outcome,
-            reason: outcome.reason,
-            provider: outcome.provider,
-            model: outcome.model,
-            elapsed_ms: outcome.elapsed_ms,
-            budget_ms: outcome.budget_ms,
-            user_signal: outcome.user_signal,
-            sent_message_parts: outcome.sent_message_parts,
-            side_effect_ticket_id: outcome.side_effect_ticket_id.map(|id| ID(id.to_string())),
-            detail: Json(outcome.detail),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct RoutingEvent {
-    id: ID,
-    at: String,
-    severity: String,
-    event_type: String,
-    workflow_key: String,
-    #[graphql(name = "providerID")]
-    provider_id: Option<ID>,
-    #[graphql(name = "modelID")]
-    model_id: Option<ID>,
-    queue_name: Option<String>,
-    #[graphql(name = "jobID")]
-    job_id: Option<ID>,
-    #[graphql(name = "chatID")]
-    chat_id: Option<ID>,
-    #[graphql(name = "threadID")]
-    thread_id: Option<i32>,
-    #[graphql(name = "messageID")]
-    message_id: Option<i32>,
-    dedupe_key: String,
-    summary: String,
-    detail: Json<Value>,
-}
-
-impl From<RuntimeRoutingEventData> for RoutingEvent {
-    fn from(event: RuntimeRoutingEventData) -> Self {
-        Self {
-            id: ID(event.id.to_string()),
-            at: event.at,
-            severity: event.severity,
-            event_type: event.event_type,
-            workflow_key: event.workflow_key,
-            provider_id: event.provider_id.map(|id| ID(id.to_string())),
-            model_id: event.model_id.map(|id| ID(id.to_string())),
-            queue_name: event.queue_name,
-            job_id: event.job_id.map(|id| ID(id.to_string())),
-            chat_id: event.chat_id.map(|id| ID(id.to_string())),
-            thread_id: event.thread_id,
-            message_id: event.message_id,
-            dedupe_key: event.dedupe_key,
-            summary: event.summary,
-            detail: Json(event.detail),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmRequestChat {
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    #[graphql(name = "threadID")]
-    thread_id: Option<i32>,
-    chat_title: Option<String>,
-}
-
-impl From<RuntimeLlmRequestChatData> for LlmRequestChat {
-    fn from(chat: RuntimeLlmRequestChatData) -> Self {
-        Self {
-            chat_id: ID(chat.chat_id.to_string()),
-            thread_id: chat.thread_id,
-            chat_title: chat.chat_title,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmRequestUser {
-    #[graphql(name = "userID")]
-    user_id: ID,
-    full_name: Option<String>,
-}
-
-impl From<RuntimeLlmRequestUserData> for LlmRequestUser {
-    fn from(user: RuntimeLlmRequestUserData) -> Self {
-        Self {
-            user_id: ID(user.user_id.to_string()),
-            full_name: user.full_name,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmRequestMessage {
-    #[graphql(name = "messageID")]
-    message_id: i32,
-}
-
-impl From<RuntimeLlmRequestMessageData> for LlmRequestMessage {
-    fn from(message: RuntimeLlmRequestMessageData) -> Self {
-        Self {
-            message_id: message.message_id,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmGenConfig {
-    max_output_tokens: i32,
-    temperature: f64,
-    top_p: f64,
-    top_k: i32,
-    safety_settings: Option<Json<Value>>,
-}
-
-impl From<RuntimeLlmGenConfigData> for LlmGenConfig {
-    fn from(config: RuntimeLlmGenConfigData) -> Self {
-        Self {
-            max_output_tokens: config.max_output_tokens,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            safety_settings: config.safety_settings.map(Json),
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmRequestResult {
-    duration_ms: i32,
-    error: Option<String>,
-    response_text_preview: Option<String>,
-}
-
-impl From<RuntimeLlmRequestResultData> for LlmRequestResult {
-    fn from(result: RuntimeLlmRequestResultData) -> Self {
-        Self {
-            duration_ms: result.duration_ms,
-            error: result.error,
-            response_text_preview: result.response_text_preview,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalytics {
-    range: String,
-    bucket: String,
-    since: String,
-    totals: LlmAnalyticsTotals,
-    series: Vec<LlmAnalyticsSeriesPoint>,
-    top_chats: Vec<LlmAnalyticsTopChat>,
-    models: Vec<LlmAnalyticsModelStat>,
-    providers: Vec<LlmAnalyticsProviderStat>,
-    stage_metrics: Vec<LlmAnalyticsStageMetric>,
-    runtime_jobs: Vec<RuntimeJobAnalyticsStat>,
-    runtime_jobs_error: Option<String>,
-    ai_farm_capacity: Option<AifarmCapacitySnapshot>,
-}
-
-impl From<RuntimeLlmAnalyticsData> for LlmAnalytics {
-    fn from(summary: RuntimeLlmAnalyticsData) -> Self {
-        Self {
-            range: summary.range,
-            bucket: summary.bucket,
-            since: summary.since,
-            totals: LlmAnalyticsTotals::from(summary.totals),
-            series: summary
-                .series
-                .into_iter()
-                .map(LlmAnalyticsSeriesPoint::from)
-                .collect(),
-            top_chats: summary
-                .top_chats
-                .into_iter()
-                .map(LlmAnalyticsTopChat::from)
-                .collect(),
-            models: summary
-                .models
-                .into_iter()
-                .map(LlmAnalyticsModelStat::from)
-                .collect(),
-            providers: summary
-                .providers
-                .into_iter()
-                .map(LlmAnalyticsProviderStat::from)
-                .collect(),
-            stage_metrics: summary
-                .stage_metrics
-                .into_iter()
-                .map(LlmAnalyticsStageMetric::from)
-                .collect(),
-            runtime_jobs: summary
-                .runtime_jobs
-                .into_iter()
-                .map(RuntimeJobAnalyticsStat::from)
-                .collect(),
-            runtime_jobs_error: summary.runtime_jobs_error,
-            ai_farm_capacity: summary.ai_farm_capacity.map(AifarmCapacitySnapshot::from),
-        }
-    }
-}
-
-#[derive(Clone, Default, SimpleObject)]
-struct LlmAnalyticsTotals {
-    total_count: i32,
-    error_count: i32,
-    avg_duration_ms: i32,
-}
-
-impl From<RuntimeLlmAnalyticsTotalsData> for LlmAnalyticsTotals {
-    fn from(totals: RuntimeLlmAnalyticsTotalsData) -> Self {
-        Self {
-            total_count: totals.total_count,
-            error_count: totals.error_count,
-            avg_duration_ms: totals.avg_duration_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalyticsSeriesPoint {
-    ts: String,
-    total_count: i32,
-    error_count: i32,
-    avg_duration_ms: i32,
-}
-
-impl From<RuntimeLlmAnalyticsSeriesPointData> for LlmAnalyticsSeriesPoint {
-    fn from(point: RuntimeLlmAnalyticsSeriesPointData) -> Self {
-        Self {
-            ts: point.ts,
-            total_count: point.total_count,
-            error_count: point.error_count,
-            avg_duration_ms: point.avg_duration_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalyticsTopChat {
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    title: Option<String>,
-    username: Option<String>,
-    request_count: i32,
-}
-
-impl From<RuntimeLlmAnalyticsTopChatData> for LlmAnalyticsTopChat {
-    fn from(chat: RuntimeLlmAnalyticsTopChatData) -> Self {
-        Self {
-            chat_id: ID(chat.chat_id.to_string()),
-            title: chat.title,
-            username: chat.username,
-            request_count: chat.request_count,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalyticsModelStat {
-    model: String,
-    request_count: i32,
-    error_count: i32,
-    avg_duration_ms: i32,
-    p50_duration_ms: i32,
-    p95_duration_ms: i32,
-}
-
-impl From<RuntimeLlmAnalyticsModelStatData> for LlmAnalyticsModelStat {
-    fn from(stat: RuntimeLlmAnalyticsModelStatData) -> Self {
-        Self {
-            model: stat.model,
-            request_count: stat.request_count,
-            error_count: stat.error_count,
-            avg_duration_ms: stat.avg_duration_ms,
-            p50_duration_ms: stat.p50_duration_ms,
-            p95_duration_ms: stat.p95_duration_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalyticsProviderStat {
-    provider: String,
-    source: String,
-    request_count: i32,
-    error_count: i32,
-    avg_duration_ms: i32,
-    p50_duration_ms: i32,
-    p95_duration_ms: i32,
-}
-
-impl From<RuntimeLlmAnalyticsProviderStatData> for LlmAnalyticsProviderStat {
-    fn from(stat: RuntimeLlmAnalyticsProviderStatData) -> Self {
-        Self {
-            provider: stat.provider,
-            source: stat.source,
-            request_count: stat.request_count,
-            error_count: stat.error_count,
-            avg_duration_ms: stat.avg_duration_ms,
-            p50_duration_ms: stat.p50_duration_ms,
-            p95_duration_ms: stat.p95_duration_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct LlmAnalyticsStageMetric {
-    stage: String,
-    source: String,
-    request_count: i32,
-    error_count: i32,
-    avg_duration_ms: i32,
-    p50_duration_ms: i32,
-    p95_duration_ms: i32,
-    avg_iteration: i32,
-    max_iteration: i32,
-}
-
-impl From<RuntimeLlmAnalyticsStageMetricData> for LlmAnalyticsStageMetric {
-    fn from(metric: RuntimeLlmAnalyticsStageMetricData) -> Self {
-        Self {
-            stage: metric.stage,
-            source: metric.source,
-            request_count: metric.request_count,
-            error_count: metric.error_count,
-            avg_duration_ms: metric.avg_duration_ms,
-            p50_duration_ms: metric.p50_duration_ms,
-            p95_duration_ms: metric.p95_duration_ms,
-            avg_iteration: metric.avg_iteration,
-            max_iteration: metric.max_iteration,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct RuntimeJobAnalyticsStat {
-    job_type: String,
-    queue_name: String,
-    provider: String,
-    created_count: i32,
-    completed_count: i32,
-    failed_count: i32,
-    avg_wait_ms: i32,
-    p95_wait_ms: i32,
-    avg_processing_ms: i32,
-    p95_processing_ms: i32,
-}
-
-impl From<RuntimeJobAnalyticsStatData> for RuntimeJobAnalyticsStat {
-    fn from(stat: RuntimeJobAnalyticsStatData) -> Self {
-        Self {
-            job_type: stat.job_type,
-            queue_name: stat.queue_name,
-            provider: stat.provider,
-            created_count: stat.created_count,
-            completed_count: stat.completed_count,
-            failed_count: stat.failed_count,
-            avg_wait_ms: stat.avg_wait_ms,
-            p95_wait_ms: stat.p95_wait_ms,
-            avg_processing_ms: stat.avg_processing_ms,
-            p95_processing_ms: stat.p95_processing_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct AifarmCapacitySnapshot {
-    service: String,
-    max_concurrent_jobs: i32,
-    running: i32,
-    queued: i32,
-    available: i32,
-    locked: bool,
-    ready: bool,
-    observed_at: String,
-    error: Option<String>,
-}
-
-impl From<RuntimeAifarmCapacitySnapshotData> for AifarmCapacitySnapshot {
-    fn from(snapshot: RuntimeAifarmCapacitySnapshotData) -> Self {
-        Self {
-            service: snapshot.service,
-            max_concurrent_jobs: snapshot.max_concurrent_jobs,
-            running: snapshot.running,
-            queued: snapshot.queued,
-            available: snapshot.available,
-            locked: snapshot.locked,
-            ready: snapshot.ready,
-            observed_at: snapshot.observed_at,
-            error: snapshot.error,
-        }
-    }
-}
-
-#[derive(Clone, Default, SimpleObject)]
-struct UpdatesRuntime {
-    active: i32,
-    state_active: i32,
-    handle_active: i32,
-    queue_len: i32,
-    queue_error: Option<String>,
-    started1m: i32,
-    completed1m: i32,
-    timeouts1m: i32,
-    oldest_active_ms: i32,
-    last_stall_at: Option<String>,
-    tasks: Vec<UpdatesTask>,
-    gates: Option<IngestionGates>,
-    stream_len: i64,
-    stream_group_lag: i64,
-    stream_pending: i64,
-    oldest_unmaterialized_ms: i64,
-    ingress_used_memory_bytes: i64,
-    ingress_maxmemory_bytes: i64,
-    ingress_maxmemory_policy: String,
-    ingress_aof_enabled: bool,
-    ingress_aof_current_size_bytes: i64,
-    ingress_aof_rewrite_in_progress: bool,
-    ingress_aof_last_write_status: String,
-    ingress_aof_last_rewrite_status: String,
-    materializer_supervisor_running: bool,
-    materializer_lease_held: bool,
-    materializer_supervisor_restarts: i64,
-    materializer_batch_rows: i32,
-    materializer_batch_bytes: i64,
-    materializer_batch_fill_ratio: f64,
-    bulk_transaction_latency_ms: i64,
-    materialized_batches: i64,
-    inbox_insert_statements: i64,
-    quarantine_insert_statements: i64,
-    materialized_inserted: i64,
-    materialized_duplicates: i64,
-    materialized_conflicted: i64,
-    materialized_quarantined: i64,
-    materializer_reclaims: i64,
-    ack_delete_mismatches: i64,
-    materializer_db_failures: i64,
-    materializer_redis_failures: i64,
-    projection_stage_rows: i64,
-    projection_oldest_stage_age_ms: i64,
-    projection_last_flush_latency_ms: i64,
-    projection_staged_mutations: i64,
-    projection_flushed_rows: i64,
-    projection_flush_errors: i64,
-    postgres_pending: i64,
-    postgres_retry_wait: i64,
-    postgres_dead_letter: i64,
-    event_to_redis_avg_ms: i64,
-    redis_to_postgres_avg_ms: i64,
-    materialization_to_claim_avg_ms: i64,
-    claim_to_taskman_avg_ms: i64,
-}
-
-impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
-    fn from(runtime: RuntimeUpdatesRuntimeData) -> Self {
-        Self {
-            active: runtime.active,
-            state_active: runtime.state_active,
-            handle_active: runtime.handle_active,
-            queue_len: runtime.queue_len,
-            queue_error: runtime.queue_error,
-            started1m: runtime.started1m,
-            completed1m: runtime.completed1m,
-            timeouts1m: runtime.timeouts1m,
-            oldest_active_ms: runtime.oldest_active_ms,
-            last_stall_at: runtime.last_stall_at,
-            tasks: runtime.tasks.into_iter().map(UpdatesTask::from).collect(),
-            gates: runtime.gates.map(IngestionGates::from),
-            stream_len: runtime.stream_len,
-            stream_group_lag: runtime.stream_group_lag,
-            stream_pending: runtime.stream_pending,
-            oldest_unmaterialized_ms: runtime.oldest_unmaterialized_ms,
-            ingress_used_memory_bytes: runtime.ingress_used_memory_bytes,
-            ingress_maxmemory_bytes: runtime.ingress_maxmemory_bytes,
-            ingress_maxmemory_policy: runtime.ingress_maxmemory_policy,
-            ingress_aof_enabled: runtime.ingress_aof_enabled,
-            ingress_aof_current_size_bytes: runtime.ingress_aof_current_size_bytes,
-            ingress_aof_rewrite_in_progress: runtime.ingress_aof_rewrite_in_progress,
-            ingress_aof_last_write_status: runtime.ingress_aof_last_write_status,
-            ingress_aof_last_rewrite_status: runtime.ingress_aof_last_rewrite_status,
-            materializer_supervisor_running: runtime.materializer_supervisor_running,
-            materializer_lease_held: runtime.materializer_lease_held,
-            materializer_supervisor_restarts: runtime.materializer_supervisor_restarts,
-            materializer_batch_rows: runtime.materializer_batch_rows,
-            materializer_batch_bytes: runtime.materializer_batch_bytes,
-            materializer_batch_fill_ratio: runtime.materializer_batch_fill_ratio,
-            bulk_transaction_latency_ms: runtime.bulk_transaction_latency_ms,
-            materialized_batches: runtime.materialized_batches,
-            inbox_insert_statements: runtime.inbox_insert_statements,
-            quarantine_insert_statements: runtime.quarantine_insert_statements,
-            materialized_inserted: runtime.materialized_inserted,
-            materialized_duplicates: runtime.materialized_duplicates,
-            materialized_conflicted: runtime.materialized_conflicted,
-            materialized_quarantined: runtime.materialized_quarantined,
-            materializer_reclaims: runtime.materializer_reclaims,
-            ack_delete_mismatches: runtime.ack_delete_mismatches,
-            materializer_db_failures: runtime.materializer_db_failures,
-            materializer_redis_failures: runtime.materializer_redis_failures,
-            projection_stage_rows: runtime.projection_stage_rows,
-            projection_oldest_stage_age_ms: runtime.projection_oldest_stage_age_ms,
-            projection_last_flush_latency_ms: runtime.projection_last_flush_latency_ms,
-            projection_staged_mutations: runtime.projection_staged_mutations,
-            projection_flushed_rows: runtime.projection_flushed_rows,
-            projection_flush_errors: runtime.projection_flush_errors,
-            postgres_pending: runtime.postgres_pending,
-            postgres_retry_wait: runtime.postgres_retry_wait,
-            postgres_dead_letter: runtime.postgres_dead_letter,
-            event_to_redis_avg_ms: runtime.event_to_redis_avg_ms,
-            redis_to_postgres_avg_ms: runtime.redis_to_postgres_avg_ms,
-            materialization_to_claim_avg_ms: runtime.materialization_to_claim_avg_ms,
-            claim_to_taskman_avg_ms: runtime.claim_to_taskman_avg_ms,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct IngestionGates {
-    task_rate_limited: i64,
-    debounce_coalesced: i64,
-    bot_sampling_skipped: i64,
-    empty_trigger_skipped: i64,
-    invalid_message: i64,
-    random_skipped_roll: i64,
-    random_skipped_reactivity_off: i64,
-    random_skipped_gate: i64,
-    random_skipped_user_disabled: i64,
-}
-
-impl From<RuntimeIngestionGatesData> for IngestionGates {
-    fn from(gates: RuntimeIngestionGatesData) -> Self {
-        Self {
-            task_rate_limited: gates.task_rate_limited,
-            debounce_coalesced: gates.debounce_coalesced,
-            bot_sampling_skipped: gates.bot_sampling_skipped,
-            empty_trigger_skipped: gates.empty_trigger_skipped,
-            invalid_message: gates.invalid_message,
-            random_skipped_roll: gates.random_skipped_roll,
-            random_skipped_reactivity_off: gates.random_skipped_reactivity_off,
-            random_skipped_gate: gates.random_skipped_gate,
-            random_skipped_user_disabled: gates.random_skipped_user_disabled,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct UpdatesTask {
-    stage: String,
-    started_at: String,
-    age_ms: i32,
-    #[graphql(name = "chatID")]
-    chat_id: Option<ID>,
-    #[graphql(name = "userID")]
-    user_id: Option<ID>,
-    update: String,
-}
-
-impl From<RuntimeUpdatesTaskData> for UpdatesTask {
-    fn from(task: RuntimeUpdatesTaskData) -> Self {
-        Self {
-            stage: task.stage,
-            started_at: task.started_at,
-            age_ms: task.age_ms,
-            chat_id: task.chat_id.map(|id| ID(id.to_string())),
-            user_id: task.user_id.map(|id| ID(id.to_string())),
-            update: task.update,
+            result: request.result,
         }
     }
 }
@@ -4745,4 +3732,17 @@ fn redact_telegram_bot_api_token(value: &str) -> String {
         }
     }
     redacted
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_graphql_schema_matches_golden_contract() {
+        let actual = runtime_api_graphql_schema(RuntimeApiGraphqlSnapshot::default()).sdl();
+        let expected = include_str!("../tests/fixtures/runtime_graphql_schema.graphql").trim_end();
+
+        assert_eq!(actual.trim_end(), expected);
+    }
 }

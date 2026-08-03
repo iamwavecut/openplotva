@@ -4,8 +4,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
-    Text as TelegramText, TextEntity as TelegramTextEntity,
-    TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
+    Text as TelegramText, TextEntity as TelegramTextEntity, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{
@@ -14,9 +13,10 @@ use openplotva_telegram::{
     build_inline_keyboard_button_url, build_inline_keyboard_markup, build_inline_keyboard_row,
     build_text_message_methods, escape_telegram_html_text, execute_telegram_method,
 };
+use openplotva_updates::{ParsedBotCommand, parse_leading_bot_command};
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::VirtualIdFactory;
 
 const START_COMMAND: &str = "start";
@@ -304,14 +304,12 @@ where
 {
     type Error = HelpCommandUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_help_command_update_or_else(&self.bot, self.effects.as_ref(), update, |update| {
-                self.next.handle_update(update)
-            })
-            .await
-            .map(|_| ())
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_help_command_update_or_else(&self.bot, self.effects.as_ref(), update, |update| {
+            self.next.handle_update(update)
         })
+        .await
+        .map(|_| ())
     }
 }
 
@@ -447,16 +445,16 @@ pub fn route_start_or_help_command(
     bot: &HelpBotIdentity,
     message: &TelegramMessage,
 ) -> HelpCommandRoute {
-    let Some(command) = leading_bot_command(message) else {
+    let Some(command) = parse_leading_bot_command(message) else {
         return HelpCommandRoute::NotHandled;
     };
     let private_chat = telegram_chat_is_private(&message.chat);
 
     if command.command == START_COMMAND {
         if private_chat {
-            return route_private_start_payload(bot, message, &command.arguments);
+            return route_private_start_payload(bot, message, command.arguments);
         }
-        if command.target.as_deref() == Some(bot.token.as_str()) {
+        if command.target == Some(bot.token.as_str()) {
             return HelpCommandRoute::ConsumedWithoutReply;
         }
         return HelpCommandRoute::NotHandled;
@@ -593,91 +591,11 @@ fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Private(_))
 }
 
-fn command_for_bot(command: &BotCommandInMessage, private_chat: bool, bot_username: &str) -> bool {
+fn command_for_bot(command: &ParsedBotCommand<'_>, private_chat: bool, bot_username: &str) -> bool {
     if private_chat {
         return true;
     }
-    command.target.as_deref() == Some(bot_username)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BotCommandInMessage {
-    command: String,
-    target: Option<String>,
-    arguments: String,
-}
-
-fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_bot_command_from_text(text)
-}
-
-fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
-    let first = text.entities.as_ref()?.into_iter().next()?;
-    let TelegramTextEntity::BotCommand(position) = first else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-
-    let command_with_slash = text_entity_content(&text.data, *position)?;
-    let command_with_target = command_with_slash.strip_prefix('/')?;
-    let (command, target) = match command_with_target.split_once('@') {
-        Some((command, target)) => (command, Some(target.to_owned())),
-        None => (command_with_target, None),
-    };
-
-    Some(BotCommandInMessage {
-        command: command.to_owned(),
-        target,
-        arguments: command_arguments(text, *position)?,
-    })
-}
-
-fn command_arguments(text: &TelegramText, position: TelegramTextEntityPosition) -> Option<String> {
-    let offset = usize::try_from(position.offset).ok()?;
-    let length = usize::try_from(position.length).ok()?;
-    let end = utf16_units_to_byte_index(&text.data, offset.checked_add(length)?)?;
-    if end == text.data.len() {
-        return Some(String::new());
-    }
-
-    let tail = &text.data[end..];
-    let mut chars = tail.char_indices();
-    chars.next()?;
-    Some(match chars.next() {
-        Some((index, _)) => tail[index..].to_owned(),
-        None => String::new(),
-    })
-}
-
-fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> Option<String> {
-    let offset = usize::try_from(position.offset).ok()?;
-    let length = usize::try_from(position.length).ok()?;
-    Some(String::from_utf16_lossy(
-        &text
-            .encode_utf16()
-            .skip(offset)
-            .take(length)
-            .collect::<Vec<u16>>(),
-    ))
-}
-
-fn utf16_units_to_byte_index(text: &str, units: usize) -> Option<usize> {
-    let mut consumed = 0usize;
-    for (index, ch) in text.char_indices() {
-        if consumed == units {
-            return Some(index);
-        }
-        consumed = consumed.checked_add(ch.len_utf16())?;
-        if consumed > units {
-            return None;
-        }
-    }
-    (consumed == units).then_some(text.len())
+    command.target == Some(bot_username)
 }
 
 #[cfg(test)]
@@ -1276,14 +1194,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

@@ -12,16 +12,14 @@ use std::{
 };
 
 use openplotva_telegram::{
-    AudioMessageRequest, DeleteMessageRequest, DispatcherMessage, DispatcherQueue,
-    DispatcherSendStatus, DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest,
-    EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
-    OutboundBuildError, PhotoMessageRequest, ReplyMessageRef, RichMessageRequest,
-    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
-    TelegramOutboundResponse, TextMessageRequest, build_audio_message_method,
-    build_audio_message_plan, build_delete_message_method, build_edit_media_message_method,
-    build_edit_media_message_plan, build_edit_text_message_method,
-    build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
-    build_photo_message_plan, build_rich_message_method, build_sticker_message_method,
+    AudioMessageRequest, DeleteMessageRequest, DispatcherMessage, DispatcherPersistencePayload,
+    DispatcherQueue, DispatcherSendStatus, DispatcherWorkItem, EditMediaMessageRequest,
+    EditTextMessageRequest, EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem,
+    MessageFingerprint, OutboundBuildError, OutboundCommand, PhotoMessageRequest, ReplyMessageRef,
+    RichMessageRequest, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_audio_message_plan,
+    build_delete_message_method, build_edit_media_message_plan, build_edit_text_message_method,
+    build_media_group_message_plan, build_photo_message_plan, build_rich_message_method,
     build_sticker_message_plan, build_text_message_method,
     build_text_message_method_without_link_preview, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_rich_message, fingerprint_sticker_message_plan,
@@ -717,14 +715,10 @@ where
     message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
     let virtual_id = next_virtual_id();
     let plan = build_sticker_message_plan(req.message, req.reply_to)?;
-    let method = build_sticker_message_method(req.message, req.reply_to)?;
-    let persistence_payload = plan
-        .to_persistence_payload()
-        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let command = persisted_command(plan.to_carapax()?, plan.to_persistence_payload())?;
     let dispatcher_message =
         DispatcherMessage::new(fingerprint_sticker_message_plan(&plan), &virtual_id)
-            .with_method(TelegramOutboundMethod::from(method))
-            .with_persistence_payload(persistence_payload)
+            .with_command(command)
             .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
     let dispatcher_message = if let Some(delete_after) = req.ephemeral_delete_after {
         dispatcher_message.with_ephemeral_delete_after(delete_after)
@@ -745,13 +739,9 @@ pub fn queue_photo_message(
     req: QueuePhotoRequest<'_>,
 ) -> Result<QueuePhotoReport, OutboundBuildError> {
     let plan = build_photo_message_plan(req.message)?;
-    let method = build_photo_message_method(req.message)?;
-    let persistence_payload = plan
-        .to_persistence_payload()
-        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
-    let dispatcher_message = DispatcherMessage::new(fingerprint_photo_message_plan(&plan), "")
-        .with_method(TelegramOutboundMethod::from(method))
-        .with_persistence_payload(persistence_payload);
+    let command = persisted_command(plan.to_carapax()?, plan.to_persistence_payload())?;
+    let dispatcher_message =
+        DispatcherMessage::new(fingerprint_photo_message_plan(&plan), "").with_command(command);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueuePhotoReport {
@@ -765,13 +755,9 @@ pub fn queue_audio_message(
     req: QueueAudioRequest<'_>,
 ) -> Result<QueueAudioReport, OutboundBuildError> {
     let plan = build_audio_message_plan(req.message);
-    let method = build_audio_message_method(req.message)?;
-    let persistence_payload = plan
-        .to_persistence_payload()
-        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
-    let dispatcher_message = DispatcherMessage::new(fingerprint_audio_message_plan(&plan), "")
-        .with_method(TelegramOutboundMethod::from(method))
-        .with_persistence_payload(persistence_payload);
+    let command = persisted_command(plan.to_carapax()?, plan.to_persistence_payload())?;
+    let dispatcher_message =
+        DispatcherMessage::new(fingerprint_audio_message_plan(&plan), "").with_command(command);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueAudioReport {
@@ -802,14 +788,10 @@ pub fn queue_media_group_message(
     req: QueueMediaGroupRequest<'_>,
 ) -> Result<QueueMediaGroupReport, OutboundBuildError> {
     let plan = build_media_group_message_plan(req.message);
-    let method = build_media_group_message_method(req.message)?;
-    let persistence_payload = plan
-        .to_persistence_payload()
-        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let command = persisted_command(plan.to_carapax()?, plan.to_persistence_payload())?;
     let dispatcher_message =
         DispatcherMessage::new(media_group_identity_fingerprint(req.message), "")
-            .with_method(TelegramOutboundMethod::from(method))
-            .with_persistence_payload(persistence_payload);
+            .with_command(command);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueMediaGroupReport {
@@ -823,20 +805,28 @@ pub fn queue_edit_media_message(
     req: QueueEditMediaRequest<'_>,
 ) -> Result<QueueEditMediaReport, OutboundBuildError> {
     let plan = build_edit_media_message_plan(req.message);
-    let method = build_edit_media_message_method(req.message)?;
-    let persistence_payload = plan
-        .to_persistence_payload()
-        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let command = persisted_command(plan.to_carapax()?, plan.to_persistence_payload())?;
     let dispatcher_message =
         DispatcherMessage::new(edit_media_identity_fingerprint(req.message), "")
-            .with_method(TelegramOutboundMethod::from(method))
-            .with_persistence_payload(persistence_payload);
+            .with_command(command);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueEditMediaReport {
         enqueue_outcome,
         immediate: req.immediate,
     })
+}
+
+fn persisted_command(
+    method: impl Into<TelegramOutboundMethod>,
+    payload: Result<DispatcherPersistencePayload, serde_json::Error>,
+) -> Result<OutboundCommand, OutboundBuildError> {
+    let payload =
+        payload.map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    Ok(OutboundCommand::from_method_and_legacy_payload(
+        method.into(),
+        payload,
+    ))
 }
 
 fn media_group_identity_fingerprint(req: &MediaGroupMessageRequest) -> MessageFingerprint {
@@ -1664,7 +1654,7 @@ mod tests {
         assert_eq!(item.metadata().virtual_id, "");
         assert!(item.metadata().fingerprint_key.starts_with("42:unknown:"));
         assert!(item.bypasses_chat_restrictions());
-        let (_, method, _, _) = item.into_persistence_parts();
+        let method = item.into_command().map(|command| command.into_method());
         assert_eq!(
             method.as_ref().map(TelegramOutboundMethod::kind),
             Some(TelegramOutboundMethodKind::EditMessageText)

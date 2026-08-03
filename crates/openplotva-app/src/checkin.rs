@@ -11,9 +11,8 @@ use std::{
 
 use carapax::types::{
     CallbackQuery as TelegramCallbackQuery, Chat as TelegramChat, MaybeInaccessibleMessage,
-    Message as TelegramMessage, MessageData as TelegramMessageData, Text as TelegramText,
-    TextEntity as TelegramTextEntity, TextEntityPosition as TelegramTextEntityPosition,
-    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
+    Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    User as TelegramUser,
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
@@ -27,10 +26,11 @@ use openplotva_telegram::{
     execute_telegram_method_with_rich, format_rich_html, replay_outbound_method,
     snapshot_outbound_method,
 };
+use openplotva_updates::parse_leading_bot_command;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     virtual_messages::{
@@ -2200,18 +2200,16 @@ where
 {
     type Error = CheckinThemeCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_checkin_theme_callback_update_or_else_at(
-                self.queue.as_ref(),
-                self.effects.as_ref(),
-                update,
-                OffsetDateTime::now_utc(),
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_checkin_theme_callback_update_or_else_at(
+            self.queue.as_ref(),
+            self.effects.as_ref(),
+            update,
+            OffsetDateTime::now_utc(),
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -2260,41 +2258,39 @@ where
 {
     type Error = CheckinThemeCallbackError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let created = OffsetDateTime::now_utc();
-            let can_send_text = match &update.update_type {
-                TelegramUpdateType::Message(message)
-                    if is_checkin_command_for_bot(message, &self.bot_username) =>
-                {
-                    self.permission
-                        .can_send_checkin_text(
-                            message.chat.get_id().into(),
-                            chat_type_name(&message.chat),
-                            created,
-                        )
-                        .await
-                        .map_err(|error| CheckinThemeCallbackError::Permission {
-                            message: error.to_string(),
-                        })?
-                }
-                _ => true,
-            };
-            handle_checkin_command_update_or_else_at(
-                self.queue.as_ref(),
-                self.store.as_ref(),
-                self.effects.as_ref(),
-                update,
-                CheckinCommandUpdateContext {
-                    bot_username: &self.bot_username,
-                    can_send_text,
-                    created,
-                },
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        let created = OffsetDateTime::now_utc();
+        let can_send_text = match &update.update_type {
+            TelegramUpdateType::Message(message)
+                if is_checkin_command_for_bot(message, &self.bot_username) =>
+            {
+                self.permission
+                    .can_send_checkin_text(
+                        message.chat.get_id().into(),
+                        chat_type_name(&message.chat),
+                        created,
+                    )
+                    .await
+                    .map_err(|error| CheckinThemeCallbackError::Permission {
+                        message: error.to_string(),
+                    })?
+            }
+            _ => true,
+        };
+        handle_checkin_command_update_or_else_at(
+            self.queue.as_ref(),
+            self.store.as_ref(),
+            self.effects.as_ref(),
+            update,
+            CheckinCommandUpdateContext {
+                bot_username: &self.bot_username,
+                can_send_text,
+                created,
+            },
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -2712,7 +2708,7 @@ fn is_checkin_command_for_bot(message: &TelegramMessage, _bot_username: &str) ->
     if telegram_chat_is_private(&message.chat) {
         return false;
     }
-    let Some(command) = leading_bot_command(message) else {
+    let Some(command) = parse_leading_bot_command(message) else {
         return false;
     };
     // strips any @target, so even /checkin@OtherBot is handled in groups.
@@ -2721,51 +2717,6 @@ fn is_checkin_command_for_bot(message: &TelegramMessage, _bot_username: &str) ->
 
 fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Private(_))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BotCommandInMessage {
-    command: String,
-    target: Option<String>,
-}
-
-fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
-    let TelegramMessageData::Text(text) = &message.data else {
-        return None;
-    };
-    leading_bot_command_from_text(text)
-}
-
-fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
-    let first = text.entities.as_ref()?.into_iter().next()?;
-    let TelegramTextEntity::BotCommand(position) = first else {
-        return None;
-    };
-    if position.offset != 0 {
-        return None;
-    }
-    let command_with_slash = text_entity_content(&text.data, *position)?;
-    let command_with_target = command_with_slash.strip_prefix('/')?;
-    let (command, target) = match command_with_target.split_once('@') {
-        Some((command, target)) => (command, Some(target.to_owned())),
-        None => (command_with_target, None),
-    };
-    Some(BotCommandInMessage {
-        command: command.to_owned(),
-        target,
-    })
-}
-
-fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> Option<String> {
-    let offset = usize::try_from(position.offset).ok()?;
-    let length = usize::try_from(position.length).ok()?;
-    Some(String::from_utf16_lossy(
-        &text
-            .encode_utf16()
-            .skip(offset)
-            .take(length)
-            .collect::<Vec<u16>>(),
-    ))
 }
 
 async fn try_execute_checkin_callback_method<Effects>(
@@ -2847,8 +2798,8 @@ mod tests {
     };
     use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
     use openplotva_taskman::{JobPayload, JobType};
     use openplotva_telegram::{
@@ -4461,14 +4412,9 @@ mod tests {
     impl UpdateHandler for NextStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls.lock().expect("next calls").push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls.lock().expect("next calls").push(update.id);
+            Ok(())
         }
     }
 

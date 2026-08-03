@@ -54,6 +54,11 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required for the loopback Telegram API" >&2
+  exit 1
+fi
+
 free_port_from() {
   local port="$1"
   while nc -z 127.0.0.1 "$port" >/dev/null 2>&1; do
@@ -66,11 +71,13 @@ app_port="$(free_port_from "${OPENPLOTVA_SERVICE_SMOKE_PORT:-18180}")"
 runtime_port="$(free_port_from "${OPENPLOTVA_SERVICE_SMOKE_RUNTIME_PORT:-19091}")"
 pg_port="$(free_port_from "${OPENPLOTVA_SERVICE_SMOKE_PG_PORT:-55432}")"
 redis_port="$(free_port_from "${OPENPLOTVA_SERVICE_SMOKE_REDIS_PORT:-56379}")"
+telegram_api_port="$(free_port_from "${OPENPLOTVA_SERVICE_SMOKE_TELEGRAM_PORT:-18081}")"
 project="openplotva-smoke-$$"
 base_url="http://127.0.0.1:${app_port}"
 runtime_base_url="https://127.0.0.1:${runtime_port}"
 log_dir="${OPENPLOTVA_SMOKE_LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/openplotva-service-smoke.XXXXXX")}"
 app_log="${log_dir}/openplotva-app.log"
+telegram_api_log="${log_dir}/telegram-api.log"
 health_file="${log_dir}/health.json"
 ready_file="${log_dir}/ready.json"
 state_file="${log_dir}/admin-state.json"
@@ -105,13 +112,50 @@ runtime_unauth_file="${log_dir}/runtime-unauthorized.txt"
 runtime_method_file="${log_dir}/runtime-method.txt"
 runtime_graphql_file="${log_dir}/runtime-graphql.json"
 app_pid=""
+telegram_api_pid=""
 smoke_admin_id="1001"
+smoke_bot_key="123:ABC"
+smoke_admin_issued_at="$(date +%s)"
+smoke_admin_expires_at="$((smoke_admin_issued_at + 86400))"
 smoke_admin_signature="$(
-  printf '%s' "$smoke_admin_id" \
-    | openssl dgst -sha256 -hmac '' \
+  printf 'v1.%s.%s.%s' "$smoke_admin_id" "$smoke_admin_issued_at" "$smoke_admin_expires_at" \
+    | openssl dgst -sha256 -hmac "$smoke_bot_key" \
     | awk '{print $NF}'
 )"
-admin_cookie_header="Cookie: admin_session=${smoke_admin_id}.${smoke_admin_signature}"
+admin_cookie_header="Cookie: admin_session=v1.${smoke_admin_id}.${smoke_admin_issued_at}.${smoke_admin_expires_at}.${smoke_admin_signature}"
+admin_cookie_value="${admin_cookie_header#Cookie: admin_session=}"
+
+settings_init_data() {
+  local user_id="$1"
+  local auth_date
+  local user
+  local data_check_string
+  local secret_key_hex
+  local hash
+  auth_date="$(date +%s)"
+  user="$(printf '{"id":%s,"first_name":"Smoke","username":"smoke"}' "$user_id")"
+  data_check_string="$(printf 'auth_date=%s\nuser=%s' "$auth_date" "$user")"
+  secret_key_hex="$(
+    printf '%s' "$smoke_bot_key" \
+      | openssl dgst -sha256 -hmac 'WebAppData' \
+      | awk '{print $NF}'
+  )"
+  hash="$(
+    printf '%s' "$data_check_string" \
+      | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${secret_key_hex}" \
+      | awk '{print $NF}'
+  )"
+  jq -nr \
+    --arg auth_date "$auth_date" \
+    --arg user "$user" \
+    --arg hash "$hash" \
+    '"auth_date=\($auth_date | @uri)&user=\($user | @uri)&hash=\($hash | @uri)"'
+}
+
+settings_user_42_init_data="$(settings_init_data 42)"
+settings_user_7_init_data="$(settings_init_data 7)"
+settings_user_42_header="X-Telegram-Init-Data: ${settings_user_42_init_data}"
+settings_user_7_header="X-Telegram-Init-Data: ${settings_user_7_init_data}"
 
 compose() {
   OPENPLOTVA_DEV_POSTGRES_PORT="$pg_port" \
@@ -124,6 +168,10 @@ cleanup() {
     kill "$app_pid" >/dev/null 2>&1 || true
     wait "$app_pid" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$telegram_api_pid" ]] && kill -0 "$telegram_api_pid" >/dev/null 2>&1; then
+    kill "$telegram_api_pid" >/dev/null 2>&1 || true
+    wait "$telegram_api_pid" >/dev/null 2>&1 || true
+  fi
   if [[ "${OPENPLOTVA_SERVICE_SMOKE_KEEP:-0}" != "1" ]]; then
     compose down -v --remove-orphans >/dev/null 2>&1 || true
   else
@@ -131,6 +179,130 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+start_loopback_telegram_api() {
+  echo "+ start loopback Telegram API on 127.0.0.1:${telegram_api_port}"
+  python3 -u - "$telegram_api_port" >"$telegram_api_log" 2>&1 <<'PY' &
+import json
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port = int(sys.argv[1])
+
+def bot_user():
+    return {
+        "id": 900000001,
+        "is_bot": True,
+        "first_name": "Plotva",
+        "username": "SmokePlotvaBot",
+        "allows_users_to_create_topics": False,
+        "can_connect_to_business": False,
+        "can_join_groups": True,
+        "can_manage_bots": False,
+        "can_read_all_group_messages": False,
+        "has_main_web_app": False,
+        "has_topics_enabled": False,
+        "supports_guest_queries": True,
+        "supports_join_request_queries": True,
+        "supports_inline_queries": True,
+    }
+
+def user(user_id):
+    user_id = int(user_id)
+    if user_id == 900000001:
+        return bot_user()
+    fixtures = {
+        7: {"first_name": "Owner", "username": "owner"},
+        8: {"first_name": "Deputy", "username": "deputy"},
+        9: {"first_name": "Member", "username": "member"},
+    }
+    return {"id": user_id, "is_bot": False, **fixtures.get(user_id, {"first_name": "Smoke"})}
+
+def parse_body(handler):
+    length = int(handler.headers.get("content-length", "0") or "0")
+    raw = handler.rfile.read(length) if length else b""
+    if "application/json" in handler.headers.get("content-type", ""):
+        try:
+            value = json.loads(raw.decode())
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    return {key: values[-1] for key, values in urllib.parse.parse_qs(raw.decode()).items()}
+
+def result_for(method, params):
+    if method == "getMe":
+        return bot_user()
+    if method in {"getUpdates", "getMyCommands"}:
+        return []
+    if method == "getChatMember":
+        requested_user = user(params.get("user_id", 7))
+        if requested_user["id"] == 7:
+            return {
+                "status": "creator",
+                "user": requested_user,
+                "is_anonymous": False,
+            }
+        return {
+            "status": "administrator",
+            "user": requested_user,
+            "can_be_edited": False,
+            "is_anonymous": False,
+            "can_manage_chat": True,
+            "can_promote_members": True,
+            "can_delete_messages": True,
+            "can_restrict_members": True,
+            "can_manage_video_chats": True,
+            "can_change_info": True,
+            "can_invite_users": True,
+            "can_post_stories": True,
+            "can_edit_stories": True,
+            "can_delete_stories": True,
+            "can_pin_messages": True,
+            "can_manage_topics": True,
+        }
+    if method == "getChatAdministrators":
+        return [{
+            "status": "creator",
+            "user": user(7),
+            "is_anonymous": False,
+        }]
+    if method == "getWebhookInfo":
+        return {
+            "url": "",
+            "has_custom_certificate": False,
+            "pending_update_count": 0,
+        }
+    return True
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        return
+
+    def do_GET(self):
+        self.handle_any()
+
+    def do_POST(self):
+        self.handle_any()
+
+    def handle_any(self):
+        parsed = urllib.parse.urlparse(self.path)
+        method = parsed.path.rstrip("/").split("/")[-1]
+        params = parse_body(self)
+        for key, values in urllib.parse.parse_qs(parsed.query).items():
+            if values:
+                params.setdefault(key, values[-1])
+        body = json.dumps({"ok": True, "result": result_for(method, params)}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+PY
+  telegram_api_pid="$!"
+}
 
 wait_for_tcp() {
   local name="$1"
@@ -178,7 +350,8 @@ start_app() {
     RUNTIME_API_ENABLED="true" \
     RUNTIME_API_HOST="127.0.0.1" \
     RUNTIME_API_PORT="${runtime_port}" \
-    BOT_KEY="" \
+    BOT_KEY="$smoke_bot_key" \
+    BOT_API_BASE_URL="http://127.0.0.1:${telegram_api_port}" \
     DB_POSTGRES_HOST="127.0.0.1" \
     DB_POSTGRES_PORT="${pg_port}" \
     DB_POSTGRES_USER="plotva" \
@@ -570,6 +743,9 @@ VALUES (
 SQL
 }
 
+start_loopback_telegram_api
+wait_for_tcp "loopback Telegram API" "$telegram_api_port"
+
 echo "+ docker compose up postgres dragonfly (${project})"
 compose up --wait --wait-timeout 120 postgres dragonfly
 wait_for_tcp "postgres" "$pg_port"
@@ -595,7 +771,7 @@ curl -fsS "${base_url}/api/ready" >"$ready_file"
 expect_body_contains "$ready_file" '"name":"migrations","status":"ok"'
 echo "+ existing migration history bridge ok"
 
-curl -fsS "${base_url}/admin/api/state" >"$state_file"
+curl -fsS -H "$admin_cookie_header" "${base_url}/admin/api/state" >"$state_file"
 expect_body_contains "$state_file" '"log_level":"info"'
 expect_body_contains "$state_file" '"queue":'
 echo "+ /admin/api/state ok"
@@ -607,10 +783,12 @@ expect_jq_equals "$auth_cookie_file" '.authenticated' "true"
 expect_jq_equals "$auth_cookie_file" '.user_id' "1001"
 echo "+ /admin/api/auth_check ok"
 
-expect_http_status "403" "${base_url}/api/settings?chat_id=42&user_id=42&signature=bad" "$settings_bad_file"
+expect_http_status "403" "${base_url}/api/settings?chat_id=42&user_id=42&signature=bad" "$settings_bad_file" \
+  -H "$settings_user_42_header"
 expect_jq_equals "$settings_bad_file" '.error' "Invalid signature"
 
-curl -fsS "${base_url}/api/settings?chat_id=42&user_id=42&signature=780e28cf" >"$settings_file"
+curl -fsS -H "$settings_user_42_header" \
+  "${base_url}/api/settings?chat_id=42&user_id=42&signature=780e28cf" >"$settings_file"
 expect_jq_equals "$settings_file" '.chat_id' "42"
 expect_jq_equals "$settings_file" '.chat_type' "private"
 expect_jq_equals "$settings_file" '.enable_global_text_reply' "true"
@@ -618,11 +796,13 @@ expect_jq_equals "$settings_file" '.enable_global_text_reply' "true"
 curl -fsS \
   -X PUT \
   -H "Content-Type: application/json" \
+  -H "$settings_user_42_header" \
   --data '{"chat_id":42,"user_id":42,"signature":"780e28cf","mood_alignment":"smoke-mood","custom_persona":"service smoke persona","reactivity_percentage":67,"proactivity_percentage":12,"enable_obscenifier":false,"enable_profanity":true,"enable_greet_joiners":true,"enable_global_text_reply":false,"enable_global_draw_reply":false,"disable_random_reactivity":true,"hide_original_draw_prompt":true}' \
   "${base_url}/api/settings" >"$settings_update_file"
 expect_jq_equals "$settings_update_file" '.status' "success"
 
-curl -fsS "${base_url}/api/settings?chat_id=42&user_id=42&signature=780e28cf" >"$settings_after_file"
+curl -fsS -H "$settings_user_42_header" \
+  "${base_url}/api/settings?chat_id=42&user_id=42&signature=780e28cf" >"$settings_after_file"
 expect_jq_equals "$settings_after_file" '.mood_alignment' "smoke-mood"
 expect_jq_equals "$settings_after_file" '.custom_persona' "service smoke persona"
 expect_jq_equals "$settings_after_file" '.reactivity_percentage' "67"
@@ -635,40 +815,48 @@ echo "+ /api/settings real-db get/put ok"
 
 seed_group_settings_fixtures
 
-curl -fsS "${base_url}/api/chats?user_id=7&signature=68b3a1ec" >"$chats_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/chats?user_id=7&signature=68b3a1ec" >"$chats_file"
 expect_jq_equals "$chats_file" '.[] | select(.id == -100777) | .title' "Smoke Group"
 expect_jq_equals "$chats_file" '.[] | select(.id == -100777) | .type' "supergroup"
 
-curl -fsS "${base_url}/api/settings?chat_id=-100777&user_id=7&signature=b8e86493" >"$group_settings_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/settings?chat_id=-100777&user_id=7&signature=b8e86493" >"$group_settings_file"
 expect_jq_equals "$group_settings_file" '.chat_title' "Smoke Group"
 expect_jq_equals "$group_settings_file" '.chat_type' "supergroup"
 expect_jq_equals "$group_settings_file" '.can_manage_deputies' "true"
 expect_jq_equals "$group_settings_file" '.deputies[0].id' "8"
 
-curl -fsS "${base_url}/api/settings/deputies/candidates?chat_id=-100777&user_id=7&signature=b8e86493&q=Deputy&limit=10" >"$deputy_candidates_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/settings/deputies/candidates?chat_id=-100777&user_id=7&signature=b8e86493&q=Deputy&limit=10" >"$deputy_candidates_file"
 expect_jq_equals "$deputy_candidates_file" '.items[0].id' "8"
 expect_jq_equals "$deputy_candidates_file" '.items[0].display_name' "Deputy"
 
 curl -fsS \
   -X PUT \
   -H "Content-Type: application/json" \
+  -H "$settings_user_7_header" \
   --data '{"chat_id":-100777,"user_id":7,"signature":"b8e86493","deputy_ids":[9]}' \
   "${base_url}/api/settings/deputies" >"$deputy_update_file"
 expect_jq_equals "$deputy_update_file" '.ok' "true"
 expect_jq_equals "$deputy_update_file" '.deputies[0].id' "9"
 
-curl -fsS "${base_url}/api/settings?chat_id=-100777&user_id=7&signature=b8e86493" >"$group_settings_after_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/settings?chat_id=-100777&user_id=7&signature=b8e86493" >"$group_settings_after_file"
 expect_jq_equals "$group_settings_after_file" '.deputies[0].id' "9"
 
-curl -fsS "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b8e86493&limit=5" >"$memory_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b8e86493&limit=5" >"$memory_file"
 expect_jq_equals "$memory_file" '.count' "1"
 expect_jq_equals "$memory_file" '.cards[0].fact_text' "Smoke Group likes real DB settings smoke."
 memory_id="$(jq -r '.cards[0].id' "$memory_file")"
 curl -fsS \
   -X DELETE \
+  -H "$settings_user_7_header" \
   "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b8e86493&id=${memory_id}" >"$memory_delete_file"
 expect_jq_equals "$memory_delete_file" '.ok' "true"
-curl -fsS "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b8e86493&limit=5" >"$memory_after_file"
+curl -fsS -H "$settings_user_7_header" \
+  "${base_url}/api/settings/memory?chat_id=-100777&user_id=7&signature=b8e86493&limit=5" >"$memory_after_file"
 expect_jq_equals "$memory_after_file" '.count' "0"
 echo "+ /api/settings side APIs real-db ok"
 
@@ -693,6 +881,7 @@ expect_jq_equals "$admin_memory_runs_file" \
   '.runs[] | select(.prompt_version == "service-smoke-memory") | .status' "completed"
 expect_jq_equals "$admin_memory_runs_file" \
   '.runs[] | select(.prompt_version == "service-smoke-memory") | .message_count' "12"
+expect_jq_equals "$admin_memory_runs_file" '.policy.token_estimator' "heuristic"
 echo "+ admin safety/analytics seeded telemetry ok"
 
 curl -fsS \
@@ -793,6 +982,9 @@ if [[ "${OPENPLOTVA_SERVICE_SMOKE_WEB_UI:-0}" == "1" ]]; then
   fi
 
   export OPENPLOTVA_WEB_UI_BASE_URL="$base_url"
+  export OPENPLOTVA_WEB_UI_ADMIN_COOKIE="$admin_cookie_value"
+  export OPENPLOTVA_WEB_UI_SETTINGS_INIT_DATA_42="$settings_user_42_init_data"
+  export OPENPLOTVA_WEB_UI_SETTINGS_INIT_DATA_7="$settings_user_7_init_data"
   export OPENPLOTVA_WEB_UI_ARTIFACT_DIR="${log_dir}/web-ui"
   export OPENPLOTVA_WEB_UI_HEADLESS="${OPENPLOTVA_WEB_UI_HEADLESS:-1}"
   mkdir -p "$OPENPLOTVA_WEB_UI_ARTIFACT_DIR"

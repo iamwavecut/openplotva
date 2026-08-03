@@ -24,7 +24,7 @@ use sha1::{Digest, Sha1};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 
 pub const GUEST_DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 pub const GUEST_DIALOG_MAX_OUTPUT_TOKENS: usize = 512;
@@ -519,17 +519,12 @@ where
 {
     type Error = GuestMessageUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_guest_message_update_or_else(
-                self.effects.as_ref(),
-                &self.config,
-                update,
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_guest_message_update_or_else(self.effects.as_ref(), &self.config, update, |update| {
+            self.next.handle_update(update)
         })
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1085,8 +1080,8 @@ mod tests {
     use time::{OffsetDateTime, macros::datetime};
 
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
 
     use super::{
@@ -2005,14 +2000,9 @@ mod tests {
     impl UpdateHandler for UpdateHandlerStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                *self.handled.lock().expect("handled") += 1;
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            *self.handled.lock().expect("handled") += 1;
+            Ok(())
         }
     }
 

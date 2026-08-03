@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::{ChatRateLimitPolicy, RateLimitStore},
-    updates::{UpdateHandler, UpdateHandlerFuture},
+    updates::UpdateHandler,
 };
 
 /// Boxed future returned by message-gate policy checks.
@@ -231,38 +231,36 @@ where
 {
     type Error = MessageGateUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            match message_gate_decision_at(
-                self.rate_limit.as_ref(),
-                self.permission.as_ref(),
-                self.blocked_chat.as_ref(),
-                &update,
-                &self.bot_username,
-                OffsetDateTime::now_utc(),
-            )
-            .await?
-            {
-                MessageGateDecision::Continue => {
-                    self.next.handle_update(update).await.map_err(|error| {
-                        MessageGateUpdateError::Downstream {
-                            message: error.to_string(),
-                        }
-                    })
-                }
-                MessageGateDecision::Skip(reason) => {
-                    let (chat_id, chat_type) = message_gate_update_chat_fields(&update);
-                    tracing::debug!(
-                        ?reason,
-                        update_id = update.id,
-                        chat_id,
-                        chat_type,
-                        "Telegram message skipped before fetcher routing"
-                    );
-                    Ok(())
-                }
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        match message_gate_decision_at(
+            self.rate_limit.as_ref(),
+            self.permission.as_ref(),
+            self.blocked_chat.as_ref(),
+            &update,
+            &self.bot_username,
+            OffsetDateTime::now_utc(),
+        )
+        .await?
+        {
+            MessageGateDecision::Continue => {
+                self.next.handle_update(update).await.map_err(|error| {
+                    MessageGateUpdateError::Downstream {
+                        message: error.to_string(),
+                    }
+                })
             }
-        })
+            MessageGateDecision::Skip(reason) => {
+                let (chat_id, chat_type) = message_gate_update_chat_fields(&update);
+                tracing::debug!(
+                    ?reason,
+                    update_id = update.id,
+                    chat_id,
+                    chat_type,
+                    "Telegram message skipped before fetcher routing"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -287,26 +285,24 @@ where
 {
     type Error = PostServiceBlockedChatUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            if post_service_blocked_chat_skip_at(
-                self.blocked_chat.as_ref(),
-                &update,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            {
-                tracing::debug!(
-                    update_id = update.id,
-                    "Telegram service message skipped by blocked-chat gate after service routing"
-                );
-                return Ok(());
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        if post_service_blocked_chat_skip_at(
+            self.blocked_chat.as_ref(),
+            &update,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::debug!(
+                update_id = update.id,
+                "Telegram service message skipped by blocked-chat gate after service routing"
+            );
+            return Ok(());
+        }
+        self.next.handle_update(update).await.map_err(|error| {
+            PostServiceBlockedChatUpdateError::Downstream {
+                message: error.to_string(),
             }
-            self.next.handle_update(update).await.map_err(|error| {
-                PostServiceBlockedChatUpdateError::Downstream {
-                    message: error.to_string(),
-                }
-            })
         })
     }
 }
@@ -332,20 +328,18 @@ where
 {
     type Error = TextReplySettingsGateUpdateError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            if text_reply_settings_gate_should_skip(self.settings.as_ref(), &update).await {
-                tracing::debug!(
-                    update_id = update.id,
-                    "Telegram message skipped by disabled global text-reply settings"
-                );
-                return Ok(());
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        if text_reply_settings_gate_should_skip(self.settings.as_ref(), &update).await {
+            tracing::debug!(
+                update_id = update.id,
+                "Telegram message skipped by disabled global text-reply settings"
+            );
+            return Ok(());
+        }
+        self.next.handle_update(update).await.map_err(|error| {
+            TextReplySettingsGateUpdateError::Downstream {
+                message: error.to_string(),
             }
-            self.next.handle_update(update).await.map_err(|error| {
-                TextReplySettingsGateUpdateError::Downstream {
-                    message: error.to_string(),
-                }
-            })
         })
     }
 }
@@ -507,8 +501,8 @@ fn message_gate_update_chat_fields(update: &TelegramUpdate) -> (i64, &'static st
 mod tests {
     use super::*;
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
@@ -1258,14 +1252,9 @@ mod tests {
     impl UpdateHandler for NextStub {
         type Error = Infallible;
 
-        fn handle_update<'a>(
-            &'a self,
-            _update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+        async fn handle_update(&self, _update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 

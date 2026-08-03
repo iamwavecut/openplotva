@@ -9,10 +9,10 @@ use openplotva_storage::{
 };
 use openplotva_taskman::{DEFAULT_PRIORITY, DialogJobParams};
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-    TelegramOutboundMethod, TextMessageRequest, build_rich_message_method,
-    build_text_message_methods, build_text_message_methods_without_link_previews,
-    snapshot_outbound_method,
+    ChatRef, DispatcherQueue, OutboundCommand, OutboundCommandCodecError, ReplyMessageRef,
+    RichMessageRequest, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, TextMessageRequest,
+    build_rich_message_method, build_text_message_methods,
+    build_text_message_methods_without_link_previews,
 };
 use sqlx::Row;
 use thiserror::Error;
@@ -172,9 +172,7 @@ pub enum DialogDispatchEffectError {
     #[error("failed to persist dialog answer in Telegram outbox: {0}")]
     Outbox(#[from] openplotva_storage::StorageError),
     #[error("failed to encode dialog answer for Telegram outbox: {0}")]
-    Encode(#[from] serde_json::Error),
-    #[error("Telegram method {0} cannot be persisted in the durable outbox")]
-    UnsupportedMethod(&'static str),
+    EncodeCommand(#[from] OutboundCommandCodecError),
 }
 
 impl DialogJobEffects for DialogDispatcherEffects {
@@ -459,21 +457,10 @@ async fn enqueue_durable_dialog_intermediate(
             .collect()
     };
     let now = OffsetDateTime::now_utc();
-    let mut parts = Vec::with_capacity(methods.len());
-    for method in &methods {
-        let method_kind = method.method_name();
-        let Some((_kind, payload)) = snapshot_outbound_method(method) else {
-            return Err(DialogDispatchEffectError::UnsupportedMethod(method_kind));
-        };
-        parts.push(TelegramOutboxPartInput {
-            method_kind: method_kind.to_owned(),
-            payload_version: 1,
-            payload: serde_json::from_slice(&payload)?,
-            blob: None,
-            available_at: now,
-            expires_at: None,
-        });
-    }
+    let parts = methods
+        .into_iter()
+        .map(|method| durable_outbox_part(method, now))
+        .collect::<Result<Vec<_>, _>>()?;
     let batch = dialog_intermediate_outbox_batch(
         outbox.bot_id,
         dialog_job_id,
@@ -571,21 +558,10 @@ async fn enqueue_durable_dialog_answer(
 ) -> Result<QueuedBatchReceipt, DialogDispatchEffectError> {
     let methods = build_dialog_answer_methods(answer, options, chat, reply_to)?;
     let now = OffsetDateTime::now_utc();
-    let mut parts = Vec::with_capacity(methods.len());
-    for method in &methods {
-        let method_kind = method.method_name();
-        let Some((_kind, payload)) = snapshot_outbound_method(method) else {
-            return Err(DialogDispatchEffectError::UnsupportedMethod(method_kind));
-        };
-        parts.push(TelegramOutboxPartInput {
-            method_kind: method_kind.to_owned(),
-            payload_version: 1,
-            payload: serde_json::from_slice(&payload)?,
-            blob: None,
-            available_at: now,
-            expires_at: None,
-        });
-    }
+    let parts = methods
+        .into_iter()
+        .map(|method| durable_outbox_part(method, now))
+        .collect::<Result<Vec<_>, _>>()?;
     let batch_id = dialog_answer_batch_id(outbox.bot_id, dialog_job_id);
     let batch = TelegramOutboxBatchInput {
         batch_id: batch_id.clone(),
@@ -617,6 +593,22 @@ async fn enqueue_durable_dialog_answer(
             .collect(),
         delivery_complete,
     ))
+}
+
+fn durable_outbox_part(
+    method: TelegramOutboundMethod,
+    available_at: OffsetDateTime,
+) -> Result<TelegramOutboxPartInput, OutboundCommandCodecError> {
+    let (method_kind, payload_version, payload) =
+        OutboundCommand::try_from_method(method)?.into_storage_parts()?;
+    Ok(TelegramOutboxPartInput {
+        method_kind: method_kind.to_owned(),
+        payload_version,
+        payload,
+        blob: None,
+        available_at,
+        expires_at: None,
+    })
 }
 
 #[cfg(test)]
@@ -674,10 +666,11 @@ mod tests {
         assert!(methods.len() > 1);
 
         for method in methods {
-            let (_, payload) = snapshot_outbound_method(&method).expect("serializable method");
-            let payload: serde_json::Value =
-                serde_json::from_slice(&payload).expect("serialized payload");
-            assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+            let command = OutboundCommand::try_from_method(method).expect("serializable method");
+            assert_eq!(
+                command.payload().expect("encoded payload")["link_preview_options"]["is_disabled"],
+                true
+            );
         }
 
         let default_methods = build_dialog_answer_methods(
@@ -687,10 +680,16 @@ mod tests {
             &reply_to,
         )
         .expect("build default durable method");
-        let (_, payload) =
-            snapshot_outbound_method(&default_methods[0]).expect("serializable default method");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&payload).expect("serialized default payload");
-        assert!(payload.get("link_preview_options").is_none());
+        let command = OutboundCommand::try_from_method(
+            default_methods.into_iter().next().expect("default method"),
+        )
+        .expect("serializable default method");
+        assert!(
+            command
+                .payload()
+                .expect("encoded payload")
+                .get("link_preview_options")
+                .is_none()
+        );
     }
 }

@@ -55,7 +55,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "components.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/components.js"),
-        sha256: "6fa51860405fb7fce5c86084fcea245917decfafb7d1f95b293253fb10a4a11c",
+        sha256: "ea15cfe0de29d60938e8e76768075a7f647c60827af02f1656bb72303b46868f",
     },
     StaticAsset {
         path: "favicon.svg",
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "bf92c6a9dd32b691c29db56c53284e5f6fdfba665889898baa84c1fcca29649c",
+        sha256: "bfe0f71bfe55a30c7efdf79eeb63ef8b8128b00a06ff7e288b09ddb31b3df7a8",
     },
     StaticAsset {
         path: "login.html",
@@ -573,6 +573,25 @@ mod tests {
         // The library + tokens must stay wired in.
         for asset in ["tokens.css", "components.css", "components.js"] {
             assert!(html.contains(asset), "index.html must link {asset}");
+        }
+    }
+
+    #[test]
+    fn admin_taskman_actions_have_handlers() {
+        for action in [
+            "loadTaskmanJobs",
+            "clearTaskmanJobsByFilter",
+            "taskmanPrevPage",
+            "taskmanNextPage",
+            "copyTaskmanSelectedJob",
+            "cancelTaskmanSelectedJob",
+            "restartTaskmanSelectedJob",
+            "loadTaskmanJobByInput",
+        ] {
+            assert!(
+                ADMIN_INDEX_HTML.contains(&format!("function {action}(")),
+                "Taskman data-action {action} must resolve to a JavaScript handler"
+            );
         }
     }
 

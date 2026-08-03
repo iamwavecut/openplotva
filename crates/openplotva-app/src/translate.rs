@@ -20,7 +20,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use url::form_urlencoded;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::updates::UpdateHandler;
 use crate::virtual_messages::{
     QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
     queue_rich_message, queue_text_message_parts,
@@ -1024,20 +1024,18 @@ where
 {
     type Error = TranslateCommandError;
 
-    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
-        Box::pin(async move {
-            handle_translate_command_update_or_else_at(
-                &self.bot,
-                self.permission.as_ref(),
-                self.queue.as_ref(),
-                self.effects.as_ref(),
-                update,
-                OffsetDateTime::now_utc(),
-                |update| self.next.handle_update(update),
-            )
-            .await
-            .map(|_| ())
-        })
+    async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        handle_translate_command_update_or_else_at(
+            &self.bot,
+            self.permission.as_ref(),
+            self.queue.as_ref(),
+            self.effects.as_ref(),
+            update,
+            OffsetDateTime::now_utc(),
+            |update| self.next.handle_update(update),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1555,8 +1553,8 @@ mod tests {
     use super::*;
     use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
     use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
+        process_update_with_state_store_at,
     };
     use openplotva_taskman::{JobPayload, JobType, control_job_params_from_stateless_job};
     use openplotva_telegram::{DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind};
@@ -2841,14 +2839,9 @@ mod tests {
     impl UpdateHandler for NextStub {
         type Error = io::Error;
 
-        fn handle_update<'a>(
-            &'a self,
-            update: TelegramUpdate,
-        ) -> UpdateHandlerFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls.lock().expect("next calls").push(update.id);
-                Ok(())
-            })
+        async fn handle_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+            self.calls.lock().expect("next calls").push(update.id);
+            Ok(())
         }
     }
 

@@ -511,7 +511,7 @@
     /* ---------- action delegation: [data-action] replaces inline onclick ---------- */
     document.addEventListener('click', function (e) {
         const target = e.target.closest && e.target.closest('[data-action]');
-        if (!target) return;
+        if (!target || target.tagName === 'FORM') return;
         if (target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true') return;
         const action = target.dataset.action;
         const fn = window[action];
