@@ -1674,10 +1674,10 @@ impl InMemoryTaskQueue {
             .count()
     }
 
-    /// Clean completion-time stats for queue ETA estimates: the most recent
-    /// `sample_size` completed jobs with p5/p95 outliers trimmed. Go
-    /// GetCleanQueueStats parity: the window spans enqueue to completion and
-    /// only image/text queues are eligible.
+    /// Clean service-time stats for queue ETA estimates: the most recent
+    /// `sample_size` observations with p5/p95 outliers trimmed. Image queues
+    /// use start-to-start intervals while backlog was present; text keeps the
+    /// enqueue-to-completion window. Only image/text queues are eligible.
     #[must_use]
     pub fn clean_queue_stats(
         &self,
@@ -1687,25 +1687,51 @@ impl InMemoryTaskQueue {
         if !(queue_name.starts_with("image-") || queue_name == TEXT_QUEUE_NAME) {
             return None;
         }
-        let mut samples: Vec<(OffsetDateTime, f64)> = self
-            .lock()
-            .records
-            .iter()
-            .filter(|record| {
-                record.queue_name == queue_name && record.status == JobStatus::Completed
-            })
-            .filter_map(|record| {
-                let completed_at = record.completed_at?;
-                let total_seconds = (completed_at - record.job.created).whole_seconds();
-                Some((completed_at, total_seconds as f64))
-            })
-            .collect();
-        samples.sort_by_key(|(completed_at, _)| std::cmp::Reverse(*completed_at));
-        samples.truncate(sample_size);
-        if samples.is_empty() {
+        let state = self.lock();
+        let mut times: Vec<f64> = if queue_name.starts_with("image-") {
+            let mut starts: Vec<(OffsetDateTime, OffsetDateTime)> = state
+                .records
+                .iter()
+                .filter(|record| {
+                    record.queue_name == queue_name && record.status == JobStatus::Completed
+                })
+                .filter_map(|record| Some((record.execution_started_at?, record.job.created)))
+                .collect();
+            starts.sort_by_key(|(started_at, _)| std::cmp::Reverse(*started_at));
+            starts
+                .windows(2)
+                .filter_map(|window| {
+                    let (newer_start, newer_created) = window[0];
+                    let (previous_start, _) = window[1];
+                    if newer_created > previous_start {
+                        return None;
+                    }
+                    let seconds = (newer_start - previous_start).whole_seconds();
+                    (seconds > 0).then_some(seconds as f64)
+                })
+                .take(sample_size)
+                .collect()
+        } else {
+            let mut samples: Vec<(OffsetDateTime, f64)> = state
+                .records
+                .iter()
+                .filter(|record| {
+                    record.queue_name == queue_name && record.status == JobStatus::Completed
+                })
+                .filter_map(|record| {
+                    let completed_at = record.completed_at?;
+                    let total_seconds = (completed_at - record.job.created).whole_seconds();
+                    Some((completed_at, total_seconds as f64))
+                })
+                .collect();
+            samples.sort_by_key(|(completed_at, _)| std::cmp::Reverse(*completed_at));
+            samples.truncate(sample_size);
+            samples.into_iter().map(|(_, seconds)| seconds).collect()
+        };
+        drop(state);
+        if times.is_empty() {
             return None;
         }
-        let mut times: Vec<f64> = samples.into_iter().map(|(_, seconds)| seconds).collect();
         times.sort_by(f64::total_cmp);
         let p5_threshold = percentile_cont(&times, 0.05);
         let p95_threshold = percentile_cont(&times, 0.95);
@@ -3493,7 +3519,7 @@ pub const QUEUE_ESTIMATE_MIN_SAMPLE_SIZE: usize = 5;
 const QUEUE_ESTIMATE_MIN_TIME: std::time::Duration = std::time::Duration::from_secs(30);
 const QUEUE_ESTIMATE_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
 
-/// Completion-time statistics over the recent clean (p5–p95) sample of one queue.
+/// Service-time statistics over the recent clean (p5–p95) sample of one queue.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CleanQueueStats {
     pub sample_count: usize,
@@ -4798,14 +4824,13 @@ mod tests {
         Ok(())
     }
 
-    fn complete_image_job(
+    fn complete_backlogged_image_job(
         queue: &InMemoryTaskQueue,
         queue_name: &str,
-        base: OffsetDateTime,
-        index: i64,
-        run_seconds: i64,
+        created: OffsetDateTime,
+        execution_started_at: OffsetDateTime,
+        completed_at: OffsetDateTime,
     ) -> Result<(), TaskQueueError> {
-        let created = base + time::Duration::seconds(index);
         let job_id = queue.assign(
             queue_name,
             new_image_gen_job_at(
@@ -4820,7 +4845,13 @@ mod tests {
                 created,
             ),
         );
-        queue.complete(job_id, created + time::Duration::seconds(run_seconds))
+        queue
+            .dequeue_matching(queue_name, "image-worker", execution_started_at, |job| {
+                job.data.job_type == JobType::ImageGen
+            })
+            .expect("seeded image job must dequeue");
+        queue.set_execution_started(job_id, execution_started_at)?;
+        queue.complete(job_id, completed_at)
     }
 
     #[test]
@@ -4828,9 +4859,25 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        for index in 0..20i64 {
-            let run_seconds = if index == 19 { 10_000 } else { 100 };
-            complete_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, now, index, run_seconds)?;
+        let created = now - TimeDuration::hours(3);
+        let mut execution_started_at = now;
+        complete_backlogged_image_job(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            created,
+            execution_started_at,
+            execution_started_at + TimeDuration::seconds(40),
+        )?;
+        for index in 1..=20i64 {
+            let cycle_seconds = if index == 20 { 10_000 } else { 100 };
+            execution_started_at += TimeDuration::seconds(cycle_seconds);
+            complete_backlogged_image_job(
+                &queue,
+                IMAGE_REGULAR_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(40),
+            )?;
         }
 
         let stats = queue
@@ -4851,12 +4898,76 @@ mod tests {
     }
 
     #[test]
+    fn image_queue_eta_uses_backlogged_start_cadence_not_queue_age()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let created = now - TimeDuration::hours(3);
+        for index in 0..7i64 {
+            let execution_started_at = now + TimeDuration::seconds(index * 45);
+            complete_backlogged_image_job(
+                &queue,
+                IMAGE_REGULAR_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(40),
+            )?;
+        }
+
+        assert_eq!(
+            queue.estimate_queue_time_for_depth(IMAGE_REGULAR_QUEUE_NAME, 10),
+            std::time::Duration::from_secs(450)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_queue_stats_ignore_idle_start_gap() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let created = now - TimeDuration::hours(3);
+        for index in 0..7i64 {
+            let execution_started_at = now + TimeDuration::seconds(index * 45);
+            complete_backlogged_image_job(
+                &queue,
+                IMAGE_REGULAR_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(40),
+            )?;
+        }
+        let after_idle = now + TimeDuration::hours(1);
+        complete_backlogged_image_job(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            after_idle,
+            after_idle,
+            after_idle + TimeDuration::seconds(40),
+        )?;
+
+        let stats = queue
+            .clean_queue_stats(IMAGE_REGULAR_QUEUE_NAME, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE)
+            .expect("backlogged image stats");
+        assert_eq!(stats.sample_count, 6);
+        assert_eq!(stats.avg_clean_time_seconds, 45.0);
+        Ok(())
+    }
+
+    #[test]
     fn estimate_queue_time_for_depth_uses_clean_stats_divided_by_active_workers()
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        for index in 0..QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
-            complete_image_job(&queue, IMAGE_VIP_QUEUE_NAME, now, index, 120)?;
+        let created = now - TimeDuration::hours(1);
+        for index in 0..=QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
+            let execution_started_at = now + TimeDuration::seconds(index * 120);
+            complete_backlogged_image_job(
+                &queue,
+                IMAGE_VIP_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(100),
+            )?;
         }
         queue.update_worker_heartbeat("image-vip-worker-0", now);
         queue.update_worker_heartbeat("image-vip-worker-1", now);
@@ -4875,8 +4986,15 @@ mod tests {
         );
 
         let floor_queue = InMemoryTaskQueue::new();
-        for index in 0..QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
-            complete_image_job(&floor_queue, IMAGE_REGULAR_QUEUE_NAME, now, index, 4)?;
+        for index in 0..=QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
+            let execution_started_at = now + TimeDuration::seconds(index * 4);
+            complete_backlogged_image_job(
+                &floor_queue,
+                IMAGE_REGULAR_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(3),
+            )?;
         }
         assert_eq!(
             floor_queue.estimate_queue_time_for_depth(IMAGE_REGULAR_QUEUE_NAME, 1),
@@ -4890,8 +5008,16 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        for index in 0..(QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 - 1) {
-            complete_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, now, index, 100)?;
+        let created = now - TimeDuration::hours(1);
+        for index in 0..QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
+            let execution_started_at = now + TimeDuration::seconds(index * 100);
+            complete_backlogged_image_job(
+                &queue,
+                IMAGE_REGULAR_QUEUE_NAME,
+                created + TimeDuration::seconds(index),
+                execution_started_at,
+                execution_started_at + TimeDuration::seconds(90),
+            )?;
         }
 
         assert_eq!(

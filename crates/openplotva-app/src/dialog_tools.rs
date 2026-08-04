@@ -4963,6 +4963,85 @@ mod tests {
         );
     }
 
+    fn seed_completed_backlogged_image_cycles(
+        queue: &InMemoryTaskQueue,
+        queue_name: &str,
+        cycle_seconds: i64,
+        job_count: i64,
+    ) {
+        let base = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
+        let created = base - time::Duration::hours(3);
+        for index in 0..job_count {
+            let job_id = queue.assign(
+                queue_name,
+                new_image_gen_job_at(
+                    ImageGenJobParams {
+                        chat_id: -700 - index,
+                        message_id: 1,
+                        user_id: 2_000 + index,
+                        user_full_name: "History".to_owned(),
+                        prompt: "history".to_owned(),
+                        ..ImageGenJobParams::default()
+                    },
+                    created + time::Duration::seconds(index),
+                )
+                .with_name("image")
+                .with_priority(DEFAULT_PRIORITY),
+            );
+            let execution_started_at = base + time::Duration::seconds(index * cycle_seconds);
+            queue
+                .dequeue_matching(queue_name, "image-worker", execution_started_at, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .expect("history image must dequeue");
+            queue
+                .set_execution_started(job_id, execution_started_at)
+                .expect("history execution start");
+            queue
+                .complete(
+                    job_id,
+                    execution_started_at + time::Duration::seconds(cycle_seconds - 5),
+                )
+                .expect("history image completion");
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_image_notice_uses_runtime_backlog_cadence() -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(false));
+        let notices = Arc::new(DrawQueueNoticeSenderStub::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_draw_image_vip_status(vip)
+            .with_draw_queue_notice_sender(Arc::clone(&notices) as Arc<dyn DrawQueueNoticeSender>);
+
+        seed_completed_backlogged_image_cycles(&queue, IMAGE_REGULAR_QUEUE_NAME, 45, 7);
+        for index in 0..10 {
+            seed_pending_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, DEFAULT_PRIORITY, index);
+        }
+
+        let scheduled = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 12,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        let sent = notices.notices();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].text,
+            "Заказ записан в очередь, перед вами <u>10</u> заказов. Примерное время ожидания: <u>7 мин. 30 сек.</u> (<a href=\"https://t.me/PlotvoBot?start=vip\">жми</a>, если не хочешь ждать)"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn schedule_image_sends_queue_notice_only_above_threshold_after_assignment()
     -> Result<(), ToolboxError> {
