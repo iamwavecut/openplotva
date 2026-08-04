@@ -2,7 +2,7 @@
 
 ## Goal
 
-Keep OpenPlotva's image workers recoverable when an AI Farm request stops making progress, and prevent sustained ASR or VIP traffic from starving older image work forever.
+Keep OpenPlotva's image workers recoverable when an AI Farm request stops making progress, prevent sustained accelerator traffic from starving older work forever, and preserve a ten-minute VIP escape above every non-VIP class.
 
 ## Scope
 
@@ -18,18 +18,20 @@ The failure is reported as a provider timeout containing the job ID and phase. E
 
 ASR, VIP image, and regular image jobs participate in one deterministic accelerator ranking at claim time:
 
-- Base priorities stay unchanged: ASR `6`, VIP `4`, regular `0`.
+- Base priorities are ASR `6`, VIP image `5`, and regular image `0`.
 - A ready or processing accelerator job gains one effective-priority point per five minutes since creation.
-- Effective priority is capped at `6`.
+- ASR and regular image work are capped at effective priority `6`.
+- VIP image work reaches `6` after five minutes and its dedicated ceiling `7` after ten minutes.
+- Legacy persisted `image-vip` jobs with base priority `4` are treated as base priority `5` during claim arbitration, so deployment does not delay jobs already waiting.
 - Ties use the existing oldest-created, then lowest-ID order.
 
-Therefore an old VIP job reaches parity with fresh ASR after 10 minutes, and an old regular job reaches parity after 30 minutes. These are eligibility guarantees, not generation-completion guarantees. Future-dated timestamps receive no boost.
+Therefore an old regular job reaches parity with ASR after 30 minutes but can never reach VIP's ten-minute priority `7`. A VIP job may remain behind an older priority-6 job before ten minutes; at ten minutes it outranks every ASR and regular job. These are eligibility guarantees, not generation-completion guarantees. Future-dated timestamps receive no boost.
 
 The ranking applies to ASR claims as well as image claims. Fresh ASR still preempts fresh image work. Once an aged image ranks first, new ASR claims wait until that aged work has been claimed and no longer ranks ahead. Existing already-running work is never cancelled.
 
 ## Compatibility
 
-Queue names, persisted priorities, job payloads, WAL format, provider routing, retries, Telegram delivery, and database schemas remain unchanged. Aging is computed at claim time and requires no migration or new persisted fields.
+Queue names, job payloads, WAL format, provider routing, retries, Telegram delivery, and database schemas remain unchanged. Newly scheduled VIP image jobs persist priority `5`; existing priority-`4` VIP image jobs are normalized only for claim ranking. Aging is computed at claim time and requires no migration or new persisted fields.
 
 ## Verification
 
@@ -38,7 +40,9 @@ Regression tests must prove:
 - a hanging draw submission returns through the watchdog instead of pinning the caller;
 - a hanging draw status poll returns through the same deadline;
 - fresh ASR still precedes fresh VIP and regular work;
-- VIP reaches ASR parity after 10 minutes;
-- regular reaches ASR parity after 30 minutes but not before;
+- new VIP image jobs persist base priority `5`;
+- VIP remains at most priority `6` at `09:59` and reaches priority `7` at `10:00`;
+- legacy priority-`4` VIP image jobs receive the same `10:00` priority-`7` claim behavior;
+- regular reaches ASR parity at priority `6` after 30 minutes but never exceeds it;
 - an aged processing draw prevents fresh ASR from extending starvation;
 - all existing Taskman and image-job tests remain green.
