@@ -10,7 +10,7 @@ This is one OpenPlotva PR. It changes the Taskman accelerator claim policy and t
 
 ## Inference watchdog
 
-Every Discovery draw attempt receives one absolute deadline covering submission and all status polls. The existing routed provider timeout remains the source of the deadline; the default is 600 seconds. Each transport future is polled through `tokio::time::timeout_at`, so a stalled connect, request body, or status response is cancelled when the deadline expires.
+Every Discovery draw attempt receives one absolute deadline covering submission and all status polls. The existing routed provider timeout remains the source of the deadline; the default is 300 seconds. Each transport future is polled through `tokio::time::timeout_at`, so a stalled connect, request body, or status response is cancelled when the deadline expires.
 
 The failure is reported as a provider timeout containing the job ID and phase. Existing image retry classification and attempt limits remain authoritative. No independent requeue loop is introduced, avoiding duplicate ownership of a still-running Taskman job.
 

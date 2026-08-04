@@ -66,7 +66,7 @@ pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
 pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
 pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
-pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(600);
+pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
@@ -6877,6 +6877,14 @@ mod tests {
         assert_eq!(
             openplotva_llm::retry::retryable_reason_from_message(&format!("job failed: {message}")),
             Some(openplotva_llm::retry::FailureReason::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn aifarm_draw_api_default_watchdog_is_five_minutes() {
+        assert_eq!(
+            AifarmDrawApiConfig::default().with_defaults().timeout,
+            StdDuration::from_secs(5 * 60)
         );
     }
 

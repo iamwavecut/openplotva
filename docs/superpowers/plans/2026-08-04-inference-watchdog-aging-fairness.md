@@ -13,7 +13,7 @@
 - Deliver one ready PR against `main`.
 - Preserve queue names, stored priorities, payloads, WAL shape, retries, and routing.
 - Use a 300-second aging step and cap effective accelerator priority at `ASR_PRIORITY`.
-- Use the configured draw timeout as one absolute submit-plus-poll watchdog deadline.
+- Use the configured draw timeout, defaulting to 300 seconds, as one absolute submit-plus-poll watchdog deadline.
 - Do not add dependencies or database migrations.
 
 ---
