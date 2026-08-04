@@ -18,10 +18,10 @@ use openplotva_dialog::{
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
-    DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
-    ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, MUSIC_VIP_QUEUE_NAME,
-    MusicGenJobParams, fallback_queue_time_estimate, format_duration_ru, format_go_duration,
-    new_image_edit_job_at, new_image_gen_job_at, new_music_gen_job_at,
+    DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_PRIORITY,
+    IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue,
+    MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, fallback_queue_time_estimate, format_duration_ru,
+    format_go_duration, new_image_edit_job_at, new_image_gen_job_at, new_music_gen_job_at,
 };
 use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -1055,12 +1055,14 @@ impl TaskmanDialogToolAdapter {
     /// Queue position the next job would take, measured before it is assigned
     /// (Go imageQueuePosition parity: VIP counts only top-priority jobs ahead).
     fn image_queue_position(&self, plan: ImageGenQueuePlan) -> usize {
-        let depth = if plan.priority == HIGHEST_PRIORITY {
-            self.queue.queue_depth(plan.queue_name, HIGHEST_PRIORITY)
+        let minimum_priority = if plan.queue_name == IMAGE_VIP_QUEUE_NAME {
+            HIGHEST_PRIORITY
         } else {
-            self.queue
-                .queue_depth_for_priority_or_higher(plan.queue_name, plan.priority)
+            plan.priority
         };
+        let depth = self
+            .queue
+            .queue_depth_for_priority_or_higher(plan.queue_name, minimum_priority);
         depth + 1
     }
 
@@ -1708,7 +1710,7 @@ fn image_gen_queue_plan(has_vip: bool) -> ImageGenQueuePlan {
     if has_vip {
         return ImageGenQueuePlan {
             queue_name: IMAGE_VIP_QUEUE_NAME,
-            priority: HIGHEST_PRIORITY,
+            priority: IMAGE_VIP_PRIORITY,
             max_active_jobs: 10,
         };
     }
@@ -5214,7 +5216,7 @@ mod tests {
         assert_eq!(scheduled.status, "scheduled");
         assert_eq!(vip.calls(), vec![42]);
         assert_eq!(queue.records()[0].queue_name, IMAGE_VIP_QUEUE_NAME);
-        assert_eq!(queue.records()[0].job.priority, HIGHEST_PRIORITY);
+        assert_eq!(queue.records()[0].job.priority, 5);
 
         for idx in 0..9 {
             queue.assign(
@@ -5748,7 +5750,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].queue_name, IMAGE_VIP_QUEUE_NAME);
         assert_eq!(records[0].job.title, "image_edit");
-        assert_eq!(records[0].job.priority, HIGHEST_PRIORITY);
+        assert_eq!(records[0].job.priority, 5);
         assert_eq!(
             records[0].job.data.job_type,
             openplotva_taskman::JobType::ImageEdit

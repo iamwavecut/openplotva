@@ -21,10 +21,12 @@ pub const DEFAULT_PRIORITY: Priority = 0;
 pub const HIGH_PRIORITY: Priority = 2;
 pub const HIGHEST_PRIORITY: Priority = 4;
 pub const ASR_PRIORITY: Priority = HIGHEST_PRIORITY + 2;
+pub const IMAGE_VIP_PRIORITY: Priority = HIGHEST_PRIORITY + 1;
 pub const TRANSACTION_PRIORITY: Priority = ASR_PRIORITY + 2;
 pub const LOW_PRIORITY: Priority = -2;
 pub const LOWEST_PRIORITY: Priority = -4;
 pub const ACCELERATOR_PRIORITY_AGING_INTERVAL_SECONDS: i64 = 5 * 60;
+const IMAGE_VIP_PRIORITY_CEILING: Priority = ASR_PRIORITY + 1;
 
 pub const TEXT_QUEUE_NAME: &str = "text";
 pub const IMAGE_REGULAR_QUEUE_NAME: &str = "image-regular";
@@ -3313,11 +3315,25 @@ fn compare_accelerator_records(
 }
 
 fn accelerator_effective_priority(record: &TaskQueueRecord, now: OffsetDateTime) -> Priority {
+    let is_vip_image = record.queue_name == IMAGE_VIP_QUEUE_NAME
+        && matches!(
+            record.job.data.job_type,
+            JobType::ImageGen | JobType::ImageEdit
+        );
+    let (base_priority, ceiling) = if is_vip_image {
+        // The floor upgrades already-persisted priority-4 VIP jobs without rewriting queue state.
+        (
+            record.job.priority.max(IMAGE_VIP_PRIORITY),
+            IMAGE_VIP_PRIORITY_CEILING,
+        )
+    } else {
+        (record.job.priority, ASR_PRIORITY)
+    };
     let age_seconds = (now - record.job.created).whole_seconds().max(0);
     let earned = age_seconds / ACCELERATOR_PRIORITY_AGING_INTERVAL_SECONDS;
-    let available = i64::from(ASR_PRIORITY.saturating_sub(record.job.priority).max(0));
+    let available = i64::from(ceiling.saturating_sub(base_priority).max(0));
     let boost = earned.min(available) as Priority;
-    record.job.priority.saturating_add(boost)
+    base_priority.saturating_add(boost)
 }
 
 fn task_queue_record_is_available(record: &TaskQueueRecord, now: OffsetDateTime) -> bool {
@@ -3643,12 +3659,13 @@ mod tests {
         QUEUE_ESTIMATE_MIN_SAMPLE_SIZE, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
         TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
         TaskQueueRecord, TaskQueueSchedule, TaskQueueScheduleDisposition, TaskQueueWalRecord,
-        TaskQueueWalSink, asr_job_params_from_stateless_job, decode_task_queue_snapshot,
-        encode_task_queue_snapshot, fallback_queue_time_estimate, format_duration_ru,
-        image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
-        music_gen_job_params_from_stateless_job, new_agent_job_at, new_asr_job_at,
-        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
-        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
+        TaskQueueWalSink, accelerator_effective_priority, asr_job_params_from_stateless_job,
+        decode_task_queue_snapshot, encode_task_queue_snapshot, fallback_queue_time_estimate,
+        format_duration_ru, image_edit_job_params_from_stateless_job,
+        image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
+        new_agent_job_at, new_asr_job_at, new_control_job_at, new_dialog_job_at,
+        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
+        new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -4643,6 +4660,36 @@ mod tests {
                 now,
             ),
         );
+        let aged_regular_record = at_boundary
+            .record(aged_regular)
+            .expect("aged regular draw record");
+        assert_eq!(
+            accelerator_effective_priority(&aged_regular_record, now),
+            6,
+            "non-VIP accelerator work must not age beyond priority six"
+        );
+        let long_aged_queue = InMemoryTaskQueue::new();
+        let long_aged_regular = long_aged_queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 22,
+                    user_id: 2,
+                    prompt: "long-aged-regular".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::hours(1),
+            ),
+        );
+        let long_aged_regular_record = long_aged_queue
+            .record(long_aged_regular)
+            .expect("long-aged regular draw record");
+        assert_eq!(
+            accelerator_effective_priority(&long_aged_regular_record, now),
+            6,
+            "additional waiting must not lift regular work above priority six"
+        );
         assert!(
             at_boundary
                 .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
@@ -4663,16 +4710,72 @@ mod tests {
     }
 
     #[test]
-    fn vip_draw_aging_changes_rank_at_ten_minute_boundary() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn vip_draw_reaches_priority_seven_at_ten_minutes() -> Result<(), Box<dyn std::error::Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let aged_vip = queue.assign(
+
+        let before_boundary = InMemoryTaskQueue::new();
+        let before_regular = before_boundary.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "regular-before-boundary".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::minutes(30),
+            ),
+        );
+        let before_vip = before_boundary.assign(
             IMAGE_VIP_QUEUE_NAME,
             new_image_edit_job_at(
                 ImageEditJobParams {
                     chat_id: 1,
-                    message_id: 10,
+                    message_id: 11,
+                    user_id: 2,
+                    prompt: "vip-before-boundary".to_owned(),
+                    photo_file_id: "photo".to_owned(),
+                    ..ImageEditJobParams::default()
+                },
+                now - time::Duration::seconds(10 * 60 - 1),
+            )
+            .with_priority(5),
+        );
+        let before_vip_record = before_boundary
+            .record(before_vip)
+            .expect("VIP draw before ten-minute boundary");
+        assert_eq!(accelerator_effective_priority(&before_vip_record, now), 6);
+        assert_eq!(
+            before_boundary
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(before_regular),
+            "before ten minutes an older non-VIP job at priority six still wins"
+        );
+
+        let at_boundary = InMemoryTaskQueue::new();
+        let regular = at_boundary.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 20,
+                    user_id: 2,
+                    prompt: "regular-at-boundary".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::minutes(30),
+            ),
+        );
+        let aged_vip = at_boundary.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_edit_job_at(
+                ImageEditJobParams {
+                    chat_id: 1,
+                    message_id: 21,
                     user_id: 2,
                     prompt: "vip-at-boundary".to_owned(),
                     photo_file_id: "photo".to_owned(),
@@ -4680,38 +4783,56 @@ mod tests {
                 },
                 now - time::Duration::minutes(10),
             )
-            .with_priority(HIGHEST_PRIORITY),
+            .with_priority(5),
         );
-        queue.assign(
-            ASR_GPU1_QUEUE_NAME,
-            new_asr_job_at(
-                AsrJobParams {
-                    chat_id: 1,
-                    message_id: 11,
-                    user_id: 2,
-                    file_unique_id: "voice".to_owned(),
-                    duration_seconds: 4,
-                    ..AsrJobParams::default()
-                },
-                now,
-            ),
-        );
+        let regular_record = at_boundary.record(regular).expect("regular draw record");
+        let aged_vip_record = at_boundary.record(aged_vip).expect("aged VIP draw record");
+        assert_eq!(accelerator_effective_priority(&regular_record, now), 6);
+        assert_eq!(accelerator_effective_priority(&aged_vip_record, now), 7);
 
         assert!(
-            queue
-                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
-                    job.data.job_type == JobType::Asr
+            at_boundary
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
                 })
                 .is_none(),
-            "a VIP draw waiting ten minutes must rank ahead of fresh ASR"
+            "at ten minutes a VIP draw at priority seven must block non-VIP work"
         );
         assert_eq!(
-            queue
+            at_boundary
                 .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, |job| {
                     job.data.job_type == JobType::ImageEdit
                 })
                 .map(|work| work.id),
             Some(aged_vip)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_vip_priority_four_uses_new_claim_ceiling() -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let legacy_vip = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "legacy VIP".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::minutes(10),
+            )
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        let legacy_vip_record = queue.record(legacy_vip).expect("legacy VIP draw record");
+
+        assert_eq!(
+            accelerator_effective_priority(&legacy_vip_record, now),
+            7,
+            "persisted VIP jobs at the former base priority must receive the new ranking"
         );
         Ok(())
     }
