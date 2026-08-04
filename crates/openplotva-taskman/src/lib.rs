@@ -24,6 +24,7 @@ pub const ASR_PRIORITY: Priority = HIGHEST_PRIORITY + 2;
 pub const TRANSACTION_PRIORITY: Priority = ASR_PRIORITY + 2;
 pub const LOW_PRIORITY: Priority = -2;
 pub const LOWEST_PRIORITY: Priority = -4;
+pub const ACCELERATOR_PRIORITY_AGING_INTERVAL_SECONDS: i64 = 5 * 60;
 
 pub const TEXT_QUEUE_NAME: &str = "text";
 pub const IMAGE_REGULAR_QUEUE_NAME: &str = "image-regular";
@@ -3239,36 +3240,58 @@ fn next_pending_index_matching(
             !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
         })
         .filter(|(_index, record)| {
-            !image_work_blocked_by_higher_priority_accelerator_work(records, record, now)
+            !accelerator_work_blocked_by_higher_ranked_work(records, record, now)
         })
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
 }
 
-/// Preserve accelerator priority across separate ASR, VIP-image, and regular-
-/// image worker queues. This is evaluated while the queue state is locked, so
-/// a lower-priority draw claim cannot race already queued higher-priority work.
-fn image_work_blocked_by_higher_priority_accelerator_work(
+/// Arbitrate separate ASR, VIP-image, and regular-image workers while the queue
+/// state is locked. Waiting jobs age to the ASR priority ceiling, after which
+/// the existing creation-time and ID order guarantees eventual eligibility.
+fn accelerator_work_blocked_by_higher_ranked_work(
     records: &[TaskQueueRecord],
     candidate: &TaskQueueRecord,
     now: OffsetDateTime,
 ) -> bool {
-    if !matches!(
-        candidate.job.data.job_type,
-        JobType::ImageGen | JobType::ImageEdit
-    ) {
+    if !is_accelerator_record(candidate) {
         return false;
     }
     records.iter().any(|record| {
-        (record.status == JobStatus::Processing
-            || (record.status == JobStatus::Pending && task_queue_record_is_available(record, now)))
-            && matches!(
-                record.job.data.job_type,
-                JobType::Asr | JobType::ImageGen | JobType::ImageEdit
-            )
-            && record.job.priority > candidate.job.priority
+        record.id != candidate.id
+            && (record.status == JobStatus::Processing
+                || (record.status == JobStatus::Pending
+                    && task_queue_record_is_available(record, now)))
+            && is_accelerator_record(record)
+            && compare_accelerator_records(record, candidate, now).is_lt()
     })
+}
+
+fn is_accelerator_record(record: &TaskQueueRecord) -> bool {
+    matches!(
+        record.job.data.job_type,
+        JobType::Asr | JobType::ImageGen | JobType::ImageEdit
+    )
+}
+
+fn compare_accelerator_records(
+    left: &TaskQueueRecord,
+    right: &TaskQueueRecord,
+    now: OffsetDateTime,
+) -> std::cmp::Ordering {
+    accelerator_effective_priority(right, now)
+        .cmp(&accelerator_effective_priority(left, now))
+        .then_with(|| left.job.created.cmp(&right.job.created))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn accelerator_effective_priority(record: &TaskQueueRecord, now: OffsetDateTime) -> Priority {
+    let age_seconds = (now - record.job.created).whole_seconds().max(0);
+    let earned = age_seconds / ACCELERATOR_PRIORITY_AGING_INTERVAL_SECONDS;
+    let available = i64::from(ASR_PRIORITY.saturating_sub(record.job.priority).max(0));
+    let boost = earned.min(available) as Priority;
+    record.job.priority.saturating_add(boost)
 }
 
 fn task_queue_record_is_available(record: &TaskQueueRecord, now: OffsetDateTime) -> bool {
@@ -4514,6 +4537,207 @@ mod tests {
                 })
                 .map(|work| work.id),
             Some(regular)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regular_draw_aging_changes_rank_at_thirty_minute_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        let before_boundary = InMemoryTaskQueue::new();
+        let before_regular = before_boundary.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "regular-before-boundary".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::seconds(30 * 60 - 1),
+            ),
+        );
+        let before_asr = before_boundary.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 11,
+                    user_id: 2,
+                    file_unique_id: "voice-before-boundary".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+        assert_eq!(
+            before_boundary
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .map(|work| work.id),
+            Some(before_asr)
+        );
+        assert_eq!(
+            before_boundary
+                .record(before_regular)
+                .map(|record| record.status),
+            Some(JobStatus::Pending)
+        );
+
+        let at_boundary = InMemoryTaskQueue::new();
+        let aged_regular = at_boundary.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 20,
+                    user_id: 2,
+                    prompt: "regular-at-boundary".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now - time::Duration::minutes(30),
+            ),
+        );
+        at_boundary.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 21,
+                    user_id: 2,
+                    file_unique_id: "voice-at-boundary".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+        assert!(
+            at_boundary
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .is_none(),
+            "a regular draw waiting thirty minutes must rank ahead of fresh ASR"
+        );
+        assert_eq!(
+            at_boundary
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(aged_regular)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vip_draw_aging_changes_rank_at_ten_minute_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let aged_vip = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_edit_job_at(
+                ImageEditJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "vip-at-boundary".to_owned(),
+                    photo_file_id: "photo".to_owned(),
+                    ..ImageEditJobParams::default()
+                },
+                now - time::Duration::minutes(10),
+            )
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        queue.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 11,
+                    user_id: 2,
+                    file_unique_id: "voice".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+
+        assert!(
+            queue
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .is_none(),
+            "a VIP draw waiting ten minutes must rank ahead of fresh ASR"
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, |job| {
+                    job.data.job_type == JobType::ImageEdit
+                })
+                .map(|work| work.id),
+            Some(aged_vip)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aged_processing_draw_blocks_fresh_asr_claim() -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let created = now - time::Duration::minutes(30);
+        let queue = InMemoryTaskQueue::new();
+        let draw = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "aged-processing-draw".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                created,
+            ),
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "draw-worker", created, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(draw)
+        );
+        queue.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 11,
+                    user_id: 2,
+                    file_unique_id: "fresh-voice".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+
+        assert!(
+            queue
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .is_none(),
+            "fresh ASR must not extend starvation after an aged draw starts"
         );
         Ok(())
     }
