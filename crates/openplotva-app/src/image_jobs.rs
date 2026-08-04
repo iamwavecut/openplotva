@@ -15,10 +15,10 @@ use openplotva_config::AppConfig;
 use openplotva_core::ChatMessageMeta;
 use openplotva_dialog::sanitize_tool_text;
 use openplotva_llm::aifarm::{
-    AifarmHttpMethod, AifarmHttpRequest, AifarmHttpTransport, DiscoveryInvocation,
-    DiscoveryJobEnvelope, DiscoveryJobRequest, DiscoveryJobResult, ReqwestAifarmTransport,
-    decode_discovery_body, is_failure_status, is_queued_status, is_running_status,
-    is_success_status, parse_job_error,
+    AifarmHttpMethod, AifarmHttpRequest, AifarmHttpResponse, AifarmHttpTransport,
+    DiscoveryInvocation, DiscoveryJobEnvelope, DiscoveryJobRequest, DiscoveryJobResult,
+    ReqwestAifarmTransport, decode_discovery_body, is_failure_status, is_queued_status,
+    is_running_status, is_success_status, parse_job_error,
 };
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_taskman::{
@@ -66,7 +66,7 @@ pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
 pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
 pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
-pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(600);
+pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
@@ -742,8 +742,9 @@ where
         }
         let payload = draw_api_payload(&prompt, &[], draw_api_dimensions(&request.aspect_ratio))
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
-        let job_id = self.submit_draw_api_job(job_id, payload).await?;
-        let mut result = self.wait_draw_api_job(&job_id).await?;
+        let deadline = Instant::now() + self.cfg.timeout;
+        let job_id = self.submit_draw_api_job(job_id, payload, deadline).await?;
+        let mut result = self.wait_draw_api_job(&job_id, deadline).await?;
         if result.images.is_empty() && result.urls.is_empty() {
             return Err(ImageGenerationError::Provider(
                 "job completed but produced no images".to_owned(),
@@ -787,12 +788,13 @@ where
         }
         let payload = draw_api_payload(&prompt, &image_inputs, None)
             .map_err(|err| ImageEditError::Provider(err.to_string()))?;
+        let deadline = Instant::now() + self.cfg.timeout;
         let job_id = self
-            .submit_draw_api_job(job_id, payload)
+            .submit_draw_api_job(job_id, payload, deadline)
             .await
             .map_err(ImageEditError::from)?;
         let result = self
-            .wait_draw_api_job(&job_id)
+            .wait_draw_api_job(&job_id, deadline)
             .await
             .map_err(ImageEditError::from)?;
         if result.images.is_empty() && result.urls.is_empty() {
@@ -810,6 +812,7 @@ where
         &self,
         job_id: &str,
         payload: Vec<u8>,
+        deadline: Instant,
     ) -> Result<String, ImageGenerationError> {
         let job_id = if job_id.trim().is_empty() {
             generated_draw_job_id()
@@ -834,15 +837,18 @@ where
         let body = serde_json::to_vec(&request)
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Post,
-                url: self.cfg.endpoint("/v1/jobs"),
-                headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
-                body,
-            })
-            .await
-            .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
+            .send_draw_api_request(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Post,
+                    url: self.cfg.endpoint("/v1/jobs"),
+                    headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
+                    body,
+                },
+                deadline,
+                &job_id,
+                "submitting draw job",
+            )
+            .await?;
         if !(200..300).contains(&response.status_code) {
             return Err(ImageGenerationError::Provider(format!(
                 "generation request failed: status {}: {}",
@@ -867,10 +873,10 @@ where
     async fn wait_draw_api_job(
         &self,
         job_id: &str,
+        deadline: Instant,
     ) -> Result<DrawApiGenerateResult, ImageGenerationError> {
-        let deadline = Instant::now() + self.cfg.timeout;
         loop {
-            let status = self.check_draw_api_job(job_id).await?;
+            let status = self.check_draw_api_job(job_id, deadline).await?;
             match evaluate_draw_api_status(&status) {
                 DrawApiWaitDecision::Done(result) => return Ok(result),
                 DrawApiWaitDecision::Failed(message) => {
@@ -879,32 +885,38 @@ where
                 DrawApiWaitDecision::Continue => {}
             }
             if Instant::now() >= deadline {
-                return Err(ImageGenerationError::Provider(format!(
-                    "timeout waiting for job {job_id}"
-                )));
+                return Err(draw_api_watchdog_error(job_id, "waiting to poll draw job"));
             }
-            tokio::time::sleep(self.cfg.poll_interval).await;
+            let next_poll = (Instant::now() + self.cfg.poll_interval).min(deadline);
+            tokio::time::sleep_until(next_poll).await;
+            if Instant::now() >= deadline {
+                return Err(draw_api_watchdog_error(job_id, "waiting to poll draw job"));
+            }
         }
     }
 
     async fn check_draw_api_job(
         &self,
         job_id: &str,
+        deadline: Instant,
     ) -> Result<DrawApiJobStatus, ImageGenerationError> {
         let job_id = job_id.trim();
         if job_id.is_empty() {
             return Err(ImageGenerationError::Provider("job ID is empty".to_owned()));
         }
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Get,
-                url: self.cfg.endpoint(&format!("/v1/jobs/{job_id}")),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-            })
-            .await
-            .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
+            .send_draw_api_request(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Get,
+                    url: self.cfg.endpoint(&format!("/v1/jobs/{job_id}")),
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                },
+                deadline,
+                job_id,
+                "polling draw job",
+            )
+            .await?;
         if !(200..300).contains(&response.status_code) {
             return Err(ImageGenerationError::Provider(format!(
                 "status {}: {}",
@@ -918,6 +930,27 @@ where
             })?;
         draw_api_status_from_envelope(job_id, &envelope)
     }
+
+    async fn send_draw_api_request(
+        &self,
+        request: AifarmHttpRequest,
+        deadline: Instant,
+        job_id: &str,
+        phase: &str,
+    ) -> Result<AifarmHttpResponse, ImageGenerationError> {
+        match tokio::time::timeout_at(deadline, self.transport.send(request)).await {
+            Ok(response) => {
+                response.map_err(|error| ImageGenerationError::Provider(error.to_string()))
+            }
+            Err(_) => Err(draw_api_watchdog_error(job_id, phase)),
+        }
+    }
+}
+
+fn draw_api_watchdog_error(job_id: &str, phase: &str) -> ImageGenerationError {
+    ImageGenerationError::Provider(format!(
+        "draw-api provider timeout: inference watchdog expired while {phase} {job_id}"
+    ))
 }
 
 fn add_flux_watermark(encoded: &[u8]) -> Result<Vec<u8>, String> {
@@ -6847,6 +6880,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aifarm_draw_api_default_watchdog_is_five_minutes() {
+        assert_eq!(
+            AifarmDrawApiConfig::default().with_defaults().timeout,
+            StdDuration::from_secs(5 * 60)
+        );
+    }
+
     #[tokio::test]
     async fn aifarm_draw_api_generator_submits_go_shaped_job_and_polls_result() {
         let source_image = encode_solid_png(4, 4, image::Rgba([10, 20, 30, 255]));
@@ -6928,6 +6969,113 @@ mod tests {
         );
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
         assert_eq!(requests[1].url, "https://draw.example.test/v1/jobs/job-1");
+    }
+
+    #[tokio::test]
+    async fn aifarm_draw_api_watchdog_bounds_hanging_submission() {
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_millis(50),
+                poll_interval: StdDuration::from_millis(10),
+            },
+            HangingAifarmTransport::new(Vec::new()),
+        );
+
+        let result = tokio::time::timeout(
+            StdDuration::from_millis(500),
+            generator.generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "castle".to_owned(),
+                    caption_text: "castle".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "draw-hanging-submit",
+            ),
+        )
+        .await
+        .expect("configured inference watchdog must beat the outer safety timeout")
+        .expect_err("hanging submission must fail");
+
+        assert!(result.message().contains("inference watchdog"));
+        assert!(result.message().contains("submitting draw job"));
+        assert!(result.message().contains("draw-hanging-submit"));
+    }
+
+    #[tokio::test]
+    async fn aifarm_draw_api_watchdog_bounds_hanging_status_poll() {
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_millis(50),
+                poll_interval: StdDuration::from_millis(10),
+            },
+            HangingAifarmTransport::new(vec![Ok(json_response(json!({
+                "job_id": "draw-hanging-poll",
+                "state": "queued"
+            })))]),
+        );
+
+        let result = tokio::time::timeout(
+            StdDuration::from_millis(500),
+            generator.generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "castle".to_owned(),
+                    caption_text: "castle".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "draw-hanging-poll",
+            ),
+        )
+        .await
+        .expect("configured inference watchdog must beat the outer safety timeout")
+        .expect_err("hanging status poll must fail");
+
+        assert!(result.message().contains("inference watchdog"));
+        assert!(result.message().contains("polling draw job"));
+        assert!(result.message().contains("draw-hanging-poll"));
+    }
+
+    #[tokio::test]
+    async fn aifarm_draw_api_watchdog_caps_poll_sleep_at_deadline() {
+        let queued = || {
+            Ok(json_response(json!({
+                "job_id": "draw-slow-poll",
+                "state": "queued"
+            })))
+        };
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_millis(50),
+                poll_interval: StdDuration::from_secs(5),
+            },
+            HangingAifarmTransport::new(vec![queued(), queued()]),
+        );
+
+        let result = tokio::time::timeout(
+            StdDuration::from_millis(500),
+            generator.generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "castle".to_owned(),
+                    caption_text: "castle".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "draw-slow-poll",
+            ),
+        )
+        .await
+        .expect("configured inference watchdog must cap the polling sleep")
+        .expect_err("unfinished job must time out");
+
+        assert!(result.message().contains("inference watchdog"));
+        assert!(result.message().contains("draw-slow-poll"));
     }
 
     #[tokio::test]
@@ -7499,6 +7647,35 @@ mod tests {
                     .responses
                     .pop_front()
                     .unwrap_or_else(|| Ok(AifarmHttpResponse::default()))
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HangingAifarmTransport {
+        responses_before_hang: Arc<Mutex<VecDeque<Result<AifarmHttpResponse, CompletionError>>>>,
+    }
+
+    impl HangingAifarmTransport {
+        fn new(responses_before_hang: Vec<Result<AifarmHttpResponse, CompletionError>>) -> Self {
+            Self {
+                responses_before_hang: Arc::new(Mutex::new(responses_before_hang.into())),
+            }
+        }
+    }
+
+    impl AifarmHttpTransport for HangingAifarmTransport {
+        fn send<'a>(&'a self, _request: AifarmHttpRequest) -> AifarmHttpFuture<'a> {
+            let response = self
+                .responses_before_hang
+                .lock()
+                .expect("hanging aifarm state")
+                .pop_front();
+            Box::pin(async move {
+                match response {
+                    Some(response) => response,
+                    None => std::future::pending().await,
+                }
             })
         }
     }
