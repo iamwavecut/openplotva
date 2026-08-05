@@ -76,6 +76,8 @@ It then orders dialog fallbacks as Bonsai `0` and Gemini `99`, disables the hist
 
 Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-storage memory_routing_cascades -- --nocapture`
 
+Run with a disposable PostgreSQL DSN: `OPENPLOTVA_TEST_POSTGRES_DSN=<dsn> CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-storage live_memory_routing_migration_preserves_operator_pool_and_prior_assignments -- --nocapture`
+
 Expected: all matching tests pass; the optional PostgreSQL test skips when its DSN is absent.
 
 ### Task 2: Separate extraction and subject-merge adapters
@@ -149,7 +151,7 @@ Update/add model-routing tests so the memory backfill target is asserted as `mem
 
 - [ ] **Step 2: Run the focused test and confirm failure**
 
-Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app memory_vram -- --nocapture`
+Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app subject_merge_targets_resolve_without_vram_catalog -- --nocapture`
 
 Expected: the new key assertion fails against the historical constant.
 
@@ -159,7 +161,9 @@ Replace only LLM workflow references with `memory_extraction`. Keep taskman queu
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app memory_vram -- --nocapture`
+Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app subject_merge_targets_resolve_without_vram_catalog -- --nocapture`
+
+Run with a disposable PostgreSQL DSN: `OPENPLOTVA_TEST_POSTGRES_DSN=<dsn> CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app live_memory_backfill_is_atomic_and_subject_merge_does_not_wait_for_vram -- --nocapture`
 
 Expected: pass.
 
@@ -184,7 +188,11 @@ Expected: both succeed with no formatting errors.
 
 Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-storage memory_routing_cascades -- --nocapture`
 
+Run with a disposable PostgreSQL DSN: `OPENPLOTVA_TEST_POSTGRES_DSN=<dsn> CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-storage live_memory_routing_migration_preserves_operator_pool_and_prior_assignments -- --nocapture`
+
 Run: `CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app routed_memory_adapters_use_independent_workflows`
+
+Run with a disposable PostgreSQL DSN: `OPENPLOTVA_TEST_POSTGRES_DSN=<dsn> CARGO_TARGET_DIR=/tmp/openplotva-memory-routing-cascades-target cargo test -p openplotva-app live_memory_backfill_is_atomic_and_subject_merge_does_not_wait_for_vram -- --nocapture`
 
 Expected: pass.
 
