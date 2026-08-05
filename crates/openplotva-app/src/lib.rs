@@ -10484,12 +10484,14 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to backfill capacity pools");
     }
-    if let Err(error) = model_routing::backfill_memory_vram_pool(&service_clients.postgres).await {
+    if let Err(error) =
+        model_routing::backfill_memory_routing_cascades(&service_clients.postgres).await
+    {
         routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
-            "backfill_memory_vram_pool",
+            "backfill_memory_routing_cascades",
             &error.to_string(),
         ));
-        tracing::warn!(%error, "failed to route memory consolidation onto the vram pool");
+        tracing::warn!(%error, "failed to backfill independent memory routing cascades");
     }
     match openrouter_free_pool::load_pool_config(&service_clients.postgres).await {
         Ok(pool_config) if pool_config.refresh_on_startup => {
@@ -11841,7 +11843,7 @@ async fn start_runtime_workers(
         let memory_workers_cap = config.persistent_queue.memory_workers_cap.max(1);
         let derived_memory_workers = openplotva_llm::router::derived_worker_count(
             &router_handle.snapshot(),
-            "memory_consolidation",
+            memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY,
             1,
             u32::try_from(memory_workers_cap).unwrap_or(1),
         );
@@ -11908,7 +11910,17 @@ async fn start_runtime_workers(
             );
         }
         if config.memory.subject_merge_enabled {
-            let merge_merger = memory_runtime::subject_merger_from_app_config(config);
+            let merge_merger = memory_runtime::routed_subject_merger_from_app_config(
+                config,
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                .with_reporter(routing_event_reporter.clone()),
+            );
             let merge_store = memory_store.clone();
             let merge_embedder = memory_write_embedder.clone();
             let merge_cfg = memory_runtime::MemorySubjectMergeConfig {

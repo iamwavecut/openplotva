@@ -44,6 +44,8 @@ pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX: &str = "memory-consolidation-worker";
+pub const MEMORY_EXTRACTION_WORKFLOW_KEY: &str = "memory_extraction";
+pub const MEMORY_SUBJECT_MERGE_WORKFLOW_KEY: &str = "memory_subject_merge";
 const MEMORY_RETRIEVAL_QUERY_TASK: &str = "Conversational query for scoped memory retrieval";
 const MEMORY_CARD_EMBEDDING_TASK: &str = "Memory card for scoped conversational retrieval";
 const MEMORY_EPISODE_EMBEDDING_TASK: &str =
@@ -3373,18 +3375,6 @@ pub fn aifarm_memory_extractor_config_from_app_config(
     aifarm_memory_extractor_config_from_app_config_with_model(config, None)
 }
 
-/// Build a raw aifarm extractor for the backlog subject merge-pass, targeting the
-/// consolidation model (vram-cloud) directly. Raw rather than routed: the pass is
-/// gated on vram-cloud availability, so it wants the vram model or nothing.
-#[must_use]
-pub fn subject_merger_from_app_config(
-    config: &AppConfig,
-) -> AifarmMemoryExtractor<ReqwestAifarmTransport> {
-    AifarmMemoryExtractor::new(aifarm_memory_extractor_config_from_app_config_with_model(
-        config, None,
-    ))
-}
-
 #[must_use]
 pub fn aifarm_memory_extractor_config_from_app_config_with_model(
     config: &AppConfig,
@@ -3615,6 +3605,22 @@ pub struct RoutedMemoryExtractor {
     redactor: Option<RoutedDiscoveryRedactor>,
 }
 
+#[derive(Clone)]
+pub struct RoutedSubjectMerger {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+}
+
+impl RoutedSubjectMerger {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        Self {
+            walker,
+            config: config.clone(),
+        }
+    }
+}
+
 impl RoutedMemoryExtractor {
     #[must_use]
     pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
@@ -3703,6 +3709,22 @@ pub enum RoutedMemoryExtractorError {
     Routing(#[from] RoutedRoutingError),
 }
 
+#[derive(Debug, Error)]
+pub enum RoutedSubjectMergerAttemptError {
+    #[error("subject merge does not support routed provider {0:?}")]
+    UnsupportedProvider(String),
+    #[error(transparent)]
+    Aifarm(#[from] AifarmMemoryExtractorError),
+}
+
+#[derive(Debug, Error)]
+pub enum RoutedSubjectMergerError {
+    #[error(transparent)]
+    Attempt(#[from] RoutedSubjectMergerAttemptError),
+    #[error(transparent)]
+    Routing(#[from] RoutedRoutingError),
+}
+
 impl MemoryExtractor for RoutedMemoryExtractor {
     type Error = RoutedMemoryExtractorError;
 
@@ -3713,7 +3735,7 @@ impl MemoryExtractor for RoutedMemoryExtractor {
                 self.walker
                     .run(
                         RoutedRequestContext {
-                            workflow_key: "memory_consolidation".to_owned(),
+                            workflow_key: MEMORY_EXTRACTION_WORKFLOW_KEY.to_owned(),
                             queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
                             ..RoutedRequestContext::default()
                         },
@@ -3740,6 +3762,41 @@ impl MemoryExtractor for RoutedMemoryExtractor {
             {
                 Ok(redacted) => Ok(redacted),
                 Err(_) => Ok(original),
+            }
+        })
+    }
+}
+
+impl openplotva_memory::SubjectMerger for RoutedSubjectMerger {
+    type Error = RoutedSubjectMergerError;
+
+    fn merge_subject<'a>(
+        &'a self,
+        input: &'a openplotva_memory::SubjectMergeInput,
+    ) -> openplotva_memory::SubjectMergerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let result =
+                self.walker
+                    .run(
+                        RoutedRequestContext {
+                            workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW_KEY.to_owned(),
+                            queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                            ..RoutedRequestContext::default()
+                        },
+                        move |attempt| {
+                            let config = config.clone();
+                            async move {
+                                merge_subject_with_routed_attempt(&config, attempt, input).await
+                            }
+                        },
+                        routed_subject_merger_retryable_reason,
+                    )
+                    .await;
+            match result {
+                Ok(plan) => Ok(plan),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error.into()),
+                Err(RoutedAttemptRunError::Routing(error)) => Err(error.into()),
             }
         })
     }
@@ -3793,6 +3850,31 @@ async fn extract_memory_with_routed_attempt(
     MemoryExtractor::extract(&extractor, input)
         .await
         .map_err(Into::into)
+}
+
+async fn merge_subject_with_routed_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    input: &openplotva_memory::SubjectMergeInput,
+) -> Result<openplotva_memory::SubjectMergePlan, RoutedSubjectMergerAttemptError> {
+    if routed_attempt_is_genkit(&attempt) {
+        return Err(RoutedSubjectMergerAttemptError::UnsupportedProvider(
+            attempt.provider_name,
+        ));
+    }
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    openplotva_memory::SubjectMerger::merge_subject(&extractor, input)
+        .await
+        .map_err(Into::into)
+}
+
+fn routed_subject_merger_retryable_reason(
+    error: &RoutedSubjectMergerAttemptError,
+) -> Option<FailureReason> {
+    match error {
+        RoutedSubjectMergerAttemptError::UnsupportedProvider(_) => None,
+        RoutedSubjectMergerAttemptError::Aifarm(error) => retryable_reason(error),
+    }
 }
 
 fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
@@ -3964,6 +4046,14 @@ pub fn routed_memory_extractor_from_app_config(
     walker: RoutedAttemptWalker,
 ) -> RoutedMemoryExtractor {
     RoutedMemoryExtractor::new(walker, config)
+}
+
+#[must_use]
+pub fn routed_subject_merger_from_app_config(
+    config: &AppConfig,
+    walker: RoutedAttemptWalker,
+) -> RoutedSubjectMerger {
+    RoutedSubjectMerger::new(walker, config)
 }
 
 pub fn memory_extractor_from_app_config_with_model(
@@ -4226,6 +4316,15 @@ fn runtime_memory_restart_model(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_subject_merger<T: openplotva_memory::SubjectMerger>() {}
+
+    #[test]
+    fn routed_memory_adapters_use_independent_workflows() {
+        assert_subject_merger::<RoutedSubjectMerger>();
+        assert_eq!(MEMORY_EXTRACTION_WORKFLOW_KEY, "memory_extraction");
+        assert_eq!(MEMORY_SUBJECT_MERGE_WORKFLOW_KEY, "memory_subject_merge");
+    }
 
     #[test]
     fn plan_to_subject_merge_apply_sums_observations_and_validates_ids() {

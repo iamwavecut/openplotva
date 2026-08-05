@@ -9757,6 +9757,224 @@ mod tests {
         assert!(DOWN.contains("model.model_name = 'ternary-bonsai-27b'"));
     }
 
+    #[test]
+    fn memory_routing_cascades_migration_defines_independent_workflows_and_pool() {
+        const UP: &str = include_str!("../../../migrations/179_memory_routing_cascades.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/179_memory_routing_cascades.down.sql");
+
+        assert!(UP.contains("('memory_extraction', 'chat', FALSE, 4, 900000, TRUE)"));
+        assert!(UP.contains("('memory_subject_merge', 'chat', FALSE, 2, 900000, TRUE)"));
+        assert!(UP.contains("retry_max_hops = 5"));
+        assert!(UP.contains("retry_wall_ms = 180000"));
+        assert!(UP.contains("fallback_order = 0"));
+        assert!(UP.contains("fallback_order = 99"));
+        assert!(UP.contains("disabled_by_memory_routing_cascades_v1"));
+        assert!(UP.contains("'aifarm-gpu2-qwen27b'"));
+        assert!(UP.contains("max_concurrency = 1"));
+        assert!(UP.contains("memory_routing_cascades_v1_previous_pool_id"));
+        assert!(UP.contains("memory_routing_cascades_v1_previous_max_concurrency"));
+        assert!(!UP.contains("config = llm_capacity_pools.config || EXCLUDED.config"));
+        for model in [
+            "vram.cloud/qwen3.6-35b-a3b",
+            "vram.cloud/qwen3.6-27b",
+            "vibethinker-3b",
+            "ternary-bonsai-27b",
+        ] {
+            assert!(UP.contains(model), "missing routed model {model}");
+        }
+        assert!(UP.contains("DELETE FROM workflows\nWHERE key = 'memory_consolidation'"));
+
+        assert!(DOWN.contains("('memory_consolidation', 'chat', FALSE, 3, 60000, TRUE)"));
+        assert!(DOWN.contains(
+            "DELETE FROM workflows\nWHERE key IN ('memory_extraction', 'memory_subject_merge')"
+        ));
+        assert!(DOWN.contains("DELETE FROM llm_capacity_pools"));
+        assert!(DOWN.contains("memory_routing_cascades_v1_previous_pool_id"));
+        assert!(DOWN.contains("memory_routing_cascades_v1_previous_max_concurrency"));
+        assert!(DOWN.contains("disabled_by_memory_routing_cascades_v1"));
+    }
+
+    #[tokio::test]
+    async fn live_memory_routing_migration_preserves_operator_pool_and_prior_assignments()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE workflows (\
+                key TEXT PRIMARY KEY, kind TEXT NOT NULL, full_routing BOOLEAN NOT NULL, \
+                retry_max_hops INTEGER NOT NULL, retry_wall_ms INTEGER NOT NULL, \
+                enabled BOOLEAN NOT NULL\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE llm_providers (id BIGINT PRIMARY KEY, name TEXT NOT NULL) \
+             ON COMMIT DROP; \
+             CREATE TEMP TABLE llm_capacity_pools (\
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, max_concurrency INTEGER, \
+                description TEXT, config JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE provider_models (\
+                id BIGINT PRIMARY KEY, provider_id BIGINT NOT NULL, model_name TEXT NOT NULL, \
+                pool_id BIGINT, config JSONB NOT NULL DEFAULT '{}'::jsonb\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE workflow_assignments (\
+                id BIGSERIAL PRIMARY KEY, workflow_key TEXT NOT NULL, scope TEXT NOT NULL, \
+                role TEXT NOT NULL, provider_model_id BIGINT NOT NULL, weight INTEGER, \
+                fallback_order INTEGER, canary_percent INTEGER, enabled BOOLEAN NOT NULL, \
+                inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE workflow_triggers (\
+                id BIGSERIAL PRIMARY KEY, workflow_key TEXT NOT NULL, trigger_type TEXT NOT NULL, \
+                engage_assignment_id BIGINT NOT NULL, enabled BOOLEAN NOT NULL, queue_name TEXT, \
+                high_watermark INTEGER, low_watermark INTEGER, \
+                params JSONB NOT NULL DEFAULT '{}'::jsonb\
+             ) ON COMMIT DROP",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::raw_sql(
+            "INSERT INTO workflows VALUES \
+                ('dialog', 'chat', TRUE, 3, 60000, TRUE), \
+                ('memory_consolidation', 'chat', FALSE, 3, 60000, TRUE); \
+             INSERT INTO llm_providers VALUES \
+                (1, 'vram-cloud'), (2, 'aifarm-llamacpp-gpu2'), (3, 'genkit'); \
+             INSERT INTO llm_capacity_pools \
+                (id, name, max_concurrency, description, config) VALUES \
+                (70, 'aifarm-gpu2-qwen27b', 3, 'operator pool', '{\"owner\":\"operator\"}'), \
+                (71, 'vibe-original', 2, 'vibe original', '{}'), \
+                (72, 'bonsai-original', 2, 'bonsai original', '{}'); \
+             INSERT INTO provider_models (id, provider_id, model_name, pool_id) VALUES \
+                (10, 1, 'vram.cloud/qwen3.6-35b-a3b', NULL), \
+                (11, 1, 'vram.cloud/qwen3.6-27b', NULL), \
+                (20, 2, 'vibethinker-3b', 71), \
+                (21, 2, 'ternary-bonsai-27b', 72), \
+                (30, 3, 'gemini-2.5-flash-lite', NULL); \
+             INSERT INTO workflow_assignments \
+                (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, \
+                 enabled, cb_failure_threshold, cb_cooldown_ms) VALUES \
+                (100, 'dialog', 'global', 'fallback', 21, NULL, 1, TRUE, 5, 30000), \
+                (101, 'dialog', 'global', 'fallback', 30, NULL, 0, TRUE, 5, 30000), \
+                (102, 'dialog', 'global', 'overflow', 30, 100, NULL, TRUE, 5, 30000); \
+             INSERT INTO workflow_triggers \
+                (id, workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, \
+                 high_watermark, low_watermark) VALUES \
+                (200, 'dialog', 'queue_depth', 102, TRUE, 'dialog-aifarm', 30, 20)",
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/179_memory_routing_cascades.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let operator_pool: (i32, String, String) = sqlx::query_as(
+            "SELECT max_concurrency, description, config::text \
+             FROM llm_capacity_pools WHERE id = 70",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(operator_pool.0, 1);
+        assert_eq!(operator_pool.1, "operator pool");
+        assert!(operator_pool.2.contains("\"owner\": \"operator\""));
+        assert!(
+            operator_pool
+                .2
+                .contains("\"memory_routing_cascades_v1_previous_max_concurrency\": 3")
+        );
+        assert!(!operator_pool.2.contains("\"managed_by\""));
+
+        let moved_models: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, pool_id, config::text FROM provider_models \
+             WHERE id IN (20, 21) ORDER BY id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        assert_eq!(moved_models[0].1, Some(70));
+        assert!(
+            moved_models[0]
+                .2
+                .contains("\"memory_routing_cascades_v1_previous_pool_id\": 71")
+        );
+        assert_eq!(moved_models[1].1, Some(70));
+        assert!(
+            moved_models[1]
+                .2
+                .contains("\"memory_routing_cascades_v1_previous_pool_id\": 72")
+        );
+        let memory_assignment_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_assignments \
+             WHERE workflow_key IN ('memory_extraction', 'memory_subject_merge')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(memory_assignment_count, 6);
+        let overflow_enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM workflow_assignments WHERE id = 102")
+                .fetch_one(&mut *transaction)
+                .await?;
+        let trigger_enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM workflow_triggers WHERE id = 200")
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert!(!overflow_enabled);
+        assert!(!trigger_enabled);
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/179_memory_routing_cascades.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let restored_pool: (i32, String, String) = sqlx::query_as(
+            "SELECT max_concurrency, description, config::text \
+             FROM llm_capacity_pools WHERE id = 70",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(
+            restored_pool,
+            (
+                3,
+                "operator pool".to_owned(),
+                "{\"owner\": \"operator\"}".to_owned()
+            )
+        );
+        let restored_models: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, pool_id, config::text FROM provider_models \
+             WHERE id IN (20, 21) ORDER BY id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        assert_eq!(
+            restored_models,
+            vec![
+                (20, Some(71), "{}".to_owned()),
+                (21, Some(72), "{}".to_owned())
+            ]
+        );
+        let overflow_restored: bool =
+            sqlx::query_scalar("SELECT enabled FROM workflow_assignments WHERE id = 102")
+                .fetch_one(&mut *transaction)
+                .await?;
+        let trigger_restored: bool =
+            sqlx::query_scalar("SELECT enabled FROM workflow_triggers WHERE id = 200")
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert!(overflow_restored);
+        assert!(trigger_restored);
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_ternary_bonsai_migration_preserves_model_and_assignment_ids()
     -> Result<(), Box<dyn Error>> {

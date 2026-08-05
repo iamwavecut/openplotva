@@ -379,7 +379,7 @@ pub async fn seed_routing_from_env(
     seed_primary(pool, "embedding", embedding_model, None).await?;
     seed_primary(pool, "music", music_model, None).await?;
     for workflow in [
-        "memory_consolidation",
+        MEMORY_EXTRACTION_WORKFLOW,
         "history_summary",
         "agentic_song",
         "agentic_image",
@@ -603,7 +603,7 @@ fn assignment_input_from_record(
 }
 
 /// Lift the GPU-served llama.cpp models that the agentic reasoner and the memory
-/// pipeline actually use into managed DB rows, and repoint those config-only workflows
+/// pipeline actually uses into managed DB rows, and repoint those config-only workflows
 /// at them. The initial seed flattened these to the dialog Gemma model; this corrects an
 /// already-seeded database (idempotent via the `gpu_backfilled` flag) so the GPU2 models
 /// (`vibethinker-3b` for memory/history) show up in the admin and drive the
@@ -618,7 +618,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
     // (workflow, discovery service, endpoint, model) each flow really resolves to.
     let targets: Vec<(&str, String, String, String)> = vec![
         (
-            "memory_consolidation",
+            MEMORY_EXTRACTION_WORKFLOW,
             memory.aifarm_service_name.clone(),
             memory.aifarm_endpoint_name.clone(),
             memory.consolidation_model.clone(),
@@ -1794,114 +1794,342 @@ pub async fn backfill_capacity_pools(
     Ok(true)
 }
 
-const MEMORY_VRAM_POOL_KEY: &str = "llm.routing.memory_vram_pool_v1";
-const MEMORY_CONSOLIDATION_WORKFLOW: &str = "memory_consolidation";
+const MEMORY_EXTRACTION_CASCADE_KEY: &str = "llm.routing.memory_extraction_cascade_v1";
+const MEMORY_SUBJECT_MERGE_CASCADE_KEY: &str = "llm.routing.memory_subject_merge_cascade_v1";
+const DIALOG_FALLBACK_CASCADE_KEY: &str = "llm.routing.dialog_fallback_cascade_v1";
+const MEMORY_EXTRACTION_WORKFLOW: &str = "memory_extraction";
+const MEMORY_SUBJECT_MERGE_WORKFLOW: &str = "memory_subject_merge";
+const MEMORY_GPU2_POOL: &str = "aifarm-gpu2-qwen27b";
 
-/// Route memory consolidation through the vram.cloud pool: its 16 parallel
-/// slots chew per-chat runs far faster than the single GPU2 model, and runs
-/// parallelize safely (claimed with `FOR UPDATE SKIP LOCKED`). The existing
-/// primaries (vibethinker) are demoted to the fallback tail, so consolidation
-/// still proceeds when the pool is saturated by dialog traffic. Config-only
-/// workflows pick the first live candidate, and the walker's busy-skip moves
-/// past a full pool, so ordering is: vram models first, old primary last.
-pub async fn backfill_memory_vram_pool(pool: &PgPool) -> Result<bool, StorageError> {
-    if app_setting_present(pool, MEMORY_VRAM_POOL_KEY).await? {
-        return Ok(false);
-    }
-    let providers = list_providers(pool).await?;
-    let Some(vram_provider_id) = existing_provider_id(&providers, VRAM_CLOUD_PROVIDER) else {
-        return Ok(false);
-    };
-    let models = list_models(pool).await?;
-    let mut vram_models: Vec<&ModelRecord> = models
-        .iter()
-        .filter(|model| model.provider_id == vram_provider_id && model.enabled)
-        .collect();
-    if vram_models.is_empty() {
-        return Ok(false);
-    }
-    // Largest model first: config-only routing uses the chain head.
-    vram_models.sort_by(|a, b| b.model_name.cmp(&a.model_name));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemoryRoutingCascadeTarget {
+    workflow_key: &'static str,
+    role: &'static str,
+    provider_name: &'static str,
+    model_name: &'static str,
+    weight: Option<i32>,
+    fallback_order: Option<i32>,
+}
 
-    let assignments = list_assignments(pool).await?;
-    let next_fallback_order = assignments
+fn memory_routing_cascade_targets() -> &'static [MemoryRoutingCascadeTarget] {
+    const TARGETS: &[MemoryRoutingCascadeTarget] = &[
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_EXTRACTION_WORKFLOW,
+            role: "primary",
+            provider_name: VRAM_CLOUD_PROVIDER,
+            model_name: "vram.cloud/qwen3.6-35b-a3b",
+            weight: Some(100),
+            fallback_order: None,
+        },
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_EXTRACTION_WORKFLOW,
+            role: "fallback",
+            provider_name: VRAM_CLOUD_PROVIDER,
+            model_name: "vram.cloud/qwen3.6-27b",
+            weight: None,
+            fallback_order: Some(0),
+        },
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_EXTRACTION_WORKFLOW,
+            role: "fallback",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: "vibethinker-3b",
+            weight: None,
+            fallback_order: Some(1),
+        },
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_EXTRACTION_WORKFLOW,
+            role: "fallback",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: "ternary-bonsai-27b",
+            weight: None,
+            fallback_order: Some(2),
+        },
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
+            role: "primary",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: "vibethinker-3b",
+            weight: Some(100),
+            fallback_order: None,
+        },
+        MemoryRoutingCascadeTarget {
+            workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
+            role: "fallback",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: "ternary-bonsai-27b",
+            weight: None,
+            fallback_order: Some(0),
+        },
+    ];
+    TARGETS
+}
+
+fn resolved_memory_workflow_targets(
+    workflow_key: &'static str,
+    providers: &[ProviderRecord],
+    models: &[ModelRecord],
+) -> Option<Vec<(MemoryRoutingCascadeTarget, i64)>> {
+    let targets = memory_routing_cascade_targets()
         .iter()
-        .filter(|a| {
-            a.workflow_key == MEMORY_CONSOLIDATION_WORKFLOW
-                && a.scope == "global"
-                && a.role == "fallback"
-        })
-        .filter_map(|a| a.fallback_order)
-        .max()
-        .map_or(0, |order| order + 1);
-    let mut demoted = 0;
-    for assignment in assignments.iter().filter(|a| {
-        a.workflow_key == MEMORY_CONSOLIDATION_WORKFLOW
-            && a.scope == "global"
-            && a.role == "primary"
+        .filter(|target| target.workflow_key == workflow_key);
+    let mut resolved = Vec::new();
+    for target in targets {
+        let provider_id = existing_provider_id(providers, target.provider_name)?;
+        let model_id = existing_model_id(models, provider_id, target.model_name)?;
+        resolved.push((*target, model_id));
+    }
+    (!resolved.is_empty()).then_some(resolved)
+}
+
+fn canonical_dialog_fallback_order(provider_name: &str, model_name: &str) -> Option<i32> {
+    if provider_name == crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME
+        && model_name == crate::agent_runtime::DEFAULT_BONSAI_MODEL
+    {
+        Some(0)
+    } else if matches!(provider_name, "genkit" | "gemini") {
+        Some(99)
+    } else {
+        None
+    }
+}
+
+fn dialog_cascade_ready(
+    providers: &[ProviderRecord],
+    models: &[ModelRecord],
+    assignments: &[AssignmentRecord],
+) -> bool {
+    let mut bonsai = false;
+    let mut gemini = false;
+    for assignment in assignments.iter().filter(|assignment| {
+        assignment.workflow_key == "dialog"
+            && assignment.scope == "global"
+            && assignment.role == "fallback"
     }) {
-        if vram_models
+        let Some(model) = models
             .iter()
-            .any(|model| model.id == assignment.provider_model_id)
-        {
+            .find(|model| model.id == assignment.provider_model_id)
+        else {
             continue;
+        };
+        let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.id == model.provider_id)
+        else {
+            continue;
+        };
+        match canonical_dialog_fallback_order(&provider.name, &model.model_name) {
+            Some(0) => bonsai = true,
+            Some(99) => gemini = true,
+            _ => {}
         }
-        update_assignment(
-            pool,
-            assignment.id,
-            &AssignmentInput {
-                workflow_key: assignment.workflow_key.clone(),
-                scope: assignment.scope.clone(),
-                role: "fallback".to_owned(),
-                provider_model_id: assignment.provider_model_id,
-                weight: None,
-                fallback_order: Some(next_fallback_order + demoted),
-                canary_percent: assignment.canary_percent,
-                enabled: assignment.enabled,
-                inference_overrides: assignment.inference_overrides.clone(),
-                cb_failure_threshold: assignment.cb_failure_threshold,
-                cb_cooldown_ms: assignment.cb_cooldown_ms,
-            },
+    }
+    bonsai && gemini
+}
+
+/// Normalize the two memory LLM workflows after every model/provider backfill
+/// has had a chance to materialize env-backed rows. Migration 179 handles an
+/// upgraded database; this guarded pass makes a brand-new database converge
+/// after its models are seeded during the first startup.
+pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, StorageError> {
+    let providers = list_providers(pool).await?;
+    let models = list_models(pool).await?;
+    let assignments = list_assignments(pool).await?;
+    let extraction = if app_setting_present(pool, MEMORY_EXTRACTION_CASCADE_KEY).await? {
+        None
+    } else {
+        resolved_memory_workflow_targets(MEMORY_EXTRACTION_WORKFLOW, &providers, &models)
+    };
+    let subject_merge = if app_setting_present(pool, MEMORY_SUBJECT_MERGE_CASCADE_KEY).await? {
+        None
+    } else {
+        resolved_memory_workflow_targets(MEMORY_SUBJECT_MERGE_WORKFLOW, &providers, &models)
+    };
+    let normalize_dialog = !app_setting_present(pool, DIALOG_FALLBACK_CASCADE_KEY).await?
+        && dialog_cascade_ready(&providers, &models, &assignments);
+    if extraction.is_none() && subject_merge.is_none() && !normalize_dialog {
+        return Ok(false);
+    }
+
+    // Keep the route replacement, shared-pool reconciliation, overflow disable,
+    // and their guards atomic. The runtime loads the routing snapshot only after
+    // this transaction commits, so it can never publish a half-replaced chain.
+    let mut transaction = pool.begin().await?;
+
+    if let Some(targets) = subject_merge.as_ref() {
+        sqlx::query(
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
+             VALUES ($1, 'chat', FALSE, 2, 900000, TRUE) \
+             ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
+             full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
+        )
+        .bind(MEMORY_SUBJECT_MERGE_WORKFLOW)
+        .execute(&mut *transaction)
+        .await?;
+
+        let capacity_pool_id: i64 = sqlx::query_scalar(
+            "INSERT INTO llm_capacity_pools (name, max_concurrency, description, config) \
+             VALUES ($1, 1, $2, '{\"managed_by\":\"memory_routing_cascades_v1\"}'::jsonb) \
+             ON CONFLICT (name) DO UPDATE SET max_concurrency = 1, \
+             config = CASE \
+                 WHEN llm_capacity_pools.config ? 'memory_routing_cascades_v1_previous_max_concurrency' \
+                 THEN llm_capacity_pools.config \
+                 ELSE jsonb_set(llm_capacity_pools.config, \
+                     '{memory_routing_cascades_v1_previous_max_concurrency}', \
+                     COALESCE(to_jsonb(llm_capacity_pools.max_concurrency), 'null'::jsonb), TRUE) \
+             END, updated_at = now() \
+             RETURNING id",
+        )
+        .bind(MEMORY_GPU2_POOL)
+        .bind("Shared single-slot GPU2 budget for VibeThinker and Ternary Bonsai.")
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let mut gpu2_model_ids = targets
+            .iter()
+            .map(|(_, model_id)| *model_id)
+            .collect::<Vec<_>>();
+        gpu2_model_ids.sort_unstable();
+        gpu2_model_ids.dedup();
+        for model_id in gpu2_model_ids {
+            sqlx::query(
+                "UPDATE provider_models SET \
+                 config = CASE \
+                     WHEN config ? 'memory_routing_cascades_v1_previous_pool_id' THEN config \
+                     ELSE jsonb_set(config, '{memory_routing_cascades_v1_previous_pool_id}', \
+                         COALESCE(to_jsonb(pool_id), 'null'::jsonb), TRUE) \
+                 END, pool_id = $1 WHERE id = $2",
+            )
+            .bind(capacity_pool_id)
+            .bind(model_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        replace_memory_workflow_assignments(
+            &mut transaction,
+            MEMORY_SUBJECT_MERGE_WORKFLOW,
+            targets,
         )
         .await?;
-        demoted += 1;
+        mark_app_setting_in_transaction(&mut transaction, MEMORY_SUBJECT_MERGE_CASCADE_KEY).await?;
     }
-    let mut added = 0;
-    for model in &vram_models {
-        if assignment_exists(
-            &assignments,
-            MEMORY_CONSOLIDATION_WORKFLOW,
-            "primary",
-            model.id,
-        ) {
-            continue;
-        }
-        insert_assignment(
-            pool,
-            &AssignmentInput {
-                workflow_key: MEMORY_CONSOLIDATION_WORKFLOW.to_owned(),
-                scope: "global".to_owned(),
-                role: "primary".to_owned(),
-                provider_model_id: model.id,
-                weight: None,
-                fallback_order: None,
-                canary_percent: None,
-                enabled: true,
-                inference_overrides: json!({}),
-                cb_failure_threshold: 5,
-                cb_cooldown_ms: 30_000,
-            },
+
+    if let Some(targets) = extraction.as_ref() {
+        sqlx::query(
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
+             VALUES ($1, 'chat', FALSE, 4, 900000, TRUE) \
+             ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
+             full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
         )
+        .bind(MEMORY_EXTRACTION_WORKFLOW)
+        .execute(&mut *transaction)
         .await?;
-        added += 1;
+        replace_memory_workflow_assignments(&mut transaction, MEMORY_EXTRACTION_WORKFLOW, targets)
+            .await?;
+        mark_app_setting_in_transaction(&mut transaction, MEMORY_EXTRACTION_CASCADE_KEY).await?;
     }
-    mark_app_setting(pool, MEMORY_VRAM_POOL_KEY).await?;
+
+    if normalize_dialog {
+        sqlx::query(
+            "UPDATE workflows SET retry_max_hops = 5, retry_wall_ms = 180000 WHERE key = 'dialog'",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_assignments AS assignment SET fallback_order = \
+             CASE WHEN provider.name = $1 AND model.model_name = $2 THEN 0 ELSE 99 END \
+             FROM provider_models AS model, llm_providers AS provider \
+             WHERE assignment.provider_model_id = model.id AND model.provider_id = provider.id \
+             AND assignment.workflow_key = 'dialog' AND assignment.scope = 'global' \
+             AND assignment.role = 'fallback' \
+             AND ((provider.name = $1 AND model.model_name = $2) \
+                  OR provider.name IN ('genkit', 'gemini'))",
+        )
+        .bind(crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME)
+        .bind(crate::agent_runtime::DEFAULT_BONSAI_MODEL)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_triggers AS trigger SET enabled = FALSE, \
+             params = trigger.params || '{\"disabled_by_memory_routing_cascades_v1\":true}'::jsonb \
+             FROM workflow_assignments AS assignment, provider_models AS model, \
+                  llm_providers AS provider \
+             WHERE trigger.engage_assignment_id = assignment.id \
+             AND assignment.provider_model_id = model.id AND model.provider_id = provider.id \
+             AND trigger.workflow_key = 'dialog' AND trigger.enabled \
+             AND assignment.workflow_key = 'dialog' AND assignment.scope = 'global' \
+             AND assignment.role = 'overflow' AND provider.name IN ('genkit', 'gemini')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_assignments AS assignment SET enabled = FALSE, \
+             inference_overrides = assignment.inference_overrides \
+                 || '{\"disabled_by_memory_routing_cascades_v1\":true}'::jsonb \
+             FROM provider_models AS model, llm_providers AS provider \
+             WHERE assignment.provider_model_id = model.id AND model.provider_id = provider.id \
+             AND assignment.workflow_key = 'dialog' AND assignment.scope = 'global' \
+             AND assignment.role = 'overflow' AND assignment.enabled \
+             AND provider.name IN ('genkit', 'gemini')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        mark_app_setting_in_transaction(&mut transaction, DIALOG_FALLBACK_CASCADE_KEY).await?;
+    }
+
+    transaction.commit().await?;
     tracing::info!(
-        added,
-        demoted,
-        "backfilled memory consolidation onto the vram.cloud pool"
+        extraction = extraction.is_some(),
+        subject_merge = subject_merge.is_some(),
+        dialog = normalize_dialog,
+        extraction_hops = 4,
+        subject_merge_hops = 2,
+        pool = MEMORY_GPU2_POOL,
+        "backfilled independent memory routing cascades"
     );
     Ok(true)
+}
+
+async fn replace_memory_workflow_assignments(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_key: &str,
+    targets: &[(MemoryRoutingCascadeTarget, i64)],
+) -> Result<(), StorageError> {
+    sqlx::query("DELETE FROM workflow_assignments WHERE workflow_key = $1 AND scope = 'global'")
+        .bind(workflow_key)
+        .execute(&mut **transaction)
+        .await?;
+    for (target, provider_model_id) in targets {
+        sqlx::query(
+            "INSERT INTO workflow_assignments (workflow_key, scope, role, provider_model_id, \
+             weight, fallback_order, enabled, inference_overrides, cb_failure_threshold, \
+             cb_cooldown_ms) VALUES ($1, 'global', $2, $3, $4, $5, TRUE, '{}'::jsonb, 5, 30000)",
+        )
+        .bind(target.workflow_key)
+        .bind(target.role)
+        .bind(provider_model_id)
+        .bind(target.weight)
+        .bind(target.fallback_order)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn mark_app_setting_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ($1, '1', NOW()) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind(key)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 /// Everything the runtime rebuilds when the routing configuration changes:
@@ -2320,6 +2548,82 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn memory_routing_backfill_matches_the_canonical_cascades() {
+        assert_eq!(MEMORY_EXTRACTION_WORKFLOW, "memory_extraction");
+        assert_eq!(MEMORY_SUBJECT_MERGE_WORKFLOW, "memory_subject_merge");
+        let targets = memory_routing_cascade_targets()
+            .iter()
+            .map(|target| {
+                (
+                    target.workflow_key,
+                    target.role,
+                    target.provider_name,
+                    target.model_name,
+                    target.fallback_order,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    "memory_extraction",
+                    "primary",
+                    "vram-cloud",
+                    "vram.cloud/qwen3.6-35b-a3b",
+                    None,
+                ),
+                (
+                    "memory_extraction",
+                    "fallback",
+                    "vram-cloud",
+                    "vram.cloud/qwen3.6-27b",
+                    Some(0),
+                ),
+                (
+                    "memory_extraction",
+                    "fallback",
+                    "aifarm-llamacpp-gpu2",
+                    "vibethinker-3b",
+                    Some(1),
+                ),
+                (
+                    "memory_extraction",
+                    "fallback",
+                    "aifarm-llamacpp-gpu2",
+                    "ternary-bonsai-27b",
+                    Some(2),
+                ),
+                (
+                    "memory_subject_merge",
+                    "primary",
+                    "aifarm-llamacpp-gpu2",
+                    "vibethinker-3b",
+                    None,
+                ),
+                (
+                    "memory_subject_merge",
+                    "fallback",
+                    "aifarm-llamacpp-gpu2",
+                    "ternary-bonsai-27b",
+                    Some(0),
+                ),
+            ]
+        );
+        assert_eq!(
+            canonical_dialog_fallback_order(
+                crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+                "ternary-bonsai-27b",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            canonical_dialog_fallback_order("genkit", "gemini-2.5-flash-lite"),
+            Some(99)
+        );
+    }
+
     fn provider(id: i64, name: &str, kind: &str) -> ProviderRecord {
         ProviderRecord {
             id,
@@ -2440,6 +2744,42 @@ mod tests {
         assert_eq!(route.fallback_tail[0].provider, 2);
         assert_eq!(route.triggers.len(), 1);
         assert_eq!(route.triggers[0].engage.provider, 3);
+    }
+
+    #[test]
+    fn canonical_dialog_route_ignores_disabled_gemini_overflow_when_trigger_state_is_engaged() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.providers.push(provider(
+            4,
+            crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            "chat",
+        ));
+        snapshot
+            .models
+            .push(model(40, 4, crate::agent_runtime::DEFAULT_BONSAI_MODEL));
+        snapshot.assignments[1].fallback_order = Some(99);
+        snapshot.assignments[2].enabled = false;
+        snapshot.triggers[0].enabled = false;
+        let mut bonsai = assignment(103, "dialog", "global", "fallback", 40, None);
+        bonsai.fallback_order = Some(0);
+        snapshot.assignments.push(bonsai);
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+        let breakers = BreakerSet::new();
+        let liveness = BreakerLiveness::new(&breakers, std::time::Instant::now());
+        let engaged = TriggerState::new();
+        engaged.set_engaged(200, true);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let attempts = select(route, &liveness, &engaged, &mut rng);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.model)
+                .collect::<Vec<_>>(),
+            vec![10, 40, 20]
+        );
     }
 
     #[test]
@@ -2629,6 +2969,149 @@ mod tests {
         engaged.set_engaged(200, true);
         let attempts = select(route, &liveness, &engaged, &mut rng);
         assert!(attempts.iter().any(|a| a.provider == 3));
+    }
+
+    #[test]
+    fn subject_merge_targets_resolve_without_vram_catalog() {
+        let providers = vec![provider(
+            1,
+            crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            "chat",
+        )];
+        let models = vec![
+            model(10, 1, "vibethinker-3b"),
+            model(11, 1, crate::agent_runtime::DEFAULT_BONSAI_MODEL),
+        ];
+
+        assert_eq!(
+            resolved_memory_workflow_targets(MEMORY_SUBJECT_MERGE_WORKFLOW, &providers, &models,)
+                .expect("subject merge targets")
+                .len(),
+            2
+        );
+        assert!(
+            resolved_memory_workflow_targets(MEMORY_EXTRACTION_WORKFLOW, &providers, &models)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_memory_backfill_is_atomic_and_subject_merge_does_not_wait_for_vram()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE app_settings (\
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             ); \
+             CREATE TEMP TABLE workflows (\
+                key TEXT PRIMARY KEY, kind TEXT NOT NULL, full_routing BOOLEAN NOT NULL, \
+                retry_max_hops INTEGER NOT NULL, retry_wall_ms INTEGER NOT NULL, \
+                enabled BOOLEAN NOT NULL\
+             ); \
+             CREATE TEMP TABLE llm_providers (\
+                id BIGINT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, protocol TEXT, \
+                runtime_hint TEXT, endpoint TEXT, discovery_service_name TEXT, \
+                discovery_endpoint_name TEXT, api_key_ref TEXT, api_key_encrypted BYTEA, \
+                enabled BOOLEAN NOT NULL, config JSONB NOT NULL DEFAULT '{}'::jsonb\
+             ); \
+             CREATE TEMP TABLE llm_capacity_pools (\
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, max_concurrency INTEGER, \
+                description TEXT, config JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             ); \
+             CREATE TEMP TABLE provider_models (\
+                id BIGINT PRIMARY KEY, provider_id BIGINT NOT NULL, model_name TEXT NOT NULL, \
+                display_name TEXT, base_url TEXT, capabilities TEXT[] NOT NULL DEFAULT '{}', \
+                embedding_dim INTEGER, pool_id BIGINT, enabled BOOLEAN NOT NULL, \
+                config JSONB NOT NULL DEFAULT '{}'::jsonb\
+             ); \
+             CREATE TEMP TABLE workflow_assignments (\
+                id BIGSERIAL PRIMARY KEY, workflow_key TEXT NOT NULL, scope TEXT NOT NULL, \
+                role TEXT NOT NULL, provider_model_id BIGINT NOT NULL, weight INTEGER, \
+                fallback_order INTEGER, canary_percent INTEGER, enabled BOOLEAN NOT NULL, \
+                inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL, \
+                CONSTRAINT reject_bonsai CHECK (provider_model_id <> 21)\
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::raw_sql(
+            "INSERT INTO workflows VALUES \
+                ('memory_subject_merge', 'chat', FALSE, 3, 60000, TRUE); \
+             INSERT INTO llm_providers \
+                (id, name, kind, protocol, enabled) VALUES \
+                (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE); \
+             INSERT INTO provider_models \
+                (id, provider_id, model_name, capabilities, enabled) VALUES \
+                (20, 2, 'vibethinker-3b', ARRAY['chat', 'tools'], TRUE), \
+                (21, 2, 'ternary-bonsai-27b', ARRAY['chat', 'tools'], TRUE); \
+             INSERT INTO workflow_assignments \
+                (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, \
+                 enabled, cb_failure_threshold, cb_cooldown_ms) VALUES \
+                (99, 'memory_subject_merge', 'global', 'primary', 20, 100, NULL, \
+                 TRUE, 5, 30000)",
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(backfill_memory_routing_cascades(&pool).await.is_err());
+        let surviving_assignment: i64 = sqlx::query_scalar(
+            "SELECT id FROM workflow_assignments WHERE workflow_key = 'memory_subject_merge'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(surviving_assignment, 99);
+        let guard_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM app_settings \
+             WHERE key = 'llm.routing.memory_subject_merge_cascade_v1'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let pool_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM llm_capacity_pools WHERE name = 'aifarm-gpu2-qwen27b'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(guard_count, 0);
+        assert_eq!(pool_count, 0);
+
+        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_bonsai")
+            .execute(&pool)
+            .await?;
+        assert!(backfill_memory_routing_cascades(&pool).await?);
+        let subject_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_assignments \
+             WHERE workflow_key = 'memory_subject_merge'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let extraction_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_assignments \
+             WHERE workflow_key = 'memory_extraction'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let guards: Vec<String> = sqlx::query_scalar("SELECT key FROM app_settings ORDER BY key")
+            .fetch_all(&pool)
+            .await?;
+        let model_pools: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT pool_id FROM provider_models ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(subject_count, 2);
+        assert_eq!(extraction_count, 0);
+        assert_eq!(guards, vec![MEMORY_SUBJECT_MERGE_CASCADE_KEY.to_owned()]);
+        assert_eq!(model_pools[0], model_pools[1]);
+        assert!(model_pools[0].is_some());
+        Ok(())
     }
 
     #[test]

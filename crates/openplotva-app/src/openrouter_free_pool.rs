@@ -968,7 +968,9 @@ fn candidate_is_compatible_with_workflow(
         return true;
     }
     match workflow {
-        "memory_consolidation" | "history_summary" | "media_prompt_optimizer" => {
+        crate::memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY
+        | "history_summary"
+        | "media_prompt_optimizer" => {
             candidate.supports_response_format || candidate.supports_structured_outputs
         }
         "agentic_search_reasoner" | "agentic_search_writer" | "agentic_song" | "agentic_image" => {
@@ -1216,7 +1218,10 @@ mod tests {
             },
         ];
         let config = OpenRouterFreePoolConfig {
-            target_workflows: vec!["dialog".to_owned(), "memory_consolidation".to_owned()],
+            target_workflows: vec![
+                "dialog".to_owned(),
+                crate::memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY.to_owned(),
+            ],
             fallback_model: FALLBACK_MODEL.to_owned(),
             ..OpenRouterFreePoolConfig::default()
         };
@@ -1230,7 +1235,9 @@ mod tests {
         );
         let memory = plan
             .iter()
-            .filter(|assignment| assignment.workflow_key == "memory_consolidation")
+            .filter(|assignment| {
+                assignment.workflow_key == crate::memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY
+            })
             .collect::<Vec<_>>();
         assert_eq!(memory[0].model_name, "structured/model:free");
         assert_eq!(memory[0].role, "fallback");
@@ -1251,14 +1258,14 @@ mod tests {
     }
 
     #[test]
-    fn default_config_does_not_auto_target_memory_consolidation() {
+    fn default_config_does_not_auto_target_memory_extraction() {
         let config = OpenRouterFreePoolConfig::default();
 
         assert!(
             !config
                 .target_workflows
                 .iter()
-                .any(|workflow| workflow == "memory_consolidation")
+                .any(|workflow| workflow == crate::memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY)
         );
     }
 
