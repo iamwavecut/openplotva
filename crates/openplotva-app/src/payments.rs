@@ -6078,6 +6078,25 @@ pub(crate) fn payment_control_job_failure_message(
                 .clone()
                 .unwrap_or_else(|| "successful payment control job user is required".to_owned()),
         ),
+        PaymentControlJobOutcome::SuccessfulPayment(
+            SuccessfulPaymentOutcome::UnsupportedCurrency,
+        ) => Some("successful payment currency is unsupported".to_owned()),
+        PaymentControlJobOutcome::SuccessfulPayment(SuccessfulPaymentOutcome::UnknownPayload) => {
+            Some("successful payment has an unknown invoice payload".to_owned())
+        }
+        PaymentControlJobOutcome::SuccessfulPayment(SuccessfulPaymentOutcome::InvalidInvoice) => {
+            Some("successful payment does not match its invoice".to_owned())
+        }
+        PaymentControlJobOutcome::SuccessfulPayment(
+            SuccessfulPaymentOutcome::SubscriptionStorageError
+            | SuccessfulPaymentOutcome::SubscriptionLedgerError
+            | SuccessfulPaymentOutcome::DonationStorageError,
+        ) => Some(
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "successful payment persistence failed".to_owned()),
+        ),
         PaymentControlJobOutcome::NotPaymentControlJob => {
             Some("unsupported payment control job kind".to_owned())
         }
@@ -6961,7 +6980,35 @@ mod tests {
             now,
         )
         .await;
-        let legacy = process_successful_payment_at(
+        assert_eq!(forwarded.outcome, SuccessfulPaymentOutcome::InvalidInvoice);
+        assert_eq!(
+            wrong_amount.outcome,
+            SuccessfulPaymentOutcome::InvalidInvoice
+        );
+        assert!(store.subscriptions().is_empty());
+        assert!(store.vip_events().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_subscription_payment_is_processed_at_the_fixed_price()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let expires_at = now + time::Duration::days(30);
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 77,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            subscription_id: Some(10),
+            actor_user_id: None,
+            reason: "payment telegram-charge".to_owned(),
+            created_at: now,
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_successful_payment_at(
             &store,
             &effects,
             &sample_message("subscription_42", 300),
@@ -6969,12 +7016,31 @@ mod tests {
         )
         .await;
 
-        assert_eq!(forwarded.outcome, SuccessfulPaymentOutcome::InvalidInvoice);
         assert_eq!(
-            wrong_amount.outcome,
-            SuccessfulPaymentOutcome::InvalidInvoice
+            report.outcome,
+            SuccessfulPaymentOutcome::SubscriptionProcessed
         );
-        assert_eq!(legacy.outcome, SuccessfulPaymentOutcome::UnknownPayload);
+        assert_eq!(store.subscriptions().len(), 1);
+        assert_eq!(store.vip_events().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_subscription_payment_rejects_a_noncanonical_amount()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+
+        let report = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_42", 1),
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, SuccessfulPaymentOutcome::InvalidInvoice);
         assert!(store.subscriptions().is_empty());
         assert!(store.vip_events().is_empty());
         Ok(())
@@ -11887,6 +11953,43 @@ mod tests {
         assert_eq!(
             queue.failed(),
             vec![(7, "failed to parse donation invoice link".to_owned())]
+        );
+        assert!(queue.completed_ids().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_worker_marks_rejected_successful_payment_failed()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let mut params = sample_successful_payment_control_job();
+        params
+            .data
+            .payment
+            .as_mut()
+            .expect("sample payment")
+            .invoice_payload = "unsupported".to_owned();
+        let queue = PaymentControlJobWorkerQueueStub::default()
+            .with_next_job(sample_work_item(7, params, now));
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+
+        let report = process_payment_control_job_once_at(&queue, &store, &effects, now).await;
+
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert_eq!(
+            report.execution.as_ref().map(|report| &report.outcome),
+            Some(&PaymentControlJobOutcome::SuccessfulPayment(
+                SuccessfulPaymentOutcome::UnknownPayload
+            ))
+        );
+        assert_eq!(
+            queue.failed(),
+            vec![(
+                7,
+                "successful payment has an unknown invoice payload".to_owned()
+            )]
         );
         assert!(queue.completed_ids().is_empty());
         Ok(())

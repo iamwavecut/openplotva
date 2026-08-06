@@ -187,3 +187,34 @@ struct RawStarUser {
     language_code: Option<String>,
     is_premium: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_star_subscription_payment;
+
+    #[test]
+    fn legacy_recurring_invoice_is_a_subscription_payment() {
+        let payment = parse_star_subscription_payment(json!({
+            "id": "stx-legacy-renewal",
+            "amount": 300,
+            "date": 1_775_551_056,
+            "source": {
+                "type": "user",
+                "transaction_type": "invoice_payment",
+                "user": {
+                    "id": 42,
+                    "first_name": "Alice"
+                },
+                "invoice_payload": "subscription_42",
+                "subscription_period": 2_592_000
+            }
+        }))
+        .expect("legacy recurring invoice should remain reconcilable");
+
+        assert_eq!(payment.user_id, 42);
+        assert_eq!(payment.amount_stars, 300);
+        assert_eq!(payment.invoice_payload, "subscription_42");
+    }
+}

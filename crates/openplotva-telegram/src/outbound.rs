@@ -829,12 +829,25 @@ pub fn donation_invoice_payload(user_id: i64, amount_stars: i64) -> String {
 pub fn parse_payment_payload(payload: &str) -> Option<PaymentPayload> {
     let mut parts = payload.split('_');
     let kind = parts.next()?;
-    if parts.next()? != "v1" {
+    let second = parts.next()?;
+    let third = parts.next();
+    let fourth = parts.next();
+    if parts.next().is_some() {
         return None;
     }
-    let user_id = parts.next()?.parse::<i64>().ok()?;
-    let amount_stars = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() || user_id <= 0 || amount_stars <= 0 {
+
+    let (user_id, amount_stars) = match (kind, second, third, fourth) {
+        // Telegram recurring renewals retain the payload of invoices created by the Go bot.
+        ("subscription", user_id, None, None) => {
+            (user_id.parse::<i64>().ok()?, SUBSCRIPTION_PRICE_STARS)
+        }
+        (_, "v1", Some(user_id), Some(amount_stars)) => (
+            user_id.parse::<i64>().ok()?,
+            amount_stars.parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if user_id <= 0 || amount_stars <= 0 {
         return None;
     }
     match kind {
