@@ -1,5 +1,10 @@
 # Memory Routing Cascades Implementation Plan
 
+> **Historical pre-Maple document.** This records the migrations 178-179 design
+> truthfully. Migration 180 replaces active Bonsai routes with Maple; see
+> [the Maple GPU2 cutover design](../specs/2026-08-07-maple-gpu2-cutover-design.md).
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add independent dialog, memory-extraction, and subject-merge cascades with a serialized shared GPU2 capacity pool.

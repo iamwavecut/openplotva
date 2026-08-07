@@ -154,6 +154,8 @@ pub struct ProviderRow {
     pub kind: Kind,
     /// Wire protocol (`openai_compat`, `genkit`, ...); `None` on legacy rows.
     pub protocol: Option<String>,
+    /// Serving engine hint used for request-shape normalization.
+    pub runtime_hint: Option<String>,
     pub endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,

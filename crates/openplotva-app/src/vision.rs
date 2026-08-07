@@ -1906,6 +1906,7 @@ mod tests {
             model_id: 11,
             provider_name: "vram-cloud".to_owned(),
             model_name: "vram.cloud/qwen3.6-35b-a3b".to_owned(),
+            provider_runtime_hint: None,
             provider_endpoint: Some("https://vision.example.test/v1".to_owned()),
             discovery_service_name: None,
             discovery_endpoint_name: None,

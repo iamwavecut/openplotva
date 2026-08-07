@@ -698,7 +698,11 @@ fn canonical_provider_for_model(model: &str, flow: &str) -> Option<&'static str>
         return Some("vram-cloud");
     }
     match model {
-        "vibethinker-3b" | "qwen3.6-27b-moq" | "ternary-bonsai-27b" => Some("aifarm-llamacpp-gpu2"),
+        "maple-preview-2bit-mlx" => Some("aifarm-maple"),
+        "vibethinker-3b" => Some("aifarm-llamacpp-gpu2"),
+        // Historical and rollback wire ids remain classifiable without making
+        // them eligible for any active route.
+        "qwen3.6-27b-moq" | "ternary-bonsai-27b" => Some("aifarm-llamacpp-gpu2"),
         "Gemma 4 26B Heretic" => Some(if flow.eq_ignore_ascii_case("vision") {
             "aifarm-vision"
         } else {
@@ -1671,6 +1675,11 @@ mod tests {
             canonical_provider_for_model("vibethinker-3b", "memory_extraction"),
             Some("aifarm-llamacpp-gpu2")
         );
+        assert_eq!(
+            canonical_provider_for_model("maple-preview-2bit-mlx", "dialog"),
+            Some("aifarm-maple")
+        );
+        // Rollback/historical ids retain their truthful provider classification.
         assert_eq!(
             canonical_provider_for_model("ternary-bonsai-27b", "dialog"),
             Some("aifarm-llamacpp-gpu2")

@@ -662,7 +662,9 @@ Memory migration timeline: `100` (pipeline) → `126` (portable) → `127`
 archival index — **on main, not deployed**; uses plain `CREATE INDEX`, briefly
 blocks writes on `memory_cards` during deploy). Routing: `121-125` (declarative v1)
 → `129-131` (events, capacity trigger, v2) → `146-147` (capacity pools,
-provider protocol). Virtual-message subsystem (`15`) retired in `140`.
+provider protocol) → `178-180` (GPU2 reasoner identities, independent memory
+cascades, and the audit-preserving Maple cutover). Virtual-message subsystem
+(`15`) retired in `140`.
 
 ---
 
@@ -685,7 +687,8 @@ provider protocol). Virtual-message subsystem (`15`) retired in `140`.
 - **HTTP timeout sizing** (`openplotva-telegram`): 90s total must exceed 60s long-poll + slack — without it a half-open socket stalls sends indefinitely. Rich sends reuse the same timeouts deliberately.
 - **Bounded retry** (`transport.rs`): mid-response transport failures are terminal (request may have been accepted → replay risks double-send). Only short 429s (≤5s) and connect-phase failures retry.
 - **`ledger.rs` VALUES bug**: `SQL_INSERT_TURN_OUTCOMES_PREFIX` stops at the column list — `push_values` emits `VALUES`. A previous trailing `VALUES` produced `VALUES VALUES` and silently broke every insert. Regression test pins exactly one `VALUES`.
-- **Provider canonicalization** (`runtime_llm.rs`): the observer overrides the stamped provider from the **model name** (`vram.cloud/*`→`vram-cloud`, `vibethinker-3b`→`aifarm-llamacpp-gpu2`, etc.) so historical backfill (mig 150) and forward fix can't drift.
+- **Provider canonicalization** (`runtime_llm.rs`): the observer overrides the stamped provider from the **model name** (`vram.cloud/*`→`vram-cloud`, `vibethinker-3b`→`aifarm-llamacpp-gpu2`, `maple-preview-2bit-mlx`→`aifarm-maple`) so historical backfill and forward classification cannot drift. Rollback-only legacy ids stay classifiable but are not active route targets.
+- **Maple request compatibility** (`aifarm.rs`): an `mlx` runtime hint strips unsupported DRY controls before Discovery serialization while retaining `repeat_penalty` and float `top_k`; migration 180 keeps Maple and Bonsai as distinct rows so routing-event history remains truthful.
 - **Capacity pools are not semaphores** (`router/capacity.rs`): the custom `PoolCell` survives live resize without losing in-flight counts (tokio Semaphore shrink needs `forget_permits` debt). `apply()` rewrites `max` in place; outstanding permits hold their own `Arc<PoolCell>`.
 - **Capacity-slot waits are excluded from the retry wall**: pool-busy skips don't consume hops or trip breakers; `wait_for_release` is budgeted separately. Without this split, a busy pool would burn the entire retry budget on one candidate.
 - **Breaker fairness ≥30s slice**: a deadline-cut charges the breaker only if `remaining ≥ 30s` — a fallback handed the last seconds of a turn must not open its circuit in lockstep with a degraded primary.

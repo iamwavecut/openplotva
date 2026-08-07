@@ -942,6 +942,7 @@ where
         if request.model.trim().is_empty() {
             request.model = self.cfg.default_model.clone();
         }
+        normalize_request_for_runtime_hint(&mut request, &self.cfg.runtime_hint);
         let pending_trace = pending_aifarm_trace(&request);
         let started = std::time::Instant::now();
         let result = if self.uses_direct_endpoint() {
@@ -3832,6 +3833,8 @@ pub struct AifarmClientConfig {
     pub capacity_poll_interval: StdDuration,
     /// Default model.
     pub default_model: String,
+    /// Serving runtime hint used for request-shape normalization.
+    pub runtime_hint: String,
     /// Discovery priority.
     pub priority: i32,
     /// Workload label.
@@ -3854,6 +3857,7 @@ impl Default for AifarmClientConfig {
             capacity_wait: StdDuration::ZERO,
             capacity_poll_interval: StdDuration::ZERO,
             default_model: String::new(),
+            runtime_hint: String::new(),
             priority: 0,
             workload: String::new(),
             fail_fast_on_capacity_unavailable: false,
@@ -4275,13 +4279,45 @@ pub fn build_discovery_job_request(
     job_id: &str,
     request: &ChatCompletionRequest,
 ) -> Result<DiscoveryJobRequest, AifarmRequestError> {
-    let payload = if request.model.trim().is_empty() {
-        serde_json::to_vec(&request_with_default_model(request, &cfg.default_model))
-    } else {
-        serde_json::to_vec(request)
-    }
-    .map_err(AifarmRequestError::ChatCompletionRequest)?;
+    let mut request = request_with_default_model(request, &cfg.default_model);
+    normalize_request_for_runtime_hint(&mut request, &cfg.runtime_hint);
+    let payload =
+        serde_json::to_vec(&request).map_err(AifarmRequestError::ChatCompletionRequest)?;
     build_discovery_json_payload_job_request(cfg, job_id, &payload)
+}
+
+fn normalize_request_for_runtime_hint(request: &mut ChatCompletionRequest, runtime_hint: &str) {
+    if runtime_hint.trim().eq_ignore_ascii_case("mlx") {
+        // The Maple facade rejects unsupported nonzero DRY controls. Omit them
+        // rather than relying on an upstream to silently ignore a false parity
+        // claim; repeat_penalty and float top_k remain part of its accepted
+        // normalization contract. Its OpenAI compatibility layer recursively
+        // unwraps nested `extra_body` objects, so scrub the same controls at
+        // every level that can be promoted to the top-level request.
+        request.dry_multiplier = None;
+        request.dry_base = None;
+        request.dry_allowed_length = 0;
+        if let Some(extra_body) = request.extra_body.as_mut() {
+            scrub_mlx_extra_body(extra_body);
+        }
+    }
+}
+
+fn scrub_mlx_extra_body(extra_body: &mut Value) {
+    let Value::Object(object) = extra_body else {
+        return;
+    };
+    for key in [
+        "dry_multiplier",
+        "dry_base",
+        "dry_allowed_length",
+        "dry_penalty_last_n",
+    ] {
+        object.remove(key);
+    }
+    if let Some(nested) = object.get_mut("extra_body") {
+        scrub_mlx_extra_body(nested);
+    }
 }
 
 pub fn build_discovery_json_job_request(
@@ -8150,6 +8186,138 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value["json_schema"]["name"].as_str()),
             Some("plotva_step")
+        );
+    }
+
+    #[test]
+    fn maple_discovery_body_omits_dry_but_keeps_supported_normalization_inputs() {
+        let cfg = AifarmClientConfig {
+            service_name: "llm-openai-maple".to_owned(),
+            endpoint_name: "chat_completions".to_owned(),
+            default_model: "maple-preview-2bit-mlx".to_owned(),
+            runtime_hint: "mlx".to_owned(),
+            ..AifarmClientConfig::default()
+        }
+        .with_defaults();
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "ping".to_owned(),
+                ..ChatMessage::default()
+            }],
+            max_tokens: 256,
+            top_k: Some(40.0),
+            repeat_penalty: Some(1.1),
+            dry_multiplier: Some(0.8),
+            dry_base: Some(1.75),
+            dry_allowed_length: 2,
+            ..ChatCompletionRequest::default()
+        };
+
+        let job = build_discovery_job_request(&cfg, "maple-1", &request)
+            .expect("Maple Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        let body: Value = serde_json::from_slice(&payload).expect("Maple request JSON");
+
+        assert_eq!(job.invocation.service_name, "llm-openai-maple");
+        assert_eq!(
+            body,
+            json!({
+                "model": "maple-preview-2bit-mlx",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false,
+                "max_tokens": 256,
+                "top_k": 40.0,
+                "repeat_penalty": 1.1
+            })
+        );
+        assert!(body.get("dry_multiplier").is_none());
+        assert!(body.get("dry_base").is_none());
+        assert!(body.get("dry_allowed_length").is_none());
+    }
+
+    #[test]
+    fn maple_discovery_body_scrubs_dry_from_nested_extra_body() {
+        let cfg = AifarmClientConfig {
+            runtime_hint: "mlx".to_owned(),
+            ..AifarmClientConfig::default()
+        }
+        .with_defaults();
+        let request = ChatCompletionRequest {
+            extra_body: Some(json!({
+                "dry_multiplier": 0.8,
+                "dry_base": 1.75,
+                "dry_allowed_length": 2,
+                "dry_penalty_last_n": 4096,
+                "keep": "outer",
+                "extra_body": {
+                    "dry_multiplier": 0.9,
+                    "dry_base": 2.0,
+                    "dry_allowed_length": 3,
+                    "dry_penalty_last_n": 2048,
+                    "keep": "nested",
+                    "extra_body": {
+                        "dry_multiplier": 1.0,
+                        "keep": "deep"
+                    }
+                }
+            })),
+            ..ChatCompletionRequest::default()
+        };
+
+        let job = build_discovery_job_request(&cfg, "maple-extra-body", &request)
+            .expect("Maple Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        let body: Value = serde_json::from_slice(&payload).expect("Maple request JSON");
+
+        assert_eq!(
+            body["extra_body"],
+            json!({
+                "keep": "outer",
+                "extra_body": {
+                    "keep": "nested",
+                    "extra_body": {"keep": "deep"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn non_mlx_discovery_body_preserves_typed_and_extra_body_dry_controls() {
+        let cfg = AifarmClientConfig {
+            runtime_hint: "llama_cpp".to_owned(),
+            ..AifarmClientConfig::default()
+        }
+        .with_defaults();
+        let request = ChatCompletionRequest {
+            dry_multiplier: Some(0.8),
+            dry_base: Some(1.75),
+            dry_allowed_length: 2,
+            extra_body: Some(json!({
+                "dry_multiplier": 0.9,
+                "dry_penalty_last_n": 4096,
+                "extra_body": {"dry_base": 2.0}
+            })),
+            ..ChatCompletionRequest::default()
+        };
+
+        let job = build_discovery_job_request(&cfg, "llama-extra-body", &request)
+            .expect("llama.cpp Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        let body: Value = serde_json::from_slice(&payload).expect("llama.cpp request JSON");
+
+        assert_eq!(body["dry_multiplier"], json!(0.8));
+        assert_eq!(body["dry_base"], json!(1.75));
+        assert_eq!(body["dry_allowed_length"], json!(2));
+        assert_eq!(
+            body["extra_body"],
+            request.extra_body.expect("test request has extra_body")
         );
     }
 

@@ -241,6 +241,7 @@ impl RoutedAttemptWalker {
                     model_id: attempt.model,
                     provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
                     model_name: model.map(|row| row.model_name.clone()).unwrap_or_default(),
+                    provider_runtime_hint: provider.and_then(|row| row.runtime_hint.clone()),
                     provider_endpoint: provider.and_then(|row| row.endpoint.clone()),
                     discovery_service_name: provider
                         .and_then(|row| row.discovery_service_name.clone()),
@@ -556,6 +557,7 @@ pub struct RoutedAttempt {
     pub model_id: i64,
     pub provider_name: String,
     pub model_name: String,
+    pub provider_runtime_hint: Option<String>,
     pub provider_endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,

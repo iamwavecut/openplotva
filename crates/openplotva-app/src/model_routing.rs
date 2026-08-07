@@ -562,9 +562,9 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
 const GPU_BACKFILL_KEY: &str = "llm.routing.gpu_backfilled";
 const DIALOG_QWEN_FALLBACK_KEY: &str = "llm.routing.dialog_qwen_fallback";
 
-/// Provider name for a Discovery service. The default dialog service and the
-/// legacy-named shared GPU2 llama.cpp service retain their persisted provider ids;
-/// other services get a deterministic `aifarm-<service>` name.
+/// Provider name for a Discovery service. The canonical dialog, dedicated
+/// Maple, and retained VibeThinker services keep stable provider ids; other
+/// services get a deterministic `aifarm-<service>` name.
 fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
     let service = service.trim();
     if service == config.llm.dialog.discovery_service_name {
@@ -573,6 +573,8 @@ fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
         .eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME)
     {
         crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME.to_owned()
+    } else if service.eq_ignore_ascii_case(crate::agent_runtime::VIBETHINKER_SERVICE_NAME) {
+        crate::agent_runtime::VIBETHINKER_PROVIDER_NAME.to_owned()
     } else {
         format!(
             "aifarm-{}",
@@ -580,6 +582,17 @@ fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
                 .trim_start_matches("llm-openai-")
                 .trim_start_matches("llm-")
         )
+    }
+}
+
+fn gpu_runtime_hint(service: &str) -> &'static str {
+    if service
+        .trim()
+        .eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME)
+    {
+        "mlx"
+    } else {
+        "llama_cpp"
     }
 }
 
@@ -660,7 +673,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
                         name: provider_name.clone(),
                         kind: "chat".to_owned(),
                         protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
-                        runtime_hint: Some("llama_cpp".to_owned()),
+                        runtime_hint: Some(gpu_runtime_hint(service).to_owned()),
                         endpoint: None,
                         discovery_service_name: Some(service.clone()),
                         discovery_endpoint_name: Some(endpoint.clone()),
@@ -749,7 +762,7 @@ pub async fn backfill_dialog_local_reasoner_fallback(
             name: provider_name,
             kind: "chat".to_owned(),
             protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
-            runtime_hint: Some("llama_cpp".to_owned()),
+            runtime_hint: Some(gpu_runtime_hint(&reasoner.discovery_service_name).to_owned()),
             endpoint: None,
             discovery_service_name: Some(reasoner.discovery_service_name),
             discovery_endpoint_name: Some(reasoner.discovery_endpoint_name),
@@ -1832,7 +1845,7 @@ fn memory_routing_cascade_targets() -> &'static [MemoryRoutingCascadeTarget] {
         MemoryRoutingCascadeTarget {
             workflow_key: MEMORY_EXTRACTION_WORKFLOW,
             role: "fallback",
-            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            provider_name: crate::agent_runtime::VIBETHINKER_PROVIDER_NAME,
             model_name: "vibethinker-3b",
             weight: None,
             fallback_order: Some(1),
@@ -1841,14 +1854,14 @@ fn memory_routing_cascade_targets() -> &'static [MemoryRoutingCascadeTarget] {
             workflow_key: MEMORY_EXTRACTION_WORKFLOW,
             role: "fallback",
             provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-            model_name: "ternary-bonsai-27b",
+            model_name: crate::agent_runtime::DEFAULT_MAPLE_MODEL,
             weight: None,
             fallback_order: Some(2),
         },
         MemoryRoutingCascadeTarget {
             workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
             role: "primary",
-            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            provider_name: crate::agent_runtime::VIBETHINKER_PROVIDER_NAME,
             model_name: "vibethinker-3b",
             weight: Some(100),
             fallback_order: None,
@@ -1857,7 +1870,7 @@ fn memory_routing_cascade_targets() -> &'static [MemoryRoutingCascadeTarget] {
             workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
             role: "fallback",
             provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-            model_name: "ternary-bonsai-27b",
+            model_name: crate::agent_runtime::DEFAULT_MAPLE_MODEL,
             weight: None,
             fallback_order: Some(0),
         },
@@ -1884,7 +1897,7 @@ fn resolved_memory_workflow_targets(
 
 fn canonical_dialog_fallback_order(provider_name: &str, model_name: &str) -> Option<i32> {
     if provider_name == crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME
-        && model_name == crate::agent_runtime::DEFAULT_BONSAI_MODEL
+        && model_name == crate::agent_runtime::DEFAULT_MAPLE_MODEL
     {
         Some(0)
     } else if matches!(provider_name, "genkit" | "gemini") {
@@ -1899,7 +1912,7 @@ fn dialog_cascade_ready(
     models: &[ModelRecord],
     assignments: &[AssignmentRecord],
 ) -> bool {
-    let mut bonsai = false;
+    let mut maple = false;
     let mut gemini = false;
     for assignment in assignments.iter().filter(|assignment| {
         assignment.workflow_key == "dialog"
@@ -1919,12 +1932,12 @@ fn dialog_cascade_ready(
             continue;
         };
         match canonical_dialog_fallback_order(&provider.name, &model.model_name) {
-            Some(0) => bonsai = true,
+            Some(0) => maple = true,
             Some(99) => gemini = true,
             _ => {}
         }
     }
-    bonsai && gemini
+    maple && gemini
 }
 
 /// Normalize the two memory LLM workflows after every model/provider backfill
@@ -1982,7 +1995,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
              RETURNING id",
         )
         .bind(MEMORY_GPU2_POOL)
-        .bind("Shared single-slot GPU2 budget for VibeThinker and Ternary Bonsai.")
+        .bind("Shared single-slot GPU2 budget for VibeThinker and Maple.")
         .fetch_one(&mut *transaction)
         .await?;
 
@@ -1999,7 +2012,8 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
                      WHEN config ? 'memory_routing_cascades_v1_previous_pool_id' THEN config \
                      ELSE jsonb_set(config, '{memory_routing_cascades_v1_previous_pool_id}', \
                          COALESCE(to_jsonb(pool_id), 'null'::jsonb), TRUE) \
-                 END, pool_id = $1 WHERE id = $2",
+                 END, pool_id = $1 \
+                 WHERE id = $2 AND pool_id IS DISTINCT FROM $1",
             )
             .bind(capacity_pool_id)
             .bind(model_id)
@@ -2048,7 +2062,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
                   OR provider.name IN ('genkit', 'gemini'))",
         )
         .bind(crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME)
-        .bind(crate::agent_runtime::DEFAULT_BONSAI_MODEL)
+        .bind(crate::agent_runtime::DEFAULT_MAPLE_MODEL)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -2357,6 +2371,7 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
                 name: record.name.clone(),
                 kind,
                 protocol: record.protocol.clone(),
+                runtime_hint: record.runtime_hint.clone(),
                 endpoint: record.endpoint.clone(),
                 discovery_service_name: record.discovery_service_name.clone(),
                 discovery_endpoint_name: record.discovery_endpoint_name.clone(),
@@ -2591,8 +2606,8 @@ mod tests {
                 (
                     "memory_extraction",
                     "fallback",
-                    "aifarm-llamacpp-gpu2",
-                    "ternary-bonsai-27b",
+                    "aifarm-maple",
+                    crate::agent_runtime::DEFAULT_MAPLE_MODEL,
                     Some(2),
                 ),
                 (
@@ -2605,8 +2620,8 @@ mod tests {
                 (
                     "memory_subject_merge",
                     "fallback",
-                    "aifarm-llamacpp-gpu2",
-                    "ternary-bonsai-27b",
+                    "aifarm-maple",
+                    crate::agent_runtime::DEFAULT_MAPLE_MODEL,
                     Some(0),
                 ),
             ]
@@ -2614,7 +2629,7 @@ mod tests {
         assert_eq!(
             canonical_dialog_fallback_order(
                 crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-                "ternary-bonsai-27b",
+                crate::agent_runtime::DEFAULT_MAPLE_MODEL,
             ),
             Some(0)
         );
@@ -2756,13 +2771,13 @@ mod tests {
         ));
         snapshot
             .models
-            .push(model(40, 4, crate::agent_runtime::DEFAULT_BONSAI_MODEL));
+            .push(model(40, 4, crate::agent_runtime::DEFAULT_MAPLE_MODEL));
         snapshot.assignments[1].fallback_order = Some(99);
         snapshot.assignments[2].enabled = false;
         snapshot.triggers[0].enabled = false;
-        let mut bonsai = assignment(103, "dialog", "global", "fallback", 40, None);
-        bonsai.fallback_order = Some(0);
-        snapshot.assignments.push(bonsai);
+        let mut maple = assignment(103, "dialog", "global", "fallback", 40, None);
+        maple.fallback_order = Some(0);
+        snapshot.assignments.push(maple);
 
         let table = build_routing_table(&snapshot);
         let route = table.resolve("dialog", false).expect("dialog route");
@@ -2783,12 +2798,27 @@ mod tests {
     }
 
     #[test]
-    fn gpu_provider_name_preserves_shared_llamacpp_provider_identity() {
+    fn gpu_provider_classification_separates_maple_from_vibethinker() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
 
         assert_eq!(
-            gpu_provider_name("llm-openai-qwen27b-gguf", &config),
-            "aifarm-llamacpp-gpu2"
+            gpu_provider_name(crate::agent_runtime::VIBETHINKER_SERVICE_NAME, &config),
+            crate::agent_runtime::VIBETHINKER_PROVIDER_NAME
+        );
+        assert_eq!(
+            gpu_provider_name(
+                crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME,
+                &config,
+            ),
+            crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME
+        );
+        assert_eq!(
+            gpu_runtime_hint(crate::agent_runtime::VIBETHINKER_SERVICE_NAME),
+            "llama_cpp"
+        );
+        assert_eq!(
+            gpu_runtime_hint(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME),
+            "mlx"
         );
         assert_eq!(gpu_provider_name("llm-openai", &config), "aifarm");
         assert_eq!(
@@ -2809,6 +2839,7 @@ mod tests {
             ("chat", "nvidia", false, PROTOCOL_OPENAI_COMPAT),
             ("chat", "vmlx", false, PROTOCOL_OPENAI_COMPAT),
             ("chat", "aifarm-llamacpp-gpu2", true, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "aifarm-maple", true, PROTOCOL_OPENAI_COMPAT),
             ("vision", "aifarm-vision", true, PROTOCOL_OPENAI_COMPAT),
             ("embedding", "aifarm-embed", true, PROTOCOL_DISCOVERY_JOBS),
             ("image", "aifarm-draw", true, PROTOCOL_DISCOVERY_DRAW),
@@ -2973,14 +3004,17 @@ mod tests {
 
     #[test]
     fn subject_merge_targets_resolve_without_vram_catalog() {
-        let providers = vec![provider(
-            1,
-            crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-            "chat",
-        )];
+        let providers = vec![
+            provider(1, crate::agent_runtime::VIBETHINKER_PROVIDER_NAME, "chat"),
+            provider(
+                2,
+                crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+                "chat",
+            ),
+        ];
         let models = vec![
             model(10, 1, "vibethinker-3b"),
-            model(11, 1, crate::agent_runtime::DEFAULT_BONSAI_MODEL),
+            model(11, 2, crate::agent_runtime::DEFAULT_MAPLE_MODEL),
         ];
 
         assert_eq!(
@@ -3038,7 +3072,7 @@ mod tests {
                 fallback_order INTEGER, canary_percent INTEGER, enabled BOOLEAN NOT NULL, \
                 inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb, \
                 cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL, \
-                CONSTRAINT reject_bonsai CHECK (provider_model_id <> 21)\
+                CONSTRAINT reject_maple CHECK (provider_model_id <> 21)\
              )",
         )
         .execute(&pool)
@@ -3046,13 +3080,18 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO workflows VALUES \
                 ('memory_subject_merge', 'chat', FALSE, 3, 60000, TRUE); \
+             INSERT INTO llm_capacity_pools \
+                (id, name, max_concurrency, description) VALUES \
+                (7, 'aifarm-gpu2-qwen27b', 1, 'shared test pool'); \
              INSERT INTO llm_providers \
                 (id, name, kind, protocol, enabled) VALUES \
-                (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE); \
+                (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE), \
+                (3, 'aifarm-maple', 'chat', 'openai_compat', TRUE); \
              INSERT INTO provider_models \
-                (id, provider_id, model_name, capabilities, enabled) VALUES \
-                (20, 2, 'vibethinker-3b', ARRAY['chat', 'tools'], TRUE), \
-                (21, 2, 'ternary-bonsai-27b', ARRAY['chat', 'tools'], TRUE); \
+                (id, provider_id, model_name, capabilities, pool_id, enabled, config) VALUES \
+                (20, 2, 'vibethinker-3b', ARRAY['chat', 'tools'], NULL, TRUE, '{}'), \
+                (21, 3, 'maple-preview-2bit-mlx', ARRAY['chat', 'tools'], 7, TRUE, \
+                 jsonb_build_object('managed_by', 'maple_gpu2_cutover_v1', 'origin', 'fresh')); \
              INSERT INTO workflow_assignments \
                 (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, \
                  enabled, cb_failure_threshold, cb_cooldown_ms) VALUES \
@@ -3081,9 +3120,9 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(guard_count, 0);
-        assert_eq!(pool_count, 0);
+        assert_eq!(pool_count, 1);
 
-        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_bonsai")
+        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_maple")
             .execute(&pool)
             .await?;
         assert!(backfill_memory_routing_cascades(&pool).await?);
@@ -3109,8 +3148,133 @@ mod tests {
         assert_eq!(subject_count, 2);
         assert_eq!(extraction_count, 0);
         assert_eq!(guards, vec![MEMORY_SUBJECT_MERGE_CASCADE_KEY.to_owned()]);
-        assert_eq!(model_pools[0], model_pools[1]);
-        assert!(model_pools[0].is_some());
+        assert_eq!(model_pools, vec![Some(7), Some(7)]);
+        let maple_config: Value =
+            sqlx::query_scalar("SELECT config FROM provider_models WHERE id = 21")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            maple_config,
+            json!({"managed_by": "maple_gpu2_cutover_v1", "origin": "fresh"})
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_fresh_migrations_memory_backfill_and_maple_rollback_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let schema = format!("maple_fresh_runtime_{}", std::process::id());
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+        )))
+        .execute(&admin)
+        .await?;
+
+        let search_path = format!("{schema},public");
+        let options = dsn
+            .parse::<sqlx::postgres::PgConnectOptions>()?
+            .options([("search_path", search_path.as_str())]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+
+        let maple: (i64, i64, i64, Value) = sqlx::query_as(
+            "SELECT provider.id, model.id, model.pool_id, model.config              FROM llm_providers AS provider              JOIN provider_models AS model ON model.provider_id = provider.id              WHERE provider.name = 'aifarm-maple'                AND model.model_name = 'maple-preview-2bit-mlx'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(maple.3["origin"], json!("fresh"));
+
+        let vibe_provider_id: i64 = sqlx::query_scalar(
+            "INSERT INTO llm_providers                 (name, kind, protocol, runtime_hint, discovery_service_name,                  discovery_endpoint_name, api_key_ref, enabled, config)              VALUES ('aifarm-llamacpp-gpu2', 'chat', 'openai_compat', 'llama_cpp',                      'llm-openai-qwen27b-gguf', 'chat_completions',                      'DIALOG_API_KEY', TRUE, '{}'::jsonb)              RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let vibe_model_id: i64 = sqlx::query_scalar(
+            "INSERT INTO provider_models                 (provider_id, model_name, display_name, capabilities, enabled, config)              VALUES ($1, 'vibethinker-3b', 'VibeThinker 3B',                      ARRAY['chat', 'tools'], TRUE, '{}'::jsonb)              RETURNING id",
+        )
+        .bind(vibe_provider_id)
+        .fetch_one(&pool)
+        .await?;
+
+        assert!(backfill_memory_routing_cascades(&pool).await?);
+        let maple_config_after_backfill: Value =
+            sqlx::query_scalar("SELECT config FROM provider_models WHERE id = $1")
+                .bind(maple.1)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(maple_config_after_backfill, maple.3);
+        let vibe_pool_id: i64 =
+            sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = $1")
+                .bind(vibe_model_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(vibe_pool_id, maple.2);
+
+        let maple_assignment_id: i64 = sqlx::query_scalar(
+            "SELECT assignment.id              FROM workflow_assignments AS assignment              WHERE assignment.workflow_key = 'memory_subject_merge'                AND assignment.provider_model_id = $1",
+        )
+        .bind(maple.1)
+        .fetch_one(&pool)
+        .await?;
+        let maple_event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO llm_routing_events                 (severity, event_type, workflow_key, provider_id, model_id,                  dedupe_key, summary, detail)              VALUES ('info', 'maple_fresh_test', 'memory_subject_merge', $1, $2,                      'maple-fresh-runtime-round-trip', 'Maple fresh runtime test',                      jsonb_build_object('preserve', TRUE))              RETURNING id",
+        )
+        .bind(maple.0)
+        .bind(maple.1)
+        .fetch_one(&pool)
+        .await?;
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.down.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let rolled_back_assignment: (i64, bool, bool) = sqlx::query_as(
+            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
+        )
+        .bind(maple_assignment_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(rolled_back_assignment, (maple.1, false, true));
+        let preserved_event: (i64, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT id, provider_id, model_id FROM llm_routing_events WHERE id = $1",
+        )
+        .bind(maple_event_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            preserved_event,
+            (maple_event_id, Some(maple.0), Some(maple.1))
+        );
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let reapplied_assignment: (i64, bool, bool) = sqlx::query_as(
+            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
+        )
+        .bind(maple_assignment_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(reapplied_assignment, (maple.1, true, false));
+
+        pool.close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
         Ok(())
     }
 

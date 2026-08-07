@@ -50,20 +50,25 @@ const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
 
-/// Stable provider id for the shared GPU2 llama.cpp service.
-pub const LOCAL_REASONER_PROVIDER_NAME: &str = "aifarm-llamacpp-gpu2";
-/// Legacy Discovery service name targeted by the auto-registered `qwen-reasoner`
-/// compatibility key. The service now hosts Ternary Bonsai and VibeThinker.
-pub const DEFAULT_LOCAL_REASONER_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
-/// Canonical model id sent to the shared GPU2 llama.cpp router.
-pub const DEFAULT_BONSAI_MODEL: &str = "ternary-bonsai-27b";
+/// Stable routing provider id for the dedicated GPU2 Maple service.
+pub const LOCAL_REASONER_PROVIDER_NAME: &str = "aifarm-maple";
+/// Provider id for VibeThinker on the retained shared GPU2 llama.cpp service.
+pub const VIBETHINKER_PROVIDER_NAME: &str = "aifarm-llamacpp-gpu2";
+/// Discovery service that continues to host VibeThinker on GPU2.
+pub const VIBETHINKER_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
+/// Discovery service targeted by the auto-registered `qwen-reasoner`
+/// compatibility key.
+pub const DEFAULT_LOCAL_REASONER_SERVICE_NAME: &str =
+    openplotva_config::DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME;
+/// Canonical model id sent to the dedicated Maple compatibility service.
+pub const DEFAULT_MAPLE_MODEL: &str = openplotva_config::DEFAULT_MAPLE_MODEL;
 
 /// Legacy Rust API alias; use [`DEFAULT_LOCAL_REASONER_SERVICE_NAME`].
 #[deprecated(note = "use DEFAULT_LOCAL_REASONER_SERVICE_NAME")]
 pub const DEFAULT_QWEN_SERVICE_NAME: &str = DEFAULT_LOCAL_REASONER_SERVICE_NAME;
-/// Legacy Rust API alias; use [`DEFAULT_BONSAI_MODEL`].
-#[deprecated(note = "use DEFAULT_BONSAI_MODEL")]
-pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_BONSAI_MODEL;
+/// Legacy Rust API alias; use [`DEFAULT_MAPLE_MODEL`].
+#[deprecated(note = "use DEFAULT_MAPLE_MODEL")]
+pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_MAPLE_MODEL;
 
 /// System prompt for the song-writing agent.
 pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
@@ -146,8 +151,8 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
         );
     }
 
-    // Auto-register the local Bonsai reasoner so the search agent works out of the
-    // box. The persisted `qwen-reasoner` key stays stable; an explicit
+    // Auto-register the local Maple reasoner so the search agent works out of the
+    // box. The persisted `qwen-reasoner` compatibility key stays stable; an explicit
     // `LLM_PROVIDERS_*` entry of the same name takes precedence.
     let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
     if let std::collections::hash_map::Entry::Vacant(entry) = by_name.entry(default_reasoner) {
@@ -199,7 +204,7 @@ pub fn local_reasoner_named_provider_config(
             kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
             discovery_service_name: DEFAULT_LOCAL_REASONER_SERVICE_NAME.to_owned(),
             discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
-            model: DEFAULT_BONSAI_MODEL.to_owned(),
+            model: DEFAULT_MAPLE_MODEL.to_owned(),
             base_url: String::new(),
             url: String::new(),
             api_key: String::new(),
@@ -1276,6 +1281,7 @@ fn agent_client_config_from_attempt(
     if let Some(service) = attempt.discovery_service_name.as_deref() {
         client.service_name = service.to_owned();
     }
+    client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         client.endpoint_name = endpoint.to_owned();
     }
@@ -1625,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_auto_registers_bonsai_under_legacy_reasoner_key() {
+    fn registry_auto_registers_maple_under_legacy_reasoner_key() {
         let config =
             openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig::default())
                 .expect("default config");
@@ -1635,7 +1641,7 @@ mod tests {
         let reasoner = registry
             .get(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER)
             .expect("local reasoner");
-        assert_eq!(reasoner.model, DEFAULT_BONSAI_MODEL);
+        assert_eq!(reasoner.model, DEFAULT_MAPLE_MODEL);
         let spec = local_reasoner_named_provider_config(&config);
         assert_eq!(
             spec.discovery_service_name,
