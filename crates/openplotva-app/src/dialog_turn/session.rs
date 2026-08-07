@@ -67,10 +67,11 @@ const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 /// A duplicate final answer is regenerated only with this much budget left.
 const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 
-/// A searched answer gets two focused rewrites before the turn fails closed.
+/// A searched answer gets two focused rewrites before the best available final
+/// answer is sent, even if the model still omitted a citation.
 const MAX_SEARCH_CITATION_REPAIRS: i32 = 2;
 
-const SEARCH_CITATION_REPAIR_HINT: &str = "ПРОВЕРКА ИСТОЧНИКОВ: предыдущий черновик финального ответа не содержит обязательной inline-ссылки на реально найденный источник. Сразу перепиши финальный ответ, не упоминая исправление и не выполняя новый поиск. Используй только URL из уже имеющихся результатов web_search/crawl_url и оберни конкретные подтверждаемые слова или фразы в <a href=\"URL\">...</a>. Не печатай raw URL или отдельную библиографию.";
+const SEARCH_CITATION_REPAIR_HINT: &str = "ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ИСТОЧНИКОВ: предыдущий черновик финального ответа не содержит требуемой inline-ссылки на реально найденный источник. Перепиши финальный ответ без нового поиска и без упоминания этой проверки. Если ты используешь сведения из web_search/crawl_url, ответ ОБЯЗАН содержать хотя бы одну семантическую inline HTML-ссылку вида <a href=\"URL\">подтверждаемая фраза</a>, где href в точности совпадает с одним из URL в уже имеющихся результатах. Размещай ссылку прямо на подтверждаемом утверждении; не печатай raw URL или отдельную библиографию.";
 
 /// Slice reserved for the final send after a tool call finishes.
 const TOOL_RESERVE: TimeDuration = TimeDuration::seconds(5);
@@ -596,18 +597,12 @@ where
                     );
                     continue;
                 }
-                let error = format!(
-                    "dialog answer omitted a citation to {} web source(s) after {search_citation_repairs} repair attempt(s)",
-                    web_source_urls.len()
+                tracing::warn!(
+                    job_id = ctx.item_id,
+                    attempts = search_citation_repairs,
+                    sources = web_source_urls.len(),
+                    "sending searched answer without a source citation after repair attempts"
                 );
-                return TurnResolution {
-                    outcome: TurnOutcome::TerminalFailed {
-                        reason: "missing_search_citations",
-                        error: error.clone(),
-                        user_signal: UserSignalPlan::React,
-                    },
-                    disposition: JobDisposition::Fail(error),
-                };
             }
 
             if sent.matches_delivery(&sanitized) {
@@ -1711,10 +1706,11 @@ pub async fn run_captured_session(
                     search_citation_repairs += 1;
                     continue;
                 }
-                return Err(format!(
-                    "final answer omitted a citation to {} web source(s) after {search_citation_repairs} repair attempt(s)",
-                    web_source_urls.len()
-                ));
+                tracing::warn!(
+                    attempts = search_citation_repairs,
+                    sources = web_source_urls.len(),
+                    "sending captured searched answer without a source citation after repair attempts"
+                );
             }
             if !sanitized.trim().is_empty() {
                 messages.push(sanitized);
