@@ -78,6 +78,7 @@ impl Protocol {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeHint {
     LlamaCpp,
+    Mlx,
     Vllm,
     Sglang,
     Ollama,
@@ -89,6 +90,7 @@ impl RuntimeHint {
     pub fn from_db(value: &str) -> Option<Self> {
         match value {
             "llama_cpp" => Some(Self::LlamaCpp),
+            "mlx" => Some(Self::Mlx),
             "vllm" => Some(Self::Vllm),
             "sglang" => Some(Self::Sglang),
             "ollama" => Some(Self::Ollama),
@@ -101,6 +103,7 @@ impl RuntimeHint {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LlamaCpp => "llama_cpp",
+            Self::Mlx => "mlx",
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
@@ -112,6 +115,7 @@ impl RuntimeHint {
     pub fn all() -> &'static [Self] {
         &[
             Self::LlamaCpp,
+            Self::Mlx,
             Self::Vllm,
             Self::Sglang,
             Self::Ollama,
@@ -250,6 +254,12 @@ pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value 
             { "key": "repeat_penalty", "kind": "float", "label": "Repeat penalty" },
             { "key": "dry_multiplier", "kind": "float", "label": "DRY multiplier" },
         ]),
+        (Protocol::OpenAiCompat, Some(RuntimeHint::Mlx)) => json!([
+            { "key": "top_k", "kind": "float", "min": 0.0, "label": "Top-k" },
+            { "key": "repeat_penalty", "kind": "float", "label": "Repeat penalty" },
+            { "key": "enable_thinking", "kind": "bool", "label": "Enable thinking" },
+            { "key": "chat_template_kwargs", "kind": "json", "label": "Chat template kwargs" },
+        ]),
         (Protocol::OpenAiCompat, Some(RuntimeHint::Vllm | RuntimeHint::Sglang)) => json!([
             { "key": "enable_thinking", "kind": "bool", "label": "Enable thinking" },
             { "key": "chat_template_kwargs", "kind": "json", "label": "Chat template kwargs" },
@@ -326,6 +336,13 @@ mod tests {
         let descriptor = param_descriptor(Protocol::OpenAiCompat, Some(RuntimeHint::Sglang));
         assert_eq!(descriptor["supports_model_listing"], json!(true));
         assert_eq!(descriptor["runtime_hint"], json!("sglang"));
+        let mlx = param_descriptor(Protocol::OpenAiCompat, Some(RuntimeHint::Mlx));
+        assert_eq!(mlx["runtime_hint"], json!("mlx"));
+        assert!(
+            mlx["runtime_fields"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|field| field["key"] == "top_k"))
+        );
         let descriptor = param_descriptor(Protocol::PrivacyFilter, None);
         assert_eq!(descriptor["supports_model_listing"], json!(false));
     }

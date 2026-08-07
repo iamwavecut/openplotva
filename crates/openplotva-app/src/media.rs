@@ -373,6 +373,7 @@ pub(crate) fn aifarm_structured_json_config_for_attempt(
     if let Some(service) = attempt.discovery_service_name.as_deref() {
         cfg.client.service_name = service.to_owned();
     }
+    cfg.client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         cfg.client.endpoint_name = endpoint.to_owned();
     }
@@ -795,7 +796,19 @@ pub fn agent_client_config_from_named_provider(
     if spec.task_timeout_seconds > 0 {
         client.task_timeout = positive_seconds(spec.task_timeout_seconds);
     }
+    client.runtime_hint = discovery_runtime_hint(&client.service_name).to_owned();
     client
+}
+
+fn discovery_runtime_hint(service_name: &str) -> &'static str {
+    if service_name
+        .trim()
+        .eq_ignore_ascii_case(openplotva_config::DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME)
+    {
+        "mlx"
+    } else {
+        ""
+    }
 }
 
 fn discovery_client_config_from_app_config(config: &AppConfig, model: &str) -> AifarmClientConfig {

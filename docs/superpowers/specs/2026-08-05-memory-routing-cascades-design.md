@@ -1,5 +1,10 @@
 # Memory Routing Cascades Design
 
+> **Historical pre-Maple document.** This records the migrations 178-179 design
+> truthfully. Migration 180 replaces active Bonsai routes with Maple; see
+> [the Maple GPU2 cutover design](2026-08-07-maple-gpu2-cutover-design.md).
+
+
 ## Goal
 
 Give dialog, memory extraction, and memory subject merge independent retry budgets and deterministic model cascades, while preventing VibeThinker and Ternary Bonsai from running concurrently on their shared GPU2 service.

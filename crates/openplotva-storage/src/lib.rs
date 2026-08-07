@@ -9794,6 +9794,51 @@ mod tests {
         assert!(DOWN.contains("disabled_by_memory_routing_cascades_v1"));
     }
 
+    #[test]
+    fn maple_gpu2_cutover_preserves_historical_model_rows_and_is_reversible() {
+        const UP: &str = include_str!("../../../migrations/180_maple_gpu2_cutover.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/180_maple_gpu2_cutover.down.sql");
+
+        assert!(UP.contains("'aifarm-maple'"));
+        assert!(UP.contains("'llm-openai-maple'"));
+        assert!(UP.contains("'maple-preview-2bit-mlx'"));
+        assert!(UP.contains("'mlx'"));
+        assert!(UP.contains("'managed_by', 'maple_gpu2_cutover_v1'"));
+        assert!(UP.contains("'origin', CASE WHEN fresh_install"));
+        assert!(UP.contains("ARRAY['chat', 'tools']::TEXT[]"));
+        assert!(UP.contains("expected_assignment_count"));
+        assert!(UP.contains("GET DIAGNOSTICS moved_assignment_count = ROW_COUNT"));
+        assert!(UP.contains("LOCK TABLE app_settings"));
+        assert!(UP.contains("fresh Maple cutover assignments do not match migration 179"));
+        assert!(UP.contains("llm.routing.maple_gpu2_cutover_v1_assignment_ids"));
+        assert!(UP.contains("disabled_by_maple_gpu2_cutover_v1_rollback"));
+        assert!(UP.contains("llm.routing.dialog_qwen_fallback"));
+        assert!(UP.contains("requires exactly one Bonsai model row"));
+        assert!(UP.contains("requires exactly one VibeThinker model row"));
+        assert!(UP.contains("requires exactly one shared GPU2 pool"));
+        assert!(UP.contains("Maple identity collision"));
+        assert!(!UP.contains("ON CONFLICT"));
+        assert!(!UP.contains("maple_gpu2_cutover_v1_previous_pool_id"));
+        assert!(!UP.contains("UPDATE llm_routing_events"));
+        assert!(!UP.contains("DELETE FROM llm_routing_events"));
+        assert!(!UP.contains("provider.name = 'aifarm'"));
+        assert!(!UP.contains("provider.name = 'aifarm-vision'"));
+
+        assert!(DOWN.contains("Maple rollback marker drift"));
+        assert!(DOWN.contains("Maple rollback assignment manifest drift"));
+        assert!(DOWN.contains("Maple rollback disable-marker collision"));
+        assert!(DOWN.contains("WHERE inference_overrides"));
+        assert!(DOWN.contains("maple_gpu2_cutover_v1_previous_model_id"));
+        assert!(DOWN.contains("retired_by"));
+        assert!(!DOWN.contains("INSERT INTO llm_providers"));
+        assert!(!DOWN.contains("INSERT INTO provider_models"));
+        assert!(!DOWN.contains("provider_model_id = COALESCE"));
+        assert!(!DOWN.contains("DELETE FROM provider_models"));
+        assert!(!DOWN.contains("DELETE FROM llm_providers"));
+        assert!(!DOWN.contains("UPDATE llm_routing_events"));
+        assert!(!DOWN.contains("DELETE FROM llm_routing_events"));
+    }
+
     #[tokio::test]
     async fn live_memory_routing_migration_preserves_operator_pool_and_prior_assignments()
     -> Result<(), Box<dyn Error>> {
@@ -10065,6 +10110,682 @@ mod tests {
                 .fetch_one(&mut *transaction)
                 .await?;
         assert_eq!(reverted, (11, "qwen3.6-27b-moq".to_owned()));
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_maple_cutover_preserves_historical_attribution_and_assignment_ids()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE llm_providers (\
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, \
+                endpoint TEXT, discovery_service_name TEXT, discovery_endpoint_name TEXT, \
+                api_key_ref TEXT, api_key_encrypted BYTEA, enabled BOOLEAN NOT NULL, \
+                config JSONB NOT NULL DEFAULT '{}'::jsonb, protocol TEXT, runtime_hint TEXT, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                CONSTRAINT llm_providers_runtime_hint_check CHECK (runtime_hint IS NULL OR \
+                    runtime_hint IN ('llama_cpp', 'vllm', 'sglang', 'ollama', 'tgi'))\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE llm_capacity_pools (\
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, max_concurrency INTEGER, \
+                description TEXT, config JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE provider_models (\
+                id BIGSERIAL PRIMARY KEY, provider_id BIGINT NOT NULL REFERENCES llm_providers(id), \
+                model_name TEXT NOT NULL, display_name TEXT, base_url TEXT, \
+                capabilities TEXT[] NOT NULL DEFAULT '{}', embedding_dim INTEGER, \
+                pool_id BIGINT REFERENCES llm_capacity_pools(id), enabled BOOLEAN NOT NULL, \
+                config JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                UNIQUE (provider_id, model_name, base_url)\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE workflow_assignments (\
+                id BIGINT PRIMARY KEY, workflow_key TEXT NOT NULL, scope TEXT NOT NULL, \
+                role TEXT NOT NULL, provider_model_id BIGINT NOT NULL REFERENCES provider_models(id), \
+                weight INTEGER, fallback_order INTEGER, enabled BOOLEAN NOT NULL, \
+                inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE llm_routing_events (\
+                id BIGINT PRIMARY KEY, provider_id BIGINT REFERENCES llm_providers(id) ON DELETE SET NULL, \
+                model_id BIGINT REFERENCES provider_models(id) ON DELETE SET NULL\
+             ) ON COMMIT DROP; \
+             CREATE TEMP TABLE app_settings (\
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             ) ON COMMIT DROP"
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::raw_sql(
+            "INSERT INTO llm_providers \
+                (id, name, kind, discovery_service_name, discovery_endpoint_name, api_key_ref, \
+                 enabled, protocol, runtime_hint) VALUES \
+                (-1, 'aifarm', 'chat', 'llm-openai', 'chat_completions', \
+                 'DIALOG_API_KEY', TRUE, 'openai_compat', 'vllm'), \
+                (-2, 'aifarm-llamacpp-gpu2', 'chat', 'llm-openai-qwen27b-gguf', \
+                 'chat_completions', 'DIALOG_API_KEY', TRUE, 'openai_compat', 'llama_cpp'), \
+                (-3, 'aifarm-vision', 'vision', 'llm-openai', 'chat_completions', \
+                 'DIALOG_API_KEY', TRUE, 'openai_compat', 'vllm'); \
+             INSERT INTO llm_capacity_pools \
+                (id, name, max_concurrency, description, config) VALUES \
+                (-70, 'aifarm-gpu2-qwen27b', 1, \
+                 'Shared single-slot GPU2 budget for VibeThinker and Ternary Bonsai.', \
+                 '{\"managed_by\":\"memory_routing_cascades_v1\"}'); \
+             INSERT INTO provider_models \
+                (id, provider_id, model_name, display_name, capabilities, pool_id, enabled) VALUES \
+                (-10, -1, 'Gemma 4 26B Heretic', 'Primary', ARRAY['chat', 'tools'], NULL, TRUE), \
+                (-11, -3, 'Gemma 4 26B Heretic', 'Vision', ARRAY['vision'], NULL, TRUE), \
+                (-20, -2, 'vibethinker-3b', 'VibeThinker', ARRAY['chat', 'tools'], -70, TRUE), \
+                (-21, -2, 'ternary-bonsai-27b', 'Ternary Bonsai', \
+                 ARRAY['chat', 'tools'], -70, TRUE); \
+             INSERT INTO workflow_assignments \
+                (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, enabled) VALUES \
+                (-100, 'dialog', 'global', 'fallback', -21, NULL, 0, TRUE), \
+                (-101, 'memory_extraction', 'global', 'fallback', -21, NULL, 2, TRUE), \
+                (-102, 'memory_subject_merge', 'global', 'fallback', -21, NULL, 0, TRUE), \
+                (-103, 'agentic_search_reasoner', 'global', 'primary', -21, 100, NULL, TRUE), \
+                (-104, 'history_summary', 'global', 'fallback', -21, NULL, 9, FALSE); \
+             INSERT INTO llm_routing_events (id, provider_id, model_id) VALUES \
+                (-200, -2, -21), (-201, -2, -20); \
+             INSERT INTO app_settings (key, value) VALUES \
+                ('llm.routing.gpu_backfilled', '1'), \
+                ('llm.routing.dialog_qwen_fallback', '1'), \
+                ('llm.routing.memory_extraction_cascade_v1', '1'), \
+                ('llm.routing.memory_subject_merge_cascade_v1', '1'), \
+                ('llm.routing.dialog_fallback_cascade_v1', '1')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query("SAVEPOINT marker_collision")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE workflow_assignments              SET inference_overrides = jsonb_set(                  inference_overrides,                  '{maple_gpu2_cutover_v1_previous_model_id}',                  '-21'::jsonb, TRUE)              WHERE id = -104",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let marker_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("global prior-model marker collision must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT marker_collision")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT marker_collision")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(marker_error.to_string().contains("marker collision"));
+
+        sqlx::query("SAVEPOINT missing_convergence_guard")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM app_settings WHERE key = 'llm.routing.gpu_backfilled'")
+            .execute(&mut *transaction)
+            .await?;
+        let guard_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("missing convergence guard must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT missing_convergence_guard")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT missing_convergence_guard")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            guard_error
+                .to_string()
+                .contains("requires all routing-cascade convergence guards")
+        );
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let maple: (i64, i64, String, String, bool, Option<i64>, String) = sqlx::query_as(
+            "SELECT model.id, provider.id, provider.discovery_service_name, model.model_name, \
+                    model.enabled, model.pool_id, model.config::text \
+             FROM provider_models AS model \
+             JOIN llm_providers AS provider ON provider.id = model.provider_id \
+             WHERE provider.name = 'aifarm-maple' \
+               AND model.model_name = 'maple-preview-2bit-mlx'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_ne!(maple.0, -21);
+        assert_ne!(maple.1, -2);
+        assert_eq!(maple.2, "llm-openai-maple");
+        assert_eq!(maple.3, "maple-preview-2bit-mlx");
+        assert!(maple.4);
+        assert_eq!(maple.5, Some(-70));
+        assert!(
+            maple
+                .6
+                .contains("\"managed_by\": \"maple_gpu2_cutover_v1\"")
+        );
+        let maple_capabilities: Vec<String> =
+            sqlx::query_scalar("SELECT capabilities FROM provider_models WHERE id = $1")
+                .bind(maple.0)
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert_eq!(maple_capabilities, vec!["chat", "tools"]);
+        for flag in [
+            "supports_tools",
+            "supports_structured_outputs",
+            "supports_response_format",
+            "supports_reasoning",
+        ] {
+            assert!(maple.6.contains(flag), "missing Maple config flag {flag}");
+        }
+
+        let assignments: Vec<(i64, i64, bool, String)> = sqlx::query_as(
+            "SELECT id, provider_model_id, enabled, inference_overrides::text \
+             FROM workflow_assignments ORDER BY id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        for assignment in assignments.iter().filter(|row| row.2) {
+            assert_eq!(assignment.1, maple.0, "active assignment {}", assignment.0);
+            assert!(
+                assignment
+                    .3
+                    .contains("maple_gpu2_cutover_v1_previous_model_id")
+            );
+        }
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|row| row.0 == -104)
+                .map(|row| row.1),
+            Some(-21)
+        );
+        let bonsai_enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM provider_models WHERE id = -21")
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert!(!bonsai_enabled);
+        let historical: (String, String) = sqlx::query_as(
+            "SELECT provider.name, model.model_name \
+             FROM llm_routing_events AS event \
+             JOIN llm_providers AS provider ON provider.id = event.provider_id \
+             JOIN provider_models AS model ON model.id = event.model_id \
+             WHERE event.id = -200",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(
+            historical,
+            (
+                "aifarm-llamacpp-gpu2".to_owned(),
+                "ternary-bonsai-27b".to_owned()
+            )
+        );
+        let untouched_services: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, discovery_service_name FROM llm_providers \
+             WHERE name IN ('aifarm', 'aifarm-vision') ORDER BY name",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        assert_eq!(
+            untouched_services,
+            vec![
+                ("aifarm".to_owned(), "llm-openai".to_owned()),
+                ("aifarm-vision".to_owned(), "llm-openai".to_owned()),
+            ]
+        );
+        let pool_state: (i32, Vec<i64>) = sqlx::query_as(
+            "SELECT pool.max_concurrency, array_agg(model.id ORDER BY model.id) \
+             FROM llm_capacity_pools AS pool \
+             JOIN provider_models AS model ON model.pool_id = pool.id \
+             WHERE pool.name = 'aifarm-gpu2-qwen27b' \
+               AND model.id IN (-20, $1) GROUP BY pool.max_concurrency",
+        )
+        .bind(maple.0)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(pool_state, (1, vec![-20, maple.0]));
+
+        sqlx::query("SAVEPOINT assignment_manifest_drift")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE workflow_assignments              SET inference_overrides = inference_overrides                  - 'maple_gpu2_cutover_v1_previous_model_id'              WHERE id = -100",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let manifest_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("missing moved-assignment marker must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT assignment_manifest_drift")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT assignment_manifest_drift")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            manifest_error
+                .to_string()
+                .contains("assignment manifest drift")
+        );
+
+        sqlx::query(
+            "INSERT INTO llm_routing_events (id, provider_id, model_id) VALUES (-202, $1, $2)",
+        )
+        .bind(maple.1)
+        .bind(maple.0)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO workflow_assignments
+                (id, workflow_key, scope, role, provider_model_id, weight,
+                 fallback_order, enabled)
+               VALUES
+                (-105, 'operator_maple_workflow', 'global', 'primary', $1, 100, NULL, TRUE)"#,
+        )
+        .bind(maple.0)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let restored_assignments: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, provider_model_id FROM workflow_assignments \
+             WHERE enabled ORDER BY id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        assert!(restored_assignments.iter().all(|row| row.1 == -21));
+        let unrelated_maple_assignment: (i64, bool, String) = sqlx::query_as(
+            "SELECT provider_model_id, enabled, inference_overrides::text \
+             FROM workflow_assignments WHERE id = -105",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(unrelated_maple_assignment.0, maple.0);
+        assert!(!unrelated_maple_assignment.1);
+        assert!(
+            unrelated_maple_assignment
+                .2
+                .contains("disabled_by_maple_gpu2_cutover_v1_rollback")
+        );
+        let restored_bonsai_enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM provider_models WHERE id = -21")
+                .fetch_one(&mut *transaction)
+                .await?;
+        let retired_maple_enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM provider_models WHERE id = $1")
+                .bind(maple.0)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let retired_provider: (bool, Option<String>) =
+            sqlx::query_as("SELECT enabled, runtime_hint FROM llm_providers WHERE id = $1")
+                .bind(maple.1)
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert!(restored_bonsai_enabled);
+        assert!(!retired_maple_enabled);
+        assert_eq!(retired_provider, (false, None));
+        let audit_rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT event.id, provider.name, model.model_name \
+             FROM llm_routing_events AS event \
+             JOIN llm_providers AS provider ON provider.id = event.provider_id \
+             JOIN provider_models AS model ON model.id = event.model_id \
+             ORDER BY event.id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        assert_eq!(
+            audit_rows,
+            vec![
+                (
+                    -202,
+                    "aifarm-maple".to_owned(),
+                    "maple-preview-2bit-mlx".to_owned()
+                ),
+                (
+                    -201,
+                    "aifarm-llamacpp-gpu2".to_owned(),
+                    "vibethinker-3b".to_owned()
+                ),
+                (
+                    -200,
+                    "aifarm-llamacpp-gpu2".to_owned(),
+                    "ternary-bonsai-27b".to_owned()
+                ),
+            ]
+        );
+
+        // A SQLx down/up cycle may reuse only the exact migration-owned retired
+        // identity that this rollback just produced.
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        let reapplied_state: (bool, Option<String>, bool) = sqlx::query_as(
+            "SELECT provider.enabled, provider.runtime_hint, model.enabled \
+             FROM llm_providers AS provider \
+             JOIN provider_models AS model ON model.provider_id = provider.id \
+             WHERE provider.id = $1 AND model.id = $2",
+        )
+        .bind(maple.1)
+        .bind(maple.0)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(reapplied_state, (true, Some("mlx".to_owned()), true));
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        // An unrelated row that merely collides with the Maple name must abort
+        // instead of being reconciled or claimed by the migration.
+        sqlx::query(
+            r#"UPDATE llm_providers
+               SET config = '{"managed_by":"operator"}'::jsonb
+               WHERE id = $1"#,
+        )
+        .bind(maple.1)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("SAVEPOINT maple_collision")
+            .execute(&mut *transaction)
+            .await?;
+        let collision_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("unrelated Maple collision must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT maple_collision")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT maple_collision")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            collision_error
+                .to_string()
+                .contains("Maple identity collision")
+        );
+
+        sqlx::query(
+            r#"UPDATE llm_providers
+               SET config = '{"managed_by":"maple_gpu2_cutover_v1",
+                              "origin":"upgrade",
+                              "retired_by":"maple_gpu2_cutover_v1_rollback"}'::jsonb
+               WHERE id = $1"#,
+        )
+        .bind(maple.1)
+        .execute(&mut *transaction)
+        .await?;
+
+        // The source identity is equally strict: a missing/renamed Bonsai row
+        // aborts before any target row can be enabled or assignment moved.
+        sqlx::query("UPDATE provider_models SET model_name = 'missing-bonsai' WHERE id = -21")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("SAVEPOINT missing_bonsai")
+            .execute(&mut *transaction)
+            .await?;
+        let missing_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("missing Bonsai identity must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT missing_bonsai")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT missing_bonsai")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            missing_error
+                .to_string()
+                .contains("requires exactly one Bonsai model row")
+        );
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_maple_cutover_accepts_exact_post_179_fresh_shape() -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(
+            r#"CREATE TEMP TABLE llm_providers (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+                endpoint TEXT, discovery_service_name TEXT, discovery_endpoint_name TEXT,
+                api_key_ref TEXT, api_key_encrypted BYTEA, enabled BOOLEAN NOT NULL,
+                config JSONB NOT NULL DEFAULT '{}'::jsonb, protocol TEXT, runtime_hint TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CONSTRAINT llm_providers_runtime_hint_check CHECK (runtime_hint IS NULL OR
+                    runtime_hint IN ('llama_cpp', 'vllm', 'sglang', 'ollama', 'tgi'))
+             ) ON COMMIT DROP;
+             CREATE TEMP TABLE llm_capacity_pools (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, max_concurrency INTEGER,
+                description TEXT, config JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             ) ON COMMIT DROP;
+             CREATE TEMP TABLE provider_models (
+                id BIGSERIAL PRIMARY KEY, provider_id BIGINT NOT NULL REFERENCES llm_providers(id),
+                model_name TEXT NOT NULL, display_name TEXT, base_url TEXT,
+                capabilities TEXT[] NOT NULL DEFAULT '{}', embedding_dim INTEGER,
+                pool_id BIGINT REFERENCES llm_capacity_pools(id), enabled BOOLEAN NOT NULL,
+                config JSONB NOT NULL DEFAULT '{}'::jsonb,
+                UNIQUE (provider_id, model_name, base_url)
+             ) ON COMMIT DROP;
+             CREATE TEMP TABLE workflow_assignments (
+                id BIGINT PRIMARY KEY, workflow_key TEXT NOT NULL, scope TEXT NOT NULL,
+                role TEXT NOT NULL, provider_model_id BIGINT NOT NULL REFERENCES provider_models(id),
+                weight INTEGER, fallback_order INTEGER, enabled BOOLEAN NOT NULL,
+                inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb
+             ) ON COMMIT DROP;
+             CREATE TEMP TABLE llm_routing_events (
+                id BIGINT PRIMARY KEY,
+                provider_id BIGINT REFERENCES llm_providers(id) ON DELETE SET NULL,
+                model_id BIGINT REFERENCES provider_models(id) ON DELETE SET NULL
+             ) ON COMMIT DROP;
+             CREATE TEMP TABLE app_settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             ) ON COMMIT DROP"#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::raw_sql(
+            r#"INSERT INTO llm_providers
+                (id, name, kind, endpoint, enabled, protocol)
+               VALUES
+                (-1, 'openrouter-free', 'chat',
+                 'https://openrouter.ai/api/v1', FALSE, 'openai_compat');
+             INSERT INTO llm_capacity_pools
+                (id, name, max_concurrency, description, config)
+               VALUES
+                (-1, 'openrouter-free', 1, 'OpenRouter free pool', '{}'),
+                (-2, 'aifarm-gpu2-qwen27b', 1,
+                 'Shared single-slot GPU2 budget for VibeThinker and Ternary Bonsai.',
+                 '{"managed_by":"memory_routing_cascades_v1"}');
+             INSERT INTO provider_models
+                (id, provider_id, model_name, capabilities, pool_id, enabled)
+               VALUES
+                (-1, -1, 'openrouter/free', ARRAY['chat'], -1, TRUE);
+             INSERT INTO workflow_assignments
+                (id, workflow_key, scope, role, provider_model_id,
+                 fallback_order, enabled)
+               VALUES
+                (-1, 'agentic_image', 'global', 'fallback', -1, 1, TRUE),
+                (-2, 'agentic_search_reasoner', 'global', 'fallback', -1, 2, TRUE),
+                (-3, 'agentic_search_writer', 'global', 'fallback', -1, 3, TRUE),
+                (-4, 'agentic_song', 'global', 'fallback', -1, 4, TRUE),
+                (-5, 'history_summary', 'global', 'fallback', -1, 5, TRUE),
+                (-6, 'media_prompt_optimizer', 'global', 'fallback', -1, 6, TRUE),
+                (-8, 'youtube_summary', 'global', 'fallback', -1, 8, TRUE)"#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query("SAVEPOINT duplicate_fresh_shape")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE workflow_assignments SET workflow_key = 'agentic_image', fallback_order = 1 WHERE id = -8")
+            .execute(&mut *transaction)
+            .await?;
+        let duplicate_error = sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .expect_err("duplicate/missing post-179 fresh pairs must fail closed");
+        sqlx::query("ROLLBACK TO SAVEPOINT duplicate_fresh_shape")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT duplicate_fresh_shape")
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("assignments do not match migration 179")
+        );
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        let maple: (i64, i64, bool, bool, Option<i64>, Vec<String>, String) = sqlx::query_as(
+            "SELECT provider.id, model.id, provider.enabled, model.enabled, model.pool_id, \
+                    model.capabilities, model.config::text \
+             FROM llm_providers AS provider \
+             JOIN provider_models AS model ON model.provider_id = provider.id \
+             WHERE provider.name = 'aifarm-maple' \
+               AND model.model_name = 'maple-preview-2bit-mlx'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(maple.2 && maple.3);
+        assert_eq!(maple.4, Some(-2));
+        assert_eq!(maple.5, vec!["chat", "tools"]);
+        assert!(maple.6.contains("\"origin\": \"fresh\""));
+        assert!(maple.6.contains("\"supports_response_format\": true"));
+        let unchanged_openrouter_assignments: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_assignments \
+             WHERE provider_model_id = -1 \
+               AND NOT inference_overrides \
+                    ? 'maple_gpu2_cutover_v1_previous_model_id'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(unchanged_openrouter_assignments, 7);
+
+        // Simulate runtime convergence and use before a fresh-origin rollback:
+        // Vibe appears, Maple gains an unmarked assignment/event, and guards exist.
+        sqlx::raw_sql(
+            r#"INSERT INTO llm_providers
+                (id, name, kind, discovery_service_name, discovery_endpoint_name,
+                 api_key_ref, enabled, protocol, runtime_hint)
+               VALUES
+                (-2, 'aifarm-llamacpp-gpu2', 'chat', 'llm-openai-qwen27b-gguf',
+                 'chat_completions', 'DIALOG_API_KEY', TRUE,
+                 'openai_compat', 'llama_cpp');
+             INSERT INTO provider_models
+                (id, provider_id, model_name, capabilities, pool_id, enabled)
+               VALUES
+                (-2, -2, 'vibethinker-3b', ARRAY['chat', 'tools'], -2, TRUE);
+             INSERT INTO workflow_assignments
+                (id, workflow_key, scope, role, provider_model_id, weight, enabled)
+               VALUES
+                (-20, 'fresh_maple_runtime', 'global', 'primary', 1, 100, TRUE);
+             INSERT INTO llm_routing_events (id, provider_id, model_id)
+               VALUES (-20, 1, 1);
+             INSERT INTO app_settings (key, value) VALUES
+                ('llm.routing.gpu_backfilled', '1'),
+                ('llm.routing.dialog_qwen_fallback', '1'),
+                ('llm.routing.memory_extraction_cascade_v1', '1'),
+                ('llm.routing.memory_subject_merge_cascade_v1', '1'),
+                ('llm.routing.dialog_fallback_cascade_v1', '1')"#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.down.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        let retired: (bool, Option<String>, bool, String) = sqlx::query_as(
+            "SELECT provider.enabled, provider.runtime_hint, model.enabled, model.config::text \
+             FROM llm_providers AS provider \
+             JOIN provider_models AS model ON model.provider_id = provider.id \
+             WHERE provider.id = $1 AND model.id = $2",
+        )
+        .bind(maple.0)
+        .bind(maple.1)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!((retired.0, retired.1, retired.2), (false, None, false));
+        assert!(retired.3.contains("maple_gpu2_cutover_v1_rollback"));
+        let unmarked_runtime_assignment: (i64, bool) = sqlx::query_as(
+            "SELECT provider_model_id, enabled FROM workflow_assignments WHERE id = -20",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(unmarked_runtime_assignment, (maple.1, false));
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/180_maple_gpu2_cutover.up.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        let reapplied: (bool, Option<String>, bool) = sqlx::query_as(
+            "SELECT provider.enabled, provider.runtime_hint, model.enabled \
+             FROM llm_providers AS provider \
+             JOIN provider_models AS model ON model.provider_id = provider.id \
+             WHERE provider.id = $1 AND model.id = $2",
+        )
+        .bind(maple.0)
+        .bind(maple.1)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(reapplied, (true, Some("mlx".to_owned()), true));
+        let restored_runtime_assignment: bool =
+            sqlx::query_scalar("SELECT enabled FROM workflow_assignments WHERE id = -20")
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert!(restored_runtime_assignment);
 
         transaction.rollback().await?;
         Ok(())

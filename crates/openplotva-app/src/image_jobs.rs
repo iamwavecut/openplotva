@@ -7142,6 +7142,7 @@ mod tests {
             model_id: 2,
             provider_name: "aifarm-draw".to_owned(),
             model_name: "boogu-image-turbo-sdnq".to_owned(),
+            provider_runtime_hint: None,
             provider_endpoint: None,
             discovery_service_name: Some(AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
             discovery_endpoint_name: Some(AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),

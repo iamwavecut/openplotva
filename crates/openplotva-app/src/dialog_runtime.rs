@@ -139,6 +139,7 @@ impl ChatClientFactory {
         cfg.client.api_key =
             resolve_provider_api_key(row.api_key_ref.as_deref(), row.api_key_encrypted.as_deref())
                 .unwrap_or_default();
+        cfg.client.runtime_hint = row.runtime_hint.clone().unwrap_or_default();
         match (&row.discovery_service_name, &row.endpoint) {
             (Some(service), _) => {
                 cfg.client.service_name = service.clone();
@@ -199,6 +200,7 @@ fn provider_row_fingerprint(row: &openplotva_llm::router::ProviderRow) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     row.name.hash(&mut hasher);
     row.protocol.hash(&mut hasher);
+    row.runtime_hint.hash(&mut hasher);
     row.endpoint.hash(&mut hasher);
     row.discovery_service_name.hash(&mut hasher);
     row.discovery_endpoint_name.hash(&mut hasher);
@@ -488,6 +490,9 @@ fn aifarm_discovery_provider_name(service: &str, config: &AppConfig) -> String {
     }
     if service.eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME) {
         return crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME.to_owned();
+    }
+    if service.eq_ignore_ascii_case(crate::agent_runtime::VIBETHINKER_SERVICE_NAME) {
+        return crate::agent_runtime::VIBETHINKER_PROVIDER_NAME.to_owned();
     }
     format!(
         "aifarm-{}",
@@ -829,16 +834,17 @@ mod tests {
     }
 
     #[test]
-    fn local_reasoner_dialog_config_targets_stable_gpu_provider_with_tools() {
+    fn local_reasoner_dialog_config_targets_maple_with_tools() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
 
         let cfg = local_reasoner_dialog_config_from_app_config(&config);
 
-        assert_eq!(cfg.provider_name, "aifarm-llamacpp-gpu2");
-        assert_eq!(cfg.client.service_name, "llm-openai-qwen27b-gguf");
+        assert_eq!(cfg.provider_name, "aifarm-maple");
+        assert_eq!(cfg.client.service_name, "llm-openai-maple");
         assert_eq!(cfg.client.endpoint_name, "chat_completions");
-        assert_eq!(cfg.model, "ternary-bonsai-27b");
-        assert_eq!(cfg.client.default_model, "ternary-bonsai-27b");
+        assert_eq!(cfg.client.runtime_hint, "mlx");
+        assert_eq!(cfg.model, "maple-preview-2bit-mlx");
+        assert_eq!(cfg.client.default_model, "maple-preview-2bit-mlx");
         assert_eq!(cfg.include_reasoning, Some(false));
         assert_eq!(cfg.enable_thinking, Some(false));
     }
@@ -1479,6 +1485,7 @@ mod tests {
             model_id: 10,
             provider_name: provider_name.to_owned(),
             model_name: "db/model".to_owned(),
+            provider_runtime_hint: None,
             provider_endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -1530,14 +1537,16 @@ mod tests {
             "an unchanged row must reuse the cached client"
         );
 
-        let changed = admin_created_provider_snapshot("openai_compat", "https://other.local/v1");
+        let mut changed =
+            admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
+        changed.providers[0].runtime_hint = Some("mlx".to_owned());
         handle.store(crate::model_routing::build_routing_table(&changed));
         let third = factory
             .resolve(&attempt_for(5, "my-sglang"))
             .expect("third");
         assert!(
             !Arc::ptr_eq(&first, &third),
-            "an endpoint change must invalidate the cached client"
+            "a runtime-hint-only change must invalidate the cached client"
         );
     }
 

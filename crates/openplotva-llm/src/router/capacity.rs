@@ -430,6 +430,7 @@ mod tests {
                 name: "aifarm".to_owned(),
                 kind: Kind::Chat,
                 protocol: None,
+                runtime_hint: None,
                 endpoint: None,
                 discovery_service_name: None,
                 discovery_endpoint_name: None,
