@@ -3814,6 +3814,61 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
 }
 
 #[tokio::test]
+async fn session_sends_second_uncited_web_citation_repair_when_exhausted()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let source_url = "https://example.com/current";
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что сейчас?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "что сейчас".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("Без ссылки, первоначальный ответ")),
+        Ok(step_text("Без ссылки, попытка один")),
+        Ok(step_text("Без ссылки, попытка два")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
+        SessionToolboxStub::with_web_search_result(successful_web_search_result(source_url)),
+    );
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(report.session_iterations, 4);
+    assert_eq!(effects.sent().len(), 1);
+    assert_eq!(effects.sent()[0].1, "Без ссылки, попытка два");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    assert_eq!(ledger_rows(&outcomes)[0].outcome, "sent");
+    Ok(())
+}
+
+#[tokio::test]
 async fn captured_session_repairs_missing_web_citation_for_runtime_smokes()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -3862,7 +3917,7 @@ async fn captured_session_repairs_missing_web_citation_for_runtime_smokes()
 }
 
 #[tokio::test]
-async fn captured_session_fails_closed_when_web_citation_repairs_are_exhausted()
+async fn captured_session_sends_second_uncited_web_citation_repair_when_exhausted()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let source_url = "https://example.com/news";
@@ -3878,21 +3933,17 @@ async fn captured_session_fails_closed_when_web_citation_repairs_are_exhausted()
                 },
             )],
         )),
+        Ok(step_text("Без ссылки, первоначальный ответ")),
         Ok(step_text("Без ссылки, попытка один")),
         Ok(step_text("Без ссылки, попытка два")),
-        Ok(step_text("Без ссылки, попытка три")),
     ]);
     let toolbox =
         SessionToolboxStub::with_web_search_result(successful_web_search_result(source_url));
     let input = dialog_input_from_job_params_at(&dialog_params("что нового?"), now);
 
-    let error = match crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await
-    {
-        Ok(_) => panic!("uncited searched answer escaped the captured session"),
-        Err(error) => error,
-    };
+    let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
 
-    assert!(error.contains("after 2 repair attempt(s)"), "{error}");
+    assert_eq!(output.messages, vec!["Без ссылки, попытка два"]);
     assert_eq!(provider.calls(), 4);
     Ok(())
 }
