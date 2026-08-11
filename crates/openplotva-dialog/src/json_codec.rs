@@ -489,7 +489,9 @@ impl TolerantParser<'_> {
             if self.consume_byte(b',') {
                 continue;
             }
+            let pair_start = self.index;
             let Some((key, value)) = self.parse_object_pair() else {
+                self.advance_if_stalled(pair_start);
                 continue;
             };
             if self.last_wins || !map.contains_key(&key) {
@@ -556,6 +558,7 @@ impl TolerantParser<'_> {
             if self.consume_byte(b',') {
                 continue;
             }
+            let value_start = self.index;
             if let Some(value) = self.parse_value() {
                 if !matches!(value, Value::Object(ref map) if map.is_empty()) {
                     values.push(value);
@@ -564,6 +567,7 @@ impl TolerantParser<'_> {
                 self.consume_byte(b',');
             } else {
                 self.skip_bad_array_value();
+                self.advance_if_stalled(value_start);
             }
         }
         values
@@ -740,6 +744,12 @@ impl TolerantParser<'_> {
         let ch = self.raw[self.index..].chars().next()?;
         self.index += ch.len_utf8();
         Some(ch)
+    }
+
+    fn advance_if_stalled(&mut self, previous_index: usize) {
+        if self.index == previous_index && self.index < self.raw.len() {
+            self.index += char_len_at(self.raw, self.index);
+        }
     }
 
     fn peek_byte(&self) -> Option<u8> {
@@ -945,5 +955,17 @@ mod tests {
         )
         .expect("parsed");
         assert_eq!(root["answer"], "line\nsmile:\u{263a} quote:\" slash:\\");
+    }
+
+    #[test]
+    fn tolerant_parser_skips_invalid_tokens_without_spinning() {
+        let object = parse_json_object_tolerant(r#"{:broken, answer:"ok"}"#, true)
+            .expect("later valid object fields remain salvageable");
+        assert_eq!(object["answer"], "ok");
+
+        let array = parse_json_object_tolerant(r#"{items:[}, "kept"], answer:"still ok"}"#, true)
+            .expect("later valid fields remain salvageable after a malformed array item");
+        assert_eq!(array["items"], json!(["kept"]));
+        assert_eq!(array["answer"], "still ok");
     }
 }

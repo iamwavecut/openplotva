@@ -332,7 +332,7 @@ impl RoutedAttemptWalker {
                         );
                         self.record_event(routing_event_with_severity(
                             "attempt_failed",
-                            "warn",
+                            "info",
                             &context,
                             Some(attempt.provider),
                             Some(attempt.model),
@@ -441,7 +441,7 @@ impl RoutedAttemptWalker {
                 wait_reported = true;
                 self.record_event(routing_event_with_severity(
                     "capacity_pool_wait",
-                    "warn",
+                    "info",
                     &context,
                     None,
                     None,
@@ -569,6 +569,16 @@ pub struct RoutedAttempt {
     pub model_config: Value,
     pub overrides: InferenceOverrides,
     pub variant: Option<String>,
+}
+
+impl RoutedAttempt {
+    #[must_use]
+    pub fn supports_message_name(&self) -> bool {
+        self.provider_config
+            .get("supports_message_name")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Debug)]
@@ -1273,6 +1283,59 @@ mod tests {
 
         assert_eq!(output, "fallback");
         assert_eq!(*executed.lock().expect("models"), vec![10, 20]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_retry_and_capacity_wait_events_are_informational() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.assignments[0].weight = Some(100);
+        snapshot.assignments[1].role = "fallback".to_owned();
+        snapshot.assignments[1].weight = None;
+        snapshot.assignments[1].fallback_order = Some(1);
+        snapshot.models[0].pool_id = None;
+        snapshot.models[1].pool_id = Some(1);
+
+        let pools = Arc::new(PoolRegistry::new());
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let walker =
+            walker_with_pools(&snapshot, Arc::clone(&pools)).with_reporter(reporter.clone());
+        let busy_fallback = pools.try_acquire(Some(1)).expect("occupy fallback pool");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(busy_fallback);
+        });
+
+        walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                |attempt| async move {
+                    if attempt.model_id == 10 {
+                        Err(std::io::Error::other("retryable primary failure"))
+                    } else {
+                        Ok("fallback")
+                    }
+                },
+                |_error| Some(FailureReason::ProviderProtocolError),
+            )
+            .await
+            .expect("fallback succeeds after the transient events");
+
+        let events = reporter.buffer().routing_events(10);
+        for event_type in ["attempt_failed", "capacity_pool_wait"] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .unwrap_or_else(|| panic!("missing {event_type}"));
+            assert_eq!(event.severity, "info", "{event_type} is not terminal");
+        }
     }
 
     #[tokio::test(start_paused = true)]

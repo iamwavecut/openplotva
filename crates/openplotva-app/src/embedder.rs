@@ -8,8 +8,8 @@
 //! the cooldown expires and a single probe is allowed through.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
@@ -38,14 +38,45 @@ const EMBEDDER_DISCOVERY_CONTENT_TYPE: &str = "application/json";
 
 /// Process-shared, cooling circuit breaker for the embedder service.
 ///
-/// State is kept in atomics so it can be read and updated across worker tasks
-/// without holding a lock across `.await`.
 #[derive(Debug)]
 pub struct EmbedderCircuitBreaker {
     failure_threshold: usize,
     cooldown: Duration,
-    consecutive_failures: AtomicUsize,
-    open_until_unix_ms: AtomicI64,
+    state: Mutex<EmbedderCircuitState>,
+}
+
+#[derive(Debug, Default)]
+struct EmbedderCircuitState {
+    consecutive_failures: usize,
+    open_until: Option<Instant>,
+    half_open_probe: bool,
+    generation: u64,
+}
+
+struct EmbedderRequestPermit<'a> {
+    breaker: &'a EmbedderCircuitBreaker,
+    generation: u64,
+    owns_half_open_probe: bool,
+}
+
+impl EmbedderRequestPermit<'_> {
+    fn record_success(&self) {
+        self.breaker
+            .record_success(self.generation, self.owns_half_open_probe);
+    }
+
+    fn record_failure(&self) {
+        self.breaker
+            .record_failure(self.generation, self.owns_half_open_probe);
+    }
+}
+
+impl Drop for EmbedderRequestPermit<'_> {
+    fn drop(&mut self) {
+        if self.owns_half_open_probe {
+            self.breaker.release_half_open_probe(self.generation);
+        }
+    }
 }
 
 impl EmbedderCircuitBreaker {
@@ -54,41 +85,83 @@ impl EmbedderCircuitBreaker {
         Self {
             failure_threshold: failure_threshold.max(1),
             cooldown,
-            consecutive_failures: AtomicUsize::new(0),
-            open_until_unix_ms: AtomicI64::new(0),
+            state: Mutex::new(EmbedderCircuitState::default()),
         }
     }
 
-    fn now_unix_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0)
+    fn lock_state(&self) -> MutexGuard<'_, EmbedderCircuitState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Whether the embedder may be called now. While open, returns false without
     /// any network traffic; once the cooldown elapses, a probe is allowed.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        let open_until = self.open_until_unix_ms.load(Ordering::Relaxed);
-        open_until == 0 || Self::now_unix_ms() >= open_until
+        let state = self.lock_state();
+        match state.open_until {
+            None => true,
+            Some(open_until) => Instant::now() >= open_until && !state.half_open_probe,
+        }
     }
 
-    /// Record a successful call: close the breaker and reset the failure streak.
-    pub fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.open_until_unix_ms.store(0, Ordering::Relaxed);
+    /// Acquire permission for a request. After the cooldown only one caller may
+    /// run the half-open probe; all other callers continue to fail fast.
+    fn acquire_request(&self) -> Option<EmbedderRequestPermit<'_>> {
+        let mut state = self.lock_state();
+        let owns_half_open_probe = match state.open_until {
+            None => false,
+            Some(open_until) if Instant::now() < open_until => return None,
+            Some(_) if state.half_open_probe => return None,
+            Some(_) => {
+                state.half_open_probe = true;
+                true
+            }
+        };
+        Some(EmbedderRequestPermit {
+            breaker: self,
+            generation: state.generation,
+            owns_half_open_probe,
+        })
     }
 
-    /// Record a failed call: open the breaker once the streak hits the threshold.
-    pub fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= self.failure_threshold {
-            let cooldown_ms = i64::try_from(self.cooldown.as_millis()).unwrap_or(i64::MAX);
-            self.open_until_unix_ms.store(
-                Self::now_unix_ms().saturating_add(cooldown_ms),
-                Ordering::Relaxed,
-            );
+    fn record_success(&self, generation: u64, owns_half_open_probe: bool) {
+        let mut state = self.lock_state();
+        if state.generation != generation {
+            return;
+        }
+        if state.open_until.is_some() {
+            if !owns_half_open_probe {
+                return;
+            }
+            state.open_until = None;
+            state.half_open_probe = false;
+            state.generation = state.generation.wrapping_add(1);
+        }
+        state.consecutive_failures = 0;
+    }
+
+    fn record_failure(&self, generation: u64, owns_half_open_probe: bool) {
+        let mut state = self.lock_state();
+        if state.generation != generation {
+            return;
+        }
+        if state.open_until.is_some() && !owns_half_open_probe {
+            return;
+        }
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if owns_half_open_probe || state.consecutive_failures >= self.failure_threshold {
+            state.open_until = Some(Instant::now() + self.cooldown);
+            state.half_open_probe = false;
+            state.generation = state.generation.wrapping_add(1);
+        }
+    }
+
+    fn release_half_open_probe(&self, generation: u64) {
+        let mut state = self.lock_state();
+        if state.generation == generation {
+            state.half_open_probe = false;
         }
     }
 }
@@ -211,17 +284,18 @@ impl DiscoveryEmbedderClient {
         if request.prompts.is_empty() {
             return Err(EmbedderClientError::EmptyPrompts);
         }
-        if !self.breaker.is_available() {
-            return Err(EmbedderClientError::Unavailable);
-        }
+        let permit = self
+            .breaker
+            .acquire_request()
+            .ok_or(EmbedderClientError::Unavailable)?;
         match self.encode_through_discovery(request).await {
             Ok(response) => {
-                self.breaker.record_success();
+                permit.record_success();
                 Ok(response)
             }
             Err(error) => {
                 if error.is_availability_failure() {
-                    self.breaker.record_failure();
+                    permit.record_failure();
                 }
                 Err(error)
             }
@@ -702,28 +776,134 @@ mod tests {
 
     #[test]
     fn breaker_opens_after_threshold_and_resets_on_success() {
-        let breaker = EmbedderCircuitBreaker::new(3, Duration::from_secs(300));
+        let breaker = EmbedderCircuitBreaker::new(3, Duration::from_millis(20));
         assert!(breaker.is_available());
-        breaker.record_failure();
-        breaker.record_failure();
+        breaker
+            .acquire_request()
+            .expect("first request")
+            .record_failure();
+        breaker
+            .acquire_request()
+            .expect("second request")
+            .record_failure();
         assert!(breaker.is_available(), "two failures stay closed");
-        breaker.record_failure();
+        breaker
+            .acquire_request()
+            .expect("third request")
+            .record_failure();
         assert!(!breaker.is_available(), "third failure opens the breaker");
-        breaker.record_success();
+        std::thread::sleep(Duration::from_millis(30));
+        breaker
+            .acquire_request()
+            .expect("recovery probe")
+            .record_success();
         assert!(breaker.is_available(), "success closes the breaker");
     }
 
     #[test]
     fn breaker_reopens_on_single_failure_after_streak() {
         let breaker = EmbedderCircuitBreaker::new(2, Duration::from_millis(40));
-        breaker.record_failure();
-        breaker.record_failure();
+        breaker
+            .acquire_request()
+            .expect("first request")
+            .record_failure();
+        breaker
+            .acquire_request()
+            .expect("second request")
+            .record_failure();
         assert!(!breaker.is_available());
         std::thread::sleep(Duration::from_millis(60));
         assert!(breaker.is_available(), "cooldown elapsed; probe allowed");
-        // A failed probe re-opens immediately (streak is still past threshold).
-        breaker.record_failure();
+        breaker
+            .acquire_request()
+            .expect("half-open probe")
+            .record_failure();
         assert!(!breaker.is_available());
+    }
+
+    #[test]
+    fn breaker_allows_only_one_half_open_probe() {
+        let breaker = EmbedderCircuitBreaker::new(1, Duration::from_millis(20));
+        breaker
+            .acquire_request()
+            .expect("initial request")
+            .record_failure();
+        assert!(!breaker.is_available());
+
+        std::thread::sleep(Duration::from_millis(30));
+        let probe = breaker
+            .acquire_request()
+            .expect("first caller owns the probe");
+        assert!(
+            breaker.acquire_request().is_none(),
+            "other callers must stay rejected while the probe is running"
+        );
+
+        probe.record_success();
+        drop(probe);
+        assert!(
+            breaker.acquire_request().is_some(),
+            "success closes the breaker"
+        );
+    }
+
+    #[test]
+    fn dropping_a_cancelled_half_open_probe_releases_the_next_probe() {
+        let breaker = EmbedderCircuitBreaker::new(1, Duration::from_millis(20));
+        breaker
+            .acquire_request()
+            .expect("initial request")
+            .record_failure();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let cancelled = breaker.acquire_request().expect("half-open probe");
+        drop(cancelled);
+
+        assert!(
+            breaker.acquire_request().is_some(),
+            "dropping a cancelled request must not wedge the breaker half-open"
+        );
+    }
+
+    #[test]
+    fn closed_state_request_cannot_release_a_later_half_open_probe() {
+        let breaker = EmbedderCircuitBreaker::new(1, Duration::from_millis(20));
+        let ordinary_request = breaker.acquire_request().expect("closed-state request");
+        let failing_request = breaker.acquire_request().expect("failing request");
+
+        failing_request.record_failure();
+        std::thread::sleep(Duration::from_millis(30));
+        let half_open_probe = breaker.acquire_request().expect("half-open probe");
+
+        drop(ordinary_request);
+        assert!(
+            breaker.acquire_request().is_none(),
+            "an older closed-state request must not release the active probe"
+        );
+
+        drop(half_open_probe);
+        assert!(breaker.acquire_request().is_some());
+    }
+
+    #[test]
+    fn stale_closed_state_success_cannot_close_a_later_half_open_probe() {
+        let breaker = EmbedderCircuitBreaker::new(1, Duration::from_millis(20));
+        let stale_success = breaker.acquire_request().expect("closed-state request");
+        let failing_request = breaker.acquire_request().expect("failing request");
+
+        failing_request.record_failure();
+        std::thread::sleep(Duration::from_millis(30));
+        let half_open_probe = breaker.acquire_request().expect("half-open probe");
+
+        stale_success.record_success();
+        drop(stale_success);
+        assert!(
+            breaker.acquire_request().is_none(),
+            "a stale success must not close the newer half-open generation"
+        );
+
+        drop(half_open_probe);
+        assert!(breaker.acquire_request().is_some());
     }
 
     #[test]
