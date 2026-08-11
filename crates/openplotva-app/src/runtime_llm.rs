@@ -3,9 +3,9 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use openplotva_dialog::DialogTraceArtifacts;
@@ -27,6 +27,8 @@ const GO_RESPONSE_PREVIEW_SIZE: usize = 500;
 const LLM_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
 const LLM_EVENT_WRITER_BATCH_SIZE: usize = 100;
 const LLM_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const LLM_EVENT_WRITER_INSERT_TIMEOUT: Duration = Duration::from_secs(15);
+const LLM_EVENT_WRITER_FULL_WARNING_INTERVAL_MS: u64 = 60_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_events (
@@ -472,6 +474,8 @@ impl Default for RawBodyPolicy {
 #[derive(Clone, Debug)]
 pub struct PostgresRuntimeLlmEventRecorder {
     sender: mpsc::Sender<RuntimeLlmRequestData>,
+    dropped_full: Arc<AtomicU64>,
+    last_full_warning_unix_ms: Arc<AtomicU64>,
 }
 
 impl PostgresRuntimeLlmEventRecorder {
@@ -489,18 +493,38 @@ impl PostgresRuntimeLlmEventRecorder {
             LLM_EVENT_WRITER_BATCH_SIZE,
             LLM_EVENT_WRITER_FLUSH_INTERVAL,
             raw_bodies,
+            LLM_EVENT_WRITER_INSERT_TIMEOUT,
         ));
-        (Self { sender }, handle)
+        (
+            Self {
+                sender,
+                dropped_full: Arc::new(AtomicU64::new(0)),
+                last_full_warning_unix_ms: Arc::new(AtomicU64::new(0)),
+            },
+            handle,
+        )
     }
 
     fn enqueue(&self, trace: RuntimeLlmRequestData) {
         if let Err(error) = self.sender.try_send(trace) {
             match error {
                 mpsc::error::TrySendError::Full(trace) => {
-                    tracing::warn!(
-                        source = %trace.source,
-                        "dropping llm request event because writer channel is full"
-                    );
+                    let dropped = self.dropped_full.fetch_add(1, Ordering::Relaxed) + 1;
+                    let now = unix_millis_u64();
+                    let last = self.last_full_warning_unix_ms.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= LLM_EVENT_WRITER_FULL_WARNING_INTERVAL_MS
+                        && self
+                            .last_full_warning_unix_ms
+                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        let dropped = self.dropped_full.swap(0, Ordering::Relaxed).max(dropped);
+                        tracing::warn!(
+                            source = %trace.source,
+                            dropped,
+                            "dropping llm request events because writer channel is full"
+                        );
+                    }
                 }
                 mpsc::error::TrySendError::Closed(trace) => {
                     tracing::debug!(
@@ -511,6 +535,13 @@ impl PostgresRuntimeLlmEventRecorder {
             }
         }
     }
+}
+
+fn unix_millis_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Observer that turns low-level `openplotva-llm` call records into runtime trace rows.
@@ -738,6 +769,7 @@ async fn run_llm_request_event_writer(
     batch_size: usize,
     flush_interval: Duration,
     raw_bodies: RawBodyPolicy,
+    insert_timeout: Duration,
 ) {
     let batch_size = batch_size.max(1);
     let mut pending = Vec::with_capacity(batch_size);
@@ -752,6 +784,7 @@ async fn run_llm_request_event_writer(
                 &mut pending,
                 batch_size,
                 raw_bodies,
+                insert_timeout,
             )
             .await;
             break;
@@ -766,6 +799,7 @@ async fn run_llm_request_event_writer(
                         &mut pending,
                         batch_size,
                         raw_bodies,
+                        insert_timeout,
                     )
                     .await;
                     break;
@@ -773,16 +807,16 @@ async fn run_llm_request_event_writer(
             }
             maybe_trace = receiver.recv() => {
                 let Some(trace) = maybe_trace else {
-                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
+                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies, insert_timeout).await;
                     break;
                 };
                 pending.push(trace);
                 if pending.len() >= batch_size {
-                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
+                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies, insert_timeout).await;
                 }
             }
             _ = interval.tick() => {
-                flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
+                flush_llm_request_event_batch(&pool, &mut pending, raw_bodies, insert_timeout).await;
             }
         }
     }
@@ -794,13 +828,14 @@ async fn drain_and_flush_llm_request_event_batches(
     pending: &mut Vec<RuntimeLlmRequestData>,
     batch_size: usize,
     raw_bodies: RawBodyPolicy,
+    insert_timeout: Duration,
 ) {
     loop {
         drain_llm_request_event_channel(receiver, pending, batch_size);
         if pending.is_empty() {
             break;
         }
-        flush_llm_request_event_batch(pool, pending, raw_bodies).await;
+        flush_llm_request_event_batch(pool, pending, raw_bodies, insert_timeout).await;
     }
 }
 
@@ -823,18 +858,38 @@ async fn flush_llm_request_event_batch(
     pool: &PgPool,
     pending: &mut Vec<RuntimeLlmRequestData>,
     raw_bodies: RawBodyPolicy,
+    insert_timeout: Duration,
 ) {
     if pending.is_empty() {
         return;
     }
     let batch = std::mem::take(pending);
-    if let Err(error) = insert_llm_request_events(pool, &batch, raw_bodies).await {
-        let sources = batch
-            .iter()
-            .map(|trace| trace.source.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        tracing::warn!(%error, sources, count = batch.len(), "failed to insert llm request event batch");
+    let sources = batch
+        .iter()
+        .map(|trace| trace.source.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let count = batch.len();
+    let pool = pool.clone();
+    let mut insert =
+        tokio::spawn(async move { insert_llm_request_events(&pool, &batch, raw_bodies).await });
+    match tokio::time::timeout(insert_timeout, &mut insert).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, sources, count, "failed to insert llm request event batch");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, sources, count, "llm request event batch writer task failed");
+        }
+        Err(_) => {
+            insert.abort();
+            tracing::warn!(
+                sources,
+                count,
+                timeout_ms = insert_timeout.as_millis(),
+                "timed out inserting llm request event batch; writer will continue"
+            );
+        }
     }
 }
 
@@ -2143,5 +2198,49 @@ mod tests {
         let batch_sizes = llm_request_event_shutdown_batch_sizes_for_test(receiver, 2);
 
         assert_eq!(batch_sizes, vec![2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn llm_event_batch_flush_times_out_on_an_unresponsive_database() {
+        use sqlx::postgres::PgPoolOptions;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole database listener");
+        let address = listener.local_addr().expect("listener address");
+        let blackhole = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept SQLx connection");
+            std::future::pending::<()>().await;
+        });
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy(&format!(
+                "postgres://postgres:postgres@{address}/postgres?sslmode=disable"
+            ))
+            .expect("lazy pool");
+        let mut pending = vec![RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            ..RuntimeLlmRequestData::default()
+        }];
+
+        let started = std::time::Instant::now();
+        flush_llm_request_event_batch(
+            &pool,
+            &mut pending,
+            RawBodyPolicy::default(),
+            Duration::from_millis(30),
+        )
+        .await;
+
+        assert!(
+            pending.is_empty(),
+            "the stuck batch is dropped, not retried forever"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the writer must regain control after its insert deadline"
+        );
+        blackhole.abort();
     }
 }

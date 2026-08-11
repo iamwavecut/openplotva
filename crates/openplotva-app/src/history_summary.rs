@@ -969,6 +969,7 @@ fn aifarm_history_config_for_attempt(
         cfg.client.service_name = service.to_owned();
     }
     cfg.client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
+    cfg.client.supports_message_name = attempt.supports_message_name();
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         cfg.client.endpoint_name = endpoint.to_owned();
     }

@@ -130,6 +130,7 @@ impl RuntimeHint {
 pub struct ProviderCommonConfig {
     pub timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
+    pub supports_message_name: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -229,7 +230,12 @@ pub fn validate_model_config(config: &Value) -> Result<(), ConfigSchemaError> {
 #[must_use]
 pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value {
     let provider_fields = match protocol {
-        Protocol::OpenAiCompat | Protocol::Genkit | Protocol::AceStep => json!([
+        Protocol::OpenAiCompat => json!([
+            { "key": "timeout_ms", "kind": "int", "label": "Request timeout (ms)" },
+            { "key": "connect_timeout_ms", "kind": "int", "label": "Connect timeout (ms)" },
+            { "key": "supports_message_name", "kind": "bool", "default": true, "label": "Supports message name" },
+        ]),
+        Protocol::Genkit | Protocol::AceStep => json!([
             { "key": "timeout_ms", "kind": "int", "label": "Request timeout (ms)" },
             { "key": "connect_timeout_ms", "kind": "int", "label": "Connect timeout (ms)" },
         ]),
@@ -336,6 +342,22 @@ mod tests {
         let descriptor = param_descriptor(Protocol::OpenAiCompat, Some(RuntimeHint::Sglang));
         assert_eq!(descriptor["supports_model_listing"], json!(true));
         assert_eq!(descriptor["runtime_hint"], json!("sglang"));
+        assert!(
+            descriptor["provider_fields"]
+                .as_array()
+                .is_some_and(|fields| fields
+                    .iter()
+                    .any(|field| field["key"] == "supports_message_name"))
+        );
+        assert_eq!(
+            descriptor["provider_fields"]
+                .as_array()
+                .and_then(|fields| fields
+                    .iter()
+                    .find(|field| field["key"] == "supports_message_name"))
+                .and_then(|field| field.get("default")),
+            Some(&json!(true))
+        );
         let mlx = param_descriptor(Protocol::OpenAiCompat, Some(RuntimeHint::Mlx));
         assert_eq!(mlx["runtime_hint"], json!("mlx"));
         assert!(

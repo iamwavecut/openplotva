@@ -140,6 +140,11 @@ impl ChatClientFactory {
             resolve_provider_api_key(row.api_key_ref.as_deref(), row.api_key_encrypted.as_deref())
                 .unwrap_or_default();
         cfg.client.runtime_hint = row.runtime_hint.clone().unwrap_or_default();
+        cfg.client.supports_message_name = row
+            .config
+            .get("supports_message_name")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         match (&row.discovery_service_name, &row.endpoint) {
             (Some(service), _) => {
                 cfg.client.service_name = service.clone();

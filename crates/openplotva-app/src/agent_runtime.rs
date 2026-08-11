@@ -1282,6 +1282,7 @@ fn agent_client_config_from_attempt(
         client.service_name = service.to_owned();
     }
     client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
+    client.supports_message_name = attempt.supports_message_name();
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         client.endpoint_name = endpoint.to_owned();
     }

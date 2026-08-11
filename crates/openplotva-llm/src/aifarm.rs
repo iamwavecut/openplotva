@@ -942,7 +942,7 @@ where
         if request.model.trim().is_empty() {
             request.model = self.cfg.default_model.clone();
         }
-        normalize_request_for_runtime_hint(&mut request, &self.cfg.runtime_hint);
+        normalize_request_for_client(&mut request, &self.cfg);
         let pending_trace = pending_aifarm_trace(&request);
         let started = std::time::Instant::now();
         let result = if self.uses_direct_endpoint() {
@@ -1076,10 +1076,11 @@ where
     /// Complete through a direct OpenAI-compatible endpoint with supplied job ID.
     pub async fn complete_direct_with_job_id(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
+        normalize_request_for_client(&mut request, &self.cfg);
         let body = direct_chat_completion_body(&request)
             .map_err(|err| Box::new(err) as CompletionError)?;
         emit_status(
@@ -3835,6 +3836,8 @@ pub struct AifarmClientConfig {
     pub default_model: String,
     /// Serving runtime hint used for request-shape normalization.
     pub runtime_hint: String,
+    /// Whether the upstream accepts the optional OpenAI `messages[].name` field.
+    pub supports_message_name: bool,
     /// Discovery priority.
     pub priority: i32,
     /// Workload label.
@@ -3858,6 +3861,7 @@ impl Default for AifarmClientConfig {
             capacity_poll_interval: StdDuration::ZERO,
             default_model: String::new(),
             runtime_hint: String::new(),
+            supports_message_name: true,
             priority: 0,
             workload: String::new(),
             fail_fast_on_capacity_unavailable: false,
@@ -4280,10 +4284,19 @@ pub fn build_discovery_job_request(
     request: &ChatCompletionRequest,
 ) -> Result<DiscoveryJobRequest, AifarmRequestError> {
     let mut request = request_with_default_model(request, &cfg.default_model);
-    normalize_request_for_runtime_hint(&mut request, &cfg.runtime_hint);
+    normalize_request_for_client(&mut request, cfg);
     let payload =
         serde_json::to_vec(&request).map_err(AifarmRequestError::ChatCompletionRequest)?;
     build_discovery_json_payload_job_request(cfg, job_id, &payload)
+}
+
+fn normalize_request_for_client(request: &mut ChatCompletionRequest, cfg: &AifarmClientConfig) {
+    normalize_request_for_runtime_hint(request, &cfg.runtime_hint);
+    if !cfg.supports_message_name {
+        for message in &mut request.messages {
+            message.name = None;
+        }
+    }
 }
 
 fn normalize_request_for_runtime_hint(request: &mut ChatCompletionRequest, runtime_hint: &str) {
@@ -8187,6 +8200,41 @@ mod tests {
                 .and_then(|value| value["json_schema"]["name"].as_str()),
             Some("plotva_step")
         );
+    }
+
+    #[test]
+    fn discovery_job_omits_message_name_only_for_incompatible_providers() {
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "tool".to_owned(),
+                content: r#"{"ok":true}"#.to_owned(),
+                tool_call_id: Some("call-1".to_owned()),
+                name: Some("web_search".to_owned()),
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+
+        for (supports_message_name, expected_name) in [(true, Some("web_search")), (false, None)] {
+            let cfg = AifarmClientConfig {
+                supports_message_name,
+                ..AifarmClientConfig::default()
+            }
+            .with_defaults();
+            let job = build_discovery_job_request(&cfg, "dialog-name", &request)
+                .expect("Discovery job request");
+            let payload = general_purpose::STANDARD
+                .decode(&job.invocation.body)
+                .expect("base64 body");
+            let body: Value = serde_json::from_slice(&payload).expect("request JSON");
+
+            assert_eq!(
+                body["messages"][0].get("name").and_then(Value::as_str),
+                expected_name
+            );
+            assert_eq!(body["messages"][0]["tool_call_id"], "call-1");
+            assert_eq!(body["messages"][0]["content"], r#"{"ok":true}"#);
+        }
     }
 
     #[test]

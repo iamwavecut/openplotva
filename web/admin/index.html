@@ -2853,11 +2853,13 @@
             const collectors = [];
             (fieldDefs || []).forEach(f => {
                 if (f.kind === 'bool') {
-                    const toggle = mpEl('pl-toggle', Object.assign({ label: f.label || f.key }, cfg[f.key] ? { checked: true } : {}));
+                    const configured = cfg[f.key] != null;
+                    const checked = configured ? Boolean(cfg[f.key]) : f.default === true;
+                    const toggle = mpEl('pl-toggle', Object.assign({ label: f.label || f.key }, checked ? { checked: true } : {}));
                     let touched = cfg[f.key] != null;
                     toggle.addEventListener('pl:change', () => { touched = true; });
                     node.appendChild(mpEl('pl-field-group', {}, [toggle]));
-                    collectors.push(out => { if (touched || toggle.checked) out[f.key] = toggle.checked; });
+                    collectors.push(out => { if (touched) out[f.key] = toggle.checked; });
                     return;
                 }
                 if (f.kind === 'json') {
