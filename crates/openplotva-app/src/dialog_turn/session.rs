@@ -61,6 +61,9 @@ pub const SESSION_ITERATION_STAGE: &str = "session_iteration";
 /// Job event stage recorded per executed session tool (audit only).
 pub const SESSION_TOOL_STAGE: &str = "session_tool";
 
+/// Job event stage recording why a tool-call batch continued or completed.
+pub const SESSION_BATCH_STAGE: &str = "session_batch";
+
 /// A session never starts an iteration it cannot plausibly finish.
 const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 
@@ -818,9 +821,9 @@ where
             };
         }
 
-        // ---- Tool iteration: record the assistant step, send its text (a
-        // deliberate announcement), execute every call in order, feed every
-        // result back, then continue — or terminate on a queued side effect.
+        // ---- Tool iteration: record the assistant step, deliver its visible
+        // text once, execute every call in order, then let the typed batch
+        // semantics decide whether tool results require another model step.
         transcript.push(SessionMessage::Assistant {
             text: step.text.clone(),
             tool_calls: step
@@ -833,34 +836,35 @@ where
                 })
                 .collect(),
         });
-        if !step.text.trim().is_empty() {
-            let announcement = prepare_dialog_chat_response(&step.text);
-            if !announcement.trim().is_empty() {
-                let delivery = try_send_intermediate(
-                    &active_params,
-                    effects,
-                    queue,
-                    ctx.item_id,
-                    ctx.item.latest_update_id,
-                    &mut sent,
-                    cfg.max_messages,
-                    &announcement,
-                    failure_now,
-                )
-                .await;
-                if delivery.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
-                    && let Some(runs) = ctx.llm_runs
-                {
-                    runs.mark_round_sent(
-                        &run_id,
-                        crate::runtime_llm_runs::RunRoundSent::Intermediate,
-                    );
-                }
+        let announcement = prepare_dialog_chat_response(&step.text);
+        let step_text_accounted_for = if announcement.trim().is_empty() {
+            false
+        } else {
+            let delivery = try_send_intermediate(
+                &active_params,
+                effects,
+                queue,
+                ctx.item_id,
+                ctx.item.latest_update_id,
+                &mut sent,
+                cfg.max_messages,
+                &announcement,
+                failure_now,
+            )
+            .await;
+            let delivered = delivery.status == openplotva_dialog::TOOL_RESULT_STATUS_OK;
+            if delivered && let Some(runs) = ctx.llm_runs {
+                runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Intermediate);
             }
-        }
+            delivered
+                || delivery.error.as_ref().is_some_and(|error| {
+                    error.code == "duplicate_message" && sent.matches_delivery(&announcement)
+                })
+        };
 
         let mut parallel_media_results = BTreeMap::new();
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
+        let mut batch_results = Vec::with_capacity(step.tool_calls.len());
         for (call_index, call) in step.tool_calls.iter().enumerate() {
             if !matches!(
                 call.step.step.as_str(),
@@ -982,6 +986,7 @@ where
             recorded_tool_calls.push(recorded_session_tool_call(
                 &call.step, &result, &call.id, iteration,
             ));
+            batch_results.push(result.clone());
             transcript.push(SessionMessage::ToolResult {
                 tool_call_id: call.id.clone(),
                 name: call.step.step.clone(),
@@ -997,11 +1002,48 @@ where
             }
         }
 
-        if !batch_side_effects.is_empty() {
-            // Side-effect terminal (binding decision 12): a queued generation
-            // ends the session; the engine emits NO post-factum confirmation.
-            side_effect_tickets.extend(batch_side_effects);
-            return session_delegated(&sent, &side_effect_tickets);
+        let disposition = if !announcement.trim().is_empty() && !step_text_accounted_for {
+            SessionBatchDisposition::ContinueForResults
+        } else {
+            session_batch_disposition(&step.tool_calls, &batch_results, step_text_accounted_for)
+        };
+        let disposition_now =
+            ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
+        append_session_batch_event(
+            queue,
+            ctx.item_id,
+            iteration,
+            disposition,
+            step_text_accounted_for,
+            disposition_now,
+        )
+        .await;
+        side_effect_tickets.extend(batch_side_effects);
+
+        match disposition {
+            SessionBatchDisposition::ContinueForResults
+            | SessionBatchDisposition::ContinueWithoutFinal => {}
+            SessionBatchDisposition::CompleteWithSideEffect => {
+                if sent.any() {
+                    report.sent_answer = true;
+                    append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
+                }
+                return session_delegated(&sent, &side_effect_tickets);
+            }
+            SessionBatchDisposition::CompleteAfterSidecars => {
+                report.sent_answer = true;
+                if let Some(runs) = ctx.llm_runs {
+                    runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                }
+                append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
+                return TurnResolution {
+                    outcome: TurnOutcome::Sent {
+                        parts: sent.total_count,
+                        side_effect_tickets: ticket_ids(&side_effect_tickets),
+                    },
+                    disposition: JobDisposition::Complete,
+                };
+            }
         }
     }
 }
@@ -1707,6 +1749,35 @@ async fn append_session_tool_event<Queue>(
     }
 }
 
+async fn append_session_batch_event<Queue>(
+    queue: &Queue,
+    job_id: i64,
+    iteration: i32,
+    disposition: SessionBatchDisposition,
+    step_text_accounted_for: bool,
+    at: OffsetDateTime,
+) where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let event = TaskQueueJobEvent {
+        level: "info".to_owned(),
+        stage: SESSION_BATCH_STAGE.to_owned(),
+        attempt: iteration,
+        message: "session tool batch disposition selected".to_owned(),
+        data: BTreeMap::from([
+            ("disposition".to_owned(), disposition.as_str().to_owned()),
+            (
+                "step_text_accounted_for".to_owned(),
+                step_text_accounted_for.to_string(),
+            ),
+        ]),
+        ..TaskQueueJobEvent::default()
+    };
+    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
+        tracing::debug!(error = %error, job_id, "failed to append session batch event");
+    }
+}
+
 /// Output of one captured (non-dispatching) session run for the runtime
 /// virtual dialog console: texts in send order plus the recorded tool calls.
 pub struct CapturedSessionOutput {
@@ -1718,7 +1789,7 @@ pub struct CapturedSessionOutput {
 /// Drive the session loop for the admin console: the toolbox is an argument
 /// (SAFE/REAL is the caller's choice per message, not a provider property),
 /// send_message and text-next-to-tools are captured instead of dispatched,
-/// and errors surface directly — no retries, markers, or ledger.
+/// and errors surface directly — no retries, durable markers, or durable ledger.
 pub async fn run_captured_session(
     step_provider: &dyn ChatStepProvider,
     toolbox: &dyn DialogToolbox,
@@ -1729,6 +1800,7 @@ pub async fn run_captured_session(
     let native_tools = session_native_tools().map_err(|error| error.to_string())?;
     let mut transcript: Vec<SessionMessage> = Vec::new();
     let mut messages: Vec<String> = Vec::new();
+    let mut sent = SentLog::new();
     let mut recorded: Vec<ToolCall> = Vec::new();
     let mut provider = String::new();
     let mut web_source_urls = BTreeSet::new();
@@ -1777,7 +1849,8 @@ pub async fn run_captured_session(
                     "sending captured searched answer without a source citation after repair attempts"
                 );
             }
-            if !sanitized.trim().is_empty() {
+            if !sanitized.trim().is_empty() && !sent.matches_delivery(&sanitized) {
+                sent.record(&sanitized, false);
                 messages.push(sanitized);
             }
             return Ok(CapturedSessionOutput {
@@ -1799,14 +1872,18 @@ pub async fn run_captured_session(
                 })
                 .collect(),
         });
-        if !step.text.trim().is_empty() {
-            let announcement = prepare_dialog_chat_response(&step.text);
-            if !announcement.trim().is_empty() {
-                messages.push(announcement);
-            }
-        }
+        let announcement = prepare_dialog_chat_response(&step.text);
+        let step_text_accounted_for = if announcement.trim().is_empty() {
+            false
+        } else if sent.matches_delivery(&announcement) {
+            true
+        } else {
+            sent.record(&announcement, true);
+            messages.push(announcement);
+            true
+        };
 
-        let mut terminal_side_effect = false;
+        let mut batch_results = Vec::with_capacity(step.tool_calls.len());
         for call in &step.tool_calls {
             let step_def = &call.step;
             let result = match step_def.step.as_str() {
@@ -1814,7 +1891,13 @@ pub async fn run_captured_session(
                     let sanitized = prepare_dialog_chat_response(&step_def.text);
                     if sanitized.trim().is_empty() {
                         ToolResult::failed("empty_text", "message text is empty after sanitizing")
+                    } else if sent.matches_delivery(&sanitized) {
+                        ToolResult::failed(
+                            "duplicate_message",
+                            "this text was already sent this turn",
+                        )
                     } else {
+                        sent.record(&sanitized, true);
                         messages.push(sanitized);
                         ToolResult {
                             status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
@@ -1833,9 +1916,6 @@ pub async fn run_captured_session(
                     Err(error) => ToolResult::failed("tool_error", error.to_string()),
                 },
             };
-            if queued_generation_side_effect(&result).is_some() {
-                terminal_side_effect = true;
-            }
             if step_def.step == STEP_WEB_SEARCH
                 && result
                     .status
@@ -1846,6 +1926,7 @@ pub async fn run_captured_session(
             recorded.push(recorded_session_tool_call(
                 step_def, &result, &call.id, iteration,
             ));
+            batch_results.push(result.clone());
             transcript.push(SessionMessage::ToolResult {
                 tool_call_id: call.id.clone(),
                 name: step_def.step.clone(),
@@ -1853,7 +1934,11 @@ pub async fn run_captured_session(
                     .unwrap_or_else(|_| "{\"status\":\"failed\"}".to_owned()),
             });
         }
-        if terminal_side_effect {
+        if matches!(
+            session_batch_disposition(&step.tool_calls, &batch_results, step_text_accounted_for),
+            SessionBatchDisposition::CompleteWithSideEffect
+                | SessionBatchDisposition::CompleteAfterSidecars
+        ) {
             return Ok(CapturedSessionOutput {
                 messages,
                 tool_calls: recorded,
