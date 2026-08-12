@@ -621,6 +621,8 @@ mod tests {
         assert!(rendered.contains("<tools><tool name=\"draw_image\"></tool></tools>"));
         assert!(rendered.contains("<guest_mode>"));
         assert!(rendered.contains("<locale_policy>"));
+        assert!(rendered.contains("доставляется в чат ровно один раз"));
+        assert!(rendered.contains("не повторяй эту реплику отдельным финалом"));
         Ok(())
     }
 

@@ -3370,6 +3370,15 @@ impl SessionToolboxStub {
         stub
     }
 
+    fn with_queued_draw_and_web_search(
+        ticket: &str,
+        web_search_result: openplotva_dialog::ToolResult,
+    ) -> Self {
+        let stub = Self::with_queued_draw(ticket);
+        *stub.web_search_result.lock().expect("web search result") = Some(web_search_result);
+        stub
+    }
+
     fn with_queued_song(ticket: &str) -> Self {
         let stub = Self::default();
         *stub.song_result.lock().expect("song result") = Some(openplotva_dialog::ToolResult {
@@ -3865,6 +3874,33 @@ async fn session_sends_second_uncited_web_citation_repair_when_exhausted()
     assert_eq!(effects.sent()[0].1, "Без ссылки, попытка два");
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     assert_eq!(ledger_rows(&outcomes)[0].outcome, "sent");
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_text_with_reaction_is_returned_once_without_another_model_step()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "Смешно вышло.",
+        vec![(
+            "reaction-call",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                emoji: "🤣".to_owned(),
+                target_message_id: 100,
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
+    let toolbox = SessionToolboxStub::default();
+    let input = dialog_input_from_job_params_at(&dialog_params("рассмеши"), now);
+
+    let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
+
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(output.messages, vec!["Смешно вышло."]);
+    assert_eq!(output.tool_calls.len(), 1);
     Ok(())
 }
 
@@ -4771,6 +4807,139 @@ async fn session_queued_draw_terminates_without_confirmation_text() -> Result<()
 }
 
 #[tokio::test]
+async fn session_queued_draw_delivers_adjacent_text_once_and_terminates()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("нарисуй кота"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "Начинаю рисовать кота.",
+        vec![(
+            "draw-call",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
+                prompt: "кот".to_owned(),
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::with_queued_draw("77")), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        effects.intermediates(),
+        vec![("Начинаю рисовать кота.".to_owned(), 1, true)]
+    );
+    assert!(effects.sent().is_empty());
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    assert!(
+        queue
+            .record(job_id)
+            .expect("job record")
+            .events
+            .iter()
+            .any(|event| event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE),
+        "terminal tool text must leave the same crash-reentry marker as a final answer"
+    );
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "sent");
+    assert_eq!(rows[0].side_effect_ticket_id, Some(77));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_queued_draw_with_search_continues_for_search_result() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("нарисуй по свежим данным"), now),
+    );
+    let source_url = "https://example.com/current";
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "Начинаю рисовать и проверяю данные.",
+            vec![
+                (
+                    "draw-call",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
+                        prompt: "кот".to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+                (
+                    "search-call",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                        query: "latest facts".to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                ),
+            ],
+        )),
+        Ok(step_text(&format!(
+            "Рисунок уже в очереди; вот <a href=\"{source_url}\">проверенный источник</a>."
+        ))),
+    ]);
+    let wiring = session_wiring(
+        Arc::new(SessionToolboxStub::with_queued_draw_and_web_search(
+            "77",
+            successful_web_search_result(source_url),
+        )),
+        None,
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(
+        provider.calls(),
+        2,
+        "search results require a follow-up step"
+    );
+    assert_eq!(effects.intermediates().len(), 1);
+    assert_eq!(effects.sent().len(), 1);
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].side_effect_ticket_id, Some(77));
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
@@ -4780,7 +4949,7 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
     );
     let provider = StepProviderStub::with_steps(vec![
         Ok(step_tools(
-            "",
+            "Пробую запустить рисование.",
             vec![(
                 "call-1",
                 openplotva_dialog::ToolStep {
@@ -4814,6 +4983,10 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
 
     assert!(report.sent_answer, "{report:?}");
     assert_eq!(provider.calls(), 2, "the error came back to the model");
+    assert_eq!(
+        effects.intermediates(),
+        vec![("Пробую запустить рисование.".to_owned(), 1, true)]
+    );
     let requests = provider.requests();
     let openplotva_dialog::SessionMessage::ToolResult { content, .. } = &requests[1].transcript[1]
     else {
@@ -5020,6 +5193,135 @@ async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Bo
     );
     assert!(transcript_json.contains("emoji_not_allowed"));
     assert!(transcript_json.contains("already_reacted"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_text_with_reaction_is_delivered_once_without_another_model_step()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("покажи юмор"), now),
+    );
+    let reply = "Ну и юмор, будто из трясины выудили. Почти как наши шутки в чате.";
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        reply,
+        vec![(
+            "reaction-call",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                emoji: "🤣".to_owned(),
+                target_message_id: 100,
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
+    let reactor = Arc::new(ReactorStub::default());
+    let wiring = session_wiring(
+        Arc::new(SessionToolboxStub::default()),
+        Some(Arc::clone(&reactor) as Arc<dyn crate::dialog_turn::SessionReactor>),
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(provider.calls(), 1, "a sidecar must not reopen the model");
+    assert_eq!(
+        effects.intermediates(),
+        vec![(reply.to_owned(), 1, true)],
+        "the adjacent response text must be delivered exactly once"
+    );
+    assert!(effects.sent().is_empty());
+    assert_eq!(
+        reactor.reactions.lock().expect("reactions").clone(),
+        vec![(42, 100, "🤣".to_owned())]
+    );
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    let record = queue.record(job_id).expect("job record");
+    assert!(record.events.iter().any(|event| {
+        event.stage == crate::dialog_turn::SESSION_BATCH_STAGE
+            && event.data.get("disposition").map(String::as_str) == Some("complete_after_sidecars")
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_suppresses_html_equivalent_tool_text_but_executes_later_tools()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("проверь два факта"), now),
+    );
+    let search = |id: &str, query: &str, text: &str| {
+        step_tools(
+            text,
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: query.to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(search("search-1", "first fact", "<b>Проверяю.</b>")),
+        Ok(search("search-2", "second fact", "<p>Проверяю.</p>")),
+        Ok(step_text("Оба факта проверены.")),
+    ]);
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(
+        Arc::clone(&toolbox) as Arc<dyn openplotva_dialog::DialogToolbox>,
+        None,
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(
+        toolbox.web_search_queries.lock().expect("queries").clone(),
+        vec!["first fact".to_owned(), "second fact".to_owned()],
+        "duplicate visible text must not suppress its adjacent tool"
+    );
+    assert_eq!(
+        effects.intermediates(),
+        vec![("<b>Проверяю.</b>".to_owned(), 1, true)],
+        "HTML-equivalent visible text must be queued only once"
+    );
+    assert_eq!(effects.sent()[0].1, "Оба факта проверены.");
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     Ok(())
 }
 
