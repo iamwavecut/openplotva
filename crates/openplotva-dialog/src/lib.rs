@@ -494,6 +494,14 @@ pub struct ToolArgSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolContinuation {
+    RequiresFollowup,
+    Sidecar,
+    MayTerminateOnSuccess,
+    ExplicitIntermediate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ToolSpec {
     /// Tool name.
     pub name: &'static str,
@@ -503,6 +511,8 @@ pub struct ToolSpec {
     pub when_to_use: &'static str,
     /// Expected result.
     pub result: &'static str,
+    /// How this call's result affects the surrounding dialog session.
+    pub continuation: ToolContinuation,
     /// Tool arguments.
     pub args: &'static [ToolArgSpec],
 }
@@ -626,6 +636,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         when_to_use: "Use when the latest user message asks to draw, generate, create, redraw, or edit an image.",
         result: "Schedules image generation and ENDS your turn; the image arrives asynchronously. \
                  Anything you want to tell the chat, say it before or together with this call.",
+        continuation: ToolContinuation::MayTerminateOnSuccess,
         args: DRAW_IMAGE_ARGS,
     },
     ToolSpec {
@@ -637,6 +648,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
                       the user explicitly asks to turn that writing into a song.",
         result: "Schedules music generation and ENDS your turn; the song arrives asynchronously. \
                  Anything you want to tell the chat, say it before or together with this call.",
+        continuation: ToolContinuation::MayTerminateOnSuccess,
         args: GENERATE_SONG_ARGS,
     },
     ToolSpec {
@@ -644,6 +656,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Understand supported visual media, voice, and audio from chat context.",
         when_to_use: "Use when the latest user message asks about an image, supported sticker, animation, video, video note, voice, audio, or media document, including what is shown or what is said.",
         result: "Returns visual description for images and video, transcription for voice and audio, and both together for video. A missing audio track is an explicit note rather than a visual failure. Partial modality failures, unsupported media, missing references, and Telegram's permanent oversized-file download limit are returned with stable retryability.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {
@@ -651,6 +664,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Fetch current fiat and crypto exchange rates.",
         when_to_use: "Use first when the latest user message asks for a current fiat or crypto rate. Add web_search only when the user also needs external context, causes, comparison, or verification that this specialized live tool does not provide.",
         result: "Returns fresh rate data and may queue a rates side-effect message.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: CURRENCY_RATES_ARGS,
     },
     ToolSpec {
@@ -658,6 +672,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Search the web for current, changeable, or uncertain external facts.",
         when_to_use: "MUST use before answering when accuracy depends on facts that may have changed since model knowledge, including news, prices, weather, schedules, availability, laws, versions, current roles, sports, or economic indicators, or when an external fact is uncertain. An explicit request to search is not required. Prefer a specialized live tool when it fully answers the request; do not search for stable common knowledge, opinions, creative work, or facts supplied by the user.",
         result: "Returns search results with source titles, snippets, and links. HARD REQUIREMENT: when you use these results in the final answer, include at least one semantic inline HTML link directly on the supported claim; its href MUST exactly match a URL returned by web_search or crawl_url. Verify the href against the available results before finishing. Ground the answer only in supporting results, never print raw URLs or a separate bibliography, and never invent a source when search fails. Follow promising links with crawl_url when snippets are not enough.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: WEB_SEARCH_ARGS,
     },
     ToolSpec {
@@ -666,6 +681,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         when_to_use: "Use to read a page found via web_search, or when the latest user message asks \
                       to inspect, summarize, or quote a specific webpage.",
         result: "Returns extracted page content — the natural follow-up to web_search links.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: CRAWL_URL_ARGS,
     },
     ToolSpec {
@@ -673,6 +689,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Search earlier messages in THIS chat by keywords.",
         when_to_use: "Use to ground on what was said before — recall references, in-jokes, decisions, names, or context the user implies from past conversation.",
         result: "Returns matching past messages (sender, time, text).",
+        continuation: ToolContinuation::RequiresFollowup,
         args: HISTORY_SEARCH_ARGS,
     },
     ToolSpec {
@@ -680,6 +697,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Search long-term memory for facts about the user or chat.",
         when_to_use: "Use to personalize or ground on durable facts (preferences, identity, ongoing topics) the bot has remembered.",
         result: "Returns relevant remembered facts and recent episode summaries.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: MEMORY_SEARCH_ARGS,
     },
     ToolSpec {
@@ -687,6 +705,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Fetch a YouTube transcript and summary.",
         when_to_use: "Use when the latest user message asks to summarize, explain, or review a YouTube video.",
         result: "Returns a transcript-based summary or transcript text.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: YOUTUBE_SUMMARY_ARGS,
     },
     ToolSpec {
@@ -694,6 +713,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Check the image-generation queue state.",
         when_to_use: "Use when the latest user message asks about queue position, current load, or wait time for image generation.",
         result: "Returns queue depth, active jobs, and estimated wait time.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: &[],
     },
     ToolSpec {
@@ -701,6 +721,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Cancel the user's active or queued image-generation jobs.",
         when_to_use: "Use when the latest user message asks to stop, cancel, or discard pending image generation.",
         result: "Cancels active jobs for the requesting user in the current chat.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: &[],
     },
     ToolSpec {
@@ -708,6 +729,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Translate text into a target language.",
         when_to_use: "Use when the latest user message asks to translate a word, phrase, sentence, or passage.",
         result: "Returns the translated text with language information.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: TRANSLATE_TEXT_ARGS,
     },
     ToolSpec {
@@ -715,6 +737,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Summarize recent conversation history for the current chat or Telegram thread.",
         when_to_use: "Use when the latest user message asks what people discussed, what happened recently, or asks for a recap of the last day, hours, or messages.",
         result: "Returns a saved summary with event bullets and an artistic recap of actors and events.",
+        continuation: ToolContinuation::RequiresFollowup,
         args: CHAT_HISTORY_SUMMARY_ARGS,
     },
 ];
@@ -736,6 +759,16 @@ pub fn alternative_dialog_tool_names() -> Vec<&'static str> {
         .map(|spec| spec.name)
         .filter(|name| !AGENT_ONLY_TOOL_NAMES.contains(name))
         .collect()
+}
+
+#[must_use]
+pub fn dialog_tool_continuation(name: &str) -> Option<ToolContinuation> {
+    ALTERNATIVE_DIALOG_TOOL_CATALOG
+        .iter()
+        .copied()
+        .chain([SESSION_SEND_MESSAGE_SPEC, SESSION_REACT_TO_MESSAGE_SPEC])
+        .find(|spec| spec.name.eq_ignore_ascii_case(name.trim()))
+        .map(|spec| spec.continuation)
 }
 
 /// Return whether a tool call should be omitted from dialog history.
@@ -898,6 +931,7 @@ pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
     result: "Delivers the message immediately; returns ok, or an error when the per-turn message \
              limit is reached, the text duplicates an already-sent message, or the text is empty \
              after sanitization.",
+    continuation: ToolContinuation::ExplicitIntermediate,
     args: &[ToolArgSpec {
         name: "text",
         required: true,
@@ -920,6 +954,7 @@ pub const SESSION_REACT_TO_MESSAGE_SPEC: ToolSpec = ToolSpec {
                   🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡",
     result: "Sets the reaction; returns ok, or an error for a disallowed emoji or a message you \
              already reacted to this turn.",
+    continuation: ToolContinuation::Sidecar,
     args: &[
         ToolArgSpec {
             name: "chat_id",
@@ -3152,6 +3187,21 @@ fn is_zero_i32(value: &i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_session_tool_has_explicit_continuation_semantics() {
+        for spec in alternative_dialog_tools()
+            .into_iter()
+            .chain([SESSION_SEND_MESSAGE_SPEC, SESSION_REACT_TO_MESSAGE_SPEC])
+        {
+            assert_eq!(
+                dialog_tool_continuation(spec.name),
+                Some(spec.continuation),
+                "{} must declare how its result affects the session",
+                spec.name
+            );
+        }
+    }
 
     #[test]
     fn finalize_dialog_reply_recovers_channels_and_suppresses_leaks() {
