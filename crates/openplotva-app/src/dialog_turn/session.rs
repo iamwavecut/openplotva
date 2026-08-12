@@ -25,8 +25,8 @@ use openplotva_dialog::{
     SESSION_REACT_TO_MESSAGE_SPEC, SESSION_REACTION_ALLOWED_EMOJI, SESSION_SEND_MESSAGE_SPEC,
     STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
     STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, SessionMessage, SessionToolCall, ToolContext,
-    ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs, dialog_tool_context,
-    dispatch_dialog_tool,
+    ToolContinuation, ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs,
+    dialog_tool_context, dialog_tool_continuation, dispatch_dialog_tool,
     turn::{
         ANTI_LOOP_HINT, QueuedSideEffect, SIDE_EFFECT_KIND_IMAGE, SIDE_EFFECT_KIND_MUSIC,
         SIDE_EFFECT_STATE_QUEUED,
@@ -144,6 +144,25 @@ struct SentLog {
     total_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionBatchDisposition {
+    ContinueForResults,
+    CompleteWithSideEffect,
+    CompleteAfterSidecars,
+    ContinueWithoutFinal,
+}
+
+impl SessionBatchDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContinueForResults => "continue_for_results",
+            Self::CompleteWithSideEffect => "complete_with_side_effect",
+            Self::CompleteAfterSidecars => "complete_after_sidecars",
+            Self::ContinueWithoutFinal => "continue_without_final",
+        }
+    }
+}
+
 impl SentLog {
     fn new() -> Self {
         Self {
@@ -153,16 +172,16 @@ impl SentLog {
         }
     }
 
-    /// Match either one delivery or the model's whitespace-only concatenation
-    /// of every delivery made so far.
+    /// Match either one visible delivery or the model's ordered concatenation
+    /// of every delivery made so far, independent of HTML-only differences.
     fn matches_delivery(&self, text: &str) -> bool {
-        let normalized = normalize_sent_text(text);
+        let normalized = canonical_visible_text(text);
         self.texts.contains(&normalized)
             || (self.texts.len() > 1 && self.texts.join(" ") == normalized)
     }
 
     fn record(&mut self, text: &str, intermediate: bool) {
-        self.texts.push(normalize_sent_text(text));
+        self.texts.push(canonical_visible_text(text));
         self.total_count += 1;
         if intermediate {
             self.intermediate_count += 1;
@@ -174,8 +193,11 @@ impl SentLog {
     }
 }
 
-fn normalize_sent_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+fn canonical_visible_text(text: &str) -> String {
+    openplotva_telegram::strip_telegram_html(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn collect_web_source_urls(result: &ToolResult, urls: &mut BTreeSet<String>) {
@@ -1066,6 +1088,49 @@ fn queued_generation_side_effect(result: &ToolResult) -> Option<QueuedSideEffect
     })
 }
 
+fn session_batch_disposition(
+    calls: &[ChatStepToolCall],
+    results: &[ToolResult],
+    step_had_text: bool,
+) -> SessionBatchDisposition {
+    let mut only_sidecars = !calls.is_empty();
+    let mut queued_generation = false;
+
+    for (index, call) in calls.iter().enumerate() {
+        let Some(continuation) = dialog_tool_continuation(&call.step.step) else {
+            return SessionBatchDisposition::ContinueForResults;
+        };
+        match continuation {
+            ToolContinuation::RequiresFollowup => {
+                return SessionBatchDisposition::ContinueForResults;
+            }
+            ToolContinuation::Sidecar => {}
+            ToolContinuation::MayTerminateOnSuccess => {
+                only_sidecars = false;
+                let Some(result) = results.get(index) else {
+                    return SessionBatchDisposition::ContinueForResults;
+                };
+                if queued_generation_side_effect(result).is_some() {
+                    queued_generation = true;
+                } else {
+                    return SessionBatchDisposition::ContinueForResults;
+                }
+            }
+            ToolContinuation::ExplicitIntermediate => {
+                only_sidecars = false;
+            }
+        }
+    }
+
+    if queued_generation {
+        SessionBatchDisposition::CompleteWithSideEffect
+    } else if only_sidecars && step_had_text {
+        SessionBatchDisposition::CompleteAfterSidecars
+    } else {
+        SessionBatchDisposition::ContinueWithoutFinal
+    }
+}
+
 fn semantic_tool_call_key(
     trigger_message_id: i32,
     step: &ToolStep,
@@ -1813,6 +1878,75 @@ mod tests {
     use openplotva_dialog::{ToolboxFuture, VisionRequest};
 
     use super::*;
+
+    #[test]
+    fn sent_log_matches_html_equivalent_and_aggregate_replays() {
+        let mut sent = SentLog::new();
+        sent.record("Ну и <b>юмор</b>", true);
+
+        assert!(sent.matches_delivery("<p>Ну и юмор</p>"));
+
+        sent.record("Ещё реплика", true);
+        assert!(sent.matches_delivery("Ну и юмор\n\nЕщё реплика"));
+    }
+
+    #[test]
+    fn batch_disposition_follows_tool_semantics_and_results() {
+        let call = |name: &str| ChatStepToolCall {
+            id: format!("call-{name}"),
+            step: ToolStep {
+                step: name.to_owned(),
+                ..ToolStep::default()
+            },
+            salvaged: false,
+        };
+        let ok = || ToolResult {
+            status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+            ..ToolResult::default()
+        };
+        let queued = || ToolResult {
+            status: openplotva_dialog::TOOL_RESULT_STATUS_QUEUED.to_owned(),
+            side_effect: Some(openplotva_dialog::ToolSideEffect {
+                kind: SIDE_EFFECT_KIND_IMAGE.to_owned(),
+                state: SIDE_EFFECT_STATE_QUEUED.to_owned(),
+                ..openplotva_dialog::ToolSideEffect::default()
+            }),
+            ..ToolResult::default()
+        };
+
+        assert_eq!(
+            session_batch_disposition(&[call(STEP_REACT_TO_MESSAGE)], &[ok()], true),
+            SessionBatchDisposition::CompleteAfterSidecars
+        );
+        assert_eq!(
+            session_batch_disposition(&[call(STEP_REACT_TO_MESSAGE)], &[ok()], false),
+            SessionBatchDisposition::ContinueWithoutFinal
+        );
+        assert_eq!(
+            session_batch_disposition(&[call(STEP_DRAW_IMAGE)], &[queued()], true),
+            SessionBatchDisposition::CompleteWithSideEffect
+        );
+        assert_eq!(
+            session_batch_disposition(
+                &[call(STEP_DRAW_IMAGE)],
+                &[ToolResult::failed("draw_failed", "draw failed")],
+                true,
+            ),
+            SessionBatchDisposition::ContinueForResults
+        );
+        assert_eq!(
+            session_batch_disposition(
+                &[call(STEP_DRAW_IMAGE), call(STEP_WEB_SEARCH)],
+                &[queued(), ok()],
+                true,
+            ),
+            SessionBatchDisposition::ContinueForResults
+        );
+        assert_eq!(
+            session_batch_disposition(&[call(STEP_SEND_MESSAGE)], &[ok()], false),
+            SessionBatchDisposition::ContinueWithoutFinal
+        );
+    }
 
     struct ParallelMediaToolbox {
         barrier: tokio::sync::Barrier,
