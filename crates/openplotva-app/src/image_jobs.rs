@@ -4487,6 +4487,9 @@ fn decode_draw_job_result(
     if payload.is_empty() {
         return Ok((None, status_code, body_text));
     }
+    if status_code >= 400 {
+        return Ok((None, status_code, body_text));
+    }
     let result =
         decode_draw_api_result_payload(&payload).map_err(ImageGenerationError::Provider)?;
     Ok((Some(result), status_code, body_text))
@@ -6878,6 +6881,33 @@ mod tests {
             openplotva_llm::retry::retryable_reason_from_message(&format!("job failed: {message}")),
             Some(openplotva_llm::retry::FailureReason::ProviderUnavailable)
         );
+    }
+
+    #[test]
+    fn draw_api_failed_response_preserves_upstream_error_body() {
+        let response_body = general_purpose::STANDARD
+            .encode(br#"{"detail":"CUDA error: device-side assert triggered"}"#);
+        let envelope: DiscoveryJobEnvelope = serde_json::from_value(json!({
+            "job": {
+                "job_id": "draw-failed",
+                "state": "failed",
+                "result": {
+                    "response": {
+                        "status_code": 500,
+                        "body": response_body
+                    }
+                }
+            }
+        }))
+        .expect("draw failure envelope");
+
+        let status = draw_api_status_from_envelope("draw-failed", &envelope)
+            .expect("HTTP error payload is diagnostic data, not an image result");
+
+        assert!(status.result.is_none());
+        let error = status.error.expect("upstream error body");
+        assert!(error.contains("device-side assert triggered"));
+        assert!(!error.contains("missing image_b64"));
     }
 
     #[test]

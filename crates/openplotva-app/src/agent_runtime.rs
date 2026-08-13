@@ -1206,6 +1206,8 @@ where
 /// Parse the image agent's structured final answer into a refined prompt. Returns
 /// `None` when no `PROMPT:` block is present, so the caller falls back to the optimizer.
 fn parse_image_prompt(answer: &str) -> Option<String> {
+    const MAX_IMAGE_AGENT_PROMPT_CHARS: usize = 2_048;
+
     let mut prompt = String::new();
     let mut in_prompt = false;
     for line in answer.lines() {
@@ -1228,6 +1230,14 @@ fn parse_image_prompt(answer: &str) -> Option<String> {
     }
     let prompt = prompt.trim().to_owned();
     if prompt.is_empty() {
+        return None;
+    }
+    if prompt.chars().count() > MAX_IMAGE_AGENT_PROMPT_CHARS {
+        tracing::warn!(
+            prompt_chars = prompt.chars().count(),
+            max_prompt_chars = MAX_IMAGE_AGENT_PROMPT_CHARS,
+            "image agent prompt exceeds generation boundary; using reprompt fallback"
+        );
         return None;
     }
     Some(prompt)
@@ -1581,6 +1591,15 @@ mod tests {
     fn rejects_image_prompt_without_marker() {
         assert!(parse_image_prompt("just some prose with no marker").is_none());
         assert!(parse_image_prompt("PROMPT:\n   ").is_none());
+    }
+
+    #[test]
+    fn rejects_runaway_image_prompt_instead_of_forwarding_it_to_draw() {
+        let at_limit = format!("PROMPT: {}", "x".repeat(2_048));
+        let over_limit = format!("PROMPT: {}", "x".repeat(2_049));
+
+        assert!(parse_image_prompt(&at_limit).is_some());
+        assert!(parse_image_prompt(&over_limit).is_none());
     }
 
     #[test]
