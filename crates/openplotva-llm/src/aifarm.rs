@@ -551,6 +551,11 @@ pub enum AifarmDialogError {
         "chat completion returned reasoning without final content ({reasoning_chars} reasoning chars)"
     )]
     ReasoningBudgetExhausted { reasoning_chars: usize },
+    /// Upstream exhausted the output budget after producing only partial final content.
+    #[error(
+        "chat completion output token budget exhausted with truncated final content ({output_chars} chars)"
+    )]
+    OutputBudgetExhausted { output_chars: usize },
     /// Native tool definitions failed to serialize.
     #[error("encode dialog tool definition: {0}")]
     ToolDefinition(serde_json::Error),
@@ -4859,6 +4864,11 @@ fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
         .unwrap_or_default()
         .trim()
         .to_owned();
+    if !content.is_empty() && first_choice_finish_reason(response).eq_ignore_ascii_case("length") {
+        return Err(AifarmDialogError::OutputBudgetExhausted {
+            output_chars: content.chars().count(),
+        });
+    }
     if content.is_empty() {
         // Reasoning output must never be promoted into the answer, but a
         // reasoning-only completion is a budget problem, not a protocol one:
@@ -5247,6 +5257,7 @@ fn is_retryable_final_answer_error(err: &AifarmDialogError) -> bool {
             | AifarmDialogError::FinalAnswerProtocolOnly
             | AifarmDialogError::FinalAnswerPathological(_)
             | AifarmDialogError::ReasoningBudgetExhausted { .. }
+            | AifarmDialogError::OutputBudgetExhausted { .. }
     )
 }
 
@@ -7623,19 +7634,29 @@ mod tests {
     }
 
     #[test]
-    fn length_truncated_completion_preserves_nonempty_final_content() {
-        let answer = extract_final_answer(&json!({
+    fn length_truncated_completion_retries_instead_of_using_partial_content() {
+        let err = extract_final_answer_for_provider(
+            &json!({
             "choices": [{
                 "finish_reason": "length",
                 "message": {
-                    "content": "A complete answer that reached the output limit.",
+                    "content": "A partial answer that reached the output limit.",
                     "reasoning_content": "internal reasoning"
                 }
             }]
-        }))
-        .expect("nonempty final content must remain usable");
+            }),
+            PROVIDER_AIFARM,
+        )
+        .expect_err("length-truncated content must not be consumed");
 
-        assert_eq!(answer, "A complete answer that reached the output limit.");
+        assert_eq!(
+            retryable_reason(err.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(
+            err.to_string().contains("output token budget exhausted"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
