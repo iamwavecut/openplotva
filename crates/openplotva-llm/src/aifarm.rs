@@ -46,6 +46,7 @@ const DEFAULT_SERVICE_NAME: &str = "llm-openai";
 const DEFAULT_ENDPOINT_NAME: &str = "chat_completions";
 const DEFAULT_MODEL_NAME: &str = "Gemma 4 26B Heretic";
 const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 1024;
+const SONG_OPTIMIZER_MAX_TOKENS: i32 = 4096;
 const DEFAULT_VRAM_CLOUD_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TOP_P: f64 = 0.8;
 const DEFAULT_VRAM_CLOUD_TOP_K: f64 = 20.0;
@@ -2135,7 +2136,7 @@ where
                     name: "optimize_song_prompt".to_owned(),
                     messages,
                     schema: tool.input_schema,
-                    max_tokens: 1024,
+                    max_tokens: SONG_OPTIMIZER_MAX_TOKENS,
                     temperature: 0.5,
                     ..AifarmStructuredJsonRequest::default()
                 },
@@ -7305,7 +7306,7 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "custom song user en");
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["temperature"], 0.5);
         Ok(())
     }

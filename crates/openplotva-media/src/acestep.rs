@@ -18,6 +18,8 @@ pub const DEFAULT_AUDIO_FORMAT: &str = "mp3";
 pub const DEFAULT_MODEL: &str = "acemusic/acestep-v1.5-turbo";
 pub const OPTIMIZE_SONG_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_song_prompt_terminator";
 
+const MAX_LOGGED_ERROR_BODY_BYTES: usize = 4096;
+const LOGGED_ERROR_BODY_SUFFIX: &str = "...[truncated]";
 const FILE_CANDIDATE_KEYS: [&str; 5] = ["file", "url", "audio", "audio_url", "path"];
 const ERROR_CANDIDATE_KEYS: [&str; 4] = ["error", "message", "detail", "status_message"];
 const SUPPORTED_SONG_LANGUAGES: [&str; 13] = [
@@ -369,6 +371,16 @@ impl AceStepClient {
         let status = response.status();
         let body = response.bytes().await.map_err(AceStepError::Http)?.to_vec();
         if !status.is_success() {
+            if status.is_server_error() || status.as_u16() == 429 {
+                tracing::warn!(
+                    target: "openplotva::media::acestep",
+                    method,
+                    url,
+                    status = status.as_u16(),
+                    response_body = %bounded_http_error_body(&body),
+                    "ACE-Step request returned a non-success status"
+                );
+            }
             return Err(AceStepError::HttpStatus {
                 method: method.to_owned(),
                 url: url.to_owned(),
@@ -378,6 +390,19 @@ impl AceStepClient {
         }
         Ok(body)
     }
+}
+
+fn bounded_http_error_body(body: &[u8]) -> String {
+    let body = String::from_utf8_lossy(body).trim().to_owned();
+    if body.len() <= MAX_LOGGED_ERROR_BODY_BYTES {
+        return body;
+    }
+    let content_limit = MAX_LOGGED_ERROR_BODY_BYTES.saturating_sub(LOGGED_ERROR_BODY_SUFFIX.len());
+    format!(
+        "{}{}",
+        truncate_utf8(&body, content_limit),
+        LOGGED_ERROR_BODY_SUFFIX
+    )
 }
 
 /// Completion-mode request.
@@ -1549,8 +1574,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AceStepApiMode, AceStepClient, AceStepConfig, CompletionRequest, ReleaseTaskRequest,
-        SongPromptPayload, SongPromptRequest, TaskStatus, build_audio_url, build_song_file_name,
+        AceStepApiMode, AceStepClient, AceStepConfig, CompletionRequest,
+        MAX_LOGGED_ERROR_BODY_BYTES, ReleaseTaskRequest, SongPromptPayload, SongPromptRequest,
+        TaskStatus, bounded_http_error_body, build_audio_url, build_song_file_name,
         build_song_release_prompt, detect_song_language, extract_files, extract_task_id_list,
         has_song_minimum_structure, normalize_song_language, normalize_song_lyrics,
         normalize_song_prompt_input, normalize_song_prompt_payload, normalize_song_style,
@@ -1767,6 +1793,19 @@ mod tests {
         assert_eq!(result.file_name, "song.mp3");
         assert_eq!(result.content, "ok");
         Ok(())
+    }
+
+    #[test]
+    fn http_error_body_for_log_trims_and_caps_backend_response() {
+        assert_eq!(
+            bounded_http_error_body(b"\n error code: 504 \n"),
+            "error code: 504"
+        );
+
+        let body = "x".repeat(MAX_LOGGED_ERROR_BODY_BYTES + 32);
+        let logged = bounded_http_error_body(body.as_bytes());
+        assert!(logged.len() <= MAX_LOGGED_ERROR_BODY_BYTES);
+        assert!(logged.ends_with("...[truncated]"));
     }
 
     #[tokio::test]
