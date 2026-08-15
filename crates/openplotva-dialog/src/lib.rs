@@ -1454,6 +1454,55 @@ fn is_cyrillic(ch: char) -> bool {
         || ('\u{a640}'..='\u{a69f}').contains(&ch)
 }
 
+const MIN_REPEATED_BLOCK_CHARS: usize = 160;
+const MIN_REPEATED_SINGLE_PARAGRAPH_CHARS: usize = 320;
+
+fn has_adjacent_repeated_block(value: &str) -> bool {
+    // Restrict rejection to substantial contiguous copies so ordinary short
+    // rhetorical repetition remains valid user-visible text.
+    let paragraphs = normalized_paragraphs(value);
+    for start in 0..paragraphs.len() {
+        let max_block_len = (paragraphs.len() - start) / 2;
+        for block_len in 1..=max_block_len {
+            let first = &paragraphs[start..start + block_len];
+            let content_chars: usize = first.iter().map(|part| part.chars().count()).sum();
+            if content_chars < MIN_REPEATED_BLOCK_CHARS
+                || (block_len == 1 && content_chars < MIN_REPEATED_SINGLE_PARAGRAPH_CHARS)
+            {
+                continue;
+            }
+            let second = &paragraphs[start + block_len..start + (2 * block_len)];
+            if first == second {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalized_paragraphs(value: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut paragraph = String::new();
+    for line in value.lines() {
+        if line.trim().is_empty() {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+            continue;
+        }
+        for word in line.split_whitespace() {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(word);
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    paragraphs
+}
+
 #[must_use]
 pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     let mut max_run = 0;
@@ -1481,6 +1530,9 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     }
     if cyrillic >= 80 && spaces <= 1 {
         return Some("missing word spaces".to_owned());
+    }
+    if has_adjacent_repeated_block(value) {
+        return Some("repeated block".to_owned());
     }
     let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
     for segment in value.split(['\n', '.', '!', '?']) {
@@ -3342,6 +3394,42 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("I thought so too."),
             Reply("I thought so too.".to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_adjacent_duplicate_blocks() {
+        let raw = r#"Шутка в том, что проблема P против NP — это как вопрос «можно ли быстро проверить ответ, если его уже нашли?». Математики десятилетиями спорят, и у них есть ровно два варианта: да или нет.
+
+Сотрудник лаборатории использовал нерелизную нейросеть и сузил круг ответов до двух. То есть модель потратила кучу вычислений, чтобы сказать то, что все знали с самого начала.
+
+Плотва объясняет:
+
+Проблема P против NP — это главный нерешённый вопрос математики. По сути, учёные десятилетиями спорят о том, какой из двух вариантов верен: можно ли задачу быстро решить или только быстро проверить чужое решение.
+
+Шутка в том, что сотрудник потратил ресурсы секретной нерелизной модели и кучу времени на то, чтобы подтвердить очевидное: вариантов ответа два. Нейросеть сделала вид, что совершила прорыв, а на деле просто напомнила про базовую логику.
+
+Плотва объясняет:
+
+Проблема P против NP — это главный нерешённый вопрос математики. По сути, учёные десятилетиями спорят о том, какой из двух вариантов верен: можно ли задачу быстро решить или только быстро проверить чужое решение.
+
+Шутка в том, что сотрудник потратил ресурсы секретной нерелизной модели и кучу времени на то, чтобы подтвердить очевидное: вариантов ответа два. Нейросеть сделала вид, что совершила прорыв, а на деле просто напомнила про базовую логику."#;
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated block".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_short_deliberate_repetition() {
+        let raw = "Нет, это важно.\n\nНет, это важно.";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Reply(raw.to_owned())
         );
     }
 
