@@ -1456,23 +1456,41 @@ fn is_cyrillic(ch: char) -> bool {
 
 const MIN_REPEATED_BLOCK_CHARS: usize = 160;
 const MIN_REPEATED_SINGLE_PARAGRAPH_CHARS: usize = 320;
+const MAX_FINAL_REPLY_PARAGRAPHS: usize = 256;
 
-fn has_adjacent_repeated_block(value: &str) -> bool {
+fn has_adjacent_repeated_block(paragraphs: &[String]) -> bool {
     // Restrict rejection to substantial contiguous copies so ordinary short
     // rhetorical repetition remains valid user-visible text.
-    let paragraphs = normalized_paragraphs(value);
-    for start in 0..paragraphs.len() {
-        let max_block_len = (paragraphs.len() - start) / 2;
-        for block_len in 1..=max_block_len {
-            let first = &paragraphs[start..start + block_len];
-            let content_chars: usize = first.iter().map(|part| part.chars().count()).sum();
-            if content_chars < MIN_REPEATED_BLOCK_CHARS
-                || (block_len == 1 && content_chars < MIN_REPEATED_SINGLE_PARAGRAPH_CHARS)
-            {
+    let mut paragraph_ids = std::collections::BTreeMap::<&str, usize>::new();
+    let mut ids = Vec::with_capacity(paragraphs.len());
+    let mut character_prefix = Vec::with_capacity(paragraphs.len() + 1);
+    character_prefix.push(0);
+    for paragraph in paragraphs {
+        let next_id = paragraph_ids.len();
+        let id = *paragraph_ids.entry(paragraph.as_str()).or_insert(next_id);
+        ids.push(id);
+        let character_count =
+            character_prefix.last().copied().unwrap_or_default() + paragraph.chars().count();
+        character_prefix.push(character_count);
+    }
+
+    for block_len in 1..=paragraphs.len() / 2 {
+        let mut equal_run = 0;
+        for index in 0..paragraphs.len() - block_len {
+            if ids[index] == ids[index + block_len] {
+                equal_run += 1;
+            } else {
+                equal_run = 0;
+            }
+            if equal_run < block_len {
                 continue;
             }
-            let second = &paragraphs[start + block_len..start + (2 * block_len)];
-            if first == second {
+
+            let start = index + 1 - block_len;
+            let content_chars = character_prefix[start + block_len] - character_prefix[start];
+            if content_chars >= MIN_REPEATED_BLOCK_CHARS
+                && (block_len > 1 || content_chars >= MIN_REPEATED_SINGLE_PARAGRAPH_CHARS)
+            {
                 return true;
             }
         }
@@ -1531,7 +1549,11 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     if cyrillic >= 80 && spaces <= 1 {
         return Some("missing word spaces".to_owned());
     }
-    if has_adjacent_repeated_block(value) {
+    let paragraphs = normalized_paragraphs(value);
+    if paragraphs.len() > MAX_FINAL_REPLY_PARAGRAPHS {
+        return Some("excessive paragraph count".to_owned());
+    }
+    if has_adjacent_repeated_block(&paragraphs) {
         return Some("repeated block".to_owned());
     }
     let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
@@ -3421,6 +3443,12 @@ mod tests {
                 "repeated block".to_owned()
             ))
         );
+        assert_eq!(
+            finalize_dialog_reply(&raw.replace('\n', "\r\n")),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated block".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -3430,6 +3458,21 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply(raw),
             DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_excessive_paragraph_count() {
+        let raw = (0..257)
+            .map(|index| format!("Уникальный абзац номер {index}, без повторяющегося текста."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        assert_eq!(
+            finalize_dialog_reply(&raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "excessive paragraph count".to_owned()
+            ))
         );
     }
 
