@@ -7577,6 +7577,30 @@ mod tests {
     }
 
     #[test]
+    fn duplicated_final_block_is_retryable_provider_failure() {
+        let block = "Плотва объясняет:\n\nПроблема P против NP остаётся главным нерешённым вопросом теории сложности. Учёные пытаются понять, можно ли каждую задачу с быстро проверяемым решением так же быстро решить, но доказательства пока нет ни для одного из двух вариантов.";
+        let content = format!("Краткое введение.\n\n{block}\n\n{block}");
+        let err = extract_final_answer_for_provider(
+            &json!({
+                "choices": [{
+                    "message": { "content": content }
+                }]
+            }),
+            PROVIDER_AIFARM,
+        )
+        .expect_err("duplicated block");
+
+        assert_eq!(
+            retryable_reason(err.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(
+            err.to_string().contains("repeated block"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn step_error_stamps_the_trace_artifact() {
         let error = aifarm_step_error_with_trace(
             Box::new(std::io::Error::other("transport failed")),

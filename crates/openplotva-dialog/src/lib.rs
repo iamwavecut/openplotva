@@ -1454,6 +1454,73 @@ fn is_cyrillic(ch: char) -> bool {
         || ('\u{a640}'..='\u{a69f}').contains(&ch)
 }
 
+const MIN_REPEATED_BLOCK_CHARS: usize = 160;
+const MIN_REPEATED_SINGLE_PARAGRAPH_CHARS: usize = 320;
+const MAX_FINAL_REPLY_PARAGRAPHS: usize = 256;
+
+fn has_adjacent_repeated_block(paragraphs: &[String]) -> bool {
+    // Restrict rejection to substantial contiguous copies so ordinary short
+    // rhetorical repetition remains valid user-visible text.
+    let mut paragraph_ids = std::collections::BTreeMap::<&str, usize>::new();
+    let mut ids = Vec::with_capacity(paragraphs.len());
+    let mut character_prefix = Vec::with_capacity(paragraphs.len() + 1);
+    character_prefix.push(0);
+    for paragraph in paragraphs {
+        let next_id = paragraph_ids.len();
+        let id = *paragraph_ids.entry(paragraph.as_str()).or_insert(next_id);
+        ids.push(id);
+        let character_count =
+            character_prefix.last().copied().unwrap_or_default() + paragraph.chars().count();
+        character_prefix.push(character_count);
+    }
+
+    for block_len in 1..=paragraphs.len() / 2 {
+        let mut equal_run = 0;
+        for index in 0..paragraphs.len() - block_len {
+            if ids[index] == ids[index + block_len] {
+                equal_run += 1;
+            } else {
+                equal_run = 0;
+            }
+            if equal_run < block_len {
+                continue;
+            }
+
+            let start = index + 1 - block_len;
+            let content_chars = character_prefix[start + block_len] - character_prefix[start];
+            if content_chars >= MIN_REPEATED_BLOCK_CHARS
+                && (block_len > 1 || content_chars >= MIN_REPEATED_SINGLE_PARAGRAPH_CHARS)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalized_paragraphs(value: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut paragraph = String::new();
+    for line in value.lines() {
+        if line.trim().is_empty() {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+            continue;
+        }
+        for word in line.split_whitespace() {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(word);
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    paragraphs
+}
+
 #[must_use]
 pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     let mut max_run = 0;
@@ -1481,6 +1548,13 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     }
     if cyrillic >= 80 && spaces <= 1 {
         return Some("missing word spaces".to_owned());
+    }
+    let paragraphs = normalized_paragraphs(value);
+    if paragraphs.len() > MAX_FINAL_REPLY_PARAGRAPHS {
+        return Some("excessive paragraph count".to_owned());
+    }
+    if has_adjacent_repeated_block(&paragraphs) {
+        return Some("repeated block".to_owned());
     }
     let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
     for segment in value.split(['\n', '.', '!', '?']) {
@@ -3342,6 +3416,63 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("I thought so too."),
             Reply("I thought so too.".to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_adjacent_duplicate_blocks() {
+        let raw = r#"Шутка в том, что проблема P против NP — это как вопрос «можно ли быстро проверить ответ, если его уже нашли?». Математики десятилетиями спорят, и у них есть ровно два варианта: да или нет.
+
+Сотрудник лаборатории использовал нерелизную нейросеть и сузил круг ответов до двух. То есть модель потратила кучу вычислений, чтобы сказать то, что все знали с самого начала.
+
+Плотва объясняет:
+
+Проблема P против NP — это главный нерешённый вопрос математики. По сути, учёные десятилетиями спорят о том, какой из двух вариантов верен: можно ли задачу быстро решить или только быстро проверить чужое решение.
+
+Шутка в том, что сотрудник потратил ресурсы секретной нерелизной модели и кучу времени на то, чтобы подтвердить очевидное: вариантов ответа два. Нейросеть сделала вид, что совершила прорыв, а на деле просто напомнила про базовую логику.
+
+Плотва объясняет:
+
+Проблема P против NP — это главный нерешённый вопрос математики. По сути, учёные десятилетиями спорят о том, какой из двух вариантов верен: можно ли задачу быстро решить или только быстро проверить чужое решение.
+
+Шутка в том, что сотрудник потратил ресурсы секретной нерелизной модели и кучу времени на то, чтобы подтвердить очевидное: вариантов ответа два. Нейросеть сделала вид, что совершила прорыв, а на деле просто напомнила про базовую логику."#;
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated block".to_owned()
+            ))
+        );
+        assert_eq!(
+            finalize_dialog_reply(&raw.replace('\n', "\r\n")),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated block".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_short_deliberate_repetition() {
+        let raw = "Нет, это важно.\n\nНет, это важно.";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_excessive_paragraph_count() {
+        let raw = (0..257)
+            .map(|index| format!("Уникальный абзац номер {index}, без повторяющегося текста."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        assert_eq!(
+            finalize_dialog_reply(&raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "excessive paragraph count".to_owned()
+            ))
         );
     }
 

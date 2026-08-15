@@ -3199,6 +3199,17 @@ mod tests {
     }
 
     #[test]
+    fn gemini_final_answer_suppresses_duplicated_block() {
+        let block = "Плотва объясняет:\n\nПроблема P против NP остаётся главным нерешённым вопросом теории сложности. Учёные пытаются понять, можно ли каждую задачу с быстро проверяемым решением так же быстро решить, но доказательства пока нет ни для одного из двух вариантов.";
+        let raw = format!("Краткое введение.\n\n{block}\n\n{block}");
+
+        assert_eq!(
+            gemini_final_answer(&raw),
+            GeminiFinalAnswer::Suppressed("pathological final answer: repeated block".to_owned())
+        );
+    }
+
+    #[test]
     fn gemini_aux_trace_artifacts_tags_flow_and_model() {
         let request = GeminiGenerateContentRequest {
             cached_content: None,
