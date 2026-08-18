@@ -6,6 +6,7 @@ use openplotva_dialog::{ChatStepOutput, ChatStepRequest, DialogOutput};
 
 pub mod aifarm;
 pub mod gemini;
+pub mod gradius;
 pub mod model_listing;
 pub mod provider_schema;
 pub mod retry;
