@@ -1448,7 +1448,31 @@ impl DiscoveryRedactor {
     }
 
     pub async fn redact_text(&self, text: &str) -> Result<String, DiscoveryRedactorError> {
-        let (body, mut job_id) = self.redaction_job_body(text)?;
+        self.redact_text_with_optional_mode(text, None).await
+    }
+
+    pub async fn redact_text_with_mode(
+        &self,
+        text: &str,
+        replacement_mode: RedactionReplacementMode,
+    ) -> Result<String, DiscoveryRedactorError> {
+        self.redact_text_with_optional_mode(text, Some(replacement_mode))
+            .await
+    }
+
+    async fn redact_text_with_optional_mode(
+        &self,
+        text: &str,
+        replacement_mode: Option<RedactionReplacementMode>,
+    ) -> Result<String, DiscoveryRedactorError> {
+        let request_id = memory_redact_id();
+        let job_id = memory_redact_id();
+        let (body, mut job_id) = self.redaction_job_body_with_ids_and_optional_mode(
+            text,
+            &request_id,
+            &job_id,
+            replacement_mode,
+        )?;
         let envelope = self.submit_redaction_job(body).await?;
         if let Some(resolved) = envelope.resolved_job_id() {
             job_id = resolved;
@@ -1474,10 +1498,36 @@ impl DiscoveryRedactor {
         request_id: &str,
         job_id: &str,
     ) -> Result<(Vec<u8>, String), DiscoveryRedactorError> {
+        self.redaction_job_body_with_ids_and_optional_mode(text, request_id, job_id, None)
+    }
+
+    pub fn redaction_job_body_with_ids_and_mode(
+        &self,
+        text: &str,
+        request_id: &str,
+        job_id: &str,
+        replacement_mode: RedactionReplacementMode,
+    ) -> Result<(Vec<u8>, String), DiscoveryRedactorError> {
+        self.redaction_job_body_with_ids_and_optional_mode(
+            text,
+            request_id,
+            job_id,
+            Some(replacement_mode),
+        )
+    }
+
+    fn redaction_job_body_with_ids_and_optional_mode(
+        &self,
+        text: &str,
+        request_id: &str,
+        job_id: &str,
+        replacement_mode: Option<RedactionReplacementMode>,
+    ) -> Result<(Vec<u8>, String), DiscoveryRedactorError> {
         let payload = serde_json::to_vec(&RedactionRequest {
             request_id: request_id.to_owned(),
             text: text.to_owned(),
             categories: self.categories.clone(),
+            replacement_mode,
         })
         .map_err(DiscoveryRedactorError::RequestBody)?;
 
@@ -2068,6 +2118,16 @@ pub struct RedactionRequest {
     /// Redaction categories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
+    /// Redaction replacement style. Omitted requests preserve the legacy ellipsis output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_mode: Option<RedactionReplacementMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionReplacementMode {
+    Ellipsis,
+    TypedPlaceholders,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -4050,9 +4110,36 @@ mod tests {
         assert_eq!(payload.request_id, "memory-redact-111");
         assert_eq!(payload.text, "email alice@example.com");
         assert_eq!(payload.categories, vec!["private_email", "secret"]);
+        assert_eq!(payload.replacement_mode, None);
         assert_eq!(
             redactor.endpoint("/v1/jobs/blocking"),
             "http://discovery.test/root/v1/jobs/blocking"
+        );
+    }
+
+    #[test]
+    fn discovery_redactor_job_body_supports_typed_placeholders() {
+        let redactor =
+            DiscoveryRedactor::new(DiscoveryRedactorConfig::default()).expect("redactor");
+
+        let (body, _) = redactor
+            .redaction_job_body_with_ids_and_mode(
+                "email alice@example.com",
+                "gradius-redact-111",
+                "gradius-redact-222",
+                RedactionReplacementMode::TypedPlaceholders,
+            )
+            .expect("body");
+        let submitted =
+            serde_json::from_slice::<DiscoveryRedactionJobRequest>(&body).expect("job request");
+        let payload_bytes = general_purpose::STANDARD
+            .decode(&submitted.invocation.body)
+            .expect("payload b64");
+        let payload = serde_json::from_slice::<RedactionRequest>(&payload_bytes).expect("payload");
+
+        assert_eq!(
+            payload.replacement_mode,
+            Some(RedactionReplacementMode::TypedPlaceholders)
         );
     }
 
