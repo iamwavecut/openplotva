@@ -2124,7 +2124,7 @@ where
     // retrieval failure degrades to the recency baseline in existing_cards_for_run.
     let query_embedding = match embedder {
         Some(provider) => provider
-            .embed_one(&query, embedding_dimension, MEMORY_CARD_EMBEDDING_TASK)
+            .embed_one(&query, embedding_dimension, MEMORY_RETRIEVAL_QUERY_TASK)
             .await
             .ok()
             .flatten(),
@@ -4790,6 +4790,31 @@ mod tests {
         assert!(!query.contains("spambot"), "query: {query}");
         assert!(!query.contains("buy now"), "query: {query}");
         assert!(consolidation_retrieval_query(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn related_card_lookup_embeds_the_window_as_a_query() {
+        let store = FakeMemoryWriteStore::default();
+        let embedder = FakeEmbedder::default();
+        let messages = vec![openplotva_memory::Message {
+            sender_name: "Alice".to_owned(),
+            text: "loves Rust".to_owned(),
+            ..openplotva_memory::Message::default()
+        }];
+
+        let _ = related_cards_for_window(
+            &store,
+            &openplotva_memory::Run::default(),
+            &DialogMemoryChatMeta::default(),
+            &messages,
+            Some(&embedder),
+            512,
+        )
+        .await;
+
+        let calls = embedder.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, MEMORY_RETRIEVAL_QUERY_TASK);
     }
 
     #[test]
