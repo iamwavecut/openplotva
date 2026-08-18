@@ -3905,6 +3905,11 @@ fn aifarm_memory_config_for_attempt(
         Some(attempt.model_name.trim()),
     );
     cfg.client.default_model = attempt.model_name.clone();
+    cfg.client.api_key = crate::dialog_runtime::resolve_provider_api_key(
+        attempt.provider_api_key_ref.as_deref(),
+        attempt.provider_api_key_encrypted.as_deref(),
+    )
+    .unwrap_or_default();
 
     if let Some(endpoint) = routed_attempt_endpoint(attempt) {
         if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
@@ -4326,6 +4331,34 @@ mod tests {
         assert_subject_merger::<RoutedSubjectMerger>();
         assert_eq!(MEMORY_EXTRACTION_WORKFLOW_KEY, "memory_extraction");
         assert_eq!(MEMORY_SUBJECT_MERGE_WORKFLOW_KEY, "memory_subject_merge");
+    }
+
+    #[test]
+    fn routed_memory_attempt_forwards_the_provider_api_key() {
+        let path = std::env::var("PATH").expect("test process PATH");
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+        let attempt = RoutedAttempt {
+            provider_id: 7,
+            model_id: 11,
+            provider_name: "aifarm-ninfer-gpu2".to_owned(),
+            model_name: "qwen3.8-27b".to_owned(),
+            provider_runtime_hint: Some("ninfer".to_owned()),
+            provider_endpoint: None,
+            discovery_service_name: Some("llm-openai-qwen38-ninfer".to_owned()),
+            discovery_endpoint_name: Some("chat_completions".to_owned()),
+            provider_api_key_ref: Some("PATH".to_owned()),
+            provider_api_key_encrypted: None,
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: serde_json::json!({}),
+            model_config: serde_json::json!({}),
+            overrides: Default::default(),
+            variant: None,
+        };
+
+        let routed = aifarm_memory_config_for_attempt(&config, &attempt);
+
+        assert_eq!(routed.client.api_key, path);
     }
 
     #[test]
