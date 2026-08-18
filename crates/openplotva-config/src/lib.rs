@@ -217,14 +217,20 @@ pub const DEFAULT_AGENTIC_SONG_ENABLED: bool = true;
 
 pub const DEFAULT_AGENTIC_IMAGE_ENABLED: bool = true;
 
-/// Maple model exposed by the dedicated GPU2 MLX compatibility service.
+/// Qwen3.8 model exposed by the dedicated GPU2 NInfer service.
+pub const DEFAULT_NINFER_MODEL: &str = "qwen3.8-27b";
+
+/// Discovery service for the dedicated GPU2 NInfer endpoint.
+pub const DEFAULT_NINFER_DISCOVERY_SERVICE_NAME: &str = "llm-openai-qwen38-ninfer";
+
+/// Historical Maple model identity retained for audit and rollback.
 pub const DEFAULT_MAPLE_MODEL: &str = "maple-preview-2bit-mlx";
 
-/// Discovery service for the dedicated GPU2 Maple compatibility endpoint.
+/// Historical Maple Discovery identity retained for rollback.
 pub const DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME: &str = "llm-openai-maple";
 
 /// Persisted compatibility key for the local agent reasoner. The key remains
-/// stable while its default model and Discovery service are Maple.
+/// stable while its backing runtime changes.
 pub const DEFAULT_AGENT_REASONER_PROVIDER: &str = "qwen-reasoner";
 
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
@@ -3926,14 +3932,14 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
-        // The song/image agents point at Maple through the stable local-reasoner
+        // The song/image agents point at NInfer through the stable local-reasoner
         // compatibility key; the provider is auto-registered, so the config-level
         // providers list stays empty.
         assert_eq!(config.llm.agentic.reasoner_provider, "qwen-reasoner");
-        assert_eq!(super::DEFAULT_MAPLE_MODEL, "maple-preview-2bit-mlx");
+        assert_eq!(super::DEFAULT_NINFER_MODEL, "qwen3.8-27b");
         assert_eq!(
-            super::DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME,
-            "llm-openai-maple"
+            super::DEFAULT_NINFER_DISCOVERY_SERVICE_NAME,
+            "llm-openai-qwen38-ninfer"
         );
         assert!(config.llm.providers.is_empty());
         assert!(!config.music.acestep.enabled);

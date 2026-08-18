@@ -729,6 +729,7 @@ fn canonical_provider_for_model(model: &str, flow: &str) -> Option<&'static str>
         return Some("vram-cloud");
     }
     match model {
+        "qwen3.8-27b" => Some("aifarm-ninfer-gpu2"),
         "maple-preview-2bit-mlx" => Some("aifarm-maple"),
         "vibethinker-3b" => Some("aifarm-llamacpp-gpu2"),
         // Historical and rollback wire ids remain classifiable without making
@@ -1729,6 +1730,10 @@ mod tests {
         assert_eq!(
             canonical_provider_for_model("vibethinker-3b", "memory_extraction"),
             Some("aifarm-llamacpp-gpu2")
+        );
+        assert_eq!(
+            canonical_provider_for_model("qwen3.8-27b", "dialog"),
+            Some("aifarm-ninfer-gpu2")
         );
         assert_eq!(
             canonical_provider_for_model("maple-preview-2bit-mlx", "dialog"),

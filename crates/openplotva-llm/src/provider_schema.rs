@@ -79,6 +79,7 @@ impl Protocol {
 pub enum RuntimeHint {
     LlamaCpp,
     Mlx,
+    Ninfer,
     Vllm,
     Sglang,
     Ollama,
@@ -91,6 +92,7 @@ impl RuntimeHint {
         match value {
             "llama_cpp" => Some(Self::LlamaCpp),
             "mlx" => Some(Self::Mlx),
+            "ninfer" => Some(Self::Ninfer),
             "vllm" => Some(Self::Vllm),
             "sglang" => Some(Self::Sglang),
             "ollama" => Some(Self::Ollama),
@@ -104,6 +106,7 @@ impl RuntimeHint {
         match self {
             Self::LlamaCpp => "llama_cpp",
             Self::Mlx => "mlx",
+            Self::Ninfer => "ninfer",
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
@@ -116,6 +119,7 @@ impl RuntimeHint {
         &[
             Self::LlamaCpp,
             Self::Mlx,
+            Self::Ninfer,
             Self::Vllm,
             Self::Sglang,
             Self::Ollama,
@@ -265,6 +269,9 @@ pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value 
             { "key": "repeat_penalty", "kind": "float", "label": "Repeat penalty" },
             { "key": "enable_thinking", "kind": "bool", "label": "Enable thinking" },
             { "key": "chat_template_kwargs", "kind": "json", "label": "Chat template kwargs" },
+        ]),
+        (Protocol::OpenAiCompat, Some(RuntimeHint::Ninfer)) => json!([
+            { "key": "enable_thinking", "kind": "bool", "label": "Enable thinking" },
         ]),
         (Protocol::OpenAiCompat, Some(RuntimeHint::Vllm | RuntimeHint::Sglang)) => json!([
             { "key": "enable_thinking", "kind": "bool", "label": "Enable thinking" },

@@ -839,17 +839,17 @@ mod tests {
     }
 
     #[test]
-    fn local_reasoner_dialog_config_targets_maple_with_tools() {
+    fn local_reasoner_dialog_config_targets_ninfer_with_tools() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
 
         let cfg = local_reasoner_dialog_config_from_app_config(&config);
 
-        assert_eq!(cfg.provider_name, "aifarm-maple");
-        assert_eq!(cfg.client.service_name, "llm-openai-maple");
+        assert_eq!(cfg.provider_name, "aifarm-ninfer-gpu2");
+        assert_eq!(cfg.client.service_name, "llm-openai-qwen38-ninfer");
         assert_eq!(cfg.client.endpoint_name, "chat_completions");
-        assert_eq!(cfg.client.runtime_hint, "mlx");
-        assert_eq!(cfg.model, "maple-preview-2bit-mlx");
-        assert_eq!(cfg.client.default_model, "maple-preview-2bit-mlx");
+        assert_eq!(cfg.client.runtime_hint, "ninfer");
+        assert_eq!(cfg.model, "qwen3.8-27b");
+        assert_eq!(cfg.client.default_model, "qwen3.8-27b");
         assert_eq!(cfg.include_reasoning, Some(false));
         assert_eq!(cfg.enable_thinking, Some(false));
     }

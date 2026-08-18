@@ -562,9 +562,10 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
 const GPU_BACKFILL_KEY: &str = "llm.routing.gpu_backfilled";
 const DIALOG_QWEN_FALLBACK_KEY: &str = "llm.routing.dialog_qwen_fallback";
 
-/// Provider name for a Discovery service. The canonical dialog, dedicated
-/// Maple, and retained VibeThinker services keep stable provider ids; other
-/// services get a deterministic `aifarm-<service>` name.
+/// Provider name for a Discovery service. The canonical dialog and dedicated
+/// NInfer services keep stable provider ids; historical VibeThinker references
+/// keep their attribution id, while other services get a deterministic
+/// `aifarm-<service>` name.
 fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
     let service = service.trim();
     if service == config.llm.dialog.discovery_service_name {
@@ -590,7 +591,7 @@ fn gpu_runtime_hint(service: &str) -> &'static str {
         .trim()
         .eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME)
     {
-        "mlx"
+        "ninfer"
     } else {
         "llama_cpp"
     }
@@ -1845,34 +1846,18 @@ fn memory_routing_cascade_targets() -> &'static [MemoryRoutingCascadeTarget] {
         MemoryRoutingCascadeTarget {
             workflow_key: MEMORY_EXTRACTION_WORKFLOW,
             role: "fallback",
-            provider_name: crate::agent_runtime::VIBETHINKER_PROVIDER_NAME,
-            model_name: "vibethinker-3b",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
             weight: None,
             fallback_order: Some(1),
         },
         MemoryRoutingCascadeTarget {
-            workflow_key: MEMORY_EXTRACTION_WORKFLOW,
-            role: "fallback",
-            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-            model_name: crate::agent_runtime::DEFAULT_MAPLE_MODEL,
-            weight: None,
-            fallback_order: Some(2),
-        },
-        MemoryRoutingCascadeTarget {
             workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
             role: "primary",
-            provider_name: crate::agent_runtime::VIBETHINKER_PROVIDER_NAME,
-            model_name: "vibethinker-3b",
+            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            model_name: crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
             weight: Some(100),
             fallback_order: None,
-        },
-        MemoryRoutingCascadeTarget {
-            workflow_key: MEMORY_SUBJECT_MERGE_WORKFLOW,
-            role: "fallback",
-            provider_name: crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-            model_name: crate::agent_runtime::DEFAULT_MAPLE_MODEL,
-            weight: None,
-            fallback_order: Some(0),
         },
     ];
     TARGETS
@@ -1897,7 +1882,7 @@ fn resolved_memory_workflow_targets(
 
 fn canonical_dialog_fallback_order(provider_name: &str, model_name: &str) -> Option<i32> {
     if provider_name == crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME
-        && model_name == crate::agent_runtime::DEFAULT_MAPLE_MODEL
+        && model_name == crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL
     {
         Some(0)
     } else if matches!(provider_name, "genkit" | "gemini") {
@@ -1912,7 +1897,7 @@ fn dialog_cascade_ready(
     models: &[ModelRecord],
     assignments: &[AssignmentRecord],
 ) -> bool {
-    let mut maple = false;
+    let mut local_reasoner = false;
     let mut gemini = false;
     for assignment in assignments.iter().filter(|assignment| {
         assignment.workflow_key == "dialog"
@@ -1932,12 +1917,12 @@ fn dialog_cascade_ready(
             continue;
         };
         match canonical_dialog_fallback_order(&provider.name, &model.model_name) {
-            Some(0) => maple = true,
+            Some(0) => local_reasoner = true,
             Some(99) => gemini = true,
             _ => {}
         }
     }
-    maple && gemini
+    local_reasoner && gemini
 }
 
 /// Normalize the two memory LLM workflows after every model/provider backfill
@@ -1995,7 +1980,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
              RETURNING id",
         )
         .bind(MEMORY_GPU2_POOL)
-        .bind("Shared single-slot GPU2 budget for VibeThinker and Maple.")
+        .bind("Dedicated GPU2 budget for Qwen3.8 NInfer.")
         .fetch_one(&mut *transaction)
         .await?;
 
@@ -2062,7 +2047,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
                   OR provider.name IN ('genkit', 'gemini'))",
         )
         .bind(crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME)
-        .bind(crate::agent_runtime::DEFAULT_MAPLE_MODEL)
+        .bind(crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -2599,37 +2584,23 @@ mod tests {
                 (
                     "memory_extraction",
                     "fallback",
-                    "aifarm-llamacpp-gpu2",
-                    "vibethinker-3b",
+                    "aifarm-ninfer-gpu2",
+                    crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
                     Some(1),
-                ),
-                (
-                    "memory_extraction",
-                    "fallback",
-                    "aifarm-maple",
-                    crate::agent_runtime::DEFAULT_MAPLE_MODEL,
-                    Some(2),
                 ),
                 (
                     "memory_subject_merge",
                     "primary",
-                    "aifarm-llamacpp-gpu2",
-                    "vibethinker-3b",
+                    "aifarm-ninfer-gpu2",
+                    crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
                     None,
-                ),
-                (
-                    "memory_subject_merge",
-                    "fallback",
-                    "aifarm-maple",
-                    crate::agent_runtime::DEFAULT_MAPLE_MODEL,
-                    Some(0),
                 ),
             ]
         );
         assert_eq!(
             canonical_dialog_fallback_order(
                 crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-                crate::agent_runtime::DEFAULT_MAPLE_MODEL,
+                crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
             ),
             Some(0)
         );
@@ -2769,9 +2740,11 @@ mod tests {
             crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
             "chat",
         ));
-        snapshot
-            .models
-            .push(model(40, 4, crate::agent_runtime::DEFAULT_MAPLE_MODEL));
+        snapshot.models.push(model(
+            40,
+            4,
+            crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
+        ));
         snapshot.assignments[1].fallback_order = Some(99);
         snapshot.assignments[2].enabled = false;
         snapshot.triggers[0].enabled = false;
@@ -2798,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_provider_classification_separates_maple_from_vibethinker() {
+    fn gpu_provider_classification_separates_ninfer_from_vibethinker() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
 
         assert_eq!(
@@ -2818,7 +2791,7 @@ mod tests {
         );
         assert_eq!(
             gpu_runtime_hint(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME),
-            "mlx"
+            "ninfer"
         );
         assert_eq!(gpu_provider_name("llm-openai", &config), "aifarm");
         assert_eq!(
@@ -3003,25 +2976,23 @@ mod tests {
     }
 
     #[test]
-    fn subject_merge_targets_resolve_without_vram_catalog() {
-        let providers = vec![
-            provider(1, crate::agent_runtime::VIBETHINKER_PROVIDER_NAME, "chat"),
-            provider(
-                2,
-                crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
-                "chat",
-            ),
-        ];
-        let models = vec![
-            model(10, 1, "vibethinker-3b"),
-            model(11, 2, crate::agent_runtime::DEFAULT_MAPLE_MODEL),
-        ];
+    fn subject_merge_targets_resolve_with_ninfer_alone() {
+        let providers = vec![provider(
+            2,
+            crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            "chat",
+        )];
+        let models = vec![model(
+            11,
+            2,
+            crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
+        )];
 
         assert_eq!(
             resolved_memory_workflow_targets(MEMORY_SUBJECT_MERGE_WORKFLOW, &providers, &models,)
                 .expect("subject merge targets")
                 .len(),
-            2
+            1
         );
         assert!(
             resolved_memory_workflow_targets(MEMORY_EXTRACTION_WORKFLOW, &providers, &models)

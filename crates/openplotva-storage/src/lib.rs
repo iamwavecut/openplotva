@@ -9839,6 +9839,50 @@ mod tests {
         assert!(!DOWN.contains("DELETE FROM llm_routing_events"));
     }
 
+    #[test]
+    fn ninfer_gpu2_cutover_retires_conflicting_runtimes_and_is_reversible() {
+        const UP: &str = include_str!("../../../migrations/182_ninfer_gpu2_cutover.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/182_ninfer_gpu2_cutover.down.sql");
+
+        for value in [
+            "'aifarm-ninfer-gpu2'",
+            "'llm-openai-qwen38-ninfer'",
+            "'qwen3.8-27b'",
+            "'ninfer'",
+            "'supports_message_name', FALSE",
+            "'supports_responses_api', TRUE",
+            "'supports_anthropic_messages', TRUE",
+            "ninfer_gpu2_cutover_v1_previous_model_id",
+            "ninfer_gpu2_cutover_v1_previous_role",
+            "disabled_by_ninfer_gpu2_cutover_v1",
+            "llm.routing.ninfer_gpu2_cutover_v1_assignment_ids",
+            "'aifarm-llamacpp-gpu2'",
+            "'vibethinker-3b'",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing NInfer cutover contract {value}"
+            );
+        }
+        assert!(UP.contains("SET max_concurrency = 2"));
+        assert!(UP.contains("SET enabled = FALSE"));
+        assert!(!UP.contains("DELETE FROM provider_models"));
+        assert!(!UP.contains("DELETE FROM llm_providers"));
+        assert!(!UP.contains("UPDATE llm_routing_events"));
+        assert!(!UP.contains("DELETE FROM llm_routing_events"));
+
+        assert!(DOWN.contains("disabled_by_ninfer_gpu2_cutover_v1_rollback"));
+        assert!(DOWN.contains("disabled_by_ninfer_gpu2_cutover_v1"));
+        assert!(DOWN.contains("ninfer_gpu2_cutover_v1_previous_model_id"));
+        assert!(DOWN.contains("ninfer_gpu2_cutover_v1_previous_role"));
+        assert!(DOWN.contains("retired_by"));
+        assert!(DOWN.contains("SET enabled = TRUE"));
+        assert!(!DOWN.contains("DELETE FROM provider_models"));
+        assert!(!DOWN.contains("DELETE FROM llm_providers"));
+        assert!(!DOWN.contains("UPDATE llm_routing_events"));
+        assert!(!DOWN.contains("DELETE FROM llm_routing_events"));
+    }
+
     #[tokio::test]
     async fn live_memory_routing_migration_preserves_operator_pool_and_prior_assignments()
     -> Result<(), Box<dyn Error>> {
