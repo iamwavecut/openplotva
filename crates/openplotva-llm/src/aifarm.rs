@@ -219,6 +219,9 @@ pub struct ChatCompletionRequest {
     /// Include reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_reasoning: Option<bool>,
+    /// Native thinking control used by runtimes that expose it at the top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
     /// Chat template kwargs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<Value>,
@@ -287,6 +290,9 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
         }
         if let Some(value) = request.include_reasoning {
             state.serialize_field("include_reasoning", &value)?;
+        }
+        if let Some(value) = request.enable_thinking {
+            state.serialize_field("enable_thinking", &value)?;
         }
         if let Some(value) = &request.chat_template_kwargs {
             state.serialize_field("chat_template_kwargs", value)?;
@@ -2035,7 +2041,7 @@ where
                 "chat completion returned no response".to_owned(),
             ));
         };
-        first_choice_content(response)
+        first_choice_structured_content(response)
             .map_err(|err| AifarmStructuredJsonError::Response(err.to_string()))
     }
 
@@ -2249,7 +2255,7 @@ where
                 "chat completion returned no response".to_owned(),
             ));
         };
-        let content = first_choice_content(response)
+        let content = first_choice_structured_content(response)
             .map_err(|err| AifarmHistorySummaryError::Response(err.to_string()))?;
         let decoded = decode_history_summary_response(&content)?;
         Ok(summary_document_from_llm(
@@ -2389,7 +2395,7 @@ where
                 "chat completion returned no response".to_owned(),
             ));
         };
-        let content = first_choice_content(response)
+        let content = first_choice_structured_content(response)
             .map_err(|err| AifarmMemoryExtractorError::Response(err.to_string()))?;
         Ok(openplotva_memory::decode_subject_merge_plan(&content)?)
     }
@@ -4319,7 +4325,76 @@ fn normalize_request_for_runtime_hint(request: &mut ChatCompletionRequest, runti
         if let Some(extra_body) = request.extra_body.as_mut() {
             scrub_mlx_extra_body(extra_body);
         }
+    } else if runtime_hint.trim().eq_ignore_ascii_case("ninfer") {
+        normalize_ninfer_request(request);
     }
+}
+
+fn normalize_ninfer_request(request: &mut ChatCompletionRequest) {
+    request.enable_thinking = request
+        .enable_thinking
+        .or_else(|| chat_template_enable_thinking(request.chat_template_kwargs.as_ref()))
+        .or_else(|| {
+            request
+                .extra_body
+                .as_ref()
+                .and_then(|body| body.get("chat_template_kwargs"))
+                .and_then(|kwargs| chat_template_enable_thinking(Some(kwargs)))
+        });
+    request.include_reasoning = None;
+    request.chat_template_kwargs = None;
+    request.extra_body = None;
+
+    // NInfer uses the model's native top-k/repetition defaults and implements
+    // OpenAI frequency/presence penalties. Omit controls its strict schema does
+    // not accept instead of allowing a legacy provider setting to reject every
+    // request during a routing cutover.
+    request.top_k = None;
+    request.repeat_penalty = None;
+    request.repetition_penalty = None;
+    request.dry_multiplier = None;
+    request.dry_base = None;
+    request.dry_allowed_length = 0;
+
+    let Some(response_format) = request.response_format.as_ref() else {
+        return;
+    };
+    if response_format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return;
+    }
+    let Some(json_schema) = response_format.get("json_schema") else {
+        return;
+    };
+    let Some(name) = json_schema
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(schema) = json_schema.get("schema").cloned() else {
+        return;
+    };
+
+    request.tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "parameters": schema,
+        },
+    }));
+    request.tool_choice = Some(json!({
+        "type": "function",
+        "function": {"name": name},
+    }));
+    request.parallel_tool_calls = Some(false);
+    request.response_format = None;
+}
+
+fn chat_template_enable_thinking(kwargs: Option<&Value>) -> Option<bool> {
+    kwargs?.get("enable_thinking").and_then(Value::as_bool)
 }
 
 fn scrub_mlx_extra_body(extra_body: &mut Value) {
@@ -4887,6 +4962,33 @@ fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
     Ok(content)
 }
 
+fn first_choice_structured_content(response: &Value) -> Result<String, AifarmDialogError> {
+    let message = first_choice_message_value(response)?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !content.is_empty() {
+        return first_choice_content(response);
+    }
+
+    let tool_calls = message.get("tool_calls").and_then(Value::as_array);
+    if let Some([tool_call]) = tool_calls.map(Vec::as_slice) {
+        let arguments = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if !arguments.is_empty() {
+            return Ok(arguments.to_owned());
+        }
+    }
+
+    first_choice_content(response)
+}
+
 fn first_choice_reasoning_len(message: &Value) -> usize {
     ["reasoning_content", "reasoning"]
         .iter()
@@ -4947,7 +5049,7 @@ fn decode_memory_extraction_output(
     response: &Value,
     payload: &str,
 ) -> Result<ExtractOutput, AifarmMemoryExtractorError> {
-    let content = first_choice_content(response)
+    let content = first_choice_structured_content(response)
         .map_err(|err| AifarmMemoryExtractorError::Response(err.to_string()))?;
     let mut out = decode_extraction_json(&content)?;
     if out.input_tokens == 0 {
@@ -7153,6 +7255,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ninfer_structured_json_uses_function_tool_and_decodes_arguments()
+    -> Result<(), Box<dyn Error>> {
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_structured_response",
+                        "type": "function",
+                        "function": {
+                            "name": "structured_response",
+                            "arguments": "{\"input\":\"cat\",\"outputs\":[\"cat\"]}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
+            status_code: 200,
+            status_text: "OK".to_owned(),
+            body: serde_json::to_vec(&response)?,
+            ..AifarmHttpResponse::default()
+        })]);
+        let generator = AifarmStructuredJsonGenerator::with_transport(
+            AifarmStructuredJsonConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://ninfer.example/v1/chat/completions".to_owned(),
+                    runtime_hint: "ninfer".to_owned(),
+                    supports_message_name: false,
+                    ..AifarmClientConfig::default()
+                },
+                model: "qwen3.8-27b".to_owned(),
+                ..AifarmStructuredJsonConfig::default()
+            },
+            transport.clone(),
+        );
+
+        let content = generator
+            .generate_json(
+                AifarmStructuredJsonRequest {
+                    name: "structured_response".to_owned(),
+                    messages: vec![AifarmStructuredJsonMessage {
+                        role: "user".to_owned(),
+                        content: "cat".to_owned(),
+                    }],
+                    schema: json!({
+                        "type": "object",
+                        "properties": {"outputs": {"type": "array"}},
+                        "required": ["outputs"]
+                    }),
+                    temperature: 0.2,
+                    ..AifarmStructuredJsonRequest::default()
+                },
+                &mut |_| {},
+            )
+            .await?;
+
+        assert_eq!(content, r#"{"input":"cat","outputs":["cat"]}"#);
+        let requests = transport.requests();
+        let body: Value = serde_json::from_slice(&requests[0].body)?;
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "structured_response");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["required"],
+            json!(["outputs"])
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({
+                "type": "function",
+                "function": {"name": "structured_response"}
+            })
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("include_reasoning").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("extra_body").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aifarm_structured_json_generator_executes_media_optimizers()
     -> Result<(), Box<dyn Error>> {
         let image_response = json!({
@@ -8378,6 +8565,92 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn ninfer_discovery_body_rewrites_schema_and_legacy_controls() {
+        let cfg = AifarmClientConfig {
+            service_name: "llm-openai-qwen38-ninfer".to_owned(),
+            endpoint_name: "chat_completions".to_owned(),
+            default_model: "qwen3.8-27b".to_owned(),
+            runtime_hint: "ninfer".to_owned(),
+            supports_message_name: false,
+            ..AifarmClientConfig::default()
+        }
+        .with_defaults();
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "ping".to_owned(),
+                name: Some("operator".to_owned()),
+                ..ChatMessage::default()
+            }],
+            response_format: Some(json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }
+                }
+            })),
+            max_tokens: 256,
+            temperature: Some(0.4),
+            top_p: Some(0.9),
+            top_k: Some(40.0),
+            repeat_penalty: Some(1.1),
+            repetition_penalty: Some(1.05),
+            frequency_penalty: Some(0.2),
+            presence_penalty: Some(0.3),
+            dry_multiplier: Some(0.8),
+            dry_base: Some(1.75),
+            dry_allowed_length: 2,
+            include_reasoning: Some(false),
+            chat_template_kwargs: Some(json!({"enable_thinking": false})),
+            extra_body: Some(json!({"unsupported": true})),
+            ..ChatCompletionRequest::default()
+        };
+
+        let job = build_discovery_job_request(&cfg, "ninfer-1", &request)
+            .expect("NInfer Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        let body: Value = serde_json::from_slice(&payload).expect("NInfer request JSON");
+
+        assert_eq!(job.invocation.service_name, "llm-openai-qwen38-ninfer");
+        assert_eq!(body["model"], "qwen3.8-27b");
+        assert_eq!(body["temperature"], 0.4);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["frequency_penalty"], 0.2);
+        assert_eq!(body["presence_penalty"], 0.3);
+        assert_eq!(body["enable_thinking"], false);
+        assert_eq!(body["messages"][0].get("name"), None);
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], "answer");
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "function": {"name": "answer"}})
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        for unsupported in [
+            "top_k",
+            "repeat_penalty",
+            "repetition_penalty",
+            "dry_multiplier",
+            "dry_base",
+            "dry_allowed_length",
+            "include_reasoning",
+            "chat_template_kwargs",
+            "extra_body",
+        ] {
+            assert!(
+                body.get(unsupported).is_none(),
+                "unexpected NInfer field {unsupported}"
+            );
+        }
     }
 
     #[test]

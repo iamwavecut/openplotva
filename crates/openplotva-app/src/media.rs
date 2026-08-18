@@ -798,11 +798,19 @@ pub fn agent_client_config_from_named_provider(
         client.task_timeout = positive_seconds(spec.task_timeout_seconds);
     }
     client.runtime_hint = discovery_runtime_hint(&client.service_name).to_owned();
+    if client.runtime_hint == "ninfer" {
+        client.supports_message_name = false;
+    }
     client
 }
 
 fn discovery_runtime_hint(service_name: &str) -> &'static str {
     if service_name
+        .trim()
+        .eq_ignore_ascii_case(openplotva_config::DEFAULT_NINFER_DISCOVERY_SERVICE_NAME)
+    {
+        "ninfer"
+    } else if service_name
         .trim()
         .eq_ignore_ascii_case(openplotva_config::DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME)
     {

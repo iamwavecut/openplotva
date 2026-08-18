@@ -50,25 +50,25 @@ const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
 
-/// Stable routing provider id for the dedicated GPU2 Maple service.
-pub const LOCAL_REASONER_PROVIDER_NAME: &str = "aifarm-maple";
-/// Provider id for VibeThinker on the retained shared GPU2 llama.cpp service.
+/// Stable routing provider id for the dedicated GPU2 NInfer service.
+pub const LOCAL_REASONER_PROVIDER_NAME: &str = "aifarm-ninfer-gpu2";
+/// Historical VibeThinker provider id retained for telemetry and rollback.
 pub const VIBETHINKER_PROVIDER_NAME: &str = "aifarm-llamacpp-gpu2";
-/// Discovery service that continues to host VibeThinker on GPU2.
+/// Historical VibeThinker Discovery service retained for telemetry and rollback.
 pub const VIBETHINKER_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
 /// Discovery service targeted by the auto-registered `qwen-reasoner`
 /// compatibility key.
 pub const DEFAULT_LOCAL_REASONER_SERVICE_NAME: &str =
-    openplotva_config::DEFAULT_MAPLE_DISCOVERY_SERVICE_NAME;
-/// Canonical model id sent to the dedicated Maple compatibility service.
-pub const DEFAULT_MAPLE_MODEL: &str = openplotva_config::DEFAULT_MAPLE_MODEL;
+    openplotva_config::DEFAULT_NINFER_DISCOVERY_SERVICE_NAME;
+/// Canonical model id sent to the dedicated NInfer service.
+pub const DEFAULT_LOCAL_REASONER_MODEL: &str = openplotva_config::DEFAULT_NINFER_MODEL;
 
 /// Legacy Rust API alias; use [`DEFAULT_LOCAL_REASONER_SERVICE_NAME`].
 #[deprecated(note = "use DEFAULT_LOCAL_REASONER_SERVICE_NAME")]
 pub const DEFAULT_QWEN_SERVICE_NAME: &str = DEFAULT_LOCAL_REASONER_SERVICE_NAME;
-/// Legacy Rust API alias; use [`DEFAULT_MAPLE_MODEL`].
-#[deprecated(note = "use DEFAULT_MAPLE_MODEL")]
-pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_MAPLE_MODEL;
+/// Legacy Rust API alias; use [`DEFAULT_LOCAL_REASONER_MODEL`].
+#[deprecated(note = "use DEFAULT_LOCAL_REASONER_MODEL")]
+pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_LOCAL_REASONER_MODEL;
 
 /// System prompt for the song-writing agent.
 pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
@@ -151,7 +151,7 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
         );
     }
 
-    // Auto-register the local Maple reasoner so the search agent works out of the
+    // Auto-register the local NInfer reasoner so the search agent works out of the
     // box. The persisted `qwen-reasoner` compatibility key stays stable; an explicit
     // `LLM_PROVIDERS_*` entry of the same name takes precedence.
     let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
@@ -204,7 +204,7 @@ pub fn local_reasoner_named_provider_config(
             kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
             discovery_service_name: DEFAULT_LOCAL_REASONER_SERVICE_NAME.to_owned(),
             discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
-            model: DEFAULT_MAPLE_MODEL.to_owned(),
+            model: DEFAULT_LOCAL_REASONER_MODEL.to_owned(),
             base_url: String::new(),
             url: String::new(),
             api_key: String::new(),
@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_auto_registers_maple_under_legacy_reasoner_key() {
+    fn registry_auto_registers_ninfer_under_legacy_reasoner_key() {
         let config =
             openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig::default())
                 .expect("default config");
@@ -1661,7 +1661,7 @@ mod tests {
         let reasoner = registry
             .get(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER)
             .expect("local reasoner");
-        assert_eq!(reasoner.model, DEFAULT_MAPLE_MODEL);
+        assert_eq!(reasoner.model, DEFAULT_LOCAL_REASONER_MODEL);
         let spec = local_reasoner_named_provider_config(&config);
         assert_eq!(
             spec.discovery_service_name,
