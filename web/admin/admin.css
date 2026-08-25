@@ -522,6 +522,63 @@ body {
     flex-wrap: wrap;
 }
 
+.gradius-conversation {
+    margin: 0;
+}
+
+.gradius-conversation-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
+}
+
+.gradius-conversation-title {
+    color: var(--c-text-main);
+    font-weight: 700;
+}
+
+.gradius-conversation-note,
+.gradius-turn-meta {
+    color: var(--c-text-muted);
+    font-size: 0.8rem;
+}
+
+.gradius-conversation-turns {
+    display: grid;
+    gap: var(--sp-3);
+}
+
+.gradius-turn {
+    border: 1px solid var(--c-border);
+    border-left: 3px solid var(--c-info);
+    border-radius: var(--rad-md);
+    background: var(--c-bg-input);
+    padding: var(--sp-3);
+}
+
+.gradius-turn[data-role="assistant"] {
+    border-left-color: var(--c-success);
+}
+
+.gradius-turn-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
+    margin-bottom: var(--sp-3);
+}
+
+.gradius-turn-text {
+    max-height: 32rem;
+    overflow: auto;
+    overflow-wrap: anywhere;
+    margin: 0;
+    color: var(--c-text-main);
+}
+
 .gradius-timeline {
     position: relative;
     display: grid;

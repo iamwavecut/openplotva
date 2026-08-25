@@ -6154,6 +6154,48 @@
             return card;
         }
 
+        function gradiusDialogueContext(item) {
+            const section = PL.el('section', {
+                class: 'card card-inset gradius-conversation',
+                'aria-label': 'Dialogue sent to Gradius',
+            });
+            const header = PL.el('div', { class: 'card-header gradius-conversation-head' });
+            header.append(
+                PL.el('div', { class: 'gradius-conversation-title' }, 'Dialogue sent to Gradius'),
+                PL.el('div', { class: 'gradius-conversation-note' }, 'Privacy-filtered messages in the exact order sent to the provider.'),
+            );
+            const turns = PL.el('div', { class: 'card-body gradius-conversation-turns' });
+            const calls = Array.isArray(item.api_calls) ? item.api_calls : [];
+            if (!calls.length) {
+                turns.append(PL.el('div', { class: 'text-muted' }, 'No dialogue payload was sent for this opportunity.'));
+            }
+            for (const call of calls) {
+                const role = call.role || 'call';
+                const roleLabel = role === 'user' ? 'User message' : role === 'assistant' ? 'Assistant response' : 'Provider call';
+                const requestText = typeof call.request_body?.text === 'string'
+                    ? call.request_body.text
+                    : JSON.stringify(call.request_body || {}, null, 2);
+                const turn = PL.el('article', { class: 'gradius-turn', dataset: { role } });
+                const turnHead = PL.el('div', { class: 'gradius-turn-head' });
+                turnHead.append(
+                    PL.badge(roleLabel, role === 'assistant' ? 'success' : 'info'),
+                    PL.el('span', { class: 'gradius-turn-meta mono' }, [
+                        `attempt ${call.attempt_generation || 1}.${call.sequence || 1}`,
+                        call.response_status ? `HTTP ${call.response_status}` : 'transport',
+                        call.outcome || 'unknown',
+                        `${call.duration_ms || 0} ms`,
+                    ].join(' · ')),
+                );
+                turn.append(
+                    turnHead,
+                    PL.el('pre', { class: 'pre-wrap gradius-turn-text' }, requestText || '—'),
+                );
+                turns.append(turn);
+            }
+            section.append(header, turns);
+            return section;
+        }
+
         function gradiusRenderDetail(item) {
             const body = document.getElementById('gradius-detail-body');
             const title = document.getElementById('gradius-detail-title');
@@ -6186,6 +6228,7 @@
             body.replaceChildren(
                 actions,
                 meta,
+                gradiusDialogueContext(item),
                 gradiusTimeline(item),
                 gradiusTextCard('Provider markdown', item.provider_markdown),
                 gradiusTextCard('Telegram HTML', item.telegram_html),
