@@ -17,6 +17,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::{api::ExecuteError, types::EditMessageResult};
 use futures_util::{StreamExt, stream};
+use openplotva_storage::gradius_ads::PostgresGradiusAdStore;
 use openplotva_storage::{
     ClaimedTelegramOutboxOperation, PostgresHistoryStore, PostgresTelegramOutboxStore,
     TelegramDeliveryPolicy, TelegramOutboxBatchInput, TelegramOutboxPartInput,
@@ -93,11 +94,16 @@ pub type TelegramOutboxJobFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(),
 pub trait TelegramOutboxJobResolver: Send + Sync {
     type Error: fmt::Display + Send + Sync + 'static;
 
-    fn complete_job<'a>(&'a self, job_id: i64) -> TelegramOutboxJobFuture<'a, Self::Error>;
+    fn complete_job<'a>(
+        &'a self,
+        job_id: i64,
+        batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error>;
 
     fn fail_job<'a>(
         &'a self,
         job_id: i64,
+        batch_id: &'a str,
         error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error>;
 }
@@ -105,7 +111,11 @@ pub trait TelegramOutboxJobResolver: Send + Sync {
 impl TelegramOutboxJobResolver for SharedTaskQueueRuntime {
     type Error = String;
 
-    fn complete_job<'a>(&'a self, job_id: i64) -> TelegramOutboxJobFuture<'a, Self::Error> {
+    fn complete_job<'a>(
+        &'a self,
+        job_id: i64,
+        _batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async move {
             self.queue()
                 .complete(job_id, OffsetDateTime::now_utc())
@@ -117,6 +127,7 @@ impl TelegramOutboxJobResolver for SharedTaskQueueRuntime {
     fn fail_job<'a>(
         &'a self,
         job_id: i64,
+        _batch_id: &'a str,
         error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async move {
@@ -132,6 +143,7 @@ impl TelegramOutboxJobResolver for SharedTaskQueueRuntime {
 pub struct RunAwareTelegramOutboxJobResolver {
     jobs: SharedTaskQueueRuntime,
     runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
+    gradius: PostgresGradiusAdStore,
 }
 
 impl RunAwareTelegramOutboxJobResolver {
@@ -139,18 +151,46 @@ impl RunAwareTelegramOutboxJobResolver {
     pub fn new(
         jobs: SharedTaskQueueRuntime,
         runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
+        gradius: PostgresGradiusAdStore,
     ) -> Self {
-        Self { jobs, runs }
+        Self {
+            jobs,
+            runs,
+            gradius,
+        }
     }
 }
 
 impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
     type Error = String;
 
-    fn complete_job<'a>(&'a self, job_id: i64) -> TelegramOutboxJobFuture<'a, Self::Error> {
+    fn complete_job<'a>(
+        &'a self,
+        job_id: i64,
+        batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async move {
-            self.jobs.complete_job(job_id).await?;
+            let delivered_at = OffsetDateTime::now_utc();
+            let gradius_delivered = if is_final_dialog_answer_batch(batch_id, job_id) {
+                self.gradius
+                    .reconcile_dialogue_delivered(job_id, batch_id, delivered_at)
+                    .await
+            } else {
+                self.gradius
+                    .mark_delivered_by_batch(batch_id, delivered_at)
+                    .await
+            }
+            .map_err(|error| error.to_string())?;
+            self.jobs.complete_job(job_id, batch_id).await?;
             self.runs.mark_job_delivered(job_id);
+            if gradius_delivered {
+                tracing::info!(
+                    job_id,
+                    integration_kind = "native_dialogue",
+                    delivery_state = "delivered",
+                    "Gradius delivery audit reconciled after durable Telegram batch"
+                );
+            }
             Ok(())
         })
     }
@@ -158,10 +198,41 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
     fn fail_job<'a>(
         &'a self,
         job_id: i64,
+        batch_id: &'a str,
         error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error> {
-        self.jobs.fail_job(job_id, error)
+        Box::pin(async move {
+            let failed_at = OffsetDateTime::now_utc();
+            let gradius_failed = if is_final_dialog_answer_batch(batch_id, job_id) {
+                self.gradius
+                    .reconcile_dialogue_delivery_failed(job_id, batch_id, error, failed_at)
+                    .await
+            } else {
+                self.gradius
+                    .mark_delivery_failed_by_batch(batch_id, error, failed_at)
+                    .await
+            }
+            .map_err(|store_error| store_error.to_string())?;
+            self.jobs.fail_job(job_id, batch_id, error).await?;
+            if gradius_failed {
+                tracing::info!(
+                    job_id,
+                    integration_kind = "native_dialogue",
+                    delivery_state = "failed",
+                    "Gradius delivery audit reconciled after terminal Telegram batch"
+                );
+            }
+            Ok(())
+        })
     }
+}
+
+fn is_final_dialog_answer_batch(batch_id: &str, dialog_job_id: i64) -> bool {
+    batch_id
+        .strip_prefix("dialog-answer:v1:")
+        .and_then(|value| value.rsplit_once(':'))
+        .and_then(|(_, job_id)| job_id.parse::<i64>().ok())
+        == Some(dialog_job_id)
 }
 
 /// Resolver for deployments that do not attach outbox rows to taskman jobs.
@@ -171,13 +242,18 @@ pub struct NoopTelegramOutboxJobResolver;
 impl TelegramOutboxJobResolver for NoopTelegramOutboxJobResolver {
     type Error = Infallible;
 
-    fn complete_job<'a>(&'a self, _job_id: i64) -> TelegramOutboxJobFuture<'a, Self::Error> {
+    fn complete_job<'a>(
+        &'a self,
+        _job_id: i64,
+        _batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async { Ok(()) })
     }
 
     fn fail_job<'a>(
         &'a self,
         _job_id: i64,
+        _batch_id: &'a str,
         _error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async { Ok(()) })
@@ -1508,7 +1584,7 @@ async fn resolve_batch<Jobs>(
         | Ok(BatchResolution::Terminal { job_id: None, .. }) => {}
         Ok(BatchResolution::Delivered {
             job_id: Some(job_id),
-        }) => match jobs.complete_job(job_id).await {
+        }) => match jobs.complete_job(job_id, batch_id).await {
             Ok(()) => report.jobs_completed = report.jobs_completed.saturating_add(1),
             Err(error) => record_worker_error(
                 report,
@@ -1518,7 +1594,7 @@ async fn resolve_batch<Jobs>(
         Ok(BatchResolution::Terminal {
             job_id: Some(job_id),
             error,
-        }) => match jobs.fail_job(job_id, &error).await {
+        }) => match jobs.fail_job(job_id, batch_id, &error).await {
             Ok(()) => report.jobs_failed = report.jobs_failed.saturating_add(1),
             Err(job_error) => record_worker_error(
                 report,
@@ -1627,6 +1703,22 @@ mod tests {
             TelegramOutboundMethodKind::from_storage_name("unknown"),
             None
         );
+    }
+
+    #[test]
+    fn only_the_final_dialog_answer_batch_can_recover_gradius_delivery() {
+        assert!(is_final_dialog_answer_batch(
+            "dialog-answer:v1:42:7001",
+            7001
+        ));
+        assert!(!is_final_dialog_answer_batch(
+            "dialog-intermediate:v1:42:7001:1",
+            7001
+        ));
+        assert!(!is_final_dialog_answer_batch(
+            "dialog-answer:v1:42:7002",
+            7001
+        ));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use openplotva_telegram::{
     RichMessageRequest, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, TextMessageRequest,
     build_rich_message_method, build_text_message_methods,
     build_text_message_methods_without_link_previews,
+    build_text_message_methods_without_link_previews_with_atomic_tail,
 };
 use sqlx::Row;
 use thiserror::Error;
@@ -21,6 +22,7 @@ use time::OffsetDateTime;
 use crate::virtual_messages::{
     QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
     queue_rich_message, queue_text_message_parts, queue_text_message_parts_without_link_previews,
+    queue_text_message_parts_without_link_previews_with_atomic_tail,
 };
 
 use super::{
@@ -42,6 +44,16 @@ pub struct QueuedBatchReceipt {
 pub struct DialogAnswerSendOptions {
     /// Disable Telegram link previews for a final answer grounded by web search.
     pub disable_link_preview: bool,
+    /// The final answer contains provider advertising or the VIP appendix.
+    pub contains_advertising: bool,
+    /// Byte length of the provider ad plus VIP appendix that must stay in the final part.
+    pub advertising_tail_bytes: Option<usize>,
+}
+
+impl DialogAnswerSendOptions {
+    const fn link_previews_disabled(self) -> bool {
+        self.disable_link_preview || self.contains_advertising
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +269,15 @@ impl DialogJobEffects for DialogDispatcherEffects {
                     bypass_chat_restrictions: false,
                     ephemeral_delete_after: None,
                 };
-                if options.disable_link_preview {
+                if let Some(tail_bytes) = options.advertising_tail_bytes {
+                    queue_text_message_parts_without_link_previews_with_atomic_tail(
+                        &self.queue,
+                        queue_request,
+                        || (self.next_virtual_id)(),
+                        tail_bytes,
+                    )
+                    .await?
+                } else if options.link_previews_disabled() {
                     queue_text_message_parts_without_link_previews(
                         &self.queue,
                         queue_request,
@@ -534,7 +554,13 @@ fn build_dialog_answer_methods(
         render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
         reply_markup: None,
     };
-    let methods = if options.disable_link_preview {
+    let methods = if let Some(tail_bytes) = options.advertising_tail_bytes {
+        build_text_message_methods_without_link_previews_with_atomic_tail(
+            &request,
+            Some(reply_to),
+            tail_bytes,
+        )?
+    } else if options.link_previews_disabled() {
         build_text_message_methods_without_link_previews(&request, Some(reply_to))?
     } else {
         build_text_message_methods(&request, Some(reply_to))?
@@ -658,6 +684,8 @@ mod tests {
             &answer,
             DialogAnswerSendOptions {
                 disable_link_preview: true,
+                contains_advertising: false,
+                advertising_tail_bytes: None,
             },
             chat,
             &reply_to,
@@ -690,6 +718,42 @@ mod tests {
                 .expect("encoded payload")
                 .get("link_preview_options")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn advertising_final_text_disables_preview_in_durable_payload() {
+        let chat = ChatRef {
+            id: 42,
+            is_forum: false,
+        };
+        let reply_to = ReplyMessageRef {
+            message_id: 11,
+            chat,
+            is_topic_message: false,
+            message_thread_id: 0,
+        };
+
+        let methods = build_dialog_answer_methods(
+            "<a href=\"https://ads.example/redirect\">реклама</a>",
+            DialogAnswerSendOptions {
+                disable_link_preview: false,
+                contains_advertising: true,
+                advertising_tail_bytes: Some(
+                    "<a href=\"https://ads.example/redirect\">реклама</a>".len(),
+                ),
+            },
+            chat,
+            &reply_to,
+        )
+        .expect("build advertising method");
+        let command = OutboundCommand::try_from_method(
+            methods.into_iter().next().expect("advertising method"),
+        )
+        .expect("serializable method");
+        assert_eq!(
+            command.payload().expect("encoded payload")["link_preview_options"]["is_disabled"],
+            true
         );
     }
 }

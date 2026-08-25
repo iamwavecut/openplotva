@@ -8961,6 +8961,7 @@ mod tests {
         crate::dialog_turn::SessionWorkerWiring {
             toolbox: Arc::new(NoToolbox),
             reactor: None,
+            gradius: None,
             registry: Arc::new(crate::dialog_turn::DialogSessionRegistry::new()),
             max_iterations: 8,
             max_messages: 4,

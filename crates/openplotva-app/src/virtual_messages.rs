@@ -24,7 +24,7 @@ use openplotva_telegram::{
     build_text_message_method_without_link_preview, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_rich_message, fingerprint_sticker_message_plan,
     fingerprint_text_message_part, hash_content, message_target_chat, split_telegram_text,
-    validate_text_message_text,
+    split_telegram_text_with_atomic_tail, validate_text_message_text,
 };
 use time::OffsetDateTime;
 
@@ -589,7 +589,7 @@ pub async fn queue_text_message_parts<NextId>(
 where
     NextId: FnMut() -> String,
 {
-    queue_text_message_parts_with_preview(queue, req, next_virtual_id, true).await
+    queue_text_message_parts_with_preview(queue, req, next_virtual_id, true, None).await
 }
 
 /// Queue every text part with Telegram link previews disabled.
@@ -601,7 +601,21 @@ pub async fn queue_text_message_parts_without_link_previews<NextId>(
 where
     NextId: FnMut() -> String,
 {
-    queue_text_message_parts_with_preview(queue, req, next_virtual_id, false).await
+    queue_text_message_parts_with_preview(queue, req, next_virtual_id, false, None).await
+}
+
+/// Queue every text part with previews disabled and one atomic final tail.
+pub async fn queue_text_message_parts_without_link_previews_with_atomic_tail<NextId>(
+    queue: &DispatcherQueue,
+    req: QueueTextRequest<'_>,
+    next_virtual_id: NextId,
+    tail_bytes: usize,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    NextId: FnMut() -> String,
+{
+    queue_text_message_parts_with_preview(queue, req, next_virtual_id, false, Some(tail_bytes))
+        .await
 }
 
 async fn queue_text_message_parts_with_preview<NextId>(
@@ -609,17 +623,27 @@ async fn queue_text_message_parts_with_preview<NextId>(
     req: QueueTextRequest<'_>,
     mut next_virtual_id: NextId,
     link_previews_enabled: bool,
+    atomic_tail_bytes: Option<usize>,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
     NextId: FnMut() -> String,
 {
     validate_text_message_text(&req.message.text, &req.message.render_as)?;
     let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
-    let parts = split_telegram_text(
-        &req.message.text,
-        &req.message.render_as,
-        TELEGRAM_TEXT_MAX_BYTES,
-    );
+    let parts = match atomic_tail_bytes {
+        Some(tail_bytes) => split_telegram_text_with_atomic_tail(
+            &req.message.text,
+            &req.message.render_as,
+            TELEGRAM_TEXT_MAX_BYTES,
+            tail_bytes,
+        )
+        .ok_or(OutboundBuildError::InvalidAtomicTail)?,
+        None => split_telegram_text(
+            &req.message.text,
+            &req.message.render_as,
+            TELEGRAM_TEXT_MAX_BYTES,
+        ),
+    };
     if parts.is_empty() {
         return Err(OutboundBuildError::NoParts);
     }

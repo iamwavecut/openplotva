@@ -150,6 +150,44 @@ pub fn split_telegram_text(text: &str, parse_mode: &str, max_len: usize) -> Vec<
     }
 }
 
+/// Split a Telegram message while keeping the final `tail_bytes` bytes in one part.
+///
+/// The tail must start on a UTF-8 boundary and fit within one Telegram message. The prefix
+/// and tail are expected to be independently valid for the selected parse mode.
+#[must_use]
+pub fn split_telegram_text_with_atomic_tail(
+    text: &str,
+    parse_mode: &str,
+    max_len: usize,
+    tail_bytes: usize,
+) -> Option<Vec<String>> {
+    if tail_bytes == 0 || tail_bytes > text.len() {
+        return None;
+    }
+    let tail_start = text.len() - tail_bytes;
+    if !text.is_char_boundary(tail_start) || (max_len > 0 && tail_bytes > max_len) {
+        return None;
+    }
+    if max_len == 0 || text.len() <= max_len {
+        return Some(vec![text.to_owned()]);
+    }
+
+    let (prefix, tail) = text.split_at(tail_start);
+    let mut parts = if prefix.is_empty() {
+        Vec::new()
+    } else {
+        split_telegram_text(prefix, parse_mode, max_len)
+    };
+    if let Some(last) = parts.last_mut()
+        && last.len() + tail.len() <= max_len
+    {
+        last.push_str(tail);
+    } else {
+        parts.push(tail.to_owned());
+    }
+    Some(parts)
+}
+
 /// Escape visible text for Telegram HTML.
 pub fn escape_telegram_html_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -700,7 +738,8 @@ mod tests {
         TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
         ensure_telegram_safe_text, escape_telegram_html_text, extract_visible_text,
         is_allowed_scheme, is_valid_telegram_html, parse_tag_token, sanitize_telegram_html,
-        split_html, split_telegram_text, strip_telegram_html, truncate_utf8,
+        split_html, split_telegram_text, split_telegram_text_with_atomic_tail, strip_telegram_html,
+        truncate_utf8,
     };
 
     #[test]
@@ -851,6 +890,38 @@ mod tests {
         assert!(
             split_telegram_text("<b>hello brave new world</b>", TELEGRAM_PARSE_MODE_HTML, 16).len()
                 > 1
+        );
+    }
+
+    #[test]
+    fn split_telegram_text_keeps_advertising_tail_in_the_final_part() {
+        let tail = "<b>Реклама</b>\n\n<tg-spoiler>Подсказка про VIP</tg-spoiler>";
+        let text = format!("{}\n\n{tail}", "длинный ответ ".repeat(20));
+        let parts =
+            split_telegram_text_with_atomic_tail(&text, TELEGRAM_PARSE_MODE_HTML, 120, tail.len())
+                .expect("tail fits one Telegram part");
+
+        assert!(parts.len() > 1);
+        assert!(parts.last().expect("final part").ends_with(tail));
+        assert!(parts.iter().all(|part| part.len() <= 120));
+        assert!(parts.iter().all(|part| is_valid_telegram_html(part)));
+        assert!(
+            parts[..parts.len() - 1]
+                .iter()
+                .all(|part| !part.contains("Реклама"))
+        );
+    }
+
+    #[test]
+    fn split_telegram_text_rejects_an_atomic_tail_larger_than_one_part() {
+        assert_eq!(
+            split_telegram_text_with_atomic_tail(
+                "ответ и слишком длинный хвост",
+                TELEGRAM_PARSE_MODE_HTML,
+                8,
+                "слишком длинный хвост".len(),
+            ),
+            None
         );
     }
 

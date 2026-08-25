@@ -604,6 +604,8 @@ pub struct TaskQueueWorkItem {
     pub id: i64,
     pub job: StatelessJobItem,
     pub events: Vec<TaskQueueJobEvent>,
+    /// Stable identity of this queue claim. A requeue receives a new value.
+    pub claim_started_at: OffsetDateTime,
 }
 
 /// Work item for the agent worker: like `TaskQueueWorkItem` plus the durable
@@ -1223,7 +1225,12 @@ impl InMemoryTaskQueue {
         state.worker_heartbeats.insert(worker_id, started_at);
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
-        Some(TaskQueueWorkItem { id, job, events })
+        Some(TaskQueueWorkItem {
+            id,
+            job,
+            events,
+            claim_started_at: started_at,
+        })
     }
 
     pub fn dequeue_matching(
@@ -1256,7 +1263,12 @@ impl InMemoryTaskQueue {
         state.worker_heartbeats.insert(worker_id, started_at);
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
-        Some(TaskQueueWorkItem { id, job, events })
+        Some(TaskQueueWorkItem {
+            id,
+            job,
+            events,
+            claim_started_at: started_at,
+        })
     }
 
     /// Claim a fresh `Pending` agent job, or adopt an orphaned `Processing` agent

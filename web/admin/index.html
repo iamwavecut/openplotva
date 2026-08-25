@@ -59,6 +59,10 @@
                     <pl-button variant="nav" data-tab="analytics" data-action="switchTab" data-args='["analytics"]'><i class="ti ti-chart-dots-3" aria-hidden="true"></i><span>Analytics</span></pl-button>
                 </div>
                 <div class="nav-group">
+                    <div class="nav-group-label">Advertising</div>
+                    <pl-button variant="nav" data-tab="gradius" data-action="switchTab" data-args='["gradius"]'><i class="ti ti-speakerphone" aria-hidden="true"></i><span>Gradius</span></pl-button>
+                </div>
+                <div class="nav-group">
                     <div class="nav-group-label">Trust &amp; Safety</div>
                     <pl-button variant="nav" data-tab="shield" data-action="switchTab" data-args='["shield"]'><i class="ti ti-shield-half-filled" aria-hidden="true"></i><span>Shield</span></pl-button>
                     <pl-button variant="nav" data-tab="safety" data-action="switchTab" data-args='["safety"]'><i class="ti ti-alert-triangle" aria-hidden="true"></i><span>Safety Checks</span></pl-button>
@@ -884,6 +888,88 @@
                         </pl-drawer>
                     </div>
 
+                    <!-- Gradius Advertising Audit -->
+                    <div id="gradius" class="tab-pane">
+                        <div id="gradius-browse">
+                            <div class="gradius-topbar">
+                                <div>
+                                    <div class="gradius-title">Delivery ledger</div>
+                                    <div class="text-muted">Privacy-filtered dialogue → provider response → Telegram receipt</div>
+                                </div>
+                                <pl-button variant="outline" size="sm" data-action="loadGradiusForced">Refresh</pl-button>
+                            </div>
+                            <div id="gradius-warning"></div>
+                            <div id="gradius-kpis" class="gradius-kpis"></div>
+                            <div class="card gradius-filter-card">
+                                <div class="card-header">Scope</div>
+                                <div class="card-body">
+                                    <form class="gradius-controls" data-action="loadGradiusForced" role="search">
+                                        <pl-field-group label="Period">
+                                            <pl-select id="gradius-range">
+                                                <option value="1h">1 hour</option>
+                                                <option value="24h" selected>24 hours</option>
+                                                <option value="7d">7 days</option>
+                                                <option value="30d">30 days</option>
+                                                <option value="all">All time</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Integration">
+                                            <pl-select id="gradius-kind">
+                                                <option value="">All integrations</option>
+                                                <option value="native_dialogue">Native dialogue</option>
+                                                <option value="native_generation">Native generation</option>
+                                                <option value="native_utility">Native utility</option>
+                                                <option value="dialogue_thinking">Dialogue thinking</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Outcome">
+                                            <pl-select id="gradius-outcome">
+                                                <option value="">All outcomes</option>
+                                                <option value="ad">Ad returned</option>
+                                                <option value="no_ad">No ad</option>
+                                                <option value="ineligible">Ineligible</option>
+                                                <option value="provider_error">Provider error</option>
+                                                <option value="privacy_error">Privacy error</option>
+                                                <option value="render_error">Render error</option>
+                                                <option value="unsupported_surface">Unsupported surface</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Delivery">
+                                            <pl-select id="gradius-delivery">
+                                                <option value="">All states</option>
+                                                <option value="prepared">Prepared</option>
+                                                <option value="queued">Queued</option>
+                                                <option value="delivered">Delivered</option>
+                                                <option value="failed">Failed</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="User ID"><pl-input id="gradius-user" inputmode="numeric"></pl-input></pl-field-group>
+                                        <pl-field-group label="Chat ID"><pl-input id="gradius-chat" inputmode="numeric"></pl-input></pl-field-group>
+                                        <pl-field-group label="Job ID"><pl-input id="gradius-job" inputmode="numeric"></pl-input></pl-field-group>
+                                        <pl-field-group label="Model"><pl-input id="gradius-model" placeholder="model version"></pl-input></pl-field-group>
+                                        <pl-field-group label="Search"><pl-input id="gradius-q" placeholder="ID, redacted text, response…"></pl-input></pl-field-group>
+                                        <pl-button type="submit" variant="outline" data-action="loadGradiusForced" data-search-btn>Apply</pl-button>
+                                    </form>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>Opportunities</span>
+                                    <span id="gradius-count" class="text-muted"></span>
+                                </div>
+                                <div class="card-body"><div id="gradius-list" class="list-group"></div></div>
+                            </div>
+                        </div>
+                        <pl-drawer id="gradius-detail" class="card gradius-detail">
+                            <div class="gradius-detail-head">
+                                <pl-button variant="outline" size="sm" data-action="gradiusCloseDetail">← Opportunities</pl-button>
+                                <span id="gradius-detail-title" class="gradius-detail-title"></span>
+                                <pl-button variant="outline" size="sm" data-action="gradiusCopyRaw">Copy raw JSON</pl-button>
+                            </div>
+                            <div id="gradius-detail-body" class="gradius-detail-body"></div>
+                        </pl-drawer>
+                    </div>
+
                     <!-- Safety Checks Tab -->
                     <div id="safety" class="tab-pane">
                         <div class="split-pane" id="pane-safety">
@@ -1161,6 +1247,7 @@
                 'shield': 'Shield',
                 'llm': 'LLM Dialogs',
                 'providers': 'Model Providers',
+                'gradius': 'Gradius Advertising',
                 'safety': 'Safety Checks',
                 'analytics': 'Analytics',
                 'logs': 'Real-time Logs'
@@ -1179,6 +1266,9 @@
             }
             if (tabId === 'providers') {
                 loadRouting();
+            }
+            if (tabId === 'gradius') {
+                loadGradius(false);
             }
             if (tabId === 'safety') {
                 loadSafetyChecks(false);
@@ -5886,6 +5976,322 @@
                 }
                 parent = parent.parentElement;
             }
+        }
+
+        // --- Gradius advertising audit ---
+        const gradiusState = { loaded: false, items: [], summary: null, openID: null, browseScroll: 0 };
+
+        function gradiusValue(id) {
+            return (document.getElementById(id)?.value || '').trim();
+        }
+
+        function gradiusParams(includeList) {
+            const params = new URLSearchParams();
+            const mappings = [
+                ['range', 'gradius-range'],
+                ['integration_kind', 'gradius-kind'],
+                ['outcome', 'gradius-outcome'],
+                ['delivery_state', 'gradius-delivery'],
+                ['user_id', 'gradius-user'],
+                ['chat_id', 'gradius-chat'],
+                ['dialog_job_id', 'gradius-job'],
+                ['model', 'gradius-model'],
+                ['q', 'gradius-q'],
+            ];
+            for (const [key, id] of mappings) {
+                const value = gradiusValue(id);
+                if (value) params.set(key, value);
+            }
+            if (includeList) params.set('limit', '200');
+            return params;
+        }
+
+        function gradiusTime(value) {
+            if (!value) return '—';
+            const date = new Date(value);
+            return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+        }
+
+        function gradiusOutcomeTone(value) {
+            if (value === 'ad' || value === 'delivered') return 'success';
+            if (value === 'queued' || value === 'prepared' || value === 'reserved') return 'info';
+            if (value === 'no_ad' || value === 'ineligible' || value === 'unsupported_surface') return 'neutral';
+            return 'danger';
+        }
+
+        function gradiusRenderKPIs() {
+            const host = document.getElementById('gradius-kpis');
+            const warning = document.getElementById('gradius-warning');
+            if (!host) return;
+            const summary = gradiusState.summary || {};
+            const tile = (label, value, note, danger) => {
+                const box = PL.el('div', { class: danger ? 'card gradius-kpi gradius-kpi-danger' : 'card gradius-kpi' });
+                box.append(
+                    PL.el('div', { class: 'gradius-kpi-label' }, label),
+                    PL.el('div', { class: 'gradius-kpi-value' }, value),
+                    PL.el('div', { class: 'gradius-kpi-note' }, note),
+                );
+                return box;
+            };
+            const fill = Number(summary.fill_rate || 0) * 100;
+            const price = Number(summary.confirmed_show_price_rub || 0);
+            host.replaceChildren(
+                tile('Attempts', String(summary.attempts || 0), `${summary.no_ad || 0} no-ad`, false),
+                tile('Fill rate', `${fill.toFixed(1)}%`, 'provider placements / attempts', false),
+                tile('Returned', String(summary.returned || 0), 'provider placements', false),
+                tile('Queued', String(summary.queued || 0), 'awaiting Telegram receipt', false),
+                tile('Delivered', String(summary.delivered || 0), 'confirmed full batches', false),
+                tile('Failed', String(summary.failed || 0), 'terminal Telegram batches', Number(summary.failed || 0) > 0),
+                tile('Errors', String(summary.errors || 0), 'privacy / provider / render', Number(summary.errors || 0) > 0),
+                tile('Show price', `${price.toFixed(4)} ₽`, 'delivered impressions only', false),
+            );
+            const stranded = Number(summary.returned_not_delivered || 0);
+            if (warning) {
+                if (stranded > 0) {
+                    const message = PL.el('div', { class: 'gradius-alert', role: 'status' });
+                    message.append(
+                        PL.badge('Returned, not delivered', 'warning'),
+                        PL.el('span', {}, `${stranded} placement${stranded === 1 ? '' : 's'} need delivery review.`),
+                    );
+                    warning.replaceChildren(message);
+                } else {
+                    warning.replaceChildren();
+                }
+            }
+        }
+
+        function gradiusRenderList() {
+            const host = document.getElementById('gradius-list');
+            const count = document.getElementById('gradius-count');
+            if (!host) return;
+            if (count) count.textContent = `${gradiusState.items.length} loaded`;
+            if (!gradiusState.items.length) {
+                PL.empty(host, {
+                    title: 'No Gradius opportunities in this scope',
+                    desc: 'Try a wider period or clear one of the filters.',
+                });
+                return;
+            }
+            host.replaceChildren(...gradiusState.items.map(item => {
+                const row = PL.el('div', {
+                    class: 'list-item gradius-row',
+                    role: 'button',
+                    tabindex: '0',
+                    dataset: { action: 'gradiusOpenDetail', args: JSON.stringify([item.id]) },
+                });
+                if (String(gradiusState.openID) === String(item.id)) row.classList.add('active');
+                const top = PL.el('div', { class: 'gradius-row-top' });
+                top.append(
+                    PL.el('span', { class: 'mono gradius-row-id' }, `#${item.id}`),
+                    PL.badge(item.integration_kind || 'unknown', 'neutral'),
+                    PL.badge(item.outcome || 'unknown', gradiusOutcomeTone(item.outcome)),
+                );
+                if (item.delivery_state) top.append(PL.badge(item.delivery_state, gradiusOutcomeTone(item.delivery_state)));
+                top.append(PL.el('span', { class: 'mono gradius-row-time' }, gradiusTime(item.completed_at)));
+                row.append(top);
+                row.append(PL.el('div', { class: 'gradius-row-meta mono' }, [
+                    `job:${item.dialog_job_id ?? '—'}`,
+                    `user:${item.user_id}`,
+                    `chat:${item.chat_id}`,
+                    item.model_version || 'model:—',
+                ].join(' · ')));
+                const preview = item.provider_markdown
+                    || item.delivery_error
+                    || item.ineligibility_reason
+                    || `${(item.api_calls || []).length} provider exchange${(item.api_calls || []).length === 1 ? '' : 's'}`;
+                row.append(PL.el('div', { class: 'gradius-row-preview' }, String(preview).slice(0, 220)));
+                if (item.returned_not_delivered) {
+                    row.append(PL.el('div', { class: 'gradius-row-warning' }, 'Provider returned an ad, but Telegram delivery is not confirmed.'));
+                }
+                return row;
+            }));
+        }
+
+        function gradiusTimeline(item) {
+            const rail = PL.el('div', { class: 'gradius-timeline', role: 'list' });
+            const event = (label, at, detail, state) => {
+                if (!at && !detail) return;
+                const node = PL.el('div', { class: 'gradius-event', role: 'listitem' });
+                node.setAttribute('data-state', state || 'neutral');
+                node.append(
+                    PL.el('span', { class: 'gradius-event-dot', 'aria-hidden': 'true' }),
+                    PL.el('div', { class: 'gradius-event-label' }, label),
+                    PL.el('div', { class: 'gradius-event-at mono' }, gradiusTime(at)),
+                );
+                if (detail) node.append(PL.el('div', { class: 'gradius-event-detail' }, detail));
+                rail.append(node);
+            };
+            event('Opportunity', item.completed_at, `${item.completed_answers} completed answers`, 'neutral');
+            for (const call of (item.api_calls || [])) {
+                event(
+                    `Attempt ${call.attempt_generation || 1}.${call.sequence} · Gradius · ${call.role || 'call'}`,
+                    call.created_at,
+                    `${call.outcome} · ${call.response_status || 'transport'} · ${call.duration_ms} ms`,
+                    gradiusOutcomeTone(call.outcome),
+                );
+            }
+            if (item.prepared_at) {
+                event('Prepared', item.prepared_at, item.provider_markdown ? 'Markdown converted to Telegram HTML' : '', 'info');
+            }
+            if (item.queued_at) {
+                event('Queued', item.queued_at, item.telegram_outbox_batch_id || '', 'info');
+            }
+            if (item.delivered_at) {
+                event('Delivered', item.delivered_at, item.show_price == null ? '' : `${item.show_price} ₽ confirmed`, 'success');
+            }
+            if (item.delivery_failed_at) {
+                event('Failed', item.delivery_failed_at, item.delivery_error || '', 'danger');
+            }
+            return rail;
+        }
+
+        function gradiusTextCard(title, value) {
+            const card = PL.el('div', { class: 'card card-inset gradius-payload' });
+            card.append(
+                PL.el('div', { class: 'card-header' }, title),
+                PL.el('div', { class: 'card-body' }, PL.el('pre', { class: 'pre-wrap mono' }, value || '—')),
+            );
+            return card;
+        }
+
+        function gradiusRenderDetail(item) {
+            const body = document.getElementById('gradius-detail-body');
+            const title = document.getElementById('gradius-detail-title');
+            if (!body) return;
+            if (title) title.textContent = `Opportunity #${item.id}`;
+            const meta = PL.el('div', { class: 'llmd-meta' });
+            const fields = [
+                ['integration', item.integration_kind], ['attempt', item.attempt_generation], ['outcome', item.outcome], ['delivery', item.delivery_state],
+                ['user', item.user_id], ['chat', item.chat_id], ['thread', item.thread_id],
+                ['job', item.dialog_job_id], ['model', item.model_version], ['show price', item.show_price],
+                ['click price', item.click_price], ['synthetic chat', item.api_calls?.[0]?.synthetic_chat_id],
+                ['synthetic user', item.api_calls?.[0]?.synthetic_user_id],
+            ];
+            for (const [label, value] of fields) {
+                if (value === null || value === undefined || value === '') continue;
+                const cell = PL.el('div', { class: 'llmd-meta-cell' });
+                cell.append(PL.el('div', { class: 'llmd-meta-label' }, label), PL.el('div', { class: 'llmd-meta-value mono' }, String(value)));
+                meta.append(cell);
+            }
+            const actions = PL.el('div', { class: 'gradius-detail-actions' });
+            if (item.dialog_job_id) {
+                actions.append(
+                    PL.el('pl-button', { variant: 'outline', size: 'sm', dataset: { action: 'gradiusOpenTask', args: JSON.stringify([item.dialog_job_id]) } }, 'Open task'),
+                    PL.el('pl-button', { variant: 'outline', size: 'sm', dataset: { action: 'gradiusOpenLlmTrace', args: JSON.stringify([item.dialog_job_id]) } }, 'Open LLM trace'),
+                );
+            }
+            if (item.telegram_outbox_batch_id) actions.append(PL.badge(`outbox ${item.telegram_outbox_batch_id}`, 'info'));
+            const raw = PL.el('div', { class: 'card card-inset gradius-raw' });
+            raw.append(PL.el('div', { class: 'card-header' }, 'Raw JSON'), PL.el('div', { class: 'card-body' }, llmdJSONPane(item)));
+            body.replaceChildren(
+                actions,
+                meta,
+                gradiusTimeline(item),
+                gradiusTextCard('Provider markdown', item.provider_markdown),
+                gradiusTextCard('Telegram HTML', item.telegram_html),
+                raw,
+                PL.el('div', { class: 'text-muted gradius-provider-note' }, 'Click reporting is provider-only: Gradius controls the CTA redirect and exposes no public callback API.'),
+            );
+        }
+
+        function gradiusOpenDetail(id) {
+            const item = gradiusState.items.find(candidate => String(candidate.id) === String(id));
+            if (!item) return;
+            const scroller = document.querySelector('.content-scroll');
+            gradiusState.browseScroll = scroller ? scroller.scrollTop : 0;
+            gradiusState.openID = id;
+            document.getElementById('gradius-browse').hidden = true;
+            const drawer = document.getElementById('gradius-detail');
+            if (drawer) drawer.open = true;
+            if (scroller) scroller.scrollTop = 0;
+            gradiusRenderDetail(item);
+        }
+
+        function gradiusCloseDetail() {
+            gradiusState.openID = null;
+            document.getElementById('gradius-browse').hidden = false;
+            const drawer = document.getElementById('gradius-detail');
+            if (drawer) drawer.open = false;
+            const scroller = document.querySelector('.content-scroll');
+            if (scroller) scroller.scrollTop = gradiusState.browseScroll || 0;
+            gradiusRenderList();
+        }
+
+        async function gradiusCopyRaw() {
+            const item = gradiusState.items.find(candidate => String(candidate.id) === String(gradiusState.openID));
+            if (!item) return;
+            try {
+                await navigator.clipboard.writeText(JSON.stringify(item, null, 2));
+                PL.toast('Gradius raw JSON copied', 'success');
+            } catch (_) {
+                PL.toast('Clipboard is unavailable', 'error');
+            }
+        }
+
+        function gradiusOpenTask(jobID) {
+            switchTab('taskman');
+            taskmanLoadJob(jobID);
+        }
+
+        async function gradiusOpenLlmTrace(jobID) {
+            switchTab('llm');
+            const q = document.getElementById('llmd-q');
+            if (q) q.value = String(jobID);
+            await loadLLMDialogs(true);
+            llmdApplyFilters();
+        }
+
+        function loadGradiusForced() {
+            return loadGradius(true);
+        }
+
+        let gradiusWired = false;
+        function gradiusWireOnce() {
+            if (gradiusWired) return;
+            gradiusWired = true;
+            const list = document.getElementById('gradius-list');
+            if (list) {
+                list.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    const row = event.target.closest('.gradius-row');
+                    if (!row) return;
+                    event.preventDefault();
+                    row.click();
+                });
+            }
+            const drawer = document.getElementById('gradius-detail');
+            if (drawer) drawer.addEventListener('pl:close', gradiusCloseDetail);
+        }
+
+        async function loadGradius(force) {
+            gradiusWireOnce();
+            if (gradiusState.loaded && !force) {
+                gradiusRenderKPIs();
+                gradiusRenderList();
+                return;
+            }
+            const list = document.getElementById('gradius-list');
+            const kpis = document.getElementById('gradius-kpis');
+            if (list) PL.skeleton(list, { rows: 7 });
+            if (kpis) PL.skeleton(kpis, { rows: 2 });
+            const listParams = gradiusParams(true);
+            const summaryParams = gradiusParams(false);
+            for (const key of ['outcome', 'delivery_state', 'user_id', 'chat_id', 'dialog_job_id', 'model', 'q']) summaryParams.delete(key);
+            const [opportunities, summary] = await Promise.all([
+                apiCall(`/gradius/opportunities?${listParams.toString()}`),
+                apiCall(`/gradius/summary?${summaryParams.toString()}`),
+            ]);
+            if (!opportunities || !summary) {
+                if (list) PL.error(list, { title: 'Could not load Gradius audit', onRetry: loadGradiusForced });
+                if (kpis) PL.error(kpis, { title: 'Summary unavailable', onRetry: loadGradiusForced });
+                return;
+            }
+            gradiusState.items = Array.isArray(opportunities.items) ? opportunities.items : [];
+            gradiusState.summary = summary;
+            gradiusState.loaded = true;
+            gradiusCloseDetail();
+            gradiusRenderKPIs();
+            gradiusRenderList();
         }
 
         // --- Safety Checks ---

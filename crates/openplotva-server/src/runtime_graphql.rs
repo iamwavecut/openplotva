@@ -52,6 +52,10 @@ pub type RuntimeGeminiCachePurgerFuture<'a> =
 pub type RuntimeLlmAnalyticsReaderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RuntimeLlmAnalyticsData, String>> + Send + 'a>>;
 
+/// Boxed future returned by the durable Gradius audit reader.
+pub type RuntimeGradiusAuditReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+
 /// Boxed future returned by runtime virtual-dialog managers.
 pub type RuntimeVirtualDialogFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -167,6 +171,40 @@ pub trait RuntimeRoutingEventInspector: Send + Sync {
 /// Runtime API LLM analytics read boundary.
 pub trait RuntimeLlmAnalyticsReader: Send + Sync {
     fn llm_analytics<'a>(&'a self, range: &'a str) -> RuntimeLlmAnalyticsReaderFuture<'a>;
+}
+
+/// Runtime API boundary for privacy-safe Gradius opportunities and aggregate reporting.
+pub trait RuntimeGradiusAuditReader: Send + Sync {
+    fn gradius_ad_opportunities<'a>(
+        &'a self,
+        filter: RuntimeGradiusOpportunitiesFilter,
+    ) -> RuntimeGradiusAuditReaderFuture<'a>;
+
+    fn gradius_ad_summary<'a>(
+        &'a self,
+        filter: RuntimeGradiusSummaryFilter,
+    ) -> RuntimeGradiusAuditReaderFuture<'a>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGradiusSummaryFilter {
+    pub range: String,
+    pub integration_kind: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGradiusOpportunitiesFilter {
+    pub range: String,
+    pub integration_kind: String,
+    pub outcome: String,
+    pub delivery_state: String,
+    pub user_id: Option<i64>,
+    pub chat_id: Option<i64>,
+    pub dialog_job_id: Option<i64>,
+    pub model: String,
+    pub q: String,
+    pub offset: i32,
+    pub limit: i32,
 }
 
 /// Runtime API log replay boundary.
@@ -320,6 +358,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
+    pub gradius_audit_reader: Option<Arc<dyn RuntimeGradiusAuditReader>>,
     pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     pub taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     pub updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
@@ -1909,6 +1948,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             turn_outcome_inspector: diagnostics.turn_outcome_inspector,
             routing_event_inspector: diagnostics.routing_event_inspector,
             llm_analytics_reader: diagnostics.llm_analytics_reader,
+            gradius_audit_reader: diagnostics.gradius_audit_reader,
             log_inspector: diagnostics.log_inspector,
             taskman_inspector: diagnostics.taskman_inspector,
             updates_inspector: diagnostics.updates_inspector,
@@ -1940,6 +1980,7 @@ pub struct RuntimeQuery {
     turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
+    gradius_audit_reader: Option<Arc<dyn RuntimeGradiusAuditReader>>,
     log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
@@ -2155,6 +2196,34 @@ impl RuntimeQuery {
         inspector
             .llm_runs(llm_runs_filter_from_input(filter)?)
             .map(|items| items.into_iter().map(Json).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn gradius_ad_opportunities(
+        &self,
+        filter: Option<GradiusAdOpportunitiesFilterInput>,
+    ) -> async_graphql::Result<Json<Value>> {
+        let Some(reader) = self.gradius_audit_reader.as_deref() else {
+            return Err("runtime Gradius audit reader is not configured".into());
+        };
+        reader
+            .gradius_ad_opportunities(gradius_opportunities_filter_from_input(filter)?)
+            .await
+            .map(Json)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn gradius_ad_summary(
+        &self,
+        filter: Option<GradiusAdSummaryFilterInput>,
+    ) -> async_graphql::Result<Json<Value>> {
+        let Some(reader) = self.gradius_audit_reader.as_deref() else {
+            return Err("runtime Gradius audit reader is not configured".into());
+        };
+        reader
+            .gradius_ad_summary(gradius_summary_filter_from_input(filter))
+            .await
+            .map(Json)
             .map_err(async_graphql::Error::new)
     }
 
@@ -2533,6 +2602,41 @@ fn llm_runs_filter_from_input(
         q: filter.q.unwrap_or_default().trim().to_owned(),
         limit: filter.limit.unwrap_or(0),
     })
+}
+
+fn gradius_opportunities_filter_from_input(
+    input: Option<GradiusAdOpportunitiesFilterInput>,
+) -> async_graphql::Result<RuntimeGradiusOpportunitiesFilter> {
+    let Some(input) = input else {
+        return Ok(RuntimeGradiusOpportunitiesFilter {
+            range: "24h".to_owned(),
+            limit: 100,
+            ..RuntimeGradiusOpportunitiesFilter::default()
+        });
+    };
+    Ok(RuntimeGradiusOpportunitiesFilter {
+        range: trim_optional(input.range),
+        integration_kind: trim_optional(input.integration_kind),
+        outcome: trim_optional(input.outcome),
+        delivery_state: trim_optional(input.delivery_state),
+        user_id: parse_optional_id(input.user_id, "userID")?,
+        chat_id: parse_optional_id(input.chat_id, "chatID")?,
+        dialog_job_id: parse_optional_id(input.dialog_job_id, "dialogJobID")?,
+        model: trim_optional(input.model),
+        q: trim_optional(input.q),
+        offset: clamp_non_negative_i32(input.offset.unwrap_or(0)),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 500),
+    })
+}
+
+fn gradius_summary_filter_from_input(
+    input: Option<GradiusAdSummaryFilterInput>,
+) -> RuntimeGradiusSummaryFilter {
+    let input = input.unwrap_or_default();
+    RuntimeGradiusSummaryFilter {
+        range: trim_optional(input.range),
+        integration_kind: trim_optional(input.integration_kind),
+    }
 }
 
 fn llm_requests_filter_from_input(
@@ -2953,6 +3057,32 @@ struct LlmRunsFilterInput {
     #[graphql(name = "errorsOnly")]
     errors_only: Option<bool>,
     q: Option<String>,
+    limit: Option<i32>,
+}
+
+#[derive(Default, InputObject)]
+#[allow(dead_code)]
+struct GradiusAdSummaryFilterInput {
+    range: Option<String>,
+    integration_kind: Option<String>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct GradiusAdOpportunitiesFilterInput {
+    range: Option<String>,
+    integration_kind: Option<String>,
+    outcome: Option<String>,
+    delivery_state: Option<String>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "dialogJobID")]
+    dialog_job_id: Option<ID>,
+    model: Option<String>,
+    q: Option<String>,
+    offset: Option<i32>,
     limit: Option<i32>,
 }
 

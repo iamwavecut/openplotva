@@ -43,7 +43,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "admin.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/admin.css"),
-        sha256: "6a1c3762eb7389a535cef64084c9e8cfe5ec8de8028d6a891e5b0bc24ac7cc96",
+        sha256: "0f5a60e315a405edf60689a941fb0e25e130a21a268f2b6267354820e1b8ffc1",
     },
     StaticAsset {
         path: "components.css",
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "f2a6e4d1c8372fb007c5b79ac7fd8fd9bef3235c43a104518657e3481010bd63",
+        sha256: "a02501d65391e84d43cad8aa678dac148351dca1878bc9daddf144855876db61",
     },
     StaticAsset {
         path: "login.html",
@@ -593,6 +593,43 @@ mod tests {
                 "Taskman data-action {action} must resolve to a JavaScript handler"
             );
         }
+    }
+
+    #[test]
+    fn admin_gradius_audit_has_filters_lifecycle_states_and_safe_detail_views() {
+        for marker in [
+            "id=\"gradius\"",
+            "id=\"gradius-kpis\"",
+            "id=\"gradius-list\"",
+            "id=\"gradius-detail\"",
+            "id=\"gradius-range\"",
+            "id=\"gradius-kind\"",
+            "id=\"gradius-outcome\"",
+            "id=\"gradius-delivery\"",
+            "Provider markdown",
+            "Telegram HTML",
+            "Raw JSON",
+            "Returned, not delivered",
+            "Click reporting is provider-only",
+            "tile('Returned'",
+            "tile('Errors'",
+            "function loadGradius(",
+            "PL.skeleton(list",
+            "PL.error(list",
+            "PL.empty(host",
+            "function gradiusCopyRaw(",
+            "if (item.delivered_at)",
+            "if (item.delivery_failed_at)",
+        ] {
+            assert!(
+                ADMIN_INDEX_HTML.contains(marker),
+                "Gradius admin UI must contain {marker}"
+            );
+        }
+        assert!(
+            !ADMIN_INDEX_HTML.contains("item.telegram_html || '').innerHTML"),
+            "provider-controlled Telegram HTML must not be injected into the admin DOM"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Environment-backed configuration for OpenPlotva.
 
 use std::{
-    io,
+    fmt, io,
     num::{ParseFloatError, ParseIntError, TryFromIntError},
 };
 
@@ -47,6 +47,10 @@ pub const DEFAULT_CHAT_HISTORY_RETENTION_DAYS: i32 = 8;
 pub const DEFAULT_TELEGRAM_FILES_RETENTION_DAYS: i32 = 7;
 
 pub const DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS: i32 = 30;
+
+pub const DEFAULT_GRADIUS_BASE_URL: &str = "https://api.adlean.pro";
+
+pub const DEFAULT_GRADIUS_REQUEST_TIMEOUT_SECONDS: i32 = 5;
 
 pub const DEFAULT_RUNTIME_API_CERT_FILE: &str = "";
 
@@ -382,6 +386,8 @@ pub struct AppConfig {
     /// Media uploader (plotva.geta.moe) configuration.
     pub uploader: UploaderConfig,
     pub white_circle: WhiteCircleConfig,
+    /// Privacy-preserving native advertising configuration.
+    pub gradius: GradiusConfig,
     /// Discovery/dialog LLM configuration.
     pub llm: LlmConfig,
     /// Vision captioning and direct-image configuration.
@@ -698,6 +704,26 @@ pub struct WhiteCircleConfig {
     pub deployment_id: String,
     /// Audit-log retention in days, from `WHITECIRCLE_CHECKS_RETENTION_DAYS` (0 disables).
     pub whitecircle_checks_retention_days: i32,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GradiusConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub base_url: String,
+    pub request_timeout_seconds: i32,
+}
+
+impl fmt::Debug for GradiusConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GradiusConfig")
+            .field("enabled", &self.enabled)
+            .field("api_key", &"[redacted]")
+            .field("base_url", &self.base_url)
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .finish()
+    }
 }
 
 /// LLM and provider routing configuration.
@@ -1199,6 +1225,14 @@ pub struct RawConfig {
     pub whitecircle_deployment_id: Option<String>,
     /// `WHITECIRCLE_CHECKS_RETENTION_DAYS`.
     pub whitecircle_checks_retention_days: Option<String>,
+    /// `GRADIUS_ENABLED`.
+    pub gradius_enabled: Option<String>,
+    /// `GRADIUS_API_KEY`.
+    pub gradius_api_key: Option<String>,
+    /// `GRADIUS_BASE_URL`.
+    pub gradius_base_url: Option<String>,
+    /// `GRADIUS_REQUEST_TIMEOUT_SECONDS`.
+    pub gradius_request_timeout_seconds: Option<String>,
     /// `DISCOVERY_BASE_URL`.
     pub discovery_base_url: Option<String>,
     /// `DIALOG_PROVIDER`.
@@ -2329,6 +2363,18 @@ impl AppConfig {
                     DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS,
                 )?,
             },
+            gradius: GradiusConfig {
+                enabled: parse_bool("GRADIUS_ENABLED", raw.gradius_enabled, false)?,
+                api_key: raw.gradius_api_key.unwrap_or_default(),
+                base_url: raw
+                    .gradius_base_url
+                    .unwrap_or_else(|| DEFAULT_GRADIUS_BASE_URL.to_owned()),
+                request_timeout_seconds: parse_i32(
+                    "GRADIUS_REQUEST_TIMEOUT_SECONDS",
+                    raw.gradius_request_timeout_seconds,
+                    DEFAULT_GRADIUS_REQUEST_TIMEOUT_SECONDS,
+                )?,
+            },
             llm: LlmConfig {
                 discovery: DiscoveryConfig {
                     base_url: raw
@@ -3079,6 +3125,10 @@ impl RawConfig {
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),
             whitecircle_checks_retention_days: env("WHITECIRCLE_CHECKS_RETENTION_DAYS"),
+            gradius_enabled: env("GRADIUS_ENABLED"),
+            gradius_api_key: env("GRADIUS_API_KEY"),
+            gradius_base_url: env("GRADIUS_BASE_URL"),
+            gradius_request_timeout_seconds: env("GRADIUS_REQUEST_TIMEOUT_SECONDS"),
             discovery_base_url: env("DISCOVERY_BASE_URL"),
             dialog_provider: env("DIALOG_PROVIDER"),
             dialog_fallback_provider: env("DIALOG_FALLBACK_PROVIDER"),
@@ -4055,6 +4105,29 @@ mod tests {
         assert!(config.service_probe.produce_updates);
         assert!(config.service_probe.consume_updates);
 
+        Ok(())
+    }
+
+    #[test]
+    fn gradius_is_disabled_by_default_and_maps_server_settings() -> Result<(), super::ConfigError> {
+        let defaults = AppConfig::from_raw(RawConfig::default())?;
+        assert!(!defaults.gradius.enabled);
+        assert_eq!(defaults.gradius.api_key, "");
+        assert_eq!(defaults.gradius.base_url, "https://api.adlean.pro");
+        assert_eq!(defaults.gradius.request_timeout_seconds, 5);
+
+        let configured = AppConfig::from_raw(RawConfig {
+            gradius_enabled: Some("true".to_owned()),
+            gradius_api_key: Some("secret".to_owned()),
+            gradius_base_url: Some("https://gradius.internal".to_owned()),
+            gradius_request_timeout_seconds: Some("7".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert!(configured.gradius.enabled);
+        assert_eq!(configured.gradius.api_key, "secret");
+        assert_eq!(configured.gradius.base_url, "https://gradius.internal");
+        assert_eq!(configured.gradius.request_timeout_seconds, 7);
+        assert!(!format!("{:?}", configured.gradius).contains("secret"));
         Ok(())
     }
 

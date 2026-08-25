@@ -4,6 +4,7 @@ mod callback;
 mod dedup;
 mod dispatcher;
 mod html;
+mod markdown;
 mod outbound;
 mod persistence;
 mod rate_limit;
@@ -39,8 +40,10 @@ pub use dispatcher::{
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
     ensure_telegram_safe_text, escape_telegram_html_text, extract_visible_text,
-    is_valid_telegram_html, sanitize_telegram_html, split_telegram_text, strip_telegram_html,
+    is_valid_telegram_html, sanitize_telegram_html, split_telegram_text,
+    split_telegram_text_with_atomic_tail, strip_telegram_html,
 };
+pub use markdown::{MarkdownToTelegramHtmlError, telegram_html_from_markdown};
 pub use outbound::{
     AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest,
     ChatRef, DEFAULT_GUEST_BOT_USERNAME, DONATION_DESCRIPTION, DONATION_TITLE,
@@ -74,7 +77,8 @@ pub use outbound::{
     build_sticker_message_method, build_sticker_message_plan,
     build_subscription_invoice_link_method, build_text_message_method,
     build_text_message_method_without_link_preview, build_text_message_methods,
-    build_text_message_methods_without_link_previews, classify_payment_payload,
+    build_text_message_methods_without_link_previews,
+    build_text_message_methods_without_link_previews_with_atomic_tail, classify_payment_payload,
     donation_invoice_payload, fingerprint_audio_message_plan, fingerprint_message_reaction,
     fingerprint_photo_message_plan, fingerprint_rich_message, fingerprint_sticker_message_plan,
     fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,

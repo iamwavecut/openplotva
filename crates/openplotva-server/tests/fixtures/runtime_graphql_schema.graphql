@@ -168,6 +168,25 @@ type GeminiExplicitCachePurgeResult {
 	failed: Int!
 }
 
+input GradiusAdOpportunitiesFilterInput {
+	range: String
+	integrationKind: String
+	outcome: String
+	deliveryState: String
+	userID: ID
+	chatID: ID
+	dialogJobID: ID
+	model: String
+	q: String
+	offset: Int
+	limit: Int
+}
+
+input GradiusAdSummaryFilterInput {
+	range: String
+	integrationKind: String
+}
+
 type HealthSnapshot {
 	db: DependencyHealth!
 	redis: DependencyHealth!
@@ -429,6 +448,8 @@ type RuntimeQuery {
 	safetyChecks(filter: SafetyChecksFilterInput): SafetyCheckConnection!
 	llmRequests(filter: LlmRequestsFilterInput): [LlmRequest!]!
 	llmRuns(filter: LlmRunsFilterInput): [JSON!]!
+	gradiusAdOpportunities(filter: GradiusAdOpportunitiesFilterInput): JSON!
+	gradiusAdSummary(filter: GradiusAdSummaryFilterInput): JSON!
 	dialogTurnOutcomes(filter: DialogTurnOutcomesFilterInput): [DialogTurnOutcome!]!
 	dispatcherSendFailures(limit: Int): [DispatcherSendFailure!]!
 	llmRoutingEvents(filter: RoutingEventsFilterInput): [RoutingEvent!]!
