@@ -37,7 +37,7 @@ use openplotva_taskman::TaskQueueJobEvent;
 use serde_json::Value;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::budget::{SessionBudget, TURN_DEADLINE, TurnBudget};
+use super::budget::{SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE, TurnBudget};
 use super::engine::{ANSWER_QUEUED_STAGE, ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use crate::dialog_jobs::{
@@ -57,9 +57,6 @@ pub const SESSION_INTERMEDIATE_QUEUED_STAGE: &str = "session_intermediate_queued
 
 /// Job event stage recorded per session LLM iteration (audit only).
 pub const SESSION_ITERATION_STAGE: &str = "session_iteration";
-
-/// Job event stage recorded per executed session tool (audit only).
-pub const SESSION_TOOL_STAGE: &str = "session_tool";
 
 /// Job event stage recording why a tool-call batch continued or completed.
 pub const SESSION_BATCH_STAGE: &str = "session_batch";

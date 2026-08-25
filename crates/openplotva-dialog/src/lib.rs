@@ -1521,6 +1521,46 @@ fn normalized_paragraphs(value: &str) -> Vec<String> {
     paragraphs
 }
 
+fn strip_http_urls_for_repetition(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut remainder = value;
+    loop {
+        let url_start = [remainder.find("https://"), remainder.find("http://")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(url_start) = url_start else {
+            stripped.push_str(remainder);
+            return stripped;
+        };
+        stripped.push_str(&remainder[..url_start]);
+        let url = &remainder[url_start..];
+        let url_end = url
+            .char_indices()
+            .find_map(|(index, ch)| {
+                (index > 0
+                    && (ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']')))
+                .then_some(index)
+            })
+            .unwrap_or(url.len());
+        remainder = &url[url_end..];
+    }
+}
+
+fn strip_html_tags_for_repetition(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut inside_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' if inside_tag => inside_tag = false,
+            _ if !inside_tag => stripped.push(ch),
+            _ => {}
+        }
+    }
+    stripped
+}
+
 #[must_use]
 pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     let mut max_run = 0;
@@ -1557,12 +1597,17 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
         return Some("repeated block".to_owned());
     }
     let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
-    for segment in value.split(['\n', '.', '!', '?']) {
-        let normalized = segment
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
+    let repetition_text = strip_html_tags_for_repetition(&strip_http_urls_for_repetition(value));
+    for segment in repetition_text.split(['\n', '.', '!', '?']) {
+        let words = segment
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        if words.len() < 2 {
+            continue;
+        }
+        let normalized = words.join(" ");
         if normalized.chars().count() < 8 {
             continue;
         }
@@ -3458,6 +3503,30 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply(raw),
             DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_distinct_links_from_same_domain() {
+        let raw = r#"1. Ереван — столица. [Ссылка](https://en.wikipedia.org/wiki/Yerevan)
+2. Севан — озеро. [Ссылка](https://en.wikipedia.org/wiki/Lake_Sevan)
+3. Татев — монастырь. [Ссылка](https://en.wikipedia.org/wiki/Tatev_Monastery)"#;
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_repeated_phrase_without_spaces_after_punctuation() {
+        let raw = "Ничего не вижу!Ничего не вижу!Ничего не вижу!";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated phrase".to_owned()
+            ))
         );
     }
 

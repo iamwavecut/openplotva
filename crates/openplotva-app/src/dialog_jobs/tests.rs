@@ -1533,6 +1533,81 @@ async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
 }
 
 #[tokio::test]
+async fn dialog_worker_restores_successful_tool_extension_before_retry_budget_gate()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(
+            dialog_params("continued agent flow"),
+            now - TimeDuration::seconds(200),
+        ),
+    );
+    queue.append_job_event(
+        job_id,
+        TaskQueueJobEvent {
+            stage: crate::dialog_turn::TURN_STARTED_STAGE.to_owned(),
+            ..TaskQueueJobEvent::default()
+        },
+        now - TimeDuration::seconds(130),
+    )?;
+    queue.append_job_event(
+        job_id,
+        TaskQueueJobEvent {
+            stage: crate::dialog_turn::SESSION_TOOL_STAGE.to_owned(),
+            data: std::collections::BTreeMap::from([(
+                "status".to_owned(),
+                openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+            )]),
+            ..TaskQueueJobEvent::default()
+        },
+        now - TimeDuration::seconds(70),
+    )?;
+    let provider = ProviderStub::returning(DialogOutput {
+        answer: "pong".to_owned(),
+        ..DialogOutput::default()
+    });
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            queue_name: DIALOG_AIFARM_QUEUE_NAME,
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
+            now,
+            routing_events: None,
+            turn_outcomes: Some(&outcomes),
+            session: leaked_session_wiring(),
+            llm_runs: None,
+            activity_pulse: None,
+        },
+    )
+    .await;
+
+    assert!(report.sent_answer);
+    assert!(report.completed);
+    assert_eq!(provider.inputs().len(), 1);
+    assert_eq!(effects.sent().len(), 1);
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].budget_ms, Some(180_000));
+    Ok(())
+}
+
+#[tokio::test]
 async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
