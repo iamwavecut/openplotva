@@ -14337,7 +14337,7 @@ struct RuntimeRatesHeaderProvider;
 
 impl rates::RatesHeaderProvider for RuntimeRatesHeaderProvider {
     fn rates_header(&self, user_full_name: &str) -> String {
-        user_full_name.to_owned()
+        rates::random_rates_header(user_full_name)
     }
 }
 
@@ -14408,6 +14408,18 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    #[test]
+    fn runtime_rates_header_restores_the_legacy_joke() {
+        let header =
+            <super::RuntimeRatesHeaderProvider as crate::rates::RatesHeaderProvider>::rates_header(
+                &super::RuntimeRatesHeaderProvider,
+                "Ada Lovelace",
+            );
+
+        assert_ne!(header, "Ada Lovelace");
+        assert!(header.contains("Ada Lovelace"));
+    }
 
     #[tokio::test]
     async fn runtime_worker_readiness_names_an_early_exit() {

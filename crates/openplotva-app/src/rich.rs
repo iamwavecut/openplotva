@@ -289,7 +289,7 @@ pub struct RateRow {
 #[must_use]
 pub fn compose_rates_table(header: &str, rows: &[RateRow], footer: &str) -> String {
     let mut html = String::new();
-    html.push_str(&format!("<h3>{}</h3>", esc(header)));
+    html.push_str(&format!("<p>{}</p>", esc(header)));
     html.push_str("<table bordered striped><tr><th>Пара</th><th>Курс</th><th>Динамика</th></tr>");
     for row in rows {
         html.push_str(&format!(
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn rates_table_is_rich() {
+    fn rates_table_renders_joke_as_plain_text() {
         let rows = vec![
             RateRow {
                 label: "USD/RUB".to_owned(),
@@ -429,7 +429,7 @@ mod tests {
         let html = compose_rates_table("Курсы", &rows, "источник: ЦБ РФ");
         assert_eq!(
             html,
-            "<h3>Курсы</h3><table bordered striped><tr><th>Пара</th><th>Курс</th><th>Динамика</th></tr>\
+            "<p>Курсы</p><table bordered striped><tr><th>Пара</th><th>Курс</th><th>Динамика</th></tr>\
 <tr><td>USD/RUB</td><td align=\"right\">78.42</td><td align=\"right\">+0.15</td></tr>\
 <tr><td>EUR/RUB</td><td align=\"right\">85.10</td><td align=\"right\">-0.20</td></tr></table>\
 <footer>источник: ЦБ РФ</footer>"
@@ -485,7 +485,8 @@ mod tests {
             delta: "<".to_owned(),
         }];
         let html = compose_rates_table("a<b", &rows, "");
-        assert!(html.contains("<h3>a&lt;b</h3>"));
+        assert!(html.contains("<p>a&lt;b</p>"));
+        assert!(!html.contains("<h3>"));
         assert!(html.contains("<td>&lt;b&gt;x&lt;/b&gt;</td>"));
         assert!(html.contains("<td align=\"right\">1 &amp; 2</td>"));
     }
