@@ -22,6 +22,7 @@ use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
     TextMessageRequest,
 };
+use rand::RngExt;
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use serde_json::json;
@@ -52,6 +53,30 @@ const RATE_ID_USD_RUB: &str = "usd_rub";
 const RATE_ID_EUR_RUB: &str = "eur_rub";
 const RATE_ID_EUR_USD: &str = "eur_usd";
 const RATE_ID_BTC_USD: &str = "btc_usd";
+const RATES_HEADER_TEMPLATES: &[&str] = &[
+    " {name}, ситуация на {time} такова:",
+    " {name}, {time}, хроника стабильности:",
+    "Давай лучше пивка выпьем, {name}?",
+    "Не в деньгах счастье, {name}",
+    "Наши искандеры смеются над вашими курсами, {name}",
+    "Уважаемый {name}, вы, что, не видите? У нас - обед!",
+    "Многие поступки кажутся гораздо нравственнее, если смотреть на них сквозь пальцы, которые держат деньги {name}.",
+    "Банкротство - это законная процедура, в ходе которой вы перекладываете деньги в брючный карман и отдаете пиджак {name}.",
+    "Есть люди у которых есть деньги, и есть богатые люди, {name}.",
+    "Уничтожь деньги и уничтожишь войны, {name}.",
+    "Денег, которые я заработал, хватит мне до конца жизни, если я умру сегодня в {deadline}, {name}.",
+    "Лимон – это не так уж и кисло. Если это лимон баксов, {name}.",
+    "Кажется, {name} ищет кратчайшей дороги к деньгам и при этом обходит самую прямую - ту, которая ведет через труд.",
+    "Но есть и хорошие новости: Пенсионный возраст для силовиков решено не повышать, {name}.",
+    "Стараешься избегать встречи с истериками и паникёрами, но от себя не уйти, {name}.",
+    "Хочешь карьерный рост, {name}? Устройся землекопом на карьер.",
+    "Если вас затопили соседи сверху, а вам лень с ними разбираться - откройте кран и затопите соседей снизу. Не бойтесь делегировать, {name}.",
+    "Деньги не приносят счастья, {name}, но хотя бы позволяют с комфортом предаваться печали.",
+    "Сын депутата понимает смысл сказки только после третьего чтения, {name}.",
+    "Россия - самая привлекательная страна на свете! Привлечь тут могут за что угодно, {name}.",
+    "Как определиться, чего хочешь в жизни, если не знаешь, что хочешь в продуктовом, {name}?",
+    "Росстат сообщает, что благосостояние россиян за прошедший год увеличилось. И {name} даже знает фамилии этих россиян...",
+];
 const DEFAULT_RATE_IDS: &[&str] = &[
     RATE_ID_USD_RUB,
     RATE_ID_EUR_RUB,
@@ -1101,6 +1126,24 @@ pub trait RatesHeaderProvider {
     fn rates_header(&self, user_full_name: &str) -> String;
 }
 
+/// Return one of the legacy currency-rate jokes, addressed to the requesting user.
+#[must_use]
+pub fn random_rates_header(user_full_name: &str) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    let index = rand::rng().random_range(0..RATES_HEADER_TEMPLATES.len());
+    render_rates_header(RATES_HEADER_TEMPLATES[index], user_full_name, now)
+}
+
+fn render_rates_header(template: &str, user_full_name: &str, now: time::OffsetDateTime) -> String {
+    let time = format!("{:02}:{:02}", now.hour(), now.minute());
+    let deadline = now + time::Duration::minutes(5);
+    let deadline = format!("{:02}:{:02}", deadline.hour(), deadline.minute());
+    template
+        .replace("{name}", user_full_name)
+        .replace("{time}", &time)
+        .replace("{deadline}", &deadline)
+}
+
 pub trait RatesEffects {
     /// Error returned by the concrete sender.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -1963,7 +2006,7 @@ mod tests {
             sent[0]
                 .message
                 .text
-                .starts_with("<h3>Header for Ada Lovelace</h3><table")
+                .starts_with("<p>Header for Ada Lovelace</p><table")
         );
         assert!(sent[0].message.text.contains("<td>💵 USD/RUB</td>"));
         assert!(sent[0].message.text.contains("90.00 ₽"));
@@ -2001,7 +2044,7 @@ mod tests {
         assert!(
             sent[0]
                 .html
-                .starts_with("<h3>Header for Ada Lovelace</h3><table")
+                .starts_with("<p>Header for Ada Lovelace</p><table")
         );
         assert!(sent[0].html.contains("<td>💵 USD/RUB</td>"));
         assert!(sent[0].html.contains("90.00 ₽"));
@@ -2157,7 +2200,7 @@ mod tests {
         assert_eq!(format_rate_delta(100.0, 100.0), "0.0%");
         assert_eq!(format_rate_delta(100.0, 98.0), "-2.0%");
         let rendered = format_rates_command_message("H", &RatesFetcherStub::successful_snapshot());
-        assert!(rendered.starts_with("<h3>H</h3><table bordered striped>"));
+        assert!(rendered.starts_with("<p>H</p><table bordered striped>"));
         assert!(rendered.contains("<td>💵 USD/RUB</td>"));
         assert!(rendered.contains("90.00 ₽"));
         assert!(rendered.contains("BTC/USD"));
