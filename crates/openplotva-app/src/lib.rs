@@ -20,6 +20,7 @@ pub mod dialog_turn;
 pub mod dialog_workers;
 pub mod edited;
 pub mod embedder;
+pub mod gradius_ads;
 pub mod guest;
 pub mod help;
 pub mod history_summary;
@@ -47,6 +48,7 @@ mod runtime_cache;
 mod runtime_dispatcher;
 mod runtime_entities;
 mod runtime_gemini_cache;
+mod runtime_gradius;
 mod runtime_llm;
 mod runtime_llm_analytics;
 mod runtime_llm_runs;
@@ -607,6 +609,7 @@ struct StaticWebRoutes {
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
     llm_run_buffer: Option<runtime_llm_runs::RuntimeLlmRunBuffer>,
+    gradius_audit_reader: Option<Arc<dyn openplotva_server::RuntimeGradiusAuditReader>>,
     routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     llm_discovery_base_url: Arc<str>,
@@ -675,6 +678,7 @@ fn static_web_routes(
         taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle::default(),
         llm_trace_buffer: None,
         llm_run_buffer: None,
+        gradius_audit_reader: None,
         routing_event_buffer: None,
         routing_event_reporter: None,
         llm_discovery_base_url: Arc::from(""),
@@ -759,6 +763,9 @@ fn static_web_routes_from_config(
     routes.shield_options = shield_options_from_config(&config.shield);
     if let Some(clients) = service_clients {
         routes.postgres = Some(clients.postgres.clone());
+        routes.gradius_audit_reader = Some(Arc::new(
+            runtime_gradius::PostgresRuntimeGradiusAuditReader::new(clients.postgres.clone()),
+        ));
         routes.redis = Some(clients.redis.client().clone());
         routes.settings_store = Some(PostgresChatSettingsStore::new(clients.postgres.clone()));
         routes.member_store = Some(PostgresChatMemberStore::new(clients.postgres.clone()));
@@ -907,6 +914,11 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
         .route("/admin/api/metrics", any(admin_state))
         .route("/admin/api/safety/checks", any(admin_safety_checks))
         .route(
+            "/admin/api/gradius/opportunities",
+            any(admin_gradius_opportunities),
+        )
+        .route("/admin/api/gradius/summary", any(admin_gradius_summary))
+        .route(
             "/admin/api/analytics/llm/summary",
             any(admin_llm_analytics_summary),
         )
@@ -986,6 +998,8 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/bootstrap",
     "/admin/api/metrics",
     "/admin/api/safety/checks",
+    "/admin/api/gradius/opportunities",
+    "/admin/api/gradius/summary",
     "/admin/api/analytics/llm/summary",
     "/admin/api/analytics/overview",
     "/admin/api/llm/dialogs",
@@ -1214,6 +1228,109 @@ async fn admin_safety_checks(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_safety_checks_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_gradius_opportunities(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(reader) = routes.gradius_audit_reader.as_deref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "Gradius audit unavailable");
+    };
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let filter = match admin_gradius_opportunities_filter(&values) {
+        Ok(filter) => filter,
+        Err(error) => return admin_error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    match reader.gradius_ad_opportunities(filter).await {
+        Ok(payload) => admin_json_response(StatusCode::OK, payload),
+        Err(error) => {
+            if error == "invalid Gradius range" {
+                admin_error_response(StatusCode::BAD_REQUEST, &error)
+            } else {
+                tracing::warn!(%error, "failed to read Gradius opportunities for admin");
+                admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+            }
+        }
+    }
+}
+
+async fn admin_gradius_summary(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(reader) = routes.gradius_audit_reader.as_deref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "Gradius audit unavailable");
+    };
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let filter = openplotva_server::RuntimeGradiusSummaryFilter {
+        range: values.get("range").cloned().unwrap_or_default(),
+        integration_kind: values.get("integration_kind").cloned().unwrap_or_default(),
+    };
+    match reader.gradius_ad_summary(filter).await {
+        Ok(payload) => admin_json_response(StatusCode::OK, payload),
+        Err(error) => {
+            let status = if error == "invalid Gradius range" {
+                StatusCode::BAD_REQUEST
+            } else {
+                tracing::warn!(%error, "failed to read Gradius summary for admin");
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            admin_error_response(status, &error)
+        }
+    }
+}
+
+fn admin_gradius_opportunities_filter(
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<openplotva_server::RuntimeGradiusOpportunitiesFilter, String> {
+    let parse_id = |key: &str| -> Result<Option<i64>, String> {
+        values
+            .get(key)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| format!("{key} must be an integer"))
+            })
+            .transpose()
+    };
+    let parse_page = |key: &str, default: i32| -> Result<i32, String> {
+        values.get(key).map_or(Ok(default), |value| {
+            value
+                .parse::<i32>()
+                .map_err(|_| format!("{key} must be an integer"))
+        })
+    };
+    Ok(openplotva_server::RuntimeGradiusOpportunitiesFilter {
+        range: values.get("range").cloned().unwrap_or_default(),
+        integration_kind: values.get("integration_kind").cloned().unwrap_or_default(),
+        outcome: values.get("outcome").cloned().unwrap_or_default(),
+        delivery_state: values.get("delivery_state").cloned().unwrap_or_default(),
+        user_id: parse_id("user_id")?,
+        chat_id: parse_id("chat_id")?,
+        dialog_job_id: parse_id("dialog_job_id")?,
+        model: values.get("model").cloned().unwrap_or_default(),
+        q: values.get("q").cloned().unwrap_or_default(),
+        offset: parse_page("offset", 0)?.max(0),
+        limit: parse_page("limit", 100)?.clamp(1, 500),
+    })
 }
 
 async fn admin_llm_analytics_summary(
@@ -11069,6 +11186,11 @@ async fn start_runtime_workers(
                 .with_sql_timeout_ms(config.runtime_api.sql_timeout_ms)
                 .with_taskman(Arc::clone(&runtime_taskman_reader)),
             )),
+            gradius_audit_reader: Some(Arc::new(
+                runtime_gradius::PostgresRuntimeGradiusAuditReader::new(
+                    service_clients.postgres.clone(),
+                ),
+            )),
             log_inspector: Some(Arc::new(RuntimeLogInspector::new(Arc::clone(&log_buffer)))),
             taskman_inspector: Some(runtime_taskman_reader),
             updates_inspector: Some(Arc::new(updates_inspector.clone())),
@@ -11757,6 +11879,9 @@ async fn start_runtime_workers(
     let telegram_outbox_jobs = telegram_outbox::RunAwareTelegramOutboxJobResolver::new(
         shared_task_queue.clone(),
         llm_run_buffer.clone(),
+        openplotva_storage::gradius_ads::PostgresGradiusAdStore::new(
+            service_clients.postgres.clone(),
+        ),
     );
     let telegram_outbox_worker_id =
         format!("telegram-outbox-{}-{}", bot_identity.id, std::process::id());
@@ -12334,6 +12459,61 @@ async fn start_runtime_workers(
             .with_url_crawler(url_crawler);
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
+    let gradius_for_dialog = if !config.gradius.enabled {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "gradius",
+            "Gradius dialogue advertising is disabled",
+        ));
+        None
+    } else if config.gradius.api_key.trim().is_empty() {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "gradius",
+            "Gradius is enabled but GRADIUS_API_KEY is empty",
+        ));
+        None
+    } else {
+        match openplotva_llm::gradius::GradiusPrivacyRedactor::new(
+            gradius_ads::gradius_privacy_config(config),
+        ) {
+            Ok(redactor) => {
+                let dialogue: Arc<dyn gradius_ads::GradiusDialogueClient> =
+                    Arc::new(openplotva_llm::gradius::GradiusClient::new(
+                        openplotva_llm::gradius::GradiusClientConfig {
+                            enabled: true,
+                            api_key: config.gradius.api_key.clone(),
+                            base_url: config.gradius.base_url.clone(),
+                            request_timeout: Duration::from_secs(
+                                u64::try_from(config.gradius.request_timeout_seconds.max(1))
+                                    .unwrap_or(5),
+                            ),
+                        },
+                    ));
+                let privacy: Arc<dyn gradius_ads::GradiusTextRedactor> = Arc::new(redactor);
+                let ledger: Arc<dyn gradius_ads::GradiusAdLedger> = Arc::new(
+                    openplotva_storage::gradius_ads::PostgresGradiusAdStore::new(
+                        service_clients.postgres.clone(),
+                    ),
+                );
+                let vip: Arc<dyn gradius_ads::GradiusVipChecker> = vip_status_for_updates.clone();
+                readiness_checks.push(ReadinessCheck::ok(
+                    "gradius",
+                    "Gradius dialogue advertising is enabled with fail-closed privacy redaction",
+                ));
+                Some(Arc::new(gradius_ads::GradiusAdService::new(
+                    dialogue, privacy, ledger, vip,
+                ))
+                    as Arc<dyn gradius_ads::GradiusAdAppender>)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Gradius privacy redactor unavailable");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "gradius",
+                    format!("Gradius privacy redactor unavailable: {error}"),
+                ));
+                None
+            }
+        }
+    };
     // The dialog session engine drives every turn: engine-owned tool loop,
     // multi-message turns, per-(chat, thread) serialization with initiator
     // injection.
@@ -12345,6 +12525,7 @@ async fn start_runtime_workers(
                 Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
                     as Arc<dyn dialog_turn::SessionReactor>,
             ),
+            gradius: gradius_for_dialog,
             max_iterations: config.llm.dialog.session_max_iterations,
             max_messages: config.llm.dialog.session_max_messages,
             tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
@@ -14871,9 +15052,9 @@ mod tests {
         GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler, WebhookShutdownCleanupReport,
         admin_auth_check, admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
         admin_auth_user_state, admin_bootstrap, admin_chat_get_response,
-        admin_chats_search_by_member_response, admin_i64_from_json,
-        admin_llm_analytics_summary_json, admin_loglevel_response, admin_memory_cards_response,
-        admin_memory_resolve_override, admin_memory_restart_override,
+        admin_chats_search_by_member_response, admin_gradius_opportunities_filter,
+        admin_i64_from_json, admin_llm_analytics_summary_json, admin_loglevel_response,
+        admin_memory_cards_response, admin_memory_resolve_override, admin_memory_restart_override,
         admin_memory_restart_response, admin_memory_runs_response, admin_non_empty_string,
         admin_redis_prefix_groups_from_keys, admin_safety_check_json, admin_safety_checks_filter,
         admin_session_is_authorized, admin_shield_category_matched, admin_shield_document_input,
@@ -16411,6 +16592,31 @@ mod tests {
         assert_eq!(user.is_premium, None);
     }
 
+    #[test]
+    fn admin_gradius_filters_preserve_supported_dimensions_and_reject_bad_ids() {
+        let values = admin_auth_query_values(Some(
+            "range=7d&integration_kind=native_dialogue&outcome=ad&delivery_state=delivered&user_id=7&chat_id=8&dialog_job_id=9&model=qwen&q=discount&offset=4&limit=999",
+        ));
+        let filter = admin_gradius_opportunities_filter(&values).expect("Gradius filter");
+        assert_eq!(filter.range, "7d");
+        assert_eq!(filter.integration_kind, "native_dialogue");
+        assert_eq!(filter.outcome, "ad");
+        assert_eq!(filter.delivery_state, "delivered");
+        assert_eq!(filter.user_id, Some(7));
+        assert_eq!(filter.chat_id, Some(8));
+        assert_eq!(filter.dialog_job_id, Some(9));
+        assert_eq!(filter.model, "qwen");
+        assert_eq!(filter.q, "discount");
+        assert_eq!(filter.offset, 4);
+        assert_eq!(filter.limit, 500);
+
+        let invalid = admin_auth_query_values(Some("user_id=not-an-id"));
+        assert_eq!(
+            admin_gradius_opportunities_filter(&invalid),
+            Err("user_id must be an integer".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn settings_api_without_services_fails_loud_with_go_cors_headers()
     -> Result<(), Box<dyn Error>> {
@@ -16807,6 +17013,8 @@ mod tests {
                 "/admin/api/bootstrap",
                 "/admin/api/metrics",
                 "/admin/api/safety/checks",
+                "/admin/api/gradius/opportunities",
+                "/admin/api/gradius/summary",
                 "/admin/api/analytics/llm/summary",
                 "/admin/api/analytics/overview",
                 "/admin/api/llm/dialogs",

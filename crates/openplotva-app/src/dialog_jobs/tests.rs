@@ -443,6 +443,8 @@ async fn dialog_dispatcher_effects_disable_preview_for_search_grounded_final_tex
             "<a href=\"https://example.com/current\">current fact</a>",
             DialogAnswerSendOptions {
                 disable_link_preview: true,
+                contains_advertising: false,
+                advertising_tail_bytes: None,
             },
         )
         .await?;
@@ -457,6 +459,43 @@ async fn dialog_dispatcher_effects_disable_preview_for_search_grounded_final_tex
         value["link_preview_options"]["is_disabled"],
         serde_json::json!(true)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dialog_dispatcher_effects_disable_preview_for_advertising_final_text()
+-> Result<(), Box<dyn Error>> {
+    let queue = Arc::new(DispatcherQueue::new(
+        openplotva_telegram::DispatcherConfig::default(),
+    ));
+    let effects = DialogDispatcherEffects::new(Arc::clone(&queue))
+        .with_virtual_id_factory(Arc::new(|| "dialog-ad-v1".to_owned()));
+
+    effects
+        .send_dialog_answer(
+            1,
+            None,
+            &dialog_params("hello"),
+            "<a href=\"https://ads.example/redirect\">реклама</a>",
+            DialogAnswerSendOptions {
+                disable_link_preview: false,
+                contains_advertising: true,
+                advertising_tail_bytes: Some(
+                    "<a href=\"https://ads.example/redirect\">реклама</a>".len(),
+                ),
+            },
+        )
+        .await?;
+
+    let item = queue
+        .dequeue_immediate()
+        .expect("queued advertising answer");
+    let (_, method) = item.into_parts();
+    let Some(openplotva_telegram::TelegramOutboundMethod::SendMessage(method)) = method else {
+        return Err("expected sendMessage".into());
+    };
+    let value = serde_json::to_value(method.as_ref())?;
+    assert_eq!(value["link_preview_options"]["is_disabled"], true);
     Ok(())
 }
 
@@ -477,6 +516,8 @@ async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
             "<h2>pong</h2>",
             DialogAnswerSendOptions {
                 disable_link_preview: true,
+                contains_advertising: false,
+                advertising_tail_bytes: None,
             },
         )
         .await?;
@@ -3503,6 +3544,7 @@ fn session_wiring(
     crate::dialog_turn::SessionWorkerWiring {
         toolbox,
         reactor,
+        gradius: None,
         registry: std::sync::Arc::new(crate::dialog_turn::DialogSessionRegistry::new()),
         max_iterations: 8,
         max_messages: 4,
@@ -3667,6 +3709,198 @@ fn session_options<'a>(
     }
 }
 
+#[derive(Clone, Default)]
+struct GradiusAppenderStub {
+    requests: Arc<Mutex<Vec<crate::gradius_ads::GradiusAdAppendRequest>>>,
+    render_errors: Arc<Mutex<Vec<(i64, String)>>>,
+    queued: Arc<Mutex<Vec<(i64, String)>>>,
+    delivered_jobs: Arc<Mutex<Vec<i64>>>,
+    failed_delivery_jobs: Arc<Mutex<Vec<(i64, String)>>>,
+}
+
+const TEST_GRADIUS_TAIL: &str = "<b>Реклама</b> <a href=\"https://ads.example/r/42\">перейти</a>\n\n<tg-spoiler>В <a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a> рекламы нет</tg-spoiler>";
+
+impl crate::gradius_ads::GradiusAdAppender for GradiusAppenderStub {
+    fn append<'a>(
+        &'a self,
+        request: crate::gradius_ads::GradiusAdAppendRequest,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, Option<crate::gradius_ads::GradiusAdTail>>
+    {
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("Gradius requests")
+                .push(request);
+            Ok(Some(crate::gradius_ads::GradiusAdTail {
+                opportunity_id: 91,
+                html: TEST_GRADIUS_TAIL.to_owned(),
+            }))
+        })
+    }
+
+    fn record_unsupported_surface<'a>(
+        &'a self,
+        _request: crate::gradius_ads::GradiusAdAppendRequest,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mark_render_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        error: &'a str,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            self.render_errors
+                .lock()
+                .expect("Gradius render errors")
+                .push((opportunity_id, error.to_owned()));
+            Ok(())
+        })
+    }
+
+    fn mark_queued<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch_id: &'a str,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            self.queued
+                .lock()
+                .expect("Gradius queued batches")
+                .push((opportunity_id, batch_id.to_owned()));
+            Ok(())
+        })
+    }
+
+    fn mark_delivered<'a>(
+        &'a self,
+        dialog_job_id: i64,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            self.delivered_jobs
+                .lock()
+                .expect("Gradius delivered jobs")
+                .push(dialog_job_id);
+            Ok(())
+        })
+    }
+
+    fn mark_delivery_failed<'a>(
+        &'a self,
+        dialog_job_id: i64,
+        error: &'a str,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            self.failed_delivery_jobs
+                .lock()
+                .expect("Gradius failed delivery jobs")
+                .push((dialog_job_id, error.to_owned()));
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn session_appends_gradius_tail_and_marks_final_answer_as_advertising()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("расскажи шутку"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("Базовый ответ"))]);
+    let appender = GradiusAppenderStub::default();
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let mut wiring = session_wiring(toolbox, None);
+    wiring.gradius = Some(Arc::new(appender.clone()));
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    let sent = effects.sent();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].1.starts_with("Базовый ответ\n\n<b>Реклама</b>"));
+    assert!(sent[0].1.contains("<tg-spoiler>"));
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions {
+            disable_link_preview: false,
+            contains_advertising: true,
+            advertising_tail_bytes: Some(TEST_GRADIUS_TAIL.len()),
+        }]
+    );
+    let requests = appender.requests.lock().expect("Gradius requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].user_text, "расскажи шутку");
+    assert_eq!(requests[0].assistant_text, "Базовый ответ");
+    assert_eq!(requests[0].model_version.as_deref(), Some("test-model"));
+    drop(requests);
+    let queued = appender.queued.lock().expect("Gradius queued batches");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, 91);
+    assert!(!queued[0].1.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_marks_prepared_gradius_ad_failed_when_answer_enqueue_fails()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("покажи рекламу"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("Базовый ответ"))]);
+    let appender = GradiusAppenderStub::default();
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let mut wiring = session_wiring(toolbox, None);
+    wiring.gradius = Some(Arc::new(appender.clone()));
+    let effects = EffectsStub::failing();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(report.send_error.as_deref(), Some("send down"));
+    assert_eq!(
+        appender
+            .failed_delivery_jobs
+            .lock()
+            .expect("Gradius failed delivery jobs")
+            .as_slice(),
+        &[(job_id, "send down".to_owned())]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -3716,6 +3950,8 @@ async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>>
         effects.answer_options(),
         vec![DialogAnswerSendOptions {
             disable_link_preview: true,
+            contains_advertising: false,
+            advertising_tail_bytes: None,
         }],
         "a successful web_search disables previews only on the final answer"
     );
@@ -3803,6 +4039,8 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
         effects.answer_options(),
         vec![DialogAnswerSendOptions {
             disable_link_preview: true,
+            contains_advertising: false,
+            advertising_tail_bytes: None,
         }]
     );
     let requests = provider.requests();
@@ -4449,6 +4687,8 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
         effects.answer_options(),
         vec![DialogAnswerSendOptions {
             disable_link_preview: true,
+            contains_advertising: false,
+            advertising_tail_bytes: None,
         }],
         "the intermediate send is unchanged while the final records successful search"
     );

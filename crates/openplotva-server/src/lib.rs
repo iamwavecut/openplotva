@@ -38,11 +38,13 @@ pub use runtime_graphql::{
     RuntimeChatMemberWithUserData, RuntimeChatsFilter, RuntimeDispatchFailureData,
     RuntimeDispatcherFailureInspector, RuntimeDispatcherInspector, RuntimeDispatcherStatsData,
     RuntimeEntityReader, RuntimeEntityReaderFuture, RuntimeGeminiCachePurgeResultData,
-    RuntimeGeminiCachePurger, RuntimeGeminiCachePurgerFuture, RuntimeIngestionGatesData,
-    RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
-    RuntimeLlmAnalyticsInferenceParamStatData, RuntimeLlmAnalyticsModelSeriesPointData,
-    RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
-    RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
+    RuntimeGeminiCachePurger, RuntimeGeminiCachePurgerFuture, RuntimeGradiusAuditReader,
+    RuntimeGradiusAuditReaderFuture, RuntimeGradiusOpportunitiesFilter,
+    RuntimeGradiusSummaryFilter, RuntimeIngestionGatesData, RuntimeJobAnalyticsStatData,
+    RuntimeLlmAnalyticsData, RuntimeLlmAnalyticsInferenceParamStatData,
+    RuntimeLlmAnalyticsModelSeriesPointData, RuntimeLlmAnalyticsModelStatData,
+    RuntimeLlmAnalyticsProviderStatData, RuntimeLlmAnalyticsReader,
+    RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
     RuntimeLlmAnalyticsStageMetricData, RuntimeLlmAnalyticsTopChatData,
     RuntimeLlmAnalyticsTotalsData, RuntimeLlmGenConfigData, RuntimeLlmRequestChatData,
     RuntimeLlmRequestData, RuntimeLlmRequestMessageData, RuntimeLlmRequestResultData,
@@ -514,8 +516,8 @@ async fn runtime_api_graphql<Validator>(
 where
     Validator: RuntimeTokenValidator + Send + Sync,
 {
-    if let Err(response) = runtime_api_authorize(state.as_ref(), &headers).await {
-        return response;
+    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
+        return runtime_api_unauthorized_response();
     }
     if method != Method::POST {
         return runtime_api_method_not_allowed_response();
@@ -540,8 +542,8 @@ async fn runtime_api_pprof_index<Validator>(
 where
     Validator: RuntimeTokenValidator + Send + Sync,
 {
-    if let Err(response) = runtime_api_authorize(state.as_ref(), &headers).await {
-        return response;
+    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
+        return runtime_api_unauthorized_response();
     }
     runtime_api_pprof_response("")
 }
@@ -554,8 +556,8 @@ async fn runtime_api_pprof_path<Validator>(
 where
     Validator: RuntimeTokenValidator + Send + Sync,
 {
-    if let Err(response) = runtime_api_authorize(state.as_ref(), &headers).await {
-        return response;
+    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
+        return runtime_api_unauthorized_response();
     }
     runtime_api_pprof_response(&path)
 }
@@ -567,29 +569,27 @@ async fn runtime_api_not_found<Validator>(
 where
     Validator: RuntimeTokenValidator + Send + Sync,
 {
-    if let Err(response) = runtime_api_authorize(state.as_ref(), &headers).await {
-        return response;
+    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
+        return runtime_api_unauthorized_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn runtime_api_authorize<Validator>(
+async fn runtime_api_is_authorized<Validator>(
     state: &RuntimeApiState<Validator>,
     headers: &HeaderMap,
-) -> Result<(), Response>
+) -> bool
 where
     Validator: RuntimeTokenValidator + Send + Sync,
 {
-    let token = headers
+    let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_bearer_token)
-        .ok_or_else(runtime_api_unauthorized_response)?;
-    if state.validator.validate_runtime_token(token).await {
-        Ok(())
-    } else {
-        Err(runtime_api_unauthorized_response())
-    }
+    else {
+        return false;
+    };
+    state.validator.validate_runtime_token(token).await
 }
 
 #[must_use]
@@ -922,35 +922,36 @@ mod tests {
         RuntimeDispatchFailureData, RuntimeDispatcherFailureInspector, RuntimeDispatcherInspector,
         RuntimeDispatcherStatsData, RuntimeEntityReader, RuntimeEntityReaderFuture,
         RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
-        RuntimeGeminiCachePurgerFuture, RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
-        RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
-        RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture,
-        RuntimeLlmAnalyticsSeriesPointData, RuntimeLlmAnalyticsStageMetricData,
-        RuntimeLlmAnalyticsTopChatData, RuntimeLlmAnalyticsTotalsData, RuntimeLlmGenConfigData,
-        RuntimeLlmRequestChatData, RuntimeLlmRequestData, RuntimeLlmRequestMessageData,
-        RuntimeLlmRequestResultData, RuntimeLlmRequestUserData, RuntimeLlmRequestsFilter,
-        RuntimeLlmTraceInspector, RuntimeLogEntry, RuntimeLogInspector, RuntimeLogQuery,
-        RuntimeMemoryRestartFuture, RuntimeMemoryRestartResultData, RuntimeMemoryRestarter,
-        RuntimeRedisInspector, RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup,
-        RuntimeRedisValue, RuntimeRoutingEventData, RuntimeRoutingEventInspector,
-        RuntimeRoutingEventsFilter, RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData,
-        RuntimeSafetyCheckReader, RuntimeSafetyCheckReaderFuture, RuntimeSafetyChecksFilter,
-        RuntimeSqlReadRequest, RuntimeSqlReadResult, RuntimeSqlReader, RuntimeSqlReaderFuture,
-        RuntimeSubscriptionData, RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector,
-        RuntimeTaskmanJobData, RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture,
-        RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListResultData,
-        RuntimeTaskmanJobMessageData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
-        RuntimeTaskmanQueueDiagnosticsData, RuntimeTelegramDeliveryFuture,
-        RuntimeTelegramDeliveryInspector, RuntimeTelegramDeliveryListFilter,
-        RuntimeTelegramOutboxAttemptData, RuntimeTelegramOutboxItemData,
-        RuntimeTelegramOutboxMutationResultData, RuntimeTelegramOutboxRetryRequest,
-        RuntimeTelegramOutboxStatsData, RuntimeTelegramUpdateAttemptData,
-        RuntimeTelegramUpdateInboxItemData, RuntimeTelegramUpdateInboxStatsData,
-        RuntimeTokenParseError, RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture,
-        RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData,
-        RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter,
-        RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData, RuntimeVirtualDialogData,
-        RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture,
+        RuntimeGeminiCachePurgerFuture, RuntimeGradiusAuditReader, RuntimeGradiusAuditReaderFuture,
+        RuntimeGradiusOpportunitiesFilter, RuntimeGradiusSummaryFilter,
+        RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData, RuntimeLlmAnalyticsModelStatData,
+        RuntimeLlmAnalyticsProviderStatData, RuntimeLlmAnalyticsReader,
+        RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
+        RuntimeLlmAnalyticsStageMetricData, RuntimeLlmAnalyticsTopChatData,
+        RuntimeLlmAnalyticsTotalsData, RuntimeLlmGenConfigData, RuntimeLlmRequestChatData,
+        RuntimeLlmRequestData, RuntimeLlmRequestMessageData, RuntimeLlmRequestResultData,
+        RuntimeLlmRequestUserData, RuntimeLlmRequestsFilter, RuntimeLlmTraceInspector,
+        RuntimeLogEntry, RuntimeLogInspector, RuntimeLogQuery, RuntimeMemoryRestartFuture,
+        RuntimeMemoryRestartResultData, RuntimeMemoryRestarter, RuntimeRedisInspector,
+        RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup, RuntimeRedisValue,
+        RuntimeRoutingEventData, RuntimeRoutingEventInspector, RuntimeRoutingEventsFilter,
+        RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData, RuntimeSafetyCheckReader,
+        RuntimeSafetyCheckReaderFuture, RuntimeSafetyChecksFilter, RuntimeSqlReadRequest,
+        RuntimeSqlReadResult, RuntimeSqlReader, RuntimeSqlReaderFuture, RuntimeSubscriptionData,
+        RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector, RuntimeTaskmanJobData,
+        RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData,
+        RuntimeTaskmanJobListResultData, RuntimeTaskmanJobMessageData,
+        RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter, RuntimeTaskmanQueueDiagnosticsData,
+        RuntimeTelegramDeliveryFuture, RuntimeTelegramDeliveryInspector,
+        RuntimeTelegramDeliveryListFilter, RuntimeTelegramOutboxAttemptData,
+        RuntimeTelegramOutboxItemData, RuntimeTelegramOutboxMutationResultData,
+        RuntimeTelegramOutboxRetryRequest, RuntimeTelegramOutboxStatsData,
+        RuntimeTelegramUpdateAttemptData, RuntimeTelegramUpdateInboxItemData,
+        RuntimeTelegramUpdateInboxStatsData, RuntimeTokenParseError, RuntimeUpdatesInspector,
+        RuntimeUpdatesInspectorFuture, RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData,
+        RuntimeUserConnectionData, RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup,
+        RuntimeUsersFilter, RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData,
+        RuntimeVirtualDialogData, RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture,
         RuntimeVirtualDialogManager, RuntimeVirtualDialogMessageData,
         RuntimeVirtualDialogSendRequest, RuntimeVirtualDialogStartRequest,
         RuntimeVirtualDialogToolMode, can_perform_action, format_runtime_token,
@@ -2342,6 +2343,107 @@ mod tests {
         assert_eq!(checks["items"][0]["chatID"], "-100");
         assert_eq!(checks["items"][0]["requestMessages"][0]["role"], "user");
         assert_eq!(checks["items"][0]["responseJSON"]["flagged"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_serves_gradius_audit_and_validates_ids() {
+        struct GradiusReader;
+
+        impl RuntimeGradiusAuditReader for GradiusReader {
+            fn gradius_ad_opportunities<'a>(
+                &'a self,
+                filter: RuntimeGradiusOpportunitiesFilter,
+            ) -> RuntimeGradiusAuditReaderFuture<'a> {
+                assert_eq!(
+                    filter,
+                    RuntimeGradiusOpportunitiesFilter {
+                        range: "7d".to_owned(),
+                        integration_kind: "native_dialogue".to_owned(),
+                        outcome: "ad".to_owned(),
+                        delivery_state: "delivered".to_owned(),
+                        user_id: Some(7),
+                        chat_id: Some(8),
+                        dialog_job_id: Some(9),
+                        model: "qwen".to_owned(),
+                        q: "sale".to_owned(),
+                        offset: 0,
+                        limit: 500,
+                    }
+                );
+                Box::pin(async {
+                    Ok(serde_json::json!({
+                        "count": 1,
+                        "items": [{"id": 41, "delivery_state": "delivered"}]
+                    }))
+                })
+            }
+
+            fn gradius_ad_summary<'a>(
+                &'a self,
+                filter: RuntimeGradiusSummaryFilter,
+            ) -> RuntimeGradiusAuditReaderFuture<'a> {
+                assert_eq!(
+                    filter,
+                    RuntimeGradiusSummaryFilter {
+                        range: "24h".to_owned(),
+                        integration_kind: "native_dialogue".to_owned(),
+                    }
+                );
+                Box::pin(async {
+                    Ok(serde_json::json!({
+                        "attempts": 2,
+                        "delivered": 1,
+                        "confirmed_show_price_rub": 1.25
+                    }))
+                })
+            }
+        }
+
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                gradius_audit_reader: Some(Arc::new(GradiusReader)),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let response = schema
+            .execute(
+                r#"
+                query {
+                    gradiusAdOpportunities(filter: {
+                        range: "7d",
+                        integrationKind: "native_dialogue",
+                        outcome: "ad",
+                        deliveryState: "delivered",
+                        userID: "7",
+                        chatID: "8",
+                        dialogJobID: "9",
+                        model: "qwen",
+                        q: "sale",
+                        offset: -2,
+                        limit: 900
+                    })
+                    gradiusAdSummary(filter: { range: "24h", integrationKind: "native_dialogue" })
+                }
+                "#,
+            )
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let payload = serde_json::to_value(response).expect("GraphQL response JSON");
+        assert_eq!(
+            payload["data"]["gradiusAdOpportunities"]["items"][0]["id"],
+            41
+        );
+        assert_eq!(
+            payload["data"]["gradiusAdSummary"]["confirmed_show_price_rub"],
+            1.25
+        );
+
+        let invalid = schema
+            .execute(r#"query { gradiusAdOpportunities(filter: { userID: "bad" }) }"#)
+            .await;
+        assert_eq!(invalid.errors.len(), 1);
+        assert!(invalid.errors[0].message.contains("invalid userID"));
     }
 
     #[tokio::test]

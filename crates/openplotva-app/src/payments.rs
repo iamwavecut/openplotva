@@ -110,6 +110,10 @@ pub type PaymentControlJobWorkerFuture<'a, T, E> =
 /// Boxed future returned by VIP status checks.
 pub type VipStatusCheckFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
+/// Boxed future returned by fail-closed VIP status checks used for advertising.
+pub type VerifiedVipStatusCheckFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
+
 /// Boxed future returned by external VIP membership checks.
 pub type ExternalVipMembershipFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;
@@ -888,9 +892,18 @@ pub trait AdminRefundStore {
     ) -> PaymentStoreFuture<'a, DonationRecord, Self::Error>;
 }
 
-pub trait VipStatusChecker {
+pub trait VipStatusChecker: Sync {
     /// Return whether this user should see existing VIP status instead of a new invoice.
     fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a>;
+
+    /// Return a verified VIP decision. Advertising callers skip ads on `Err`.
+    fn verified_is_vip_at<'a>(
+        &'a self,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> VerifiedVipStatusCheckFuture<'a> {
+        Box::pin(async move { Ok(self.is_vip_at(user_id, now).await) })
+    }
 }
 
 pub trait SuccessfulPaymentEffects {
@@ -3746,6 +3759,67 @@ where
             is_vip
         })
     }
+
+    fn verified_is_vip_at<'a>(
+        &'a self,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> VerifiedVipStatusCheckFuture<'a> {
+        Box::pin(async move { verified_external_vip_status(self, user_id, now).await })
+    }
+}
+
+async fn verified_external_vip_status<Store, Membership>(
+    checker: &VipStatusWithExternalMembership<Store, Membership>,
+    user_id: i64,
+    now: OffsetDateTime,
+) -> Result<bool, String>
+where
+    Store: VipStatusStore + ExternalVipCacheStore + Sync,
+    Membership: ExternalVipMembershipChecker + Sync,
+{
+    if user_id <= 0 {
+        return Ok(false);
+    }
+    if let Some(summary) = checker
+        .store
+        .get_vip_summary_by_user(user_id)
+        .await
+        .map_err(|error| format!("failed to read VIP summary: {error}"))?
+        && summary.is_active
+        && now < summary.effective_expires_at
+    {
+        return Ok(true);
+    }
+    if let Some(cache) = checker
+        .store
+        .get_vip_cache(user_id)
+        .await
+        .map_err(|error| format!("failed to read VIP cache: {error}"))?
+        && now < cache.expires_at
+    {
+        return Ok(cache.is_vip);
+    }
+    if checker.vip_chat_id == 0 {
+        return Ok(false);
+    }
+    let is_vip = checker
+        .membership
+        .is_external_vip_member(checker.vip_chat_id, user_id)
+        .await
+        .map_err(|error| format!("failed to check external VIP membership: {error}"))?;
+    if let Err(error) = checker
+        .store
+        .upsert_vip_cache(VipCacheUpsert {
+            user_id,
+            is_vip,
+            expires_at: now + vip_telegram_cache_ttl(is_vip),
+        })
+        .await
+    {
+        tracing::warn!(%error, user_id, "failed to update external VIP cache");
+    }
+    Ok(is_vip)
 }
 
 #[derive(Clone, Debug)]
@@ -10424,6 +10498,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_vip_status_propagates_external_membership_failure()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let checker = super::VipStatusWithExternalMembership::new(
+            VipStatusStoreStub::new(),
+            ExternalVipMembershipStub::failing(StubError::Request),
+            -1004242,
+        );
+
+        assert!(
+            super::VipStatusChecker::verified_is_vip_at(&checker, 42, now)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_payment_update_wrapper_delegates_non_payment_messages()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -12993,6 +13087,7 @@ mod tests {
     #[derive(Default)]
     struct ExternalVipMembershipState {
         is_member: bool,
+        error: Option<StubError>,
         calls: Vec<(i64, i64)>,
     }
 
@@ -13003,6 +13098,12 @@ mod tests {
                 .lock()
                 .expect("external VIP membership")
                 .is_member = is_member;
+            stub
+        }
+
+        fn failing(error: StubError) -> Self {
+            let stub = Self::default();
+            stub.state.lock().expect("external VIP membership").error = Some(error);
             stub
         }
 
@@ -13026,6 +13127,9 @@ mod tests {
             Box::pin(async move {
                 let mut state = self.state.lock().expect("external VIP membership");
                 state.calls.push((chat_id, user_id));
+                if let Some(error) = state.error.take() {
+                    return Err(error);
+                }
                 Ok(state.is_member)
             })
         }

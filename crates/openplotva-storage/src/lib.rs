@@ -37,6 +37,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
+pub mod gradius_ads;
 pub mod llm_routing;
 pub mod telegram_delivery;
 pub mod telegram_outbox;

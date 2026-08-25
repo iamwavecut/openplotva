@@ -383,6 +383,238 @@ body {
     margin-bottom: var(--sp-4);
 }
 
+/* Gradius audit: a receipt-ledger view, not a generic analytics dashboard. */
+.gradius-topbar,
+.gradius-detail-head,
+.gradius-row-top,
+.gradius-detail-actions,
+.gradius-alert {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+}
+
+.gradius-topbar,
+.gradius-detail-head,
+.gradius-row-top {
+    justify-content: space-between;
+}
+
+.gradius-topbar {
+    margin-bottom: var(--sp-4);
+}
+
+.gradius-title,
+.gradius-detail-title {
+    color: var(--c-text-main);
+    font-weight: 700;
+}
+
+.gradius-title {
+    font-size: 1.05rem;
+}
+
+.gradius-kpis {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: var(--sp-3);
+    margin-bottom: var(--sp-4);
+}
+
+.gradius-kpi {
+    padding: var(--sp-4);
+    margin: 0;
+}
+
+.gradius-kpi-label,
+.gradius-kpi-note {
+    color: var(--c-text-muted);
+    font-size: 0.78rem;
+}
+
+.gradius-kpi-value {
+    color: var(--c-text-main);
+    font-family: var(--font-mono);
+    font-size: 1.35rem;
+    font-weight: 700;
+    margin: var(--sp-2) 0;
+}
+
+.gradius-kpi-danger .gradius-kpi-value,
+.gradius-row-warning {
+    color: var(--c-danger);
+}
+
+.gradius-alert {
+    border: 1px solid var(--c-warning);
+    border-radius: var(--rad-md);
+    background: var(--c-warning-bg);
+    color: var(--c-text-main);
+    padding: var(--sp-3) var(--sp-4);
+    margin-bottom: var(--sp-4);
+}
+
+.gradius-filter-card {
+    margin-bottom: var(--sp-4);
+}
+
+.gradius-controls {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(9rem, 1fr));
+    gap: var(--sp-3);
+    align-items: end;
+}
+
+.gradius-row {
+    border-left: 3px solid transparent;
+}
+
+.gradius-row.active {
+    border-left-color: var(--c-primary);
+    background: var(--c-primary-light);
+}
+
+.gradius-row-top {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+}
+
+.gradius-row-time {
+    color: var(--c-text-muted);
+    margin-left: auto;
+    font-size: 0.78rem;
+}
+
+.gradius-row-id {
+    color: var(--c-text-main);
+    font-weight: 700;
+}
+
+.gradius-row-meta,
+.gradius-row-preview,
+.gradius-row-warning {
+    margin-top: var(--sp-2);
+    font-size: 0.82rem;
+}
+
+.gradius-row-meta,
+.gradius-row-preview {
+    color: var(--c-text-muted);
+}
+
+.gradius-detail .gradius-detail-head {
+    border-bottom: 1px solid var(--c-border);
+    padding: var(--sp-3) var(--sp-4);
+}
+
+.gradius-detail-title {
+    flex: 1;
+}
+
+.gradius-detail-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-4);
+    padding: var(--sp-4);
+}
+
+.gradius-detail-actions {
+    flex-wrap: wrap;
+}
+
+.gradius-timeline {
+    position: relative;
+    display: grid;
+    gap: var(--sp-3);
+    padding: var(--sp-4);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-md);
+    background: var(--c-bg-input);
+}
+
+.gradius-event {
+    display: grid;
+    grid-template-columns: 1rem minmax(8rem, auto) minmax(8rem, 1fr);
+    gap: var(--sp-2) var(--sp-3);
+    align-items: center;
+}
+
+.gradius-event-dot {
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: var(--c-text-muted);
+    box-shadow: 0 0 0 3px var(--c-bg-input), 0 0 0 4px var(--c-border);
+}
+
+.gradius-event[data-state="success"] .gradius-event-dot { background: var(--c-success); }
+.gradius-event[data-state="danger"] .gradius-event-dot { background: var(--c-danger); }
+.gradius-event[data-state="info"] .gradius-event-dot { background: var(--c-info); }
+
+.gradius-event-label {
+    color: var(--c-text-main);
+    font-weight: 600;
+}
+
+.gradius-event-at,
+.gradius-event-detail,
+.gradius-provider-note {
+    color: var(--c-text-muted);
+    font-size: 0.8rem;
+}
+
+.gradius-event-detail {
+    grid-column: 2 / -1;
+}
+
+.gradius-payload,
+.gradius-raw {
+    margin: 0;
+}
+
+.gradius-payload pre {
+    max-height: 20rem;
+    overflow: auto;
+    margin: 0;
+}
+
+.gradius-raw .json-tree {
+    max-height: 30rem;
+    overflow: auto;
+}
+
+@media (max-width: 1200px) {
+    .gradius-kpis {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .gradius-controls {
+        grid-template-columns: repeat(3, minmax(9rem, 1fr));
+    }
+}
+
+@media (max-width: 720px) {
+    .gradius-kpis,
+    .gradius-controls {
+        grid-template-columns: 1fr;
+    }
+
+    .gradius-topbar,
+    .gradius-detail-head {
+        align-items: flex-start;
+        flex-wrap: wrap;
+    }
+
+    .gradius-event {
+        grid-template-columns: 1rem 1fr;
+    }
+
+    .gradius-event-at,
+    .gradius-event-detail {
+        grid-column: 2;
+    }
+}
+
 .llmd-controls {
     display: flex;
     flex-wrap: wrap;

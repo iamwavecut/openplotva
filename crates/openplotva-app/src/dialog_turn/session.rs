@@ -102,6 +102,7 @@ pub struct SessionTurnConfig<'a> {
     pub toolbox: &'a dyn DialogToolbox,
     /// `react_to_message` executor; `None` fails the tool gracefully.
     pub reactor: Option<&'a dyn SessionReactor>,
+    pub gradius: Option<&'a dyn crate::gradius_ads::GradiusAdAppender>,
     pub max_iterations: i32,
     pub max_messages: i32,
     pub tool_extension_secs: i32,
@@ -115,6 +116,7 @@ pub struct SessionTurnConfig<'a> {
 pub struct SessionWorkerWiring {
     pub toolbox: std::sync::Arc<dyn DialogToolbox>,
     pub reactor: Option<std::sync::Arc<dyn SessionReactor>>,
+    pub gradius: Option<std::sync::Arc<dyn crate::gradius_ads::GradiusAdAppender>>,
     /// Per-(chat, thread) serialization + initiator injection.
     pub registry: std::sync::Arc<super::inbox::DialogSessionRegistry>,
     pub max_iterations: i32,
@@ -131,6 +133,7 @@ impl SessionWorkerWiring {
         SessionTurnConfig {
             toolbox: self.toolbox.as_ref(),
             reactor: self.reactor.as_deref(),
+            gradius: self.gradius.as_deref(),
             max_iterations: self.max_iterations,
             max_messages: self.max_messages,
             tool_extension_secs: self.tool_extension_secs,
@@ -752,18 +755,134 @@ where
                 .await;
             }
 
-            return match effects
+            let mut final_answer = sanitized.clone();
+            let mut contains_advertising = false;
+            let mut advertising_tail_bytes = None;
+            let mut advertising_opportunity_id = None;
+            if let Some(gradius) = cfg.gradius {
+                let request = crate::gradius_ads::GradiusAdAppendRequest {
+                    dialog_job_id: ctx.item_id,
+                    chat_id: active_params.chat_id,
+                    thread_id: active_params.thread_id,
+                    user_id: active_params.user_id,
+                    user_text: active_params.message_text.clone(),
+                    assistant_text: openplotva_telegram::strip_telegram_html(&sanitized),
+                    language: base_input.context.locale.clone(),
+                    model_version: (!step.model.trim().is_empty()).then(|| step.model.clone()),
+                    completed_at: failure_now,
+                };
+                if crate::dialog_jobs::dialog_response_requires_rich(&sanitized) {
+                    if let Err(error) = gradius.record_unsupported_surface(request).await {
+                        tracing::warn!(
+                            job_id = ctx.item_id,
+                            integration_kind = "native_dialogue",
+                            outcome = "unsupported_surface",
+                            %error,
+                            "failed to audit unsupported Gradius rich response surface"
+                        );
+                    }
+                } else {
+                    match gradius.append(request).await {
+                        Ok(Some(tail)) => {
+                            let tail_bytes = tail.html.len();
+                            let candidate = format!("{sanitized}\n\n{}", tail.html);
+                            if let Err(error) = validate_dialog_answer_deliverable(&candidate) {
+                                if let Err(audit_error) = gradius
+                                    .mark_render_error(tail.opportunity_id, &error.to_string())
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        opportunity_id = tail.opportunity_id,
+                                        job_id = ctx.item_id,
+                                        %audit_error,
+                                        "failed to persist Gradius final-answer render rejection"
+                                    );
+                                }
+                                tracing::warn!(
+                                    opportunity_id = tail.opportunity_id,
+                                    job_id = ctx.item_id,
+                                    %error,
+                                    "skipping Gradius ad rejected by final-answer validation"
+                                );
+                            } else {
+                                final_answer = candidate;
+                                contains_advertising = true;
+                                advertising_tail_bytes = Some(tail_bytes);
+                                advertising_opportunity_id = Some(tail.opportunity_id);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = ctx.item_id,
+                                %error,
+                                "skipping Gradius ad after fail-closed integration error"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let send_result = effects
                 .send_dialog_answer(
                     ctx.item_id,
                     ctx.item.latest_update_id,
                     &active_params,
-                    &sanitized,
+                    &final_answer,
                     DialogAnswerSendOptions {
                         disable_link_preview: successful_web_search,
+                        contains_advertising,
+                        advertising_tail_bytes,
                     },
                 )
-                .await
-            {
+                .await;
+            if let (Ok(receipt), Some(opportunity_id), Some(gradius)) = (
+                send_result.as_ref(),
+                advertising_opportunity_id,
+                cfg.gradius,
+            ) {
+                if let Err(error) = gradius.mark_queued(opportunity_id, &receipt.batch_id).await {
+                    tracing::warn!(
+                        opportunity_id,
+                        job_id = ctx.item_id,
+                        integration_kind = "native_dialogue",
+                        delivery_state = "queued",
+                        %error,
+                        "failed to persist Gradius queued delivery state"
+                    );
+                }
+                if receipt.delivery_complete()
+                    && let Err(error) = gradius.mark_delivered(ctx.item_id).await
+                {
+                    tracing::warn!(
+                        opportunity_id,
+                        job_id = ctx.item_id,
+                        integration_kind = "native_dialogue",
+                        delivery_state = "delivered",
+                        %error,
+                        "failed to persist already-complete Gradius delivery state"
+                    );
+                }
+            }
+            if let (Err(send_error), Some(opportunity_id), Some(gradius)) = (
+                send_result.as_ref(),
+                advertising_opportunity_id,
+                cfg.gradius,
+            ) {
+                let send_error = send_error.to_string();
+                if let Err(error) = gradius.mark_delivery_failed(ctx.item_id, &send_error).await {
+                    tracing::warn!(
+                        opportunity_id,
+                        job_id = ctx.item_id,
+                        integration_kind = "native_dialogue",
+                        delivery_state = "failed",
+                        %error,
+                        "failed to persist Gradius enqueue failure"
+                    );
+                }
+            }
+
+            return match send_result {
                 Ok(receipt) if receipt.requires_delivery_wait() => {
                     report.queued_answer = true;
                     let queued_now = ctx.now
@@ -790,7 +909,7 @@ where
                     }
                 }
                 Ok(_receipt) => {
-                    sent.record(&sanitized, false);
+                    sent.record(&final_answer, false);
                     report.sent_answer = true;
                     if let Some(runs) = ctx.llm_runs {
                         runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
@@ -2084,6 +2203,7 @@ mod tests {
         let cfg = SessionTurnConfig {
             toolbox: toolbox.as_ref(),
             reactor: None,
+            gradius: None,
             max_iterations: 4,
             max_messages: 4,
             tool_extension_secs: 10,

@@ -22,7 +22,7 @@ use crate::{
     DispatcherPersistencePayload, RICH_MESSAGE_MAX_CHARS, RichSendOptions, SendRichMessage,
     TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, escape_telegram_html_text,
     extract_visible_text, format_rich_html, rich_message_within_char_limit, sanitize_telegram_html,
-    split_telegram_text, strip_telegram_html,
+    split_telegram_text, split_telegram_text_with_atomic_tail, strip_telegram_html,
 };
 
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
@@ -499,6 +499,9 @@ pub enum OutboundBuildError {
     /// Split text unexpectedly produced no outbound parts.
     #[error("no parts to send")]
     NoParts,
+    /// A caller-provided atomic tail is invalid or cannot fit in one Telegram message.
+    #[error("atomic message tail is invalid or exceeds the Telegram text limit")]
+    InvalidAtomicTail,
     /// `carapax` failed to serialize reply parameters for a form method.
     #[error("failed to serialize Telegram reply parameters: {0}")]
     ReplyParameters(String),
@@ -519,7 +522,7 @@ pub fn build_text_message_methods(
     req: &TextMessageRequest,
     reply_to: Option<&ReplyMessageRef>,
 ) -> Result<Vec<SendMessage>, OutboundBuildError> {
-    build_text_message_methods_with_preview(req, reply_to, true)
+    build_text_message_methods_with_preview(req, reply_to, true, None)
 }
 
 /// Build all outbound `sendMessage` methods with Telegram link previews disabled.
@@ -527,17 +530,36 @@ pub fn build_text_message_methods_without_link_previews(
     req: &TextMessageRequest,
     reply_to: Option<&ReplyMessageRef>,
 ) -> Result<Vec<SendMessage>, OutboundBuildError> {
-    build_text_message_methods_with_preview(req, reply_to, false)
+    build_text_message_methods_with_preview(req, reply_to, false, None)
+}
+
+/// Build all outbound `sendMessage` methods with previews disabled and one atomic final tail.
+pub fn build_text_message_methods_without_link_previews_with_atomic_tail(
+    req: &TextMessageRequest,
+    reply_to: Option<&ReplyMessageRef>,
+    tail_bytes: usize,
+) -> Result<Vec<SendMessage>, OutboundBuildError> {
+    build_text_message_methods_with_preview(req, reply_to, false, Some(tail_bytes))
 }
 
 fn build_text_message_methods_with_preview(
     req: &TextMessageRequest,
     reply_to: Option<&ReplyMessageRef>,
     link_previews_enabled: bool,
+    atomic_tail_bytes: Option<usize>,
 ) -> Result<Vec<SendMessage>, OutboundBuildError> {
     validate_text_message_text(&req.text, &req.render_as)?;
     let chat = message_target_chat(req.chat.as_ref(), reply_to)?;
-    let parts = split_telegram_text(&req.text, &req.render_as, TELEGRAM_TEXT_MAX_BYTES);
+    let parts = match atomic_tail_bytes {
+        Some(tail_bytes) => split_telegram_text_with_atomic_tail(
+            &req.text,
+            &req.render_as,
+            TELEGRAM_TEXT_MAX_BYTES,
+            tail_bytes,
+        )
+        .ok_or(OutboundBuildError::InvalidAtomicTail)?,
+        None => split_telegram_text(&req.text, &req.render_as, TELEGRAM_TEXT_MAX_BYTES),
+    };
     let total = parts.len();
     if total == 0 {
         return Err(OutboundBuildError::NoParts);
@@ -1838,6 +1860,7 @@ mod tests {
         build_rich_message_method, build_sticker_message_method, build_sticker_message_plan,
         build_subscription_invoice_link_method, build_text_message_method,
         build_text_message_methods, build_text_message_methods_without_link_previews,
+        build_text_message_methods_without_link_previews_with_atomic_tail,
         classify_payment_payload, donation_invoice_payload, fingerprint_audio_message_plan,
         fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
         fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
@@ -2156,6 +2179,37 @@ mod tests {
             assert_eq!(payload["link_preview_options"]["is_disabled"], json!(true));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn build_text_message_methods_keep_the_advertising_tail_atomic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tail = "<b>Реклама</b>\n\n<tg-spoiler>VIP</tg-spoiler>";
+        let req = TextMessageRequest {
+            text: format!(
+                "{}\n\n{tail}",
+                "a ".repeat(TELEGRAM_TEXT_MAX_BYTES / 2 + 20)
+            ),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            ..base_text_request("unused")
+        };
+        let methods = build_text_message_methods_without_link_previews_with_atomic_tail(
+            &req,
+            None,
+            tail.len(),
+        )?;
+        assert!(methods.len() > 1);
+
+        for (index, method) in methods.iter().enumerate() {
+            let payload = serde_json::to_value(method)?;
+            assert_eq!(payload["link_preview_options"]["is_disabled"], json!(true));
+            if index + 1 == methods.len() {
+                assert!(payload["text"].as_str().expect("text").ends_with(tail));
+            } else {
+                assert!(!payload["text"].as_str().expect("text").contains("Реклама"));
+            }
+        }
         Ok(())
     }
 
