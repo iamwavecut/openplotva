@@ -1549,15 +1549,22 @@ fn strip_http_urls_for_repetition(value: &str) -> String {
 
 fn strip_html_tags_for_repetition(value: &str) -> String {
     let mut stripped = String::with_capacity(value.len());
-    let mut inside_tag = false;
-    for ch in value.chars() {
-        match ch {
-            '<' => inside_tag = true,
-            '>' if inside_tag => inside_tag = false,
-            _ if !inside_tag => stripped.push(ch),
-            _ => {}
+    let mut remainder = value;
+    while let Some(tag_start) = remainder.find('<') {
+        let after_start = &remainder[tag_start + 1..];
+        let starts_tag = after_start
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '/' | '!' | '?'));
+        if starts_tag && let Some(tag_end) = after_start.find('>') {
+            stripped.push_str(&remainder[..tag_start]);
+            remainder = &after_start[tag_end + 1..];
+        } else {
+            stripped.push_str(&remainder[..=tag_start]);
+            remainder = after_start;
         }
     }
+    stripped.push_str(remainder);
     stripped
 }
 
@@ -3529,6 +3536,18 @@ mod tests {
     #[test]
     fn finalize_dialog_reply_rejects_repeated_phrase_without_spaces_after_punctuation() {
         let raw = "Ничего не вижу!Ничего не вижу!Ничего не вижу!";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                "repeated phrase".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_checking_after_literal_less_than() {
+        let raw = "Проверка: a < b. Ничего не вижу!Ничего не вижу!Ничего не вижу!";
 
         assert_eq!(
             finalize_dialog_reply(raw),
