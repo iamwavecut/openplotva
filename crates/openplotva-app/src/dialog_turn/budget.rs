@@ -15,6 +15,9 @@ pub const TURN_STARTED_STAGE: &str = "turn_started";
 /// Job event stage recorded for each executed session tool.
 pub const SESSION_TOOL_STAGE: &str = "session_tool";
 
+/// Durable tool-event flag indicating that this call extended the session budget.
+pub const SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY: &str = "budget_extension_granted";
+
 tokio::task_local! {
     /// Wall-clock deadline for the current turn's provider work, set by the
     /// engine around each chat step and read by `RouterChatProvider`
@@ -77,7 +80,10 @@ impl TurnBudget {
             .filter(|event| {
                 event.data.get("status").is_some_and(|status| {
                     status.eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
-                })
+                }) && event
+                    .data
+                    .get(SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY)
+                    .is_some_and(|granted| granted.eq_ignore_ascii_case("true"))
             })
             .count() as i64;
         let extension = TimeDuration::seconds(
@@ -219,11 +225,23 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
         let mut successful = event("session_tool", "2026-05-19T12:28:45Z");
         successful.data.insert("status".to_owned(), "ok".to_owned());
+        successful
+            .data
+            .insert("budget_extension_granted".to_owned(), "true".to_owned());
+        let mut cached = event("session_tool", "2026-05-19T12:29:00Z");
+        cached.data.insert("status".to_owned(), "ok".to_owned());
+        cached
+            .data
+            .insert("budget_extension_granted".to_owned(), "false".to_owned());
         let mut failed = event("session_tool", "2026-05-19T12:29:15Z");
         failed.data.insert("status".to_owned(), "failed".to_owned());
+        failed
+            .data
+            .insert("budget_extension_granted".to_owned(), "true".to_owned());
         let events = vec![
             event(TURN_STARTED_STAGE, "2026-05-19T12:28:30Z"),
             successful.clone(),
+            cached,
             failed,
             successful,
         ];

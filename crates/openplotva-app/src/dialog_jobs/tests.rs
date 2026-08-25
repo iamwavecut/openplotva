@@ -1556,10 +1556,16 @@ async fn dialog_worker_restores_successful_tool_extension_before_retry_budget_ga
         job_id,
         TaskQueueJobEvent {
             stage: crate::dialog_turn::SESSION_TOOL_STAGE.to_owned(),
-            data: std::collections::BTreeMap::from([(
-                "status".to_owned(),
-                openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
-            )]),
+            data: std::collections::BTreeMap::from([
+                (
+                    "status".to_owned(),
+                    openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+                ),
+                (
+                    crate::dialog_turn::SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY.to_owned(),
+                    "true".to_owned(),
+                ),
+            ]),
             ..TaskQueueJobEvent::default()
         },
         now - TimeDuration::seconds(70),
@@ -5317,7 +5323,7 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
 async fn session_send_message_tool_respects_cap_and_dedup() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
-    queue.assign(
+    let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
         new_dialog_job_at(dialog_params("расскажи длинно"), now),
     );
@@ -5377,6 +5383,21 @@ async fn session_send_message_tool_respects_cap_and_dedup() -> Result<(), Box<dy
     assert!(transcript_json.contains("message_limit"));
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].sent_message_parts, Some(5));
+    let record = queue.record(job_id).expect("job record");
+    assert!(
+        record
+            .events
+            .iter()
+            .filter(|event| event.stage == crate::dialog_turn::SESSION_TOOL_STAGE)
+            .all(|event| {
+                event
+                    .data
+                    .get("budget_extension_granted")
+                    .map(String::as_str)
+                    == Some("false")
+            }),
+        "send_message and cached results must not earn retry budget"
+    );
     Ok(())
 }
 
@@ -5449,7 +5470,7 @@ async fn session_intermediate_without_final_answer_is_terminal_failure()
 async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
-    queue.assign(
+    let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
         new_dialog_job_at(dialog_params("смешно же"), now),
     );
@@ -5509,6 +5530,21 @@ async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Bo
     );
     assert!(transcript_json.contains("emoji_not_allowed"));
     assert!(transcript_json.contains("already_reacted"));
+    let record = queue.record(job_id).expect("job record");
+    assert!(
+        record
+            .events
+            .iter()
+            .filter(|event| event.stage == crate::dialog_turn::SESSION_TOOL_STAGE)
+            .all(|event| {
+                event
+                    .data
+                    .get("budget_extension_granted")
+                    .map(String::as_str)
+                    == Some("false")
+            }),
+        "react_to_message results must not earn retry budget"
+    );
     Ok(())
 }
 

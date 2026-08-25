@@ -3508,13 +3508,21 @@ mod tests {
 
     #[test]
     fn finalize_dialog_reply_keeps_distinct_links_from_same_domain() {
-        let raw = r#"1. Ереван — столица. [Ссылка](https://en.wikipedia.org/wiki/Yerevan)
+        let markdown = r#"1. Ереван — столица. [Ссылка](https://en.wikipedia.org/wiki/Yerevan)
 2. Севан — озеро. [Ссылка](https://en.wikipedia.org/wiki/Lake_Sevan)
 3. Татев — монастырь. [Ссылка](https://en.wikipedia.org/wiki/Tatev_Monastery)"#;
 
         assert_eq!(
-            finalize_dialog_reply(raw),
-            DialogReplyOutcome::Reply(raw.to_owned())
+            finalize_dialog_reply(markdown),
+            DialogReplyOutcome::Reply(markdown.to_owned())
+        );
+
+        let html = r#"1. Ереван — столица. <a href="https://en.wikipedia.org/wiki/Yerevan">Ссылка</a>
+2. Севан — озеро. <a href="https://en.wikipedia.org/wiki/Lake_Sevan">Ссылка</a>
+3. Татев — монастырь. <a href="https://en.wikipedia.org/wiki/Tatev_Monastery">Ссылка</a>"#;
+        assert_eq!(
+            finalize_dialog_reply(html),
+            DialogReplyOutcome::Reply(html.to_owned())
         );
     }
 

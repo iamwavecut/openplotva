@@ -42,8 +42,8 @@ mod session;
 mod signal;
 
 pub use budget::{
-    SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget,
-    current_turn_deadline, turn_started_at,
+    SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY, SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE,
+    TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
 };
 pub use engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};

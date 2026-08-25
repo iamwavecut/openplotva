@@ -37,7 +37,10 @@ use openplotva_taskman::TaskQueueJobEvent;
 use serde_json::Value;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::budget::{SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE, TurnBudget};
+use super::budget::{
+    SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY, SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE,
+    TurnBudget,
+};
 use super::engine::{ANSWER_QUEUED_STAGE, ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use crate::dialog_jobs::{
@@ -1024,9 +1027,11 @@ where
                 &call.step,
                 &media_reference_aliases,
             );
+            let mut budget_extension_granted = false;
             let (result, tool_duration_ms, executed) = if let Some(prepared) =
                 parallel_media_results.remove(&call_index)
             {
+                budget_extension_granted = true;
                 (prepared.result, prepared.duration_ms, true)
             } else if let Some((original_call_id, cached)) = tool_result_cache.get(&semantic_key) {
                 (
@@ -1047,6 +1052,7 @@ where
                         draws_scheduled: &mut draws_scheduled,
                         songs_scheduled: &mut songs_scheduled,
                         reacted_message_ids: &mut reacted_message_ids,
+                        budget_extension_granted: &mut budget_extension_granted,
                         processing_started,
                         now: ctx.now,
                     },
@@ -1085,6 +1091,7 @@ where
                 &call.step.step,
                 &result.status,
                 tool_duration_ms,
+                budget_extension_granted,
                 ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default(),
             )
             .await;
@@ -1525,6 +1532,7 @@ struct SessionToolExecution<'a, 'b> {
     draws_scheduled: &'a mut i32,
     songs_scheduled: &'a mut i32,
     reacted_message_ids: &'a mut BTreeSet<i64>,
+    budget_extension_granted: &'a mut bool,
     processing_started: tokio::time::Instant,
     now: OffsetDateTime,
 }
@@ -1608,6 +1616,7 @@ where
         }
         _ => {
             exec.budget.extend_for_tool_start();
+            *exec.budget_extension_granted = true;
             let round_now = exec.now
                 + TimeDuration::try_from(exec.processing_started.elapsed()).unwrap_or_default();
             let slice = session_tool_slice(exec.budget, exec.cfg, round_now);
@@ -1854,6 +1863,7 @@ async fn append_session_tool_event<Queue>(
     name: &str,
     status: &str,
     duration_ms: u128,
+    budget_extension_granted: bool,
     at: OffsetDateTime,
 ) where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
@@ -1862,6 +1872,10 @@ async fn append_session_tool_event<Queue>(
     data.insert("tool".to_owned(), name.to_owned());
     data.insert("status".to_owned(), status.to_owned());
     data.insert("duration_ms".to_owned(), duration_ms.to_string());
+    data.insert(
+        SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY.to_owned(),
+        budget_extension_granted.to_string(),
+    );
     let event = TaskQueueJobEvent {
         level: "info".to_owned(),
         stage: SESSION_TOOL_STAGE.to_owned(),
