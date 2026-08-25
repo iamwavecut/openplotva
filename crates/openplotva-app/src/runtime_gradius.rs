@@ -44,7 +44,7 @@ impl PostgresRuntimeGradiusAuditReader {
                               'duration_ms', c.duration_ms,
                               'outcome', c.outcome,
                               'error', c.error,
-                              'created_at', to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                              'created_at', to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
                           ) ORDER BY c.attempt_generation, c.sequence)
                           FROM gradius_api_calls c
                           WHERE c.opportunity_id = o.id),
@@ -403,6 +403,11 @@ mod tests {
             1
         );
         assert_eq!(opportunities["items"][0]["api_calls"][0]["role"], "user");
+        let api_call_created_at = opportunities["items"][0]["api_calls"][0]["created_at"]
+            .as_str()
+            .expect("API call timestamp");
+        OffsetDateTime::parse(api_call_created_at, &Rfc3339)
+            .expect("API call timestamp must be RFC 3339");
         assert_eq!(opportunities["items"][0]["telegram_html"], "<b>Ad</b>");
 
         let summary = reader

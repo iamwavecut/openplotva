@@ -43,7 +43,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "admin.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/admin.css"),
-        sha256: "0f5a60e315a405edf60689a941fb0e25e130a21a268f2b6267354820e1b8ffc1",
+        sha256: "6b5634c713216fd7e0691454102469c80bf7d65e3c1cbfb8d5cc5cf2bf41325d",
     },
     StaticAsset {
         path: "components.css",
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "a02501d65391e84d43cad8aa678dac148351dca1878bc9daddf144855876db61",
+        sha256: "ce681e246173cd31bd702b7abc51cd2b9b551149557ad1fdcb7a1cdf4f2d0f4f",
     },
     StaticAsset {
         path: "login.html",
@@ -608,6 +608,8 @@ mod tests {
             "id=\"gradius-delivery\"",
             "Provider markdown",
             "Telegram HTML",
+            "Dialogue sent to Gradius",
+            "Privacy-filtered messages in the exact order sent to the provider.",
             "Raw JSON",
             "Returned, not delivered",
             "Click reporting is provider-only",
@@ -618,6 +620,9 @@ mod tests {
             "PL.error(list",
             "PL.empty(host",
             "function gradiusCopyRaw(",
+            "function gradiusDialogueContext(item)",
+            "call.request_body?.text",
+            "gradiusDialogueContext(item)",
             "if (item.delivered_at)",
             "if (item.delivery_failed_at)",
         ] {
