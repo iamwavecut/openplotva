@@ -42,8 +42,8 @@ mod session;
 mod signal;
 
 pub use budget::{
-    SessionBudget, TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline,
-    turn_started_at,
+    SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY, SESSION_TOOL_STAGE, SessionBudget, TURN_DEADLINE,
+    TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
 };
 pub use engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};
@@ -74,8 +74,8 @@ pub use outcome::{
 };
 pub use session::{
     CapturedSessionOutput, SESSION_BATCH_STAGE, SESSION_INTERMEDIATE_QUEUED_STAGE,
-    SESSION_ITERATION_STAGE, SESSION_MESSAGE_SENT_STAGE, SESSION_TOOL_STAGE, SessionReactionFuture,
-    SessionReactor, SessionTurnConfig, SessionWorkerWiring, run_captured_session,
+    SESSION_ITERATION_STAGE, SESSION_MESSAGE_SENT_STAGE, SessionReactionFuture, SessionReactor,
+    SessionTurnConfig, SessionWorkerWiring, run_captured_session,
 };
 pub use signal::{
     DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DEFAULT_DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS,

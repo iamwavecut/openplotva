@@ -12,6 +12,12 @@ use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_kn
 /// Job event stage marking when a job first began processing.
 pub const TURN_STARTED_STAGE: &str = "turn_started";
 
+/// Job event stage recorded for each executed session tool.
+pub const SESSION_TOOL_STAGE: &str = "session_tool";
+
+/// Durable tool-event flag indicating that this call extended the session budget.
+pub const SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY: &str = "budget_extension_granted";
+
 tokio::task_local! {
     /// Wall-clock deadline for the current turn's provider work, set by the
     /// engine around each chat step and read by `RouterChatProvider`
@@ -57,6 +63,37 @@ impl TurnBudget {
         }
     }
 
+    /// Restore the extension earned by successful toolbox calls recorded by
+    /// earlier attempts of the same session.
+    #[must_use]
+    pub fn from_session_events(
+        events: &[TaskQueueJobEvent],
+        budget_secs: i32,
+        per_tool_extension_secs: i32,
+        hard_cap_secs: i32,
+        now: OffsetDateTime,
+    ) -> Self {
+        let mut budget = Self::from_events(events, budget_secs, now);
+        let successful_tools = events
+            .iter()
+            .filter(|event| event.stage == SESSION_TOOL_STAGE)
+            .filter(|event| {
+                event.data.get("status").is_some_and(|status| {
+                    status.eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
+                }) && event
+                    .data
+                    .get(SESSION_TOOL_BUDGET_EXTENSION_GRANTED_KEY)
+                    .is_some_and(|granted| granted.eq_ignore_ascii_case("true"))
+            })
+            .count() as i64;
+        let extension = TimeDuration::seconds(
+            i64::from(per_tool_extension_secs.max(0)).saturating_mul(successful_tools),
+        );
+        let hard_cap = TimeDuration::seconds(i64::from(hard_cap_secs.max(1))).max(budget.limit);
+        budget.limit = (budget.limit + extension).min(hard_cap);
+        budget
+    }
+
     #[must_use]
     pub fn deadline(&self) -> OffsetDateTime {
         self.anchor + self.limit
@@ -75,11 +112,11 @@ impl TurnBudget {
     }
 }
 
-/// Session budget: the plain turn budget plus a bounded extension per started
-/// toolbox call, hard-capped so a session can never outlive
-/// `DIALOG_SESSION_HARD_CAP_SECS`. Extensions are in-memory only — a crash
-/// re-run recomputes from the durable anchor with the base budget, which is
-/// strictly safer (and the sent-marker resolves re-runs without replay anyway).
+/// Session budget: the restored turn budget plus a bounded extension per
+/// started toolbox call, hard-capped so a session can never outlive
+/// `DIALOG_SESSION_HARD_CAP_SECS`. Successful calls are recorded as durable
+/// events and restored by [`TurnBudget::from_session_events`] on a later
+/// attempt; failed or interrupted calls keep only their in-memory extension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionBudget {
     base: TurnBudget,
@@ -181,6 +218,38 @@ mod tests {
             budget.elapsed(now - TimeDuration::seconds(5)),
             TimeDuration::ZERO
         );
+    }
+
+    #[test]
+    fn turn_budget_restores_successful_tool_extensions_across_attempts() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
+        let mut successful = event("session_tool", "2026-05-19T12:28:45Z");
+        successful.data.insert("status".to_owned(), "ok".to_owned());
+        successful
+            .data
+            .insert("budget_extension_granted".to_owned(), "true".to_owned());
+        let mut cached = event("session_tool", "2026-05-19T12:29:00Z");
+        cached.data.insert("status".to_owned(), "ok".to_owned());
+        cached
+            .data
+            .insert("budget_extension_granted".to_owned(), "false".to_owned());
+        let mut failed = event("session_tool", "2026-05-19T12:29:15Z");
+        failed.data.insert("status".to_owned(), "failed".to_owned());
+        failed
+            .data
+            .insert("budget_extension_granted".to_owned(), "true".to_owned());
+        let events = vec![
+            event(TURN_STARTED_STAGE, "2026-05-19T12:28:30Z"),
+            successful.clone(),
+            cached,
+            failed,
+            successful,
+        ];
+
+        let budget = TurnBudget::from_session_events(&events, 120, 60, 300, now);
+
+        assert_eq!(budget.limit, TimeDuration::seconds(240));
+        assert_eq!(budget.remaining(now), TimeDuration::seconds(150));
     }
 
     #[test]
