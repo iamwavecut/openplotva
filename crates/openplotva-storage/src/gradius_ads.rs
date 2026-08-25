@@ -580,10 +580,12 @@ impl PostgresGradiusAdStore {
     ) -> Result<(), GradiusAdStoreError> {
         let result = sqlx::query(
             "UPDATE gradius_ad_opportunities SET delivery_state = 'queued', \
-                 outbox_batch_id = $2, queued_at = COALESCE(queued_at, $3), \
+                 outbox_batch_id = $2, \
+                 queued_at = CASE WHEN outbox_batch_id IS DISTINCT FROM $2 \
+                     THEN $3 ELSE COALESCE(queued_at, $3) END, \
                  delivery_failed_at = NULL, delivery_error = NULL, updated_at = $3 \
              WHERE id = $1 AND outcome = 'ad' AND delivery_state IN ('prepared', 'queued', 'failed') \
-               AND (outbox_batch_id IS NULL OR outbox_batch_id = $2)",
+               AND (outbox_batch_id IS NULL OR outbox_batch_id = $2 OR delivery_state = 'failed')",
         )
         .bind(opportunity_id)
         .bind(batch_id)
@@ -1299,10 +1301,25 @@ mod tests {
             )
         );
         store
-            .mark_queued(opportunity_id, "dialog-answer:v1:test", at(10_005))
+            .mark_queued(opportunity_id, "dialog-answer:v1:failed", at(10_005))
             .await?;
         store
-            .mark_delivered_by_batch("dialog-answer:v1:test", at(10_006))
+            .mark_delivery_failed_by_batch(
+                "dialog-answer:v1:failed",
+                "telegram rejected batch",
+                at(10_006),
+            )
+            .await?;
+        store
+            .mark_queued(opportunity_id, "dialog-answer:v1:retry", at(10_007))
+            .await?;
+        assert!(
+            !store
+                .mark_delivered_by_batch("dialog-answer:v1:failed", at(10_008))
+                .await?
+        );
+        store
+            .mark_delivered_by_batch("dialog-answer:v1:retry", at(10_008))
             .await?;
         let shown_after_delivery: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM gradius_ad_opportunities WHERE user_id = $1 AND shown_at IS NOT NULL",
@@ -1316,7 +1333,7 @@ mod tests {
             GradiusAdReservation::Replay {
                 opportunity_id,
                 ad: GradiusStoredAd {
-                    shown_at: Some(at(10_006)),
+                    shown_at: Some(at(10_008)),
                     ..stored
                 },
             }
