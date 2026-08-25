@@ -25,6 +25,8 @@ CREATE TABLE gradius_ad_opportunities (
     ),
     ineligibility_reason TEXT,
     attempt_reserved_at TIMESTAMPTZ,
+    attempt_key TEXT NOT NULL CHECK (btrim(attempt_key) <> ''),
+    attempt_generation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_generation >= 0),
     provider_outcome TEXT CHECK (
         provider_outcome IS NULL OR provider_outcome IN ('no_ad', 'error', 'ad')
     ),
@@ -86,6 +88,7 @@ CREATE INDEX gradius_ad_opportunities_reporting_idx
 CREATE TABLE gradius_api_calls (
     id BIGSERIAL PRIMARY KEY,
     opportunity_id BIGINT NOT NULL REFERENCES gradius_ad_opportunities(id) ON DELETE CASCADE,
+    attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
     sequence SMALLINT NOT NULL CHECK (sequence > 0),
     role TEXT,
     synthetic_chat_id TEXT NOT NULL CHECK (btrim(synthetic_chat_id) <> ''),
@@ -100,7 +103,7 @@ CREATE TABLE gradius_api_calls (
     outcome TEXT NOT NULL CHECK (btrim(outcome) <> ''),
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (opportunity_id, sequence)
+    UNIQUE (opportunity_id, attempt_generation, sequence)
 );
 
 ALTER TABLE gradius_api_calls
@@ -109,4 +112,4 @@ ALTER TABLE gradius_api_calls
     ALTER COLUMN response_json SET COMPRESSION lz4;
 
 CREATE INDEX gradius_api_calls_opportunity_idx
-    ON gradius_api_calls (opportunity_id, sequence);
+    ON gradius_api_calls (opportunity_id, attempt_generation, sequence);

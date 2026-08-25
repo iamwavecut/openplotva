@@ -6124,7 +6124,7 @@
             event('Opportunity', item.completed_at, `${item.completed_answers} completed answers`, 'neutral');
             for (const call of (item.api_calls || [])) {
                 event(
-                    `${call.sequence}. Gradius · ${call.role || 'call'}`,
+                    `Attempt ${call.attempt_generation || 1}.${call.sequence} · Gradius · ${call.role || 'call'}`,
                     call.created_at,
                     `${call.outcome} · ${call.response_status || 'transport'} · ${call.duration_ms} ms`,
                     gradiusOutcomeTone(call.outcome),
@@ -6161,7 +6161,7 @@
             if (title) title.textContent = `Opportunity #${item.id}`;
             const meta = PL.el('div', { class: 'llmd-meta' });
             const fields = [
-                ['integration', item.integration_kind], ['outcome', item.outcome], ['delivery', item.delivery_state],
+                ['integration', item.integration_kind], ['attempt', item.attempt_generation], ['outcome', item.outcome], ['delivery', item.delivery_state],
                 ['user', item.user_id], ['chat', item.chat_id], ['thread', item.thread_id],
                 ['job', item.dialog_job_id], ['model', item.model_version], ['show price', item.show_price],
                 ['click price', item.click_price], ['synthetic chat', item.api_calls?.[0]?.synthetic_chat_id],
@@ -6181,13 +6181,6 @@
                 );
             }
             if (item.telegram_outbox_batch_id) actions.append(PL.badge(`outbox ${item.telegram_outbox_batch_id}`, 'info'));
-            if (item.telegram_outbox_batch_id && item.dialog_job_id) {
-                actions.append(PL.el('pl-button', {
-                    variant: 'outline',
-                    size: 'sm',
-                    dataset: { action: 'gradiusOpenOutbox', args: JSON.stringify([item.dialog_job_id]) },
-                }, 'Open Telegram outbox'));
-            }
             const raw = PL.el('div', { class: 'card card-inset gradius-raw' });
             raw.append(PL.el('div', { class: 'card-header' }, 'Raw JSON'), PL.el('div', { class: 'card-body' }, llmdJSONPane(item)));
             body.replaceChildren(
@@ -6236,11 +6229,6 @@
         }
 
         function gradiusOpenTask(jobID) {
-            switchTab('taskman');
-            taskmanLoadJob(jobID);
-        }
-
-        function gradiusOpenOutbox(jobID) {
             switchTab('taskman');
             taskmanLoadJob(jobID);
         }

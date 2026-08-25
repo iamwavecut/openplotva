@@ -3714,8 +3714,8 @@ struct GradiusAppenderStub {
     requests: Arc<Mutex<Vec<crate::gradius_ads::GradiusAdAppendRequest>>>,
     render_errors: Arc<Mutex<Vec<(i64, String)>>>,
     queued: Arc<Mutex<Vec<(i64, String)>>>,
-    delivered_jobs: Arc<Mutex<Vec<i64>>>,
-    failed_delivery_jobs: Arc<Mutex<Vec<(i64, String)>>>,
+    delivered_batches: Arc<Mutex<Vec<String>>>,
+    failed_delivery_opportunities: Arc<Mutex<Vec<(i64, String)>>>,
 }
 
 const TEST_GRADIUS_TAIL: &str = "<b>Реклама</b> <a href=\"https://ads.example/r/42\">перейти</a>\n\n<tg-spoiler>В <a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a> рекламы нет</tg-spoiler>";
@@ -3775,27 +3775,28 @@ impl crate::gradius_ads::GradiusAdAppender for GradiusAppenderStub {
 
     fn mark_delivered<'a>(
         &'a self,
-        dialog_job_id: i64,
+        _opportunity_id: i64,
+        batch_id: &'a str,
     ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
-            self.delivered_jobs
+            self.delivered_batches
                 .lock()
-                .expect("Gradius delivered jobs")
-                .push(dialog_job_id);
+                .expect("Gradius delivered batches")
+                .push(batch_id.to_owned());
             Ok(())
         })
     }
 
     fn mark_delivery_failed<'a>(
         &'a self,
-        dialog_job_id: i64,
+        opportunity_id: i64,
         error: &'a str,
     ) -> crate::gradius_ads::GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
-            self.failed_delivery_jobs
+            self.failed_delivery_opportunities
                 .lock()
-                .expect("Gradius failed delivery jobs")
-                .push((dialog_job_id, error.to_owned()));
+                .expect("Gradius failed delivery opportunities")
+                .push((opportunity_id, error.to_owned()));
             Ok(())
         })
     }
@@ -3863,7 +3864,7 @@ async fn session_marks_prepared_gradius_ad_failed_when_answer_enqueue_fails()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
-    let job_id = queue.assign(
+    let _job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
         new_dialog_job_at(dialog_params("покажи рекламу"), now),
     );
@@ -3892,11 +3893,11 @@ async fn session_marks_prepared_gradius_ad_failed_when_answer_enqueue_fails()
     assert_eq!(report.send_error.as_deref(), Some("send down"));
     assert_eq!(
         appender
-            .failed_delivery_jobs
+            .failed_delivery_opportunities
             .lock()
-            .expect("Gradius failed delivery jobs")
+            .expect("Gradius failed delivery opportunities")
             .as_slice(),
-        &[(job_id, "send down".to_owned())]
+        &[(91, "send down".to_owned())]
     );
     Ok(())
 }

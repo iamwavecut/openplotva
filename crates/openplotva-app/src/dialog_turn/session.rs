@@ -762,6 +762,10 @@ where
             if let Some(gradius) = cfg.gradius {
                 let request = crate::gradius_ads::GradiusAdAppendRequest {
                     dialog_job_id: ctx.item_id,
+                    attempt_key: format!(
+                        "dialog-claim:{}",
+                        ctx.item.claim_started_at.unix_timestamp_nanos()
+                    ),
                     chat_id: active_params.chat_id,
                     thread_id: active_params.thread_id,
                     user_id: active_params.user_id,
@@ -852,7 +856,9 @@ where
                     );
                 }
                 if receipt.delivery_complete()
-                    && let Err(error) = gradius.mark_delivered(ctx.item_id).await
+                    && let Err(error) = gradius
+                        .mark_delivered(opportunity_id, &receipt.batch_id)
+                        .await
                 {
                     tracing::warn!(
                         opportunity_id,
@@ -870,7 +876,10 @@ where
                 cfg.gradius,
             ) {
                 let send_error = send_error.to_string();
-                if let Err(error) = gradius.mark_delivery_failed(ctx.item_id, &send_error).await {
+                if let Err(error) = gradius
+                    .mark_delivery_failed(opportunity_id, &send_error)
+                    .await
+                {
                     tracing::warn!(
                         opportunity_id,
                         job_id = ctx.item_id,

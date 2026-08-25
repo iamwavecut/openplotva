@@ -300,7 +300,7 @@ impl fmt::Debug for ReqwestGradiusTransport {
 impl GradiusTransport for ReqwestGradiusTransport {
     fn post_json<'a>(&'a self, request: GradiusHttpRequest) -> GradiusTransportFuture<'a> {
         Box::pin(async move {
-            let response = self
+            let mut response = self
                 .client
                 .post(request.endpoint)
                 .header("Auth", request.api_key)
@@ -311,10 +311,28 @@ impl GradiusTransport for ReqwestGradiusTransport {
                 .send()
                 .await?;
             let status = response.status().as_u16();
-            let body = response.bytes().await?.to_vec();
+            let mut body = Vec::with_capacity(
+                response
+                    .content_length()
+                    .and_then(|length| usize::try_from(length).ok())
+                    .unwrap_or_default()
+                    .min(GRADIUS_RAW_BODY_MAX_BYTES + 1),
+            );
+            while let Some(chunk) = response.chunk().await? {
+                if append_bounded_response_chunk(&mut body, &chunk) {
+                    break;
+                }
+            }
             Ok(GradiusHttpResponse { status, body })
         })
     }
+}
+
+fn append_bounded_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let maximum_captured = GRADIUS_RAW_BODY_MAX_BYTES + 1;
+    let remaining = maximum_captured.saturating_sub(body.len());
+    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    body.len() == maximum_captured
 }
 
 #[derive(Debug, Error)]
@@ -1017,6 +1035,15 @@ mod tests {
             GRADIUS_RAW_BODY_MAX_BYTES
         );
         assert!(exchange.response_truncated);
+    }
+
+    #[test]
+    fn response_transport_stops_buffering_after_the_audit_limit() {
+        let mut body = vec![b'a'; GRADIUS_RAW_BODY_MAX_BYTES - 1];
+
+        assert!(append_bounded_response_chunk(&mut body, b"bcdef"));
+        assert_eq!(body.len(), GRADIUS_RAW_BODY_MAX_BYTES + 1);
+        assert_eq!(&body[GRADIUS_RAW_BODY_MAX_BYTES - 1..], b"bc");
     }
 
     #[test]

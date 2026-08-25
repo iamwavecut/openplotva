@@ -18,6 +18,8 @@ pub struct DialogJobWorkItem {
     pub id: i64,
     pub job: StatelessJobItem,
     pub events: Vec<TaskQueueJobEvent>,
+    /// Queue-claim identity used to fence retryable external side effects.
+    pub claim_started_at: OffsetDateTime,
     /// Telegram updates whose materialized handler scheduled this job.
     pub source_update_ids: Vec<i64>,
     /// Newest causation update; older retries must not replace this input.
@@ -174,6 +176,7 @@ fn dialog_work_item_from_taskman(
         id: item.id,
         job: item.job,
         events: item.events,
+        claim_started_at: item.claim_started_at,
         source_update_ids,
         latest_update_id,
     }

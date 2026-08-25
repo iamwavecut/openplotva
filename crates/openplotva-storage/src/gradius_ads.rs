@@ -107,6 +107,7 @@ impl GradiusAdPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GradiusAdOpportunityInput {
     pub opportunity_key: String,
+    pub attempt_key: String,
     pub dialog_job_id: Option<i64>,
     pub integration_kind: String,
     pub user_id: i64,
@@ -131,6 +132,7 @@ pub struct GradiusStoredAd {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradiusApiCallRecord {
     pub opportunity_id: i64,
+    pub attempt_generation: i32,
     pub sequence: i16,
     pub role: Option<String>,
     pub synthetic_chat_id: String,
@@ -153,6 +155,7 @@ pub enum GradiusAdReservation {
         opportunity_id: i64,
         interaction_started_at: OffsetDateTime,
         completed_answers: i32,
+        attempt_generation: i32,
     },
     Ineligible {
         opportunity_id: i64,
@@ -233,15 +236,42 @@ impl PostgresGradiusAdStore {
 
         if let Some(row) = sqlx::query(
             "SELECT id, opportunity_key, dialog_job_id, integration_kind, user_id, chat_id, \
-                    thread_id, outcome, ineligibility_reason, selected_placement, ad_markdown, \
-                    rendered_html, insert_index, show_price, click_price, prepared_at, shown_at \
+                    thread_id, interaction_started_at, completed_answers, outcome, \
+                    ineligibility_reason, selected_placement, ad_markdown, \
+                    rendered_html, insert_index, show_price, click_price, prepared_at, shown_at, \
+                    attempt_key, attempt_generation \
              FROM gradius_ad_opportunities WHERE opportunity_key = $1",
         )
         .bind(&input.opportunity_key)
         .fetch_optional(&mut *transaction)
         .await?
         {
-            let reservation = reservation_from_existing(&row, &input)?;
+            validate_existing_identity(&row, &input)?;
+            let opportunity_id: i64 = row.get("id");
+            if row.get::<String, _>("outcome") == "reserved" {
+                if row.get::<String, _>("attempt_key") == input.attempt_key {
+                    transaction.commit().await?;
+                    return Ok(GradiusAdReservation::Pending { opportunity_id });
+                }
+                let attempt_generation: i32 = sqlx::query_scalar(
+                    "UPDATE gradius_ad_opportunities SET attempt_reserved_at = $2, \
+                         attempt_key = $3, attempt_generation = attempt_generation + 1, updated_at = now() \
+                     WHERE id = $1 AND outcome = 'reserved' RETURNING attempt_generation",
+                )
+                .bind(opportunity_id)
+                .bind(input.completed_at)
+                .bind(&input.attempt_key)
+                .fetch_one(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                return Ok(GradiusAdReservation::Reserved {
+                    opportunity_id,
+                    interaction_started_at: row.get("interaction_started_at"),
+                    completed_answers: row.get("completed_answers"),
+                    attempt_generation,
+                });
+            }
+            let reservation = reservation_from_existing(&row)?;
             transaction.commit().await?;
             return Ok(reservation);
         }
@@ -295,8 +325,8 @@ impl PostgresGradiusAdStore {
             "INSERT INTO gradius_ad_opportunities (\
                  opportunity_key, source_kind, dialog_job_id, integration_kind, user_id, chat_id, \
                  thread_id, model_version, interaction_started_at, completed_at, completed_answers, outcome, \
-                 ineligibility_reason, attempt_reserved_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+                 ineligibility_reason, attempt_reserved_at, attempt_key, attempt_generation\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
         )
         .bind(&input.opportunity_key)
         .bind(source_kind(&input.opportunity_key))
@@ -312,6 +342,8 @@ impl PostgresGradiusAdStore {
         .bind(outcome)
         .bind(reason)
         .bind(attempt_reserved_at)
+        .bind(&input.attempt_key)
+        .bind(i32::from(attempt_reserved_at.is_some()))
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -325,6 +357,7 @@ impl PostgresGradiusAdStore {
                 opportunity_id,
                 interaction_started_at: interaction.started_at,
                 completed_answers: interaction.completed_answers,
+                attempt_generation: 1,
             },
         })
     }
@@ -336,15 +369,19 @@ impl PostgresGradiusAdStore {
         if call.sequence <= 0 {
             return Err(GradiusAdStoreError::InvalidInput("sequence"));
         }
-        sqlx::query(
+        let opportunity_id = call.opportunity_id;
+        let result = sqlx::query(
             "INSERT INTO gradius_api_calls (\
-                 opportunity_id, sequence, role, synthetic_chat_id, synthetic_user_id, endpoint, \
+                 opportunity_id, attempt_generation, sequence, role, synthetic_chat_id, synthetic_user_id, endpoint, \
                  request_body, response_status, response_body, response_json, response_truncated, \
                  duration_ms, outcome, error, created_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
-             ON CONFLICT (opportunity_id, sequence) DO NOTHING",
+             ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16 \
+             FROM gradius_ad_opportunities \
+             WHERE id = $1 AND outcome = 'reserved' AND attempt_generation = $2 \
+             ON CONFLICT (opportunity_id, attempt_generation, sequence) DO NOTHING",
         )
         .bind(call.opportunity_id)
+        .bind(call.attempt_generation)
         .bind(call.sequence)
         .bind(call.role)
         .bind(call.synthetic_chat_id)
@@ -361,12 +398,17 @@ impl PostgresGradiusAdStore {
         .bind(call.created_at)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        if result.rows_affected() > 0 {
+            Ok(())
+        } else {
+            Err(GradiusAdStoreError::InvalidTransition { opportunity_id })
+        }
     }
 
     pub async fn finish_ad(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         ad: GradiusStoredAd,
     ) -> Result<GradiusStoredAd, GradiusAdStoreError> {
         if ad.markdown.trim().is_empty()
@@ -380,7 +422,7 @@ impl PostgresGradiusAdStore {
                  provider_completed_at = $2, selected_placement = $3, ad_markdown = $4, \
                  rendered_html = $5, insert_index = $6, show_price = $7, click_price = $8, \
                  delivery_state = 'prepared', prepared_at = $2, updated_at = $2 \
-             WHERE id = $1 AND outcome = 'reserved' \
+             WHERE id = $1 AND outcome = 'reserved' AND attempt_generation = $9 \
              RETURNING selected_placement, ad_markdown, rendered_html, insert_index, show_price, \
                        click_price, prepared_at, shown_at",
         )
@@ -392,6 +434,7 @@ impl PostgresGradiusAdStore {
         .bind(ad.insert_index)
         .bind(ad.show_price)
         .bind(ad.click_price)
+        .bind(attempt_generation)
         .fetch_optional(&self.pool)
         .await?;
         if let Some(row) = row {
@@ -400,9 +443,10 @@ impl PostgresGradiusAdStore {
         let existing = sqlx::query(
             "SELECT outcome, selected_placement, ad_markdown, rendered_html, insert_index, \
                     show_price, click_price, prepared_at, shown_at \
-             FROM gradius_ad_opportunities WHERE id = $1",
+             FROM gradius_ad_opportunities WHERE id = $1 AND attempt_generation = $2",
         )
         .bind(opportunity_id)
+        .bind(attempt_generation)
         .fetch_optional(&self.pool)
         .await?;
         match existing {
@@ -416,19 +460,28 @@ impl PostgresGradiusAdStore {
     pub async fn finish_no_ad(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         completed_at: OffsetDateTime,
     ) -> Result<(), GradiusAdStoreError> {
-        self.finish_without_ad(opportunity_id, "no_ad", Some("no_ad"), completed_at)
-            .await
+        self.finish_without_ad(
+            opportunity_id,
+            attempt_generation,
+            "no_ad",
+            Some("no_ad"),
+            completed_at,
+        )
+        .await
     }
 
     pub async fn finish_provider_error(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         completed_at: OffsetDateTime,
     ) -> Result<(), GradiusAdStoreError> {
         self.finish_without_ad(
             opportunity_id,
+            attempt_generation,
             "provider_error",
             Some("error"),
             completed_at,
@@ -439,18 +492,59 @@ impl PostgresGradiusAdStore {
     pub async fn finish_privacy_error(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         completed_at: OffsetDateTime,
     ) -> Result<(), GradiusAdStoreError> {
-        self.finish_without_ad(opportunity_id, "privacy_error", None, completed_at)
-            .await
+        self.finish_without_ad(
+            opportunity_id,
+            attempt_generation,
+            "privacy_error",
+            None,
+            completed_at,
+        )
+        .await
     }
 
     pub async fn finish_unsupported_surface(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         completed_at: OffsetDateTime,
     ) -> Result<(), GradiusAdStoreError> {
-        self.finish_without_ad(opportunity_id, "unsupported_surface", None, completed_at)
+        self.finish_without_ad(
+            opportunity_id,
+            attempt_generation,
+            "unsupported_surface",
+            None,
+            completed_at,
+        )
+        .await
+    }
+
+    pub async fn finish_render_error(
+        &self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+        error: &str,
+        completed_at: OffsetDateTime,
+    ) -> Result<(), GradiusAdStoreError> {
+        let result = sqlx::query(
+            "UPDATE gradius_ad_opportunities SET outcome = 'render_error', \
+                 provider_outcome = 'ad', provider_completed_at = $4, \
+                 delivery_state = 'failed', delivery_failed_at = $4, \
+                 delivery_error = left($3, 2048), updated_at = $4 \
+             WHERE id = $1 AND attempt_generation = $2 AND outcome = 'reserved'",
+        )
+        .bind(opportunity_id)
+        .bind(attempt_generation)
+        .bind(error)
+        .bind(completed_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            return Ok(());
+        }
+        self.accept_existing_state(opportunity_id, attempt_generation, &["render_error"])
             .await
     }
 
@@ -462,12 +556,9 @@ impl PostgresGradiusAdStore {
     ) -> Result<(), GradiusAdStoreError> {
         let result = sqlx::query(
             "UPDATE gradius_ad_opportunities SET outcome = 'render_error', \
-                 provider_outcome = COALESCE(provider_outcome, 'ad'), \
-                 provider_completed_at = COALESCE(provider_completed_at, $3), \
                  delivery_state = 'failed', delivery_failed_at = $3, \
                  delivery_error = left($2, 2048), updated_at = $3 \
-             WHERE id = $1 AND (outcome = 'reserved' \
-                 OR (outcome = 'ad' AND delivery_state = 'prepared'))",
+             WHERE id = $1 AND outcome = 'ad' AND delivery_state = 'prepared'",
         )
         .bind(opportunity_id)
         .bind(error)
@@ -477,7 +568,7 @@ impl PostgresGradiusAdStore {
         if result.rows_affected() > 0 {
             return Ok(());
         }
-        self.accept_existing_state(opportunity_id, &["render_error"])
+        self.accept_existing_state_without_attempt(opportunity_id, &["render_error"])
             .await
     }
 
@@ -522,28 +613,52 @@ impl PostgresGradiusAdStore {
         }
     }
 
-    pub async fn mark_delivered_by_job(
+    pub async fn mark_delivered_by_batch(
         &self,
-        dialog_job_id: i64,
+        batch_id: &str,
         delivered_at: OffsetDateTime,
     ) -> Result<bool, GradiusAdStoreError> {
         let result = sqlx::query(
             "UPDATE gradius_ad_opportunities SET delivery_state = 'delivered', \
                  delivered_at = COALESCE(delivered_at, $2), shown_at = COALESCE(shown_at, $2), \
                  delivery_failed_at = NULL, delivery_error = NULL, updated_at = $2 \
-             WHERE dialog_job_id = $1 AND outcome = 'ad' \
-               AND delivery_state IN ('prepared', 'queued', 'delivered')",
+             WHERE outbox_batch_id = $1 AND outcome = 'ad' \
+               AND delivery_state IN ('queued', 'delivered')",
         )
-        .bind(dialog_job_id)
+        .bind(batch_id)
         .bind(delivered_at)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn mark_delivery_failed_by_job(
+    pub async fn reconcile_delivered(
         &self,
-        dialog_job_id: i64,
+        opportunity_id: i64,
+        batch_id: &str,
+        delivered_at: OffsetDateTime,
+    ) -> Result<bool, GradiusAdStoreError> {
+        let result = sqlx::query(
+            "UPDATE gradius_ad_opportunities SET delivery_state = 'delivered', \
+                 outbox_batch_id = COALESCE(outbox_batch_id, $2), \
+                 queued_at = COALESCE(queued_at, $3), \
+                 delivered_at = COALESCE(delivered_at, $3), shown_at = COALESCE(shown_at, $3), \
+                 delivery_failed_at = NULL, delivery_error = NULL, updated_at = $3 \
+             WHERE id = $1 AND outcome = 'ad' \
+               AND ((outbox_batch_id = $2 AND delivery_state IN ('queued', 'delivered')) \
+                 OR (outbox_batch_id IS NULL AND delivery_state = 'prepared'))",
+        )
+        .bind(opportunity_id)
+        .bind(batch_id)
+        .bind(delivered_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_delivery_failed_by_batch(
+        &self,
+        batch_id: &str,
         error: &str,
         failed_at: OffsetDateTime,
     ) -> Result<bool, GradiusAdStoreError> {
@@ -551,10 +666,83 @@ impl PostgresGradiusAdStore {
             "UPDATE gradius_ad_opportunities SET delivery_state = 'failed', \
                  delivery_failed_at = COALESCE(delivery_failed_at, $3), \
                  delivery_error = left($2, 2048), updated_at = $3 \
-             WHERE dialog_job_id = $1 AND outcome = 'ad' \
-               AND delivery_state IN ('prepared', 'queued', 'failed')",
+             WHERE outbox_batch_id = $1 AND outcome = 'ad' \
+               AND delivery_state IN ('queued', 'failed')",
+        )
+        .bind(batch_id)
+        .bind(error)
+        .bind(failed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn reconcile_dialogue_delivered(
+        &self,
+        dialog_job_id: i64,
+        batch_id: &str,
+        delivered_at: OffsetDateTime,
+    ) -> Result<bool, GradiusAdStoreError> {
+        let result = sqlx::query(
+            "UPDATE gradius_ad_opportunities SET delivery_state = 'delivered', \
+                 outbox_batch_id = COALESCE(outbox_batch_id, $2), \
+                 queued_at = COALESCE(queued_at, $3), \
+                 delivered_at = COALESCE(delivered_at, $3), shown_at = COALESCE(shown_at, $3), \
+                 delivery_failed_at = NULL, delivery_error = NULL, updated_at = $3 \
+             WHERE dialog_job_id = $1 AND integration_kind = 'native_dialogue' \
+               AND outcome = 'ad' \
+               AND ((outbox_batch_id = $2 AND delivery_state IN ('queued', 'delivered')) \
+                 OR (outbox_batch_id IS NULL AND delivery_state = 'prepared'))",
         )
         .bind(dialog_job_id)
+        .bind(batch_id)
+        .bind(delivered_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn reconcile_dialogue_delivery_failed(
+        &self,
+        dialog_job_id: i64,
+        batch_id: &str,
+        error: &str,
+        failed_at: OffsetDateTime,
+    ) -> Result<bool, GradiusAdStoreError> {
+        let result = sqlx::query(
+            "UPDATE gradius_ad_opportunities SET delivery_state = 'failed', \
+                 outbox_batch_id = COALESCE(outbox_batch_id, $2), \
+                 queued_at = COALESCE(queued_at, $4), \
+                 delivery_failed_at = COALESCE(delivery_failed_at, $4), \
+                 delivery_error = left($3, 2048), updated_at = $4 \
+             WHERE dialog_job_id = $1 AND integration_kind = 'native_dialogue' \
+               AND outcome = 'ad' \
+               AND ((outbox_batch_id = $2 AND delivery_state IN ('queued', 'failed')) \
+                 OR (outbox_batch_id IS NULL AND delivery_state = 'prepared'))",
+        )
+        .bind(dialog_job_id)
+        .bind(batch_id)
+        .bind(error)
+        .bind(failed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_delivery_failed(
+        &self,
+        opportunity_id: i64,
+        error: &str,
+        failed_at: OffsetDateTime,
+    ) -> Result<bool, GradiusAdStoreError> {
+        let result = sqlx::query(
+            "UPDATE gradius_ad_opportunities SET delivery_state = 'failed', \
+                 delivery_failed_at = COALESCE(delivery_failed_at, $3), \
+                 delivery_error = left($2, 2048), updated_at = $3 \
+             WHERE id = $1 AND outcome = 'ad' \
+               AND delivery_state IN ('prepared', 'failed')",
+        )
+        .bind(opportunity_id)
         .bind(error)
         .bind(failed_at)
         .execute(&self.pool)
@@ -565,15 +753,18 @@ impl PostgresGradiusAdStore {
     async fn finish_without_ad(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         outcome: &'static str,
         provider_outcome: Option<&'static str>,
         completed_at: OffsetDateTime,
     ) -> Result<(), GradiusAdStoreError> {
         let result = sqlx::query(
-            "UPDATE gradius_ad_opportunities SET outcome = $2, provider_outcome = $3, \
-                 provider_completed_at = $4, updated_at = $4 WHERE id = $1 AND outcome = 'reserved'",
+            "UPDATE gradius_ad_opportunities SET outcome = $3, provider_outcome = $4, \
+                 provider_completed_at = $5, updated_at = $5 \
+             WHERE id = $1 AND attempt_generation = $2 AND outcome = 'reserved'",
         )
         .bind(opportunity_id)
+        .bind(attempt_generation)
         .bind(outcome)
         .bind(provider_outcome)
         .bind(completed_at)
@@ -582,10 +773,35 @@ impl PostgresGradiusAdStore {
         if result.rows_affected() > 0 {
             return Ok(());
         }
-        self.accept_existing_state(opportunity_id, &[outcome]).await
+        self.accept_existing_state(opportunity_id, attempt_generation, &[outcome])
+            .await
     }
 
     async fn accept_existing_state(
+        &self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+        expected: &[&str],
+    ) -> Result<(), GradiusAdStoreError> {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT outcome FROM gradius_ad_opportunities \
+                 WHERE id = $1 AND attempt_generation = $2",
+        )
+        .bind(opportunity_id)
+        .bind(attempt_generation)
+        .fetch_optional(&self.pool)
+        .await?;
+        if existing
+            .as_deref()
+            .is_some_and(|outcome| expected.contains(&outcome))
+        {
+            Ok(())
+        } else {
+            Err(GradiusAdStoreError::InvalidTransition { opportunity_id })
+        }
+    }
+
+    async fn accept_existing_state_without_attempt(
         &self,
         opportunity_id: i64,
         expected: &[&str],
@@ -610,6 +826,9 @@ fn validate_opportunity(input: &GradiusAdOpportunityInput) -> Result<(), Gradius
     if input.opportunity_key.trim().is_empty() {
         return Err(GradiusAdStoreError::InvalidInput("opportunity_key"));
     }
+    if input.attempt_key.trim().is_empty() {
+        return Err(GradiusAdStoreError::InvalidInput("attempt_key"));
+    }
     if input.integration_kind.trim().is_empty() {
         return Err(GradiusAdStoreError::InvalidInput("integration_kind"));
     }
@@ -622,11 +841,10 @@ fn source_kind(opportunity_key: &str) -> &str {
         .map_or("external", |(source, _)| source)
 }
 
-fn reservation_from_existing(
+fn validate_existing_identity(
     row: &sqlx::postgres::PgRow,
     input: &GradiusAdOpportunityInput,
-) -> Result<GradiusAdReservation, GradiusAdStoreError> {
-    let opportunity_id: i64 = row.get("id");
+) -> Result<(), GradiusAdStoreError> {
     if row.get::<Option<i64>, _>("dialog_job_id") != input.dialog_job_id
         || row.get::<String, _>("integration_kind") != input.integration_kind
         || row.get::<i64, _>("user_id") != input.user_id
@@ -637,6 +855,13 @@ fn reservation_from_existing(
             opportunity_key: input.opportunity_key.clone(),
         });
     }
+    Ok(())
+}
+
+fn reservation_from_existing(
+    row: &sqlx::postgres::PgRow,
+) -> Result<GradiusAdReservation, GradiusAdStoreError> {
+    let opportunity_id: i64 = row.get("id");
     let outcome: String = row.get("outcome");
     match outcome.as_str() {
         "ad" => Ok(GradiusAdReservation::Replay {
@@ -829,6 +1054,9 @@ mod tests {
         assert!(UP.contains("opportunity_key TEXT NOT NULL UNIQUE"));
         assert!(UP.contains("UNIQUE (integration_kind, dialog_job_id)"));
         assert!(UP.contains("delivery_state TEXT"));
+        assert!(UP.contains("attempt_key TEXT NOT NULL"));
+        assert!(UP.contains("attempt_generation INTEGER NOT NULL"));
+        assert!(UP.contains("UNIQUE (opportunity_id, attempt_generation, sequence)"));
         assert!(UP.contains("shown_at TIMESTAMPTZ"));
         assert!(UP.contains("selected_placement JSONB"));
         assert!(UP.contains("rendered_html TEXT"));
@@ -861,6 +1089,7 @@ mod tests {
             let reservation = store
                 .reserve_opportunity(GradiusAdOpportunityInput {
                     opportunity_key: format!("dialog-job:{}", 9_820_825_100 + answer),
+                    attempt_key: format!("policy-test-claim-{answer}"),
                     dialog_job_id: Some(9_820_825_100 + answer),
                     integration_kind: "native_dialogue".to_owned(),
                     user_id,
@@ -881,6 +1110,7 @@ mod tests {
 
         let third = GradiusAdOpportunityInput {
             opportunity_key: "dialog-job:9820825103".to_owned(),
+            attempt_key: "dialog-claim-1".to_owned(),
             dialog_job_id: Some(9_820_825_103),
             integration_kind: "native_dialogue".to_owned(),
             user_id,
@@ -891,21 +1121,20 @@ mod tests {
         };
         let reserved = store.reserve_opportunity(third.clone()).await?;
         let opportunity_id = reserved.opportunity_id();
-        assert!(matches!(
-            reserved,
+        let attempt_generation = match reserved {
             GradiusAdReservation::Reserved {
                 completed_answers: 3,
+                attempt_generation,
                 ..
-            }
-        ));
-        assert_eq!(
-            store.reserve_opportunity(third.clone()).await?,
-            GradiusAdReservation::Pending { opportunity_id }
-        );
+            } => attempt_generation,
+            other => panic!("expected reserved opportunity, got {other:?}"),
+        };
+        assert_eq!(attempt_generation, 1);
 
         store
             .record_api_call(GradiusApiCallRecord {
                 opportunity_id,
+                attempt_generation,
                 sequence: 1,
                 role: Some("user".to_owned()),
                 synthetic_chat_id: "chat_safe".to_owned(),
@@ -923,10 +1152,97 @@ mod tests {
                 created_at: third.completed_at,
             })
             .await?;
+        assert_eq!(
+            store.reserve_opportunity(third.clone()).await?,
+            GradiusAdReservation::Pending { opportunity_id }
+        );
+        let mut retried = third.clone();
+        retried.attempt_key = "dialog-claim-2".to_owned();
+        let reclaimed_generation = match store.reserve_opportunity(retried).await? {
+            GradiusAdReservation::Reserved {
+                opportunity_id: reclaimed_id,
+                completed_answers: 3,
+                attempt_generation,
+                ..
+            } if reclaimed_id == opportunity_id => attempt_generation,
+            other => panic!("expected reclaimed opportunity, got {other:?}"),
+        };
+        assert_eq!(reclaimed_generation, 2);
+        let preserved_generations: Vec<i32> = sqlx::query_scalar(
+            "SELECT attempt_generation FROM gradius_api_calls \
+             WHERE opportunity_id = $1 ORDER BY attempt_generation, sequence",
+        )
+        .bind(opportunity_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(preserved_generations, vec![attempt_generation]);
+        assert!(
+            store
+                .record_api_call(GradiusApiCallRecord {
+                    opportunity_id,
+                    attempt_generation,
+                    sequence: 2,
+                    role: Some("assistant".to_owned()),
+                    synthetic_chat_id: "chat_safe".to_owned(),
+                    synthetic_user_id: "user_safe".to_owned(),
+                    endpoint: "https://api.adlean.pro/v1/native/dialogue_model/chat?role=assistant"
+                        .to_owned(),
+                    request_body: json!({"text": "stale attempt", "user_metadata": {}}),
+                    response_status: Some(200),
+                    response_body: Some("[]".to_owned()),
+                    response_json: Some(json!([])),
+                    response_truncated: false,
+                    duration_ms: 7,
+                    outcome: "no_ad".to_owned(),
+                    error: None,
+                    created_at: third.completed_at,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_no_ad(opportunity_id, attempt_generation, third.completed_at)
+                .await
+                .is_err()
+        );
+        store
+            .record_api_call(GradiusApiCallRecord {
+                opportunity_id,
+                attempt_generation: reclaimed_generation,
+                sequence: 1,
+                role: Some("user".to_owned()),
+                synthetic_chat_id: "chat_safe".to_owned(),
+                synthetic_user_id: "user_safe".to_owned(),
+                endpoint: "https://api.adlean.pro/v1/native/dialogue_model/chat?role=user"
+                    .to_owned(),
+                request_body: json!({"text": "[private_person]", "user_metadata": {}}),
+                response_status: Some(200),
+                response_body: Some("[]".to_owned()),
+                response_json: Some(json!([])),
+                response_truncated: false,
+                duration_ms: 8,
+                outcome: "no_ad".to_owned(),
+                error: None,
+                created_at: third.completed_at,
+            })
+            .await?;
+        let retained_attempts: Vec<i32> = sqlx::query_scalar(
+            "SELECT attempt_generation FROM gradius_api_calls \
+             WHERE opportunity_id = $1 ORDER BY attempt_generation, sequence",
+        )
+        .bind(opportunity_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            retained_attempts,
+            vec![attempt_generation, reclaimed_generation]
+        );
 
         let stored = store
             .finish_ad(
                 opportunity_id,
+                reclaimed_generation,
                 GradiusStoredAd {
                     markdown: "**Реклама**".to_owned(),
                     rendered_html: "<b>Реклама</b>".to_owned(),
@@ -947,11 +1263,46 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(shown_before_delivery, 0);
+        assert!(
+            !store
+                .mark_delivered_by_batch("dialog-intermediate:v1:test", at(10_005))
+                .await?
+        );
+        assert!(
+            store
+                .reconcile_dialogue_delivery_failed(
+                    9_820_825_103,
+                    "dialog-answer:v1:test",
+                    "final batch failed",
+                    at(10_005),
+                )
+                .await?
+        );
+        assert!(
+            !store
+                .mark_delivered_by_batch("dialog-intermediate:v1:test", at(10_005))
+                .await?
+        );
+        let failed_delivery: (String, Option<String>, Option<OffsetDateTime>) = sqlx::query_as(
+            "SELECT delivery_state, outbox_batch_id, shown_at \
+             FROM gradius_ad_opportunities WHERE id = $1",
+        )
+        .bind(opportunity_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            failed_delivery,
+            (
+                "failed".to_owned(),
+                Some("dialog-answer:v1:test".to_owned()),
+                None
+            )
+        );
         store
-            .mark_queued(opportunity_id, "dialog-answer:v1:test", at(10_004))
+            .mark_queued(opportunity_id, "dialog-answer:v1:test", at(10_005))
             .await?;
         store
-            .mark_delivered_by_job(9_820_825_103, at(10_005))
+            .mark_delivered_by_batch("dialog-answer:v1:test", at(10_006))
             .await?;
         let shown_after_delivery: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM gradius_ad_opportunities WHERE user_id = $1 AND shown_at IS NOT NULL",
@@ -965,7 +1316,7 @@ mod tests {
             GradiusAdReservation::Replay {
                 opportunity_id,
                 ad: GradiusStoredAd {
-                    shown_at: Some(at(10_005)),
+                    shown_at: Some(at(10_006)),
                     ..stored
                 },
             }
@@ -974,6 +1325,7 @@ mod tests {
         let other_surface = store
             .reserve_opportunity(GradiusAdOpportunityInput {
                 opportunity_key: "generation-job:9820825200".to_owned(),
+                attempt_key: "generation-claim-1".to_owned(),
                 dialog_job_id: Some(9_820_825_200),
                 integration_kind: "native_generation".to_owned(),
                 user_id,

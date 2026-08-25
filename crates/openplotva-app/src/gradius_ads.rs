@@ -79,18 +79,39 @@ pub trait GradiusAdLedger: Send + Sync {
     fn finish_ad<'a>(
         &'a self,
         opportunity_id: i64,
+        attempt_generation: i32,
         ad: GradiusStoredAd,
     ) -> GradiusServiceFuture<'a, GradiusStoredAd>;
 
-    fn finish_no_ad<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()>;
+    fn finish_no_ad<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()>;
 
-    fn finish_provider_error<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()>;
+    fn finish_provider_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()>;
 
-    fn finish_privacy_error<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()>;
+    fn finish_privacy_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()>;
 
     fn finish_unsupported_surface<'a>(
         &'a self,
         opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()>;
+
+    fn finish_render_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+        error: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 
     fn mark_render_error<'a>(
@@ -105,11 +126,21 @@ pub trait GradiusAdLedger: Send + Sync {
         batch_id: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 
-    fn mark_delivered_by_job<'a>(&'a self, dialog_job_id: i64) -> GradiusServiceFuture<'a, ()>;
-
-    fn mark_delivery_failed_by_job<'a>(
+    fn reconcile_delivered<'a>(
         &'a self,
-        dialog_job_id: i64,
+        opportunity_id: i64,
+        batch_id: &'a str,
+    ) -> GradiusServiceFuture<'a, ()>;
+
+    fn mark_delivery_failed_by_batch<'a>(
+        &'a self,
+        batch_id: &'a str,
+        error: &'a str,
+    ) -> GradiusServiceFuture<'a, ()>;
+
+    fn mark_delivery_failed<'a>(
+        &'a self,
+        opportunity_id: i64,
         error: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 }
@@ -137,28 +168,26 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
     fn finish_ad<'a>(
         &'a self,
         opportunity_id: i64,
+        attempt_generation: i32,
         ad: GradiusStoredAd,
     ) -> GradiusServiceFuture<'a, GradiusStoredAd> {
         Box::pin(async move {
-            PostgresGradiusAdStore::finish_ad(self, opportunity_id, ad)
+            PostgresGradiusAdStore::finish_ad(self, opportunity_id, attempt_generation, ad)
                 .await
                 .map_err(|error| error.to_string())
         })
     }
 
-    fn finish_no_ad<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()> {
+    fn finish_no_ad<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
-            PostgresGradiusAdStore::finish_no_ad(self, opportunity_id, OffsetDateTime::now_utc())
-                .await
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn finish_provider_error<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()> {
-        Box::pin(async move {
-            PostgresGradiusAdStore::finish_provider_error(
+            PostgresGradiusAdStore::finish_no_ad(
                 self,
                 opportunity_id,
+                attempt_generation,
                 OffsetDateTime::now_utc(),
             )
             .await
@@ -166,11 +195,33 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
         })
     }
 
-    fn finish_privacy_error<'a>(&'a self, opportunity_id: i64) -> GradiusServiceFuture<'a, ()> {
+    fn finish_provider_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            PostgresGradiusAdStore::finish_provider_error(
+                self,
+                opportunity_id,
+                attempt_generation,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    fn finish_privacy_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+    ) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
             PostgresGradiusAdStore::finish_privacy_error(
                 self,
                 opportunity_id,
+                attempt_generation,
                 OffsetDateTime::now_utc(),
             )
             .await
@@ -181,15 +232,36 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
     fn finish_unsupported_surface<'a>(
         &'a self,
         opportunity_id: i64,
+        attempt_generation: i32,
     ) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
             PostgresGradiusAdStore::finish_unsupported_surface(
                 self,
                 opportunity_id,
+                attempt_generation,
                 OffsetDateTime::now_utc(),
             )
             .await
             .map_err(|error| error.to_string())
+        })
+    }
+
+    fn finish_render_error<'a>(
+        &'a self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+        error: &'a str,
+    ) -> GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            PostgresGradiusAdStore::finish_render_error(
+                self,
+                opportunity_id,
+                attempt_generation,
+                error,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .map_err(|store_error| store_error.to_string())
         })
     }
 
@@ -227,11 +299,16 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
         })
     }
 
-    fn mark_delivered_by_job<'a>(&'a self, dialog_job_id: i64) -> GradiusServiceFuture<'a, ()> {
+    fn reconcile_delivered<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch_id: &'a str,
+    ) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
-            PostgresGradiusAdStore::mark_delivered_by_job(
+            PostgresGradiusAdStore::reconcile_delivered(
                 self,
-                dialog_job_id,
+                opportunity_id,
+                batch_id,
                 OffsetDateTime::now_utc(),
             )
             .await
@@ -240,15 +317,33 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
         })
     }
 
-    fn mark_delivery_failed_by_job<'a>(
+    fn mark_delivery_failed_by_batch<'a>(
         &'a self,
-        dialog_job_id: i64,
+        batch_id: &'a str,
         error: &'a str,
     ) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
-            PostgresGradiusAdStore::mark_delivery_failed_by_job(
+            PostgresGradiusAdStore::mark_delivery_failed_by_batch(
                 self,
-                dialog_job_id,
+                batch_id,
+                error,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|store_error| store_error.to_string())
+        })
+    }
+
+    fn mark_delivery_failed<'a>(
+        &'a self,
+        opportunity_id: i64,
+        error: &'a str,
+    ) -> GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            PostgresGradiusAdStore::mark_delivery_failed(
+                self,
+                opportunity_id,
                 error,
                 OffsetDateTime::now_utc(),
             )
@@ -285,6 +380,7 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GradiusAdAppendRequest {
     pub dialog_job_id: i64,
+    pub attempt_key: String,
     pub chat_id: i64,
     pub thread_id: Option<i32>,
     pub user_id: i64,
@@ -324,11 +420,15 @@ pub trait GradiusAdAppender: Send + Sync {
         batch_id: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 
-    fn mark_delivered<'a>(&'a self, dialog_job_id: i64) -> GradiusServiceFuture<'a, ()>;
+    fn mark_delivered<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch_id: &'a str,
+    ) -> GradiusServiceFuture<'a, ()>;
 
     fn mark_delivery_failed<'a>(
         &'a self,
-        dialog_job_id: i64,
+        opportunity_id: i64,
         error: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 }
@@ -378,6 +478,7 @@ impl GradiusAdService {
             .ledger
             .reserve(GradiusAdOpportunityInput {
                 opportunity_key: format!("dialog-job:{}", request.dialog_job_id),
+                attempt_key: request.attempt_key.clone(),
                 dialog_job_id: Some(request.dialog_job_id),
                 integration_kind: GradiusIntegrationKind::NativeDialogue.as_str().to_owned(),
                 user_id: request.user_id,
@@ -388,33 +489,45 @@ impl GradiusAdService {
             })
             .await?;
         let opportunity_id = reservation.opportunity_id();
-        match reservation {
+        let attempt_generation = match reservation {
             GradiusAdReservation::Replay { ad, .. } => {
                 return Ok(Some(GradiusAdTail {
                     opportunity_id,
                     html: ad.rendered_html,
                 }));
             }
-            GradiusAdReservation::Reserved { .. } => {}
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
             GradiusAdReservation::Ineligible { .. }
             | GradiusAdReservation::Pending { .. }
             | GradiusAdReservation::Completed { .. } => return Ok(None),
-        }
+        };
 
-        let result = self.fetch_ad(opportunity_id, &request, &ids).await;
+        let result = self
+            .fetch_ad(opportunity_id, attempt_generation, &request, &ids)
+            .await;
         let ad = match result {
             Ok(Some(GradiusPlacement::NativeDialogue(ad))) => ad,
             Ok(Some(_)) => {
                 let error = "Gradius returned an unsupported placement for native_dialogue";
-                let _ = self.ledger.mark_render_error(opportunity_id, error).await;
+                let _ = self
+                    .ledger
+                    .finish_render_error(opportunity_id, attempt_generation, error)
+                    .await;
                 return Err(error.to_owned());
             }
             Ok(None) => {
-                self.ledger.finish_no_ad(opportunity_id).await?;
+                self.ledger
+                    .finish_no_ad(opportunity_id, attempt_generation)
+                    .await?;
                 return Ok(None);
             }
             Err(error) => {
-                let _ = self.ledger.finish_provider_error(opportunity_id).await;
+                let _ = self
+                    .ledger
+                    .finish_provider_error(opportunity_id, attempt_generation)
+                    .await;
                 return Err(error);
             }
         };
@@ -446,11 +559,16 @@ impl GradiusAdService {
         let (stored, tail) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = self.ledger.mark_render_error(opportunity_id, &error).await;
+                let _ = self
+                    .ledger
+                    .finish_render_error(opportunity_id, attempt_generation, &error)
+                    .await;
                 return Err(error);
             }
         };
-        self.ledger.finish_ad(opportunity_id, stored).await?;
+        self.ledger
+            .finish_ad(opportunity_id, attempt_generation, stored)
+            .await?;
         tracing::info!(
             opportunity_id,
             job_id = request.dialog_job_id,
@@ -478,6 +596,7 @@ impl GradiusAdService {
             .ledger
             .reserve(GradiusAdOpportunityInput {
                 opportunity_key: format!("dialog-job:{}", request.dialog_job_id),
+                attempt_key: request.attempt_key,
                 dialog_job_id: Some(request.dialog_job_id),
                 integration_kind: GradiusIntegrationKind::NativeDialogue.as_str().to_owned(),
                 user_id: request.user_id,
@@ -487,9 +606,14 @@ impl GradiusAdService {
                 completed_at: request.completed_at,
             })
             .await?;
-        if matches!(reservation, GradiusAdReservation::Reserved { .. }) {
+        if let GradiusAdReservation::Reserved {
+            opportunity_id,
+            attempt_generation,
+            ..
+        } = reservation
+        {
             self.ledger
-                .finish_unsupported_surface(reservation.opportunity_id())
+                .finish_unsupported_surface(opportunity_id, attempt_generation)
                 .await?;
         }
         Ok(())
@@ -498,13 +622,17 @@ impl GradiusAdService {
     async fn fetch_ad(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         request: &GradiusAdAppendRequest,
         ids: &GradiusSyntheticIds,
     ) -> Result<Option<GradiusPlacement>, String> {
         let user_text = match self.redactor.redact(&request.user_text).await {
             Ok(text) => text,
             Err(error) => {
-                let _ = self.ledger.finish_privacy_error(opportunity_id).await;
+                let _ = self
+                    .ledger
+                    .finish_privacy_error(opportunity_id, attempt_generation)
+                    .await;
                 return Err(error);
             }
         };
@@ -512,6 +640,7 @@ impl GradiusAdService {
         let user_call = self
             .call_and_record(
                 opportunity_id,
+                attempt_generation,
                 1,
                 ids,
                 request.completed_at,
@@ -525,7 +654,8 @@ impl GradiusAdService {
                 },
             )
             .await?;
-        if user_call.is_some() {
+        let unexpected_user_placement = user_call.is_some();
+        if unexpected_user_placement {
             tracing::info!(
                 opportunity_id,
                 job_id = request.dialog_job_id,
@@ -538,13 +668,28 @@ impl GradiusAdService {
         let assistant_text = match self.redactor.redact(&request.assistant_text).await {
             Ok(text) => text,
             Err(error) => {
-                let _ = self.ledger.finish_privacy_error(opportunity_id).await;
+                if unexpected_user_placement {
+                    let _ = self
+                        .ledger
+                        .finish_render_error(
+                            opportunity_id,
+                            attempt_generation,
+                            "Gradius returned a placement for the user turn",
+                        )
+                        .await;
+                } else {
+                    let _ = self
+                        .ledger
+                        .finish_privacy_error(opportunity_id, attempt_generation)
+                        .await;
+                }
                 return Err(error);
             }
         };
-        let ad = self
+        let assistant_call = self
             .call_and_record(
                 opportunity_id,
+                attempt_generation,
                 2,
                 ids,
                 request.completed_at,
@@ -557,7 +702,30 @@ impl GradiusAdService {
                     text: assistant_text.clone(),
                 },
             )
-            .await?;
+            .await;
+        let ad = match assistant_call {
+            Ok(ad) => ad,
+            Err(error) if unexpected_user_placement => {
+                let _ = self
+                    .ledger
+                    .finish_render_error(
+                        opportunity_id,
+                        attempt_generation,
+                        "Gradius returned a placement for the user turn",
+                    )
+                    .await;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if unexpected_user_placement {
+            let error = "Gradius returned a placement for the user turn";
+            let _ = self
+                .ledger
+                .finish_render_error(opportunity_id, attempt_generation, error)
+                .await;
+            return Err(error.to_owned());
+        }
         if ad.as_ref().is_some_and(|placement| match placement {
             GradiusPlacement::NativeDialogue(ad) => {
                 ad.insert_index != assistant_text.chars().count()
@@ -565,7 +733,10 @@ impl GradiusAdService {
             GradiusPlacement::Standalone { .. } => true,
         }) {
             let error = "Gradius returned a non-terminal or unsupported placement";
-            let _ = self.ledger.mark_render_error(opportunity_id, error).await;
+            let _ = self
+                .ledger
+                .finish_render_error(opportunity_id, attempt_generation, error)
+                .await;
             return Err(error.to_owned());
         }
         Ok(ad)
@@ -574,6 +745,7 @@ impl GradiusAdService {
     async fn call_and_record(
         &self,
         opportunity_id: i64,
+        attempt_generation: i32,
         sequence: i16,
         ids: &GradiusSyntheticIds,
         created_at: OffsetDateTime,
@@ -589,6 +761,7 @@ impl GradiusAdService {
             self.ledger
                 .record_api_call(GradiusApiCallRecord {
                     opportunity_id,
+                    attempt_generation,
                     sequence,
                     role: exchange.role.map(|role| role.as_str().to_owned()),
                     synthetic_chat_id: ids.chat_id.clone(),
@@ -650,17 +823,20 @@ impl GradiusAdAppender for GradiusAdService {
         self.ledger.mark_queued(opportunity_id, batch_id)
     }
 
-    fn mark_delivered<'a>(&'a self, dialog_job_id: i64) -> GradiusServiceFuture<'a, ()> {
-        self.ledger.mark_delivered_by_job(dialog_job_id)
+    fn mark_delivered<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch_id: &'a str,
+    ) -> GradiusServiceFuture<'a, ()> {
+        self.ledger.reconcile_delivered(opportunity_id, batch_id)
     }
 
     fn mark_delivery_failed<'a>(
         &'a self,
-        dialog_job_id: i64,
+        opportunity_id: i64,
         error: &'a str,
     ) -> GradiusServiceFuture<'a, ()> {
-        self.ledger
-            .mark_delivery_failed_by_job(dialog_job_id, error)
+        self.ledger.mark_delivery_failed(opportunity_id, error)
     }
 }
 
@@ -858,8 +1034,9 @@ mod tests {
         finished_unsupported: Arc<Mutex<Vec<i64>>>,
         render_errors: Arc<Mutex<Vec<(i64, String)>>>,
         queued: Arc<Mutex<Vec<(i64, String)>>>,
-        delivered_jobs: Arc<Mutex<Vec<i64>>>,
-        failed_delivery_jobs: Arc<Mutex<Vec<(i64, String)>>>,
+        delivered_batches: Arc<Mutex<Vec<String>>>,
+        failed_delivery_batches: Arc<Mutex<Vec<(String, String)>>>,
+        failed_delivery_opportunities: Arc<Mutex<Vec<(i64, String)>>>,
     }
 
     impl LedgerStub {
@@ -889,6 +1066,7 @@ mod tests {
                         opportunity_id: 1,
                         interaction_started_at: input.completed_at,
                         completed_answers: 3,
+                        attempt_generation: 1,
                     }))
             })
         }
@@ -903,6 +1081,7 @@ mod tests {
         fn finish_ad<'a>(
             &'a self,
             opportunity_id: i64,
+            _attempt_generation: i32,
             ad: GradiusStoredAd,
         ) -> TestFuture<'a, GradiusStoredAd> {
             Box::pin(async move {
@@ -914,7 +1093,11 @@ mod tests {
             })
         }
 
-        fn finish_no_ad<'a>(&'a self, opportunity_id: i64) -> TestFuture<'a, ()> {
+        fn finish_no_ad<'a>(
+            &'a self,
+            opportunity_id: i64,
+            _attempt_generation: i32,
+        ) -> TestFuture<'a, ()> {
             Box::pin(async move {
                 self.finished_no_ads
                     .lock()
@@ -924,7 +1107,11 @@ mod tests {
             })
         }
 
-        fn finish_provider_error<'a>(&'a self, opportunity_id: i64) -> TestFuture<'a, ()> {
+        fn finish_provider_error<'a>(
+            &'a self,
+            opportunity_id: i64,
+            _attempt_generation: i32,
+        ) -> TestFuture<'a, ()> {
             Box::pin(async move {
                 self.finished_provider_errors
                     .lock()
@@ -934,7 +1121,11 @@ mod tests {
             })
         }
 
-        fn finish_privacy_error<'a>(&'a self, opportunity_id: i64) -> TestFuture<'a, ()> {
+        fn finish_privacy_error<'a>(
+            &'a self,
+            opportunity_id: i64,
+            _attempt_generation: i32,
+        ) -> TestFuture<'a, ()> {
             Box::pin(async move {
                 self.finished_privacy_errors
                     .lock()
@@ -944,12 +1135,31 @@ mod tests {
             })
         }
 
-        fn finish_unsupported_surface<'a>(&'a self, opportunity_id: i64) -> TestFuture<'a, ()> {
+        fn finish_unsupported_surface<'a>(
+            &'a self,
+            opportunity_id: i64,
+            _attempt_generation: i32,
+        ) -> TestFuture<'a, ()> {
             Box::pin(async move {
                 self.finished_unsupported
                     .lock()
                     .expect("finished unsupported surfaces")
                     .push(opportunity_id);
+                Ok(())
+            })
+        }
+
+        fn finish_render_error<'a>(
+            &'a self,
+            opportunity_id: i64,
+            _attempt_generation: i32,
+            error: &'a str,
+        ) -> TestFuture<'a, ()> {
+            Box::pin(async move {
+                self.render_errors
+                    .lock()
+                    .expect("render errors")
+                    .push((opportunity_id, error.to_owned()));
                 Ok(())
             })
         }
@@ -978,26 +1188,44 @@ mod tests {
             })
         }
 
-        fn mark_delivered_by_job<'a>(&'a self, dialog_job_id: i64) -> TestFuture<'a, ()> {
+        fn reconcile_delivered<'a>(
+            &'a self,
+            _opportunity_id: i64,
+            batch_id: &'a str,
+        ) -> TestFuture<'a, ()> {
             Box::pin(async move {
-                self.delivered_jobs
+                self.delivered_batches
                     .lock()
-                    .expect("delivered jobs")
-                    .push(dialog_job_id);
+                    .expect("delivered batches")
+                    .push(batch_id.to_owned());
                 Ok(())
             })
         }
 
-        fn mark_delivery_failed_by_job<'a>(
+        fn mark_delivery_failed_by_batch<'a>(
             &'a self,
-            dialog_job_id: i64,
+            batch_id: &'a str,
             error: &'a str,
         ) -> TestFuture<'a, ()> {
             Box::pin(async move {
-                self.failed_delivery_jobs
+                self.failed_delivery_batches
                     .lock()
-                    .expect("failed delivery jobs")
-                    .push((dialog_job_id, error.to_owned()));
+                    .expect("failed delivery batches")
+                    .push((batch_id.to_owned(), error.to_owned()));
+                Ok(())
+            })
+        }
+
+        fn mark_delivery_failed<'a>(
+            &'a self,
+            opportunity_id: i64,
+            error: &'a str,
+        ) -> TestFuture<'a, ()> {
+            Box::pin(async move {
+                self.failed_delivery_opportunities
+                    .lock()
+                    .expect("failed delivery opportunities")
+                    .push((opportunity_id, error.to_owned()));
                 Ok(())
             })
         }
@@ -1060,6 +1288,7 @@ mod tests {
     fn test_request(dialog_job_id: i64) -> GradiusAdAppendRequest {
         GradiusAdAppendRequest {
             dialog_job_id,
+            attempt_key: "test-claim-1".to_owned(),
             chat_id: 42,
             thread_id: None,
             user_id: 42,
@@ -1197,6 +1426,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_records_unexpected_user_placement_as_render_error() {
+        let dialogue = DialogueStub::default();
+        {
+            let mut responses = dialogue.responses.lock().expect("dialogue responses");
+            responses.push_back(Ok(Some(GradiusPlacement::NativeDialogue(
+                GradiusDialogueAd {
+                    insert_index: "user-safe".chars().count(),
+                    markdown: "unexpected user ad".to_owned(),
+                    show_price: Some(1.0),
+                    click_price: None,
+                },
+            ))));
+            responses.push_back(Ok(None));
+        }
+        let ledger = LedgerStub::default();
+        let service = GradiusAdService::new(
+            Arc::new(dialogue.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+
+        assert!(service.append(test_request(730)).await.is_err());
+        assert_eq!(dialogue.calls.lock().expect("dialogue calls").len(), 2);
+        assert_eq!(ledger.api_calls.lock().expect("api calls").len(), 2);
+        assert!(
+            ledger
+                .finished_no_ads
+                .lock()
+                .expect("finished no ads")
+                .is_empty()
+        );
+        assert_eq!(
+            ledger
+                .render_errors
+                .lock()
+                .expect("render errors")
+                .as_slice(),
+            &[(
+                1,
+                "Gradius returned a placement for the user turn".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_user_placement_stays_a_render_error_when_assistant_call_fails() {
+        let dialogue = DialogueStub::default();
+        {
+            let mut responses = dialogue.responses.lock().expect("dialogue responses");
+            responses.push_back(Ok(Some(GradiusPlacement::NativeDialogue(
+                GradiusDialogueAd {
+                    insert_index: "user-safe".chars().count(),
+                    markdown: "unexpected user ad".to_owned(),
+                    show_price: Some(1.0),
+                    click_price: None,
+                },
+            ))));
+            responses.push_back(Err("assistant provider failed".to_owned()));
+        }
+        let ledger = LedgerStub::default();
+        let service = GradiusAdService::new(
+            Arc::new(dialogue.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+
+        assert!(service.append(test_request(7301)).await.is_err());
+        assert_eq!(dialogue.calls.lock().expect("dialogue calls").len(), 2);
+        assert_eq!(ledger.api_calls.lock().expect("api calls").len(), 2);
+        assert_eq!(
+            ledger
+                .render_errors
+                .lock()
+                .expect("render errors")
+                .as_slice(),
+            &[(
+                1,
+                "Gradius returned a placement for the user turn".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn service_preserves_partial_user_exchange_when_assistant_privacy_fails() {
         let dialogue = DialogueStub::default();
         dialogue
@@ -1326,6 +1640,7 @@ mod tests {
         let tail = service
             .append(GradiusAdAppendRequest {
                 dialog_job_id: 77,
+                attempt_key: "test-claim-77".to_owned(),
                 chat_id: 42,
                 thread_id: None,
                 user_id: 42,
@@ -1396,6 +1711,7 @@ mod tests {
         let result = service
             .append(GradiusAdAppendRequest {
                 dialog_job_id: 88,
+                attempt_key: "test-claim-88".to_owned(),
                 chat_id: 42,
                 thread_id: None,
                 user_id: 42,
@@ -1445,6 +1761,7 @@ mod tests {
         let result = service
             .append(GradiusAdAppendRequest {
                 dialog_job_id: 89,
+                attempt_key: "test-claim-89".to_owned(),
                 chat_id: 42,
                 thread_id: None,
                 user_id: 42,

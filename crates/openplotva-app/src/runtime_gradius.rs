@@ -30,6 +30,7 @@ impl PostgresRuntimeGradiusAuditReader {
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'id', c.id,
+                              'attempt_generation', c.attempt_generation,
                               'sequence', c.sequence,
                               'role', c.role,
                               'synthetic_chat_id', c.synthetic_chat_id,
@@ -44,7 +45,7 @@ impl PostgresRuntimeGradiusAuditReader {
                               'outcome', c.outcome,
                               'error', c.error,
                               'created_at', to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
-                          ) ORDER BY c.sequence)
+                          ) ORDER BY c.attempt_generation, c.sequence)
                           FROM gradius_api_calls c
                           WHERE c.opportunity_id = o.id),
                           '[]'::jsonb
@@ -119,7 +120,7 @@ impl PostgresRuntimeGradiusAuditReader {
         let cutoff = range_cutoff(&filter.range)?;
         let mut query = QueryBuilder::<Postgres>::new(
             r#"SELECT
-                   COUNT(*) FILTER (WHERE attempt_reserved_at IS NOT NULL)::BIGINT AS attempts,
+                   COALESCE(SUM(attempt_generation), 0)::BIGINT AS attempts,
                    COUNT(*) FILTER (WHERE provider_outcome = 'ad')::BIGINT AS returned,
                    COUNT(*) FILTER (WHERE outcome = 'no_ad')::BIGINT AS no_ad,
                    COUNT(*) FILTER (WHERE delivery_state = 'queued')::BIGINT AS queued,
@@ -212,6 +213,7 @@ fn opportunity_json(row: &sqlx::postgres::PgRow) -> Result<Value, String> {
         "outcome": row.get::<String, _>("outcome"),
         "ineligibility_reason": row.get::<Option<String>, _>("ineligibility_reason"),
         "attempt_reserved_at": optional_timestamp(row.get("attempt_reserved_at"))?,
+        "attempt_generation": row.get::<i32, _>("attempt_generation"),
         "provider_outcome": row.get::<Option<String>, _>("provider_outcome"),
         "provider_completed_at": optional_timestamp(row.get("provider_completed_at"))?,
         "selected_placement": selected_placement,
@@ -279,7 +281,8 @@ mod tests {
     use std::{env, error::Error};
 
     use openplotva_storage::gradius_ads::{
-        GradiusAdOpportunityInput, GradiusApiCallRecord, GradiusStoredAd, PostgresGradiusAdStore,
+        GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
+        PostgresGradiusAdStore,
     };
     use sqlx::postgres::PgPoolOptions;
 
@@ -318,6 +321,7 @@ mod tests {
             let reservation = store
                 .reserve_opportunity(GradiusAdOpportunityInput {
                     opportunity_key: format!("dialog-job:{}", 9_825_250_100 + answer),
+                    attempt_key: format!("audit-test-claim-{answer}"),
                     dialog_job_id: Some(9_825_250_100 + answer),
                     integration_kind: "native_dialogue".to_owned(),
                     user_id,
@@ -329,9 +333,16 @@ mod tests {
                 .await?;
             if answer == 3 {
                 let opportunity_id = reservation.opportunity_id();
+                let GradiusAdReservation::Reserved {
+                    attempt_generation, ..
+                } = reservation
+                else {
+                    panic!("third answer must reserve a Gradius opportunity");
+                };
                 store
                     .record_api_call(GradiusApiCallRecord {
                         opportunity_id,
+                        attempt_generation,
                         sequence: 1,
                         role: Some("user".to_owned()),
                         synthetic_chat_id: "chat_safe".to_owned(),
@@ -351,6 +362,7 @@ mod tests {
                 store
                     .finish_ad(
                         opportunity_id,
+                        attempt_generation,
                         GradiusStoredAd {
                             markdown: "**Ad**".to_owned(),
                             rendered_html: "<b>Ad</b>".to_owned(),
@@ -366,7 +378,7 @@ mod tests {
                 store
                     .mark_queued(opportunity_id, "batch-audit", now)
                     .await?;
-                store.mark_delivered_by_job(9_825_250_103, now).await?;
+                store.mark_delivered_by_batch("batch-audit", now).await?;
             }
         }
 
@@ -385,6 +397,11 @@ mod tests {
             })
             .await?;
         assert_eq!(opportunities["count"], 1);
+        assert_eq!(opportunities["items"][0]["attempt_generation"], 1);
+        assert_eq!(
+            opportunities["items"][0]["api_calls"][0]["attempt_generation"],
+            1
+        );
         assert_eq!(opportunities["items"][0]["api_calls"][0]["role"], "user");
         assert_eq!(opportunities["items"][0]["telegram_html"], "<b>Ad</b>");
 

@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "23b01b0674e2ff70ef0159f8b7932bdc54e7173d544d5e02665e08370498a4c2",
+        sha256: "a02501d65391e84d43cad8aa678dac148351dca1878bc9daddf144855876db61",
     },
     StaticAsset {
         path: "login.html",
