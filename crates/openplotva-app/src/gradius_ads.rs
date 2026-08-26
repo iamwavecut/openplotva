@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 
 const VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 const LINKED_VIP: &str = "<a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a>";
+const GRADIUS_AD_LABEL: &str = "📢 ";
 
 pub type GradiusServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
@@ -848,7 +849,7 @@ fn render_ad_tail(
     let ad_html = telegram_html_from_markdown(markdown).map_err(|error| error.to_string())?;
     let appendix = render_gradius_vip_appendix(&format!("dialog-job-{dialog_job_id}"))
         .ok_or_else(|| "Gradius VIP appendix catalog is empty".to_owned())?;
-    let html = format!("{ad_html}\n\n{appendix}");
+    let html = format!("{GRADIUS_AD_LABEL}{ad_html}\n\n{appendix}");
     if html.len() > TELEGRAM_TEXT_MAX_BYTES {
         return Err("Gradius advertising tail exceeds the Telegram text limit".to_owned());
     }
@@ -1655,7 +1656,7 @@ mod tests {
 
         let tail = tail.expect("advertising tail");
         assert_eq!(tail.opportunity_id, 1);
-        assert!(tail.html.starts_with("<b>Реклама</b>"));
+        assert!(tail.html.starts_with("📢 <b>Реклама</b>"));
         assert!(tail.html.contains("https://ads.example/r/42"));
         assert!(tail.html.contains("<tg-spoiler>"));
         let calls = dialogue.calls.lock().expect("dialogue calls");
