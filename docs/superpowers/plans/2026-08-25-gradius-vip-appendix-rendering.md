@@ -14,6 +14,7 @@
 - Support private chats and non-VIP users only.
 - First eligible answer: after three completed answers in the interaction, or five minutes from interaction start. Reset the interaction after 30 minutes of inactivity.
 - Enforce a rolling user cap of ten shown ads per 24 hours and a one-hour minimum user gap. Do not rate-limit provider attempts after no-ad responses or provider errors; neither outcome consumes the impression cap.
+- Let one returned ad hold the delivery slot while its durable Telegram batch is active. Reconcile missed terminal callbacks from the outbox and release an orphaned pre-enqueue slot after 15 minutes.
 - Do not add a per-chat cap until product policy is decided.
 - Treat `content.content` as Markdown and preserve its HTTP(S)/Telegram redirect links. Reject unsafe URLs and raw HTML instead of weakening Telegram output safety.
 - Because dashboard placement is `end`, accept an ad only when Gradius reports an end insertion index for the redacted assistant text. Never map arbitrary redacted offsets back into original HTML.
