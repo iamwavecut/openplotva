@@ -13,7 +13,8 @@
 - Derive deterministic irreversible Gradius chat/user IDs with the existing `GradiusSyntheticIds` implementation.
 - Support private chats and non-VIP users only.
 - First eligible answer: after three completed answers in the interaction, or five minutes from interaction start. Reset the interaction after 30 minutes of inactivity.
-- Enforce a rolling user cap of five shown ads per 24 hours, a one-hour minimum user gap, and a five-minute provider-attempt cooldown. A no-ad response or provider error does not consume the impression cap.
+- Enforce a rolling user cap of ten shown ads per 24 hours and a one-hour minimum user gap. Do not rate-limit provider attempts after no-ad responses or provider errors; neither outcome consumes the impression cap.
+- Let one returned ad hold the delivery slot while its durable Telegram batch is active. Reconcile missed terminal callbacks from the outbox and release an orphaned pre-enqueue slot after 15 minutes.
 - Do not add a per-chat cap until product policy is decided.
 - Treat `content.content` as Markdown and preserve its HTTP(S)/Telegram redirect links. Reject unsafe URLs and raw HTML instead of weakening Telegram output safety.
 - Because dashboard placement is `end`, accept an ad only when Gradius reports an end insertion index for the redacted assistant text. Never map arbitrary redacted offsets back into original HTML.
@@ -44,7 +45,7 @@
 ## Task 4: Transactional eligibility and persistence
 
 - [x] Add migration 183 up/down files for a per-dialog-job event ledger and the indexes needed by rolling caps and interaction lookup.
-- [x] Write RED storage tests for interaction count/time eligibility, 30-minute reset, five-per-24h cap, one-hour gap, five-minute attempt cooldown, idempotent reservation, no-ad/error accounting, and saved-ad replay.
+- [x] Write RED storage tests for interaction count/time eligibility, 30-minute reset, ten-per-24h cap, one-hour gap, unrestricted back-to-back provider attempts, idempotent reservation, no-ad/error accounting, and saved-ad replay.
 - [x] Implement per-user advisory locking and idempotent reservation/finalization in `openplotva-storage`.
 - [x] Record only internal IDs/timestamps plus provider ad output needed for retry; never persist unredacted dialogue text.
 

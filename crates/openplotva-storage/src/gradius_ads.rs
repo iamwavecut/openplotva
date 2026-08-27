@@ -3,6 +3,10 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
+// Long enough for the normal enqueue path; durable active outbox batches remain protected
+// beyond this lease and are reconciled from their terminal state.
+const PENDING_DELIVERY_PREPARATION_LEASE: Duration = Duration::minutes(15);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GradiusInteractionState {
     pub started_at: OffsetDateTime,
@@ -16,7 +20,9 @@ pub struct GradiusAdEligibilityInput {
     pub interaction_started_at: OffsetDateTime,
     pub completed_answers: i32,
     pub shown_last_24_hours: i64,
+    pub pending_delivery_count: i64,
     pub last_shown_at: Option<OffsetDateTime>,
+    /// Latest attempt timestamp retained for policy diagnostics, not an eligibility gate.
     pub last_attempt_at: Option<OffsetDateTime>,
 }
 
@@ -24,7 +30,9 @@ pub struct GradiusAdEligibilityInput {
 pub enum GradiusAdIneligibility {
     InteractionThreshold,
     UserDailyCap,
+    PendingDelivery,
     UserImpressionGap,
+    /// Historical persisted outcome retained for audit compatibility.
     AttemptCooldown,
 }
 
@@ -35,7 +43,6 @@ pub struct GradiusAdPolicy {
     minimum_interaction_age: Duration,
     user_daily_cap: i64,
     user_impression_gap: Duration,
-    attempt_cooldown: Duration,
 }
 
 impl Default for GradiusAdPolicy {
@@ -44,9 +51,8 @@ impl Default for GradiusAdPolicy {
             interaction_timeout: Duration::minutes(30),
             minimum_completed_answers: 3,
             minimum_interaction_age: Duration::minutes(5),
-            user_daily_cap: 5,
+            user_daily_cap: 10,
             user_impression_gap: Duration::hours(1),
-            attempt_cooldown: Duration::minutes(5),
         }
     }
 }
@@ -88,17 +94,14 @@ impl GradiusAdPolicy {
         if input.shown_last_24_hours >= self.user_daily_cap {
             return Some(GradiusAdIneligibility::UserDailyCap);
         }
+        if input.pending_delivery_count > 0 {
+            return Some(GradiusAdIneligibility::PendingDelivery);
+        }
         if input
             .last_shown_at
             .is_some_and(|last| input.now - last < self.user_impression_gap)
         {
             return Some(GradiusAdIneligibility::UserImpressionGap);
-        }
-        if input
-            .last_attempt_at
-            .is_some_and(|last| input.now - last < self.attempt_cooldown)
-        {
-            return Some(GradiusAdIneligibility::AttemptCooldown);
         }
         None
     }
@@ -220,6 +223,67 @@ impl PostgresGradiusAdStore {
         &self.pool
     }
 
+    async fn reconcile_pending_deliveries(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        input: &GradiusAdOpportunityInput,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "WITH pending AS (\
+                 SELECT opportunity.id, opportunity.updated_at, batch.batch_id, batch.has_rows, \
+                        batch.has_active, batch.all_delivered, batch.resolved_at \
+                 FROM gradius_ad_opportunities AS opportunity \
+                 LEFT JOIN LATERAL (\
+                     SELECT MAX(outbox.batch_id) AS batch_id, COUNT(*) > 0 AS has_rows, \
+                            COALESCE(BOOL_OR(outbox.state IN ('pending', 'leased', 'retry_wait')), FALSE) \
+                                AS has_active, \
+                            COALESCE(BOOL_AND(outbox.state = 'delivered'), FALSE) AS all_delivered, \
+                            MAX(COALESCE(outbox.confirmed_at, outbox.updated_at)) AS resolved_at \
+                     FROM telegram_outbox AS outbox \
+                     WHERE outbox.batch_id = opportunity.outbox_batch_id \
+                        OR (opportunity.outbox_batch_id IS NULL \
+                            AND opportunity.integration_kind = 'native_dialogue' \
+                            AND opportunity.dialog_job_id IS NOT NULL \
+                            AND outbox.dialog_job_id = opportunity.dialog_job_id \
+                            AND outbox.batch_id LIKE \
+                                'dialog-answer:v1:%:' || opportunity.dialog_job_id::TEXT)\
+                 ) AS batch ON TRUE \
+                 WHERE opportunity.integration_kind = $1 AND opportunity.user_id = $2 \
+                   AND opportunity.outcome = 'ad' \
+                   AND opportunity.delivery_state IN ('prepared', 'queued')\
+             ), resolvable AS (\
+                 SELECT pending.*, COALESCE(pending.resolved_at, $4) AS transition_at \
+                 FROM pending \
+                 WHERE (pending.has_rows AND NOT pending.has_active) \
+                    OR (NOT pending.has_rows AND pending.updated_at <= $3)\
+             ) \
+             UPDATE gradius_ad_opportunities AS opportunity SET \
+                 delivery_state = CASE WHEN resolvable.all_delivered \
+                     THEN 'delivered' ELSE 'failed' END, \
+                 outbox_batch_id = COALESCE(opportunity.outbox_batch_id, resolvable.batch_id), \
+                 delivered_at = CASE WHEN resolvable.all_delivered \
+                     THEN COALESCE(opportunity.delivered_at, resolvable.transition_at) \
+                     ELSE opportunity.delivered_at END, \
+                 shown_at = CASE WHEN resolvable.all_delivered \
+                     THEN COALESCE(opportunity.shown_at, resolvable.transition_at) \
+                     ELSE opportunity.shown_at END, \
+                 delivery_failed_at = CASE WHEN resolvable.all_delivered THEN NULL \
+                     ELSE COALESCE(opportunity.delivery_failed_at, resolvable.transition_at) END, \
+                 delivery_error = CASE WHEN resolvable.all_delivered THEN NULL \
+                     WHEN resolvable.has_rows THEN 'Telegram batch reached a terminal non-delivered state' \
+                     ELSE 'delivery preparation lease expired' END, \
+                 updated_at = GREATEST(opportunity.updated_at, resolvable.transition_at) \
+             FROM resolvable WHERE opportunity.id = resolvable.id",
+        )
+        .bind(&input.integration_kind)
+        .bind(input.user_id)
+        .bind(input.completed_at - PENDING_DELIVERY_PREPARATION_LEASE)
+        .bind(input.completed_at)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
     pub async fn reserve_opportunity(
         &self,
         input: GradiusAdOpportunityInput,
@@ -276,6 +340,9 @@ impl PostgresGradiusAdStore {
             return Ok(reservation);
         }
 
+        self.reconcile_pending_deliveries(&mut transaction, &input)
+            .await?;
+
         let previous = sqlx::query(
             "SELECT interaction_started_at, completed_at, completed_answers \
              FROM gradius_ad_opportunities \
@@ -297,6 +364,9 @@ impl PostgresGradiusAdStore {
 
         let limits = sqlx::query(
             "SELECT COUNT(*) FILTER (WHERE shown_at > $3)::BIGINT AS shown_last_24_hours, \
+                    COUNT(*) FILTER (WHERE outcome = 'ad' \
+                        AND delivery_state IN ('prepared', 'queued'))::BIGINT \
+                        AS pending_delivery_count, \
                     MAX(shown_at) AS last_shown_at, MAX(attempt_reserved_at) AS last_attempt_at \
              FROM gradius_ad_opportunities WHERE integration_kind = $1 AND user_id = $2",
         )
@@ -310,6 +380,7 @@ impl PostgresGradiusAdStore {
             interaction_started_at: interaction.started_at,
             completed_answers: interaction.completed_answers,
             shown_last_24_hours: limits.get("shown_last_24_hours"),
+            pending_delivery_count: limits.get("pending_delivery_count"),
             last_shown_at: limits.get("last_shown_at"),
             last_attempt_at: limits.get("last_attempt_at"),
         };
@@ -920,6 +991,7 @@ const fn ineligibility_reason(reason: GradiusAdIneligibility) -> &'static str {
     match reason {
         GradiusAdIneligibility::InteractionThreshold => "interaction_threshold",
         GradiusAdIneligibility::UserDailyCap => "user_daily_cap",
+        GradiusAdIneligibility::PendingDelivery => "pending_delivery",
         GradiusAdIneligibility::UserImpressionGap => "user_impression_gap",
         GradiusAdIneligibility::AttemptCooldown => "attempt_cooldown",
     }
@@ -929,6 +1001,7 @@ fn parse_ineligibility_reason(value: &str) -> Option<GradiusAdIneligibility> {
     match value {
         "interaction_threshold" => Some(GradiusAdIneligibility::InteractionThreshold),
         "user_daily_cap" => Some(GradiusAdIneligibility::UserDailyCap),
+        "pending_delivery" => Some(GradiusAdIneligibility::PendingDelivery),
         "user_impression_gap" => Some(GradiusAdIneligibility::UserImpressionGap),
         "attempt_cooldown" => Some(GradiusAdIneligibility::AttemptCooldown),
         _ => None,
@@ -988,6 +1061,7 @@ mod tests {
             interaction_started_at: at(1),
             completed_answers: 2,
             shown_last_24_hours: 0,
+            pending_delivery_count: 0,
             last_shown_at: None,
             last_attempt_at: None,
         };
@@ -1003,23 +1077,38 @@ mod tests {
     }
 
     #[test]
-    fn user_cap_gap_and_attempt_cooldown_are_enforced_at_the_boundary() {
+    fn ten_ad_cap_and_hourly_gap_are_enforced_at_the_boundary() {
         let policy = GradiusAdPolicy::default();
         let base = GradiusAdEligibilityInput {
             now: at(100_000),
             interaction_started_at: at(99_000),
             completed_answers: 3,
             shown_last_24_hours: 0,
+            pending_delivery_count: 0,
             last_shown_at: None,
             last_attempt_at: None,
         };
 
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
-                shown_last_24_hours: 5,
+                shown_last_24_hours: 9,
+                ..base
+            }),
+            None
+        );
+        assert_eq!(
+            policy.ineligibility(&GradiusAdEligibilityInput {
+                shown_last_24_hours: 10,
                 ..base
             }),
             Some(GradiusAdIneligibility::UserDailyCap)
+        );
+        assert_eq!(
+            policy.ineligibility(&GradiusAdEligibilityInput {
+                pending_delivery_count: 1,
+                ..base
+            }),
+            Some(GradiusAdIneligibility::PendingDelivery)
         );
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
@@ -1031,16 +1120,25 @@ mod tests {
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
                 last_shown_at: Some(base.now - Duration::hours(1)),
-                last_attempt_at: Some(base.now - Duration::minutes(5) + Duration::seconds(1)),
                 ..base
             }),
-            Some(GradiusAdIneligibility::AttemptCooldown)
+            None
         );
+    }
+
+    #[test]
+    fn recent_attempt_does_not_block_an_eligible_opportunity() {
+        let policy = GradiusAdPolicy::default();
+
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
-                last_shown_at: Some(base.now - Duration::hours(1)),
-                last_attempt_at: Some(base.now - Duration::minutes(5)),
-                ..base
+                now: at(100_000),
+                interaction_started_at: at(99_000),
+                completed_answers: 3,
+                shown_last_24_hours: 0,
+                pending_delivery_count: 0,
+                last_shown_at: None,
+                last_attempt_at: Some(at(100_000)),
             }),
             None
         );
@@ -1359,6 +1457,475 @@ mod tests {
                 ..
             }
         ));
+
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_store_holds_one_slot_until_ad_delivery_is_terminal()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let user_id = 9_820_825_501_i64;
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_outbox WHERE dialog_job_id BETWEEN $1 AND $2")
+            .bind(9_820_825_500_i64)
+            .bind(9_820_825_599_i64)
+            .execute(&pool)
+            .await?;
+        let store = PostgresGradiusAdStore::new(pool.clone());
+
+        for answer in 1..=2_i64 {
+            let reservation = store
+                .reserve_opportunity(GradiusAdOpportunityInput {
+                    opportunity_key: format!("dialog-job:{}", 9_820_825_500 + answer),
+                    attempt_key: format!("pending-slot-claim-{answer}"),
+                    dialog_job_id: Some(9_820_825_500 + answer),
+                    integration_kind: "native_dialogue".to_owned(),
+                    user_id,
+                    chat_id: user_id,
+                    thread_id: 0,
+                    model_version: None,
+                    completed_at: at(20_000 + answer),
+                })
+                .await?;
+            assert!(matches!(
+                reservation,
+                GradiusAdReservation::Ineligible {
+                    reason: GradiusAdIneligibility::InteractionThreshold,
+                    ..
+                }
+            ));
+        }
+
+        let third = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825503".to_owned(),
+                attempt_key: "pending-slot-claim-3".to_owned(),
+                dialog_job_id: Some(9_820_825_503),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_003),
+            })
+            .await?;
+        let third_id = third.opportunity_id();
+        let third_generation = match third {
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
+            other => panic!("expected third answer reservation, got {other:?}"),
+        };
+        store
+            .finish_ad(
+                third_id,
+                third_generation,
+                GradiusStoredAd {
+                    markdown: "ad".to_owned(),
+                    rendered_html: "ad".to_owned(),
+                    selected_placement: json!({"type": "native-text-ad"}),
+                    insert_index: Some(2),
+                    show_price: None,
+                    click_price: None,
+                    prepared_at: at(20_003),
+                    shown_at: None,
+                },
+            )
+            .await?;
+
+        let fourth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825504".to_owned(),
+                attempt_key: "pending-slot-claim-4".to_owned(),
+                dialog_job_id: Some(9_820_825_504),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_004),
+            })
+            .await?;
+        assert!(matches!(fourth, GradiusAdReservation::Ineligible { .. }));
+        let fourth_reason: Option<String> = sqlx::query_scalar(
+            "SELECT ineligibility_reason FROM gradius_ad_opportunities WHERE id = $1",
+        )
+        .bind(fourth.opportunity_id())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(fourth_reason.as_deref(), Some("pending_delivery"));
+
+        assert!(
+            store
+                .mark_delivery_failed(third_id, "telegram rejected batch", at(20_005))
+                .await?
+        );
+        let fifth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825505".to_owned(),
+                attempt_key: "pending-slot-claim-5".to_owned(),
+                dialog_job_id: Some(9_820_825_505),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_005),
+            })
+            .await?;
+        let fifth_id = fifth.opportunity_id();
+        let fifth_generation = match fifth {
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
+            other => panic!("expected reservation after terminal delivery failure, got {other:?}"),
+        };
+        store
+            .finish_no_ad(fifth_id, fifth_generation, at(20_005))
+            .await?;
+        let sixth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825506".to_owned(),
+                attempt_key: "pending-slot-claim-6".to_owned(),
+                dialog_job_id: Some(9_820_825_506),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_005),
+            })
+            .await?;
+        let sixth_id = sixth.opportunity_id();
+        let sixth_generation = match sixth {
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
+            other => panic!("expected immediate reservation after no-ad, got {other:?}"),
+        };
+        store
+            .finish_ad(
+                sixth_id,
+                sixth_generation,
+                GradiusStoredAd {
+                    markdown: "stale ad".to_owned(),
+                    rendered_html: "stale ad".to_owned(),
+                    selected_placement: json!({"type": "native-text-ad"}),
+                    insert_index: Some(2),
+                    show_price: None,
+                    click_price: None,
+                    prepared_at: at(20_005),
+                    shown_at: None,
+                },
+            )
+            .await?;
+
+        let seventh = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825507".to_owned(),
+                attempt_key: "pending-slot-claim-7".to_owned(),
+                dialog_job_id: Some(9_820_825_507),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_904),
+            })
+            .await?;
+        assert!(matches!(
+            seventh,
+            GradiusAdReservation::Ineligible {
+                reason: GradiusAdIneligibility::PendingDelivery,
+                ..
+            }
+        ));
+
+        let eighth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825508".to_owned(),
+                attempt_key: "pending-slot-claim-8".to_owned(),
+                dialog_job_id: Some(9_820_825_508),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(20_905),
+            })
+            .await?;
+        let eighth_id = eighth.opportunity_id();
+        let eighth_generation = match eighth {
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
+            other => panic!("expected stale prepared slot to expire, got {other:?}"),
+        };
+        let stale_delivery: (String, Option<String>) = sqlx::query_as(
+            "SELECT delivery_state, delivery_error FROM gradius_ad_opportunities WHERE id = $1",
+        )
+        .bind(sixth_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stale_delivery.0, "failed");
+        assert_eq!(
+            stale_delivery.1.as_deref(),
+            Some("delivery preparation lease expired")
+        );
+
+        store
+            .finish_ad(
+                eighth_id,
+                eighth_generation,
+                GradiusStoredAd {
+                    markdown: "recovered ad".to_owned(),
+                    rendered_html: "recovered ad".to_owned(),
+                    selected_placement: json!({"type": "native-text-ad"}),
+                    insert_index: Some(2),
+                    show_price: None,
+                    click_price: None,
+                    prepared_at: at(20_905),
+                    shown_at: None,
+                },
+            )
+            .await?;
+        let recovered_batch_id = "dialog-answer:v1:recovered:9820825508";
+        sqlx::query(
+            "INSERT INTO telegram_outbox (operation_id, batch_id, part_index, bot_id, chat_id, \
+                 thread_id, ordering_key, dialog_job_id, method_kind, payload_version, \
+                 original_payload, payload, delivery_policy, state, created_at, updated_at) \
+             VALUES ($1, $2, 0, 1, $3, 0, $4, $5, 'send_message', 1, '{}'::jsonb, \
+                 '{}'::jsonb, 'create', 'pending', $6, $6)",
+        )
+        .bind("pending-slot-recovered-operation")
+        .bind(recovered_batch_id)
+        .bind(user_id)
+        .bind(format!("chat:{user_id}:thread:0"))
+        .bind(9_820_825_508_i64)
+        .bind(at(20_906))
+        .execute(&pool)
+        .await?;
+
+        let ninth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825509".to_owned(),
+                attempt_key: "pending-slot-claim-9".to_owned(),
+                dialog_job_id: Some(9_820_825_509),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(21_806),
+            })
+            .await?;
+        assert!(matches!(
+            ninth,
+            GradiusAdReservation::Ineligible {
+                reason: GradiusAdIneligibility::PendingDelivery,
+                ..
+            }
+        ));
+        sqlx::query(
+            "UPDATE telegram_outbox SET state = 'delivered', receipt = '{}'::jsonb, \
+                 confirmed_at = $2, updated_at = $2 WHERE operation_id = $1",
+        )
+        .bind("pending-slot-recovered-operation")
+        .bind(at(21_807))
+        .execute(&pool)
+        .await?;
+        let tenth = store
+            .reserve_opportunity(GradiusAdOpportunityInput {
+                opportunity_key: "dialog-job:9820825510".to_owned(),
+                attempt_key: "pending-slot-claim-10".to_owned(),
+                dialog_job_id: Some(9_820_825_510),
+                integration_kind: "native_dialogue".to_owned(),
+                user_id,
+                chat_id: user_id,
+                thread_id: 0,
+                model_version: None,
+                completed_at: at(21_808),
+            })
+            .await?;
+        assert!(matches!(
+            tenth,
+            GradiusAdReservation::Ineligible {
+                reason: GradiusAdIneligibility::UserImpressionGap,
+                ..
+            }
+        ));
+        let recovered_delivery: (String, Option<String>, Option<OffsetDateTime>) = sqlx::query_as(
+            "SELECT delivery_state, outbox_batch_id, shown_at \
+                 FROM gradius_ad_opportunities WHERE id = $1",
+        )
+        .bind(eighth_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            recovered_delivery,
+            (
+                "delivered".to_owned(),
+                Some(recovered_batch_id.to_owned()),
+                Some(at(21_807))
+            )
+        );
+
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_outbox WHERE dialog_job_id BETWEEN $1 AND $2")
+            .bind(9_820_825_500_i64)
+            .bind(9_820_825_599_i64)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_store_enforces_ten_deliveries_per_surface_in_rolling_day()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let user_id = 9_820_825_701_i64;
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        let store = PostgresGradiusAdStore::new(pool.clone());
+
+        for impression in 0..=10_i64 {
+            let interaction_start = 100_000 + impression * 3_602;
+            for answer in 0..2_i64 {
+                let reservation = store
+                    .reserve_opportunity(GradiusAdOpportunityInput {
+                        opportunity_key: format!("cap-dialog-{impression}-{answer}"),
+                        attempt_key: format!("cap-dialog-claim-{impression}-{answer}"),
+                        dialog_job_id: Some(9_820_826_000 + impression * 3 + answer),
+                        integration_kind: "native_dialogue".to_owned(),
+                        user_id,
+                        chat_id: user_id,
+                        thread_id: 0,
+                        model_version: None,
+                        completed_at: at(interaction_start + answer),
+                    })
+                    .await?;
+                assert!(matches!(
+                    reservation,
+                    GradiusAdReservation::Ineligible {
+                        reason: GradiusAdIneligibility::InteractionThreshold,
+                        ..
+                    }
+                ));
+            }
+
+            let completed_at = at(interaction_start + 2);
+            let reservation = store
+                .reserve_opportunity(GradiusAdOpportunityInput {
+                    opportunity_key: format!("cap-dialog-{impression}-2"),
+                    attempt_key: format!("cap-dialog-claim-{impression}-2"),
+                    dialog_job_id: Some(9_820_826_000 + impression * 3 + 2),
+                    integration_kind: "native_dialogue".to_owned(),
+                    user_id,
+                    chat_id: user_id,
+                    thread_id: 0,
+                    model_version: None,
+                    completed_at,
+                })
+                .await?;
+            if impression == 10 {
+                assert!(matches!(
+                    reservation,
+                    GradiusAdReservation::Ineligible {
+                        reason: GradiusAdIneligibility::UserDailyCap,
+                        ..
+                    }
+                ));
+                continue;
+            }
+
+            let opportunity_id = reservation.opportunity_id();
+            let attempt_generation = match reservation {
+                GradiusAdReservation::Reserved {
+                    attempt_generation, ..
+                } => attempt_generation,
+                other => panic!("expected impression {impression} reservation, got {other:?}"),
+            };
+            store
+                .finish_ad(
+                    opportunity_id,
+                    attempt_generation,
+                    GradiusStoredAd {
+                        markdown: "ad".to_owned(),
+                        rendered_html: "ad".to_owned(),
+                        selected_placement: json!({"type": "native-text-ad"}),
+                        insert_index: Some(2),
+                        show_price: None,
+                        click_price: None,
+                        prepared_at: completed_at,
+                        shown_at: None,
+                    },
+                )
+                .await?;
+            let batch_id = format!("cap-dialog-batch-{impression}");
+            store
+                .mark_queued(opportunity_id, &batch_id, completed_at)
+                .await?;
+            assert!(
+                store
+                    .mark_delivered_by_batch(&batch_id, completed_at)
+                    .await?
+            );
+        }
+
+        let other_surface_start = 140_000;
+        for answer in 0..3_i64 {
+            let reservation = store
+                .reserve_opportunity(GradiusAdOpportunityInput {
+                    opportunity_key: format!("cap-generation-{answer}"),
+                    attempt_key: format!("cap-generation-claim-{answer}"),
+                    dialog_job_id: Some(9_820_826_100 + answer),
+                    integration_kind: "native_generation".to_owned(),
+                    user_id,
+                    chat_id: user_id,
+                    thread_id: 0,
+                    model_version: None,
+                    completed_at: at(other_surface_start + answer),
+                })
+                .await?;
+            if answer < 2 {
+                assert!(matches!(
+                    reservation,
+                    GradiusAdReservation::Ineligible {
+                        reason: GradiusAdIneligibility::InteractionThreshold,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(reservation, GradiusAdReservation::Reserved { .. }));
+            }
+        }
 
         sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
             .bind(user_id)
