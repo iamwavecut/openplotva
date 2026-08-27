@@ -17,6 +17,7 @@ pub struct GradiusAdEligibilityInput {
     pub completed_answers: i32,
     pub shown_last_24_hours: i64,
     pub last_shown_at: Option<OffsetDateTime>,
+    /// Latest attempt timestamp retained for policy diagnostics, not an eligibility gate.
     pub last_attempt_at: Option<OffsetDateTime>,
 }
 
@@ -25,6 +26,7 @@ pub enum GradiusAdIneligibility {
     InteractionThreshold,
     UserDailyCap,
     UserImpressionGap,
+    /// Historical persisted outcome retained for audit compatibility.
     AttemptCooldown,
 }
 
@@ -35,7 +37,6 @@ pub struct GradiusAdPolicy {
     minimum_interaction_age: Duration,
     user_daily_cap: i64,
     user_impression_gap: Duration,
-    attempt_cooldown: Duration,
 }
 
 impl Default for GradiusAdPolicy {
@@ -44,9 +45,8 @@ impl Default for GradiusAdPolicy {
             interaction_timeout: Duration::minutes(30),
             minimum_completed_answers: 3,
             minimum_interaction_age: Duration::minutes(5),
-            user_daily_cap: 5,
+            user_daily_cap: 10,
             user_impression_gap: Duration::hours(1),
-            attempt_cooldown: Duration::minutes(5),
         }
     }
 }
@@ -93,12 +93,6 @@ impl GradiusAdPolicy {
             .is_some_and(|last| input.now - last < self.user_impression_gap)
         {
             return Some(GradiusAdIneligibility::UserImpressionGap);
-        }
-        if input
-            .last_attempt_at
-            .is_some_and(|last| input.now - last < self.attempt_cooldown)
-        {
-            return Some(GradiusAdIneligibility::AttemptCooldown);
         }
         None
     }
@@ -1003,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn user_cap_gap_and_attempt_cooldown_are_enforced_at_the_boundary() {
+    fn ten_ad_cap_and_hourly_gap_are_enforced_at_the_boundary() {
         let policy = GradiusAdPolicy::default();
         let base = GradiusAdEligibilityInput {
             now: at(100_000),
@@ -1016,7 +1010,14 @@ mod tests {
 
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
-                shown_last_24_hours: 5,
+                shown_last_24_hours: 9,
+                ..base
+            }),
+            None
+        );
+        assert_eq!(
+            policy.ineligibility(&GradiusAdEligibilityInput {
+                shown_last_24_hours: 10,
                 ..base
             }),
             Some(GradiusAdIneligibility::UserDailyCap)
@@ -1031,16 +1032,24 @@ mod tests {
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
                 last_shown_at: Some(base.now - Duration::hours(1)),
-                last_attempt_at: Some(base.now - Duration::minutes(5) + Duration::seconds(1)),
                 ..base
             }),
-            Some(GradiusAdIneligibility::AttemptCooldown)
+            None
         );
+    }
+
+    #[test]
+    fn recent_attempt_does_not_block_an_eligible_opportunity() {
+        let policy = GradiusAdPolicy::default();
+
         assert_eq!(
             policy.ineligibility(&GradiusAdEligibilityInput {
-                last_shown_at: Some(base.now - Duration::hours(1)),
-                last_attempt_at: Some(base.now - Duration::minutes(5)),
-                ..base
+                now: at(100_000),
+                interaction_started_at: at(99_000),
+                completed_answers: 3,
+                shown_last_24_hours: 0,
+                last_shown_at: None,
+                last_attempt_at: Some(at(100_000)),
             }),
             None
         );
