@@ -39,7 +39,12 @@ pub async fn dispatch_dialog_tool(
                 .await
         }
         STEP_GENERATE_SONG => {
-            if step.topic.trim().is_empty() {
+            // Small dialog models sometimes call the tool with no topic at all
+            // (observed live: input {"step": "generate_song"}) and then narrate
+            // a phantom success over the failure. The user's own message is a
+            // perfectly good topic, so fall back to it like web_search does.
+            let topic = non_empty_or(&step.topic, &meta.message_text);
+            if topic.trim().is_empty() {
                 return Ok(ToolResult::failed(
                     "generate_song_topic_empty",
                     "generate_song topic is empty",
@@ -48,7 +53,7 @@ pub async fn dispatch_dialog_tool(
             toolbox
                 .generate_song(SongRequest {
                     context: meta.clone(),
-                    topic: step.topic.clone(),
+                    topic,
                 })
                 .await
         }
@@ -180,5 +185,73 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
         fallback.trim().to_owned()
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+    use crate::{DialogToolbox, SongRequest, ToolResult, ToolboxFuture};
+
+    /// The dispatch path with a mock toolbox never actually suspends.
+    fn poll_ready<T>(future: impl Future<Output = T>) -> T {
+        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("dispatch future suspended in a sync test"),
+        }
+    }
+
+    #[derive(Default)]
+    struct TopicRecorder {
+        topics: Mutex<Vec<String>>,
+    }
+
+    impl DialogToolbox for TopicRecorder {
+        fn generate_song<'a>(&'a self, req: SongRequest) -> ToolboxFuture<'a> {
+            self.topics.lock().expect("recorder lock").push(req.topic);
+            Box::pin(async { Ok(ToolResult::failed("test_sink", "recorded")) })
+        }
+    }
+
+    #[test]
+    fn generate_song_falls_back_to_the_message_text() {
+        let toolbox = TopicRecorder::default();
+        let meta = ToolContext {
+            message_text: "напиши драмнбейс трек про колобка".to_owned(),
+            ..ToolContext::default()
+        };
+        let step = ToolStep {
+            step: STEP_GENERATE_SONG.to_owned(),
+            ..ToolStep::default()
+        };
+        poll_ready(dispatch_dialog_tool(&toolbox, &meta, &step)).expect("dispatch");
+        assert_eq!(
+            toolbox.topics.lock().expect("recorder lock").as_slice(),
+            ["напиши драмнбейс трек про колобка"]
+        );
+    }
+
+    #[test]
+    fn generate_song_still_fails_with_no_topic_anywhere() {
+        let toolbox = TopicRecorder::default();
+        let result = poll_ready(dispatch_dialog_tool(
+            &toolbox,
+            &ToolContext::default(),
+            &ToolStep {
+                step: STEP_GENERATE_SONG.to_owned(),
+                ..ToolStep::default()
+            },
+        ))
+        .expect("dispatch");
+        assert_eq!(
+            result.error.as_ref().map(|e| e.code.as_str()),
+            Some("generate_song_topic_empty")
+        );
+        assert!(toolbox.topics.lock().expect("recorder lock").is_empty());
     }
 }
