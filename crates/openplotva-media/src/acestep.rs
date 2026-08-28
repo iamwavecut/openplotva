@@ -664,7 +664,7 @@ pub fn normalize_song_prompt_payload(
     let style = normalize_song_style(&raw_style);
     if style.is_empty() {
         return Err(AceStepError::InvalidResponse(
-            "song style is invalid".to_owned(),
+            SONG_STYLE_INVALID_REJECTION.to_owned(),
         ));
     }
     result.raw_style = raw_style;
@@ -672,16 +672,36 @@ pub fn normalize_song_prompt_payload(
     let lyrics = normalize_song_lyrics(&payload.lyrics);
     if lyrics.is_empty() {
         return Err(AceStepError::InvalidResponse(
-            "song lyrics are empty".to_owned(),
+            SONG_LYRICS_EMPTY_REJECTION.to_owned(),
         ));
     }
     if !has_song_minimum_structure(&lyrics) {
         return Err(AceStepError::InvalidResponse(
-            "song lyrics do not satisfy minimum structure".to_owned(),
+            SONG_LYRICS_STRUCTURE_REJECTION.to_owned(),
         ));
     }
     result.lyrics = lyrics;
     Ok(result)
+}
+
+pub const SONG_STYLE_INVALID_REJECTION: &str = "song style is invalid";
+pub const SONG_LYRICS_EMPTY_REJECTION: &str = "song lyrics are empty";
+pub const SONG_LYRICS_STRUCTURE_REJECTION: &str = "song lyrics do not satisfy minimum structure";
+
+/// The model answered but produced unusable song material. Retry classifiers
+/// key off these markers to fall through to another routed model; keeping them
+/// as the same constants the validator throws makes that contract compile-time.
+pub const INVALID_SONG_MATERIAL_MARKERS: &[&str] = &[
+    SONG_STYLE_INVALID_REJECTION,
+    SONG_LYRICS_EMPTY_REJECTION,
+    SONG_LYRICS_STRUCTURE_REJECTION,
+];
+
+#[must_use]
+pub fn is_invalid_song_material_message(message: &str) -> bool {
+    INVALID_SONG_MATERIAL_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 pub fn decode_song_prompt_payload(

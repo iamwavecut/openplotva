@@ -394,25 +394,15 @@ async fn build_song_prompt_with_attempt_and_prompt_store(
     generator.build_song_prompt(request).await
 }
 
-// The song material validator's stable rejection markers
-// (openplotva-media/src/acestep.rs, normalize_song_prompt_payload): the model
-// answered but the material is unusable. Observed live: Gemma's first sample
-// missed the Verse 1/Verse 2/2x Chorus gate and the whole job died terminally
-// instead of falling through to the next routed model.
-const INVALID_SONG_MATERIAL_MARKERS: &[&str] = &[
-    "song lyrics do not satisfy minimum structure",
-    "song lyrics are empty",
-    "song style is invalid",
-];
-
 fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
     match error {
         MusicGenerationError::EmptyTopic | MusicGenerationError::Provider(_) => None,
         MusicGenerationError::Material(message) => {
-            if INVALID_SONG_MATERIAL_MARKERS
-                .iter()
-                .any(|marker| message.contains(marker))
-            {
+            // The model answered but the material failed the validator
+            // (observed live: Gemma's first sample missed the structural
+            // gate and the job died terminally). Fall through to the next
+            // routed model instead.
+            if openplotva_media::acestep::is_invalid_song_material_message(message) {
                 return Some(FailureReason::ProviderProtocolError);
             }
             retryable_reason_from_message(message)
