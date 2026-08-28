@@ -64,7 +64,7 @@ def configure_settings(pr_url: str) -> None:
 
     apply_repo_settings(pr_url)
 
-    settings.set("CONFIG.MODEL", os.environ.get("PR_AGENT_MODEL", "openai/glm-5.2"))
+    settings.set("CONFIG.MODEL", os.environ.get("PR_AGENT_MODEL", "openai/glm-5.3"))
     settings.set("CONFIG.FALLBACK_MODELS", env_json_list("PR_AGENT_FALLBACK_MODELS", []))
     settings.set("CONFIG.AI_TIMEOUT", env_int("PR_AGENT_AI_TIMEOUT", 600))
     settings.set("CONFIG.REASONING_EFFORT", os.environ.get("PR_AGENT_REASONING_EFFORT", "low"))
