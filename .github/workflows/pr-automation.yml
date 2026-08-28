@@ -63,6 +63,7 @@ jobs:
         id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
           PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -107,7 +108,7 @@ jobs:
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
           OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
           OPENAI__API_BASE: ${{ secrets.PR_AGENT_OPENAI_BASE_URL }}
-          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.2' }}
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.3' }}
           PR_AGENT_FALLBACK_MODELS: ${{ vars.PR_AGENT_FALLBACK_MODELS || '[]' }}
           PR_AGENT_AI_TIMEOUT: ${{ vars.PR_AGENT_AI_TIMEOUT || '600' }}
           PR_AGENT_REASONING_EFFORT: ${{ vars.PR_AGENT_REASONING_EFFORT || 'low' }}
