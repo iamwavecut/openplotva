@@ -394,10 +394,29 @@ async fn build_song_prompt_with_attempt_and_prompt_store(
     generator.build_song_prompt(request).await
 }
 
+// The song material validator's stable rejection markers
+// (openplotva-media/src/acestep.rs, normalize_song_prompt_payload): the model
+// answered but the material is unusable. Observed live: Gemma's first sample
+// missed the Verse 1/Verse 2/2x Chorus gate and the whole job died terminally
+// instead of falling through to the next routed model.
+const INVALID_SONG_MATERIAL_MARKERS: &[&str] = &[
+    "song lyrics do not satisfy minimum structure",
+    "song lyrics are empty",
+    "song style is invalid",
+];
+
 fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
     match error {
         MusicGenerationError::EmptyTopic | MusicGenerationError::Provider(_) => None,
-        MusicGenerationError::Material(message) => retryable_reason_from_message(message),
+        MusicGenerationError::Material(message) => {
+            if INVALID_SONG_MATERIAL_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker))
+            {
+                return Some(FailureReason::ProviderProtocolError);
+            }
+            retryable_reason_from_message(message)
+        }
     }
 }
 
@@ -1833,6 +1852,26 @@ mod tests {
         error::Error,
         sync::{Arc, Mutex, MutexGuard},
     };
+
+    #[test]
+    fn invalid_song_material_falls_through_to_the_next_routed_model() {
+        use openplotva_llm::retry::FailureReason;
+
+        use super::{MusicGenerationError, song_prompt_retryable_reason};
+
+        let error = MusicGenerationError::Material(
+            "song reprompt failed: song reprompt: song lyrics do not satisfy minimum structure"
+                .to_owned(),
+        );
+        assert_eq!(
+            song_prompt_retryable_reason(&error),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        let unrelated = MusicGenerationError::Material("some other material problem".to_owned());
+        assert_eq!(song_prompt_retryable_reason(&unrelated), None);
+        let provider = MusicGenerationError::Provider("capacity unavailable".to_owned());
+        assert_eq!(song_prompt_retryable_reason(&provider), None);
+    }
 
     use openplotva_taskman::{
         DEFAULT_LLM_JOB_MAX_ATTEMPTS, HIGHEST_PRIORITY, JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE,
