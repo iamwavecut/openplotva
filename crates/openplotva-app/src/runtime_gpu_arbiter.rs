@@ -202,8 +202,14 @@ fn parse_range(range: &str) -> (time::Duration, &'static str) {
 }
 
 fn parse_duration(value: &str) -> Option<time::Duration> {
+    // Cap before constructing: time::Duration::hours/days panic on i64 overflow,
+    // and everything above the cap collapses to MAX_RANGE anyway.
+    const MAX_AMOUNT: i64 = 100_000;
     let (number, unit) = value.split_at(value.len().checked_sub(1)?);
-    let amount = number.parse::<i64>().ok().filter(|amount| *amount > 0)?;
+    let amount = number
+        .parse::<i64>()
+        .ok()
+        .filter(|amount| (1..=MAX_AMOUNT).contains(amount))?;
     match unit {
         "h" => Some(time::Duration::hours(amount)),
         "d" => Some(time::Duration::days(amount)),
@@ -252,6 +258,10 @@ mod tests {
         assert_eq!(parse_range("7d"), (time::Duration::days(7), "day"));
         assert_eq!(parse_range("90d"), (time::Duration::days(14), "day"));
         assert_eq!(parse_range("nonsense"), (time::Duration::hours(72), "day"));
+        assert_eq!(
+            parse_range("999999999999999999d"),
+            (time::Duration::hours(72), "day")
+        );
     }
 
     #[test]
