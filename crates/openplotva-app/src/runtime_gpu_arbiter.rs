@@ -10,7 +10,8 @@ use std::time::Duration as StdDuration;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use openplotva_llm::aifarm::{
-    DiscoveryInvocation, DiscoveryJobEnvelope, DiscoveryJobRequest, decode_discovery_body,
+    DiscoveryInvocation, DiscoveryJob, DiscoveryJobEnvelope, DiscoveryJobRequest,
+    decode_discovery_body,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -23,6 +24,10 @@ const GPU_BUTLER_SERVICE_NAME: &str = "gpu-butler";
 const GPU_BUTLER_ENDPOINT_NAME: &str = "status";
 const GPU_BUTLER_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const GPU_BUTLER_UPSTREAM_TIMEOUT_MS: i32 = 2_500;
+// Discovery's blocking submit waits for capacity, not completion, so a queued
+// envelope is normal; a few short polls fetch the terminal state.
+const GPU_BUTLER_POLLS: u32 = 5;
+const GPU_BUTLER_POLL_DELAY: StdDuration = StdDuration::from_millis(300);
 const DEFAULT_RANGE: time::Duration = time::Duration::hours(72);
 const MAX_RANGE: time::Duration = time::Duration::days(14);
 const HOUR_BUCKET_MAX: time::Duration = time::Duration::days(2);
@@ -124,29 +129,47 @@ impl GpuArbiterReader {
             Ok(envelope) => envelope,
             Err(error) => return section_error(format!("decode discovery envelope: {error}")),
         };
-        let job = envelope.resolve_job();
-        let state = job.resolved_status().to_ascii_uppercase();
-        if !state.contains("SUCC") {
-            return section_error(format!("discovery job state {state}"));
+        let mut job = envelope.resolve_job();
+        let mut state = job.resolved_status().to_ascii_uppercase();
+        let job_id = job.resolved_id().trim().to_owned();
+        let mut polls = 0;
+        while !state.contains("SUCC")
+            && !state.contains("FAIL")
+            && !state.contains("CANCEL")
+            && !job_id.is_empty()
+            && polls < GPU_BUTLER_POLLS
+        {
+            polls += 1;
+            tokio::time::sleep(GPU_BUTLER_POLL_DELAY).await;
+            let poll_url = format!(
+                "{}/v1/jobs/{}",
+                self.discovery_base_url.trim_end_matches('/'),
+                job_id
+            );
+            let response = match self
+                .http
+                .get(poll_url)
+                .timeout(GPU_BUTLER_HTTP_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return section_error(format!("discovery poll failed: {error}")),
+            };
+            if !response.status().is_success() {
+                return section_error(format!("discovery poll answered {}", response.status()));
+            }
+            match response.json::<DiscoveryJobEnvelope>().await {
+                Ok(envelope) => {
+                    job = envelope.resolve_job();
+                    state = job.resolved_status().to_ascii_uppercase();
+                }
+                Err(error) => {
+                    return section_error(format!("decode discovery poll envelope: {error}"));
+                }
+            }
         }
-        let Some(payload) = job
-            .result
-            .as_ref()
-            .and_then(|result| result.response.clone())
-        else {
-            return section_error("discovery job succeeded without a response payload");
-        };
-        if payload.status_code >= 300 {
-            return section_error(format!("gpu-butler answered {}", payload.status_code));
-        }
-        let bytes = match decode_discovery_body(&payload.body) {
-            Ok(bytes) => bytes,
-            Err(error) => return section_error(format!("decode gpu-butler body: {error}")),
-        };
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => value,
-            Err(error) => section_error(format!("decode gpu-butler status: {error}")),
-        }
+        succeeded_payload(&job, &state)
     }
 
     async fn asr_fallback(&self, since: OffsetDateTime, bucket: &str) -> Value {
@@ -186,6 +209,30 @@ impl GpuArbiterReader {
 
 fn section_error(message: impl Into<String>) -> Value {
     json!({ "error": message.into() })
+}
+
+fn succeeded_payload(job: &DiscoveryJob, state: &str) -> Value {
+    if !state.contains("SUCC") {
+        return section_error(format!("discovery job state {state}"));
+    }
+    let Some(payload) = job
+        .result
+        .as_ref()
+        .and_then(|result| result.response.clone())
+    else {
+        return section_error("discovery job succeeded without a response payload");
+    };
+    if payload.status_code >= 300 {
+        return section_error(format!("gpu-butler answered {}", payload.status_code));
+    }
+    let bytes = match decode_discovery_body(&payload.body) {
+        Ok(bytes) => bytes,
+        Err(error) => return section_error(format!("decode gpu-butler body: {error}")),
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => section_error(format!("decode gpu-butler status: {error}")),
+    }
 }
 
 fn parse_range(range: &str) -> (time::Duration, &'static str) {
