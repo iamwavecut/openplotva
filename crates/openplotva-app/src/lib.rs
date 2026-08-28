@@ -48,6 +48,7 @@ mod runtime_cache;
 mod runtime_dispatcher;
 mod runtime_entities;
 mod runtime_gemini_cache;
+mod runtime_gpu_arbiter;
 mod runtime_gradius;
 mod runtime_llm;
 mod runtime_llm_analytics;
@@ -926,6 +927,7 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
             "/admin/api/analytics/overview",
             any(admin_analytics_overview),
         )
+        .route("/admin/api/gpu1/status", any(admin_gpu1_status))
         .route("/admin/api/llm/dialogs", any(admin_llm_dialogs))
         .route(
             "/admin/api/llm/dialogs/detail",
@@ -1349,6 +1351,39 @@ async fn admin_analytics_overview(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_analytics_overview_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_gpu1_status(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_gpu1_status_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_gpu1_status_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let range = admin_auth_query_values(raw_query)
+        .remove("range")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let reader = runtime_gpu_arbiter::GpuArbiterReader::new(
+        routes.llm_discovery_base_url.to_string(),
+        routes.postgres.clone(),
+        routes.runtime_sql_timeout_ms,
+    );
+    admin_json_no_cache_response(StatusCode::OK, reader.snapshot(&range).await)
 }
 
 async fn admin_llm_dialogs(
