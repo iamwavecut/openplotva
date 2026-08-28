@@ -202,19 +202,23 @@ fn parse_range(range: &str) -> (time::Duration, &'static str) {
 }
 
 fn parse_duration(value: &str) -> Option<time::Duration> {
-    // Cap before constructing: time::Duration::hours/days panic on i64 overflow,
-    // and everything above the cap collapses to MAX_RANGE anyway.
+    if let Some(number) = value.strip_suffix('h') {
+        return parse_amount(number).map(time::Duration::hours);
+    }
+    if let Some(number) = value.strip_suffix('d') {
+        return parse_amount(number).map(time::Duration::days);
+    }
+    None
+}
+
+// Cap before constructing: time::Duration::hours/days panic on i64 overflow,
+// and everything above the cap collapses to MAX_RANGE anyway.
+fn parse_amount(number: &str) -> Option<i64> {
     const MAX_AMOUNT: i64 = 100_000;
-    let (number, unit) = value.split_at(value.len().checked_sub(1)?);
-    let amount = number
+    number
         .parse::<i64>()
         .ok()
-        .filter(|amount| (1..=MAX_AMOUNT).contains(amount))?;
-    match unit {
-        "h" => Some(time::Duration::hours(amount)),
-        "d" => Some(time::Duration::days(amount)),
-        _ => None,
-    }
+        .filter(|amount| (1..=MAX_AMOUNT).contains(amount))
 }
 
 fn get_i64(row: &PgRow, column: &str) -> i64 {
@@ -262,6 +266,11 @@ mod tests {
             parse_range("999999999999999999d"),
             (time::Duration::hours(72), "day")
         );
+        assert_eq!(
+            parse_range("24h\u{1f642}"),
+            (time::Duration::hours(72), "day")
+        );
+        assert_eq!(parse_range("\u{65e5}"), (time::Duration::hours(72), "day"));
     }
 
     #[test]
