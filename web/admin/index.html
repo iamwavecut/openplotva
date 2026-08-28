@@ -44,6 +44,7 @@
                     <pl-button variant="nav" data-tab="taskman" data-action="switchTab" data-args='["taskman"]'><i class="ti ti-list-check" aria-hidden="true"></i><span>Tasks</span></pl-button>
                     <pl-button variant="nav" data-tab="redis" data-action="switchTab" data-args='["redis"]'><i class="ti ti-database" aria-hidden="true"></i><span>Redis</span></pl-button>
                     <pl-button variant="nav" data-tab="logs" data-action="switchTab" data-args='["logs"]'><i class="ti ti-terminal-2" aria-hidden="true"></i><span>Logs</span></pl-button>
+                    <pl-button variant="nav" data-tab="gpu1" data-action="switchTab" data-args='["gpu1"]'><i class="ti ti-cpu" aria-hidden="true"></i><span>GPU1 Arbiter</span></pl-button>
                 </div>
                 <div class="nav-group">
                     <div class="nav-group-label">Community</div>
@@ -1164,6 +1165,48 @@
                         <div id="mp-graph" class="mp-view mp-hidden" data-testid="mp-graph"></div>
                     </div>
 
+                    <div id="gpu1" class="tab-pane">
+                        <div class="an-topbar">
+                            <div>
+                                <span class="an-title">GPU1 Arbiter</span>
+                                <span id="gpu1-updated" class="an-updated"></span>
+                            </div>
+                            <div class="an-controls">
+                                <pl-select id="gpu1-range" class="w-range" aria-label="ASR trendline range">
+                                    <option value="24h">24h</option>
+                                    <option value="72h" selected>72h</option>
+                                    <option value="7d">7d</option>
+                                    <option value="14d">14d</option>
+                                </pl-select>
+                                <pl-button variant="outline" size="sm" data-action="loadGpu1" data-args='[true]'>Refresh</pl-button>
+                            </div>
+                        </div>
+
+                        <div id="gpu1-health" class="an-health"></div>
+
+                        <h3 class="an-section-title">VRAM ledger</h3>
+                        <div class="an-grid">
+                            <div class="card an-card">
+                                <div class="card-header">Committed bytes</div>
+                                <div class="card-body" id="gpu1-ledger"></div>
+                            </div>
+                            <div class="card an-card">
+                                <div class="card-header">ASR fallback trend</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="gpu1-asr-chart"></canvas></div></div>
+                            </div>
+                        </div>
+
+                        <h3 class="an-section-title">Grants</h3>
+                        <div class="card">
+                            <div class="card-body"><pl-table id="gpu1-grants" dense></pl-table></div>
+                        </div>
+
+                        <h3 class="an-section-title">Watchdog alarms</h3>
+                        <div class="card">
+                            <div class="card-body"><pl-table id="gpu1-alarms" dense></pl-table></div>
+                        </div>
+                    </div>
+
                     <div id="logs" class="tab-pane">
                         <div class="card logs-card logs-card-fill">
                             <div class="card-header sticky-header logs-header">
@@ -1250,7 +1293,8 @@
                 'gradius': 'Gradius Advertising',
                 'safety': 'Safety Checks',
                 'analytics': 'Analytics',
-                'logs': 'Real-time Logs'
+                'logs': 'Real-time Logs',
+                'gpu1': 'GPU1 Arbiter'
             };
             document.getElementById('page-title').textContent = titles[tabId];
             document.title = `${titles[tabId]} - Plotva Admin`;
@@ -1275,6 +1319,9 @@
             }
             if (tabId === 'analytics') {
                 loadAnalytics(false);
+            }
+            if (tabId === 'gpu1') {
+                loadGpu1(false);
             }
             if (tabId === 'taskman' && typeof loadTaskmanJobs === 'function') {
                 loadTaskmanJobs(false);
@@ -6562,6 +6609,189 @@
 
         function formatAnalyticsCount(value) {
             return Number(value || 0).toLocaleString();
+        }
+
+        // === GPU1 arbiter panel ===
+        const gpu1State = { loading: false, data: null, pollTimer: null, seriesKey: null, wired: false };
+
+        async function gpu1Fetch() {
+            const rangeEl = document.getElementById('gpu1-range');
+            const range = rangeEl ? rangeEl.value : '72h';
+            try {
+                const res = await fetch('/admin/api/gpu1/status?range=' + encodeURIComponent(range));
+                if (!res.ok) return null;
+                return await res.json();
+            } catch (_) { return null; }
+        }
+
+        async function loadGpu1(force) {
+            if (gpu1State.loading) return;
+            gpu1Wire();
+            if (!gpu1State.data || force) {
+                PL.skeleton(document.getElementById('gpu1-health'), { rows: 1 });
+                PL.skeleton(document.getElementById('gpu1-ledger'), { rows: 3 });
+                document.getElementById('gpu1-grants').state = 'loading';
+                document.getElementById('gpu1-alarms').state = 'loading';
+                gpu1State.seriesKey = null;
+            }
+            gpu1State.loading = true;
+            const data = await gpu1Fetch();
+            gpu1State.loading = false;
+            if (!data) {
+                PL.error(document.getElementById('gpu1-health'), {
+                    message: 'Could not load GPU1 arbiter status.',
+                    onRetry: function () { loadGpu1(true); },
+                });
+                gpu1StopPoll();
+                return;
+            }
+            gpu1State.data = data;
+            gpu1Render();
+            gpu1StartPoll();
+        }
+
+        function gpu1Wire() {
+            if (gpu1State.wired) return;
+            gpu1State.wired = true;
+            const range = document.getElementById('gpu1-range');
+            if (range) range.addEventListener('change', function () { loadGpu1(true); });
+        }
+
+        function gpu1StopPoll() {
+            if (gpu1State.pollTimer) { clearTimeout(gpu1State.pollTimer); gpu1State.pollTimer = null; }
+        }
+
+        function gpu1StartPoll() {
+            gpu1StopPoll();
+            gpu1State.pollTimer = setTimeout(async function () {
+                const pane = document.getElementById('gpu1');
+                if (!pane || !pane.classList.contains('active')) { gpu1StopPoll(); return; }
+                await loadGpu1(false);
+            }, 5000);
+        }
+
+        function gpu1Chip(label, value, ok) {
+            return mpEl('div', { class: 'health-item' }, [
+                mpEl('span', { class: 'health-dot ' + (ok ? 'ok' : 'idle') }),
+                mpEl('span', { class: 'health-name', text: label }),
+                mpEl('span', { class: 'health-status', text: value }),
+            ]);
+        }
+
+        function gpu1Render() {
+            const data = gpu1State.data || {};
+            const arb = data.arbiter || {};
+            const asr = data.asr_fallback || {};
+            const updated = document.getElementById('gpu1-updated');
+            if (updated) updated.textContent = 'updated ' + new Date().toLocaleTimeString();
+            gpu1RenderHealth(arb, asr);
+            gpu1RenderLedger(arb);
+            gpu1RenderGrants(arb);
+            gpu1RenderAlarms(arb);
+            const seriesKey = JSON.stringify(asr.series || null);
+            if (seriesKey !== gpu1State.seriesKey) {
+                gpu1State.seriesKey = seriesKey;
+                gpu1RenderChart(asr);
+            }
+        }
+
+        function gpu1RenderHealth(arb, asr) {
+            const host = document.getElementById('gpu1-health');
+            host.textContent = '';
+            const strip = mpEl('div', { class: 'dash-health' });
+            if (arb.error) {
+                strip.appendChild(gpu1Chip('Arbiter', 'unreachable', false));
+            } else {
+                const committed = Number(arb.committed_mib || 0);
+                const capacity = Number(arb.capacity_mib || 0);
+                const alarms = (arb.alarms || []).length;
+                strip.appendChild(gpu1Chip('Committed', committed.toLocaleString() + ' / ' + capacity.toLocaleString() + ' MiB', capacity === 0 || committed <= capacity));
+                strip.appendChild(gpu1Chip('Grants', String((arb.grants || []).length), true));
+                strip.appendChild(gpu1Chip('Queue', String(arb.queued || 0), (arb.queued || 0) === 0));
+                strip.appendChild(gpu1Chip('Bridge flock', arb.bridge && arb.bridge.held ? 'held' : 'idle', true));
+                strip.appendChild(gpu1Chip('Alarms', String(alarms), alarms === 0));
+                strip.appendChild(gpu1Chip('Adoption grace', arb.adoption_grace ? 'active' : 'off', !arb.adoption_grace));
+            }
+            const pct = asr.error ? null : asr.fallback_pct;
+            strip.appendChild(gpu1Chip('ASR fallback', pct == null ? '—' : pct + '%', pct != null && pct < 10));
+            host.appendChild(strip);
+        }
+
+        function gpu1RenderLedger(arb) {
+            const host = document.getElementById('gpu1-ledger');
+            host.textContent = '';
+            if (arb.error) {
+                PL.empty(host, { title: 'Arbiter unreachable', desc: String(arb.error) });
+                return;
+            }
+            const bar = document.createElement('pl-slotbar');
+            bar.capacity = Number(arb.capacity_mib || 0);
+            bar.busy = Number(arb.committed_mib || 0);
+            host.appendChild(bar);
+            const contexts = arb.contexts_mib || {};
+            const strip = mpEl('div', { class: 'dash-health' }, Object.keys(contexts).sort().map(function (name) {
+                return mpEl('div', { class: 'health-item' }, [
+                    mpEl('span', { class: 'health-name', text: name }),
+                    mpEl('span', { class: 'health-status', text: contexts[name] + ' MiB ctx' }),
+                ]);
+            }));
+            host.appendChild(strip);
+            const nvml = arb.nvml || {};
+            host.appendChild(mpEl('div', { class: 'mp-row-sub', text: nvml.available
+                ? 'NVML free ' + Number(nvml.free_mib || 0).toLocaleString() + ' MiB'
+                : 'NVML view unavailable' }));
+        }
+
+        function gpu1RenderGrants(arb) {
+            const table = document.getElementById('gpu1-grants');
+            table.columns = [
+                { key: 'id', label: 'Grant', mono: true },
+                { key: 'kind', label: 'Kind' },
+                { key: 'service', label: 'Service' },
+                { key: 'profile_key', label: 'Profile', mono: true },
+                { key: 'envelope_mib', label: 'MiB', num: true },
+                { key: 'state', label: 'State', render: function (row) {
+                    return PL.badge(row.state || 'unknown', row.state === 'active' ? 'success' : 'warning');
+                } },
+                { key: 'age_s', label: 'Age, s', num: true },
+            ];
+            table.emptyTitle = arb.error ? 'Arbiter unreachable' : 'No active grants';
+            table.rows = arb.error ? [] : (arb.grants || []);
+        }
+
+        function gpu1RenderAlarms(arb) {
+            const table = document.getElementById('gpu1-alarms');
+            table.columns = [
+                { key: 'kind', label: 'Kind', render: function (row) { return PL.badge(row.kind || 'alarm', 'warning'); } },
+                { key: 'detail', label: 'Detail' },
+            ];
+            table.emptyTitle = arb.error ? 'Arbiter unreachable' : 'No alarms';
+            table.rows = arb.error ? [] : (arb.alarms || []);
+        }
+
+        function gpu1RenderChart(asr) {
+            const series = (asr && asr.series) || [];
+            anBuildChart('gpu1-asr-chart', {
+                type: 'bar',
+                data: {
+                    labels: series.map(function (point) { return formatChartLabel(point.ts); }),
+                    datasets: [
+                        {
+                            label: 'Transcripts',
+                            data: series.map(function (point) { return point.transcripts; }),
+                            backgroundColor: anAlpha(anColor('--c-accent'), 0.35),
+                            borderColor: anColor('--c-accent'),
+                        },
+                        {
+                            label: 'Vosk fallbacks',
+                            data: series.map(function (point) { return point.fallbacks; }),
+                            backgroundColor: anAlpha(anColor('--c-danger'), 0.5),
+                            borderColor: anColor('--c-danger'),
+                        },
+                    ],
+                },
+                options: anOptions({}),
+            });
         }
 
         function formatAnalyticsMs(value) {
