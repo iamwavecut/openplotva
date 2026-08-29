@@ -7555,7 +7555,7 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "custom song user en");
-        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_tokens"], 6144);
         assert_eq!(body["temperature"], 0.5);
         Ok(())
     }
