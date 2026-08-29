@@ -137,6 +137,17 @@ pub fn provider_name<'a>(err: &'a (dyn Error + 'static)) -> &'a str {
         .unwrap_or_default()
 }
 
+/// The model spent its output budget without a usable final answer - the
+/// Display texts of `AifarmChatTurnError::OutputBudgetExhausted` and
+/// `::ReasoningBudgetExhausted` (aifarm.rs), kept in sync by a test there.
+/// Another routed model (or the same one on a fresh sample) can succeed, so
+/// callers classify these as attempt failures rather than terminal ones.
+#[must_use]
+pub fn is_truncated_model_output_message(message: &str) -> bool {
+    message.contains("output token budget exhausted")
+        || message.contains("returned reasoning without final content")
+}
+
 /// Classify retryability from an error message.
 #[must_use]
 pub fn retryable_reason_from_message(message: &str) -> Option<FailureReason> {

@@ -398,11 +398,14 @@ fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureR
     match error {
         MusicGenerationError::EmptyTopic | MusicGenerationError::Provider(_) => None,
         MusicGenerationError::Material(message) => {
-            // The model answered but the material failed the validator
-            // (observed live: Gemma's first sample missed the structural
-            // gate and the job died terminally). Fall through to the next
-            // routed model instead.
-            if openplotva_media::acestep::is_invalid_song_material_message(message) {
+            // The model answered but produced unusable material - the
+            // validator rejected it, or the output budget ran out mid-JSON
+            // (observed live: Gemma reasoned at length and truncated the
+            // lyrics at 1145 chars). Fall through to the next routed model
+            // instead of dying terminally.
+            if openplotva_media::acestep::is_invalid_song_material_message(message)
+                || openplotva_llm::retry::is_truncated_model_output_message(message)
+            {
                 return Some(FailureReason::ProviderProtocolError);
             }
             retryable_reason_from_message(message)
@@ -1855,6 +1858,15 @@ mod tests {
         );
         assert_eq!(
             song_prompt_retryable_reason(&error),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        let truncated = MusicGenerationError::Material(
+            "song reprompt failed: structured JSON response: chat completion output \
+             token budget exhausted with truncated final content (1145 chars)"
+                .to_owned(),
+        );
+        assert_eq!(
+            song_prompt_retryable_reason(&truncated),
             Some(FailureReason::ProviderProtocolError)
         );
         let unrelated = MusicGenerationError::Material("some other material problem".to_owned());
