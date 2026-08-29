@@ -46,7 +46,9 @@ const DEFAULT_SERVICE_NAME: &str = "llm-openai";
 const DEFAULT_ENDPOINT_NAME: &str = "chat_completions";
 const DEFAULT_MODEL_NAME: &str = "Gemma 4 26B Heretic";
 const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 1024;
-const SONG_OPTIMIZER_MAX_TOKENS: i32 = 4096;
+// 6144, not 4096: the Gemma reprompt primary reasons at length before the
+// JSON and was observed truncating Russian lyrics at 1145 final chars.
+const SONG_OPTIMIZER_MAX_TOKENS: i32 = 6144;
 const DEFAULT_VRAM_CLOUD_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TOP_P: f64 = 0.8;
 const DEFAULT_VRAM_CLOUD_TOP_K: f64 = 20.0;
@@ -7553,7 +7555,7 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "custom song user en");
-        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_tokens"], 6144);
         assert_eq!(body["temperature"], 0.5);
         Ok(())
     }
@@ -7869,6 +7871,14 @@ mod tests {
             err.to_string().contains("output token budget exhausted"),
             "unexpected error: {err}"
         );
+        // String-typed paths (the song reprompt turns errors into Material
+        // strings) rely on this predicate matching both Display texts.
+        assert!(crate::retry::is_truncated_model_output_message(
+            &err.to_string()
+        ));
+        assert!(crate::retry::is_truncated_model_output_message(
+            &AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars: 7 }.to_string()
+        ));
     }
 
     #[test]
