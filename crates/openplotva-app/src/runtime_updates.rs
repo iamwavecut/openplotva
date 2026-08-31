@@ -39,12 +39,10 @@ struct RuntimeUpdateStreamPlane {
 }
 
 impl RuntimeUpdatesInspectorHandle {
-    pub(crate) fn new(queue: openplotva_updates::RedisUpdateQueue) -> Self {
+    pub(crate) fn new(queue: openplotva_updates::RedisUpdateQueue, worker_limit: usize) -> Self {
         Self {
             queue,
-            tracker: RuntimeUpdateTracker::with_worker_limit(
-                openplotva_updates::UpdateConsumerConfig::default().worker_limit,
-            ),
+            tracker: RuntimeUpdateTracker::with_worker_limit(worker_limit),
             gate_counters: Arc::new(Mutex::new(None)),
             stream_plane: Arc::new(Mutex::new(None)),
         }

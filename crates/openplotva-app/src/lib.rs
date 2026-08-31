@@ -133,10 +133,17 @@ const RUNTIME_PROCESSOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_PERSISTENCE_RESERVE: Duration = Duration::from_secs(8);
 const RUNTIME_FINALIZATION_RESERVE: Duration = Duration::from_secs(2);
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 4;
+// Keep I/O overlap without restoring the 12:1 backlog fan-out that exhausted
+// the critical pool before update leases and Telegram receipts could advance.
+const DURABLE_UPDATE_CONSUMER_MAX_WORKERS: usize =
+    openplotva_storage::POSTGRES_CRITICAL_MAX_CONNECTIONS as usize * 3;
 const REGULAR_IMAGE_GENERATION_WORKFLOW_KEY: &str =
     image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY;
 const VIP_IMAGE_EDITOR_WORKFLOW_KEY: &str = image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY;
+
+fn durable_update_consumer_worker_limit(configured: usize) -> usize {
+    configured.clamp(1, DURABLE_UPDATE_CONSUMER_MAX_WORKERS)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeWorkerPhase {
@@ -10841,14 +10848,19 @@ async fn start_runtime_workers(
     }
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+    let mut update_consumer_config = openplotva_updates::UpdateConsumerConfig::default();
+    update_consumer_config.worker_limit =
+        durable_update_consumer_worker_limit(update_consumer_config.worker_limit);
     let update_stream_redis_client = if config.update_queue.stream_redis_url.is_empty() {
         service_clients.redis.client().clone()
     } else {
         redis::Client::open(config.update_queue.stream_redis_url.as_str())
             .context("create dedicated Telegram ingress Redis client")?
     };
-    let updates_inspector =
-        runtime_updates::RuntimeUpdatesInspectorHandle::new(update_queue.clone());
+    let updates_inspector = runtime_updates::RuntimeUpdatesInspectorHandle::new(
+        update_queue.clone(),
+        update_consumer_config.worker_limit,
+    );
     let ingestion_gate_counters = Arc::new(ingestion_telemetry::IngestionGateCounters::default());
     updates_inspector.set_gate_counters(Arc::clone(&ingestion_gate_counters));
     let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
@@ -13878,10 +13890,6 @@ async fn start_runtime_workers(
         let delivery_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
             service_clients.critical_postgres.clone(),
         );
-        let mut update_consumer_config = openplotva_updates::UpdateConsumerConfig::default();
-        update_consumer_config.worker_limit = update_consumer_config
-            .worker_limit
-            .saturating_mul(DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER);
         let update_consumer_worker = tokio::spawn(async move {
             let report = updates::run_materialized_update_consumer_until(
                 delivery_store,
@@ -13900,7 +13908,10 @@ async fn start_runtime_workers(
         );
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_consumer",
-            "Postgres Telegram inbox consumer started with leased, fenced claims",
+            format!(
+                "Postgres Telegram inbox consumer started with {} workers and leased, fenced claims",
+                update_consumer_config.worker_limit
+            ),
         ));
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
@@ -14833,6 +14844,16 @@ mod tests {
         assert!(!super::postgres_capacity_is_exhausted(7, 8, 0));
         assert!(!super::postgres_capacity_is_exhausted(8, 8, 1));
         assert!(super::postgres_capacity_is_exhausted(8, 8, 0));
+    }
+
+    #[test]
+    fn durable_update_consumer_caps_backlog_fanout() {
+        assert_eq!(super::durable_update_consumer_worker_limit(96), 24);
+    }
+
+    #[test]
+    fn durable_update_consumer_preserves_smaller_worker_limits() {
+        assert_eq!(super::durable_update_consumer_worker_limit(8), 8);
     }
 
     #[test]
