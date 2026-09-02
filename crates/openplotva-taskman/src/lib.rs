@@ -689,6 +689,9 @@ pub enum TaskQueueError {
     QueueNameRequired,
     /// Status mutation targeted a missing job ID.
     JobNotFound(i64),
+    /// Status mutation targeted a job the user already cancelled; a cancel is
+    /// final and must survive the in-flight worker's retry or finalize.
+    JobCancelled(i64),
     /// Assignment would exceed the active per-user job limit.
     UserActiveLimitReached {
         /// Queue name where the limit was checked.
@@ -712,6 +715,7 @@ impl fmt::Display for TaskQueueError {
         match self {
             Self::QueueNameRequired => write!(f, "queue name is required"),
             Self::JobNotFound(job_id) => write!(f, "taskman job {job_id} not found"),
+            Self::JobCancelled(job_id) => write!(f, "taskman job {job_id} is cancelled"),
             Self::UserActiveLimitReached {
                 queue_name,
                 user_id,
@@ -1442,6 +1446,9 @@ impl InMemoryTaskQueue {
             .iter_mut()
             .find(|record| record.id == job_id)
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        if record.status == JobStatus::Cancelled {
+            return Err(TaskQueueError::JobCancelled(job_id));
+        }
         record.queue_name = queue_name;
         record.status = JobStatus::Pending;
         record.worker_id = None;
@@ -2260,6 +2267,9 @@ impl InMemoryTaskQueue {
             .iter_mut()
             .find(|record| record.id == job_id)
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        if record.status == JobStatus::Cancelled && status != JobStatus::Cancelled {
+            return Err(TaskQueueError::JobCancelled(job_id));
+        }
         record.status = status;
         record.completed_at = Some(completed_at);
         record.error = error;
@@ -5672,6 +5682,53 @@ mod tests {
         assert_eq!(statuses.get(&second), Some(&JobStatus::Cancelled));
         assert_eq!(statuses.get(&other_user), Some(&JobStatus::Pending));
         assert_eq!(statuses.get(&other_chat), Some(&JobStatus::Pending));
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_task_queue_keeps_cancelled_jobs_cancelled_across_worker_finalize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let id = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            job_at("edit", DEFAULT_PRIORITY, now, 7, 10, 1),
+        );
+        assert_eq!(
+            queue
+                .dequeue(IMAGE_VIP_QUEUE_NAME, "worker", now)
+                .map(|item| item.id),
+            Some(id)
+        );
+
+        // The user cancels while the worker is still executing the attempt.
+        assert_eq!(
+            queue.cancel_user_jobs(7, 10, "cancelled by user", now),
+            vec![id]
+        );
+
+        // The attempt then fails with a retryable error and the worker tries to requeue.
+        assert_eq!(
+            queue.requeue_job_to_queue(id, IMAGE_VIP_QUEUE_NAME),
+            Err(TaskQueueError::JobCancelled(id))
+        );
+        assert_eq!(
+            queue.fail(id, "provider timeout", now),
+            Err(TaskQueueError::JobCancelled(id))
+        );
+        assert_eq!(
+            queue.complete(id, now),
+            Err(TaskQueueError::JobCancelled(id))
+        );
+        let record = queue.record(id).expect("job");
+        assert_eq!(record.status, JobStatus::Cancelled);
+        assert_eq!(record.error.as_deref(), Some("cancelled by user"));
+        assert!(
+            queue
+                .dequeue(IMAGE_VIP_QUEUE_NAME, "worker-b", now)
+                .is_none(),
+            "a cancelled job must never be dequeued again"
+        );
         Ok(())
     }
 

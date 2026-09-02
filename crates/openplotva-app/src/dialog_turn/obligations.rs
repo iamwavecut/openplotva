@@ -38,6 +38,11 @@ pub const OBLIGATION_FAILURE_NOTICE: &str = "Не получилось сген�
 /// (punch #8: extend once, never error-then-image).
 pub const OBLIGATION_EXTENDED_NOTICE: &str = "Дольше обычного, не бросила 🐟";
 
+/// Ticket error recorded when the watcher cancels a generation that outlived
+/// its extended deadline, so the failure notice is final: no further retries
+/// and no late artifact after "не получилось".
+pub const OBLIGATION_EXPIRED_CANCEL_REASON: &str = "delivery deadline expired";
+
 /// Default watcher poll interval (`DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`).
 pub const DEFAULT_DIALOG_OBLIGATION_WATCH_INTERVAL_SECS: i32 = 15;
 /// Default image delivery deadline (`DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS`).
@@ -180,12 +185,21 @@ impl DeliveryObligationAnnotator for PostgresDeliveryObligationStore {
     }
 }
 
-/// Resolves a generation ticket record by id.
+/// Resolves a generation ticket record by id and can cancel a live ticket.
 pub trait TicketRecordSource: Send + Sync {
     fn ticket_record<'a>(
         &'a self,
         ticket_job_id: i64,
     ) -> ObligationFuture<'a, Option<TaskQueueRecord>>;
+
+    /// Cancel a still-running ticket. Returns true when this source owned the
+    /// live record and cancelled it; a durable mirror returns false.
+    fn cancel_ticket<'a>(
+        &'a self,
+        ticket_job_id: i64,
+        reason: &'a str,
+        now: OffsetDateTime,
+    ) -> ObligationFuture<'a, bool>;
 }
 
 impl<T: TicketRecordSource + ?Sized> TicketRecordSource for Arc<T> {
@@ -194,6 +208,15 @@ impl<T: TicketRecordSource + ?Sized> TicketRecordSource for Arc<T> {
         ticket_job_id: i64,
     ) -> ObligationFuture<'a, Option<TaskQueueRecord>> {
         self.as_ref().ticket_record(ticket_job_id)
+    }
+
+    fn cancel_ticket<'a>(
+        &'a self,
+        ticket_job_id: i64,
+        reason: &'a str,
+        now: OffsetDateTime,
+    ) -> ObligationFuture<'a, bool> {
+        self.as_ref().cancel_ticket(ticket_job_id, reason, now)
     }
 }
 
@@ -204,6 +227,16 @@ impl TicketRecordSource for InMemoryTaskQueue {
     ) -> ObligationFuture<'a, Option<TaskQueueRecord>> {
         let record = self.record(ticket_job_id);
         Box::pin(async move { Ok(record) })
+    }
+
+    fn cancel_ticket<'a>(
+        &'a self,
+        ticket_job_id: i64,
+        reason: &'a str,
+        now: OffsetDateTime,
+    ) -> ObligationFuture<'a, bool> {
+        let cancelled = self.cancel(ticket_job_id, reason, now).is_ok();
+        Box::pin(async move { Ok(cancelled) })
     }
 }
 
@@ -217,6 +250,17 @@ impl TicketRecordSource for PostgresTaskQueueStore {
                 .await
                 .map_err(|error| Box::new(error) as ObligationError)
         })
+    }
+
+    // The Postgres row mirrors the in-memory queue; only the live record can
+    // stop a running worker, so the durable side never cancels.
+    fn cancel_ticket<'a>(
+        &'a self,
+        _ticket_job_id: i64,
+        _reason: &'a str,
+        _now: OffsetDateTime,
+    ) -> ObligationFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
     }
 }
 
@@ -256,6 +300,15 @@ where
             };
             secondary.ticket_record(ticket_job_id).await
         })
+    }
+
+    fn cancel_ticket<'a>(
+        &'a self,
+        ticket_job_id: i64,
+        reason: &'a str,
+        now: OffsetDateTime,
+    ) -> ObligationFuture<'a, bool> {
+        self.primary.cancel_ticket(ticket_job_id, reason, now)
     }
 }
 
@@ -519,6 +572,7 @@ pub struct ObligationWatchTickReport {
     pub orphaned_notified: usize,
     pub extended: usize,
     pub expired_notified: usize,
+    pub tickets_cancelled: usize,
     pub notices_sent: usize,
     pub notice_failures: usize,
     pub errors: usize,
@@ -644,8 +698,10 @@ async fn resolve_obligation(
                 }
             }
             JobStatus::Pending | JobStatus::Processing | JobStatus::WaitingDelivery => {
-                resolve_in_flight_deadline(store, notifier, timeouts, now, obligation, report)
-                    .await?;
+                resolve_in_flight_deadline(
+                    store, tickets, notifier, timeouts, now, obligation, report,
+                )
+                .await?;
             }
         },
         None => {
@@ -670,12 +726,13 @@ async fn resolve_obligation(
 }
 
 /// Punch #8: past-deadline tickets that are still alive get ONE "taking
-/// longer" notice with a single deadline extension; only a ticket that also
-/// outlives the extension expires with the error notice. The ticket itself is
-/// left alone — a late artifact after `extended_once` still resolves as
-/// delivered, never error-then-image.
+/// longer" notice with a single deadline extension; a late artifact after
+/// `extended_once` still resolves as delivered. Only a ticket that also
+/// outlives the extension expires with the error notice, and that ticket is
+/// cancelled on the spot: the notice is final, never error-then-image.
 async fn resolve_in_flight_deadline(
     store: &dyn DeliveryObligationStore,
+    tickets: &dyn TicketRecordSource,
     notifier: &dyn DeliveryObligationNotifier,
     timeouts: DeliveryObligationTimeouts,
     now: OffsetDateTime,
@@ -704,6 +761,16 @@ async fn resolve_in_flight_deadline(
             .await?
     {
         report.expired_notified += 1;
+        if tickets
+            .cancel_ticket(
+                obligation.ticket_job_id,
+                OBLIGATION_EXPIRED_CANCEL_REASON,
+                now,
+            )
+            .await?
+        {
+            report.tickets_cancelled += 1;
+        }
         send_notice(notifier, obligation, OBLIGATION_FAILURE_NOTICE, report).await;
         notifier
             .signal_failure_reaction(obligation_reaction_target(obligation))
@@ -1045,6 +1112,7 @@ mod tests {
     #[derive(Default)]
     struct FakeTicketSource {
         records: HashMap<i64, TaskQueueRecord>,
+        cancelled: Mutex<Vec<(i64, String)>>,
     }
 
     impl FakeTicketSource {
@@ -1054,7 +1122,12 @@ mod tests {
                     .into_iter()
                     .map(|record| (record.id, record))
                     .collect(),
+                cancelled: Mutex::new(Vec::new()),
             }
+        }
+
+        fn cancelled(&self) -> Vec<(i64, String)> {
+            lock(&self.cancelled).clone()
         }
     }
 
@@ -1065,6 +1138,19 @@ mod tests {
         ) -> ObligationFuture<'a, Option<TaskQueueRecord>> {
             let record = self.records.get(&ticket_job_id).cloned();
             Box::pin(async move { Ok(record) })
+        }
+
+        fn cancel_ticket<'a>(
+            &'a self,
+            ticket_job_id: i64,
+            reason: &'a str,
+            _now: OffsetDateTime,
+        ) -> ObligationFuture<'a, bool> {
+            let known = self.records.contains_key(&ticket_job_id);
+            if known {
+                lock(&self.cancelled).push((ticket_job_id, reason.to_owned()));
+            }
+            Box::pin(async move { Ok(known) })
         }
     }
 
@@ -1294,6 +1380,10 @@ mod tests {
             notifier.notices(),
             vec![(42, 100, OBLIGATION_EXTENDED_NOTICE.to_owned())]
         );
+        assert!(
+            tickets.cancelled().is_empty(),
+            "the extension keeps the ticket alive"
+        );
 
         // Second tick before the new deadline: nothing happens (single notice).
         let second =
@@ -1302,12 +1392,14 @@ mod tests {
         assert_eq!(second.expired_notified, 0);
         assert_eq!(notifier.notices().len(), 1, "no duplicate notice");
 
-        // Past the extended deadline too: expire with the error notice; the
-        // ticket itself is left alone.
+        // Past the extended deadline too: expire with the error notice AND
+        // cancel the ticket, so "не получилось" is final rather than followed
+        // by more retries (and a possible late image).
         let later = now + TimeDuration::seconds(1201);
         let third =
             process_delivery_obligations_once(&store, &tickets, &notifier, timeouts(), later).await;
         assert_eq!(third.expired_notified, 1);
+        assert_eq!(third.tickets_cancelled, 1);
         assert_eq!(
             store.state_of(1),
             DELIVERY_OBLIGATION_STATE_EXPIRED_NOTIFIED
@@ -1315,6 +1407,46 @@ mod tests {
         assert_eq!(notifier.notices().len(), 2);
         assert_eq!(notifier.notices()[1].2, OBLIGATION_FAILURE_NOTICE);
         assert_eq!(notifier.reactions(), vec![("fail", 42, 100)]);
+        assert_eq!(
+            tickets.cancelled(),
+            vec![(500, OBLIGATION_EXPIRED_CANCEL_REASON.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_ticket_source_cancels_the_live_in_memory_ticket() {
+        let now = base_time();
+        let queue = InMemoryTaskQueue::new();
+        let ticket_id = queue.assign(
+            "image-vip",
+            new_image_gen_job_at(ImageGenJobParams::default(), now),
+        );
+        assert!(queue.dequeue("image-vip", "worker", now).is_some());
+        let source = FallbackTicketRecordSource::new(
+            queue,
+            Some(FakeTicketSource::with_records(vec![ticket(
+                ticket_id,
+                JobStatus::Processing,
+                None,
+            )])),
+        );
+
+        let cancelled = source
+            .cancel_ticket(ticket_id, OBLIGATION_EXPIRED_CANCEL_REASON, now)
+            .await
+            .expect("cancel");
+
+        assert!(cancelled);
+        let record = source
+            .ticket_record(ticket_id)
+            .await
+            .expect("record")
+            .expect("in-memory record");
+        assert_eq!(record.status, JobStatus::Cancelled);
+        assert_eq!(
+            record.error.as_deref(),
+            Some(OBLIGATION_EXPIRED_CANCEL_REASON)
+        );
     }
 
     #[tokio::test]
