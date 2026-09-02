@@ -23,7 +23,7 @@ use openplotva_llm::aifarm::{
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_taskman::{
     DEFAULT_LLM_JOB_MAX_ATTEMPTS, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
-    ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, JobType,
+    ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, JobStatus, JobType,
     LLM_JOB_RETRY_EXHAUSTED_STAGE, LLM_JOB_RETRY_STAGE, TaskQueueError, TaskQueueJobEvent,
     TaskQueueWorkItem, image_edit_job_params_from_stateless_job,
     image_gen_job_params_from_stateless_job,
@@ -68,6 +68,13 @@ pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate"
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// How long the farm may hold a draw submit for a free slot before answering
+/// 429 instead of queueing it. draw-api runs one job at a time, so a queued job
+/// abandoned by our inference watchdog would still burn the slot later; waiting
+/// in the submit means nothing is queued that we are not polling.
+pub const AIFARM_DRAW_API_DEFAULT_CAPACITY_WAIT: StdDuration = StdDuration::from_secs(4 * 60);
+/// Local slack over `capacity_wait` for the held submit round-trip itself.
+const AIFARM_DRAW_API_SUBMIT_MARGIN: StdDuration = StdDuration::from_secs(30);
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
@@ -243,10 +250,14 @@ pub struct AifarmDrawApiConfig {
     pub service_name: String,
     /// Discovery endpoint name.
     pub endpoint_name: String,
-    /// Upstream draw task timeout.
+    /// Inference budget: sent to the farm as the job timeout and enforced
+    /// locally from the moment the farm accepts the job.
     pub timeout: StdDuration,
     /// Poll interval for `/v1/jobs/{id}`.
     pub poll_interval: StdDuration,
+    /// Slot wait the farm applies inside the submit (`wait_for_capacity_ms`);
+    /// zero submits into the farm queue without waiting.
+    pub capacity_wait: StdDuration,
 }
 
 impl Default for AifarmDrawApiConfig {
@@ -257,6 +268,7 @@ impl Default for AifarmDrawApiConfig {
             endpoint_name: String::new(),
             timeout: StdDuration::ZERO,
             poll_interval: StdDuration::ZERO,
+            capacity_wait: StdDuration::ZERO,
         }
     }
 }
@@ -293,6 +305,17 @@ impl AifarmDrawApiConfig {
     pub fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url.trim_end_matches('/'), path)
     }
+
+    /// Local bound for the submit round-trip: the farm may hold it for the
+    /// whole capacity wait; without a capacity wait the inference budget
+    /// bounds it as before.
+    fn submit_deadline(&self, now: Instant) -> Instant {
+        if self.capacity_wait.is_zero() {
+            now + self.timeout
+        } else {
+            now + self.capacity_wait + AIFARM_DRAW_API_SUBMIT_MARGIN
+        }
+    }
 }
 
 /// Build draw-api config from app config.
@@ -300,6 +323,7 @@ impl AifarmDrawApiConfig {
 pub fn aifarm_draw_api_config_from_app_config(config: &AppConfig) -> AifarmDrawApiConfig {
     AifarmDrawApiConfig {
         base_url: config.llm.discovery.base_url.clone(),
+        capacity_wait: AIFARM_DRAW_API_DEFAULT_CAPACITY_WAIT,
         ..AifarmDrawApiConfig::default()
     }
     .with_defaults()
@@ -742,9 +766,11 @@ where
         }
         let payload = draw_api_payload(&prompt, &[], draw_api_dimensions(&request.aspect_ratio))
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
-        let deadline = Instant::now() + self.cfg.timeout;
-        let job_id = self.submit_draw_api_job(job_id, payload, deadline).await?;
-        let mut result = self.wait_draw_api_job(&job_id, deadline).await?;
+        let job_id = self
+            .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
+            .await?;
+        let inference_deadline = Instant::now() + self.cfg.timeout;
+        let mut result = self.wait_draw_api_job(&job_id, inference_deadline).await?;
         if result.images.is_empty() && result.urls.is_empty() {
             return Err(ImageGenerationError::Provider(
                 "job completed but produced no images".to_owned(),
@@ -788,13 +814,13 @@ where
         }
         let payload = draw_api_payload(&prompt, &image_inputs, None)
             .map_err(|err| ImageEditError::Provider(err.to_string()))?;
-        let deadline = Instant::now() + self.cfg.timeout;
         let job_id = self
-            .submit_draw_api_job(job_id, payload, deadline)
+            .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
             .await
             .map_err(ImageEditError::from)?;
+        let inference_deadline = Instant::now() + self.cfg.timeout;
         let result = self
-            .wait_draw_api_job(&job_id, deadline)
+            .wait_draw_api_job(&job_id, inference_deadline)
             .await
             .map_err(ImageEditError::from)?;
         if result.images.is_empty() && result.urls.is_empty() {
@@ -831,8 +857,12 @@ where
             },
             idempotency_key: job_id.clone(),
             priority: 0,
-            wait_for_capacity_ms: 0,
-            capacity_poll_ms: 0,
+            wait_for_capacity_ms: duration_ms(self.cfg.capacity_wait),
+            capacity_poll_ms: if self.cfg.capacity_wait.is_zero() {
+                0
+            } else {
+                duration_ms(self.cfg.poll_interval)
+            },
         };
         let body = serde_json::to_vec(&request)
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
@@ -2499,6 +2529,9 @@ pub enum ImageGenJobExecutionOutcome {
     Completed,
     SafetyBlocked,
     Failed,
+    /// The job was cancelled while the attempt was running; placeholders are
+    /// cleaned up and the queue record is left as the canceller set it.
+    Cancelled,
 }
 
 /// Report from one image job execution.
@@ -2525,6 +2558,9 @@ pub enum ImageEditJobExecutionOutcome {
     Completed,
     SafetyBlocked,
     Failed,
+    /// The job was cancelled while the attempt was running; placeholders are
+    /// cleaned up and the queue record is left as the canceller set it.
+    Cancelled,
 }
 
 /// Report from one image-edit job execution.
@@ -2547,6 +2583,8 @@ pub struct ImageEditJobExecutionReport {
 pub enum ImageGenQueuePollOutcome {
     /// No matching image generation job was pending.
     Idle,
+    /// Job was cancelled (by the user or an operator) while the attempt ran.
+    Cancelled,
     /// Job completed successfully.
     Completed,
     /// Job was safety-blocked and completed without retry.
@@ -2581,6 +2619,8 @@ pub struct ImageGenQueuePollReport {
 pub enum ImageEditQueuePollOutcome {
     /// No matching image edit job was pending.
     Idle,
+    /// Job was cancelled (by the user or an operator) while the attempt ran.
+    Cancelled,
     /// Job completed successfully.
     Completed,
     /// Job was safety-blocked and completed without retry.
@@ -2629,6 +2669,8 @@ pub struct ImageGenWorkerRunReport {
     pub failed: u64,
     /// Number of payload decode failures.
     pub decode_failed: u64,
+    /// Number of jobs cancelled mid-attempt.
+    pub cancelled: u64,
     /// Number of idle ticks.
     pub idle: u64,
     /// Number of poll reports carrying a status/failure error.
@@ -2652,6 +2694,7 @@ impl ImageGenWorkerRunReport {
             ImageGenQueuePollOutcome::RetryExhausted => self.retry_exhausted += 1,
             ImageGenQueuePollOutcome::Failed => self.failed += 1,
             ImageGenQueuePollOutcome::DecodeFailed => self.decode_failed += 1,
+            ImageGenQueuePollOutcome::Cancelled => self.cancelled += 1,
         }
         if report.error.is_some() {
             self.errors += 1;
@@ -2681,6 +2724,8 @@ pub struct ImageEditWorkerRunReport {
     pub failed: u64,
     /// Number of payload decode failures.
     pub decode_failed: u64,
+    /// Number of jobs cancelled mid-attempt.
+    pub cancelled: u64,
     /// Number of idle ticks.
     pub idle: u64,
     /// Number of poll reports carrying a status/failure error.
@@ -2704,6 +2749,7 @@ impl ImageEditWorkerRunReport {
             ImageEditQueuePollOutcome::RetryExhausted => self.retry_exhausted += 1,
             ImageEditQueuePollOutcome::Failed => self.failed += 1,
             ImageEditQueuePollOutcome::DecodeFailed => self.decode_failed += 1,
+            ImageEditQueuePollOutcome::Cancelled => self.cancelled += 1,
         }
         if report.error.is_some() {
             self.errors += 1;
@@ -2782,6 +2828,24 @@ pub fn image_gen_caption_text(params: &ImageGenJobParams, prompt: &str) -> Strin
     prompt.to_owned()
 }
 
+/// How often a running attempt re-checks its queue record for a user cancel.
+const IMAGE_JOB_CANCEL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(500);
+
+fn image_job_is_cancelled(queue: &InMemoryTaskQueue, job_id: i64) -> bool {
+    queue
+        .record(job_id)
+        .is_none_or(|record| record.status == JobStatus::Cancelled)
+}
+
+/// Resolves once the job is cancelled by the user or deleted by an operator, so
+/// the worker abandons the provider call instead of finishing a doomed attempt
+/// and requeueing over the cancel.
+async fn wait_for_image_job_cancellation(queue: &InMemoryTaskQueue, job_id: i64) {
+    while !image_job_is_cancelled(queue, job_id) {
+        tokio::time::sleep(IMAGE_JOB_CANCEL_POLL_INTERVAL).await;
+    }
+}
+
 pub async fn execute_image_gen_job<Generator, Effects>(
     generator: &Generator,
     effects: &Effects,
@@ -2790,6 +2854,22 @@ pub async fn execute_image_gen_job<Generator, Effects>(
 where
     Generator: ImageGenerator + Sync,
     Effects: ImageJobEffects + Sync,
+{
+    execute_image_gen_job_with_cancel(generator, effects, params, std::future::pending()).await
+}
+
+/// Like [`execute_image_gen_job`], but `cancelled` resolving mid-generation
+/// aborts the provider call, deletes the placeholders and reports `Cancelled`.
+pub async fn execute_image_gen_job_with_cancel<Generator, Effects, Cancel>(
+    generator: &Generator,
+    effects: &Effects,
+    params: ImageGenJobParams,
+    cancelled: Cancel,
+) -> ImageGenJobExecutionReport
+where
+    Generator: ImageGenerator + Sync,
+    Effects: ImageJobEffects + Sync,
+    Cancel: std::future::Future<Output = ()>,
 {
     let params = sanitize_image_gen_job_params(params);
     let prompt = image_gen_prompt(&params);
@@ -2888,7 +2968,22 @@ where
         }
         filled
     };
-    let (result, filled) = tokio::join!(generate, fill);
+    let cancelled = std::pin::pin!(cancelled);
+    let (result, filled) = tokio::select! {
+        joined = async { tokio::join!(generate, fill) } => joined,
+        () = cancelled => {
+            cleanup_image_placeholders(effects, chat_id, &placeholders).await;
+            return ImageGenJobExecutionReport {
+                outcome: ImageGenJobExecutionOutcome::Cancelled,
+                prompt,
+                caption_text,
+                image_url: None,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: None,
+            };
+        }
+    };
 
     match result {
         Ok(result) => {
@@ -2994,6 +3089,22 @@ where
     Editor: ImageEditor + Sync,
     Effects: ImageJobEffects + Sync,
 {
+    execute_image_edit_job_with_cancel(editor, effects, params, std::future::pending()).await
+}
+
+/// Like [`execute_image_edit_job`], but `cancelled` resolving mid-edit aborts
+/// the provider call, deletes the placeholders and reports `Cancelled`.
+pub async fn execute_image_edit_job_with_cancel<Editor, Effects, Cancel>(
+    editor: &Editor,
+    effects: &Effects,
+    params: ImageEditJobParams,
+    cancelled: Cancel,
+) -> ImageEditJobExecutionReport
+where
+    Editor: ImageEditor + Sync,
+    Effects: ImageJobEffects + Sync,
+    Cancel: std::future::Future<Output = ()>,
+{
     let params = sanitize_image_edit_job_params(params);
     let expected_image_count = editor
         .expected_image_count()
@@ -3041,7 +3152,20 @@ where
         photo_urls: params.photo_urls,
     };
 
-    let result = editor.edit_image(request).await;
+    let cancelled = std::pin::pin!(cancelled);
+    let result = tokio::select! {
+        result = editor.edit_image(request) => result,
+        () = cancelled => {
+            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            return ImageEditJobExecutionReport {
+                outcome: ImageEditJobExecutionOutcome::Cancelled,
+                prompt: params.prompt,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: None,
+            };
+        }
+    };
 
     match result {
         Ok(result) => {
@@ -3254,7 +3378,13 @@ where
             TelegramActivityAction::UploadPhoto,
         )
     });
-    let execution = execute_image_gen_job(generator, effects, params).await;
+    let execution = execute_image_gen_job_with_cancel(
+        generator,
+        effects,
+        params,
+        wait_for_image_job_cancellation(queue, work.id),
+    )
+    .await;
     let activity = activity_guard
         .as_ref()
         .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
@@ -3284,10 +3414,26 @@ where
             activity,
             options.now,
         ),
+        ImageGenJobExecutionOutcome::Cancelled => ImageGenQueuePollReport {
+            queue_name: queue_name.to_owned(),
+            job_id: Some(work.id),
+            outcome: ImageGenQueuePollOutcome::Cancelled,
+            error: None,
+            activity,
+        },
         ImageGenJobExecutionOutcome::Failed => {
             let error = execution
                 .error
                 .unwrap_or_else(|| "image generation failed".to_owned());
+            if image_job_is_cancelled(queue, work.id) {
+                return ImageGenQueuePollReport {
+                    queue_name: queue_name.to_owned(),
+                    job_id: Some(work.id),
+                    outcome: ImageGenQueuePollOutcome::Cancelled,
+                    error: None,
+                    activity,
+                };
+            }
             if let Some(report) = retry_or_exhaust_image_gen_job(
                 queue,
                 &work,
@@ -3353,11 +3499,15 @@ fn retry_or_exhaust_image_gen_job(
             activity,
         });
     }
-    queue.requeue_job_to_queue(work.id, &target_queue).ok()?;
+    let outcome = match queue.requeue_job_to_queue(work.id, &target_queue) {
+        Ok(()) => ImageGenQueuePollOutcome::RetryRequeued,
+        Err(TaskQueueError::JobCancelled(_)) => ImageGenQueuePollOutcome::Cancelled,
+        Err(_) => return None,
+    };
     Some(ImageGenQueuePollReport {
         queue_name: queue_name.to_owned(),
         job_id: Some(work.id),
-        outcome: ImageGenQueuePollOutcome::RetryRequeued,
+        outcome,
         error: None,
         activity,
     })
@@ -3495,7 +3645,13 @@ where
             TelegramActivityAction::UploadPhoto,
         )
     });
-    let execution = execute_image_edit_job(editor, effects, params).await;
+    let execution = execute_image_edit_job_with_cancel(
+        editor,
+        effects,
+        params,
+        wait_for_image_job_cancellation(queue, work.id),
+    )
+    .await;
     let activity = activity_guard
         .as_ref()
         .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
@@ -3523,10 +3679,26 @@ where
             activity,
             options.now,
         ),
+        ImageEditJobExecutionOutcome::Cancelled => ImageEditQueuePollReport {
+            queue_name: queue_name.to_owned(),
+            job_id: Some(work.id),
+            outcome: ImageEditQueuePollOutcome::Cancelled,
+            error: None,
+            activity,
+        },
         ImageEditJobExecutionOutcome::Failed => {
             let error = execution
                 .error
                 .unwrap_or_else(|| "image edit failed".to_owned());
+            if image_job_is_cancelled(queue, work.id) {
+                return ImageEditQueuePollReport {
+                    queue_name: queue_name.to_owned(),
+                    job_id: Some(work.id),
+                    outcome: ImageEditQueuePollOutcome::Cancelled,
+                    error: None,
+                    activity,
+                };
+            }
             if let Some(report) = retry_or_exhaust_image_edit_job(
                 queue,
                 &work,
@@ -3592,11 +3764,15 @@ fn retry_or_exhaust_image_edit_job(
             activity,
         });
     }
-    queue.requeue_job_to_queue(work.id, &target_queue).ok()?;
+    let outcome = match queue.requeue_job_to_queue(work.id, &target_queue) {
+        Ok(()) => ImageEditQueuePollOutcome::RetryRequeued,
+        Err(TaskQueueError::JobCancelled(_)) => ImageEditQueuePollOutcome::Cancelled,
+        Err(_) => return None,
+    };
     Some(ImageEditQueuePollReport {
         queue_name: queue_name.to_owned(),
         job_id: Some(work.id),
-        outcome: ImageEditQueuePollOutcome::RetryRequeued,
+        outcome,
         error: None,
         activity,
     })
@@ -4032,7 +4208,8 @@ fn trace_image_edit_queue_tick(tick: &ImageEditQueuePollReport) {
         ImageEditQueuePollOutcome::Idle => {}
         ImageEditQueuePollOutcome::Completed
         | ImageEditQueuePollOutcome::SafetyBlocked
-        | ImageEditQueuePollOutcome::RetryRequeued => {
+        | ImageEditQueuePollOutcome::RetryRequeued
+        | ImageEditQueuePollOutcome::Cancelled => {
             tracing::debug!(
                 queue_name = tick.queue_name,
                 job_id = tick.job_id,
@@ -6749,6 +6926,7 @@ mod tests {
                 retry_exhausted: 0,
                 failed: 1,
                 decode_failed: 0,
+                cancelled: 0,
                 idle: 1,
                 errors: 1,
                 activity_pulses_sent: 0,
@@ -6952,6 +7130,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
             },
             transport,
         );
@@ -7002,6 +7181,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aifarm_draw_api_submit_waits_for_farm_capacity_instead_of_queueing() {
+        let transport = AifarmTransportStub::new(vec![Ok(json_response(
+            json!({"job_id": "job-1", "state": "failed", "error": {"message": "boom"}}),
+        ))]);
+        let probe = transport.clone();
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_millis(250),
+                capacity_wait: StdDuration::from_secs(7),
+            },
+            transport,
+        );
+
+        let _ = generator
+            .generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "castle".to_owned(),
+                    caption_text: "castle".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "draw-capacity",
+            )
+            .await;
+
+        let requests = probe.requests();
+        let job: DiscoveryJobRequest =
+            serde_json::from_slice(&requests[0].body).expect("job request");
+        assert_eq!(
+            job.wait_for_capacity_ms, 7000,
+            "farm holds the submit for a free slot"
+        );
+        assert_eq!(job.capacity_poll_ms, 250);
+        assert_eq!(
+            job.invocation.timeout_ms, 5000,
+            "inference budget stays separate"
+        );
+    }
+
+    #[tokio::test]
+    async fn aifarm_draw_api_inference_deadline_starts_after_the_farm_accepts_the_job() {
+        let queued = json_response(json!({"job_id": "job-1", "state": "queued"}));
+        let transport = DelayedAifarmTransport::new(
+            vec![(
+                StdDuration::from_millis(300),
+                json_response(json!({"job_id": "job-1", "state": "processing"})),
+            )],
+            queued,
+        );
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_millis(200),
+                poll_interval: StdDuration::from_millis(10),
+                capacity_wait: StdDuration::from_secs(1),
+            },
+            transport,
+        );
+
+        let started = Instant::now();
+        let result = generator
+            .generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "castle".to_owned(),
+                    caption_text: "castle".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "draw-late-accept",
+            )
+            .await
+            .expect_err("job never finishes");
+        let elapsed = started.elapsed();
+
+        assert!(result.message().contains("inference watchdog"));
+        assert!(
+            result.message().contains("waiting to poll draw job"),
+            "the slow accept must not eat the inference budget: {}",
+            result.message()
+        );
+        assert!(
+            elapsed >= StdDuration::from_millis(480),
+            "accept 300ms + inference 200ms, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn aifarm_draw_api_watchdog_bounds_hanging_submission() {
         let generator = AifarmDrawApiImageGenerator::with_transport(
             AifarmDrawApiConfig {
@@ -7010,6 +7280,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_millis(50),
                 poll_interval: StdDuration::from_millis(10),
+                capacity_wait: StdDuration::ZERO,
             },
             HangingAifarmTransport::new(Vec::new()),
         );
@@ -7043,6 +7314,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_millis(50),
                 poll_interval: StdDuration::from_millis(10),
+                capacity_wait: StdDuration::ZERO,
             },
             HangingAifarmTransport::new(vec![Ok(json_response(json!({
                 "job_id": "draw-hanging-poll",
@@ -7085,6 +7357,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_millis(50),
                 poll_interval: StdDuration::from_secs(5),
+                capacity_wait: StdDuration::ZERO,
             },
             HangingAifarmTransport::new(vec![queued(), queued()]),
         );
@@ -7139,6 +7412,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
             },
             transport,
         );
@@ -7228,6 +7502,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
             },
             transport,
         );
@@ -7295,6 +7570,7 @@ mod tests {
                 endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
             },
             transport,
         );
@@ -7362,6 +7638,7 @@ mod tests {
                     endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                     timeout: StdDuration::from_secs(5),
                     poll_interval: StdDuration::from_nanos(1),
+                    capacity_wait: StdDuration::ZERO,
                 },
                 transport,
             ),
@@ -7678,6 +7955,45 @@ mod tests {
                     .responses
                     .pop_front()
                     .unwrap_or_else(|| Ok(AifarmHttpResponse::default()))
+            })
+        }
+    }
+
+    /// Serves each scripted response after its delay, then the fallback forever.
+    #[derive(Clone, Debug)]
+    struct DelayedAifarmTransport {
+        scripted: Arc<Mutex<VecDeque<(StdDuration, AifarmHttpResponse)>>>,
+        fallback: AifarmHttpResponse,
+    }
+
+    impl DelayedAifarmTransport {
+        fn new(
+            scripted: Vec<(StdDuration, AifarmHttpResponse)>,
+            fallback: AifarmHttpResponse,
+        ) -> Self {
+            Self {
+                scripted: Arc::new(Mutex::new(scripted.into())),
+                fallback,
+            }
+        }
+    }
+
+    impl AifarmHttpTransport for DelayedAifarmTransport {
+        fn send<'a>(&'a self, _request: AifarmHttpRequest) -> AifarmHttpFuture<'a> {
+            let next = self
+                .scripted
+                .lock()
+                .expect("delayed aifarm state")
+                .pop_front();
+            let fallback = self.fallback.clone();
+            Box::pin(async move {
+                match next {
+                    Some((delay, response)) => {
+                        tokio::time::sleep(delay).await;
+                        Ok(response)
+                    }
+                    None => Ok(fallback),
+                }
             })
         }
     }
@@ -8005,6 +8321,251 @@ mod tests {
                 Err(ImageGenerationError::Forbidden)
             })
         }
+    }
+
+    /// Cancels the job's user from inside the provider call, then fails with a
+    /// retryable error — the shape of `/stop` landing mid-attempt.
+    struct CancellingEditor {
+        queue: Arc<InMemoryTaskQueue>,
+        user_id: i64,
+        chat_id: i64,
+    }
+
+    impl ImageEditor for CancellingEditor {
+        fn edit_image<'a>(&'a self, _request: ImageEditRequest) -> ImageEditFuture<'a> {
+            self.queue.cancel_user_jobs(
+                self.user_id,
+                self.chat_id,
+                "cancelled by user",
+                OffsetDateTime::now_utc(),
+            );
+            Box::pin(async move {
+                Err(ImageEditError::Provider(
+                    "aifarm provider provider_unavailable: status 503".to_owned(),
+                ))
+            })
+        }
+    }
+
+    struct CancellingGenerator {
+        queue: Arc<InMemoryTaskQueue>,
+        user_id: i64,
+        chat_id: i64,
+    }
+
+    impl ImageGenerator for CancellingGenerator {
+        fn generate_image<'a>(
+            &'a self,
+            _request: ImageGenerationRequest,
+        ) -> ImageGenerationFuture<'a> {
+            self.queue.cancel_user_jobs(
+                self.user_id,
+                self.chat_id,
+                "cancelled by user",
+                OffsetDateTime::now_utc(),
+            );
+            Box::pin(async move {
+                Err(ImageGenerationError::Provider(
+                    "aifarm provider provider_unavailable: status 503".to_owned(),
+                ))
+            })
+        }
+    }
+
+    fn cancel_test_edit_job(now: OffsetDateTime) -> StatelessJobItem {
+        new_image_edit_job_at(
+            ImageEditJobParams {
+                chat_id: -100,
+                message_id: 21,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "make it night".to_owned(),
+                photo_file_id: "photo-file".to_owned(),
+                photo_urls: vec!["https://telegram.test/original.png".to_owned()],
+                thread_id: None,
+            },
+            now,
+        )
+        .with_name("image_edit")
+        .with_priority(HIGHEST_PRIORITY)
+    }
+
+    fn cancel_test_gen_job(now: OffsetDateTime) -> StatelessJobItem {
+        new_image_gen_job_at(
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            now,
+        )
+    }
+
+    #[tokio::test]
+    async fn image_edit_worker_does_not_resurrect_a_job_cancelled_during_the_attempt() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let job_id = queue.assign(IMAGE_VIP_QUEUE_NAME, cancel_test_edit_job(now));
+        let effects = EffectsStub::new();
+
+        let report = run_image_edit_queue_once(
+            queue.as_ref(),
+            IMAGE_VIP_QUEUE_NAME,
+            &CancellingEditor {
+                queue: Arc::clone(&queue),
+                user_id: 30,
+                chat_id: -100,
+            },
+            &effects,
+            "image-edit-worker-1",
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageEditQueuePollOutcome::Cancelled);
+        let record = queue.record(job_id).expect("job");
+        assert_eq!(record.status, JobStatus::Cancelled);
+        assert!(
+            record.events.is_empty(),
+            "no retry bookkeeping for a cancelled job: {:?}",
+            record.events
+        );
+        assert!(
+            queue
+                .dequeue(IMAGE_VIP_QUEUE_NAME, "image-edit-worker-2", now)
+                .is_none()
+        );
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| call == "delete_placeholder:-100:888"),
+            "placeholder cleaned up: {:?}",
+            effects.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn image_gen_worker_does_not_resurrect_a_job_cancelled_during_the_attempt() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let job_id = queue.assign(IMAGE_REGULAR_QUEUE_NAME, cancel_test_gen_job(now));
+
+        let report = run_image_gen_queue_once(
+            queue.as_ref(),
+            IMAGE_REGULAR_QUEUE_NAME,
+            &CancellingGenerator {
+                queue: Arc::clone(&queue),
+                user_id: 30,
+                chat_id: -100,
+            },
+            &EffectsStub::new(),
+            "image-worker-1",
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Cancelled);
+        let record = queue.record(job_id).expect("job");
+        assert_eq!(record.status, JobStatus::Cancelled);
+        assert!(record.events.is_empty());
+        assert!(
+            queue
+                .dequeue(IMAGE_REGULAR_QUEUE_NAME, "image-worker-2", now)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn image_edit_worker_interrupts_a_hanging_provider_call_when_the_job_is_cancelled() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let job_id = queue.assign(IMAGE_VIP_QUEUE_NAME, cancel_test_edit_job(now));
+        let never = Arc::new(tokio::sync::Notify::new());
+        let editor = WaitingEditorStub::success(vec![], Arc::clone(&never));
+        let effects = EffectsStub::new();
+
+        let canceller = Arc::clone(&queue);
+        let cancel = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            canceller.cancel_user_jobs(30, -100, "cancelled by user", OffsetDateTime::now_utc())
+        });
+
+        let report = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            run_image_edit_queue_once(
+                queue.as_ref(),
+                IMAGE_VIP_QUEUE_NAME,
+                &editor,
+                &effects,
+                "image-edit-worker-1",
+                now,
+            ),
+        )
+        .await
+        .expect("cancellation must interrupt the hanging provider call");
+        assert_eq!(cancel.await.expect("cancel task"), vec![job_id]);
+
+        assert_eq!(report.outcome, ImageEditQueuePollOutcome::Cancelled);
+        assert_eq!(
+            queue.record(job_id).expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| call == "delete_placeholder:-100:888"),
+            "placeholder cleaned up after interruption: {:?}",
+            effects.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn image_gen_worker_interrupts_a_hanging_provider_call_when_the_job_is_cancelled() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let job_id = queue.assign(IMAGE_REGULAR_QUEUE_NAME, cancel_test_gen_job(now));
+        let never = Arc::new(tokio::sync::Notify::new());
+        let generator = WaitingGeneratorStub::success("https://cdn.test/never.png", never);
+        let effects = EffectsStub::new();
+
+        let canceller = Arc::clone(&queue);
+        tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            canceller.cancel_user_jobs(30, -100, "cancelled by user", OffsetDateTime::now_utc());
+        });
+
+        let report = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            run_image_gen_queue_once(
+                queue.as_ref(),
+                IMAGE_REGULAR_QUEUE_NAME,
+                &generator,
+                &effects,
+                "image-worker-1",
+                now,
+            ),
+        )
+        .await
+        .expect("cancellation must interrupt the hanging provider call");
+
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Cancelled);
+        assert_eq!(
+            queue.record(job_id).expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| call == "delete_placeholder:-100:888"),
+            "placeholder cleaned up after interruption: {:?}",
+            effects.calls()
+        );
     }
 
     #[derive(Clone, Debug)]
