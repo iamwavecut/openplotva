@@ -396,6 +396,7 @@ type RoutingEvent {
 	queueName: String
 	jobID: ID
 	chatID: ID
+	userID: ID
 	threadID: Int
 	messageID: Int
 	dedupeKey: String!
