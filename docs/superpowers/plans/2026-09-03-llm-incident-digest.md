@@ -32,7 +32,7 @@
 **Interfaces:**
 - Produces: `RoutingEventInput.user_id: Option<i64>` and `RoutingEventRecord.user_id: Option<i64>`.
 - Produces: `PostgresRoutingAdminReportStore::snapshot(since)` returning `RoutingAdminIncidentSnapshot` groups with exact counts and bounded context samples.
-- Produces: `PostgresRoutingAdminReportStore::{state, mark_pending, record_delivery}` for the app worker and dispatcher receipt path.
+- Produces: `PostgresRoutingAdminReportStore::{state, claim_pending, record_delivery}` for the app worker and dispatcher receipt path.
 
 - [ ] **Step 1: Write failing storage tests**
 
@@ -105,7 +105,7 @@ Aggregate by `dedupe_key`, join provider/model names, compute exact occurrence/d
 
 - [ ] **Step 5: Implement state persistence and pure transition logic**
 
-Use compare-by-`pending_virtual_id` updates so a stale dispatcher result cannot overwrite a newer operation. `record_delivery` loads the row, applies the tested pure transition, and persists it. A failed operation sets `last_delivery_attempt_at/error_class`; a successful one clears both.
+Use compare-by-`pending_virtual_id` updates so a stale dispatcher result cannot overwrite a newer operation. `claim_pending` is one conditional SQL write that enforces stale-pending recovery, the delivery retry floor, the 60-minute send gate, and the expected edit target; only its returned row owns the dispatcher enqueue. `record_delivery` loads the row, applies the tested pure transition, and persists it. A failed operation sets `last_delivery_attempt_at/error_class`; a successful one clears both.
 
 - [ ] **Step 6: Expose additive runtime API identity**
 
@@ -250,7 +250,7 @@ missing worker/store interfaces.
 On startup refresh once. Thereafter select over a one-minute delayed interval,
 actionable `Notify`, and stop. Coalesce repeated notifications during the
 five-second writer settling delay. For each admin, clear stale pending state,
-load state, calculate a pure plan, persist pending before queueing, then enqueue
+load state, calculate a pure plan, atomically claim pending before queueing, then enqueue
 one namespaced protected immediate dispatcher command with a unique debounce
 key.
 

@@ -58,6 +58,12 @@ fingerprint, and any in-flight dispatcher operation. This state prevents
 restart-driven duplicates. A stale in-flight marker expires after ten minutes
 so a crash cannot suppress reporting forever.
 
+The pending-operation write is an atomic conditional claim. It checks the
+stale-pending rule, five-minute delivery retry floor, 60-minute new-message
+gate, and expected edit target in PostgreSQL before returning ownership. This
+also prevents duplicate sends if two application revisions overlap during a
+rolling deployment.
+
 Both sends and edits continue through the existing dispatcher. Report
 operations carry a namespaced virtual ID. The dispatcher persists the result
 of those operations back to `llm_admin_report_state` before declaring its work
