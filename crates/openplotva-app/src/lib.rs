@@ -10118,6 +10118,7 @@ struct DispatcherWorkerGroupInputs {
     queue: Arc<openplotva_telegram::DispatcherQueue>,
     limiters: Arc<openplotva_telegram::ChatLimiters>,
     failure_ring: Arc<DispatchFailureRing>,
+    routing_admin_reports: openplotva_storage::llm_routing::PostgresRoutingAdminReportStore,
 }
 
 fn build_dispatcher_worker_group(
@@ -10134,6 +10135,7 @@ fn build_dispatcher_worker_group(
         queue,
         limiters,
         failure_ring,
+        routing_admin_reports,
     } = inputs;
     let mut workers = RuntimeWorkerGroup::new(RuntimeWorkerPhase::Outbound);
 
@@ -10145,6 +10147,7 @@ fn build_dispatcher_worker_group(
     let immediate_permissions = Arc::clone(&permissions);
     let immediate_queue = Arc::clone(&queue);
     let immediate_failure_ring = Arc::clone(&failure_ring);
+    let immediate_routing_admin_reports = routing_admin_reports.clone();
     let immediate_stop = stops.subscribe(RuntimeWorkerPhase::Outbound);
     workers.register(
         "dispatcher-immediate",
@@ -10159,6 +10162,7 @@ fn build_dispatcher_worker_group(
                         Arc::clone(&immediate_rate_limits),
                         Arc::clone(&immediate_permissions),
                         Some(Arc::clone(&immediate_failure_ring)),
+                        Some(immediate_routing_admin_reports.clone()),
                         item,
                     )
                 })
@@ -10187,6 +10191,7 @@ fn build_dispatcher_worker_group(
                             Arc::clone(&rate_limits),
                             Arc::clone(&permissions),
                             Some(Arc::clone(&failure_ring)),
+                            Some(routing_admin_reports.clone()),
                             item,
                         )
                     },
@@ -11660,6 +11665,41 @@ async fn start_runtime_workers(
     let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
         go_dispatcher_config(),
     ));
+    let routing_admin_report_store =
+        openplotva_storage::llm_routing::PostgresRoutingAdminReportStore::new(
+            service_clients.postgres.clone(),
+        );
+    if config.admins.admin_ids.is_empty() {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "llm_admin_reports",
+            "ADMINS_ADMIN_IDS is empty",
+        ));
+    } else {
+        let report_store = routing_admin_report_store.clone();
+        let report_queue = Arc::clone(&dispatcher_queue);
+        let report_admin_ids = Arc::<[i64]>::from(config.admins.admin_ids.clone());
+        let report_trigger = Arc::clone(&routing_admin_report_trigger);
+        let report_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
+        worker_registry.register(
+            "routing-admin-reports",
+            RuntimeWorkerPhase::Processor,
+            tokio::spawn(async move {
+                routing_admin_reports::run_routing_admin_report_worker_until(
+                    report_store,
+                    report_queue,
+                    report_admin_ids,
+                    report_trigger,
+                    report_stop,
+                )
+                .await;
+                tracing::info!("LLM admin report worker stopped");
+            }),
+        );
+        readiness_checks.push(ReadinessCheck::ok(
+            "llm_admin_reports",
+            "rolling 60-minute digest; new messages hourly, intermediate updates edited",
+        ));
+    }
     dispatcher_inspector.set_queue(Arc::clone(&dispatcher_queue));
     let restore_report = dispatcher_persistence
         .load_into_queue(&dispatcher_queue)
@@ -13932,6 +13972,7 @@ async fn start_runtime_workers(
             queue: Arc::clone(&dispatcher_queue),
             limiters: dispatcher_limiters,
             failure_ring: dispatch_failure_ring,
+            routing_admin_reports: routing_admin_report_store,
         },
         worker_stops.as_ref(),
     ));
@@ -14212,6 +14253,7 @@ async fn send_dispatcher_work_item(
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
     failure_ring: Option<Arc<DispatchFailureRing>>,
+    routing_admin_reports: Option<openplotva_storage::llm_routing::PostgresRoutingAdminReportStore>,
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
     send_dispatcher_work_item_with_transport_and_history(
@@ -14220,6 +14262,7 @@ async fn send_dispatcher_work_item(
         rate_limits,
         permissions,
         failure_ring,
+        routing_admin_reports,
         item,
         |method| {
             let telegram = telegram.clone();
@@ -14257,6 +14300,7 @@ where
         rate_limits,
         permissions,
         None,
+        None,
         item,
         send,
     )
@@ -14270,6 +14314,7 @@ async fn send_dispatcher_work_item_with_transport_and_history<H, E, R, P, SendFn
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
     permissions: Arc<permissions::ChatPermissionPolicy<P>>,
     failure_ring: Option<Arc<DispatchFailureRing>>,
+    routing_admin_reports: Option<openplotva_storage::llm_routing::PostgresRoutingAdminReportStore>,
     item: openplotva_telegram::DispatcherWorkItem,
     send: SendFn,
 ) -> openplotva_telegram::DispatcherSendStatus
@@ -14327,6 +14372,17 @@ where
                 "skipped send for rate-limited chat".to_owned(),
                 DISPATCH_FAILURE_CLASS_CHAT_RATE_LIMITED,
             );
+            if let Some(store) = routing_admin_reports.as_ref()
+                && let Err(error) = routing_admin_reports::record_routing_admin_dispatch_failure(
+                    store,
+                    &virtual_id,
+                    DISPATCH_FAILURE_CLASS_CHAT_RATE_LIMITED,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+            {
+                tracing::warn!(%error, %virtual_id, "failed to record rate-limited LLM admin report");
+            }
             return openplotva_telegram::DispatcherSendStatus::Failed;
         }
     }
@@ -14356,6 +14412,19 @@ where
                     format!("skipped send: chat permission settings deny {action}"),
                     openplotva_telegram::OutboundSendErrorClass::TerminalPermission.as_str(),
                 );
+                if let Some(store) = routing_admin_reports.as_ref()
+                    && let Err(error) =
+                        routing_admin_reports::record_routing_admin_dispatch_failure(
+                            store,
+                            &virtual_id,
+                            openplotva_telegram::OutboundSendErrorClass::TerminalPermission
+                                .as_str(),
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await
+                {
+                    tracing::warn!(%error, %virtual_id, "failed to record denied LLM admin report");
+                }
                 return openplotva_telegram::DispatcherSendStatus::Failed;
             }
         }
@@ -14478,6 +14547,16 @@ where
             "outbound dispatcher send failed"
         );
         record_failure(send_error, error_class);
+    }
+    if let Some(store) = routing_admin_reports.as_ref()
+        && let Err(error) = routing_admin_reports::record_routing_admin_dispatch_result(
+            store,
+            &report,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    {
+        tracing::warn!(%error, virtual_id = report.virtual_id, "failed to record LLM admin report delivery");
     }
     report.status
 }
@@ -15517,6 +15596,7 @@ mod tests {
             rate_limits,
             permissions,
             Some(Arc::clone(&ring)),
+            None,
             item,
             |_| async { Err::<TelegramOutboundResponse, _>(permission_error()) },
         )

@@ -72,6 +72,7 @@ CREATE TABLE llm_admin_report_state (
     admin_id BIGINT PRIMARY KEY,
     telegram_message_id BIGINT,
     last_new_message_at TIMESTAMPTZ,
+    last_new_message_attempt_at TIMESTAMPTZ,
     last_rendered_fingerprint TEXT,
     pending_virtual_id TEXT UNIQUE,
     pending_kind TEXT,
@@ -105,7 +106,7 @@ Aggregate by `dedupe_key`, join provider/model names, compute exact occurrence/d
 
 - [ ] **Step 5: Implement state persistence and pure transition logic**
 
-Use compare-by-`pending_virtual_id` updates so a stale dispatcher result cannot overwrite a newer operation. `claim_pending` is one conditional SQL write that enforces stale-pending recovery, the delivery retry floor, the 60-minute send gate, and the expected edit target; only its returned row owns the dispatcher enqueue. `record_delivery` loads the row, applies the tested pure transition, and persists it. A failed operation sets `last_delivery_attempt_at/error_class`; a successful one clears both.
+Use compare-by-`pending_virtual_id` updates so a stale dispatcher result cannot overwrite a newer operation. `claim_pending` is one conditional SQL write that enforces stale-pending recovery, the delivery retry floor, the 60-minute successful-send/ambiguous-send-claim gates, and the expected edit target; only its returned row owns the dispatcher enqueue. `record_delivery` loads the row, applies the tested pure transition, and persists it. A proved-not-sent failure releases the send claim, an ambiguous failure keeps it for an hour, and a successful operation clears retry state.
 
 - [ ] **Step 6: Expose additive runtime API identity**
 

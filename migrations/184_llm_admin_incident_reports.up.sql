@@ -5,6 +5,7 @@ CREATE TABLE llm_admin_report_state (
     admin_id BIGINT PRIMARY KEY,
     telegram_message_id BIGINT,
     last_new_message_at TIMESTAMPTZ,
+    last_new_message_attempt_at TIMESTAMPTZ,
     last_rendered_fingerprint TEXT,
     pending_virtual_id TEXT UNIQUE,
     pending_kind TEXT,

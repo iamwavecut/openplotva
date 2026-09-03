@@ -1,12 +1,24 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc, time::Duration as StdDuration};
 
+use futures_util::FutureExt as _;
+use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
-    RoutingAdminIncidentGroup, RoutingAdminIncidentSample, RoutingAdminIncidentSnapshot,
-    RoutingAdminReportState,
+    PostgresRoutingAdminReportStore, RoutingAdminIncidentGroup, RoutingAdminIncidentSample,
+    RoutingAdminIncidentSnapshot, RoutingAdminReportDeliveryResult,
+    RoutingAdminReportOperationKind, RoutingAdminReportPendingClaim, RoutingAdminReportState,
+};
+use openplotva_telegram::{
+    ChatRef, DispatcherMessage, DispatcherQueue, DispatcherSendStatus, EditTextMessageRequest,
+    EnqueueOutcome, TelegramOutboundMethod, TextMessageRequest, build_edit_text_message_method,
+    build_text_message_method_without_link_preview, fingerprint_text_message_part,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
+use tokio::{
+    sync::{Notify, watch},
+    time::Instant,
+};
 
 pub const MAX_TELEGRAM_REPORT_BYTES: usize = 3_900;
 const MAX_RENDERED_GROUPS: usize = 5;
@@ -14,6 +26,9 @@ const REPORT_WINDOW: Duration = Duration::seconds(60 * 60);
 const ACTIVE_FAILURE_AGE: Duration = Duration::seconds(5 * 60);
 const DELIVERY_RETRY_FLOOR: Duration = Duration::seconds(5 * 60);
 const STALE_PENDING_AGE: Duration = Duration::seconds(10 * 60);
+pub const ROUTING_ADMIN_REPORT_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(60);
+pub const ROUTING_ADMIN_REPORT_EVENT_SETTLE_DELAY: StdDuration = StdDuration::from_secs(5);
+pub const ROUTING_ADMIN_REPORT_VIRTUAL_ID_PREFIX: &str = "routing-admin-report:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FormattedIncidentDigest {
@@ -121,9 +136,13 @@ pub fn plan_admin_report_delivery(
     {
         return AdminReportDeliveryPlan::None;
     }
+    let recent_send_claim = state
+        .last_new_message_attempt_at
+        .is_some_and(|attempted| attempted > now - REPORT_WINDOW);
 
     let Some(message_id) = state.telegram_message_id else {
         if !digest.has_incidents
+            || recent_send_claim
             || state
                 .last_new_message_at
                 .is_some_and(|sent| sent > now - REPORT_WINDOW)
@@ -133,7 +152,8 @@ pub fn plan_admin_report_delivery(
         return AdminReportDeliveryPlan::Send;
     };
 
-    if digest.has_incidents
+    if !recent_send_claim
+        && digest.has_incidents
         && let (Some(last_new), Some(latest)) =
             (state.last_new_message_at, digest.latest_occurrence)
         && now >= last_new + REPORT_WINDOW
@@ -142,6 +162,254 @@ pub fn plan_admin_report_delivery(
         return AdminReportDeliveryPlan::Send;
     }
     AdminReportDeliveryPlan::Edit { message_id }
+}
+
+pub fn build_admin_report_dispatch(
+    admin_id: i64,
+    digest: &FormattedIncidentDigest,
+    plan: AdminReportDeliveryPlan,
+    virtual_id: &str,
+) -> Result<DispatcherMessage, String> {
+    let chat = ChatRef {
+        id: admin_id,
+        is_forum: false,
+    };
+    let method = match plan {
+        AdminReportDeliveryPlan::Send => {
+            let request = TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id: 0,
+                disable_notification: false,
+                allow_sending_without_reply: None,
+                text: digest.text.clone(),
+                render_as: String::new(),
+                reply_markup: None,
+            };
+            build_text_message_method_without_link_preview(
+                &request,
+                chat,
+                None,
+                digest.text.clone(),
+                true,
+            )
+            .map(TelegramOutboundMethod::from)
+            .map_err(|error| error.to_string())?
+        }
+        AdminReportDeliveryPlan::Edit { message_id } => {
+            let request = EditTextMessageRequest {
+                chat,
+                message_id,
+                text: digest.text.clone(),
+                render_as: String::new(),
+                reply_markup: None,
+            };
+            build_edit_text_message_method(&request)
+                .map(TelegramOutboundMethod::from)
+                .map_err(|error| error.to_string())?
+        }
+        AdminReportDeliveryPlan::None => {
+            return Err("cannot dispatch an empty admin report plan".to_owned());
+        }
+    };
+    Ok(DispatcherMessage::new(
+        fingerprint_text_message_part(admin_id, &digest.text),
+        virtual_id,
+    )
+    .with_debounce_key(virtual_id)
+    .with_bypass_chat_restrictions(true)
+    .with_protected(true)
+    .with_method(method))
+}
+
+#[must_use]
+pub fn delivery_result_from_dispatch_report(
+    report: &crate::virtual_messages::DispatchSendReport,
+    at: OffsetDateTime,
+) -> Option<RoutingAdminReportDeliveryResult> {
+    if !report
+        .virtual_id
+        .starts_with(ROUTING_ADMIN_REPORT_VIRTUAL_ID_PREFIX)
+    {
+        return None;
+    }
+    Some(RoutingAdminReportDeliveryResult {
+        virtual_id: report.virtual_id.clone(),
+        sent_message_id: report.sent_message_id,
+        succeeded: report.status == DispatcherSendStatus::Sent,
+        error_class: (report.status == DispatcherSendStatus::Failed)
+            .then(|| report.error_class.unwrap_or("dispatcher_failed").to_owned()),
+        at,
+    })
+}
+
+pub async fn record_routing_admin_dispatch_result(
+    store: &PostgresRoutingAdminReportStore,
+    report: &crate::virtual_messages::DispatchSendReport,
+    at: OffsetDateTime,
+) -> Result<bool, StorageError> {
+    let Some(result) = delivery_result_from_dispatch_report(report, at) else {
+        return Ok(false);
+    };
+    store.record_delivery(&result).await
+}
+
+pub async fn record_routing_admin_dispatch_failure(
+    store: &PostgresRoutingAdminReportStore,
+    virtual_id: &str,
+    error_class: &str,
+    at: OffsetDateTime,
+) -> Result<bool, StorageError> {
+    if !virtual_id.starts_with(ROUTING_ADMIN_REPORT_VIRTUAL_ID_PREFIX) {
+        return Ok(false);
+    }
+    store
+        .record_delivery(&RoutingAdminReportDeliveryResult {
+            virtual_id: virtual_id.to_owned(),
+            sent_message_id: None,
+            succeeded: false,
+            error_class: Some(error_class.to_owned()),
+            at,
+        })
+        .await
+}
+
+pub async fn run_routing_admin_report_worker_until(
+    store: PostgresRoutingAdminReportStore,
+    queue: Arc<DispatcherQueue>,
+    admin_ids: Arc<[i64]>,
+    trigger: Arc<Notify>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut sequence = 0u64;
+    let mut interval =
+        tokio::time::interval_at(Instant::now(), ROUTING_ADMIN_REPORT_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                refresh_routing_admin_reports(
+                    &store,
+                    &queue,
+                    &admin_ids,
+                    &mut sequence,
+                    OffsetDateTime::now_utc(),
+                ).await;
+            }
+            _ = trigger.notified() => {
+                let settle = tokio::time::sleep(ROUTING_ADMIN_REPORT_EVENT_SETTLE_DELAY);
+                tokio::pin!(settle);
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
+                    }
+                    () = &mut settle => {}
+                }
+                while trigger.notified().now_or_never().is_some() {}
+                refresh_routing_admin_reports(
+                    &store,
+                    &queue,
+                    &admin_ids,
+                    &mut sequence,
+                    OffsetDateTime::now_utc(),
+                ).await;
+            }
+        }
+    }
+}
+
+async fn refresh_routing_admin_reports(
+    store: &PostgresRoutingAdminReportStore,
+    queue: &DispatcherQueue,
+    admin_ids: &[i64],
+    sequence: &mut u64,
+    now: OffsetDateTime,
+) {
+    let snapshot = match store.snapshot(now - REPORT_WINDOW).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load LLM admin incident digest snapshot");
+            return;
+        }
+    };
+    let digest = format_incident_digest(&snapshot, now);
+    for admin_id in admin_ids.iter().copied() {
+        let state = match store.state(admin_id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => RoutingAdminReportState {
+                admin_id,
+                ..RoutingAdminReportState::default()
+            },
+            Err(error) => {
+                tracing::warn!(%error, admin_id, "failed to load LLM admin report state");
+                continue;
+            }
+        };
+        let plan = plan_admin_report_delivery(&state, &digest, now);
+        if plan == AdminReportDeliveryPlan::None {
+            continue;
+        }
+
+        *sequence = sequence.saturating_add(1);
+        let kind = match plan {
+            AdminReportDeliveryPlan::Send => RoutingAdminReportOperationKind::Send,
+            AdminReportDeliveryPlan::Edit { .. } => RoutingAdminReportOperationKind::Edit,
+            AdminReportDeliveryPlan::None => continue,
+        };
+        let virtual_id = format!(
+            "{ROUTING_ADMIN_REPORT_VIRTUAL_ID_PREFIX}{}:{admin_id}:{}:{}",
+            kind.as_str(),
+            now.unix_timestamp_nanos(),
+            *sequence
+        );
+        let message = match build_admin_report_dispatch(admin_id, &digest, plan, &virtual_id) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, admin_id, "failed to build LLM admin report dispatch");
+                continue;
+            }
+        };
+        let expected_message_id = match plan {
+            AdminReportDeliveryPlan::Edit { message_id } => Some(message_id),
+            AdminReportDeliveryPlan::Send | AdminReportDeliveryPlan::None => None,
+        };
+        let claim = RoutingAdminReportPendingClaim {
+            admin_id,
+            virtual_id: virtual_id.clone(),
+            kind,
+            fingerprint: digest.fingerprint.clone(),
+            expected_message_id,
+            now,
+            stale_pending_before: now - STALE_PENDING_AGE,
+            retry_before: now - DELIVERY_RETRY_FLOOR,
+            send_before: now - REPORT_WINDOW,
+        };
+        match store.claim_pending(&claim).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(%error, admin_id, "failed to claim LLM admin report delivery");
+                continue;
+            }
+        }
+        if queue.enqueue(message, true) == EnqueueOutcome::Deduped
+            && let Err(error) =
+                record_routing_admin_dispatch_failure(store, &virtual_id, "dispatcher_deduped", now)
+                    .await
+        {
+            tracing::warn!(%error, admin_id, "failed to release deduped LLM admin report claim");
+        }
+    }
 }
 
 fn formatted_digest(
@@ -435,6 +703,10 @@ mod tests {
         RoutingAdminIncidentGroup, RoutingAdminIncidentSample, RoutingAdminIncidentSnapshot,
         RoutingAdminReportOperationKind, RoutingAdminReportState,
     };
+    use openplotva_telegram::{
+        DispatcherConfig, DispatcherQueue, DispatcherSendStatus, EnqueueOutcome,
+        TelegramOutboundMethod, TelegramOutboundMethodKind,
+    };
     use serde_json::json;
     use time::OffsetDateTime;
 
@@ -677,6 +949,24 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_send_claim_never_bypasses_the_hourly_send_gate() {
+        let digest = format_incident_digest(
+            &snapshot(vec![group("dialog", "dialog", 1, 1, 999, 999)]),
+            at(1_000),
+        );
+        let state = RoutingAdminReportState {
+            admin_id: 42,
+            last_new_message_attempt_at: Some(at(900)),
+            ..RoutingAdminReportState::default()
+        };
+
+        assert_eq!(
+            plan_admin_report_delivery(&state, &digest, at(1_000)),
+            AdminReportDeliveryPlan::None
+        );
+    }
+
+    #[test]
     fn recent_failure_and_live_pending_operation_suppress_retries() {
         let digest = format_incident_digest(
             &snapshot(vec![group("dialog", "dialog", 1, 1, 999, 999)]),
@@ -753,5 +1043,83 @@ mod tests {
             plan_admin_report_delivery(&absent, &digest, at(1_000)),
             AdminReportDeliveryPlan::None
         );
+    }
+
+    #[test]
+    fn report_dispatch_builds_one_protected_send_with_tracking_id() {
+        let digest = format_incident_digest(
+            &snapshot(vec![group("dialog", "dialog", 1, 1, 999, 999)]),
+            at(1_000),
+        );
+        let virtual_id = "routing-admin-report:send:42:1";
+        let message =
+            build_admin_report_dispatch(42, &digest, AdminReportDeliveryPlan::Send, virtual_id)
+                .expect("send command");
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+
+        assert_eq!(queue.enqueue(message, true), EnqueueOutcome::Enqueued);
+        let item = queue.dequeue_immediate().expect("queued report");
+        assert!(item.metadata().protected);
+        assert_eq!(item.metadata().virtual_id, virtual_id);
+        assert_eq!(
+            item.method_kind(),
+            Some(TelegramOutboundMethodKind::SendMessage)
+        );
+    }
+
+    #[test]
+    fn report_dispatch_edits_the_claimed_telegram_message() {
+        let digest = format_incident_digest(
+            &snapshot(vec![group("dialog", "dialog", 2, 1, 999, 999)]),
+            at(1_000),
+        );
+        let virtual_id = "routing-admin-report:edit:42:2";
+        let message = build_admin_report_dispatch(
+            42,
+            &digest,
+            AdminReportDeliveryPlan::Edit { message_id: 77 },
+            virtual_id,
+        )
+        .expect("edit command");
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        assert_eq!(queue.enqueue(message, true), EnqueueOutcome::Enqueued);
+
+        let method = queue
+            .dequeue_immediate()
+            .and_then(|item| item.into_method())
+            .expect("queued edit method");
+        assert_eq!(method.kind(), TelegramOutboundMethodKind::EditMessageText);
+        let TelegramOutboundMethod::EditMessageText(method) = method else {
+            panic!("expected editMessageText");
+        };
+        let payload = serde_json::to_value(method).expect("edit payload");
+        assert_eq!(payload["chat_id"], 42);
+        assert_eq!(payload["message_id"], 77);
+        assert_eq!(payload["text"], digest.text);
+    }
+
+    #[test]
+    fn dispatcher_receipt_maps_only_namespaced_report_operations() {
+        let sent = crate::virtual_messages::DispatchSendReport {
+            status: DispatcherSendStatus::Sent,
+            virtual_id: "routing-admin-report:send:42:1".to_owned(),
+            sent_message_id: Some(77),
+            send_error: None,
+            error_class: None,
+            protected: true,
+            ephemeral_track_error: None,
+        };
+
+        let result =
+            delivery_result_from_dispatch_report(&sent, at(1_000)).expect("report delivery result");
+        assert!(result.succeeded);
+        assert_eq!(result.sent_message_id, Some(77));
+        assert_eq!(result.virtual_id, sent.virtual_id);
+
+        let unrelated = crate::virtual_messages::DispatchSendReport {
+            virtual_id: "dialog-answer:42".to_owned(),
+            ..sent
+        };
+        assert!(delivery_result_from_dispatch_report(&unrelated, at(1_000)).is_none());
     }
 }

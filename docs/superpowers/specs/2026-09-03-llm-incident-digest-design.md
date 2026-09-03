@@ -54,7 +54,7 @@ for the five-second routing-event writer flush.
 
 One small `llm_admin_report_state` row per admin stores the current Telegram
 message ID, the last successful new-message time, the last rendered
-fingerprint, and any in-flight dispatcher operation. This state prevents
+fingerprint, the latest new-message claim, and any in-flight dispatcher operation. This state prevents
 restart-driven duplicates. A stale in-flight marker expires after ten minutes
 so a crash cannot suppress reporting forever.
 
@@ -63,6 +63,13 @@ stale-pending rule, five-minute delivery retry floor, 60-minute new-message
 gate, and expected edit target in PostgreSQL before returning ownership. This
 also prevents duplicate sends if two application revisions overlap during a
 rolling deployment.
+
+A send claim itself reserves the hourly slot until its outcome is known. A
+failure that proves Telegram did not accept the request releases that
+reservation; an ambiguous transport result, a successful response without a
+recoverable message ID, or a lost database receipt keeps it for 60 minutes.
+This closes the failure window between Telegram acceptance and receipt
+persistence without weakening the anti-spam contract.
 
 Both sends and edits continue through the existing dispatcher. Report
 operations carry a namespaced virtual ID. The dispatcher persists the result

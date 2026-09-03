@@ -288,6 +288,7 @@ pub struct RoutingAdminReportState {
     pub admin_id: i64,
     pub telegram_message_id: Option<i64>,
     pub last_new_message_at: Option<OffsetDateTime>,
+    pub last_new_message_attempt_at: Option<OffsetDateTime>,
     pub last_rendered_fingerprint: Option<String>,
     pub pending_virtual_id: Option<String>,
     pub pending_kind: Option<RoutingAdminReportOperationKind>,
@@ -353,6 +354,7 @@ pub fn next_admin_report_delivery_state(
         if kind == Some(RoutingAdminReportOperationKind::Send) {
             state.telegram_message_id = result.sent_message_id.map(i64::from);
             state.last_new_message_at = Some(result.at);
+            state.last_new_message_attempt_at = None;
         }
         state.last_rendered_fingerprint = state.pending_fingerprint.take();
         state.last_delivery_attempt_at = None;
@@ -362,6 +364,14 @@ pub fn next_admin_report_delivery_state(
             .error_class
             .clone()
             .unwrap_or_else(|| "missing_message_id".to_owned());
+        if kind == Some(RoutingAdminReportOperationKind::Send)
+            && !matches!(
+                error_class.as_str(),
+                "terminal_other" | "missing_message_id"
+            )
+        {
+            state.last_new_message_attempt_at = None;
+        }
         if kind == Some(RoutingAdminReportOperationKind::Edit)
             && matches!(
                 error_class.as_str(),
@@ -662,6 +672,7 @@ const SQL_ROUTING_ADMIN_REPORT_STATE: &str = r#"SELECT
     admin_id,
     telegram_message_id,
     last_new_message_at,
+    last_new_message_attempt_at,
     last_rendered_fingerprint,
     pending_virtual_id,
     pending_kind,
@@ -678,14 +689,16 @@ const SQL_CLAIM_ROUTING_ADMIN_REPORT_SEND: &str = r#"INSERT INTO llm_admin_repor
     pending_kind,
     pending_fingerprint,
     pending_started_at,
+    last_new_message_attempt_at,
     updated_at
 )
-VALUES ($1, $2, 'send', $3, $4, $4)
+VALUES ($1, $2, 'send', $3, $4, $4, $4)
 ON CONFLICT (admin_id) DO UPDATE SET
     pending_virtual_id = EXCLUDED.pending_virtual_id,
     pending_kind = EXCLUDED.pending_kind,
     pending_fingerprint = EXCLUDED.pending_fingerprint,
     pending_started_at = EXCLUDED.pending_started_at,
+    last_new_message_attempt_at = EXCLUDED.last_new_message_attempt_at,
     updated_at = EXCLUDED.updated_at
 WHERE (
         llm_admin_report_state.pending_virtual_id IS NULL
@@ -699,6 +712,10 @@ WHERE (
   AND (
         llm_admin_report_state.last_new_message_at IS NULL
         OR llm_admin_report_state.last_new_message_at <= $7
+    )
+  AND (
+        llm_admin_report_state.last_new_message_attempt_at IS NULL
+        OR llm_admin_report_state.last_new_message_attempt_at <= $7
     )
 RETURNING admin_id"#;
 const SQL_CLAIM_ROUTING_ADMIN_REPORT_EDIT: &str = r#"UPDATE llm_admin_report_state SET
@@ -723,6 +740,7 @@ const SQL_ROUTING_ADMIN_REPORT_STATE_BY_PENDING_FOR_UPDATE: &str = r#"SELECT
     admin_id,
     telegram_message_id,
     last_new_message_at,
+    last_new_message_attempt_at,
     last_rendered_fingerprint,
     pending_virtual_id,
     pending_kind,
@@ -737,14 +755,15 @@ FOR UPDATE"#;
 const SQL_UPDATE_ROUTING_ADMIN_REPORT_STATE: &str = r#"UPDATE llm_admin_report_state SET
     telegram_message_id = $2,
     last_new_message_at = $3,
-    last_rendered_fingerprint = $4,
-    pending_virtual_id = $5,
-    pending_kind = $6,
-    pending_fingerprint = $7,
-    pending_started_at = $8,
-    last_delivery_attempt_at = $9,
-    last_delivery_error_class = $10,
-    updated_at = $11
+    last_new_message_attempt_at = $4,
+    last_rendered_fingerprint = $5,
+    pending_virtual_id = $6,
+    pending_kind = $7,
+    pending_fingerprint = $8,
+    pending_started_at = $9,
+    last_delivery_attempt_at = $10,
+    last_delivery_error_class = $11,
+    updated_at = $12
 WHERE admin_id = $1"#;
 pub const SQL_DELETE_OLD_LLM_ROUTING_EVENTS_BATCH: &str = r#"
 WITH doomed AS (
@@ -883,6 +902,7 @@ fn routing_admin_report_state_from_row(
         admin_id: row.try_get("admin_id")?,
         telegram_message_id: row.try_get("telegram_message_id")?,
         last_new_message_at: row.try_get("last_new_message_at")?,
+        last_new_message_attempt_at: row.try_get("last_new_message_attempt_at")?,
         last_rendered_fingerprint: row.try_get("last_rendered_fingerprint")?,
         pending_virtual_id: row.try_get("pending_virtual_id")?,
         pending_kind,
@@ -1687,6 +1707,7 @@ impl PostgresRoutingAdminReportStore {
             .bind(next.admin_id)
             .bind(next.telegram_message_id)
             .bind(next.last_new_message_at)
+            .bind(next.last_new_message_attempt_at)
             .bind(next.last_rendered_fingerprint.as_deref())
             .bind(next.pending_virtual_id.as_deref())
             .bind(
@@ -1906,6 +1927,45 @@ mod tests {
             next.last_delivery_error_class.as_deref(),
             Some("terminal_bad_request")
         );
+    }
+
+    #[test]
+    fn ambiguous_send_failure_keeps_the_hourly_send_claim() {
+        let claimed_at = OffsetDateTime::from_unix_timestamp(1_780_000_000).expect("timestamp");
+        let failed_at = claimed_at + time::Duration::seconds(10);
+        let state = RoutingAdminReportState {
+            admin_id: 42,
+            last_new_message_attempt_at: Some(claimed_at),
+            pending_virtual_id: Some("routing-admin-report:send:42:3".to_owned()),
+            pending_kind: Some(RoutingAdminReportOperationKind::Send),
+            pending_fingerprint: Some("digest-c".to_owned()),
+            pending_started_at: Some(claimed_at),
+            ..RoutingAdminReportState::default()
+        };
+
+        let ambiguous = next_admin_report_delivery_state(
+            state.clone(),
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:send:42:3".to_owned(),
+                sent_message_id: None,
+                succeeded: false,
+                error_class: Some("terminal_other".to_owned()),
+                at: failed_at,
+            },
+        );
+        let known_not_sent = next_admin_report_delivery_state(
+            state,
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:send:42:3".to_owned(),
+                sent_message_id: None,
+                succeeded: false,
+                error_class: Some("retryable_transient".to_owned()),
+                at: failed_at,
+            },
+        );
+
+        assert_eq!(ambiguous.last_new_message_attempt_at, Some(claimed_at));
+        assert_eq!(known_not_sent.last_new_message_attempt_at, None);
     }
 
     #[test]
