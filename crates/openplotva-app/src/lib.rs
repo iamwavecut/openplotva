@@ -8052,6 +8052,7 @@ fn record_openrouter_free_key_status_failed(
         queue_name: None,
         job_id: None,
         chat_id: None,
+        user_id: None,
         thread_id: None,
         message_id: None,
         dedupe_key: format!("openrouter_free_key_status_failed:{source}"),
@@ -8658,6 +8659,7 @@ async fn admin_routing_apply_action(
                     queue_name: None,
                     job_id: None,
                     chat_id: None,
+                    user_id: None,
                     thread_id: None,
                     message_id: None,
                     dedupe_key: "openrouter_free_refresh_started:manual".to_owned(),
@@ -8678,6 +8680,7 @@ async fn admin_routing_apply_action(
                             queue_name: None,
                             job_id: None,
                             chat_id: None,
+                            user_id: None,
                             thread_id: None,
                             message_id: None,
                             dedupe_key: "openrouter_free_refresh_succeeded:manual".to_owned(),
@@ -8718,6 +8721,7 @@ async fn admin_routing_apply_action(
                             queue_name: None,
                             job_id: None,
                             chat_id: None,
+                            user_id: None,
                             thread_id: None,
                             message_id: None,
                             dedupe_key: "openrouter_free_refresh_failed:manual".to_owned(),
@@ -10523,11 +10527,11 @@ async fn start_runtime_workers(
         RuntimeWorkerPhase::Ancillary,
         routing_event_recorder_worker,
     );
-    let mut routing_event_reporter = runtime_routing::RoutingEventReporter::new(
+    let routing_admin_report_trigger = Arc::new(tokio::sync::Notify::new());
+    let routing_event_reporter = runtime_routing::RoutingEventReporter::new(
         routing_event_buffer.clone(),
         Some(routing_event_recorder.clone()),
-        None,
-        runtime_routing::DEFAULT_ROUTING_ADMIN_REPORT_COOLDOWN,
+        Some(Arc::clone(&routing_admin_report_trigger)),
     );
     workers.routing_event_buffer = Some(routing_event_buffer.clone());
     workers.routing_event_reporter = Some(routing_event_reporter.clone());
@@ -10671,6 +10675,7 @@ async fn start_runtime_workers(
                         queue_name: None,
                         job_id: None,
                         chat_id: None,
+                        user_id: None,
                         thread_id: None,
                         message_id: None,
                         dedupe_key: "openrouter_free_refresh_succeeded:startup".to_owned(),
@@ -10702,6 +10707,7 @@ async fn start_runtime_workers(
                         queue_name: None,
                         job_id: None,
                         chat_id: None,
+                        user_id: None,
                         thread_id: None,
                         message_id: None,
                         dedupe_key: "openrouter_free_refresh_failed:startup".to_owned(),
@@ -10801,6 +10807,7 @@ async fn start_runtime_workers(
                                     queue_name: None,
                                     job_id: None,
                                     chat_id: None,
+                                    user_id: None,
                                     thread_id: None,
                                     message_id: None,
                                     dedupe_key: "openrouter_free_refresh_succeeded:daily".to_owned(),
@@ -10832,6 +10839,7 @@ async fn start_runtime_workers(
                                     queue_name: None,
                                     job_id: None,
                                     chat_id: None,
+                                    user_id: None,
                                     thread_id: None,
                                     message_id: None,
                                     dedupe_key: "openrouter_free_refresh_failed:daily".to_owned(),
@@ -11651,18 +11659,6 @@ async fn start_runtime_workers(
     let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
         go_dispatcher_config(),
     ));
-    let routing_admin_notifier: Arc<dyn runtime_routing::RoutingAdminNotifier> =
-        Arc::new(runtime_routing::DispatcherRoutingAdminNotifier::new(
-            Arc::<[i64]>::from(config.admins.admin_ids.clone()),
-            Arc::clone(&dispatcher_queue),
-        ));
-    routing_event_reporter = runtime_routing::RoutingEventReporter::new(
-        routing_event_buffer.clone(),
-        Some(routing_event_recorder.clone()),
-        Some(routing_admin_notifier),
-        runtime_routing::DEFAULT_ROUTING_ADMIN_REPORT_COOLDOWN,
-    );
-    workers.routing_event_reporter = Some(routing_event_reporter.clone());
     dispatcher_inspector.set_queue(Arc::clone(&dispatcher_queue));
     let restore_report = dispatcher_persistence
         .load_into_queue(&dispatcher_queue)

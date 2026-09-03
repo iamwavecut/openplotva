@@ -290,6 +290,7 @@ impl ChatStepProvider for RouterChatProvider {
                         queue_name: Some("dialog".to_owned()),
                         chat_id: (request.input.context.chat_id != 0)
                             .then_some(request.input.context.chat_id),
+                        user_id: (request.input.user.id != 0).then_some(request.input.user.id),
                         thread_id: request.input.context.thread_id,
                         message_id: (request.input.message.id != 0)
                             .then_some(request.input.message.id),
@@ -885,7 +886,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = router_provider_for_test(
             RoutingSnapshot::default(),
@@ -894,10 +894,13 @@ mod tests {
             reporter.clone(),
         );
 
+        let mut request = default_step_request();
+        request.input.user.id = 42;
+        request.input.user.full_name = "Alice Example".to_owned();
         let error = provider
             .as_chat_step()
             .expect("step seam")
-            .run_chat_step(default_step_request())
+            .run_chat_step(request)
             .await
             .err();
 
@@ -906,6 +909,7 @@ mod tests {
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events[0].event_type, "route_unavailable");
         assert_eq!(events[0].workflow_key, "dialog");
+        assert_eq!(events[0].user_id, Some(42));
     }
 
     #[tokio::test(start_paused = true)]
@@ -929,7 +933,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = RouterChatProvider::new(
             Arc::clone(&handle),
@@ -964,7 +967,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let mut snapshot = routed_dialog_snapshot();
         snapshot.providers[0].enabled = false;
@@ -1007,7 +1009,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = router_provider_for_test(
             routed_dialog_snapshot(),
@@ -1056,7 +1057,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let mut snapshot = routed_dialog_snapshot();
         snapshot.assignments.push(AssignmentRecord {
@@ -1143,7 +1143,6 @@ mod tests {
                 crate::runtime_routing::RoutingEventBuffer::new(8),
                 None,
                 None,
-                std::time::Duration::from_secs(600),
             ),
         );
 
@@ -1182,7 +1181,6 @@ mod tests {
                 crate::runtime_routing::RoutingEventBuffer::new(8),
                 None,
                 None,
-                std::time::Duration::from_secs(600),
             ),
         );
 
@@ -1236,7 +1234,6 @@ mod tests {
                 crate::runtime_routing::RoutingEventBuffer::new(8),
                 None,
                 None,
-                std::time::Duration::from_secs(600),
             ),
         );
 
@@ -1804,7 +1801,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = router_provider_for_test(
             routed_dialog_snapshot(),
@@ -1833,7 +1829,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = router_provider_for_test(
             routed_dialog_snapshot(),
@@ -1869,7 +1864,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let provider = router_provider_for_test(
             routed_dialog_snapshot(),

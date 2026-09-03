@@ -221,6 +221,7 @@ fn dialog_retry_exhausted_routing_event(
         queue_name: Some(failure.queue_name.to_owned()),
         job_id: Some(item.id),
         chat_id: (params.chat_id != 0).then_some(params.chat_id),
+        user_id: (params.user_id != 0).then_some(params.user_id),
         thread_id: params.thread_id,
         message_id: (params.message_id != 0).then_some(params.message_id),
         dedupe_key: format!("all_attempts_exhausted:dialog:job_retry_exhausted:{provider}"),

@@ -3737,6 +3737,9 @@ impl MemoryExtractor for RoutedMemoryExtractor {
                         RoutedRequestContext {
                             workflow_key: MEMORY_EXTRACTION_WORKFLOW_KEY.to_owned(),
                             queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                            job_id: (input.run.id != 0).then_some(input.run.id),
+                            chat_id: (input.run.chat_id != 0).then_some(input.run.chat_id),
+                            thread_id: (input.run.thread_id != 0).then_some(input.run.thread_id),
                             ..RoutedRequestContext::default()
                         },
                         move |attempt| {

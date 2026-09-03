@@ -1555,6 +1555,7 @@ fn image_generation_context(
     RoutedRequestContext {
         workflow_key: workflow_key.to_owned(),
         chat_id: (request.chat_id != 0).then_some(request.chat_id),
+        user_id: (request.user_id != 0).then_some(request.user_id),
         thread_id: request.thread_id,
         message_id: (request.message_id != 0).then_some(request.message_id),
         ..RoutedRequestContext::default()
@@ -1565,6 +1566,7 @@ fn image_edit_context(workflow_key: &str, request: &ImageEditRequest) -> RoutedR
     RoutedRequestContext {
         workflow_key: workflow_key.to_owned(),
         chat_id: (request.chat_id != 0).then_some(request.chat_id),
+        user_id: (request.user_id != 0).then_some(request.user_id),
         thread_id: request.thread_id,
         message_id: (request.message_id != 0).then_some(request.message_id),
         ..RoutedRequestContext::default()

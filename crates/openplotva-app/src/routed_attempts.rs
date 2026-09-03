@@ -539,6 +539,7 @@ pub struct RoutedRequestContext {
     pub queue_name: Option<String>,
     pub job_id: Option<i64>,
     pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub vip: bool,
@@ -675,6 +676,7 @@ fn routing_event_with_severity(
         queue_name: context.queue_name.clone(),
         job_id: context.job_id,
         chat_id: context.chat_id,
+        user_id: context.user_id,
         thread_id: context.thread_id,
         message_id: context.message_id,
         dedupe_key: format!(
@@ -847,7 +849,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let walker = walker_for(RoutingSnapshot::default()).with_reporter(reporter.clone());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1076,7 +1077,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let walker = walker_with_breakers(snapshot(json!({}), json!({})), breakers)
             .with_reporter(reporter.clone());
@@ -1300,7 +1300,6 @@ mod tests {
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
             None,
-            std::time::Duration::from_secs(600),
         );
         let walker =
             walker_with_pools(&snapshot, Arc::clone(&pools)).with_reporter(reporter.clone());

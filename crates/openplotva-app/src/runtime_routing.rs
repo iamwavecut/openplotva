@@ -1,8 +1,7 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +10,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     task::JoinHandle,
 };
 
@@ -21,7 +20,6 @@ const ROUTING_EVENT_WRITER_BATCH_SIZE: usize = 100;
 const ROUTING_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 pub const LLM_ROUTING_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
 pub const LLM_ROUTING_EVENTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-pub const DEFAULT_ROUTING_ADMIN_REPORT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RoutingEvent {
@@ -33,6 +31,7 @@ pub struct RoutingEvent {
     pub queue_name: Option<String>,
     pub job_id: Option<i64>,
     pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub dedupe_key: String,
@@ -59,6 +58,7 @@ fn routing_failure_event(event_type: &str, operation: &str, error: &str) -> Rout
         queue_name: None,
         job_id: None,
         chat_id: None,
+        user_id: None,
         thread_id: None,
         message_id: None,
         dedupe_key: format!("{event_type}:{operation}"),
@@ -82,6 +82,7 @@ pub struct RoutingEventData {
     pub queue_name: Option<String>,
     pub job_id: Option<i64>,
     pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub dedupe_key: String,
@@ -102,6 +103,7 @@ impl RoutingEventData {
             queue_name: event.queue_name,
             job_id: event.job_id,
             chat_id: event.chat_id,
+            user_id: event.user_id,
             thread_id: event.thread_id,
             message_id: event.message_id,
             dedupe_key: event.dedupe_key,
@@ -208,10 +210,6 @@ impl openplotva_server::RuntimeRoutingEventInspector for RoutingEventBuffer {
     }
 }
 
-pub trait RoutingAdminNotifier: Send + Sync {
-    fn notify_admins(&self, text: String) -> Result<(), String>;
-}
-
 #[derive(Clone)]
 pub struct PostgresRoutingEventRecorder {
     sender: mpsc::Sender<openplotva_storage::llm_routing::RoutingEventInput>,
@@ -256,30 +254,19 @@ impl PostgresRoutingEventRecorder {
 pub struct RoutingEventReporter {
     buffer: RoutingEventBuffer,
     recorder: Option<PostgresRoutingEventRecorder>,
-    admin_notifier: Option<Arc<dyn RoutingAdminNotifier>>,
-    suppression: Arc<Mutex<HashMap<String, SuppressionState>>>,
-    cooldown: Duration,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SuppressionState {
-    next_allowed_millis: i64,
-    suppressed: u64,
+    report_trigger: Option<Arc<Notify>>,
 }
 
 impl RoutingEventReporter {
     pub fn new(
         buffer: RoutingEventBuffer,
         recorder: Option<PostgresRoutingEventRecorder>,
-        admin_notifier: Option<Arc<dyn RoutingAdminNotifier>>,
-        cooldown: Duration,
+        report_trigger: Option<Arc<Notify>>,
     ) -> Self {
         Self {
             buffer,
             recorder,
-            admin_notifier,
-            suppression: Arc::new(Mutex::new(HashMap::new())),
-            cooldown,
+            report_trigger,
         }
     }
 
@@ -292,130 +279,35 @@ impl RoutingEventReporter {
     }
 
     pub fn record_at_millis(&self, event: RoutingEvent, now_millis: i64) {
-        let page = self.admin_page_decision(&event, now_millis);
+        let report = if is_admin_actionable_event(&event) {
+            if self.report_trigger.is_some() {
+                AdminReportDecision::Aggregate
+            } else {
+                AdminReportDecision::NotConfigured
+            }
+        } else {
+            AdminReportDecision::NotActionable
+        };
         let mut event = event;
-        event.detail = enrich_detail_for_admin_page(event.detail, &page);
+        event.detail = enrich_detail_for_admin_report(event.detail, report);
 
         self.buffer.record(event.clone(), now_millis);
         if let Some(recorder) = &self.recorder {
             recorder.enqueue(storage_input_from_event(&event));
         }
-        if let AdminPageDecision::Send { suppressed } = page
-            && let Some(notifier) = &self.admin_notifier
+        if report == AdminReportDecision::Aggregate
+            && let Some(trigger) = &self.report_trigger
         {
-            let text = format_admin_report(&event, suppressed);
-            if let Err(error) = notifier.notify_admins(text) {
-                tracing::warn!(
-                    %error,
-                    workflow = %event.workflow_key,
-                    event_type = %event.event_type,
-                    "failed to enqueue llm routing admin report"
-                );
-            }
+            trigger.notify_one();
         }
-    }
-
-    fn admin_page_decision(&self, event: &RoutingEvent, now_millis: i64) -> AdminPageDecision {
-        if self.admin_notifier.is_none() {
-            return AdminPageDecision::NotConfigured;
-        }
-        if event
-            .detail
-            .get("admin_actionable")
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            return AdminPageDecision::NotActionable;
-        }
-        if event
-            .detail
-            .get("admin_actionable")
-            .and_then(Value::as_bool)
-            != Some(true)
-            && is_single_retryable_all_attempts_exhausted(event)
-        {
-            return AdminPageDecision::NotActionable;
-        }
-        if !is_actionable_event(&event.event_type) {
-            return AdminPageDecision::NotActionable;
-        }
-        let mut suppression = self
-            .suppression
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = suppression.entry(event.dedupe_key.clone()).or_default();
-        if now_millis < state.next_allowed_millis {
-            state.suppressed = state.suppressed.saturating_add(1);
-            return AdminPageDecision::Suppressed {
-                suppressed: state.suppressed,
-            };
-        }
-        let suppressed = state.suppressed;
-        state.suppressed = 0;
-        state.next_allowed_millis = now_millis.saturating_add(self.cooldown.as_millis() as i64);
-        AdminPageDecision::Send { suppressed }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdminPageDecision {
+enum AdminReportDecision {
     NotConfigured,
     NotActionable,
-    Send { suppressed: u64 },
-    Suppressed { suppressed: u64 },
-}
-
-#[derive(Debug)]
-pub struct DispatcherRoutingAdminNotifier {
-    admin_ids: Arc<[i64]>,
-    queue: Arc<openplotva_telegram::DispatcherQueue>,
-    sequence: AtomicU64,
-}
-
-impl DispatcherRoutingAdminNotifier {
-    pub fn new(
-        admin_ids: impl Into<Arc<[i64]>>,
-        queue: Arc<openplotva_telegram::DispatcherQueue>,
-    ) -> Self {
-        Self {
-            admin_ids: admin_ids.into(),
-            queue,
-            sequence: AtomicU64::new(0),
-        }
-    }
-}
-
-impl RoutingAdminNotifier for DispatcherRoutingAdminNotifier {
-    fn notify_admins(&self, text: String) -> Result<(), String> {
-        for admin_id in self.admin_ids.iter().copied() {
-            let request = openplotva_telegram::TextMessageRequest {
-                chat: Some(openplotva_telegram::ChatRef {
-                    id: admin_id,
-                    is_forum: false,
-                }),
-                message_thread_id: 0,
-                disable_notification: false,
-                allow_sending_without_reply: None,
-                text: text.clone(),
-                render_as: String::new(),
-                reply_markup: None,
-            };
-            let methods = openplotva_telegram::build_text_message_methods(&request, None)
-                .map_err(|error| error.to_string())?;
-            for method in methods {
-                let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-                let fingerprint =
-                    openplotva_telegram::fingerprint_text_message_part(admin_id, &text);
-                let message = openplotva_telegram::DispatcherMessage::new(
-                    fingerprint,
-                    format!("routing-admin-{admin_id}-{sequence}"),
-                )
-                .with_method(openplotva_telegram::TelegramOutboundMethod::from(method));
-                let _ = self.queue.enqueue(message, true);
-            }
-        }
-        Ok(())
-    }
+    Aggregate,
 }
 
 fn storage_input_from_event(
@@ -430,7 +322,7 @@ fn storage_input_from_event(
         queue_name: event.queue_name.clone(),
         job_id: event.job_id,
         chat_id: event.chat_id,
-        user_id: None,
+        user_id: event.user_id,
         thread_id: event.thread_id,
         message_id: event.message_id,
         dedupe_key: event.dedupe_key.clone(),
@@ -452,6 +344,28 @@ fn is_actionable_event(event_type: &str) -> bool {
     )
 }
 
+#[must_use]
+pub fn is_admin_actionable_event(event: &RoutingEvent) -> bool {
+    if event
+        .detail
+        .get("admin_actionable")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return false;
+    }
+    if event
+        .detail
+        .get("admin_actionable")
+        .and_then(Value::as_bool)
+        != Some(true)
+        && is_single_retryable_all_attempts_exhausted(event)
+    {
+        return false;
+    }
+    is_actionable_event(&event.event_type)
+}
+
 fn is_single_retryable_all_attempts_exhausted(event: &RoutingEvent) -> bool {
     event.event_type == "all_attempts_exhausted"
         && event.detail.get("failed_attempts").and_then(Value::as_u64) == Some(1)
@@ -462,78 +376,15 @@ fn is_single_retryable_all_attempts_exhausted(event: &RoutingEvent) -> bool {
             .is_some_and(|reason| !reason.trim().is_empty())
 }
 
-fn enrich_detail_for_admin_page(detail: Value, page: &AdminPageDecision) -> Value {
+fn enrich_detail_for_admin_report(detail: Value, decision: AdminReportDecision) -> Value {
     let mut object = detail.as_object().cloned().unwrap_or_default();
-    let page_json = match page {
-        AdminPageDecision::NotConfigured => json!({"action": "not_configured"}),
-        AdminPageDecision::NotActionable => json!({"action": "none"}),
-        AdminPageDecision::Send { suppressed } => {
-            json!({"action": "sent", "suppressed_repeats": suppressed})
-        }
-        AdminPageDecision::Suppressed { suppressed } => {
-            json!({"action": "suppressed", "suppressed_repeats": suppressed})
-        }
+    let report = match decision {
+        AdminReportDecision::NotConfigured => json!({"action": "not_configured"}),
+        AdminReportDecision::NotActionable => json!({"action": "none"}),
+        AdminReportDecision::Aggregate => json!({"action": "aggregated"}),
     };
-    object.insert("admin_report".to_owned(), page_json);
+    object.insert("admin_report".to_owned(), report);
     Value::Object(object)
-}
-
-fn format_admin_report(event: &RoutingEvent, suppressed: u64) -> String {
-    let mut lines = vec![
-        "LLM routing incident".to_owned(),
-        format!("severity: {}", compact(&event.severity)),
-        format!("workflow: {}", compact(&event.workflow_key)),
-        format!("failure: {}", compact(&event.event_type)),
-    ];
-    if event.provider_id.is_some() || event.model_id.is_some() {
-        lines.push(format!(
-            "provider/model: {}/{}",
-            event
-                .provider_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned()),
-            event
-                .model_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
-        ));
-    }
-    let context = report_context(event);
-    if !context.is_empty() {
-        lines.push(format!("context: {context}"));
-    }
-    if suppressed > 0 {
-        lines.push(format!("suppressed repeats: {suppressed}"));
-    }
-    if !event.summary.trim().is_empty() {
-        lines.push(format!("summary: {}", compact(&event.summary)));
-    }
-    lines.push("inspect: runtime API llmRequests and routing events".to_owned());
-    lines.join("\n")
-}
-
-fn report_context(event: &RoutingEvent) -> String {
-    let mut parts = Vec::new();
-    if let Some(queue) = event
-        .queue_name
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(format!("queue={}", compact(queue)));
-    }
-    if let Some(job_id) = event.job_id {
-        parts.push(format!("job={job_id}"));
-    }
-    if let Some(chat_id) = event.chat_id {
-        parts.push(format!("chat={chat_id}"));
-    }
-    if let Some(thread_id) = event.thread_id {
-        parts.push(format!("thread={thread_id}"));
-    }
-    if let Some(message_id) = event.message_id {
-        parts.push(format!("message={message_id}"));
-    }
-    parts.join(" ")
 }
 
 fn compact(value: &str) -> String {
@@ -586,7 +437,7 @@ fn server_event_from_buffer_event(
         queue_name: event.queue_name,
         job_id: event.job_id,
         chat_id: event.chat_id,
-        user_id: None,
+        user_id: event.user_id,
         thread_id: event.thread_id,
         message_id: event.message_id,
         dedupe_key: event.dedupe_key,
@@ -754,36 +605,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use futures_util::FutureExt as _;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
-
-    #[derive(Default)]
-    struct CapturingAdminNotifier {
-        messages: Mutex<Vec<String>>,
-    }
-
-    impl RoutingAdminNotifier for CapturingAdminNotifier {
-        fn notify_admins(&self, text: String) -> Result<(), String> {
-            self.messages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(text);
-            Ok(())
-        }
-    }
-
-    impl CapturingAdminNotifier {
-        fn messages(&self) -> Vec<String> {
-            self.messages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        }
-    }
 
     fn event(event_type: &str) -> RoutingEvent {
         RoutingEvent {
@@ -795,6 +624,7 @@ mod tests {
             queue_name: Some("text".to_owned()),
             job_id: Some(30),
             chat_id: Some(-100),
+            user_id: Some(42),
             thread_id: Some(5),
             message_id: Some(77),
             dedupe_key: "route:dialog".to_owned(),
@@ -806,45 +636,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn routing_reporter_suppresses_duplicate_admin_pages_until_cooldown() {
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
+    #[tokio::test]
+    async fn actionable_event_is_aggregated_and_wakes_report_worker() {
+        let trigger = Arc::new(Notify::new());
+        let reporter =
+            RoutingEventReporter::new(RoutingEventBuffer::new(8), None, Some(Arc::clone(&trigger)));
 
         reporter.record_at_millis(event("route_unavailable"), 0);
-        reporter.record_at_millis(event("route_unavailable"), 1_000);
-        reporter.record_at_millis(event("route_unavailable"), 600_001);
 
-        let messages = notifier.messages();
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].contains("severity: error"));
-        assert!(messages[0].contains("workflow: dialog"));
-        assert!(messages[0].contains("failure: route_unavailable"));
-        assert!(messages[0].contains("provider/model: 10/20"));
-        assert!(messages[0].contains("queue=text"));
-        assert!(messages[0].contains("job=30"));
-        assert!(messages[0].contains("chat=-100"));
-        assert!(messages[0].contains("message=77"));
-        assert!(messages[0].contains("llmRequests"));
-        assert!(messages[0].contains("routing events"));
-        assert!(!messages[0].contains("raw_prompt"));
-        assert!(!messages[0].contains("redis_value"));
-        assert!(messages[1].contains("suppressed repeats: 1"));
+        let recorded = reporter
+            .buffer()
+            .routing_events(1)
+            .pop()
+            .expect("recorded event");
+        assert_eq!(recorded.user_id, Some(42));
+        assert_eq!(recorded.detail["admin_report"]["action"], "aggregated");
+        tokio::time::timeout(Duration::from_millis(10), trigger.notified())
+            .await
+            .expect("report worker wake-up");
     }
 
     #[test]
-    fn routing_reporter_records_every_suppressed_event_in_buffer() {
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            None,
-            Duration::from_millis(600_000),
-        );
+    fn routing_reporter_records_every_event_in_buffer() {
+        let reporter = RoutingEventReporter::new(RoutingEventBuffer::new(8), None, None);
 
         reporter.record_at_millis(event("all_attempts_exhausted"), 0);
         reporter.record_at_millis(event("all_attempts_exhausted"), 1_000);
@@ -856,56 +670,22 @@ mod tests {
     }
 
     #[test]
-    fn routing_reporter_without_notifier_does_not_consume_admin_cooldown() {
-        let buffer = RoutingEventBuffer::new(8);
-        let reporter_without_notifier =
-            RoutingEventReporter::new(buffer.clone(), None, None, Duration::from_millis(600_000));
-
-        reporter_without_notifier.record_at_millis(event("router_reload_failed"), 0);
-
-        let first = buffer.routing_events(1).pop().expect("buffered event");
-        assert_eq!(
-            first.detail["admin_report"]["action"].as_str(),
-            Some("not_configured")
-        );
-
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter_with_notifier = RoutingEventReporter::new(
-            buffer,
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
-        reporter_with_notifier.record_at_millis(event("router_reload_failed"), 1_000);
-
-        assert_eq!(notifier.messages().len(), 1);
-    }
-
-    #[test]
-    fn retryable_provider_error_is_recorded_but_does_not_page_admins() {
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
+    fn retryable_provider_error_is_recorded_but_does_not_wake_reporter() {
+        let trigger = Arc::new(Notify::new());
+        let reporter =
+            RoutingEventReporter::new(RoutingEventBuffer::new(8), None, Some(Arc::clone(&trigger)));
 
         reporter.record_at_millis(event("provider_retryable_error"), 0);
 
-        assert!(notifier.messages().is_empty());
+        assert!(trigger.notified().now_or_never().is_none());
         assert_eq!(reporter.buffer().routing_events(10).len(), 1);
     }
 
     #[test]
-    fn non_actionable_detail_suppresses_admin_page_for_actionable_event_type() {
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
+    fn non_actionable_detail_suppresses_report_wake_for_actionable_event_type() {
+        let trigger = Arc::new(Notify::new());
+        let reporter =
+            RoutingEventReporter::new(RoutingEventBuffer::new(8), None, Some(Arc::clone(&trigger)));
         let mut event = event("all_attempts_exhausted");
         event.detail = json!({
             "admin_actionable": false,
@@ -914,21 +694,17 @@ mod tests {
 
         reporter.record_at_millis(event, 0);
 
-        assert!(notifier.messages().is_empty());
+        assert!(trigger.notified().now_or_never().is_none());
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail["admin_report"]["action"], "none");
     }
 
     #[test]
-    fn single_retryable_exhaustion_is_recorded_but_does_not_page_admins() {
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
+    fn single_retryable_exhaustion_is_recorded_but_does_not_wake_reporter() {
+        let trigger = Arc::new(Notify::new());
+        let reporter =
+            RoutingEventReporter::new(RoutingEventBuffer::new(8), None, Some(Arc::clone(&trigger)));
         let mut event = event("all_attempts_exhausted");
         event.detail = json!({
             "failed_attempts": 1,
@@ -937,21 +713,17 @@ mod tests {
 
         reporter.record_at_millis(event, 0);
 
-        assert!(notifier.messages().is_empty());
+        assert!(trigger.notified().now_or_never().is_none());
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail["admin_report"]["action"], "none");
     }
 
     #[test]
-    fn multi_attempt_exhaustion_still_pages_admins() {
-        let notifier = Arc::new(CapturingAdminNotifier::default());
-        let reporter = RoutingEventReporter::new(
-            RoutingEventBuffer::new(8),
-            None,
-            Some(notifier.clone()),
-            Duration::from_millis(600_000),
-        );
+    fn multi_attempt_exhaustion_wakes_aggregate_reporter() {
+        let trigger = Arc::new(Notify::new());
+        let reporter =
+            RoutingEventReporter::new(RoutingEventBuffer::new(8), None, Some(Arc::clone(&trigger)));
         let mut event = event("all_attempts_exhausted");
         event.detail = json!({
             "failed_attempts": 2,
@@ -960,10 +732,10 @@ mod tests {
 
         reporter.record_at_millis(event, 0);
 
-        assert_eq!(notifier.messages().len(), 1);
+        assert!(trigger.notified().now_or_never().is_some());
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].detail["admin_report"]["action"], "sent");
+        assert_eq!(events[0].detail["admin_report"]["action"], "aggregated");
     }
 
     #[test]
@@ -994,6 +766,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].workflow_key, "dialog");
         assert_eq!(events[0].event_type, "route_unavailable");
+        assert_eq!(events[0].user_id, Some(42));
         assert_eq!(events[0].at, "2026-05-28T20:26:40Z");
     }
 }
