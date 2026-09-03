@@ -42,6 +42,7 @@ pub mod reactions;
 pub mod reset;
 pub mod rich;
 mod routed_attempts;
+mod routing_admin_reports;
 mod runtime_analytics_overview;
 pub mod runtime_api;
 mod runtime_cache;

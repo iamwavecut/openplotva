@@ -487,8 +487,8 @@ const SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT: &str = r#"
 WITH recent_base AS (
     SELECT
         e.*,
-        p.name AS provider_name,
-        m.model_name,
+        COALESCE(p.name, NULLIF(e.detail->>'provider', '')) AS provider_name,
+        COALESCE(m.model_name, NULLIF(e.detail->>'model', '')) AS model_name,
         NULLIF(BTRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name,
         u.username AS user_username,
         COALESCE(
