@@ -2099,7 +2099,6 @@ async fn dialog_worker_exhausts_retryable_provider_error_at_default_limit()
         crate::runtime_routing::RoutingEventBuffer::new(8),
         None,
         None,
-        Duration::from_secs(600),
     );
 
     let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -2161,6 +2160,7 @@ async fn dialog_worker_exhausts_retryable_provider_error_at_default_limit()
     );
     assert_eq!(routing_events[0].job_id, Some(job_id));
     assert_eq!(routing_events[0].chat_id, Some(42));
+    assert_eq!(routing_events[0].user_id, Some(7));
     assert_eq!(routing_events[0].message_id, Some(100));
     assert_eq!(
         routing_events[0].detail["last_retryable_reason"],

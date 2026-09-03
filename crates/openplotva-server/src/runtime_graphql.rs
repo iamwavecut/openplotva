@@ -1428,6 +1428,17 @@ pub struct RuntimeRoutingEventData {
         skip
     )]
     pub chat_id: Option<i64>,
+    #[graphql(
+        derived(
+            owned,
+            name = "user_id",
+            into = "Option<ID>",
+            with = "graphql_optional_id"
+        ),
+        name = "userID",
+        skip
+    )]
+    pub user_id: Option<i64>,
     #[graphql(name = "threadID")]
     pub thread_id: Option<i32>,
     #[graphql(name = "messageID")]

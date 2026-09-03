@@ -263,6 +263,7 @@ impl Reasoner for AifarmReasoner {
                 context: openplotva_llm::LlmCallContext {
                     chat_id: self.context.chat_id.unwrap_or_default(),
                     thread_id: self.context.thread_id,
+                    user_id: self.context.user_id.unwrap_or_default(),
                     message_id: self.context.message_id.unwrap_or_default(),
                     ..openplotva_llm::LlmCallContext::default()
                 },
@@ -814,6 +815,7 @@ impl SongAgentMaterialProvider {
                 workflow_key: AGENTIC_SONG_WORKFLOW.to_owned(),
                 queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
                 chat_id: (params.chat_id != 0).then_some(params.chat_id),
+                user_id: (params.user_id != 0).then_some(params.user_id),
                 thread_id: params.thread_id,
                 message_id: (params.message_id != 0).then_some(params.message_id),
                 ..RoutedRequestContext::default()
@@ -1089,6 +1091,7 @@ where
             RoutedRequestContext {
                 workflow_key: AGENTIC_IMAGE_WORKFLOW.to_owned(),
                 chat_id: (request.chat_id != 0).then_some(request.chat_id),
+                user_id: (request.user_id != 0).then_some(request.user_id),
                 thread_id: request.thread_id,
                 message_id: (request.message_id != 0).then_some(request.message_id),
                 suppress_all_attempts_exhausted_admin_report: true,

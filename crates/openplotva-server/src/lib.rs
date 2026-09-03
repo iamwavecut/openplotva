@@ -2638,6 +2638,7 @@ mod tests {
                     queue_name: Some("text".to_owned()),
                     job_id: Some(30),
                     chat_id: Some(-100),
+                    user_id: Some(42),
                     thread_id: Some(5),
                     message_id: Some(77),
                     dedupe_key: "route:dialog".to_owned(),
@@ -2659,7 +2660,7 @@ mod tests {
                 r#"
                 query {
                     llmRoutingEvents(filter: { workflowKey: "dialog", eventType: "route_unavailable", limit: 10 }) {
-                        id at severity eventType workflowKey providerID modelID queueName jobID chatID threadID messageID dedupeKey summary detail
+                        id at severity eventType workflowKey providerID modelID queueName jobID chatID userID threadID messageID dedupeKey summary detail
                     }
                 }
                 "#,
@@ -2679,6 +2680,7 @@ mod tests {
         assert_eq!(event["workflowKey"], "dialog");
         assert_eq!(event["providerID"], "10");
         assert_eq!(event["modelID"], "20");
+        assert_eq!(event["userID"], "42");
         assert_eq!(event["detail"]["admin_report"]["action"], "sent");
     }
 

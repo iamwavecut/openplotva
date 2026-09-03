@@ -883,6 +883,11 @@ impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
                 .run(
                     RoutedRequestContext {
                         workflow_key: "history_summary".to_owned(),
+                        chat_id: (input.chat_id != 0).then_some(input.chat_id),
+                        user_id: (input.requested_by_user_id != 0)
+                            .then_some(input.requested_by_user_id),
+                        thread_id: (input.thread_id != 0).then_some(input.thread_id),
+                        message_id: (input.last_message_id != 0).then_some(input.last_message_id),
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {

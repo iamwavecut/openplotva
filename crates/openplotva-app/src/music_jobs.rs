@@ -328,6 +328,7 @@ impl SongPromptGenerator for RoutedSongPromptGenerator {
                     RoutedRequestContext {
                         workflow_key: "media_prompt_optimizer".to_owned(),
                         queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
+                        user_id: (request.user_id != 0).then_some(request.user_id),
                         message_id: (request.message_id != 0).then_some(request.message_id),
                         ..RoutedRequestContext::default()
                     },

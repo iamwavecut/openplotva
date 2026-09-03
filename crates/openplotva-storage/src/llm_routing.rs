@@ -8,6 +8,7 @@
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
@@ -187,6 +188,7 @@ pub struct RoutingEventRecord {
     pub queue_name: Option<String>,
     pub job_id: Option<i64>,
     pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub dedupe_key: String,
@@ -204,11 +206,190 @@ pub struct RoutingEventInput {
     pub queue_name: Option<String>,
     pub job_id: Option<i64>,
     pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub dedupe_key: String,
     pub summary: String,
     pub detail: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct RoutingAdminIncidentSample {
+    pub user_id: Option<i64>,
+    pub user_name: Option<String>,
+    pub user_username: Option<String>,
+    pub chat_id: Option<i64>,
+    pub chat_name: Option<String>,
+    pub chat_username: Option<String>,
+    pub job_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub message_id: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingAdminIncidentGroup {
+    pub dedupe_key: String,
+    pub severity: String,
+    pub event_type: String,
+    pub workflow_key: String,
+    pub provider_id: Option<i64>,
+    pub provider_name: Option<String>,
+    pub model_id: Option<i64>,
+    pub model_name: Option<String>,
+    pub queue_name: Option<String>,
+    pub summary: String,
+    pub reason_counts: Value,
+    pub occurrences: i64,
+    pub affected_users: i64,
+    pub affected_chats: i64,
+    pub affected_jobs: i64,
+    pub first_seen: OffsetDateTime,
+    pub last_seen: OffsetDateTime,
+    pub samples: Vec<RoutingAdminIncidentSample>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoutingAdminIncidentSnapshot {
+    pub total_occurrences: i64,
+    pub affected_users: i64,
+    pub affected_chats: i64,
+    pub affected_jobs: i64,
+    pub total_groups: i64,
+    pub groups: Vec<RoutingAdminIncidentGroup>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingAdminReportOperationKind {
+    Send,
+    Edit,
+}
+
+impl RoutingAdminReportOperationKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Send => "send",
+            Self::Edit => "edit",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "send" => Some(Self::Send),
+            "edit" => Some(Self::Edit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoutingAdminReportState {
+    pub admin_id: i64,
+    pub telegram_message_id: Option<i64>,
+    pub last_new_message_at: Option<OffsetDateTime>,
+    pub last_new_message_attempt_at: Option<OffsetDateTime>,
+    pub last_rendered_fingerprint: Option<String>,
+    pub pending_virtual_id: Option<String>,
+    pub pending_kind: Option<RoutingAdminReportOperationKind>,
+    pub pending_fingerprint: Option<String>,
+    pub pending_started_at: Option<OffsetDateTime>,
+    pub last_delivery_attempt_at: Option<OffsetDateTime>,
+    pub last_delivery_error_class: Option<String>,
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingAdminReportPendingClaim {
+    pub admin_id: i64,
+    pub virtual_id: String,
+    pub kind: RoutingAdminReportOperationKind,
+    pub fingerprint: String,
+    pub expected_message_id: Option<i64>,
+    pub now: OffsetDateTime,
+    pub stale_pending_before: OffsetDateTime,
+    pub retry_before: OffsetDateTime,
+    pub send_before: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingAdminReportDeliveryResult {
+    pub virtual_id: String,
+    pub sent_message_id: Option<i32>,
+    pub succeeded: bool,
+    pub error_class: Option<String>,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug)]
+pub struct PostgresRoutingAdminReportStore {
+    pool: PgPool,
+}
+
+impl PostgresRoutingAdminReportStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+#[must_use]
+pub fn next_admin_report_delivery_state(
+    mut state: RoutingAdminReportState,
+    result: &RoutingAdminReportDeliveryResult,
+) -> RoutingAdminReportState {
+    if state.pending_virtual_id.as_deref() != Some(result.virtual_id.as_str()) {
+        return state;
+    }
+
+    let kind = state.pending_kind;
+    let successful_send =
+        kind != Some(RoutingAdminReportOperationKind::Send) || result.sent_message_id.is_some();
+    if result.succeeded && successful_send {
+        if kind == Some(RoutingAdminReportOperationKind::Send) {
+            state.telegram_message_id = result.sent_message_id.map(i64::from);
+            state.last_new_message_at = Some(result.at);
+            state.last_new_message_attempt_at = None;
+        }
+        state.last_rendered_fingerprint = state.pending_fingerprint.take();
+        state.last_delivery_attempt_at = None;
+        state.last_delivery_error_class = None;
+    } else {
+        let error_class = result
+            .error_class
+            .clone()
+            .unwrap_or_else(|| "missing_message_id".to_owned());
+        if kind == Some(RoutingAdminReportOperationKind::Send)
+            && !matches!(
+                error_class.as_str(),
+                "terminal_other" | "missing_message_id"
+            )
+        {
+            state.last_new_message_attempt_at = None;
+        }
+        if kind == Some(RoutingAdminReportOperationKind::Edit)
+            && matches!(
+                error_class.as_str(),
+                "terminal_bad_request" | "terminal_permission"
+            )
+        {
+            state.telegram_message_id = None;
+        }
+        state.last_delivery_attempt_at = Some(result.at);
+        state.last_delivery_error_class = Some(error_class);
+    }
+
+    state.pending_virtual_id = None;
+    state.pending_kind = None;
+    state.pending_fingerprint = None;
+    state.pending_started_at = None;
+    state.updated_at = Some(result.at);
+    state
 }
 
 const SQL_LIST_PROVIDERS: &str = "SELECT id, name, kind, protocol, runtime_hint, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config::text AS config FROM llm_providers ORDER BY id ASC";
@@ -268,12 +449,13 @@ const SQL_INSERT_ROUTING_EVENT_RETURNING_ID: &str = r#"INSERT INTO llm_routing_e
     queue_name,
     job_id,
     chat_id,
+    user_id,
     thread_id,
     message_id,
     dedupe_key,
     summary,
     detail
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
 RETURNING id"#;
 const SQL_INSERT_ROUTING_EVENTS_PREFIX: &str = r#"INSERT INTO llm_routing_events (
     severity,
@@ -284,6 +466,7 @@ const SQL_INSERT_ROUTING_EVENTS_PREFIX: &str = r#"INSERT INTO llm_routing_events
     queue_name,
     job_id,
     chat_id,
+    user_id,
     thread_id,
     message_id,
     dedupe_key,
@@ -301,6 +484,7 @@ const SQL_LIST_ROUTING_EVENTS: &str = r#"SELECT
     queue_name,
     job_id,
     chat_id,
+    user_id,
     thread_id,
     message_id,
     dedupe_key,
@@ -309,6 +493,278 @@ const SQL_LIST_ROUTING_EVENTS: &str = r#"SELECT
 FROM llm_routing_events
 ORDER BY created_at DESC, id DESC
 LIMIT $1"#;
+const SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT: &str = r#"
+WITH recent_base AS (
+    SELECT
+        e.*,
+        COALESCE(p.name, NULLIF(e.detail->>'provider', '')) AS provider_name,
+        COALESCE(m.model_name, NULLIF(e.detail->>'model', '')) AS model_name,
+        NULLIF(BTRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name,
+        u.username AS user_username,
+        COALESCE(
+            NULLIF(c.title, ''),
+            NULLIF(BTRIM(CONCAT_WS(' ', c.first_name, c.last_name)), '')
+        ) AS chat_name,
+        c.username AS chat_username,
+        COALESCE(
+            NULLIF(e.detail->>'last_retryable_reason', ''),
+            NULLIF(e.detail->>'retryable_reason', ''),
+            NULLIF(e.detail->>'reason', ''),
+            CASE
+                WHEN e.event_type IN ('router_reload_failed', 'routing_backfill_failed')
+                THEN NULLIF(e.detail->>'error', '')
+            END,
+            NULLIF(e.summary, ''),
+            e.event_type
+        ) AS reason
+    FROM llm_routing_events e
+    LEFT JOIN llm_providers p ON p.id = e.provider_id
+    LEFT JOIN provider_models m ON m.id = e.model_id
+    LEFT JOIN telegram_users_effective u ON u.id = e.user_id
+    LEFT JOIN telegram_chats_effective c ON c.id = e.chat_id
+    WHERE e.created_at >= $1
+      AND e.event_type IN (
+          'route_unavailable',
+          'no_candidates',
+          'all_attempts_exhausted',
+          'circuit_open_exhaustion',
+          'capacity_unavailable',
+          'router_reload_failed',
+          'routing_backfill_failed'
+      )
+      AND COALESCE(e.detail->>'admin_actionable', 'true') <> 'false'
+      AND NOT (
+          e.event_type = 'all_attempts_exhausted'
+          AND COALESCE(e.detail->>'admin_actionable', '') <> 'true'
+          AND COALESCE(e.detail->>'failed_attempts', '') = '1'
+          AND COALESCE(e.detail->>'last_retryable_reason', '') <> ''
+      )
+),
+recent AS (
+    SELECT
+        recent_base.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY dedupe_key
+            ORDER BY
+                CASE
+                    WHEN user_id IS NOT NULL OR chat_id IS NOT NULL OR job_id IS NOT NULL
+                    THEN 1 ELSE 0
+                END DESC,
+                created_at DESC,
+                id DESC
+        ) AS context_rank
+    FROM recent_base
+),
+reason_counts AS (
+    SELECT dedupe_key, reason, COUNT(*)::BIGINT AS occurrences
+    FROM recent
+    GROUP BY dedupe_key, reason
+),
+reason_maps AS (
+    SELECT dedupe_key, jsonb_object_agg(reason, occurrences) AS reason_counts
+    FROM reason_counts
+    GROUP BY dedupe_key
+),
+grouped AS (
+    SELECT
+        r.dedupe_key,
+        (array_agg(
+            r.severity
+            ORDER BY CASE r.severity
+                WHEN 'critical' THEN 5
+                WHEN 'error' THEN 4
+                WHEN 'warn' THEN 3
+                WHEN 'info' THEN 2
+                ELSE 1
+            END DESC, r.created_at DESC, r.id DESC
+        ))[1] AS severity,
+        (array_agg(r.event_type ORDER BY r.created_at DESC, r.id DESC))[1] AS event_type,
+        (array_agg(r.workflow_key ORDER BY r.created_at DESC, r.id DESC))[1] AS workflow_key,
+        (array_agg(r.provider_id ORDER BY r.created_at DESC, r.id DESC)
+            FILTER (WHERE r.provider_id IS NOT NULL))[1] AS provider_id,
+        (array_agg(r.provider_name ORDER BY r.created_at DESC, r.id DESC)
+            FILTER (WHERE r.provider_name IS NOT NULL))[1] AS provider_name,
+        (array_agg(r.model_id ORDER BY r.created_at DESC, r.id DESC)
+            FILTER (WHERE r.model_id IS NOT NULL))[1] AS model_id,
+        (array_agg(r.model_name ORDER BY r.created_at DESC, r.id DESC)
+            FILTER (WHERE r.model_name IS NOT NULL))[1] AS model_name,
+        (array_agg(r.queue_name ORDER BY r.created_at DESC, r.id DESC)
+            FILTER (WHERE r.queue_name IS NOT NULL))[1] AS queue_name,
+        (array_agg(r.summary ORDER BY r.created_at DESC, r.id DESC))[1] AS summary,
+        COUNT(*)::BIGINT AS occurrences,
+        COUNT(DISTINCT r.user_id)::BIGINT AS affected_users,
+        COUNT(DISTINCT r.chat_id)::BIGINT AS affected_chats,
+        COUNT(DISTINCT r.job_id)::BIGINT AS affected_jobs,
+        MIN(r.created_at) AS first_seen,
+        MAX(r.created_at) AS last_seen,
+        COALESCE(
+            jsonb_agg(
+                jsonb_strip_nulls(jsonb_build_object(
+                    'user_id', r.user_id,
+                    'user_name', r.user_name,
+                    'user_username', r.user_username,
+                    'chat_id', r.chat_id,
+                    'chat_name', r.chat_name,
+                    'chat_username', r.chat_username,
+                    'job_id', r.job_id,
+                    'thread_id', r.thread_id,
+                    'message_id', r.message_id
+                ))
+                ORDER BY r.created_at DESC, r.id DESC
+            ) FILTER (
+                WHERE r.context_rank <= 3
+                  AND (r.user_id IS NOT NULL OR r.chat_id IS NOT NULL OR r.job_id IS NOT NULL)
+            ),
+            '[]'::jsonb
+        ) AS samples
+    FROM recent r
+    GROUP BY r.dedupe_key
+),
+totals AS (
+    SELECT
+        COUNT(*)::BIGINT AS total_occurrences,
+        COUNT(DISTINCT user_id)::BIGINT AS affected_users,
+        COUNT(DISTINCT chat_id)::BIGINT AS affected_chats,
+        COUNT(DISTINCT job_id)::BIGINT AS affected_jobs,
+        COUNT(DISTINCT dedupe_key)::BIGINT AS total_groups
+    FROM recent
+)
+SELECT
+    t.total_occurrences,
+    t.affected_users AS total_affected_users,
+    t.affected_chats AS total_affected_chats,
+    t.affected_jobs AS total_affected_jobs,
+    t.total_groups,
+    g.dedupe_key,
+    g.severity,
+    g.event_type,
+    g.workflow_key,
+    g.provider_id,
+    g.provider_name,
+    g.model_id,
+    g.model_name,
+    g.queue_name,
+    g.summary,
+    rm.reason_counts::text AS reason_counts,
+    g.occurrences,
+    g.affected_users,
+    g.affected_chats,
+    g.affected_jobs,
+    g.first_seen,
+    g.last_seen,
+    g.samples::text AS samples
+FROM totals t
+LEFT JOIN grouped g ON TRUE
+LEFT JOIN reason_maps rm ON rm.dedupe_key = g.dedupe_key
+ORDER BY
+    (g.affected_users > 0 OR g.affected_chats > 0 OR g.affected_jobs > 0) DESC NULLS LAST,
+    CASE g.severity
+        WHEN 'critical' THEN 5
+        WHEN 'error' THEN 4
+        WHEN 'warn' THEN 3
+        WHEN 'info' THEN 2
+        ELSE 1
+    END DESC,
+    g.occurrences DESC,
+    g.last_seen DESC
+LIMIT 50"#;
+const SQL_ROUTING_ADMIN_REPORT_STATE: &str = r#"SELECT
+    admin_id,
+    telegram_message_id,
+    last_new_message_at,
+    last_new_message_attempt_at,
+    last_rendered_fingerprint,
+    pending_virtual_id,
+    pending_kind,
+    pending_fingerprint,
+    pending_started_at,
+    last_delivery_attempt_at,
+    last_delivery_error_class,
+    updated_at
+FROM llm_admin_report_state
+WHERE admin_id = $1"#;
+const SQL_CLAIM_ROUTING_ADMIN_REPORT_SEND: &str = r#"INSERT INTO llm_admin_report_state (
+    admin_id,
+    pending_virtual_id,
+    pending_kind,
+    pending_fingerprint,
+    pending_started_at,
+    last_new_message_attempt_at,
+    updated_at
+)
+VALUES ($1, $2, 'send', $3, $4, $4, $4)
+ON CONFLICT (admin_id) DO UPDATE SET
+    pending_virtual_id = EXCLUDED.pending_virtual_id,
+    pending_kind = EXCLUDED.pending_kind,
+    pending_fingerprint = EXCLUDED.pending_fingerprint,
+    pending_started_at = EXCLUDED.pending_started_at,
+    last_new_message_attempt_at = EXCLUDED.last_new_message_attempt_at,
+    updated_at = EXCLUDED.updated_at
+WHERE (
+        llm_admin_report_state.pending_virtual_id IS NULL
+        OR llm_admin_report_state.pending_started_at <= $5
+    )
+  AND (
+        llm_admin_report_state.last_delivery_error_class IS NULL
+        OR llm_admin_report_state.last_delivery_attempt_at <= $6
+    )
+  AND llm_admin_report_state.last_rendered_fingerprint IS DISTINCT FROM $3
+  AND (
+        llm_admin_report_state.last_new_message_at IS NULL
+        OR llm_admin_report_state.last_new_message_at <= $7
+    )
+  AND (
+        llm_admin_report_state.last_new_message_attempt_at IS NULL
+        OR llm_admin_report_state.last_new_message_attempt_at <= $7
+    )
+RETURNING admin_id"#;
+const SQL_CLAIM_ROUTING_ADMIN_REPORT_EDIT: &str = r#"UPDATE llm_admin_report_state SET
+    pending_virtual_id = $2,
+    pending_kind = 'edit',
+    pending_fingerprint = $3,
+    pending_started_at = $4,
+    updated_at = $4
+WHERE admin_id = $1
+  AND (
+        pending_virtual_id IS NULL
+        OR pending_started_at <= $6
+    )
+  AND (
+        last_delivery_error_class IS NULL
+        OR last_delivery_attempt_at <= $7
+    )
+  AND last_rendered_fingerprint IS DISTINCT FROM $3
+  AND telegram_message_id = $5
+RETURNING admin_id"#;
+const SQL_ROUTING_ADMIN_REPORT_STATE_BY_PENDING_FOR_UPDATE: &str = r#"SELECT
+    admin_id,
+    telegram_message_id,
+    last_new_message_at,
+    last_new_message_attempt_at,
+    last_rendered_fingerprint,
+    pending_virtual_id,
+    pending_kind,
+    pending_fingerprint,
+    pending_started_at,
+    last_delivery_attempt_at,
+    last_delivery_error_class,
+    updated_at
+FROM llm_admin_report_state
+WHERE pending_virtual_id = $1
+FOR UPDATE"#;
+const SQL_UPDATE_ROUTING_ADMIN_REPORT_STATE: &str = r#"UPDATE llm_admin_report_state SET
+    telegram_message_id = $2,
+    last_new_message_at = $3,
+    last_new_message_attempt_at = $4,
+    last_rendered_fingerprint = $5,
+    pending_virtual_id = $6,
+    pending_kind = $7,
+    pending_fingerprint = $8,
+    pending_started_at = $9,
+    last_delivery_attempt_at = $10,
+    last_delivery_error_class = $11,
+    updated_at = $12
+WHERE admin_id = $1"#;
 pub const SQL_DELETE_OLD_LLM_ROUTING_EVENTS_BATCH: &str = r#"
 WITH doomed AS (
     SELECT id
@@ -426,11 +882,35 @@ fn routing_event_from_row(row: PgRow) -> Result<RoutingEventRecord, StorageError
         queue_name: row.try_get("queue_name")?,
         job_id: row.try_get("job_id")?,
         chat_id: row.try_get("chat_id")?,
+        user_id: row.try_get("user_id")?,
         thread_id: row.try_get("thread_id")?,
         message_id: row.try_get("message_id")?,
         dedupe_key: row.try_get("dedupe_key")?,
         summary: row.try_get("summary")?,
         detail: parse_json(row.try_get("detail")?)?,
+    })
+}
+
+fn routing_admin_report_state_from_row(
+    row: &PgRow,
+) -> Result<RoutingAdminReportState, StorageError> {
+    let pending_kind = row
+        .try_get::<Option<String>, _>("pending_kind")?
+        .as_deref()
+        .and_then(RoutingAdminReportOperationKind::parse);
+    Ok(RoutingAdminReportState {
+        admin_id: row.try_get("admin_id")?,
+        telegram_message_id: row.try_get("telegram_message_id")?,
+        last_new_message_at: row.try_get("last_new_message_at")?,
+        last_new_message_attempt_at: row.try_get("last_new_message_attempt_at")?,
+        last_rendered_fingerprint: row.try_get("last_rendered_fingerprint")?,
+        pending_virtual_id: row.try_get("pending_virtual_id")?,
+        pending_kind,
+        pending_fingerprint: row.try_get("pending_fingerprint")?,
+        pending_started_at: row.try_get("pending_started_at")?,
+        last_delivery_attempt_at: row.try_get("last_delivery_attempt_at")?,
+        last_delivery_error_class: row.try_get("last_delivery_error_class")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -1026,6 +1506,7 @@ pub async fn insert_routing_event(
         .bind(input.queue_name.as_deref())
         .bind(input.job_id)
         .bind(input.chat_id)
+        .bind(input.user_id)
         .bind(input.thread_id)
         .bind(input.message_id)
         .bind(&input.dedupe_key)
@@ -1073,6 +1554,7 @@ const SQL_LIST_ROUTING_EVENTS_PAGE: &str = r#"SELECT
     queue_name,
     job_id,
     chat_id,
+    user_id,
     thread_id,
     message_id,
     dedupe_key,
@@ -1107,6 +1589,143 @@ pub async fn list_routing_events_page(
         .collect()
 }
 
+impl PostgresRoutingAdminReportStore {
+    pub async fn snapshot(
+        &self,
+        since: OffsetDateTime,
+    ) -> Result<RoutingAdminIncidentSnapshot, StorageError> {
+        let rows = sqlx::query(SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?;
+        let Some(first) = rows.first() else {
+            return Ok(RoutingAdminIncidentSnapshot::default());
+        };
+        let mut snapshot = RoutingAdminIncidentSnapshot {
+            total_occurrences: first.try_get("total_occurrences")?,
+            affected_users: first.try_get("total_affected_users")?,
+            affected_chats: first.try_get("total_affected_chats")?,
+            affected_jobs: first.try_get("total_affected_jobs")?,
+            total_groups: first.try_get("total_groups")?,
+            groups: Vec::with_capacity(rows.len()),
+        };
+        for row in rows {
+            let Some(dedupe_key) = row.try_get::<Option<String>, _>("dedupe_key")? else {
+                continue;
+            };
+            let samples = parse_json(row.try_get("samples")?)?;
+            snapshot.groups.push(RoutingAdminIncidentGroup {
+                dedupe_key,
+                severity: row.try_get("severity")?,
+                event_type: row.try_get("event_type")?,
+                workflow_key: row.try_get("workflow_key")?,
+                provider_id: row.try_get("provider_id")?,
+                provider_name: row.try_get("provider_name")?,
+                model_id: row.try_get("model_id")?,
+                model_name: row.try_get("model_name")?,
+                queue_name: row.try_get("queue_name")?,
+                summary: row.try_get("summary")?,
+                reason_counts: parse_json(row.try_get("reason_counts")?)?,
+                occurrences: row.try_get("occurrences")?,
+                affected_users: row.try_get("affected_users")?,
+                affected_chats: row.try_get("affected_chats")?,
+                affected_jobs: row.try_get("affected_jobs")?,
+                first_seen: row.try_get("first_seen")?,
+                last_seen: row.try_get("last_seen")?,
+                samples: serde_json::from_value(samples)
+                    .map_err(|source| StorageError::RoutingJsonCodec { source })?,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn state(
+        &self,
+        admin_id: i64,
+    ) -> Result<Option<RoutingAdminReportState>, StorageError> {
+        sqlx::query(SQL_ROUTING_ADMIN_REPORT_STATE)
+            .bind(admin_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(routing_admin_report_state_from_row)
+            .transpose()
+    }
+
+    pub async fn claim_pending(
+        &self,
+        claim: &RoutingAdminReportPendingClaim,
+    ) -> Result<bool, StorageError> {
+        let claimed = match claim.kind {
+            RoutingAdminReportOperationKind::Send => {
+                sqlx::query_scalar::<_, i64>(SQL_CLAIM_ROUTING_ADMIN_REPORT_SEND)
+                    .bind(claim.admin_id)
+                    .bind(&claim.virtual_id)
+                    .bind(&claim.fingerprint)
+                    .bind(claim.now)
+                    .bind(claim.stale_pending_before)
+                    .bind(claim.retry_before)
+                    .bind(claim.send_before)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            RoutingAdminReportOperationKind::Edit => {
+                let Some(message_id) = claim.expected_message_id else {
+                    return Ok(false);
+                };
+                sqlx::query_scalar::<_, i64>(SQL_CLAIM_ROUTING_ADMIN_REPORT_EDIT)
+                    .bind(claim.admin_id)
+                    .bind(&claim.virtual_id)
+                    .bind(&claim.fingerprint)
+                    .bind(claim.now)
+                    .bind(message_id)
+                    .bind(claim.stale_pending_before)
+                    .bind(claim.retry_before)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+        };
+        Ok(claimed.is_some())
+    }
+
+    pub async fn record_delivery(
+        &self,
+        result: &RoutingAdminReportDeliveryResult,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(SQL_ROUTING_ADMIN_REPORT_STATE_BY_PENDING_FOR_UPDATE)
+            .bind(&result.virtual_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let state = routing_admin_report_state_from_row(&row)?;
+        let next = next_admin_report_delivery_state(state, result);
+        sqlx::query(SQL_UPDATE_ROUTING_ADMIN_REPORT_STATE)
+            .bind(next.admin_id)
+            .bind(next.telegram_message_id)
+            .bind(next.last_new_message_at)
+            .bind(next.last_new_message_attempt_at)
+            .bind(next.last_rendered_fingerprint.as_deref())
+            .bind(next.pending_virtual_id.as_deref())
+            .bind(
+                next.pending_kind
+                    .map(RoutingAdminReportOperationKind::as_str),
+            )
+            .bind(next.pending_fingerprint.as_deref())
+            .bind(next.pending_started_at)
+            .bind(next.last_delivery_attempt_at)
+            .bind(next.last_delivery_error_class.as_deref())
+            .bind(next.updated_at.unwrap_or(result.at))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
 pub async fn delete_old_llm_routing_events_batch(
     pool: &PgPool,
     retention_days: i32,
@@ -1135,6 +1754,7 @@ fn routing_event_insert_builder(events: &[RoutingEventInput]) -> QueryBuilder<Po
             .push_bind(event.queue_name.clone())
             .push_bind(event.job_id)
             .push_bind(event.chat_id)
+            .push_bind(event.user_id)
             .push_bind(event.thread_id)
             .push_bind(event.message_id)
             .push_bind(event.dedupe_key.clone())
@@ -1228,6 +1848,7 @@ mod tests {
             queue_name: Some("text".to_owned()),
             job_id: Some(30),
             chat_id: Some(-100),
+            user_id: Some(42),
             thread_id: Some(5),
             message_id: Some(77),
             dedupe_key: "route:dialog".to_owned(),
@@ -1237,8 +1858,127 @@ mod tests {
 
         assert!(sql.starts_with("INSERT INTO llm_routing_events"));
         assert!(sql.contains("provider_id"));
+        assert!(sql.contains("user_id"));
         assert!(sql.contains("dedupe_key"));
         assert!(!sql.contains("llm_request_events"));
+    }
+
+    #[test]
+    fn admin_report_send_delivery_records_real_message_and_hourly_gate() {
+        let at = OffsetDateTime::from_unix_timestamp(1_780_000_000).expect("timestamp");
+        let state = RoutingAdminReportState {
+            admin_id: 42,
+            pending_virtual_id: Some("routing-admin-report:send:42:1".to_owned()),
+            pending_kind: Some(RoutingAdminReportOperationKind::Send),
+            pending_fingerprint: Some("digest-a".to_owned()),
+            ..RoutingAdminReportState::default()
+        };
+
+        let next = next_admin_report_delivery_state(
+            state,
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:send:42:1".to_owned(),
+                sent_message_id: Some(77),
+                succeeded: true,
+                error_class: None,
+                at,
+            },
+        );
+
+        assert_eq!(next.telegram_message_id, Some(77));
+        assert_eq!(next.last_new_message_at, Some(at));
+        assert_eq!(next.last_rendered_fingerprint.as_deref(), Some("digest-a"));
+        assert!(next.pending_virtual_id.is_none());
+        assert!(next.pending_kind.is_none());
+        assert!(next.pending_fingerprint.is_none());
+    }
+
+    #[test]
+    fn terminal_edit_failure_drops_only_the_unusable_edit_target() {
+        let sent_at = OffsetDateTime::from_unix_timestamp(1_779_996_400).expect("timestamp");
+        let failed_at = OffsetDateTime::from_unix_timestamp(1_780_000_000).expect("timestamp");
+        let state = RoutingAdminReportState {
+            admin_id: 42,
+            telegram_message_id: Some(77),
+            last_new_message_at: Some(sent_at),
+            last_rendered_fingerprint: Some("digest-a".to_owned()),
+            pending_virtual_id: Some("routing-admin-report:edit:42:2".to_owned()),
+            pending_kind: Some(RoutingAdminReportOperationKind::Edit),
+            pending_fingerprint: Some("digest-b".to_owned()),
+            ..RoutingAdminReportState::default()
+        };
+
+        let next = next_admin_report_delivery_state(
+            state,
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:edit:42:2".to_owned(),
+                sent_message_id: None,
+                succeeded: false,
+                error_class: Some("terminal_bad_request".to_owned()),
+                at: failed_at,
+            },
+        );
+
+        assert_eq!(next.telegram_message_id, None);
+        assert_eq!(next.last_new_message_at, Some(sent_at));
+        assert_eq!(next.last_rendered_fingerprint.as_deref(), Some("digest-a"));
+        assert_eq!(next.last_delivery_attempt_at, Some(failed_at));
+        assert_eq!(
+            next.last_delivery_error_class.as_deref(),
+            Some("terminal_bad_request")
+        );
+    }
+
+    #[test]
+    fn ambiguous_send_failure_keeps_the_hourly_send_claim() {
+        let claimed_at = OffsetDateTime::from_unix_timestamp(1_780_000_000).expect("timestamp");
+        let failed_at = claimed_at + time::Duration::seconds(10);
+        let state = RoutingAdminReportState {
+            admin_id: 42,
+            last_new_message_attempt_at: Some(claimed_at),
+            pending_virtual_id: Some("routing-admin-report:send:42:3".to_owned()),
+            pending_kind: Some(RoutingAdminReportOperationKind::Send),
+            pending_fingerprint: Some("digest-c".to_owned()),
+            pending_started_at: Some(claimed_at),
+            ..RoutingAdminReportState::default()
+        };
+
+        let ambiguous = next_admin_report_delivery_state(
+            state.clone(),
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:send:42:3".to_owned(),
+                sent_message_id: None,
+                succeeded: false,
+                error_class: Some("terminal_other".to_owned()),
+                at: failed_at,
+            },
+        );
+        let known_not_sent = next_admin_report_delivery_state(
+            state,
+            &RoutingAdminReportDeliveryResult {
+                virtual_id: "routing-admin-report:send:42:3".to_owned(),
+                sent_message_id: None,
+                succeeded: false,
+                error_class: Some("retryable_transient".to_owned()),
+                at: failed_at,
+            },
+        );
+
+        assert_eq!(ambiguous.last_new_message_attempt_at, Some(claimed_at));
+        assert_eq!(known_not_sent.last_new_message_attempt_at, None);
+    }
+
+    #[test]
+    fn admin_report_migration_adds_identity_and_restart_safe_state() {
+        const UP: &str = include_str!("../../../migrations/184_llm_admin_incident_reports.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/184_llm_admin_incident_reports.down.sql");
+
+        assert!(UP.contains("ADD COLUMN user_id BIGINT"));
+        assert!(UP.contains("CREATE TABLE llm_admin_report_state"));
+        assert!(UP.contains("pending_virtual_id TEXT UNIQUE"));
+        assert!(DOWN.contains("DROP TABLE IF EXISTS llm_admin_report_state"));
+        assert!(DOWN.contains("DROP COLUMN IF EXISTS user_id"));
     }
 
     #[test]

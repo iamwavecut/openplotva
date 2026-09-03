@@ -553,6 +553,8 @@ impl AsrTranscriber for RoutedAsrTranscriber {
                 .run(
                     RoutedRequestContext {
                         workflow_key: ASR_WORKFLOW_KEY.to_owned(),
+                        chat_id: (request.chat_id != 0).then_some(request.chat_id),
+                        message_id: (request.message_id != 0).then_some(request.message_id),
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {
