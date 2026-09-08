@@ -580,8 +580,18 @@ recent_base AS (
     FROM selected e
     LEFT JOIN llm_providers p ON p.id = e.provider_id
     LEFT JOIN provider_models m ON m.id = e.model_id
-    LEFT JOIN telegram_users_effective u ON u.id = e.user_id
-    LEFT JOIN telegram_chats_effective c ON c.id = e.chat_id
+    LEFT JOIN LATERAL (
+        SELECT first_name, last_name, username
+        FROM telegram_users_effective
+        WHERE id = e.user_id
+        LIMIT 1
+    ) u ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT title, first_name, last_name, username
+        FROM telegram_chats_effective
+        WHERE id = e.chat_id
+        LIMIT 1
+    ) c ON TRUE
 ),
 recent AS (
     SELECT
