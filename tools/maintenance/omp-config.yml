@@ -1,0 +1,22 @@
+enabledModels:
+  - maintenance/glm-5.3
+disabledProviders:
+  - native
+  - omp-plugins
+  - claude
+  - agent-plugins
+  - codex
+  - agents
+  - claude-plugins
+  - gemini
+  - opencode
+  - cursor
+  - windsurf
+  - cline
+  - github
+  - vscode
+  - agents-md
+  - claude-md
+  - mcp-json
+  - ssh-json
+  - builtin-defaults

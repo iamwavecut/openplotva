@@ -39,6 +39,32 @@ pub struct FormattedIncidentDigest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncidentDigestStatus {
+    Recovered,
+    UserImpact,
+    Background,
+    Observing,
+}
+
+pub fn incident_digest_status(
+    snapshot: &RoutingAdminIncidentSnapshot,
+    now: OffsetDateTime,
+) -> IncidentDigestStatus {
+    if snapshot.groups.is_empty() {
+        return IncidentDigestStatus::Recovered;
+    }
+    let latest = snapshot.groups.iter().map(|group| group.last_seen).max();
+    let active = latest.is_some_and(|last| now - last <= ACTIVE_FAILURE_AGE);
+    if active && snapshot.groups.iter().any(user_facing_group_has_context) {
+        IncidentDigestStatus::UserImpact
+    } else if active {
+        IncidentDigestStatus::Background
+    } else {
+        IncidentDigestStatus::Observing
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminReportDeliveryPlan {
     None,
     Send,
@@ -63,15 +89,12 @@ pub fn format_incident_digest(
     let mut groups = snapshot.groups.clone();
     groups.sort_by(compare_incident_groups);
     let latest_occurrence = groups.iter().map(|group| group.last_seen).max();
-    let user_impact = groups.iter().any(user_facing_group_has_context);
-    let status = match latest_occurrence {
-        Some(last_seen) if now - last_seen <= ACTIVE_FAILURE_AGE && user_impact => {
-            "🔴 LLM: сбои затрагивают пользователей"
+    let status = match incident_digest_status(snapshot, now) {
+        IncidentDigestStatus::UserImpact => "🔴 LLM: сбои затрагивают пользователей",
+        IncidentDigestStatus::Background => "🟠 LLM: деградируют фоновые пайплайны",
+        IncidentDigestStatus::Observing | IncidentDigestStatus::Recovered => {
+            "🟡 LLM: новых сбоев нет, наблюдаем"
         }
-        Some(last_seen) if now - last_seen <= ACTIVE_FAILURE_AGE => {
-            "🟠 LLM: деградируют фоновые пайплайны"
-        }
-        _ => "🟡 LLM: новых сбоев нет, наблюдаем",
     };
 
     let mut text = format!(

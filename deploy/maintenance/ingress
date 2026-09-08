@@ -1,0 +1,12 @@
+#!/usr/bin/python3 -I
+"""The only sudo capability granted to the restricted SSH ingress account."""
+import os
+import re
+import sys
+
+if len(sys.argv) != 2 or not re.fullmatch(r"enqueue [1-9][0-9]{0,9} [1-9][0-9]{0,19}", sys.argv[1]):
+    sys.exit("only enqueue ISSUE_NUMBER WORKFLOW_RUN_ID is permitted")
+operation, issue, run = sys.argv[1].split()
+os.execve("/usr/bin/python3", ["/usr/bin/python3", "/opt/openplotva-maintenance/controller.py",
+          "--config", "/etc/openplotva-maintenance/config.json", operation, issue, run],
+          {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"})

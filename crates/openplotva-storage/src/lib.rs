@@ -39,6 +39,8 @@ use tokio::sync::OnceCell;
 
 pub mod gradius_ads;
 pub mod llm_routing;
+pub mod maintenance;
+pub mod maintenance_notifications;
 pub mod telegram_delivery;
 pub mod telegram_outbox;
 pub mod telegram_projection;

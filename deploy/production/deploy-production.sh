@@ -3,12 +3,16 @@ set -euo pipefail
 
 deploy_root="${OPENPLOTVA_DEPLOY_ROOT:-/home/wavecut/openplotva}"
 compose_file="${deploy_root}/compose.production.yml"
+maintenance_compose_file="${OPENPLOTVA_MAINTENANCE_COMPOSE_FILE:-${deploy_root}/compose.maintenance.yml}"
+maintenance_env_file="${OPENPLOTVA_MAINTENANCE_ENV_FILE:-/etc/openplotva-maintenance/runtime.env}"
 env_file="${deploy_root}/.env.production"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"
 image="${OPENPLOTVA_DEPLOY_IMAGE:?OPENPLOTVA_DEPLOY_IMAGE is required}"
 dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
 update_stream_valkey_image="${UPDATE_STREAM_VALKEY_IMAGE:-${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
+maintenance_env_snapshot=""
+maintenance_overlay_active=false
 
 log() {
   printf '+ %s\n' "$*"
@@ -22,7 +26,11 @@ fail() {
 compose() {
   local db_password
   db_password="$(effective_db_postgres_password)"
-  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
+  local -a compose_args=(docker compose --env-file "$env_file" -p "$project" -f "$compose_file")
+  if [[ "$maintenance_overlay_active" == true ]]; then
+    compose_args+=(--env-file "$maintenance_env_snapshot" -f "$maintenance_compose_file")
+  fi
+  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" DB_POSTGRES_PASSWORD="$db_password" "${compose_args[@]}" "$@"
 }
 
 env_file_has_key() {
@@ -38,6 +46,58 @@ env_file_value() {
 install_layout() {
   install -d -m 755 "$deploy_root"
   cd "$deploy_root"
+}
+
+cleanup_maintenance_env_snapshot() {
+  if [[ -n "$maintenance_env_snapshot" ]]; then
+    rm -f -- "$maintenance_env_snapshot"
+    maintenance_env_snapshot=""
+  fi
+}
+
+existing_app_has_maintenance_enabled() {
+  local container="${project}-openplotva-1"
+  container_exists "$container" || return 1
+  [[ "$(docker inspect -f '{{range .Config.Env}}{{if or (eq . "MAINTENANCE_ENABLED=true") (eq . "MAINTENANCE_ENABLED=1") (eq . "MAINTENANCE_ENABLED=t")}}true{{end}}{{end}}' "$container" 2>/dev/null)" == "true" ]]
+}
+
+configure_maintenance_overlay() {
+  if [[ ! -f "$maintenance_compose_file" ]]; then
+    if existing_app_has_maintenance_enabled; then
+      fail "maintenance overlay is missing while the existing app is enabled"
+    fi
+    return 0
+  fi
+
+  if ! sudo -n test -f "$maintenance_env_file" 2>/dev/null; then
+    if existing_app_has_maintenance_enabled; then
+      fail "maintenance runtime env is unavailable while the existing app is enabled"
+    fi
+    log "maintenance overlay skipped: protected runtime env is unavailable"
+    return 0
+  fi
+  if sudo -n test -L "$maintenance_env_file" 2>/dev/null; then
+    fail "maintenance runtime env must be a regular root-owned file"
+  fi
+
+  local metadata
+  metadata="$(sudo -n stat -c '%u:%g:%a:%F' -- "$maintenance_env_file" 2>/dev/null)" ||
+    fail "cannot inspect protected maintenance runtime env"
+  [[ "$metadata" == "0:0:600:regular file" ]] ||
+    fail "protected maintenance runtime env must be root-owned mode 0600"
+
+  maintenance_env_snapshot="$(mktemp "${deploy_root}/.maintenance-runtime.env.XXXXXX")" ||
+    fail "cannot create temporary maintenance runtime env"
+  chmod 600 "$maintenance_env_snapshot"
+  # Root reads the protected source; the deploy user owns the temporary destination.
+  # shellcheck disable=SC2024
+  if ! sudo -n cat -- "$maintenance_env_file" >"$maintenance_env_snapshot"; then
+    cleanup_maintenance_env_snapshot
+    fail "cannot read protected maintenance runtime env"
+  fi
+  trap cleanup_maintenance_env_snapshot EXIT
+  maintenance_overlay_active=true
+  log "maintenance overlay enabled from protected runtime configuration"
 }
 
 bootstrap_env() {
@@ -412,6 +472,7 @@ main() {
   bootstrap_env
   validate_env
   validate_runtime_store_images
+  configure_maintenance_overlay
   compose_config
   docker_login_and_pull
 
@@ -429,4 +490,6 @@ main() {
   log "production deployment applied"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

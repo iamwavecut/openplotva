@@ -1,0 +1,22 @@
+[Unit]
+Description=OMP credential broker for OpenPlotva maintenance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openplotva-omp
+Group=openplotva-omp
+UMask=0077
+Environment=PI_CONFIG_DIR=.omp
+ExecStart=/opt/openplotva-maintenance/omp auth-broker serve --bind=127.0.0.1:8765
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/openplotva-omp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

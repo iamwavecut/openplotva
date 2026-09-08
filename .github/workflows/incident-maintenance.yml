@@ -1,0 +1,38 @@
+name: Incident maintenance dispatch
+run-name: 'Incident maintenance issue #${{ github.event.issue.number }}'
+
+on:
+  issues:
+    types: [opened, labeled, reopened]
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: incident-maintenance-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  enqueue:
+    if: >-
+      github.repository == 'iamwavecut/openplotva' &&
+      github.actor == 'iamwavecut' && github.actor_id == '239034' &&
+      github.event.issue.user.login == 'iamwavecut' &&
+      github.event.issue.user.id == 239034 &&
+      contains(github.event.issue.labels.*.name, 'agent:created') &&
+      contains(github.event.issue.labels.*.name, 'agent:queued')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read dispatcher from trusted main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate current issue and enqueue over restricted SSH
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAINTENANCE_SSH_KEY: ${{ secrets.MAINTENANCE_SSH_KEY }}
+          MAINTENANCE_SSH_KNOWN_HOSTS: ${{ secrets.MAINTENANCE_SSH_KNOWN_HOSTS }}
+        run: python3 .github/scripts/dispatch_incident.py
