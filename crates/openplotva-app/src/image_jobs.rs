@@ -75,6 +75,8 @@ pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from
 pub const AIFARM_DRAW_API_DEFAULT_CAPACITY_WAIT: StdDuration = StdDuration::from_secs(4 * 60);
 /// Local slack over `capacity_wait` for the held submit round-trip itself.
 const AIFARM_DRAW_API_SUBMIT_MARGIN: StdDuration = StdDuration::from_secs(30);
+const AIFARM_DRAW_API_POLL_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const AIFARM_DRAW_API_MAX_POLL_RETRY_DELAY: StdDuration = StdDuration::from_secs(10);
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
@@ -905,19 +907,57 @@ where
         job_id: &str,
         deadline: Instant,
     ) -> Result<DrawApiGenerateResult, ImageGenerationError> {
+        let mut retry_delay = self
+            .cfg
+            .poll_interval
+            .min(AIFARM_DRAW_API_MAX_POLL_RETRY_DELAY);
+        let mut poll_failures = 0;
         loop {
-            let status = self.check_draw_api_job(job_id, deadline).await?;
-            match evaluate_draw_api_status(&status) {
-                DrawApiWaitDecision::Done(result) => return Ok(result),
-                DrawApiWaitDecision::Failed(message) => {
-                    return Err(classify_draw_api_error(format!("job failed: {message}")));
-                }
-                DrawApiWaitDecision::Continue => {}
-            }
             if Instant::now() >= deadline {
                 return Err(draw_api_watchdog_error(job_id, "waiting to poll draw job"));
             }
-            let next_poll = (Instant::now() + self.cfg.poll_interval).min(deadline);
+            // A lost GET does not cancel the farm job. Keep its ID and deadline;
+            // retrying the generation instead would discard or duplicate its result.
+            let poll_deadline = deadline.min(Instant::now() + AIFARM_DRAW_API_POLL_TIMEOUT);
+            let delay = match self.check_draw_api_job(job_id, poll_deadline).await {
+                Ok(status) => {
+                    if poll_failures > 0 {
+                        tracing::info!(job_id, poll_failures, "resumed draw job polling");
+                    }
+                    poll_failures = 0;
+                    retry_delay = self
+                        .cfg
+                        .poll_interval
+                        .min(AIFARM_DRAW_API_MAX_POLL_RETRY_DELAY);
+                    match evaluate_draw_api_status(&status) {
+                        DrawApiWaitDecision::Done(result) => return Ok(result),
+                        DrawApiWaitDecision::Failed(message) => {
+                            return Err(classify_draw_api_error(format!("job failed: {message}")));
+                        }
+                        DrawApiWaitDecision::Continue => {}
+                    }
+                    self.cfg.poll_interval
+                }
+                Err(DrawApiPollError::Terminal(error)) => return Err(error),
+                Err(DrawApiPollError::Retryable(error)) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    if poll_failures == 0 {
+                        tracing::warn!(
+                            job_id,
+                            "temporary draw status poll failure; retrying existing job"
+                        );
+                    }
+                    poll_failures += 1;
+                    let delay = retry_delay;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(AIFARM_DRAW_API_MAX_POLL_RETRY_DELAY);
+                    delay
+                }
+            };
+            let next_poll = (Instant::now() + delay).min(deadline);
             tokio::time::sleep_until(next_poll).await;
             if Instant::now() >= deadline {
                 return Err(draw_api_watchdog_error(job_id, "waiting to poll draw job"));
@@ -929,10 +969,12 @@ where
         &self,
         job_id: &str,
         deadline: Instant,
-    ) -> Result<DrawApiJobStatus, ImageGenerationError> {
+    ) -> Result<DrawApiJobStatus, DrawApiPollError> {
         let job_id = job_id.trim();
         if job_id.is_empty() {
-            return Err(ImageGenerationError::Provider("job ID is empty".to_owned()));
+            return Err(DrawApiPollError::Terminal(ImageGenerationError::Provider(
+                "job ID is empty".to_owned(),
+            )));
         }
         let response = self
             .send_draw_api_request(
@@ -946,19 +988,27 @@ where
                 job_id,
                 "polling draw job",
             )
-            .await?;
+            .await
+            .map_err(DrawApiPollError::Retryable)?;
         if !(200..300).contains(&response.status_code) {
-            return Err(ImageGenerationError::Provider(format!(
+            let error = ImageGenerationError::Provider(format!(
                 "status {}: {}",
                 response.status_code,
                 String::from_utf8_lossy(&response.body).trim()
-            )));
+            ));
+            return Err(if matches!(response.status_code, 408 | 429 | 500..=599) {
+                DrawApiPollError::Retryable(error)
+            } else {
+                DrawApiPollError::Terminal(error)
+            });
         }
         let envelope =
             serde_json::from_slice::<DiscoveryJobEnvelope>(&response.body).map_err(|err| {
-                ImageGenerationError::Provider(format!("decode draw job status response: {err}"))
+                DrawApiPollError::Terminal(ImageGenerationError::Provider(format!(
+                    "decode draw job status response: {err}"
+                )))
             })?;
-        draw_api_status_from_envelope(job_id, &envelope)
+        draw_api_status_from_envelope(job_id, &envelope).map_err(DrawApiPollError::Terminal)
     }
 
     async fn send_draw_api_request(
@@ -975,6 +1025,11 @@ where
             Err(_) => Err(draw_api_watchdog_error(job_id, phase)),
         }
     }
+}
+
+enum DrawApiPollError {
+    Retryable(ImageGenerationError),
+    Terminal(ImageGenerationError),
 }
 
 fn draw_api_watchdog_error(job_id: &str, phase: &str) -> ImageGenerationError {
@@ -2551,7 +2606,7 @@ pub struct ImageGenJobExecutionReport {
     pub image_urls: Vec<String>,
     /// Telegram message ID of the delivered image.
     pub result_message_id: Option<i32>,
-    /// Failure text when the job should fail.
+    /// Failure text, or a warning when only part of the requested album was delivered.
     pub error: Option<String>,
 }
 
@@ -3024,7 +3079,9 @@ where
                 image_url,
                 image_urls,
                 result_message_id: placeholders.first().copied(),
-                error: None,
+                error: (filled < expected_image_count).then(|| {
+                    format!("delivered {filled} of {expected_image_count} requested images")
+                }),
             }
         }
         Err(ImageGenerationError::Forbidden) => {
@@ -3393,20 +3450,36 @@ where
     drop(activity_guard);
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
+            if let Some(error) = &execution.error {
+                let _ = queue.append_job_event(
+                    work.id,
+                    TaskQueueJobEvent {
+                        level: "warn".to_owned(),
+                        stage: "image_partial_result".to_owned(),
+                        message: "image generation delivered a partial result".to_owned(),
+                        error: error.clone(),
+                        ..TaskQueueJobEvent::default()
+                    },
+                    OffsetDateTime::now_utc(),
+                );
+                tracing::warn!(job_id = work.id, %error, "image generation delivered a partial result");
+            }
             if !execution.image_urls.is_empty() {
                 let _ = queue.set_job_image_urls(work.id, execution.image_urls);
             } else if let Some(image_url) = execution.image_url {
                 let _ = queue.set_job_image_urls(work.id, vec![image_url]);
             }
             let _ = queue.update_job_result_message(work.id, execution.result_message_id);
-            finalize_completed(
+            let mut report = finalize_completed(
                 queue,
                 work.id,
                 queue_name,
                 ImageGenQueuePollOutcome::Completed,
                 activity,
                 options.now,
-            )
+            );
+            report.error = report.error.or(execution.error);
+            report
         }
         ImageGenJobExecutionOutcome::SafetyBlocked => finalize_completed(
             queue,
@@ -7180,6 +7253,234 @@ mod tests {
         );
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
         assert_eq!(requests[1].url, "https://draw.example.test/v1/jobs/job-1");
+    }
+
+    fn draw_poll_test_config() -> AifarmDrawApiConfig {
+        AifarmDrawApiConfig {
+            base_url: "https://draw.example.test".to_owned(),
+            endpoint_name: AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME.to_owned(),
+            timeout: StdDuration::from_secs(60),
+            poll_interval: StdDuration::from_secs(1),
+            ..AifarmDrawApiConfig::default()
+        }
+    }
+
+    fn completed_draw_poll_response() -> AifarmHttpResponse {
+        json_response(json!({
+            "job": {
+                "job_id": "accepted-job",
+                "state": "completed",
+                "result": {
+                    "response": {
+                        "status_code": 200,
+                        "body": general_purpose::STANDARD.encode(
+                            br#"{"image_url":"https://img.test/recovered.png"}"#
+                        )
+                    }
+                }
+            }
+        }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aifarm_draw_api_poll_recovers_transient_errors_without_resubmitting() {
+        let mut responses = vec![
+            Ok(json_response(
+                json!({"job_id": "accepted-job", "state": "queued"}),
+            )),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()),
+        ];
+        for status_code in [408, 429, 500, 502, 503, 504] {
+            responses.push(Ok(AifarmHttpResponse {
+                status_code,
+                ..AifarmHttpResponse::default()
+            }));
+        }
+        responses.push(Ok(completed_draw_poll_response()));
+        let transport = AifarmTransportStub::new(responses);
+        let generator =
+            AifarmDrawApiImageGenerator::with_transport(draw_poll_test_config(), transport.clone());
+        let first = GeneratorStub::success("https://img.test/first.png");
+        let vip = ParallelImageGenerator::new(first.clone(), generator);
+        let effects = EffectsStub::new().with_placeholder_ids(vec![888, 889]);
+
+        let report = execute_image_gen_job(
+            &vip,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                user_id: 30,
+                prompt: "castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        assert_eq!(report.error, None);
+        assert_eq!(report.image_urls.len(), 2);
+        assert_eq!(
+            first.requests().len(),
+            1,
+            "the delivered slot must not run again"
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[0].method, AifarmHttpMethod::Post);
+        for request in &requests[1..] {
+            assert_eq!(request.method, AifarmHttpMethod::Get);
+            assert_eq!(
+                request.url,
+                "https://draw.example.test/v1/jobs/accepted-job"
+            );
+        }
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("record_last_gen:-100:30:[888, 889]:"))
+        );
+        assert!(
+            !effects
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("delete_placeholder:"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aifarm_draw_api_poll_does_not_retry_permanent_responses() {
+        let cases = [
+            AifarmHttpResponse {
+                status_code: 401,
+                ..AifarmHttpResponse::default()
+            },
+            AifarmHttpResponse {
+                status_code: 403,
+                ..AifarmHttpResponse::default()
+            },
+            AifarmHttpResponse {
+                status_code: 404,
+                ..AifarmHttpResponse::default()
+            },
+            AifarmHttpResponse {
+                status_code: 422,
+                ..AifarmHttpResponse::default()
+            },
+            AifarmHttpResponse {
+                status_code: 200,
+                body: b"invalid JSON".to_vec(),
+                ..AifarmHttpResponse::default()
+            },
+            json_response(
+                json!({"job_id": "accepted-job", "state": "failed", "error": {"message": "service unavailable"}}),
+            ),
+        ];
+        for response in cases {
+            let transport =
+                AifarmTransportStub::new(vec![Ok(response), Ok(completed_draw_poll_response())]);
+            let generator = AifarmDrawApiImageGenerator::with_transport(
+                draw_poll_test_config(),
+                transport.clone(),
+            );
+            assert!(
+                generator
+                    .wait_draw_api_job("accepted-job", Instant::now() + StdDuration::from_secs(60))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aifarm_draw_api_poll_retry_preserves_the_original_deadline() {
+        let transport = AifarmTransportStub::new(
+            (0..20)
+                .map(|_| Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()))
+                .collect(),
+        );
+        let generator =
+            AifarmDrawApiImageGenerator::with_transport(draw_poll_test_config(), transport.clone());
+        let started = Instant::now();
+        let error = generator
+            .wait_draw_api_job("accepted-job", started + StdDuration::from_secs(5))
+            .await
+            .expect_err("retry budget must expire");
+        assert!(error.message().contains("inference watchdog"));
+        assert_eq!(started.elapsed(), StdDuration::from_secs(5));
+        assert!(
+            (2..=5).contains(&transport.requests().len()),
+            "retries must wait between polls"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aifarm_draw_api_poll_recovers_from_a_hanging_request() {
+        let transport = DelayedAifarmTransport::new(
+            vec![(StdDuration::from_secs(90), completed_draw_poll_response())],
+            completed_draw_poll_response(),
+        );
+        let generator =
+            AifarmDrawApiImageGenerator::with_transport(draw_poll_test_config(), transport);
+        let started = Instant::now();
+        let result = generator
+            .wait_draw_api_job("accepted-job", started + StdDuration::from_secs(60))
+            .await
+            .expect("retry a hung status request within the inference budget");
+        assert_eq!(result.urls, vec!["https://img.test/recovered.png"]);
+        assert!(started.elapsed() < StdDuration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn vip_partial_result_records_a_warning_without_requeueing_delivered_images() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(IMAGE_VIP_QUEUE_NAME, cancel_test_gen_job(now));
+        let first = GeneratorStub::success("https://img.test/first.png");
+        let vip = ParallelImageGenerator::new(
+            first.clone(),
+            GeneratorStub::error("provider unavailable"),
+        );
+        let effects = EffectsStub::new().with_placeholder_ids(vec![888, 889]);
+        let report = run_image_gen_queue_once(
+            &queue,
+            IMAGE_VIP_QUEUE_NAME,
+            &vip,
+            &effects,
+            "vip-worker",
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+        let record = queue.record(job_id).expect("job");
+        assert_eq!(record.status, JobStatus::Completed);
+        assert_eq!(
+            record.events.len(),
+            1,
+            "partial success must remain visible to operators"
+        );
+        assert_eq!(record.events[0].stage, "image_partial_result");
+        assert_eq!(record.events[0].level, "warn");
+        assert_eq!(record.events[0].error, "delivered 1 of 2 requested images");
+        assert_eq!(
+            report.error.as_deref(),
+            Some("delivered 1 of 2 requested images")
+        );
+        assert_eq!(first.requests().len(), 1);
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("record_last_gen:-100:30:[888]:"))
+        );
+        assert!(
+            !effects
+                .calls()
+                .iter()
+                .any(|call| call == "delete_placeholder:-100:888")
+        );
     }
 
     #[tokio::test]
