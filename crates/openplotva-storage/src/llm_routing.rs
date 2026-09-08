@@ -246,6 +246,7 @@ pub struct RoutingAdminIncidentGroup {
     pub affected_jobs: i64,
     pub first_seen: OffsetDateTime,
     pub last_seen: OffsetDateTime,
+    pub explanatory: bool,
     pub samples: Vec<RoutingAdminIncidentSample>,
 }
 
@@ -494,7 +495,66 @@ FROM llm_routing_events
 ORDER BY created_at DESC, id DESC
 LIMIT $1"#;
 const SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT: &str = r#"
-WITH recent_base AS (
+WITH candidates AS (
+    SELECT e.*
+    FROM llm_routing_events e
+    WHERE e.created_at >= $1 - interval '10 minutes'
+      AND e.event_type IN (
+          'route_unavailable',
+          'no_candidates',
+          'all_attempts_exhausted',
+          'circuit_open_exhaustion',
+          'capacity_unavailable',
+          'router_reload_failed',
+          'routing_backfill_failed',
+          'attempt_failed'
+      )
+),
+actionable AS (
+    SELECT e.*
+    FROM candidates e
+    WHERE e.created_at >= $1
+      AND e.event_type IN (
+          'route_unavailable',
+          'no_candidates',
+          'all_attempts_exhausted',
+          'circuit_open_exhaustion',
+          'capacity_unavailable',
+          'router_reload_failed',
+          'routing_backfill_failed'
+      )
+      AND COALESCE(e.detail->>'admin_actionable', 'true') <> 'false'
+      AND NOT (
+          e.event_type = 'all_attempts_exhausted'
+          AND COALESCE(e.detail->>'admin_actionable', '') <> 'true'
+          AND COALESCE(e.detail->>'failed_attempts', '') = '1'
+          AND COALESCE(e.detail->>'last_retryable_reason', '') <> ''
+      )
+),
+selected AS (
+    SELECT e.*, FALSE AS explanatory
+    FROM actionable e
+    UNION ALL
+    SELECT e.*, TRUE AS explanatory
+    FROM candidates e
+    WHERE e.event_type = 'attempt_failed'
+      AND e.provider_id IS NOT NULL
+      AND e.model_id IS NOT NULL
+      AND e.chat_id IS NOT NULL
+      AND e.message_id IS NOT NULL
+      AND EXISTS (
+          SELECT 1
+          FROM actionable terminal
+          WHERE terminal.event_type = 'all_attempts_exhausted'
+            AND terminal.job_id IS NOT NULL
+            AND terminal.workflow_key = e.workflow_key
+            AND terminal.chat_id = e.chat_id
+            AND terminal.message_id = e.message_id
+            AND terminal.created_at BETWEEN e.created_at
+                                        AND e.created_at + interval '10 minutes'
+      )
+),
+recent_base AS (
     SELECT
         e.*,
         COALESCE(p.name, NULLIF(e.detail->>'provider', '')) AS provider_name,
@@ -517,34 +577,27 @@ WITH recent_base AS (
             NULLIF(e.summary, ''),
             e.event_type
         ) AS reason
-    FROM llm_routing_events e
+    FROM selected e
     LEFT JOIN llm_providers p ON p.id = e.provider_id
     LEFT JOIN provider_models m ON m.id = e.model_id
-    LEFT JOIN telegram_users_effective u ON u.id = e.user_id
-    LEFT JOIN telegram_chats_effective c ON c.id = e.chat_id
-    WHERE e.created_at >= $1
-      AND e.event_type IN (
-          'route_unavailable',
-          'no_candidates',
-          'all_attempts_exhausted',
-          'circuit_open_exhaustion',
-          'capacity_unavailable',
-          'router_reload_failed',
-          'routing_backfill_failed'
-      )
-      AND COALESCE(e.detail->>'admin_actionable', 'true') <> 'false'
-      AND NOT (
-          e.event_type = 'all_attempts_exhausted'
-          AND COALESCE(e.detail->>'admin_actionable', '') <> 'true'
-          AND COALESCE(e.detail->>'failed_attempts', '') = '1'
-          AND COALESCE(e.detail->>'last_retryable_reason', '') <> ''
-      )
+    LEFT JOIN LATERAL (
+        SELECT first_name, last_name, username
+        FROM telegram_users_effective
+        WHERE id = e.user_id
+        LIMIT 1
+    ) u ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT title, first_name, last_name, username
+        FROM telegram_chats_effective
+        WHERE id = e.chat_id
+        LIMIT 1
+    ) c ON TRUE
 ),
 recent AS (
     SELECT
         recent_base.*,
         ROW_NUMBER() OVER (
-            PARTITION BY dedupe_key
+            PARTITION BY dedupe_key, explanatory
             ORDER BY
                 CASE
                     WHEN user_id IS NOT NULL OR chat_id IS NOT NULL OR job_id IS NOT NULL
@@ -556,18 +609,19 @@ recent AS (
     FROM recent_base
 ),
 reason_counts AS (
-    SELECT dedupe_key, reason, COUNT(*)::BIGINT AS occurrences
+    SELECT dedupe_key, explanatory, reason, COUNT(*)::BIGINT AS occurrences
     FROM recent
-    GROUP BY dedupe_key, reason
+    GROUP BY dedupe_key, explanatory, reason
 ),
 reason_maps AS (
-    SELECT dedupe_key, jsonb_object_agg(reason, occurrences) AS reason_counts
+    SELECT dedupe_key, explanatory, jsonb_object_agg(reason, occurrences) AS reason_counts
     FROM reason_counts
-    GROUP BY dedupe_key
+    GROUP BY dedupe_key, explanatory
 ),
 grouped AS (
     SELECT
         r.dedupe_key,
+        r.explanatory,
         (array_agg(
             r.severity
             ORDER BY CASE r.severity
@@ -618,7 +672,7 @@ grouped AS (
             '[]'::jsonb
         ) AS samples
     FROM recent r
-    GROUP BY r.dedupe_key
+    GROUP BY r.dedupe_key, r.explanatory
 ),
 totals AS (
     SELECT
@@ -626,8 +680,8 @@ totals AS (
         COUNT(DISTINCT user_id)::BIGINT AS affected_users,
         COUNT(DISTINCT chat_id)::BIGINT AS affected_chats,
         COUNT(DISTINCT job_id)::BIGINT AS affected_jobs,
-        COUNT(DISTINCT dedupe_key)::BIGINT AS total_groups
-    FROM recent
+        (SELECT COUNT(*)::BIGINT FROM grouped) AS total_groups
+    FROM actionable
 )
 SELECT
     t.total_occurrences,
@@ -652,12 +706,16 @@ SELECT
     g.affected_jobs,
     g.first_seen,
     g.last_seen,
+    g.explanatory,
     g.samples::text AS samples
 FROM totals t
 LEFT JOIN grouped g ON TRUE
-LEFT JOIN reason_maps rm ON rm.dedupe_key = g.dedupe_key
+LEFT JOIN reason_maps rm
+  ON rm.dedupe_key = g.dedupe_key
+ AND rm.explanatory = g.explanatory
 ORDER BY
     (g.affected_users > 0 OR g.affected_chats > 0 OR g.affected_jobs > 0) DESC NULLS LAST,
+    g.explanatory ASC,
     CASE g.severity
         WHEN 'critical' THEN 5
         WHEN 'error' THEN 4
@@ -1632,6 +1690,7 @@ impl PostgresRoutingAdminReportStore {
                 affected_jobs: row.try_get("affected_jobs")?,
                 first_seen: row.try_get("first_seen")?,
                 last_seen: row.try_get("last_seen")?,
+                explanatory: row.try_get("explanatory")?,
                 samples: serde_json::from_value(samples)
                     .map_err(|source| StorageError::RoutingJsonCodec { source })?,
             });
@@ -1836,6 +1895,92 @@ pub fn open_key(master_secret: &str, sealed: &[u8]) -> Result<String, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_admin_digest_correlates_models_without_counting_retries_as_incidents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE llm_routing_events (
+                id BIGSERIAL, created_at TIMESTAMPTZ, severity TEXT DEFAULT 'error',
+                event_type TEXT, workflow_key TEXT DEFAULT 'dialog', provider_id BIGINT,
+                model_id BIGINT, queue_name TEXT, job_id BIGINT, chat_id BIGINT DEFAULT 1,
+                user_id BIGINT DEFAULT 42, thread_id INTEGER, message_id INTEGER DEFAULT 7,
+                dedupe_key TEXT, summary TEXT DEFAULT '', detail JSONB DEFAULT '{}'
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE llm_providers (id BIGINT, name TEXT) ON COMMIT DROP;
+            CREATE TEMP TABLE provider_models (id BIGINT, model_name TEXT) ON COMMIT DROP;
+            CREATE TEMP TABLE telegram_users_effective (
+                id BIGINT, first_name TEXT, last_name TEXT, username TEXT
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE telegram_chats_effective (
+                id BIGINT, title TEXT, first_name TEXT, last_name TEXT, username TEXT
+            ) ON COMMIT DROP;
+            INSERT INTO llm_providers VALUES (8, 'test-provider');
+            INSERT INTO provider_models VALUES (9, 'test-model');
+            INSERT INTO llm_routing_events
+                (created_at, event_type, provider_id, model_id, dedupe_key, detail)
+            VALUES
+                ('2026-09-03 15:59Z', 'attempt_failed', 8, 9, 'linked',
+                 '{"retryable_reason":"provider_unavailable"}'),
+                ('2026-09-03 16:00Z', 'attempt_failed', 8, 9, 'linked',
+                 '{"retryable_reason":"provider_unavailable"}'),
+                ('2026-09-03 15:50Z', 'attempt_failed', 8, 9, 'too-old', '{}'),
+                ('2026-09-03 16:02Z', 'attempt_failed', 8, 9, 'after-terminal', '{}');
+            INSERT INTO llm_routing_events
+                (created_at, event_type, provider_id, model_id, dedupe_key, message_id)
+            VALUES ('2026-09-03 16:00Z', 'attempt_failed', 8, 9, 'different-message', 8);
+            INSERT INTO llm_routing_events
+                (created_at, event_type, job_id, dedupe_key, detail)
+            VALUES ('2026-09-03 16:01Z', 'all_attempts_exhausted', 10, 'terminal',
+                    '{"admin_actionable":true,"last_retryable_reason":"capacity_unavailable"}');
+            "#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let since = OffsetDateTime::from_unix_timestamp(1_788_451_200)?;
+        let rows = sqlx::query(SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT)
+            .bind(since)
+            .fetch_all(&mut *transaction)
+            .await?;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.try_get::<i64, _>("total_occurrences")?, 1);
+            assert_eq!(row.try_get::<i64, _>("total_affected_users")?, 1);
+            assert_eq!(row.try_get::<i64, _>("total_affected_chats")?, 1);
+            assert_eq!(row.try_get::<i64, _>("total_affected_jobs")?, 1);
+        }
+        let attempts = rows
+            .iter()
+            .find(|row| row.get::<bool, _>("explanatory"))
+            .expect("linked attempts");
+        assert_eq!(attempts.try_get::<String, _>("dedupe_key")?, "linked");
+        assert_eq!(attempts.try_get::<i64, _>("occurrences")?, 2);
+        assert_eq!(
+            attempts.try_get::<String, _>("provider_name")?,
+            "test-provider"
+        );
+        assert_eq!(attempts.try_get::<String, _>("model_name")?, "test-model");
+        sqlx::query("DELETE FROM llm_routing_events WHERE job_id = 10")
+            .execute(&mut *transaction)
+            .await?;
+        let empty = sqlx::query(SQL_ROUTING_ADMIN_INCIDENT_SNAPSHOT)
+            .bind(since)
+            .fetch_one(&mut *transaction)
+            .await?;
+        assert_eq!(empty.try_get::<i64, _>("total_occurrences")?, 0);
+        assert_eq!(empty.try_get::<Option<String>, _>("dedupe_key")?, None);
+        transaction.rollback().await?;
+        Ok(())
+    }
 
     #[test]
     fn routing_event_insert_sql_targets_dedicated_table() {

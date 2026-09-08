@@ -432,6 +432,7 @@ fn compare_incident_groups(
 ) -> Ordering {
     user_facing_group_has_context(right)
         .cmp(&user_facing_group_has_context(left))
+        .then_with(|| left.explanatory.cmp(&right.explanatory))
         .then_with(|| severity_rank(&right.severity).cmp(&severity_rank(&left.severity)))
         .then_with(|| right.occurrences.cmp(&left.occurrences))
         .then_with(|| right.last_seen.cmp(&left.last_seen))
@@ -480,7 +481,7 @@ fn format_incident_group(group: &RoutingAdminIncidentGroup, index: usize) -> Str
         lines.push(format!("Маршрут: {route}"));
     }
     if group.affected_users > 0 || group.affected_chats > 0 || group.affected_jobs > 0 {
-        let label = if is_user_facing_workflow(&group.workflow_key) {
+        let label = if !group.explanatory && is_user_facing_workflow(&group.workflow_key) {
             "Затронуто"
         } else {
             "Связано"
@@ -510,6 +511,9 @@ fn format_incident_group(group: &RoutingAdminIncidentGroup, index: usize) -> Str
 }
 
 fn operation_label(group: &RoutingAdminIncidentGroup) -> &'static str {
+    if group.explanatory {
+        return "Попытки маршрута";
+    }
     match group.event_type.as_str() {
         "route_unavailable" => "Маршрут не настроен",
         "no_candidates" => "Нет подходящей модели",
@@ -742,6 +746,7 @@ mod tests {
             affected_jobs: i64::from(affected_users > 0),
             first_seen: at(first_seen),
             last_seen: at(last_seen),
+            explanatory: false,
             samples: if affected_users > 0 {
                 vec![RoutingAdminIncidentSample {
                     user_id: Some(42),
@@ -805,6 +810,36 @@ mod tests {
         assert!(!digest.text.contains("raw_prompt"));
         assert_eq!(digest.latest_occurrence, Some(at(998)));
         assert!(digest.has_incidents);
+    }
+
+    #[test]
+    fn correlated_attempt_group_names_the_models_without_becoming_the_incident() {
+        let terminal = group("terminal", "dialog", 1, 1, 990, 999);
+        let mut attempt = group("attempt", "dialog", 3, 1, 980, 998);
+        attempt.event_type = "attempt_failed".to_owned();
+        attempt.explanatory = true;
+        attempt.provider_name = Some("aifarm-vllm-gpu0".to_owned());
+        attempt.model_name = Some("Gemma 4 26B Heretic".to_owned());
+        attempt.reason_counts = json!({"provider_unavailable": 3});
+
+        let data = RoutingAdminIncidentSnapshot {
+            total_occurrences: 1,
+            affected_users: 1,
+            affected_chats: 1,
+            affected_jobs: 1,
+            total_groups: 2,
+            groups: vec![attempt, terminal],
+        };
+        let digest = format_incident_digest(&data, at(1_000));
+
+        assert!(digest.text.contains("события: 1 · пользователи: 1"));
+        assert!(digest.text.contains("1. Ответ в диалоге · dialog · 1"));
+        assert!(digest.text.contains("2. Попытки маршрута · dialog · 3"));
+        assert!(
+            digest
+                .text
+                .contains("aifarm-vllm-gpu0 → Gemma 4 26B Heretic")
+        );
     }
 
     #[test]
