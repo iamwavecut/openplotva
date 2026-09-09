@@ -38,7 +38,7 @@ def validate_dispatch(issue, run, number, event_id):
 def select_candidates(items, incident, limit=20):
     tokens = set(re.findall(r'[a-z0-9_]{3,}', json.dumps(incident).lower()))
     def rank(item):
-        words = set(re.findall(r'[a-z0-9_]{3,}', (item.get('title', '')+' '+item.get('body', '')).lower()))
+        words = set(re.findall(r'[a-z0-9_]{3,}', (item.get('title', '')+' '+(item.get('body') or '')).lower()))
         return (-len(words & tokens), item['kind'], item['number'])
     return sorted(items, key=rank)[:max(1, min(30, limit))]
 
