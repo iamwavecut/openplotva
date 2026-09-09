@@ -20,6 +20,34 @@ def patch_for(path, extra=""):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_runtime_revision_tracks_promoted_deployment_not_pr_build(self):
+        build = "b" * 40
+        deployed = "d" * 40
+        cases = [
+            ("ghcr.io/iamwavecut/openplotva:" + deployed, build, deployed, build),
+            ("ghcr.io/iamwavecut/openplotva@sha256:" + "a" * 64, build, build, build),
+            ("unrelated/image:" + deployed, build, build, build),
+            ("ghcr.io/iamwavecut/openplotva:latest", "invalid", None, None),
+            ("unrelated/image:" + deployed, None, None, None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Runner({"state_dir": tmp, "source_dir": tmp + "/source",
+                             "image": "sha256:" + "a" * 64, "production_container": "production"}, None)
+            for reference, label, expected, expected_build in cases:
+                with self.subTest(reference=reference):
+                    inspected = [{"Config": {"Image": reference,
+                        "Labels": {"org.opencontainers.image.revision": label}},
+                        "Image": "sha256:" + "a" * 64, "RestartCount": 0,
+                        "State": {"OOMKilled": False, "Running": True}}]
+                    responses = [SimpleNamespace(returncode=0, stdout=json.dumps(inspected).encode()),
+                                 SimpleNamespace(returncode=1, stdout=b"")]
+                    with patch("runner.command", side_effect=responses), \
+                         patch("runner.memory_available", return_value=8 * 1024 ** 3):
+                        snapshot = runner.host_snapshot()
+                    self.assertEqual(snapshot["revision"], expected)
+                    self.assertEqual(snapshot["runtime"]["revision"], expected)
+                    self.assertEqual(snapshot["runtime"]["build_revision"], expected_build)
+
     def test_failed_run_charges_elapsed_time_without_losing_quota_usage(self):
         for error in (Deferred("resource boundary"), QuotaUnavailable(usage={"total_tokens": 20})):
             with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:

@@ -173,13 +173,17 @@ class Runner:
         result = command(["docker", "inspect", name], check=False)
         if result.returncode == 0:
             item = json.loads(result.stdout)[0]
-            revision = (item.get("Config", {}).get("Labels") or {}).get("org.opencontainers.image.revision")
-            if not revision:
-                revision = item.get("Config", {}).get("Image", "").rsplit(":", 1)[-1]
-            if not re.fullmatch(r"[a-f0-9]{40}", revision or ""):
-                revision = None
+            build_revision = (item.get("Config", {}).get("Labels") or {}).get("org.opencontainers.image.revision")
+            if not re.fullmatch(r"[a-f0-9]{40}", build_revision or ""):
+                build_revision = None
+            deployed = re.fullmatch(r"ghcr\.io/iamwavecut/openplotva:([a-f0-9]{40})",
+                                    item.get("Config", {}).get("Image", ""))
+            # Deployment promotes an identical-tree PR image under the merge SHA;
+            # its immutable OCI label still records the earlier PR build revision.
+            revision = deployed.group(1) if deployed else build_revision
             snapshot["revision"] = revision
             snapshot["runtime"] = {"available": True, "image": item["Image"], "revision": revision,
+                "build_revision": build_revision,
                 "restart_count": item["RestartCount"], "oom_killed": item["State"]["OOMKilled"],
                 "running": item["State"]["Running"]}
             stats = command(["docker", "stats", "--no-stream", "--format", "{{json .}}", name], check=False, timeout=20)
