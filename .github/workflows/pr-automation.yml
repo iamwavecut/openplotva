@@ -51,7 +51,7 @@ jobs:
 
   pr-agent:
     name: PR-Agent review and suggestions
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.pr_number != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action != 'edited' && github.actor != 'github-actions[bot]') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.repository == 'iamwavecut/openplotva' && github.actor == 'iamwavecut' && inputs.pr_number != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action != 'edited' && github.actor != 'github-actions[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -70,36 +70,49 @@ jobs:
           PULL_REQUEST_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
           PULL_REQUEST_DELETIONS: ${{ github.event.pull_request.deletions || 0 }}
           PULL_REQUEST_CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
+          REVIEW_EVENT: ${{ github.event_name }}
+          REVIEW_ACTOR: ${{ github.actor }}
+          REVIEW_EXECUTION_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            pr_json="$(gh pr view "$PR_NUMBER" --json url,baseRefOid,additions,deletions,changedFiles)"
-            pr_url="$(jq -r .url <<< "$pr_json")"
-            base_sha="$(jq -r .baseRefOid <<< "$pr_json")"
+          if [[ "$REVIEW_EVENT" == "workflow_dispatch" ]]; then
+            [[ "$GH_REPO" == iamwavecut/openplotva && "$REVIEW_ACTOR" == iamwavecut ]] || exit 1
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 1
+            pr_json="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")"
+            jq -e --arg repo "$GH_REPO" '.head.repo.full_name == $repo and .base.repo.full_name == $repo' <<< "$pr_json" >/dev/null
+            pr_url="$(jq -r .html_url <<< "$pr_json")"
+            base_sha="$(jq -r .base.sha <<< "$pr_json")"
+            head_sha="$(jq -r .head.sha <<< "$pr_json")"
+            [[ "$REVIEW_EXECUTION_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$REVIEW_EXECUTION_SHA" == "$base_sha" || "$REVIEW_EXECUTION_SHA" == "$head_sha" ]] || exit 1
+            # An owner dispatch may test this PR's exact wrapper before merge.
+            wrapper_sha="$REVIEW_EXECUTION_SHA"
             additions="$(jq -r .additions <<< "$pr_json")"
             deletions="$(jq -r .deletions <<< "$pr_json")"
-            changed_files="$(jq -r .changedFiles <<< "$pr_json")"
+            changed_files="$(jq -r .changed_files <<< "$pr_json")"
           else
             pr_url="$PULL_REQUEST_URL"
             base_sha="$PULL_REQUEST_BASE_SHA"
+            wrapper_sha="$base_sha"
             additions="$PULL_REQUEST_ADDITIONS"
             deletions="$PULL_REQUEST_DELETIONS"
             changed_files="$PULL_REQUEST_CHANGED_FILES"
           fi
           test -n "$pr_url"
-          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           changed_lines="$(( additions + deletions ))"
           {
             echo "pr_url=$pr_url"
             echo "base_sha=$base_sha"
+            echo "wrapper_sha=$wrapper_sha"
             echo "changed_lines=$changed_lines"
             echo "changed_files=$changed_files"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout trusted base revision
+      - name: Checkout authorized review revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ steps.target.outputs.base_sha }}
+          ref: ${{ steps.target.outputs.wrapper_sha }}
           persist-credentials: false
 
       - name: Run PR-Agent review and suggestions
@@ -144,7 +157,7 @@ jobs:
           docker run --rm \
             -i \
             --entrypoint python \
-            -v "$PWD/.github/scripts/run_pr_agent_pair.py:/tmp/run_pr_agent_pair.py:ro" \
+            -v "$PWD/.github/scripts:/tmp/pr-agent-scripts:ro" \
             -e GITHUB_TOKEN \
             -e "GITHUB.USER_TOKEN=$GITHUB_TOKEN" \
             -e "GITHUB.DEPLOYMENT_TYPE=user" \
@@ -161,8 +174,9 @@ jobs:
             -e PR_AGENT_SKIP_IMPROVE \
             -e PR_AGENT_PUBLISH_NO_FINDINGS \
             -e PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS \
+            -e PR_AGENT_CONFIG_BRANCH \
             pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
-            /tmp/run_pr_agent_pair.py 2>&1 | tee "$log_file"
+            /tmp/pr-agent-scripts/run_pr_agent_pair.py 2>&1 | tee "$log_file"
           status="${PIPESTATUS[0]}"
           set -e
           if (( status != 0 )); then
