@@ -214,6 +214,31 @@ class GitHub:
             raise Deferred('GitHub GraphQL operation is not confirmed')
         return value
 
+    def diagnostic_artifact(self, report):
+        check_id=report['id']
+        if type(check_id) is not int or check_id<=0: raise Deferred('invalid diagnostic check identity')
+        output=report.get('output') or {}
+        body='\n\n'.join(str(output.get(field) or '') for field in ('summary','text')).strip()
+        if output.get('annotations_count'):
+            annotations=self.pages('repos/'+REPOSITORY+'/check-runs/'+str(check_id)+'/annotations')
+            if len(annotations)!=output['annotations_count']: raise Deferred('incomplete diagnostic annotations')
+            body+='\n\n'+json.dumps([{key:a.get(key) for key in ('path','start_line','end_line','annotation_level','title','message','raw_details')} for a in annotations])
+        artifact={'kind':'comment','id':'check_'+str(check_id),'body':body,
+                  'head':report.get('head_sha'),'author':(report.get('app') or {}).get('slug','')}
+        artifact['hash']=fingerprint({key:value for key,value in artifact.items() if key!='head'})
+        return artifact
+
+    def previous_diagnostic(self, reference, expected_head):
+        match=re.fullmatch(r'check_([1-9][0-9]*)',reference)
+        if not match: raise InvalidResult('invalid diagnostic reference')
+        report=self.api('repos/'+REPOSITORY+'/check-runs/'+match[1])
+        if (report.get('id')!=int(match[1]) or report.get('head_sha')!=sha(expected_head)
+                or report.get('name')!='semgrep' or report.get('status')!='completed'
+                or (report.get('app') or {}).get('id')!=15368
+                or (report.get('app') or {}).get('slug')!='github-actions'):
+            raise InvalidResult('diagnostic report provenance changed')
+        return self.diagnostic_artifact(report)
+
     def review_snapshot(self, number):
         pr = self.pr(number); head = sha(pr['head']['sha'])
         checks = []
@@ -239,6 +264,12 @@ class GitHub:
                 thread['comments']['nodes'].extend(page['nodes'])
                 thread['comments']['pageInfo']=page['pageInfo']
         artifacts = []
+        # reviewdog's report is intentionally neutral; its full current findings
+        # still require an explicit response before readiness can be confirmed.
+        diagnostic_checks={c['name']:c for c in sorted(checks,key=lambda c:c.get('id',0))}
+        report=diagnostic_checks.get('semgrep')
+        if report and report.get('conclusion')=='neutral':
+            artifacts.append(self.diagnostic_artifact(report))
         for comment in comments:
             if is_owner(comment.get('user')) and '<!-- maintenance:' in (comment.get('body') or ''): continue
             artifacts.append({'kind': 'comment', 'id': str(comment['id']), 'body': comment.get('body') or '', 'head': head, 'author': comment.get('user', {}).get('login', '')})
@@ -258,7 +289,7 @@ class GitHub:
             if external:
                 artifacts.append({'kind':'thread','id':thread['id'],'body':'\n\n'.join(external),'head':head})
         # Content identity survives a fix push; readiness separately binds handling to exact HEAD.
-        for artifact in artifacts: artifact['hash'] = fingerprint({key:value for key,value in artifact.items() if key!='head'})
+        for artifact in artifacts: artifact['hash'] = fingerprint({key:value for key,value in artifact.items() if key not in ('head','hash')})
         review_checks=[c for c in checks if c['name']=='PR-Agent review and suggestions']
         completed=False
         if review_checks:

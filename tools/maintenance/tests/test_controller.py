@@ -148,6 +148,31 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.state.job(job['id'])['status'],'queued')
         self.assertEqual(self.state.job(job['id'])['rounds'],5)
 
+    def test_diagnostic_fix_acknowledges_previous_check_after_push_then_reviews_new_head(self):
+        github=self.gh; github.items[7]=issue(); github.prs[8]={'state':'open','head':{'sha':BASE}}
+        artifact={'kind':'comment','id':'check_2','body':'Old finding','hash':'old','head':BASE}
+        def snapshot(number):
+            head=github.prs[number]['head']['sha']
+            return {'head':head,'artifacts':[artifact] if head==BASE else [],'threads':[],'checks':[],'pr':github.prs[number]}
+        github.review_snapshot=snapshot
+        github.previous_diagnostic=lambda reference,head: artifact if (reference,head)==('check_2',BASE) else None
+        original_push=github.push
+        def push(prepared,previous=None):
+            result=original_push(prepared,previous); github.prs[8]['head']['sha']=prepared['sha']; return result
+        github.push=push
+        result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,'patch_path':'/offline',
+            'checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],
+            'feedback':[{'kind':'comment','id':'check_2','action':'fixed','body':'The failing case is fixed and tested.'}]}
+        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+            branch='fix/issue-7',feedback=[artifact],result=result,status='result')
+        self.controller.process_results()
+        current=self.state.job(job['id'])
+        self.assertEqual(current['status'],'waiting_ci')
+        self.assertEqual(current['published_sha'],'b'*40)
+        self.assertEqual(current['handled']['comment:check_2'],{'hash':'old','head':'b'*40})
+        self.assertIn('Fixed in '+'b'*40,next(iter(github.comment_values.values()))['body'])
+
+
     def test_feedback_does_not_resolve_if_body_or_head_changes_after_reply(self):
         for changed in ('body','head'):
             with self.subTest(changed=changed):
@@ -389,6 +414,24 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(review_ready(snapshot,['PR-Agent review and suggestions'],{}))
         snapshot['review_completed']=True
         self.assertTrue(review_ready(snapshot,['PR-Agent review and suggestions'],{}))
+
+    def test_neutral_semgrep_report_requires_handling_without_weakening_required_checks(self):
+        required={'id':1,'name':'Semgrep CE','head_sha':BASE,'status':'completed','conclusion':'success'}
+        report={'id':2,'name':'semgrep','app':{'id':15368,'slug':'github-actions'},
+                'head_sha':BASE,'status':'completed','conclusion':'neutral'}
+        artifact={'kind':'comment','id':'check_2','hash':'findings'}
+        snapshot={'head':BASE,'checks':[required,report],'statuses':[], 'threads':[], 'artifacts':[artifact]}
+        handled={'comment:check_2':{'hash':'findings','head':BASE}}
+        self.assertFalse(review_ready(snapshot,['Semgrep CE'],{}))
+        self.assertTrue(review_ready(snapshot,['Semgrep CE'],handled))
+        for fields in ({'conclusion':'failure'},{'status':'in_progress'},{'head_sha':'b'*40},
+                       {'name':'Unknown report'},{'app':{'id':123,'slug':'github-actions'}}):
+            snapshot['checks']=[required,{**report,**fields}]
+            self.assertFalse(review_ready(snapshot,['Semgrep CE'],handled))
+        snapshot['checks']=[required,report]
+        self.assertFalse(review_ready(snapshot,['Semgrep CE','semgrep'],handled))
+        snapshot['checks']=[{**required,'conclusion':'neutral'},report]
+        self.assertFalse(review_ready(snapshot,['Semgrep CE'],handled))
 
     def test_context_failure_after_previous_attempt_is_bounded(self):
         job=self.incident(); self.state.update_job(job['id'],base_sha=BASE)

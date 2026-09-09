@@ -129,6 +129,40 @@ class ReviewGitHub(GitHub):
 
 
 class ReviewSnapshotTests(unittest.TestCase):
+    def test_previous_diagnostic_requires_exact_original_head_and_app(self):
+        github=GitHub({})
+        report={'id':2,'name':'semgrep','head_sha':'a'*40,'status':'completed','conclusion':'neutral',
+                'app':{'id':15368,'slug':'github-actions'},'output':{'summary':'Original finding'}}
+        github.api=lambda path: report
+        self.assertEqual(github.previous_diagnostic('check_2','a'*40)['body'],'Original finding')
+        with self.assertRaises(InvalidResult): github.previous_diagnostic('check_2','b'*40)
+        with self.assertRaises(InvalidResult): github.previous_diagnostic('check_3','a'*40)
+        report['app']['id']=123
+        with self.assertRaises(InvalidResult): github.previous_diagnostic('check_2','a'*40)
+
+    def test_neutral_diagnostic_check_body_is_a_versioned_review_artifact(self):
+        github=ReviewGitHub(); original=github.api
+        report={'id':2,'name':'semgrep','head_sha':github.head,'status':'completed','conclusion':'neutral',
+                'app':{'id':15368,'slug':'github-actions'},'output':{'summary':'Finding one','text':'Full explanation','annotations_count':1}}
+        annotation={'path':'code.rs','start_line':3,'message':'Annotation-only evidence'}
+        def api(path,method='GET',payload=None):
+            if '/check-runs/2/annotations?' in path: return [annotation]
+            value=original(path,method,payload)
+            if '/check-runs?' in path: value['check_runs'].append(report)
+            return value
+        github.api=api
+        artifact=next(a for a in github.review_snapshot(8)['artifacts'] if a['id']=='check_2')
+        self.assertIn('Finding one',artifact['body']); self.assertIn('Full explanation',artifact['body'])
+        self.assertIn('Annotation-only evidence',artifact['body'])
+        report['output']['summary']='Edited finding'
+        changed=next(a for a in github.review_snapshot(8)['artifacts'] if a['id']=='check_2')
+        self.assertNotEqual(artifact['hash'],changed['hash'])
+        annotation['message']='Edited annotation'
+        latest=next(a for a in github.review_snapshot(8)['artifacts'] if a['id']=='check_2')
+        self.assertNotEqual(changed['hash'],latest['hash'])
+        report['output']['annotations_count']=2
+        with self.assertRaises(Deferred): github.review_snapshot(8)
+
     def test_resolved_thread_original_edit_invalidates_readiness_and_own_reply_does_not(self):
         from tools.maintenance.controller import review_ready
         github=ReviewGitHub()

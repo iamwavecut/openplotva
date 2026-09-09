@@ -39,7 +39,12 @@ def review_ready(snapshot, required_checks, handled):
         checks[check['name']] = check
     if not required_checks or not set(required_checks) <= checks.keys(): return False
     for check in checks.values():
-        if check.get('head_sha') != head or check.get('status') != 'completed' or check.get('conclusion') != 'success': return False
+        diagnostic = (check['name']=='semgrep' and check['name'] not in required_checks
+                      and (check.get('app') or {}).get('id')==15368
+                      and (check.get('app') or {}).get('slug')=='github-actions'
+                      and check.get('conclusion')=='neutral')
+        if check.get('head_sha') != head or check.get('status') != 'completed': return False
+        if check.get('conclusion') != 'success' and not diagnostic: return False
     statuses = {}
     for status in snapshot.get('statuses', []): statuses.setdefault(status['context'], status)
     if any(s['state'] != 'success' for s in statuses.values()): return False
@@ -421,6 +426,10 @@ class Controller:
             for reference in seen:
                 old=artifacts[reference]
                 new=current.get(reference)
+                if (new is None and reference[0]=='comment' and reference[1].startswith('check_')
+                        and job['result']['outcome']=='patch' and old.get('head')==job['base_sha']
+                        and (job.get('prepared') or {}).get('sha')==snapshot['head']):
+                    new=self.github.previous_diagnostic(reference[1],job['base_sha'])
                 if not new or new['body']!=old['body'] or new['hash']!=old['hash']:
                     raise InvalidResult('review artifact changed during repair')
 
