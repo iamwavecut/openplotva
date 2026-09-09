@@ -79,3 +79,10 @@ the root.
 Do not output a narrative in place of this artifact. Never claim success solely
 because a command exited zero. If evidence or local verification is insufficient,
 leave the partial patch and report needs_human with the missing facts.
+
+Before exiting, run `python3 /opt/maintenance/worker.py validate`. Fix artifact
+errors using its safe schema hints and run it again within the same deadline.
+Do not edit the validator or its contracts. A passing precheck does not publish
+anything or replace the controller's independent artifact, feedback, patch and
+verification checks. Explanation-only review returns no_fix with rebuttal;
+never claim patch or fixed when no code changed.

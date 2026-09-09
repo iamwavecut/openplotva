@@ -6,16 +6,18 @@ import datetime
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 if __package__:
-    from .contracts import DEEP_SECONDS, INITIAL_SECONDS, MODEL, diagnosis, sha
+    from .contracts import DEEP_SECONDS, INITIAL_SECONDS, MODEL, InvalidResult, diagnosis, sha, validate_output
 else:
-    from contracts import DEEP_SECONDS, INITIAL_SECONDS, MODEL, diagnosis, sha
+    from contracts import DEEP_SECONDS, INITIAL_SECONDS, MODEL, InvalidResult, diagnosis, sha, validate_output
 
 POLICY = Path("/opt/maintenance/policy.md")
 CONFIG = Path("/opt/maintenance/omp-config.yml")
@@ -81,6 +83,9 @@ def launch_instruction(seconds):
         "checkpoint by the checkpoint deadline, earlier if possible. Use only observed facts; "
         "state uncertainty and missing evidence explicitly. Update this artifact as findings improve. "
         "An early checkpoint is not permission to claim success or skip verification. "
+        "Before exiting, run python3 /opt/maintenance/worker.py validate. Correct the artifact using "
+        "its safe schema hints and revalidate within this same budget; validation does not publish "
+        "anything or replace the controller's checks. "
         "Check UTC time with date -u as needed; tool calls and retries do not reset the deadline. "
         "Stop investigating at the stated cutoff, finalize /work/result.json, and exit normally before "
         "the hard deadline. A checkpoint does not make a timeout or nonzero exit acceptable.\n" + scope
@@ -177,6 +182,61 @@ def _agent(seconds, diagnostic):
     return 0
 
 
+def validate_result():
+    """Advisory artifact precheck; the controller remains the acceptance authority."""
+    hint = "Read valid JSON from the fixed context.json and result.json paths."
+    try:
+        documents = []
+        for name, limit in (("context.json", 8 * 1024 * 1024), ("result.json", 256 * 1024)):
+            descriptor = os.open(WORK / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                    raise ValueError("invalid artifact file")
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("artifact exceeds limit")
+            documents.append(json.loads(data))
+        context, value = documents
+        hint = "The context stage must be initial, deep, or review."
+        stage = context.get("stage") if isinstance(context, dict) else None
+        if stage not in ("initial", "deep", "review"):
+            raise ValueError("invalid stage")
+        hint = ("Follow the canonical root, diagnosis, and feedback schemas and the allowed values in the policy. "
+                "matches belongs inside diagnosis; use observed facts and state uncertainty.")
+        validate_output(value, stage)
+        hint = "Without a patch, use outcome no_fix and feedback action rebuttal for explanations; do not claim fixed."
+        if value["outcome"] != "patch" and any(item["action"] == "fixed" for item in value["feedback"]):
+            raise InvalidResult("fixed feedback has no patch")
+        if value["outcome"] == "patch":
+            hint = "A claimed patch needs a readable repository and actual changes from context.base_sha."
+            base = sha(context["base_sha"])
+            common = ["/usr/bin/git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                      "-c", "core.fsmonitor=false", "-C", str(WORK / "repo")]
+            changed = subprocess.run(common + ["diff", "--quiet", "--no-ext-diff", "--no-textconv", base, "--"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode
+            if changed not in (0, 1):
+                raise ValueError("repository diff unavailable")
+            if changed == 0:
+                with tempfile.TemporaryFile(dir=WORK) as output:
+                    subprocess.run(common + ["ls-files", "--others", "--exclude-standard", "--directory", "-z"],
+                                   stdout=output, stderr=subprocess.DEVNULL, timeout=10, check=True)
+                    output.seek(0)
+                    changed = bool(output.read(1))
+            hint = "No patch exists. For explanation-only review use outcome no_fix and feedback action rebuttal."
+            if not changed:
+                raise InvalidResult("empty patch")
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, InvalidResult, subprocess.SubprocessError):
+        print(json.dumps({"valid": False, "hint": hint,
+            "expected_root_fields": ["diagnosis", "outcome", "feedback"],
+            "expected_diagnosis_fields": ["external_cause", "code_defect", "observations", "hypotheses",
+                "supporting", "contradicting", "related_changes", "missing", "next_action", "title", "summary",
+                "matches", "acceptance"], "expected_feedback_fields": ["kind", "id", "action", "body"]}))
+        return 1
+    print(json.dumps({"valid": True, "hint": "Artifact precheck passed; the controller still validates feedback, patch and checks."}))
+    return 0
+
+
 def export_patch(base):
     sha(base)
     common = ["/usr/bin/git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
@@ -221,6 +281,8 @@ if __name__ == "__main__":
             sys.exit(export_patch(sys.argv[2]))
         if operation == "verify":
             sys.exit(verify())
+        if operation == "validate":
+            sys.exit(validate_result())
         sys.exit(2)
     except (OSError, ValueError, subprocess.SubprocessError):
         sys.exit(1)

@@ -2,6 +2,8 @@
 import io
 import json
 import os
+import subprocess
+import sys
 from contextlib import redirect_stdout
 import tempfile
 import unittest
@@ -27,6 +29,82 @@ class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.work=Path(self.temp.name).resolve()
+
+    def check_artifact(self,value,stage='review'):
+        self.assertTrue(callable(getattr(worker,'validate_result',None)),'image has no artifact validation command')
+        (self.work/'context.json').write_text(json.dumps({'stage':stage}))
+        (self.work/'result.json').write_text(json.dumps(value))
+        with patch.object(worker,'WORK',self.work),redirect_stdout(io.StringIO()) as output:
+            status=worker.validate_result()
+        return status,json.loads(output.getvalue())
+
+    def test_validate_accepts_review_explanation_and_rejects_misplaced_matches_safely(self):
+        value=result_fixture()
+        value['outcome']='no_fix'
+        value['feedback']=[{'kind':'comment','id':'1','action':'rebuttal','body':'Synthetic explanation; no code change.'}]
+        status,receipt=self.check_artifact(value)
+        self.assertEqual(status,0)
+        self.assertTrue(receipt['valid'])
+        value['matches']=value['diagnosis'].pop('matches')
+        value['PRIVATE_CANARY']='PRIVATE_CANARY'
+        status,receipt=self.check_artifact(value)
+        self.assertEqual(status,1)
+        self.assertFalse(receipt['valid'])
+        self.assertEqual(receipt['expected_root_fields'],['diagnosis','outcome','feedback'])
+        self.assertIn('matches',receipt['expected_diagnosis_fields'])
+        self.assertNotIn('PRIVATE_CANARY',json.dumps(receipt))
+        self.assertIn('matches',(self.work/'result.json').read_text())
+
+    def test_validate_rejects_missing_diagnosis_matches_and_fixed_without_patch(self):
+        value=result_fixture();value['diagnosis'].pop('matches')
+        status,receipt=self.check_artifact(value)
+        self.assertEqual(status,1)
+        self.assertIn('diagnosis',receipt['hint'])
+        value=result_fixture();value['outcome']='no_fix'
+        value['feedback']=[{'kind':'comment','id':'1','action':'fixed','body':'Synthetic explanation.'}]
+        status,receipt=self.check_artifact(value)
+        self.assertEqual(status,1)
+        self.assertIn('rebuttal',receipt['hint'])
+
+    def test_validate_patch_requires_tracked_or_untracked_changes_without_mutating_index(self):
+        self.assertTrue(callable(getattr(worker,'validate_result',None)),'image has no artifact validation command')
+        repo=self.work/'repo';repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git','-C',str(repo),*args],check=True,capture_output=True).stdout
+        git('init','--quiet');git('config','user.name','Synthetic');git('config','user.email','synthetic@example.invalid')
+        (repo/'fixture.txt').write_text('before\n');git('add','.');git('commit','--quiet','-m','synthetic')
+        base=git('rev-parse','HEAD').decode().strip()
+        value=result_fixture();value['outcome']='patch'
+        value['diagnosis'].update(next_action='fix',code_defect='confirmed',supporting=['Synthetic evidence'],acceptance=['Synthetic test'])
+        (self.work/'context.json').write_text(json.dumps({'stage':'review','base_sha':base}))
+        (self.work/'result.json').write_text(json.dumps(value))
+        for change in ('none','untracked','tracked'):
+            if change=='untracked': (repo/'new.txt').write_text('new\n')
+            if change=='tracked':
+                (repo/'new.txt').unlink();(repo/'fixture.txt').write_text('after\n')
+            before=git('status','--porcelain')
+            with self.subTest(change=change),patch.object(worker,'WORK',self.work),redirect_stdout(io.StringIO()) as output:
+                status=worker.validate_result()
+            self.assertEqual(status,1 if change=='none' else 0)
+            self.assertEqual(git('status','--porcelain'),before)
+            self.assertEqual(git('diff','--cached'),b'')
+
+    def test_validate_rejects_fifo_symlink_and_oversize_without_reading_payload(self):
+        self.assertTrue(callable(getattr(worker,'validate_result',None)),'image has no artifact validation command')
+        (self.work/'context.json').write_text('{"stage":"review"}')
+        target=self.work/'result.json'
+        for kind in ('fifo','symlink','oversize'):
+            if kind=='fifo':os.mkfifo(target)
+            elif kind=='symlink':target.symlink_to(self.work/'context.json')
+            else:target.write_text('PRIVATE_CANARY'*(256*1024))
+            probe = 'from pathlib import Path; import sys; from tools.maintenance import worker; worker.WORK=Path(sys.argv[1]); sys.exit(worker.validate_result())'
+            with self.subTest(kind=kind):
+                output=subprocess.run([sys.executable,'-c',probe,str(self.work)],capture_output=True,
+                    cwd=Path(__file__).resolve().parents[3],timeout=2)
+                self.assertEqual(output.returncode,1)
+                self.assertFalse(json.loads(output.stdout)['valid'])
+            self.assertNotIn(b'PRIVATE_CANARY',output.stdout+output.stderr)
+            target.unlink()
 
     def test_cargo_materialization_preserves_macro_relative_includes_and_job_writes(self):
         image=self.work/'image'/'usr'/'local'/'cargo'
@@ -124,6 +202,7 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('rebuttal',instruction)
         self.assertIn('Do not create a patch',instruction)
         self.assertIn('required checks',instruction)
+        self.assertIn('python3 /opt/maintenance/worker.py validate',instruction)
 
     def test_trusted_initial_deadlines_reach_omp_without_untrusted_context_strings(self):
         status,command,_,_,timer=self.run_agent('initial',60,extra_context={

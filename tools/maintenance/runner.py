@@ -19,11 +19,11 @@ from pathlib import Path
 
 if __package__:
     from .contracts import (DEEP_SECONDS, INITIAL_SECONDS, Deferred, InvalidResult, QuotaUnavailable,
-                            REPOSITORY, diagnosis, identifier, safe_patch_path, sha, text)
+                            REPOSITORY, identifier, safe_patch_path, sha, text, validate_output)
     from .gateway import RunGateway
 else:
     from contracts import (DEEP_SECONDS, INITIAL_SECONDS, Deferred, InvalidResult, QuotaUnavailable,
-                           REPOSITORY, diagnosis, identifier, safe_patch_path, sha, text)
+                           REPOSITORY, identifier, safe_patch_path, sha, text, validate_output)
     from gateway import RunGateway
 
 GIB = 1024 ** 3
@@ -91,26 +91,6 @@ def validate_patch(patch: bytes) -> list[str]:
     if not paths or len(paths) > 100 or len(paths) != len(set(paths)):
         raise InvalidResult("patch file list is invalid")
     return paths
-
-
-def validate_output(value, stage):
-    if not isinstance(value, dict) or set(value) != {"diagnosis", "outcome", "feedback"}:
-        raise InvalidResult("unexpected worker result fields")
-    diagnosis(value["diagnosis"])
-    if value["outcome"] not in ("patch", "no_fix", "needs_human"):
-        raise InvalidResult("invalid worker outcome")
-    if value["outcome"] == "patch" and (stage == "initial" or value["diagnosis"]["next_action"] != "fix"):
-        raise InvalidResult("patch was not justified by a deep diagnosis")
-    if not isinstance(value["feedback"], list) or len(value["feedback"]) > 100:
-        raise InvalidResult("invalid feedback responses")
-    for response in value["feedback"]:
-        if not isinstance(response, dict) or set(response) != {"kind", "id", "action", "body"}:
-            raise InvalidResult("invalid feedback response")
-        if response["kind"] not in ("comment", "thread") or response["action"] not in ("fixed", "rebuttal"):
-            raise InvalidResult("invalid feedback resolution")
-        identifier(str(response["id"]))
-        text(response["body"], 12000)
-    return value
 
 
 def verification_receipt(data, exit_code):

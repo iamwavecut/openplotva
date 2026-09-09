@@ -114,6 +114,26 @@ def diagnosis(value: object) -> dict:
     return value
 
 
+def validate_output(value, stage):
+    if not isinstance(value, dict) or set(value) != {"diagnosis", "outcome", "feedback"}:
+        raise InvalidResult("unexpected worker result fields")
+    diagnosis(value["diagnosis"])
+    if value["outcome"] not in ("patch", "no_fix", "needs_human"):
+        raise InvalidResult("invalid worker outcome")
+    if value["outcome"] == "patch" and (stage == "initial" or value["diagnosis"]["next_action"] != "fix"):
+        raise InvalidResult("patch was not justified by a deep diagnosis")
+    if not isinstance(value["feedback"], list) or len(value["feedback"]) > 100:
+        raise InvalidResult("invalid feedback responses")
+    for response in value["feedback"]:
+        if not isinstance(response, dict) or set(response) != {"kind", "id", "action", "body"}:
+            raise InvalidResult("invalid feedback response")
+        if response["kind"] not in ("comment", "thread") or response["action"] not in ("fixed", "rebuttal"):
+            raise InvalidResult("invalid feedback resolution")
+        identifier(str(response["id"]))
+        text(response["body"], 12000)
+    return value
+
+
 def safe_patch_path(value: str) -> bool:
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in ("..", ".git") for part in path.parts) or "\\" in value:
