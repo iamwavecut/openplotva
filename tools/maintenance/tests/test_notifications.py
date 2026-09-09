@@ -93,6 +93,25 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(reason_code({'reason': 'required PR-Agent execution proof unavailable'},
                                      'needs_human'), 'review_incomplete')
 
+    def test_legacy_sent_or_ambiguous_delivery_fences_replacements_across_restart(self):
+        for delivered in ('sent', 'ambiguous'):
+            with self.subTest(delivered=delivered):
+                job = self.state.new_job('deep', delivered, 1, issue_number=7 if delivered == 'sent' else 8,
+                    reason='deep investigation produced no verified fix; issue remains open')
+                for number, status in enumerate((delivered, 'pending')):
+                    key = (('a' if delivered == 'sent' else 'b')+str(number))*32
+                    payload = {'key': key, 'run_id': job['id'], 'status': 'needs_human',
+                               'issue_number': job['issue_number']}
+                    self.state.put_record('notifications', key,
+                        {'key': key, 'payload': payload, 'posted': number == 0, 'state': status})
+                other = State(self.path)
+                try:
+                    api = API(); controller = Controller({}, other, api, None, None)
+                    controller.notify(job, 'needs_human'); controller.poll_notifications()
+                    self.assertEqual(api.receipts, {})
+                finally:
+                    other.close()
+
     def test_unacknowledged_legacy_post_reuses_the_same_transport_key(self):
         api = API(); self.controller.api = api
         for number in range(2):

@@ -41,7 +41,6 @@ def coalesce_pending(state):
         groups = {}
         for record in records:
             if 'identity_key' not in record:
-                if record['state'] in ('sent', 'ambiguous'): continue
                 job = state.job(record['payload']['run_id'])
                 record['identity_key'] = notification_payload(state, job, record['payload']['status'])['key']
                 state.put_record('notifications', record['key'], record)

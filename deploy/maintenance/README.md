@@ -380,6 +380,7 @@ so and links to the issue queue; it never claims an issue was left open.
 Pending legacy notices are coalesced before delivery. Their original transport
 keys and payloads remain unchanged to reconcile a lost acknowledgement; duplicate
 unposted notices are suppressed. Already posted receipts continue to be polled.
+Historical sent and ambiguous receipts also prevent replacement notices.
 Deploy the runtime's optional `reason_code` notification support before upgrading
 the controller. Older controllers remain compatible with the new runtime.
 
