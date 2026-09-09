@@ -24,6 +24,34 @@ manual dispatch. Its backup is stored under
 The default retention is the newest 14 complete `scheduled-*` directories.
 Override it with `OPENPLOTVA_BACKUP_KEEP`.
 
+The uploader's media volume has a separate daily retention job on `geta.moe`:
+
+```sh
+sudo install -o root -g root -m 0644 tools/uploader-retention.cron \
+  /etc/cron.d/openplotva-uploader-retention
+```
+
+This is a system crontab with a user field; do not install it with `crontab`.
+At 04:30 UTC it deletes regular files at least eight complete days old, preserving
+the existing `find -mtime +7` policy. Old message media URLs expire with their
+files. The job does not follow symlinks or cross filesystems, uses idle I/O
+priority, and has a five-minute deadline and a lock against overlapping runs.
+
+LLM event retention runs at startup and daily. Each pass archives complete UTC
+days older than `LLM_REQUEST_EVENTS_RETENTION_DAYS` once, then drains expired raw
+events in committed batches of 10,000 with 200 ms pauses. The cutoff stays fixed
+throughout the pass; the boundary day remains raw until it can be archived in
+full. Archive failures preserve the raw events and retry after five minutes.
+
+To exercise backlog draining, archive rollback, restart, and retention boundaries,
+use an empty PostgreSQL database whose name starts with `openplotva_retention_test_`:
+
+```sh
+OPENPLOTVA_RETENTION_TEST_DATABASE_URL=postgres://localhost/openplotva_retention_test_run \
+  cargo test -p openplotva-app \
+  cleanup_drains_multiple_batches_without_losing_rollups_or_recent_events -- --ignored
+```
+
 Before restore, stop OpenPlotva and the affected dependency. Validate the
 backup with `sha256sum --check SHA256SUMS`. Restore PostgreSQL with
 `pg_restore --clean --if-exists --no-owner`. For Dragonfly, empty its data
