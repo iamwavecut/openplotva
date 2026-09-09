@@ -81,7 +81,8 @@ class State:
             failures = min(16, previous.get('failures', 0) + 1)
             delay = retry_after(delay) or min(3600, 600 * 2 ** (failures - 1))
             at = self.clock() if at is None else at
-            value = {'source': source, 'failures': failures, 'since': previous.get('since', at), 'observed_at': at,
+            value = {'source': source, 'failures': failures, 'since': previous.get('since', at),
+                     'observed_at': max(previous.get('observed_at', at), at),
                      'until': max(previous.get('until', 0), at + delay), 'retry_after_seconds': delay}
             self.set_setting('provider_quota', value)
             return value

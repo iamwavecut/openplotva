@@ -39,6 +39,15 @@ class StateTests(unittest.TestCase):
             self.state.job=original
             other.close()
 
+    def test_late_quota_receipt_cannot_let_older_success_clear_newer_limit(self):
+        self.state.defer_provider('newer-refusal', 600, at=self.now)
+        self.state.defer_provider('late-old-receipt', 600, at=self.now-120)
+        self.state.provider_recovered(self.now-60)
+        self.assertFalse(self.state.provider_available())
+        self.assertEqual(self.state.setting('provider_quota')['observed_at'], self.now)
+        self.state.provider_recovered(self.now+1)
+        self.assertTrue(self.state.provider_available())
+
     def test_cancellation_is_monotonic_even_for_stale_save_and_nested_update(self):
         job=self.state.new_job('deep','sig',1)
         self.state.cancel(job['id'])
