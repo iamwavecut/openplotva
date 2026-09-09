@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contracts import InvalidResult, Deferred, QuotaUnavailable, diagnosis
@@ -20,6 +21,97 @@ def patch_for(path, extra=""):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_failure_receipt_is_saved_before_empty_patch_cleanup_without_private_text(self):
+        for result_text,phase in (('PRIVATE_CANARY invalid JSON','result_json'),
+                                  ('{"PRIVATE_CANARY":true}','result_contract')):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                runner = Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64,
+                                 'gateway_url':'http://127.0.0.1:4000','gateway_token_file':'unused'},
+                                SimpleNamespace(evidence=None))
+                job={'id':'receipt-test','base_sha':'b'*40,'stage':'review','incident_id':1,'remaining_seconds':14400}
+                gateway=SimpleNamespace(address=('127.0.0.1',1234),usage={})
+                def checkout(work,base):
+                    (work/'repo').mkdir()
+                    (work/'result.json').write_text(result_text)
+                def host_command(args,**kwargs):
+                    if args[0]=='umount':
+                        self.assertEqual(len(list(Path(tmp).glob('artifacts/*/*/failure.json'))),1)
+                    return SimpleNamespace(stdout=b'',returncode=0)
+                with patch.object(runner,'preflight'),patch.object(runner,'refresh_source'), \
+                     patch.object(runner,'_checkout',side_effect=checkout), \
+                     patch.object(runner,'_network',return_value=('opm-test','opmtest','127.0.0.1')), \
+                     patch.object(runner,'_firewall',return_value=nullcontext()), \
+                     patch.object(runner,'container_args',return_value=['docker','create']), \
+                     patch.object(runner,'_exec',return_value=(0,b'')), \
+                     patch('runner.RunGateway',return_value=nullcontext(gateway)),patch('runner.secret_file',return_value='synthetic'), \
+                     patch('runner.os.chown'),patch('runner.command',side_effect=host_command):
+                    with self.assertRaises((InvalidResult,ValueError)):
+                        runner.run(job,{})
+                receipts=list(Path(tmp).glob('artifacts/*/*/failure.json'))
+                self.assertEqual(len(receipts),1,'cleanup discarded the terminal diagnostic')
+                raw=receipts[0].read_text(); receipt=json.loads(raw)
+                self.assertEqual(receipt['phase'],phase)
+                self.assertNotIn('PRIVATE_CANARY',raw)
+                self.assertEqual((receipts[0].parent/'partial.patch').read_bytes(),b'')
+                self.assertEqual(list(Path(tmp).glob('workspaces/*')),[])
+
+    def test_exec_retains_exit_and_whitelisted_worker_status_without_raw_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner=Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64},None)
+            def launch(args,**kwargs):
+                kwargs['stdout'].write(b'{"version":1,"status":"omp_nonzero","omp_exit_code":137}')
+                return SimpleNamespace(poll=lambda:1,returncode=1)
+            with patch('runner.subprocess.Popen',side_effect=launch),self.assertRaises(Deferred) as caught:
+                runner._exec('opm-synthetic',['agent','60'],'job',time.monotonic()+60)
+            diagnostic=getattr(caught.exception,'diagnostic',{})
+            self.assertEqual(diagnostic.get('exit_code'),1)
+            self.assertEqual(diagnostic.get('worker',{}).get('omp_exit_code'),137)
+
+    def test_exec_rejects_private_or_malformed_diagnostic_output(self):
+        for payload in (b'PRIVATE_CANARY',b'{"version":1,"status":"PRIVATE_CANARY","omp_exit_code":1}',
+                        b'{"version":1,"status":"omp_nonzero","omp_exit_code":1,"message":"PRIVATE_CANARY"}'):
+            with self.subTest(payload=payload),tempfile.TemporaryDirectory() as tmp:
+                runner=Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64},None)
+                def launch(args,**kwargs):
+                    kwargs['stdout'].write(payload)
+                    return SimpleNamespace(poll=lambda:1,returncode=1)
+                with patch('runner.subprocess.Popen',side_effect=launch),self.assertRaises(Deferred) as caught:
+                    runner._exec('opm-synthetic',['agent','60'],'job',time.monotonic()+60)
+                self.assertIsNone(caught.exception.diagnostic['worker'])
+                self.assertNotIn('PRIVATE_CANARY',json.dumps(caught.exception.diagnostic))
+
+    def test_exec_distinguishes_each_supervisor_stop_without_changing_exception_type(self):
+        for reason in ('cancelled','deadline','disk_reserve','memory_reserve'):
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory() as tmp:
+                runner=Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64},None,
+                              cancelled=lambda job:reason=='cancelled')
+                process=SimpleNamespace(poll=lambda:None,returncode=143,wait=lambda **kwargs:143)
+                with patch('runner.subprocess.Popen',return_value=process),patch('runner.command'), \
+                     patch('runner.shutil.disk_usage',return_value=SimpleNamespace(free=(1 if reason=='disk_reserve' else 20)*1024**3)), \
+                     patch('runner.memory_available',return_value=(1 if reason=='memory_reserve' else 8)*1024**3), \
+                     self.assertRaises(Deferred) as caught:
+                    runner._exec('opm-synthetic',['agent','60'],'job',0 if reason=='deadline' else time.monotonic()+60)
+                self.assertEqual(caught.exception.diagnostic['stop'],reason)
+                self.assertEqual(caught.exception.diagnostic['exit_code'],143)
+
+    def test_failed_receipt_write_preserves_original_quota_error_and_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner=Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64},None)
+            job={'id':'receipt-write-test','base_sha':'b'*40,'stage':'deep','incident_id':1,'remaining_seconds':14400}
+            error=QuotaUnavailable(usage={'total_tokens':20},retry_after_seconds=900)
+            with patch.object(runner,'preflight'),patch.object(runner,'refresh_source'), \
+                 patch.object(runner,'_checkout',side_effect=error), \
+                 patch('runner.command',return_value=SimpleNamespace(stdout=b'',returncode=0)), \
+                 patch('runner.os.replace',side_effect=OSError('PRIVATE_CANARY')), \
+                 patch('runner.time.monotonic',side_effect=[100,130]),self.assertRaises(QuotaUnavailable) as caught:
+                runner.run(job,{})
+            self.assertIs(caught.exception,error)
+            self.assertEqual(error.active_seconds,30)
+            self.assertEqual(error.retry_after_seconds,900)
+            self.assertEqual(error.usage,{'total_tokens':20})
+            self.assertEqual(len(list(Path(tmp).glob('workspaces/*/manifest.json'))),1)
+            self.assertEqual(list(Path(tmp).glob('artifacts/*/*/failure.json')),[])
+
     def test_runtime_revision_tracks_promoted_deployment_not_pr_build(self):
         build = "b" * 40
         deployed = "d" * 40
