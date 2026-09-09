@@ -195,6 +195,10 @@ jobs:
           PR_CHANGED_FILES: ${{ steps.target.outputs.changed_files }}
         run: |
           set -euo pipefail
+          if [[ ! -f .github/scripts/review_execution.py ]]; then
+            echo "This base revision predates execution receipts. An owner must dispatch review at the exact PR head." >&2
+            exit 1
+          fi
           export PR_AGENT_SKIP_IMPROVE=false
           if {
             (( PR_CHANGED_LINES > PR_AGENT_IMPROVE_MAX_CHANGED_LINES )) ||
