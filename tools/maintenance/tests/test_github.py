@@ -43,6 +43,15 @@ class GitHubTests(unittest.TestCase):
         items = [{'kind': 'issue', 'number': n, 'title': 'queue timeout', 'body': 'locks'} for n in range(1,101)]
         self.assertEqual(select_candidates(items, {'reason': 'timeout'}, 3), items[:3])
 
+    def test_candidate_search_ranks_empty_github_bodies_by_title(self):
+        items = [
+            {'kind': 'pr', 'number': 2, 'title': 'queue timeout', 'body': None},
+            {'kind': 'issue', 'number': 3, 'title': 'unrelated', 'body': ''},
+            {'kind': 'issue', 'number': 1, 'title': 'timeout', 'body': None},
+        ]
+        self.assertEqual(select_candidates(items, {'reason': 'timeout'}, 2), [items[2], items[0]])
+        self.assertIsNone(items[0]['body'])
+
     def test_publication_checks_patch_in_real_git_and_preserves_commit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); source = root/'source'; source.mkdir()
