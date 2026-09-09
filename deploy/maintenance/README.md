@@ -245,6 +245,8 @@ The bounded decision is one of:
 - **continue**: resume diagnosis or revise the managed PR using the owner's
   latest guidance. The normal defect evidence, tests and lifetime repair budgets
   still apply. A new attempt after a closed PR does not reopen that PR.
+  If the owner manually reopens it and then requests continuation in a new
+  comment, it can be reused within its existing scope and lifetime budget.
 - **close_pr**: close only the supplied controller-created PR after checking
   its recorded branch and unchanged HEAD; publish an explanation and retain the
   open issue, branch and artifacts. The action is journaled before transmission,

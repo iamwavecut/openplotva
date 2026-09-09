@@ -58,7 +58,7 @@ class ConversationTests(unittest.TestCase):
         self.gh.prs[8] = {'kind': 'pr', 'title': 'Queue fix', 'number': 8, 'state': 'open', 'merged_at': None, 'user': owner(), 'body': marker,
             'base': {'repo': {'full_name': 'iamwavecut/openplotva'}},
             'head': {'sha': BASE, 'ref': 'fix/issue-7', 'repo': {'full_name': 'iamwavecut/openplotva'}}}
-        self.gh.close_pr = lambda number: self.gh.prs[number].update(state='closed') or {'number': number}
+        self.gh.close_pr = lambda number: self.gh.prs[number].update(state='closed') or copy.deepcopy(self.gh.prs[number])
         return job
 
     def test_only_owner_comments_create_one_durable_triage_and_edits_are_new_feedback(self):
@@ -343,3 +343,28 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(writes, [('repos/iamwavecut/openplotva/pulls/8', 'PATCH', {'state': 'closed'})])
         github.api = lambda *args: {'login': 'other', 'id': 123}
         with self.assertRaises(InvalidResult): github.close_pr(8)
+
+    def test_close_response_must_confirm_closed_state_and_expected_head(self):
+        for response in ({'number': 8, 'state': 'open', 'head': {'sha': BASE}},
+                         {'number': 9, 'state': 'closed', 'head': {'sha': BASE}},
+                         {'number': 8, 'state': 'closed', 'head': {'sha': 'c'*40}}):
+            with self.subTest(response=response):
+                repair = self.managed_pr()
+                self.comment('Close the obsolete PR.')
+                self.gh.close_pr = lambda number: response
+                result = self.complete(self.poll()[-1], 'close_pr')
+                self.assertEqual(result['status'], 'result')
+                self.assertEqual(self.gh.prs[8]['state'], 'open')
+                self.assertEqual(self.state.job(repair['id'])['status'], 'ready')
+                self.assertEqual(self.gh.comment_values, {})
+                self.state.cancel(result['id'])
+
+    def test_owner_can_manually_reopen_pr_then_request_continuation(self):
+        repair = self.managed_pr(); self.comment('Close this approach.')
+        self.complete(self.poll()[0], 'close_pr')
+        self.gh.prs[8]['state'] = 'open'
+        self.gh.review_snapshot = lambda number: {'head': BASE, 'artifacts': [], 'checks': []}
+        self.comment('I reopened the PR; continue revising it with the new evidence.')
+        self.complete(self.poll()[-1], 'continue')
+        self.assertEqual(self.state.job(repair['id'])['status'], 'queued')
+        self.assertEqual(self.state.job(repair['id'])['pr_number'], 8)

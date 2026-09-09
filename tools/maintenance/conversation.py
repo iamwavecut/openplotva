@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime
 
-from .contracts import DEEP_SECONDS, MAX_ROUNDS, REPOSITORY, InvalidResult, fingerprint, text, validate_output
+from .contracts import DEEP_SECONDS, MAX_ROUNDS, REPOSITORY, Deferred, InvalidResult, fingerprint, text, validate_output
 from .github import is_owner, validate_issue
 from .privacy import public_feedback
 
@@ -187,8 +187,17 @@ class Conversation:
                 if pr.get('merged_at') or pr['head']['sha'] != expected['head']:
                     raise InvalidResult('closure target changed')
                 return {'number': pr['number']} if pr['state'] == 'closed' else None
+            def close():
+                receipt = self.github.close_pr(expected['number'])
+                if (not isinstance(receipt, dict) or receipt.get('number') != expected['number']
+                        or receipt.get('state') != 'closed' or receipt.get('merged_at')
+                        or receipt.get('head', {}).get('sha') != expected['head']):
+                    raise Deferred('pull request closure receipt is unconfirmed')
+                return {'number': receipt['number'], 'head': expected['head'], 'state': 'closed'}
             controller.effect(key, 'close_pr', {'number': expected['number'], 'head': expected['head']},
-                              reconcile, lambda: self.github.close_pr(expected['number']), job)
+                              reconcile, close, job)
+            if reconcile() is None: raise Deferred('pull request closure is not yet observable')
+            body += '\n\nClosed PR #'+str(expected['number'])+'.'
         controller.effect(fingerprint({'conversation_reply': job['id']}), 'reply',
             {'number': target, 'body': body},
             lambda: self.github.find_comment(target, marker),
