@@ -67,6 +67,14 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
             self.assertGreaterEqual(len(calls), 2)
             self.assertEqual(calls[0]["model"], "glm-5.3")
+            system = "\n".join(message["content"] for message in calls[0]["messages"]
+                               if message["role"] == "system" and isinstance(message.get("content"), str))
+            self.assertIn("Trusted launch budget", system)
+            self.assertIn("Stage: initial", system)
+            self.assertIn("Available runtime: 60 seconds", system)
+            self.assertIn("Checkpoint deadline (UTC):", system)
+            self.assertIn("Hard deadline (UTC):", system)
+            self.assertIn("normal exit", system)
             self.assertTrue(any(tool["function"]["name"] == "write" for tool in calls[0]["tools"]))
         finally:
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=20, check=False)
