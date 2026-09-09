@@ -648,7 +648,9 @@ class Controller:
                 if record['posted']:
                     receipt=self.api.notification(record['key'])
                 else:
-                    receipt=self.api.notify(record['payload']); record['posted']=True
+                    try: receipt=self.api.notification(record['key'])
+                    except Deferred: receipt=self.api.notify(record['payload'])
+                    record['posted']=True
                 if receipt.get('key') != record['key']: raise Deferred('notification receipt key mismatch')
                 if receipt['state']=='sent' and not receipt.get('telegram_message_id'): raise Deferred('notification not confirmed by dispatcher')
                 record.update(state=receipt['state'],telegram_message_id=receipt.get('telegram_message_id'))

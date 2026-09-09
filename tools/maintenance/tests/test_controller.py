@@ -29,6 +29,7 @@ class API:
         self.receipts[payload['key']] = {'key': payload['key'], 'state': self.delivery, 'telegram_message_id': 1 if self.delivery == 'sent' else None}
         return self.receipts[payload['key']]
     def notification(self, key):
+        if key not in self.receipts: raise Deferred('notification unavailable')
         self.receipts[key]['state'] = self.delivery
         self.receipts[key]['telegram_message_id'] = 1 if self.delivery == 'sent' else None
         return self.receipts[key]

@@ -102,6 +102,7 @@ class NotificationTests(unittest.TestCase):
             if number == 0: api.notify(payload)  # Dispatcher accepted it before the process stopped.
             self.state.put_record('notifications', key,
                 {'key': key, 'payload': payload, 'posted': False, 'state': 'pending'})
+        api.notify = lambda *_: self.fail('An existing dispatcher receipt must not be posted again')
         self.controller.poll_notifications()
         self.controller.notify(job, 'needs_human')
         self.assertEqual(set(api.receipts), {'0'*64})
