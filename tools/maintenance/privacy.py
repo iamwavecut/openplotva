@@ -32,12 +32,22 @@ def identity_values(value, selected=False):
     """Collect typed identifiers, never arbitrary prose under a private object."""
     if isinstance(value, dict):
         for key, child in value.items():
-            yield from identity_values(child, key.lower() in IDENTITY_KEYS)
+            yield from identity_values(child, key.lower() if key.lower() in IDENTITY_KEYS else False)
     elif isinstance(value, list):
         for child in value:
             yield from identity_values(child, selected)
     elif selected and isinstance(value, str) and 3 <= len(value) <= 512 and not value.isdecimal():
         yield value
+        if selected in ('model', 'models', 'model_name') and '/' in value:
+            model = value.rsplit('/', 1)[-1]
+            if len(model) >= 3: yield model
+        if re.fullmatch(r'sha256:[a-f0-9]{64}', value):
+            yield value[7:]
+            yield value[7:19]
+        if value.startswith(('http://', 'https://')):
+            try: host = urlsplit(value).hostname
+            except ValueError: host = None
+            if host: yield host
 
 
 class PublicationPrivacy:

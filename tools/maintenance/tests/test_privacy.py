@@ -88,6 +88,15 @@ class PublicationPrivacyTests(unittest.TestCase):
                       'https://github.com/iamwavecut/openplotva/attachments/private-report'):
             with self.subTest(value=value), self.assertRaises(InvalidResult): boundary.assert_public(value)
 
+    def test_scoped_model_and_image_shorthand_stay_private_without_global_catalog(self):
+        boundary = PublicationPrivacy().with_context({'context': {
+            'evidence': {'model': 'synthetic-lab/private-model-27'},
+            'deployed': {'runtime': {'image': 'sha256:'+'ab12'*16}},
+        }})
+        for value in ('private-model-27', 'ab12'*16, 'ab12'*3):
+            with self.subTest(value=value), self.assertRaises(InvalidResult): boundary.assert_public(value)
+        self.assertEqual(boundary.assert_public('Source revision '+'a'*40), 'Source revision '+'a'*40)
+
     def test_private_inventory_rejects_missing_symlink_and_fifo_and_accepts_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
