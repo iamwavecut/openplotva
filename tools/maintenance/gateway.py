@@ -141,13 +141,23 @@ class RunGateway:
                     self.send_header("Content-Type", response.getheader("Content-Type", "application/json"))
                     self.end_headers()
                     body = bytearray()
+                    streaming = response.getheader('Content-Type', '').split(';', 1)[0].strip() == 'text/event-stream'
+                    received = 0
                     while gateway.clock() < gateway.expires:
                         chunk = response.read1(8192)
                         if not chunk:
                             break
                         body.extend(chunk)
-                        if len(body) > 8 * 1024 * 1024:
+                        received += len(chunk)
+                        if received > 8 * 1024 * 1024:
                             break
+                        if streaming:
+                            while b'\n' in body:
+                                line, _, remaining = body.partition(b'\n')
+                                body = bytearray(remaining)
+                                gateway.observe_usage(bytes(line))
+                            if gateway.quota_unavailable.is_set():
+                                break
                         self.wfile.write(chunk)
                         self.wfile.flush()
                     gateway.observe_usage(bytes(body))

@@ -17,7 +17,8 @@ def execution_receipt(checks, head, number):
     if not report or not job:
         return None
     for check in (report, job):
-        if (check.get('head_sha') != head or check.get('status') != 'completed'
+        if (type(check.get('id')) is not int or check['id'] <= 0
+                or check.get('head_sha') != head or check.get('status') != 'completed'
                 or (check.get('app') or {}).get('id') != 15368
                 or (check.get('app') or {}).get('slug') != 'github-actions'):
             return None
@@ -39,7 +40,8 @@ def execution_receipt(checks, head, number):
         if delay is not None and (type(delay) is not int or not 60 <= delay <= 604800):
             return None
         url = 'https://github.com/'+REPOSITORY+'/actions/runs/'+str(value['run_id'])
-        if (report.get('details_url') != url
+        check_url = f"https://github.com/{REPOSITORY}/runs/{report['id']}"
+        if (report.get('details_url') not in {url, check_url}
                 or report.get('external_id') != f"pr-agent:{value['run_id']}:{value['run_attempt']}"):
             return None
         match = re.fullmatch(re.escape(url) + r'/job/([1-9][0-9]*)', job.get('details_url', ''))

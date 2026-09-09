@@ -279,7 +279,11 @@ wait for that execution to finish. The controller journals the dispatch before
 POST and reconciles the incremented run attempt after a restart or lost response.
 An unconfirmed dispatch is marked `needs_human` after three minutes; a retry still
 unresolved after thirty minutes also requires inspection. Neither condition
-causes repeated POSTs. The status command exposes `provider_quota` and
+causes repeated POSTs. A completed retry has a three-minute grace period for its
+matching receipt to appear; cancellation, failure or missing proof requires
+human inspection, and managed jobs send the normal intervention notification.
+Every replacement receipt releases the previous retry's slot before entering
+another cooldown. The status command exposes `provider_quota` and
 `review_waits`. Readiness requires a successful matching receipt, the successful
 review job and the complete latest review contents; it no longer searches logs
 for phrases that look like success.

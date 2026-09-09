@@ -320,6 +320,23 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.state.job(job['id'])['status'],'queued')
         self.assertEqual(self.state.job(job['id'])['rounds'],5)
 
+    def test_review_quota_wait_preserves_rounds_and_failed_resumption_requests_human(self):
+        self.gh.items[7] = issue()
+        execution = {'state': 'quota_wait', 'check_id': 19, 'head_sha': BASE}
+        self.gh.review_snapshot = lambda _: {'head': BASE, 'pr': {'state': 'open'},
+            'review_execution': execution, 'checks': [], 'threads': [], 'artifacts': []}
+        job = self.state.new_job('revise', 'sig', 1, issue_number=7, pr_number=8,
+            published_sha=BASE, status='waiting_ci', rounds=3)
+        self.controller.poll_reviews()
+        self.assertEqual(self.state.job(job['id'])['status'], 'waiting_ci')
+        self.assertEqual(self.state.job(job['id'])['rounds'], 3)
+        self.state.set_setting('review_waits', {'8': {'phase': 'needs_human', 'receipt': execution}})
+        self.now += 61
+        self.controller.poll_reviews()
+        self.assertEqual(self.state.job(job['id'])['status'], 'needs_human')
+        self.assertEqual(self.state.job(job['id'])['rounds'], 3)
+        self.assertEqual([n['payload']['status'] for n in self.state.records('notifications')], ['paused', 'needs_human'])
+
     def test_diagnostic_fix_acknowledges_previous_check_after_push_then_reviews_new_head(self):
         github=self.gh; github.items[7]=issue(); github.prs[8]={'state':'open','head':{'sha':BASE}}
         artifact={'kind':'comment','id':'check_2','body':'Old finding','hash':'old','head':BASE}

@@ -52,6 +52,15 @@ class ReviewReceiptTests(unittest.TestCase):
                        {'conclusion': 'failure', 'output': {'summary': '{}'}}):
             self.assertIsNone(receipt.execution_receipt([old, {**old, 'id': 11, **change}, check()], HEAD, 8))
 
+    def test_github_actions_canonical_check_url_is_bound_to_the_check_identity(self):
+        row = execution()
+        row['details_url'] = 'https://github.com/iamwavecut/openplotva/runs/9'
+        self.assertEqual(receipt.execution_receipt([row, check()], HEAD, 8)['run_id'], 123)
+        for url in ('https://github.com/iamwavecut/openplotva/runs/8',
+                    'https://github.com/other/repo/runs/9',
+                    row['details_url'] + '?run=123'):
+            self.assertIsNone(receipt.execution_receipt([{**row, 'details_url': url}, check()], HEAD, 8))
+
     def test_mismatched_pr_run_or_unbounded_delay_cannot_be_a_receipt(self):
         for change in ({'pr_number': 7}, {'run_id': True}, {'run_attempt': 0},
                        {'retry_after_seconds': -1}, {'retry_after_seconds': 604801},

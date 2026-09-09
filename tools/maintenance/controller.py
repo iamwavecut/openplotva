@@ -604,7 +604,14 @@ class Controller:
                 if snapshot['head'] != job['published_sha']:
                     self.needs_human(job,'pull request HEAD changed outside controller'); continue
                 self.state.update_job(job['id'],poll_failures=0)
-                if (snapshot.get('review_execution') or {}).get('state') == 'quota_wait':
+                execution = snapshot.get('review_execution') or {}
+                review_wait = self.state.setting('review_waits', {}).get(str(job['pr_number']), {})
+                previous = review_wait.get('receipt', {})
+                if (review_wait.get('phase') == 'needs_human' and previous.get('head_sha') == snapshot['head']
+                        and (not execution or execution.get('check_id') == previous.get('check_id'))
+                        and execution.get('state') != 'complete'):
+                    self.needs_human(job, 'PR review resumption failed or could not be confirmed'); continue
+                if execution.get('state') == 'quota_wait':
                     self.state.update_job(job['id'], status='waiting_ci', reason='PR review waiting for usage quota')
                     self.notify(job, 'paused')
                     continue

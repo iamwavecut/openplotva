@@ -95,6 +95,45 @@ class ReviewQueueTests(unittest.TestCase):
         self.assertEqual(len(self.gh.posted), 1)
         self.assertEqual(self.state.jobs(), [])
 
+    def test_new_quota_receipt_releases_previous_retry_slot_even_with_stale_run_status(self):
+        self.queue.poll(); self.now += 121; self.queue.poll()
+        newer = execution()
+        newer.update(id=22, external_id='pr-agent:123:2',
+                     started_at='2026-09-09T00:03:01Z', completed_at='2026-09-09T00:04:00Z')
+        value = json.loads(newer['output']['summary']); value['run_attempt'] = 2
+        newer['output']['summary'] = json.dumps(value)
+        self.gh.rows = [newer, {**check(), 'id': 23, 'started_at': '2026-09-09T00:03:00Z',
+                              'completed_at': '2026-09-09T00:05:00Z'}]
+        self.now += 200; self.queue.poll()
+        self.assertIsNone(self.state.setting('review_slot'))
+        self.assertEqual(self.state.setting('review_waits')['8']['receipt']['check_id'], 22)
+        self.now += 121
+        self.assertTrue(self.state.provider_available())
+
+    def test_completed_retry_without_new_receipt_requires_human_after_bounded_grace(self):
+        self.queue.poll(); self.now += 121; self.queue.poll()
+        self.gh.workflow.update(status='completed', conclusion='cancelled')
+        self.gh.rows = [execution(), check()]
+        self.queue.poll()
+        self.assertIsNone(self.state.setting('review_slot'))
+        self.assertEqual(self.state.setting('review_waits')['8']['phase'], 'awaiting_receipt')
+        self.now += 181
+        self.queue = queue_module.ReviewQueue(self.state, self.gh)
+        self.queue.poll()
+        self.assertEqual(self.state.setting('review_waits')['8']['phase'], 'needs_human')
+        self.assertEqual(len(self.gh.posted), 1)
+
+    def test_failed_retry_receipt_requires_human_and_releases_slot(self):
+        self.queue.poll(); self.now += 121; self.queue.poll()
+        failed = execution('failed')
+        failed.update(id=22, conclusion='failure', external_id='pr-agent:123:2')
+        value = json.loads(failed['output']['summary']); value['run_attempt'] = 2
+        failed['output']['summary'] = json.dumps(value)
+        self.gh.rows = [failed, {**check(), 'id': 23}]
+        self.queue.poll()
+        self.assertIsNone(self.state.setting('review_slot'))
+        self.assertEqual(self.state.setting('review_waits')['8']['phase'], 'needs_human')
+
     def test_no_retry_when_disabled_changed_head_closed_or_foreign_owner(self):
         for change in ('disabled', 'head', 'closed', 'owner', 'workflow', 'actor'):
             with self.subTest(change=change):

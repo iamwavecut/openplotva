@@ -30,7 +30,7 @@ class ReviewQueue:
                 if run.get('run_attempt', 0) > record['receipt']['run_attempt']:
                     record['phase'] = 'running'
                     if run.get('status') == 'completed':
-                        record['phase'] = 'finished'
+                        record.update(phase='awaiting_receipt', finished_at=self.state.clock())
                         self.release(record)
                 timeout = 180 if record['phase'] == 'uncertain' else 1800
                 if record['phase'] in {'uncertain', 'running'} and self.state.clock() - record['requested_at'] > timeout:
@@ -38,6 +38,8 @@ class ReviewQueue:
                     # inspect/rerun the workflow without duplicate automatic work.
                     record['phase'] = 'needs_human'
                     self.release(record)
+            if record['phase'] == 'awaiting_receipt' and self.state.clock() - record['finished_at'] > 180:
+                record['phase'] = 'needs_human'
         for number, pr in eligible.items():
             execution = self.github.review_execution(pr)
             if not execution:
@@ -50,8 +52,13 @@ class ReviewQueue:
                     self.state.provider_recovered(execution['started_at'])
                 continue
             if execution['state'] != 'quota_wait':
+                if record and record['receipt']['check_id'] != execution['check_id']:
+                    self.release(record)
+                    record.update(phase='needs_human', receipt=execution)
                 continue
             if not record or record['receipt']['check_id'] != execution['check_id']:
+                if record:
+                    self.release(record)
                 quota = self.state.defer_provider('review:'+str(execution['check_id']),
                     execution['retry_after_seconds'], at=execution['completed_at'])
                 record = {'receipt': execution, 'phase': 'waiting', 'next_at': quota['until']}
