@@ -29,6 +29,7 @@ from .privacy import (boundary_for_job, hydrate_private_context, public_feedback
 from .state import State
 from .review_queue import ReviewQueue
 from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
+from .notifications import notification_payload
 
 DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
                   'Danger PR rules', 'PR-Agent review and suggestions', 'CodeQL Rust', 'Semgrep CE', 'Maintenance automation']
@@ -211,6 +212,10 @@ class Controller:
             already_started=self.state.db.execute('SELECT 1 FROM starts WHERE job_id=?',(job['id'],)).fetchone() is not None
             if spent['active_seconds'] >= budget or spent['cycles']+(0 if already_started else 1)>MAX_ROUNDS:
                 self.needs_human(job, 'active time or repair cycle budget exhausted'); continue
+            launch_after = self.state.launch_after(job)
+            if launch_after > self.clock():
+                self.state.update_job(job['id'], next_at=launch_after, reason='waiting for rolling daily launch allowance')
+                continue
             try:
                 if job['stage'] in ('deep', 'revise'):
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')
@@ -341,11 +346,9 @@ class Controller:
             self.state.put_incident(incident)
 
     def notify(self, job, status):
-        key = fingerprint({'run_id': job['id'], 'status': status})
+        payload = notification_payload(self.state, job, status)
+        key = payload['key']
         if self.state.record('notifications', key): return
-        payload = {'key': key, 'run_id': job['id'], 'status': status}
-        for field in ('issue_number', 'pr_number'):
-            if job.get(field): payload[field] = job[field]
         self.state.put_record('notifications', key, {'key': key, 'payload': payload, 'state': 'pending', 'posted': False})
 
     def needs_human(self, job, reason):

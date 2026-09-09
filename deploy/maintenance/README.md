@@ -222,6 +222,10 @@ Initial diagnosis and owner feedback triage share a 30-start rolling 24-hour
 quota; each short job has a 600-second active limit, including retries.
 Resuming the same job after provider quota exhaustion reuses its recorded launch;
 ordinary dependency retries still count toward the short-job daily limit.
+Launch admission is checked before source refresh or GitHub context loading, and
+checked again inside the atomic reservation. A full daily window leaves the job
+queued until its next slot without spending dependency retries or repeatedly
+querying GitHub.
 New deep investigations have a 10-start rolling limit. An issue has at most
 14,400 active seconds and five repair/revision rounds across retries and manual
 requeues. Waiting for CI releases the single compute slot. Status includes usage
@@ -365,6 +369,16 @@ or crash after transmission is `ambiguous`: the service does not invent delivery
 confirmation or send a replacement that might duplicate it. Inspect the personal
 chat and receipt before deciding how to recover. Bot downtime does not discard
 pending notifications.
+
+Notifications are deduplicated by issue/PR, state and a bounded reason code,
+rather than by the individual agent run. Repeated infrastructure failures before
+issue creation share one operational notice. A changed reason, PR revision or
+new quota episode can produce a new actionable notice. The payload contains no
+free-form diagnostic text. A repeat initial diagnosis recovers an unambiguous
+known issue link from the origin journal. When no issue can be linked, the message says
+so and links to the issue queue; it never claims an issue was left open.
+Deploy the runtime's optional `reason_code` notification support before upgrading
+the controller. Older controllers remain compatible with the new runtime.
 
 ## Validation and activation sequence
 

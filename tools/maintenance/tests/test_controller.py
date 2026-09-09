@@ -93,6 +93,28 @@ class ControllerTests(unittest.TestCase):
         self.controller.poll_incidents(); self.controller.schedule_incidents()
         return self.state.jobs()[0]
 
+    def test_exhausted_launch_limit_waits_without_context_io_or_failure_attempts(self):
+        for stage, count in (('initial', 30), ('deep', 10)):
+            with self.subTest(stage=stage):
+                self.state.db.execute('DELETE FROM jobs')
+                self.state.db.execute('DELETE FROM starts')
+                self.state.db.execute('DELETE FROM initial_launches')
+                for number in range(count):
+                    prior = self.state.new_job(stage, str(number), number+1)
+                    self.state.claim(prior['id'])
+                    self.state.finish_run(prior['id'], 0, {})
+                    self.state.update_job(prior['id'], status='done')
+                job = self.state.new_job(stage, 'waiting', 100)
+                def forbidden(*args): raise AssertionError('No external context IO before launch admission')
+                self.runner.refresh_source = forbidden
+                self.gh.issue = forbidden
+                self.controller.prepare_run()
+                current = self.state.job(job['id'])
+                self.assertEqual(current['status'], 'queued')
+                self.assertEqual(current['attempts'], 0)
+                self.assertEqual(current['next_at'], self.now+86400)
+                self.assertNotIn('context', current)
+
     def known_ready_incident(self):
         self.incident(); self.controller.run_next()
         deep=self.controller.enqueue(7,'123')

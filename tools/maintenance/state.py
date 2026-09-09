@@ -180,6 +180,16 @@ class State:
     def cancel(self, job_id):
         with self.transaction(): self.update_job(job_id, cancelled=True, status='cancelled')
 
+    def launch_after(self, job):
+        if job['stage'] in ('initial', 'triage'):
+            if job.get('quota_resume'): return 0
+            query, limit = 'SELECT count(*),min(at) FROM initial_launches WHERE at>?', INITIAL_LIMIT
+        else:
+            if self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job['id'],)).fetchone(): return 0
+            query, limit = "SELECT count(*),min(at) FROM starts WHERE kind='deep' AND at>?", DEEP_LIMIT
+        count, oldest = self.db.execute(query, (self.clock()-DAY,)).fetchone()
+        return oldest+DAY if count >= limit else 0
+
     def claim(self, job_id):
         with self.transaction():
             job = self.job(job_id)
@@ -192,15 +202,11 @@ class State:
             if not short and job.get('issue_number'):
                 limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage'] in ('deep', 'revise') and j.get('issue_number')==job['issue_number'])
             if job['active_seconds'] >= limit: raise Deferred('active budget exhausted')
+            if self.launch_after(job) > self.clock(): raise Deferred('rolling daily quota exhausted')
             if short and not job.get('quota_resume'):
-                count=self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0]
-                if count>=INITIAL_LIMIT: raise Deferred('rolling daily quota exhausted')
                 self.db.execute('INSERT INTO initial_launches(job_id,at) VALUES(?,?)',(job_id,self.clock()))
             if not self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job_id,)).fetchone():
                 kind = 'initial' if short else 'deep'
-                if kind=='deep':
-                    count=self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]
-                    if count>=DEEP_LIMIT: raise Deferred('rolling daily quota exhausted')
                 self.db.execute('INSERT INTO starts VALUES(?,?,?)', (job_id, kind, self.clock()))
             return self.update_job(job_id, status='running', lease_started=self.clock(), remaining_seconds=limit-job['active_seconds'])
 
