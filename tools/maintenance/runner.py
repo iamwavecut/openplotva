@@ -129,6 +129,27 @@ def verification_receipt(data, exit_code):
     return checks
 
 
+def worker_diagnostic(data):
+    # Worker metadata is advisory and must never carry arbitrary output to host artifacts.
+    statuses = ("setup_failed", "omp_launch_failed", "omp_driver_failed", "omp_nonzero",
+                "watchdog", "output_limit", "result_read_failed", "result_missing",
+                "result_not_regular", "result_too_large", "result_json_invalid",
+                "result_shape_invalid", "result_diagnosis_invalid", "diagnosis_valid")
+    if len(data) > 4096:
+        return None
+    try:
+        value = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"version", "status", "omp_exit_code"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or value["status"] not in statuses
+            or (value["omp_exit_code"] is not None and
+                (type(value["omp_exit_code"]) is not int or not -255 <= value["omp_exit_code"] <= 255))):
+        return None
+    return value
+
+
 class Runner:
     def __init__(self, config, api, cancelled=lambda job: False):
         self.config = config
@@ -263,33 +284,56 @@ class Runner:
         # Output is only trusted driver status/check receipts. Raw model logs stay
         # inside the fixed-size workspace and are never streamed to service logs.
         with tempfile.TemporaryFile(dir=self.state) as output:
-            process = subprocess.Popen(["docker", "exec", name, "python3", "/opt/maintenance/worker.py", *arguments],
-                                       stdout=output, stderr=subprocess.DEVNULL, env=ENV)
-            while process.poll() is None:
-                if quota and quota.quota_unavailable.is_set():
-                    command(["docker", "stop", "--time", "1", name], check=False, timeout=15)
-                    process.wait(timeout=15)
-                    raise QuotaUnavailable(usage=quota.usage, retry_after_seconds=quota.retry_after_seconds)
-                if (self.cancelled(job_id) or time.monotonic() >= deadline
-                        or shutil.disk_usage(self.state).free < 8 * GIB
-                        or memory_available() < 2 * GIB):
-                    command(["docker", "stop", "--time", "5", name], check=False, timeout=15)
-                    process.wait(timeout=15)
-                    raise Deferred("job stopped; cancellation, time or host resource boundary reached")
-                if output.tell() > PATCH_LIMIT:
-                    command(["docker", "stop", "--time", "1", name], check=False)
-                    process.wait(timeout=15)
+            diagnostic = {"operation": arguments[0] if arguments[0] in ("agent", "export", "verify") else "unknown",
+                          "stop": "exec_failed", "exit_code": None, "worker": None}
+            process = None
+            try:
+                process = subprocess.Popen(["docker", "exec", name, "python3", "/opt/maintenance/worker.py", *arguments],
+                                           stdout=output, stderr=subprocess.DEVNULL, env=ENV)
+                while process.poll() is None:
+                    if quota and quota.quota_unavailable.is_set():
+                        diagnostic["stop"] = "provider_quota"
+                        command(["docker", "stop", "--time", "1", name], check=False, timeout=15)
+                        process.wait(timeout=15)
+                        raise QuotaUnavailable(usage=quota.usage, retry_after_seconds=quota.retry_after_seconds)
+                    stop = ("cancelled" if self.cancelled(job_id) else
+                            "deadline" if time.monotonic() >= deadline else
+                            "disk_reserve" if shutil.disk_usage(self.state).free < 8 * GIB else
+                            "memory_reserve" if memory_available() < 2 * GIB else None)
+                    if stop:
+                        diagnostic["stop"] = stop
+                        command(["docker", "stop", "--time", "5", name], check=False, timeout=15)
+                        process.wait(timeout=15)
+                        raise Deferred("job stopped; cancellation, time or host resource boundary reached")
+                    if output.tell() > PATCH_LIMIT:
+                        diagnostic["stop"] = "output_limit"
+                        command(["docker", "stop", "--time", "1", name], check=False)
+                        process.wait(timeout=15)
+                        raise InvalidResult("worker output exceeds limit")
+                    time.sleep(2)
+                output.seek(0)
+                data = output.read(PATCH_LIMIT + 1)
+                if len(data) > PATCH_LIMIT:
+                    diagnostic["stop"] = "output_limit"
                     raise InvalidResult("worker output exceeds limit")
-                time.sleep(2)
-            output.seek(0)
-            data = output.read(PATCH_LIMIT + 1)
-            if len(data) > PATCH_LIMIT:
-                raise InvalidResult("worker output exceeds limit")
-            if quota and quota.quota_unavailable.is_set():
-                raise QuotaUnavailable(usage=quota.usage, retry_after_seconds=quota.retry_after_seconds)
-            if check and process.returncode:
-                raise Deferred("isolated worker did not produce a verified result")
-            return process.returncode, data
+                if quota and quota.quota_unavailable.is_set():
+                    diagnostic["stop"] = "provider_quota"
+                    raise QuotaUnavailable(usage=quota.usage, retry_after_seconds=quota.retry_after_seconds)
+                if check and process.returncode:
+                    diagnostic["stop"] = "worker_nonzero"
+                    raise Deferred("isolated worker did not produce a verified result")
+                return process.returncode, data
+            except Exception as error:
+                if process is not None and type(process.returncode) is int:
+                    diagnostic["exit_code"] = process.returncode
+                if diagnostic["operation"] == "agent":
+                    try:
+                        output.seek(0)
+                        diagnostic["worker"] = worker_diagnostic(output.read(4097))
+                    except OSError:
+                        pass
+                error.diagnostic = diagnostic
+                raise
 
     def _read_worker_file(self, work, filename, limit):
         descriptor = os.open(work / filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -300,6 +344,39 @@ class Runner:
         if len(value) > limit:
             raise InvalidResult("worker result is too large")
         return value
+
+    def _save_failure(self, artifacts, phase, error):
+        code = ("quota_unavailable" if isinstance(error, QuotaUnavailable) else
+                "invalid_result" if isinstance(error, InvalidResult) else
+                "invalid_json" if isinstance(error, json.JSONDecodeError) else
+                "timeout" if isinstance(error, subprocess.TimeoutExpired) else
+                "dependency_unavailable" if isinstance(error, Deferred) else
+                "filesystem" if isinstance(error, OSError) else
+                "invalid_value" if isinstance(error, ValueError) else "internal_failure")
+        record = {"version": 1, "phase": phase, "error": code,
+                  "execution": getattr(error, "diagnostic", None)}
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=artifacts, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(record, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, artifacts / "failure.json")
+            descriptor = os.open(artifacts, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return True
+        except Exception:
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _network(self, tag):
         name = "opm-" + tag
@@ -352,6 +429,8 @@ class Runner:
             saved_patch = False
             gateway = None
             failure = None
+            failure_saved = False
+            phase = "prepare"
             started = time.monotonic()
             deadline = started + seconds
             manifest = {"job_id": job_id, "base_sha": base, "container": name,
@@ -399,6 +478,7 @@ class Runner:
                         command(self.container_args(name, work, network, gateway))
                         command(["docker", "start", name])
                         try:
+                            phase = "agent"
                             self._exec(name, ["agent", str(max(1, int(deadline - time.monotonic()) - 20))], job_id, deadline, quota=gateway)
                         except Deferred as error:
                             error.usage = dict(gateway.usage)
@@ -406,8 +486,15 @@ class Runner:
                             raise
                         usage = dict(gateway.usage)
                 # Quiesce background processes before reading worker-controlled files.
+                phase = "agent_stop"
                 command(["docker", "rm", "-f", name])
-                value = validate_output(json.loads(self._read_worker_file(work, "result.json", 256 * 1024)), stage)
+                phase = "result_read"
+                data = self._read_worker_file(work, "result.json", 256 * 1024)
+                phase = "result_json"
+                value = json.loads(data)
+                phase = "result_contract"
+                value = validate_output(value, stage)
+                phase = "patch_export"
                 command(self.container_args(name, work, "none"))
                 command(["docker", "start", name])
                 _, patch = self._exec(name, ["export", base], job_id, deadline)
@@ -417,7 +504,9 @@ class Runner:
                 (artifacts / "result.json").write_text(json.dumps(value))
                 checks = []
                 if value["outcome"] == "patch":
+                    phase = "patch_validation"
                     paths = validate_patch(patch)
+                    phase = "verification_prepare"
                     for target in work.iterdir():
                         if target.is_symlink():
                             target.unlink()
@@ -432,8 +521,10 @@ class Runner:
                     os.chown(work / "changed.json", 1000, 1000)
                     command(self.container_args(name, work, "none"))
                     command(["docker", "start", name])
+                    phase = "verify"
                     exit_code, receipt = self._exec(name, ["verify"], job_id, deadline, check=False)
                     command(["docker", "rm", "-f", name])
+                    phase = "verification_receipt"
                     checks = verification_receipt(receipt, exit_code)
                     if {item["name"] for item in checks if item.get("passed")} != {"fmt", "clippy", "tests"}:
                         value["outcome"] = "needs_human"
@@ -441,12 +532,14 @@ class Runner:
                         # bound and credential-check before reuse by a subsequent agent.
                         for item in checks:
                             if not item.get("passed"):
+                                phase = "verification_logs"
                                 log = self._read_worker_file(work, item["name"] + ".log", 64 * 1024 * 1024)
                                 excerpt = log[-4000:].decode("utf-8", errors="replace")
                                 try:
                                     value["diagnosis"]["missing"].append(text(excerpt, 4000))
                                 except InvalidResult:
                                     value["diagnosis"]["missing"].append("Verification failed; diagnostic text was withheld by the output policy.")
+                phase = "result_save"
                 result = {**value, "patch_path": str(artifacts / "patch.diff") if patch else None,
                           "base_sha": base, "checks": checks, "usage": usage,
                           "active_seconds": time.monotonic() - started, "artifact_dir": str(artifacts)}
@@ -454,6 +547,7 @@ class Runner:
                 return result
             except Exception as error:
                 failure = error
+                failure_saved = self._save_failure(artifacts, phase, error)
             finally:
                 try:
                     command(["docker", "rm", "-f", name], check=False)
@@ -475,12 +569,13 @@ class Runner:
                         command(["docker", "network", "rm", network], check=False)
                     if mounted:
                         command(["umount", str(work)])
-                    if saved_patch or not mounted:
+                    if (saved_patch or not mounted) and (failure is None or failure_saved):
                         shutil.rmtree(directory)
                 except Exception as error:
                     # Keep the original quota classification and the recovery journal.
                     if failure is None:
                         failure = error
+                        self._save_failure(artifacts, "cleanup", error)
                     try:
                         (artifacts / "cleanup-failed.json").write_text(json.dumps({"recovery_required": True}))
                     except OSError:

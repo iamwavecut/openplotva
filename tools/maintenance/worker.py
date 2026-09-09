@@ -59,6 +59,12 @@ def launch_instruction(seconds):
         "run full builds, or exhaustively traverse the repository/history. Transfer unresolved causal "
         "questions to diagnosis.missing for the deep stage; finish once the next action is justified."
         if stage == "initial" else
+        "Review the supplied current feedback at the assigned revision. If it only needs an explanation, "
+        "return outcome no_fix with factual feedback action rebuttal. Do not create a patch or repeat "
+        "full builds merely to acknowledge an informational or clean review. Repair concrete valid "
+        "findings when present; any actual patch still needs real code work and the required checks "
+        "before it is a verified fix. Address all supplied actionable feedback within this budget."
+        if stage == "review" else
         "Use the exact target issue and current acceptance criteria. A verified fix still requires "
         "real code work and the required checks within this remaining budget. If evidence or checks "
         "cannot finish in time, retain the partial patch and report needs_human; never claim a verified fix."
@@ -82,6 +88,18 @@ def launch_instruction(seconds):
 
 
 def agent(seconds):
+    diagnostic = {"version": 1, "status": "setup_failed", "omp_exit_code": None}
+    try:
+        return _agent(seconds, diagnostic)
+    finally:
+        # Fixed status metadata only; raw OMP output remains inside the workspace.
+        try:
+            print(json.dumps(diagnostic), flush=True)
+        except OSError:
+            pass
+
+
+def _agent(seconds, diagnostic):
     instruction = launch_instruction(seconds)
     prepare_cargo()
     directory = WORK / "omp" / "agent"
@@ -111,8 +129,15 @@ def agent(seconds):
                "Follow the trusted system policy and write /work/result.json. "
                "Continue an existing patch in /work/repo if present."]
     with (WORK / "agent-events.jsonl").open("wb") as log:
+        diagnostic["status"] = "omp_launch_failed"
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        watchdog = threading.Timer(seconds + 15, process.kill)
+        diagnostic["status"] = "omp_driver_failed"
+
+        def timed_out():
+            diagnostic["status"] = "watchdog"
+            process.kill()
+
+        watchdog = threading.Timer(seconds + 15, timed_out)
         watchdog.daemon = True
         watchdog.start()
         written = 0
@@ -120,6 +145,7 @@ def agent(seconds):
             while chunk := process.stdout.read1(8192):
                 written += len(chunk)
                 if written > 64 * 1024 * 1024:
+                    diagnostic["status"] = "output_limit"
                     process.kill()
                     break
                 log.write(chunk)
@@ -127,12 +153,27 @@ def agent(seconds):
         finally:
             watchdog.cancel()
             process.stdout.close()
+    diagnostic["omp_exit_code"] = process.returncode
     if process.returncode != 0:
+        if diagnostic["status"] not in ("watchdog", "output_limit"):
+            diagnostic["status"] = "omp_nonzero"
         return 1
-    if not result.is_file() or result.is_symlink() or result.stat().st_size > 256 * 1024:
+    diagnostic["status"] = "result_read_failed"
+    if result.is_symlink() or (result.exists() and not result.is_file()):
+        diagnostic["status"] = "result_not_regular"
         return 2
-    output = json.loads(result.read_text())
+    if not result.exists():
+        diagnostic["status"] = "result_missing"
+        return 2
+    if result.stat().st_size > 256 * 1024:
+        diagnostic["status"] = "result_too_large"
+        return 2
+    data = result.read_text()
+    diagnostic["status"] = "result_json_invalid"
+    output = json.loads(data)
+    diagnostic["status"] = "result_diagnosis_invalid" if isinstance(output, dict) else "result_shape_invalid"
     diagnosis(output.get("diagnosis"))
+    diagnostic["status"] = "diagnosis_valid"
     return 0
 
 

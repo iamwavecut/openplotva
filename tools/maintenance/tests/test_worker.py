@@ -2,6 +2,7 @@
 import io
 import json
 import os
+from contextlib import redirect_stdout
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from tools.maintenance import worker
+from tools.maintenance.contracts import InvalidResult
 
 
 def result_fixture():
@@ -73,20 +75,55 @@ class WorkerTests(unittest.TestCase):
         (work/'cargo/git/db/fixture/config').write_text('job git')
         self.assertEqual((image/'git/db/fixture/config').read_text(),'image git')
 
-    def run_agent(self,stage,seconds,exit_code=0,extra_context=None,write_result=True):
+    def run_agent(self,stage,seconds,exit_code=0,extra_context=None,write_result=True,result_text=None,watchdog=False):
         (self.work/'context.json').write_text(json.dumps({'stage':stage,**(extra_context or {})}))
         captured=[]
         def launch(command,**kwargs):
             captured.extend(command)
-            if write_result: (self.work/'result.json').write_text(json.dumps(result_fixture()))
+            if write_result: (self.work/'result.json').write_text(result_text if result_text is not None else json.dumps(result_fixture()))
             return SimpleNamespace(stdout=io.BytesIO(b''),returncode=exit_code,wait=Mock(),kill=Mock())
         with patch.object(worker,'WORK',self.work), patch.object(worker,'prepare_cargo') as prepare, \
              patch.object(worker.subprocess,'Popen',side_effect=launch) as process, \
              patch.object(worker.threading,'Timer') as timer, \
              patch('time.time',return_value=1700000000), \
-             patch.dict('os.environ',{'MAINTENANCE_GATEWAY':'http://synthetic.invalid'}):
-            status=worker.agent(seconds)
+             patch.dict('os.environ',{'MAINTENANCE_GATEWAY':'http://synthetic.invalid'}), \
+             redirect_stdout(io.StringIO()) as output:
+            if watchdog: timer.return_value.start.side_effect=lambda:timer.call_args.args[1]()
+            try:
+                status=worker.agent(seconds)
+            finally:
+                self.diagnostic_output=output.getvalue()
         return status,captured,process,prepare,timer
+
+    def test_worker_failure_receipt_distinguishes_exit_missing_json_and_diagnosis(self):
+        for kwargs,code in (({'exit_code':137},'omp_nonzero'),
+                            ({'write_result':False},'result_missing'),
+                            ({'result_text':'PRIVATE_CANARY invalid JSON'},'result_json_invalid'),
+                            ({'result_text':'{"diagnosis":{"PRIVATE_CANARY":true}}'},'result_diagnosis_invalid')):
+            with self.subTest(code=code):
+                try:
+                    self.run_agent('review',120,**kwargs)
+                except (ValueError,InvalidResult):
+                    pass
+                self.assertTrue(self.diagnostic_output,'worker discarded its failure category')
+                receipt=json.loads(self.diagnostic_output)
+                self.assertEqual(receipt['status'],code)
+                self.assertEqual(set(receipt),{'version','status','omp_exit_code'})
+                self.assertNotIn('PRIVATE_CANARY',self.diagnostic_output)
+                if code=='omp_nonzero': self.assertEqual(receipt['omp_exit_code'],137)
+
+    def test_watchdog_kill_is_distinct_from_an_ordinary_nonzero_exit(self):
+        status,_,_,_,_=self.run_agent('review',120,exit_code=-9,watchdog=True)
+        self.assertEqual(status,1)
+        self.assertEqual(json.loads(self.diagnostic_output)['status'],'watchdog')
+
+    def test_review_guidance_permits_explanation_without_a_new_patch(self):
+        _,command,_,_,_=self.run_agent('review',120)
+        instruction=command[command.index('--append-system-prompt')+1]
+        self.assertIn('no_fix',instruction)
+        self.assertIn('rebuttal',instruction)
+        self.assertIn('Do not create a patch',instruction)
+        self.assertIn('required checks',instruction)
 
     def test_trusted_initial_deadlines_reach_omp_without_untrusted_context_strings(self):
         status,command,_,_,timer=self.run_agent('initial',60,extra_context={
@@ -126,7 +163,7 @@ class WorkerTests(unittest.TestCase):
             with self.subTest(stage=stage,seconds=seconds):
                 (self.work/'context.json').write_text(json.dumps({'stage':stage}))
                 with patch.object(worker,'WORK',self.work), patch.object(worker,'prepare_cargo') as prepare, \
-                     patch.object(worker.subprocess,'Popen') as process:
+                     patch.object(worker.subprocess,'Popen') as process,redirect_stdout(io.StringIO()):
                     with self.assertRaises(ValueError): worker.agent(seconds)
                     prepare.assert_not_called(); process.assert_not_called()
 
