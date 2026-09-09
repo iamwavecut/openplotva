@@ -45,13 +45,14 @@ class GH:
     def queue_generation(self, number, run): return "label_1"
     def assert_owner(self): pass
     def create_issue(self, title, body, labels):
-        self.created += 1; value = {**issue(), 'kind': 'issue', 'title': title, 'body': body, 'labels': [{'name': v} for v in labels]}; self.items[7] = value
+        number=max([6,*self.items,*self.prs])+1
+        self.created += 1; value = {**issue(), 'number':number, 'kind': 'issue', 'title': title, 'body': body, 'labels': [{'name': v} for v in labels]}; self.items[number] = value
         if self.fail_create: self.fail_create = False; raise Deferred('ambiguous network')
         return value
     def find_issue(self, marker): return next((v for v in self.items.values() if marker in v.get('body','')), None)
-    def find_comment(self, number, marker): return next((v for v in self.comment_values.values() if marker in v['body']), None)
+    def find_comment(self, number, marker): return next((v for v in self.comment_values.values() if v['number']==number and marker in v['body']), None)
     def comment(self, number, body, comment_id=None):
-        value = {'id': comment_id or len(self.comment_values)+1, 'body': body}; self.comment_values[value['id']] = value; return value
+        value = {'id': comment_id or len(self.comment_values)+1, 'number':number, 'body': body}; self.comment_values[value['id']] = value; return value
     def add_label(self, *args): return {}
     def pr(self, number): return self.prs[number]
     def prepare_patch(self, job, result, round_number): return {'sha': 'b'*40, 'branch': 'fix/issue-7-'+job['id'][:12], 'directory': '/local'}
@@ -89,6 +90,154 @@ class ControllerTests(unittest.TestCase):
         self.api.events = [{'id':n,'signature':'signature','first_seen':1,'last_seen':n,'snapshot':{'reason':'timeout'}} for n in range(1,101)]
         self.controller.poll_incidents(); self.controller.schedule_incidents()
         return self.state.jobs()[0]
+
+    def known_ready_incident(self):
+        self.incident(); self.controller.run_next()
+        deep=self.controller.enqueue(7,'123')
+        self.state.claim(deep['id']); self.state.finish_run(deep['id'],1,{})
+        self.state.update_job(deep['id'],status='ready',pr_number=8,branch='fix/issue-7',published_sha='b'*40)
+        self.gh.prs[8]={'kind':'pr','number':8,'state':'open','title':'Timeout fix','body':'Closes #7',
+                       'head':{'sha':'b'*40,'ref':'fix/issue-7'},'base':{'ref':'main'}}
+        # The timeline can lag publication; the persisted job still names the PR.
+        self.gh.items[7]['linked_prs']=[]
+        self.controller.config['history_limit']=1
+        self.gh.index=lambda: [{'kind':'issue','number':1,'title':'queue timeout','body':'Older unrelated report'}]
+        return deep
+
+    def repeat_known_incident(self):
+        self.api.events.append({'id':101,'signature':'signature','first_seen':1,'last_seen':101,'snapshot':{'reason':'timeout'}})
+        self.controller.poll_incidents(); self.controller.schedule_incidents()
+        self.runner.value=diagnosis(matches=[])
+        self.controller.run_next()
+
+    def test_same_signature_ready_pr_is_reused_when_model_omits_match_outside_shortlist(self):
+        deep=self.known_ready_incident()
+        self.repeat_known_incident()
+        self.assertEqual(sorted(self.gh.items),[7])
+        self.assertEqual(sorted(self.gh.prs),[8])
+        self.assertEqual(self.state.status()['starts']['deep'],1)
+        self.assertEqual(len([j for j in self.state.jobs() if j['stage']=='deep']),1)
+        self.assertEqual(self.state.job(deep['id'])['status'],'ready')
+        facts=next(iter(self.gh.comment_values.values()))
+        self.assertEqual(facts['number'],7)
+        self.assertIn('101 captured terminal events',facts['body'])
+        initial=[j for j in self.state.jobs() if j['stage']=='initial'][-1]
+        self.assertIn(7,[item['number'] for item in initial['context']['history']])
+        # Replaying the immutable event preserves the same editable fact comment.
+        self.controller.poll_incidents(); self.controller.schedule_incidents(); self.controller.process_results()
+        self.assertEqual(len(self.gh.comment_values),1)
+
+    def test_closed_known_pr_preserves_no_fix_and_material_new_evidence_routes(self):
+        self.known_ready_incident()
+        self.gh.prs[8].update(state='closed',merged_at=None)
+        self.repeat_known_incident()
+        self.assertEqual(sorted(self.gh.items),[7])
+        self.assertEqual(self.state.status()['starts']['deep'],1)
+        # A real new fact can still requeue the open issue after an unmerged PR closes.
+        self.state.new_job('initial','signature',101)
+        self.runner.value=diagnosis('fix','not_observed','confirmed',[{'kind':'issue','number':7,
+            'relationship':'new_evidence','reason':'A new reproducer establishes the missing interleaving.'}])
+        self.controller.run_next()
+        queued=[j for j in self.state.jobs({'queued'}) if j['stage']=='deep']
+        self.assertEqual(len(queued),1)
+        self.assertEqual(queued[0]['issue_number'],7)
+        self.assertEqual(self.controller.prepare_run()['id'],queued[0]['id'])
+        self.assertEqual(self.state.status()['starts']['deep'],2)
+
+    def test_duplicate_origin_cannot_start_deep_while_known_signature_pr_is_open(self):
+        self.known_ready_incident()
+        self.gh.items[9]={**issue(),'number':9,'title':'Accidental duplicate','body':'Repeated timeout'}
+        self.state.record_origin('duplicate',9,'signature',101)
+        duplicate=self.state.enqueue(9,'duplicate_event','duplicate_generation')
+        self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(self.state.job(duplicate['id'])['status'],'done')
+        self.assertEqual(self.state.status()['starts']['deep'],1)
+
+    def test_duplicate_origin_cannot_bypass_known_open_issue_after_pr_closes(self):
+        self.known_ready_incident()
+        self.gh.prs[8].update(state='closed',merged_at=None)
+        self.gh.items[9]={**issue(),'number':9,'title':'Accidental duplicate','body':'Repeated timeout'}
+        self.state.record_origin('duplicate',9,'signature',101)
+        duplicate=self.state.enqueue(9,'duplicate_event','duplicate_generation')
+        self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(self.state.job(duplicate['id'])['reused_issue_number'],7)
+        self.assertEqual(self.state.status()['starts']['deep'],1)
+
+    def test_duplicate_origin_cannot_publish_after_known_signature_pr_appears(self):
+        self.known_ready_incident()
+        self.gh.items[9]={**issue(),'number':9,'title':'Accidental duplicate','body':'Repeated timeout'}
+        self.state.record_origin('duplicate',9,'signature',101)
+        result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,
+                'patch_path':'/offline','checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],'feedback':[]}
+        duplicate=self.state.new_job('deep','signature',101,issue_number=9,status='result',base_sha=BASE,result=result)
+        self.controller.process_results()
+        self.assertEqual(self.state.job(duplicate['id'])['status'],'done')
+        self.assertEqual(self.gh.remote,{})
+        self.assertEqual(sorted(self.gh.prs),[8])
+        self.assertEqual(self.state.status()['starts']['deep'],1)
+
+    def test_known_merged_pr_still_requires_deployment_ancestry_with_empty_matches(self):
+        self.known_ready_incident()
+        self.gh.prs[8].update(state='closed',merged_at='now',merge_commit_sha='b'*40)
+        self.gh.items[7]['state']='closed'
+        self.runner.ancestry=False
+        self.repeat_known_incident()
+        latest=[j for j in self.state.jobs() if j['stage']=='initial'][-1]
+        self.assertEqual(latest['status'],'wait_deploy')
+        self.assertEqual(sorted(self.gh.items),[7])
+        self.runner.ancestry=True
+        self.state.new_job('initial','signature',101)
+        self.controller.run_next()
+        self.assertEqual(sorted(self.gh.items),[7,9])
+        self.assertIn('Regression after deployed fix in PR #8',self.gh.items[9]['body'])
+
+    def test_own_uncertain_pr_is_reconciled_before_binding_and_notification(self):
+        self.incident(); self.controller.run_next(); job=self.controller.enqueue(7,'123')
+        result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,
+                'patch_path':'/offline','checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],'feedback':[]}
+        self.state.update_job(job['id'],status='result',base_sha=BASE,result=result)
+        original=self.gh.create_pr
+        def create_then_disconnect(branch,title,body):
+            receipt=original(branch,title,body)
+            self.gh.items[7]['linked_prs']=[receipt['number']]
+            raise Deferred('response lost after remote PR creation')
+        self.gh.create_pr=create_then_disconnect
+        self.controller.process_results()
+        self.assertIsNone(self.state.job(job['id'])['pr_number'])
+        self.assertEqual(self.gh.items[7]['linked_prs'],[8])
+        self.now+=1000
+        self.controller.process_results()
+        current=self.state.job(job['id'])
+        self.assertEqual(current['status'],'waiting_ci')
+        self.assertEqual(current['pr_number'],8)
+        self.assertEqual(sorted(self.gh.prs),[8])
+        notifications=self.state.records('notifications')
+        self.assertEqual([n['payload']['status'] for n in notifications],['pr_created'])
+        self.assertEqual(notifications[0]['payload']['pr_number'],8)
+
+    def test_own_uncertain_regression_issue_keeps_effect_body_stable_on_recovery(self):
+        self.known_ready_incident()
+        self.gh.prs[8].update(state='closed',merged_at='now',merge_commit_sha='b'*40)
+        self.gh.items[7]['state']='closed'
+        self.runner.ancestry=True; self.gh.fail_create=True
+        self.repeat_known_incident()
+        job=[j for j in self.state.jobs() if j['stage']=='initial'][-1]
+        self.assertEqual(job['status'],'result')
+        self.assertEqual(sorted(self.gh.items),[7,9])
+        self.now+=1000; self.controller.process_results()
+        current=self.state.job(job['id'])
+        self.assertEqual(current['status'],'done')
+        self.assertEqual(current['issue_number'],9)
+        self.assertEqual(sorted(self.gh.items),[7,9])
+        self.assertEqual(self.gh.items[9]['body'].count('Regression after deployed fix in PR #8'),1)
+
+    def test_unresolved_other_origin_cannot_authorize_another_issue(self):
+        self.state.record_origin('prior_uncertain',None,'signature',1)
+        job=self.incident()
+        for _ in range(3): self.controller.run_next(); self.now+=1000
+        self.assertEqual(self.gh.created,0)
+        self.assertEqual(self.runner.calls,0)
+        self.assertEqual(self.state.job(job['id'])['status'],'needs_human')
     def test_new_repeat_after_no_fix_reassesses_and_updates_facts_without_another_deep_job(self):
         self.incident(); self.controller.run_next()
         deep=self.controller.enqueue(7,'123'); self.controller.run_next()
@@ -446,7 +595,7 @@ class ControllerTests(unittest.TestCase):
         self.runner.ancestry=False; self.controller.run_next()
         self.assertEqual(self.state.job(job['id'])['status'],'wait_deploy'); self.assertEqual(self.gh.created,0)
         self.runner.ancestry=True; self.state.new_job('initial','signature',100); self.controller.run_next()
-        self.assertEqual(self.gh.created,1); self.assertIn('Regression after deployed fix',self.gh.issue(7)['body'])
+        self.assertEqual(self.gh.created,1); self.assertIn('Regression after deployed fix',self.gh.issue(10)['body'])
 
     def test_same_open_or_closed_issue_updates_facts_without_new_issue(self):
         self.gh.items[7]={**issue(),'kind':'issue','title':'queue timeout','body':'known'}

@@ -200,6 +200,10 @@ class State:
         row = self.db.execute('SELECT * FROM origins WHERE issue_number=?', (issue_number,)).fetchone()
         return dict(row) if row else None
 
+    def origins_for_signature(self, signature):
+        return [dict(row) for row in self.db.execute(
+            'SELECT * FROM origins WHERE signature=? ORDER BY issue_number', (signature,))]
+
     def enqueue(self, issue_number, event_id, generation=None):
         with self.transaction():
             row = self.db.execute('SELECT job_id,issue_number FROM dispatches WHERE event_id=?', (event_id,)).fetchone()
