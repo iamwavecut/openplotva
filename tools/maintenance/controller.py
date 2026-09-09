@@ -158,7 +158,7 @@ class Controller:
         incident = self.state.incident(job['signature']) or {'signature': job['signature'], 'incident_id': job['incident_id'], 'snapshot': {}}
         candidates = select_candidates(self.state.history(), incident['snapshot'], self.config.get('history_limit', 20))
         known = self.known_issues(job)
-        history = known + [{**self.github.pr(number),'kind':'pr'}
+        history = known + [self.github.discussion({**self.github.pr(number),'kind':'pr'})
                            for number in sorted({n for item in known for n in item['linked_prs']})]
         known_keys = {(item['kind'],item['number']) for item in history}
         history += [self.github.discussion(item) for item in candidates if (item['kind'],item['number']) not in known_keys]

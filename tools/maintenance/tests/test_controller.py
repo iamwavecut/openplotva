@@ -104,6 +104,26 @@ class ControllerTests(unittest.TestCase):
         self.gh.index=lambda: [{'kind':'issue','number':1,'title':'queue timeout','body':'Older unrelated report'}]
         return deep
 
+    def test_review_loads_linked_pr_discussion_when_rest_comments_is_a_count(self):
+        deep = self.known_ready_incident()
+        self.state.update_job(deep['id'], stage='review', status='queued')
+        self.gh.prs[8]['comments'] = 2
+        comments = [{'id': 20, 'body': 'Clarify the affected route.'},
+                    {'id': 21, 'body': 'The existing patch needs no behavioral change.'}]
+        original_discussion = self.gh.discussion
+        self.gh.discussion = lambda item: {
+            **original_discussion(item),
+            'comments': comments if item['kind'] == 'pr' and item['number'] == 8 else [],
+        }
+        previous_calls = self.runner.calls
+        claimed = self.controller.prepare_run()
+        self.assertEqual(claimed['id'], deep['id'])
+        self.assertEqual(claimed['status'], 'running')
+        related = next(item for item in claimed['context']['history']
+                       if item['kind'] == 'pr' and item['number'] == 8)
+        self.assertEqual(related['comments'], comments)
+        self.assertEqual(self.runner.calls, previous_calls)
+
     def repeat_known_incident(self):
         self.api.events.append({'id':101,'signature':'signature','first_seen':1,'last_seen':101,'snapshot':{'reason':'timeout'}})
         self.controller.poll_incidents(); self.controller.schedule_incidents()
