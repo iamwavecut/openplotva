@@ -20,9 +20,11 @@ import time
 from pathlib import Path
 
 from .api import MaintenanceAPI
-from .contracts import (DEEP_SECONDS, INITIAL_SECONDS, MAX_ROUNDS, MODEL, OMP_VERSION, REPOSITORY,
+from .contracts import (DEEP_SECONDS, INITIAL_SECONDS, MAX_ROUNDS, REPOSITORY,
                         Deferred, InvalidResult, QuotaUnavailable, diagnosis, fingerprint, identifier, sha, text)
 from .github import GitHub, is_owner, select_candidates, validate_dispatch, validate_issue
+from .privacy import (boundary_for_job, hydrate_private_context, public_feedback,
+                      public_issue_body, public_title)
 from .state import State
 
 DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
@@ -54,15 +56,9 @@ def review_ready(snapshot, required_checks, handled):
     return not any(not t['isResolved'] for t in snapshot.get('threads', []))
 
 
-def issue_body(value, job, marker):
-    sections = [value['summary'], 'Repository: '+REPOSITORY,
-                'Versions: main `'+job['base_sha']+'`; deployed `'+str(job.get('context', {}).get('deployed', {}).get('revision') or 'unknown')+'`; OMP '+OMP_VERSION+'; '+MODEL+'.',
-                'Independent causes: external '+value['external_cause']+'; code '+value['code_defect']+'.']
-    for key in ('observations', 'hypotheses', 'supporting', 'contradicting', 'related_changes', 'missing', 'acceptance'):
-        sections.append('## '+key.replace('_',' ').capitalize()+'\n\n'+('\n'.join('- '+item for item in value[key]) or 'None identified.'))
-    sections.append('## Impact\n\nSanitized incident aggregate: '+str(job.get('context', {}).get('incident', {}).get('count', 1))+' captured terminal events.')
-    sections.append(marker)
-    return text('\n\n'.join(sections), 60000)
+def issue_body(value, job, marker, config=None):
+    """Render the only functional sections allowed to cross into GitHub."""
+    return public_issue_body(value, job, marker, config)
 
 
 class Controller:
@@ -179,6 +175,14 @@ class Controller:
             context['target_issue']={'repository':REPOSITORY,'number':target['number'],'title':target.get('title') or '',
                 'state':target['state'],'body':body,'acceptance_criteria':'\n\n'.join(section.strip() for section in sections).strip() or None}
         if job.get('previous_attempt'): context['previous_attempt'] = job['previous_attempt']
+        # Keep the exact initial diagnosis in the private job context so a
+        # deep/review worker can repair from the original facts after a restart.
+        initial = [candidate for candidate in self.state.jobs()
+                   if candidate['stage'] == 'initial' and candidate['signature'] == job['signature']
+                   and isinstance(candidate.get('result'), dict)
+                   and isinstance(candidate['result'].get('diagnosis'), dict)]
+        initial_job = max(initial, key=lambda candidate: (candidate.get('incident_id', 0), candidate['id'])) if initial else None
+        context = hydrate_private_context(context, initial_job)
         text(json.dumps(context), 1024*1024)
         return context
 
@@ -332,7 +336,7 @@ class Controller:
 
     def facts_comment(self, job, number, value):
         marker = '<!-- maintenance:facts:'+fingerprint({'signature':job['signature'],'issue':number})+' -->'
-        body = issue_body(value, job, marker)
+        body = issue_body(value, job, marker, self.config)
         key = fingerprint({'comment':marker, 'body':body})
         existing = self.github.find_comment(number, marker)
         self.effect(key, 'comment', {'number':number,'marker':marker,'body':body},
@@ -426,14 +430,15 @@ class Controller:
         if value['next_action'] == 'observe':
             self.state.update_job(job['id'], status='observing'); self.incident_status(job,'observing'); return
         marker = '<!-- maintenance:origin:'+job['id']+' -->'
-        body = issue_body(value, job, marker)
+        body = issue_body(value, job, marker, self.config)
+        title = public_title(value['title'], job, self.config)
         labels = ['agent:created','agent:queued','bug' if value['code_defect']=='confirmed' else 'needs-triage']
-        payload = {'marker':marker,'signature':job['signature'],'incident_id':job['incident_id'],'title':value['title'],'body':body,'labels':labels}
+        payload = {'marker':marker,'signature':job['signature'],'incident_id':job['incident_id'],'title':title,'body':body,'labels':labels}
         self.effect(fingerprint({'labels':'maintenance-v1'}),'labels',{'version':1},
             lambda: {} if self.github.labels_ready() else None,self.github.ensure_labels,job)
         self.state.record_origin(marker, None, job['signature'], job['incident_id'])
         issue = self.effect(fingerprint({'issue':job['id']}), 'issue', payload,
-                            lambda:self.github.find_issue(marker), lambda:self.github.create_issue(value['title'],body,labels), job)
+                            lambda:self.github.find_issue(marker), lambda:self.github.create_issue(title,body,labels), job)
         self.state.record_origin(marker,issue['number'],job['signature'],job['incident_id'])
         self.state.update_job(job['id'],status='done',issue_number=issue['number']); self.incident_status(job,'done')
 
@@ -444,22 +449,32 @@ class Controller:
             raise InvalidResult('patch has no complete verification receipt')
         validate_issue(self.github.issue(job['issue_number']),job['issue_number'])
         if self.reuse_known_work(job,value): return
+        marker = '<!-- maintenance:pr:'+job['id']+' -->'
+        title = public_title(value['title'], job, self.config)
+        body = (issue_body(value, job, marker, self.config)
+                +'\n\nCloses #'+str(job['issue_number'])
+                +'\n\nValidation: cargo fmt; workspace clippy with warnings denied; affected tests passed.')
+        # Build and validate the complete public PR payload before the patch
+        # push effect is journaled.
+        boundary_for_job(self.config, job).assert_public(title, 180)
+        boundary_for_job(self.config, job).assert_public(body, 60000)
         prepared = job.get('prepared')
         if prepared is None:
             prepared = self.github.prepare_patch(job,result,job['rounds'])
             # Commit revision and local checkout exist durably BEFORE any push.
             job = self.state.update_job(job['id'],prepared=prepared,branch=prepared['branch'])
+        # A restart may reuse a commit prepared under an older privacy policy.
+        # Validate its actual bytes even when the push effect already exists.
+        self.github.validate_prepared(job, prepared)
         self.effect(fingerprint({'push':job['id'],'sha':prepared['sha']}),'push',prepared,
                     lambda: {'sha':prepared['sha']} if self.github.remote_sha(prepared['branch']) == prepared['sha'] else None,
                     lambda:self.github.push(prepared,job.get('published_sha')),job)
         job = self.state.update_job(job['id'],published_sha=prepared['sha'])
         if not job.get('pr_number'):
             if self.reuse_known_work(job,value): return
-            marker = '<!-- maintenance:pr:'+job['id']+' -->'
-            body = issue_body(value,job,marker)+'\n\nCloses #'+str(job['issue_number'])+'\n\nValidation: cargo fmt; workspace clippy with warnings denied; affected tests passed.'
-            payload = {'branch':prepared['branch'],'marker':marker,'title':value['title'],'body':body}
+            payload = {'branch':prepared['branch'],'marker':marker,'title':title,'body':body}
             pr = self.effect(fingerprint({'pr':job['id']}),'pr',payload,
-                lambda:self.github.find_pr(prepared['branch'],marker),lambda:self.github.create_pr(prepared['branch'],value['title'],body),job)
+                lambda:self.github.find_pr(prepared['branch'],marker),lambda:self.github.create_pr(prepared['branch'],title,body),job)
             job = self.state.update_job(job['id'],pr_number=pr['number'])
             self.notify(job,'pr_created')
         self.handle_feedback(job)
@@ -502,9 +517,10 @@ class Controller:
                 raise InvalidResult('feedback response references unknown review artifact')
             if response['action']=='fixed' and job['result']['outcome'] != 'patch': raise InvalidResult('fixed feedback has no published patch')
             artifact = artifacts[(response['kind'],str(response['id']))]
-            body = text(response['body'])
+            body = public_feedback(response['body'], job, self.config)
             marker = '<!-- maintenance:feedback:'+fingerprint({'job':job['id'],'hash':artifact['hash'],'head':job.get('published_sha')})+' -->'
             body += '\n\n'+('Fixed in '+job['published_sha']+'.\n\n' if response['action']=='fixed' else '')+marker
+            boundary_for_job(self.config, job).assert_public(body, 60000)
             key = fingerprint({'reply':marker})
             if response['kind']=='thread':
                 def reconcile_reply():

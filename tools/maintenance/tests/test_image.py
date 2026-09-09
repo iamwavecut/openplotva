@@ -75,6 +75,9 @@ class ImageTests(unittest.TestCase):
             self.assertIn("Checkpoint deadline (UTC):", system)
             self.assertIn("Hard deadline (UTC):", system)
             self.assertIn("normal exit", system)
+            self.assertIn("FUNCTIONAL problem", system)
+            self.assertIn("context.private.initial_diagnosis", system)
+            self.assertIn("Never hide details in HTML comments", system)
             self.assertTrue(any(tool["function"]["name"] == "write" for tool in calls[0]["tools"]))
         finally:
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=20, check=False)

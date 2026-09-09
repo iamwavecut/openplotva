@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .api import secret_file
 from .contracts import Deferred, InvalidResult, OWNER, OWNER_ID, REPOSITORY, fingerprint, identifier, sha, text
+from .privacy import PublicationPrivacy
 
 
 def is_owner(value): return isinstance(value, dict) and value.get('login') == OWNER and value.get('id') == OWNER_ID
@@ -47,6 +48,9 @@ class GitHub:
     def __init__(self, config, execute=None):
         self.config = config
         self.execute = execute
+        # Snapshot private identifiers once per trusted controller process. The
+        # inventory is never passed to the worker or written to GitHub.
+        self.privacy = PublicationPrivacy.from_config(config)
 
     def command(self, args, *, data=None, authenticated=False, cwd=None):
         env = {'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'), 'HOME': str(Path(self.config['state_dir']).resolve()),
@@ -123,7 +127,7 @@ class GitHub:
 
     def create_issue(self, title, body, labels):
         self.assert_owner()
-        return self.api('repos/'+REPOSITORY+'/issues', 'POST', {'title': text(title, 180), 'body': text(body, 60000), 'labels': labels})
+        return self.api('repos/'+REPOSITORY+'/issues', 'POST', {'title': self.privacy.assert_public(title, 180), 'body': self.privacy.assert_public(body, 60000), 'labels': labels})
 
     def assert_owner(self):
         if not is_owner(self.api('user')): raise InvalidResult('publishing credential is not the authorized owner')
@@ -143,7 +147,7 @@ class GitHub:
     def comment(self, number, body, comment_id=None):
         self.assert_owner()
         return self.api('repos/'+REPOSITORY+('/issues/comments/'+str(comment_id) if comment_id else '/issues/'+str(number)+'/comments'),
-                        'PATCH' if comment_id else 'POST', {'body': text(body, 60000)})
+                        'PATCH' if comment_id else 'POST', {'body': self.privacy.assert_public(body, 60000)})
 
     def add_label(self, number, label):
         self.assert_owner()
@@ -155,6 +159,10 @@ class GitHub:
         if patch_path.is_symlink() or patch_path.stat().st_size > 2*1024*1024: raise InvalidResult('unsafe patch artifact')
         patch = patch_path.read_bytes()
         validate_patch(patch)
+        # Check additions before creating a checkout or applying executable
+        # changes, so a confidential patch fails closed at the publication
+        # boundary and cannot affect a recovery attempt.
+        self.privacy.with_context(job).assert_patch_public(patch)
         text(patch.decode(), 2*1024*1024)
         base = sha(result['base_sha'])
         if base != job['base_sha']: raise InvalidResult('patch starting revision mismatch')
@@ -187,6 +195,15 @@ class GitHub:
                             'ls-remote', 'https://github.com/'+REPOSITORY+'.git', 'refs/heads/'+branch], authenticated=True)
         return sha(raw.decode().split()[0]) if raw.strip() else None
 
+    def validate_prepared(self, job, prepared):
+        boundary = self.privacy.with_context(job)
+        prefix = ['git', '-C', prepared['directory'], '-c', 'core.hooksPath=/dev/null']
+        revision = sha(prepared['sha'])
+        base = sha(job['base_sha'])
+        boundary.assert_public(prepared['branch'], 180)
+        boundary.assert_patch_public(self.command(prefix+['diff', '--no-ext-diff', '--no-textconv', base, revision, '--']))
+        boundary.assert_public(self.command(prefix+['log', '--format=%B', base+'..'+revision]).decode(), 60000)
+
     def push(self, prepared, previous=None):
         self.assert_owner()
         args = ['git', '-C', prepared['directory'], '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=',
@@ -206,7 +223,7 @@ class GitHub:
 
     def create_pr(self, branch, title, body):
         self.assert_owner()
-        return self.api('repos/'+REPOSITORY+'/pulls', 'POST', {'head': branch, 'base': 'main', 'title': text(title, 180), 'body': text(body, 60000), 'draft': False})
+        return self.api('repos/'+REPOSITORY+'/pulls', 'POST', {'head': branch, 'base': 'main', 'title': self.privacy.assert_public(title, 180), 'body': self.privacy.assert_public(body, 60000), 'draft': False})
 
     def graphql(self, query, **variables):
         value=self.api('graphql', 'POST', {'query': query, 'variables': variables})
@@ -306,7 +323,7 @@ class GitHub:
 
     def reply_thread(self, thread_id, body):
         self.assert_owner()
-        value=self.graphql('mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}', id=identifier(thread_id), body=text(body))
+        value=self.graphql('mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}', id=identifier(thread_id), body=self.privacy.assert_public(body))
         try:
             reply_id=value['data']['addPullRequestReviewThreadReply']['comment']['id']
             identifier(reply_id)

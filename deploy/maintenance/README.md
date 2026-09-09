@@ -91,6 +91,37 @@ installer fills the image only on first installation; later changes do not
 silently replace operator configuration. Keep the configuration and secret files
 root-owned and non-writable by the SSH ingress account.
 
+Set `private_inventory_file` to a root-owned mode-0600 JSON file containing
+`{"identifiers": ["private-provider-name", "private-model-name", "private-host"]}`.
+Populate it privately from the current provider/model configuration and host
+inventory, including display names, model aliases, endpoints and deployment
+names. Do not include credentials or commit the real inventory. Update it when
+configuration changes and restart the controller to refresh its adapter snapshot.
+An unreadable, unsafe or malformed configured inventory prevents publication.
+The controller additionally collects typed identities from each incident's
+scoped evidence. The full inventory never enters a worker container.
+
+Public issues, PR descriptions and review replies describe functional behavior,
+evidence, hypotheses and acceptance checks. Identifying production specifics
+remain in private incident evidence and SQLite job results. Deep/review workers
+receive the original same-incident diagnosis through
+`context.private.initial_diagnosis` and the original scoped evidence through
+`context.private.initial_evidence`, including after a restart or expiration of
+live attempt history. Public prose is
+redacted and checked again at the GitHub adapter; patches and commit messages
+are rejected rather than rewritten if they disclose identities. Recovered
+prepared commits undergo this check again before any push or PR publication.
+Only opaque publication markers are stored in GitHub HTML comments. Hidden
+sections, edit history, filenames, removed diff lines and attachments are still
+public and must never carry private context.
+
+For an existing disclosure, disable new starts and stop the controller before
+cleaning public artifacts; `disable` alone still permits result publication.
+Preserve original diagnostics only in the protected state directory. Editing a
+GitHub issue does not remove its earlier revisions or title timeline events;
+history removal needs separate owner handling. Resume only after checking the
+new publication boundary against retained private results and queued commits.
+
 Provision a fine-grained **user** GitHub token belonging to `iamwavecut` (numeric
 ID 239034), restricted to `iamwavecut/openplotva`: repository contents, issues and
 pull requests write; Actions and checks read; metadata read. Store it in
