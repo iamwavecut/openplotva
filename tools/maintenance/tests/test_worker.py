@@ -1,6 +1,7 @@
 """Trusted worker launch budgeting without provider calls or container dependencies."""
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,54 @@ def result_fixture():
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
-        self.work=Path(self.temp.name)
+        self.work=Path(self.temp.name).resolve()
+
+    def test_cargo_materialization_preserves_macro_relative_includes_and_job_writes(self):
+        image=self.work/'image'/'usr'/'local'/'cargo'
+        crate=Path('registry/src/index.crates.io-fixture/async-graphql-fixture')
+        source=image/crate/'src/http/graphiql_source.rs'
+        template=image/crate/'templates/graphiql_source.jinja'
+        source.parent.mkdir(parents=True); template.parent.mkdir(parents=True)
+        source.write_text('synthetic template macro input')
+        template.write_text('synthetic template')
+        (image/'registry/cache').mkdir()
+        (image/'registry/cache/fixture.crate').write_bytes(b'offline archive')
+        (image/'registry/index').mkdir()
+        (image/'registry/index/config.json').write_text('{}')
+        work=self.work/'job'; work.mkdir()
+        with patch.object(worker,'WORK',work), patch.object(worker,'Path',return_value=image):
+            worker.prepare_cargo()
+            lexical_source=work/'cargo'/crate/'src/http/graphiql_source.rs'
+            lexical_template=work/'cargo'/crate/'templates/graphiql_source.jinja'
+            relative=os.path.relpath(lexical_template.resolve(),lexical_source.parent)
+            generated_include=lexical_source.parent/relative
+            self.assertTrue(generated_include.is_file(),'macro relative include cannot reach its canonical template')
+            self.assertEqual(generated_include.read_text(),'synthetic template')
+            self.assertEqual(lexical_source.resolve(),lexical_source)
+            self.assertFalse((work/'cargo/registry').is_symlink())
+            self.assertEqual((work/'cargo/registry/cache/fixture.crate').read_bytes(),b'offline archive')
+            job_data=work/'cargo/registry/cache/job-generated.crate'; job_data.write_bytes(b'job data')
+            lexical_template.write_text('job-local template')
+            worker.prepare_cargo()
+            self.assertEqual(job_data.read_bytes(),b'job data')
+            self.assertEqual(lexical_template.read_text(),'job-local template')
+            self.assertEqual(template.read_text(),'synthetic template')
+            self.assertFalse((work/'cargo/git').exists())
+
+    def test_cargo_materializes_optional_git_and_replaces_legacy_links_without_touching_image(self):
+        image=self.work/'image'; (image/'registry').mkdir(parents=True); (image/'git/db/fixture').mkdir(parents=True)
+        (image/'registry/config').write_text('image registry')
+        (image/'git/db/fixture/config').write_text('image git')
+        work=self.work/'job'; (work/'cargo').mkdir(parents=True)
+        (work/'cargo/registry').symlink_to(image/'registry',target_is_directory=True)
+        (work/'cargo/git').symlink_to(image/'git',target_is_directory=True)
+        with patch.object(worker,'WORK',work), patch.object(worker,'Path',return_value=image): worker.prepare_cargo()
+        for name in ('registry','git'):
+            self.assertFalse((work/'cargo'/name).is_symlink())
+            self.assertTrue((image/name).is_dir())
+        self.assertEqual((work/'cargo/git/db/fixture/config').read_text(),'image git')
+        (work/'cargo/git/db/fixture/config').write_text('job git')
+        self.assertEqual((image/'git/db/fixture/config').read_text(),'image git')
 
     def run_agent(self,stage,seconds,exit_code=0,extra_context=None,write_result=True):
         (self.work/'context.json').write_text(json.dumps({'stage':stage,**(extra_context or {})}))

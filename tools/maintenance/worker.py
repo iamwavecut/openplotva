@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -27,8 +28,13 @@ def prepare_cargo():
     for name in ("registry", "git"):
         source = Path("/usr/local/cargo") / name
         destination = cargo / name
-        if source.exists() and not destination.exists():
-            destination.symlink_to(source, target_is_directory=True)
+        if not source.exists():
+            continue
+        # Proc macros need lexical and canonical source paths to agree for relative includes.
+        if destination.is_symlink():
+            destination.unlink()
+        if not destination.exists():
+            shutil.copytree(source, destination)
 
 
 def launch_instruction(seconds):
