@@ -24,7 +24,8 @@ HOST = re.compile(r'(?<!\w)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|loc
 IPV4 = re.compile(r'(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]+)?(?![\w.])')
 IPV6 = re.compile(r'(?<![\w:])(?:[a-f0-9]{0,4}:){2,}[a-f0-9:.]+(?:%[a-z0-9]+)?', re.I)
 UUID = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I)
-INTERNAL_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)[ _-]?(?:id|reference)\s*[:=#]\s*[`"\']?[-\w:.]+', re.I)
+INTERNAL_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)[ _-]?(?:id|reference)[`"\']?\s*[:=#]\s*[`"\']?[-\w:.]+', re.I)
+NUMERIC_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)(?:[ _-]?(?:id|reference))?[`"\']?\s*(?:[:=#]\s*)?[`"\']?[0-9]+\b[`"\']?', re.I)
 INCIDENT_REF = re.compile(r'\bincident:[0-9]+(?::[\w-]+)*', re.I)
 
 
@@ -113,7 +114,7 @@ class PublicationPrivacy:
             try: parsed = urlsplit(raw)
             except ValueError: return '[private endpoint]'
             tail = parsed.path+'#'+parsed.fragment
-            if any(pattern.search(tail) for pattern in (HOST, IPV4, IPV6, UUID, INTERNAL_ID, INCIDENT_REF)):
+            if any(pattern.search(tail) for pattern in (HOST, IPV4, IPV6, UUID, INTERNAL_ID, NUMERIC_ID, INCIDENT_REF)):
                 return '[private endpoint]'
             synthetic = parsed.hostname and (parsed.hostname.endswith(('.invalid', '.test')) or parsed.hostname == 'localhost')
             repo = (parsed.scheme == 'https' and parsed.netloc == 'github.com'
@@ -142,6 +143,7 @@ class PublicationPrivacy:
         value = IPV6.sub(ipv6, value)
         value = UUID.sub('[private reference]', value)
         value = INTERNAL_ID.sub('[private reference]', value)
+        value = NUMERIC_ID.sub('[private reference]', value)
         value = INCIDENT_REF.sub('[private reference]', value)
         for index, url in enumerate(urls):
             value = value.replace('\x01'+str(index)+'\x02', url)

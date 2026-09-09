@@ -97,6 +97,16 @@ class PublicationPrivacyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(InvalidResult): boundary.assert_public(value)
         self.assertEqual(boundary.assert_public('Source revision '+'a'*40), 'Source revision '+'a'*40)
 
+    def test_natural_internal_ids_are_private_while_counts_and_github_numbers_remain(self):
+        job = {'context': {'incident': {'incident_id': 123, 'count': 123}}}
+        boundary = PublicationPrivacy().with_context(job)
+        for value in ('Incident 123 failed', 'incident #123 failed', 'incident `123` failed',
+                      'Provider 27 failed', 'job ID 912 failed', '"incident_id": 123'):
+            with self.subTest(value=value), self.assertRaises(InvalidResult): boundary.assert_public(value)
+        self.assertEqual(public_title('Incident 123 stops before fallback', job), '[private reference] stops before fallback')
+        for value in ('123 captured terminal events', 'Issue #123; PR #27', 'HTTP 503 after 123ms'):
+            self.assertEqual(boundary.assert_public(value), value)
+
     def test_private_inventory_rejects_missing_symlink_and_fifo_and_accepts_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
