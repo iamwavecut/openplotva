@@ -36,6 +36,19 @@ jobs:
           python3 tools/maintenance/controller.py --help
           python3 tools/maintenance/preflight.py --help
 
+      - name: Test review workflow authorization
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s .github/scripts/tests -p test_review_workflow.py -v
+
+      - name: Test GLM review transport in the pinned PR-Agent runtime
+        run: |
+          docker run --rm --network none --entrypoint python \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD/.github/scripts:/tmp/pr-agent-scripts:ro" \
+            pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
+            -m unittest discover -s /tmp/pr-agent-scripts/tests -p test_glm_coding_plan.py -v
+
   rust-workspace:
     name: Rust workspace
     runs-on: ubuntu-22.04
