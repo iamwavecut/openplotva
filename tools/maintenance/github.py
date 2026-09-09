@@ -180,6 +180,23 @@ class GitHub:
 
     def comments(self, number): return self.pages('repos/'+REPOSITORY+'/issues/'+str(number)+'/comments')
 
+    def acknowledge_comment(self, number, comment_id):
+        if any(type(value) is not int or value <= 0 for value in (number, comment_id)):
+            raise InvalidResult('invalid comment reference')
+        self.assert_owner()
+        path = 'repos/'+REPOSITORY+'/issues/comments/'+str(comment_id)
+        comment = self.api(path)
+        if not isinstance(comment, dict): raise Deferred('comment response unavailable')
+        if (not is_owner(comment.get('user')) or comment.get('id') != comment_id
+                or comment.get('issue_url') != 'https://api.github.com/repos/'+REPOSITORY+'/issues/'+str(number)):
+            raise InvalidResult('comment outside owner conversation')
+        # GitHub returns the existing reaction for the same user/content after a lost acknowledgement.
+        receipt = self.api(path+'/reactions', 'POST', {'content': 'eyes'})
+        if (not isinstance(receipt, dict) or type(receipt.get('id')) is not int or receipt['id'] <= 0
+                or receipt.get('content') != 'eyes' or not is_owner(receipt.get('user'))):
+            raise Deferred('comment reaction receipt unconfirmed')
+        return {'id': receipt['id']}
+
     def find_comment(self, number, marker):
         values = [c for c in self.comments(number) if marker in (c.get('body') or '') and is_owner(c.get('user'))]
         if len(values) > 1: raise InvalidResult('ambiguous comment provenance')

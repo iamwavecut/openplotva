@@ -26,6 +26,14 @@ class ConversationTests(unittest.TestCase):
         self.comments = {7: []}
         self.gh.comments = lambda number: copy.deepcopy(self.comments.get(number, []))
         self.gh.discussion = lambda item: {**item, 'comments': self.gh.comments(item['number']), 'linked_prs': []}
+        self.reactions = {}; self.reaction_calls = 0
+        def acknowledge(number, comment_id):
+            self.assertFalse(self.state.db.in_transaction)
+            self.assertTrue(any(c['id'] == comment_id for j in self.state.jobs()
+                                if j['stage'] == 'triage' for c in j['owner_comments']))
+            self.reaction_calls += 1
+            return self.reactions.setdefault((number, comment_id), {'id': 900+comment_id})
+        self.gh.acknowledge_comment = acknowledge
         self.state.set_setting('owner_feedback_since', '1970-01-02T00:00:00Z')
 
     def comment(self, body='Please explain which behavior is incorrect.', number=7, author=None):
@@ -74,6 +82,91 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(len(self.poll()), 1)
         original.update(body='The failure also loses the queued task.', updated_at='1970-01-02T01:01:00Z')
         self.assertEqual(len(self.poll()), 2)
+
+    def test_accepted_comment_gets_one_reaction_even_when_quota_is_full(self):
+        for n in range(29):
+            job = self.state.new_job('initial', str(n), n+2)
+            self.state.claim(job['id']); self.state.finish_run(job['id'], 0, {})
+            self.state.update_job(job['id'], status='done')
+        self.comment(author={'login': 'iamwavecut', 'id': 1})
+        accepted = self.comment()
+        self.poll()
+        self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(set(self.reactions), {(7, accepted['id'])})
+        self.state = State(self.state.path, clock=lambda: self.now)
+        self.addCleanup(self.state.close)
+        self.controller = fixtures.Controller(self.controller.config, self.state, self.api, self.gh, self.runner)
+        for _ in range(10): self.poll()
+        accepted.update(body='More context.', updated_at='1970-01-02T01:03:00Z')
+        self.poll()
+        self.assertEqual(self.reaction_calls, 1)
+        self.assertEqual(self.state.status()['starts']['initial'], 30)
+
+    def test_lost_reaction_receipt_retries_without_losing_accepted_comment(self):
+        self.comment(); original = self.gh.acknowledge_comment
+        def lost_ack(number, comment_id):
+            original(number, comment_id)
+            raise Deferred('response lost')
+        self.gh.acknowledge_comment = lost_ack
+        jobs = self.poll()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['status'], 'queued')
+        self.gh.acknowledge_comment = original
+        self.poll(); self.poll()
+        self.assertEqual(len(self.reactions), 1)
+        self.assertEqual(self.reaction_calls, 2)
+
+    def test_reaction_adapter_requires_owner_comment_and_confirms_receipt(self):
+        from tools.maintenance.github import GitHub
+        github = GitHub({}); writes = []
+        comment = self.comment()
+        receipt = {'id': 900, 'content': 'eyes', 'user': owner()}
+        def api(path, method='GET', payload=None):
+            if path == 'user': return owner()
+            if method == 'GET': return comment
+            writes.append((path, payload))
+            return receipt
+        github.api = api
+        self.assertEqual(github.acknowledge_comment(7, comment['id']), {'id': 900})
+        self.assertEqual(writes, [('repos/iamwavecut/openplotva/issues/comments/100/reactions', {'content': 'eyes'})])
+        for mutation in ({'user': {'login': 'other', 'id': 1}}, {'issue_url': comment['issue_url']+'0'}):
+            original = copy.deepcopy(comment); comment.update(mutation); writes.clear()
+            with self.assertRaises(InvalidResult): github.acknowledge_comment(7, comment['id'])
+            self.assertEqual(writes, [])
+            comment.clear(); comment.update(original)
+        receipt['content'] = 'heart'
+        with self.assertRaises(Deferred): github.acknowledge_comment(7, comment['id'])
+
+    def test_malformed_reaction_responses_are_retryable(self):
+        from tools.maintenance.github import GitHub
+        github = GitHub({}); comment = self.comment()
+        for malformed in ([], None, 'unavailable'):
+            for stage in ('comment', 'receipt'):
+                with self.subTest(stage=stage, malformed=malformed):
+                    def api(path, method='GET', payload=None):
+                        if path == 'user': return owner()
+                        if method == 'GET': return malformed if stage == 'comment' else comment
+                        return malformed
+                    github.api = api
+                    with self.assertRaises(Deferred): github.acknowledge_comment(7, comment['id'])
+
+    def test_revoked_scope_after_comment_fetch_does_not_acknowledge(self):
+        for target in ('issue', 'pr'):
+            with self.subTest(target=target):
+                self.gh.items[7]['labels'] = [{'name': name} for name in ('agent:created', 'agent:queued')]
+                self.comments = {7: []}; self.reactions.clear()
+                if target == 'pr': self.managed_pr()
+                accepted = self.comment(number=8 if target == 'pr' else 7)
+                if target == 'pr': accepted['id'] += 100
+                def comments(number):
+                    values = copy.deepcopy(self.comments.get(number, []))
+                    if values:
+                        if target == 'issue': self.gh.items[7]['labels'] = []
+                        else: self.gh.prs[8]['state'] = 'closed'
+                    return values
+                self.gh.comments = comments
+                self.poll()
+                self.assertEqual(self.reactions, {})
 
     def test_agent_reply_is_not_owner_feedback_and_legacy_comments_are_not_replayed(self):
         self.assertTrue(hasattr(self.controller, 'conversation'), 'owner comment triage is absent')

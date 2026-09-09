@@ -166,6 +166,43 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state.status()['starts']['deep'],10)
         self.now+=DAY+1; self.state.claim(blocked['id'])
 
+    def test_manual_short_quota_reset_preserves_accounting_and_is_idempotent(self):
+        self.state.set_enabled(True)
+        for n in range(30):
+            job = self.state.new_job('initial', str(n), n+1)
+            self.state.claim(job['id']); self.state.finish_run(job['id'], 2, {'tokens': 10})
+            self.state.update_job(job['id'], status='done')
+        waiting = self.state.new_job('triage', 'waiting', 31, issue_number=7, next_at=self.now+DAY,
+            reason='waiting for rolling daily launch allowance')
+        deferred = self.state.new_job('initial', 'dependency', 32, next_at=self.now+600, reason='agent dependency unavailable')
+        ledger = [tuple(r) for r in self.state.db.execute('SELECT * FROM initial_launches')]
+        usage = self.state.status()['usage']
+        self.state.defer_provider('test-refusal', 120)
+        receipt = self.state.reset_initial_quota('owner-request')
+        self.assertEqual(receipt['previous_count'], 30)
+        self.assertEqual(receipt['released_jobs'], 1)
+        self.assertEqual(self.state.job(waiting['id'])['next_at'], 0)
+        self.assertEqual(self.state.job(deferred['id'])['next_at'], self.now+600)
+        self.assertEqual([tuple(r) for r in self.state.db.execute('SELECT * FROM initial_launches')], ledger)
+        self.assertEqual(self.state.status()['usage'], usage)
+        self.assertEqual(self.state.status()['starts']['initial'], 0)
+        with self.assertRaises(Deferred): self.state.claim(waiting['id'])
+        self.state.provider_recovered()
+        self.state.claim(waiting['id']); self.state.finish_run(waiting['id'], 0, {})
+        self.state.update_job(waiting['id'], status='done')
+        other = State(self.state.path, clock=lambda: self.now)
+        try:
+            self.assertEqual(other.reset_initial_quota('owner-request'), receipt)
+            self.assertEqual(other.status()['starts']['initial'], 1)
+            self.assertEqual(other.status()['initial_launches_last_24h'], 31)
+            for n in range(29):
+                job = other.new_job('initial', str(n), n+40)
+                other.claim(job['id']); other.finish_run(job['id'], 0, {})
+                other.update_job(job['id'], status='done')
+            with self.assertRaises(Deferred): other.claim(deferred['id'])
+        finally:
+            other.close()
+
     def test_late_duplicate_label_event_never_restarts_finished_generation(self):
         self.state.record_origin('marker',7,'sig',1)
         job=self.state.enqueue(7,'123',generation='label_1')

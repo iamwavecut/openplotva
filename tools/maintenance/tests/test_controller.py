@@ -4,6 +4,7 @@ import io
 import json
 import copy
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from tools.maintenance.controller import Controller, issue_body, review_ready, main
@@ -115,6 +116,36 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(current['attempts'], 0)
                 self.assertEqual(current['next_at'], self.now+86400)
                 self.assertNotIn('context', current)
+
+    def test_concurrent_quota_reset_cannot_be_overwritten_by_old_wait_time(self):
+        for number in range(30):
+            prior = self.state.new_job('initial', str(number), number+1)
+            self.state.claim(prior['id']); self.state.finish_run(prior['id'], 0, {})
+            self.state.update_job(prior['id'], status='done')
+        waiting = self.state.new_job('initial', 'waiting', 100)
+        other = State(self.state.path, clock=lambda: self.now)
+        self.addCleanup(other.close)
+        started = threading.Event()
+        original = self.state.launch_after
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            futures = []
+            def reset():
+                started.set()
+                return other.reset_initial_quota('concurrent-owner-request')
+            def admission(job):
+                after = original(job)
+                if not futures:
+                    future = pool.submit(reset); futures.append(future)
+                    self.assertTrue(started.wait(5))
+                    try: future.result(timeout=1)
+                    except concurrent.futures.TimeoutError: pass
+                return after
+            self.state.launch_after = admission
+            self.controller.prepare_run()
+            receipt = futures[0].result(timeout=5)
+        self.assertEqual(self.state.job(waiting['id'])['next_at'], 0)
+        self.assertEqual(other.reset_initial_quota('concurrent-owner-request'), receipt)
+        self.assertEqual(self.state.status()['starts']['initial'], 0)
 
     def known_ready_incident(self):
         self.incident(); self.controller.run_next()
@@ -574,11 +605,12 @@ class ControllerTests(unittest.TestCase):
     def test_cli_status_pause_and_cancel_use_only_durable_state(self):
         config=Path(self.temp.name)/'config.json'; config.write_text(json.dumps({'state_dir':self.temp.name}))
         job=self.state.new_job('initial','sig',1)
-        for args in (['disable'],['status'],['cancel',job['id']]):
+        for args in (['reset-short-quota','test-request'],['disable'],['status'],['cancel',job['id']]):
             output=io.StringIO()
             with contextlib.redirect_stdout(output): result=main(['--config',str(config),*args])
             self.assertEqual(result,0); self.assertIsInstance(json.loads(output.getvalue()),dict)
         self.assertFalse(self.state.enabled()); self.assertTrue(self.state.cancelled(job['id']))
+        self.assertEqual(self.state.setting('initial_quota_reset')['request_id'], 'test-request')
 
     def test_hundred_events_create_one_issue_and_duplicate_dispatch_one_deep_job(self):
         self.incident(); self.controller.run_next()

@@ -81,18 +81,32 @@ class Conversation:
                     seen = {comment['version'] for job in previous for comment in job['owner_comments']}
                     fresh = sorted((comment for comment in comments if comment['version'] not in seen),
                                    key=lambda comment: (comment['updated_at'], comment['id']))
-                    if not fresh: continue
                     # A polling retry and a crash reuse the same SQLite reservation.
-                    waiting = next((job for job in previous if job['status'] == 'queued' and not job.get('context')), None)
-                    if waiting:
-                        combined = {(comment['number'], comment['id']): comment for comment in waiting['owner_comments']+fresh}
-                        self.state.update_job(waiting['id'], owner_comments=sorted(combined.values(),
-                            key=lambda comment: (comment['updated_at'], comment['id'])))
-                    else:
-                        origin = self.state.origin(number)
-                        self.state.new_job('triage', origin['signature'], origin['incident_id'],
-                                           issue_number=number, owner_comments=fresh)
-                    self.state.set_setting('owner_hold_'+str(number), True)
+                    if fresh:
+                        waiting = next((job for job in previous if job['status'] == 'queued' and not job.get('context')), None)
+                        if waiting:
+                            combined = {(comment['number'], comment['id']): comment for comment in waiting['owner_comments']+fresh}
+                            self.state.update_job(waiting['id'], owner_comments=sorted(combined.values(),
+                                key=lambda comment: (comment['updated_at'], comment['id'])))
+                        else:
+                            origin = self.state.origin(number)
+                            self.state.new_job('triage', origin['signature'], origin['incident_id'],
+                                               issue_number=number, owner_comments=fresh)
+                        self.state.set_setting('owner_hold_'+str(number), True)
+                for comment in comments:
+                    key = fingerprint({'owner_comment_ack': comment['id']})
+                    if self.state.record('effects', key): continue
+                    try:
+                        validate_issue(self.github.issue(number), number)
+                        if comment['number'] != number:
+                            current = self.managed_pr(number)
+                            if not current or current[1]['number'] != comment['number']:
+                                raise InvalidResult('comment target is no longer managed')
+                        receipt = self.github.acknowledge_comment(comment['number'], comment['id'])
+                    except Deferred: continue
+                    self.state.put_record('effects', key, {'kind': 'reaction', 'state': 'done',
+                        'payload': {'number': comment['number'], 'comment_id': comment['id'], 'content': 'eyes'},
+                        'result': receipt})
             except InvalidResult:
                 # A removed label or changed provenance revokes conversation access.
                 continue
