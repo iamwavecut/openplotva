@@ -54,7 +54,7 @@ class ImageTests(unittest.TestCase):
             status = subprocess.run(["docker", "run", "--name", container_name, *network, "--rm", "--user", "1000:1000", "--read-only",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges=true", "--cpus", "2",
                 "--memory", "4g", "--memory-swap", "4g", "--pids-limit", "256",
-                "--tmpfs", "/work:rw,exec,size=512m,uid=1000,gid=1000,mode=0700",
+                "--tmpfs", "/work:rw,exec,size=1g,uid=1000,gid=1000,mode=0700",
                 "--tmpfs", "/tmp:rw,size=64m,uid=1000,gid=1000,mode=1777",
                 "--workdir", "/work", "--env", "PI_CONFIG_DIR=.omp", "--env", "PI_CODING_AGENT_DIR=/work/omp/agent",
                 "--env", "MAINTENANCE_RUN_TOKEN=synthetic-revocable-capability", "--env", "MAINTENANCE_INCIDENT_ID=1",
@@ -67,6 +67,14 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
             self.assertGreaterEqual(len(calls), 2)
             self.assertEqual(calls[0]["model"], "glm-5.3")
+            system = "\n".join(message["content"] for message in calls[0]["messages"]
+                               if message["role"] == "system" and isinstance(message.get("content"), str))
+            self.assertIn("Trusted launch budget", system)
+            self.assertIn("Stage: initial", system)
+            self.assertIn("Available runtime: 60 seconds", system)
+            self.assertIn("Checkpoint deadline (UTC):", system)
+            self.assertIn("Hard deadline (UTC):", system)
+            self.assertIn("normal exit", system)
             self.assertTrue(any(tool["function"]["name"] == "write" for tool in calls[0]["tools"]))
         finally:
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=20, check=False)

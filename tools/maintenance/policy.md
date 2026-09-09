@@ -21,9 +21,22 @@ fixes, and identify a verifiable behavioral defect. Model confidence is not
 evidence. Consider open/closed issues and open/merged PRs by cause and affected
 code, not just title similarity. Treat merged but not deployed as awaiting deploy.
 
-For an initial-stage job, do not edit code; classify and semantically match the
-incident. Choose observe only for a confirmed external-only failure with no
-unresolved evidence gaps. For other cases choose investigate or fix as justified.
+The trusted launch instruction gives the stage, remaining runtime, checkpoint,
+finalization cutoff and hard deadline. Read the scoped incident/evidence first,
+then write a complete evidence-backed /work/result.json checkpoint by its stated
+deadline. Preserve uncertainty explicitly; do not invent a fallback diagnosis.
+Update the checkpoint as facts improve. Reserve the stated finalization time and
+exit normally before the hard deadline. A checkpoint never makes a timeout or
+nonzero exit successful, and reading more evidence never resets the budget.
+
+For an initial-stage job, perform bounded triage: classify and semantically match
+the incident without editing code. Inspect the directly affected path and select
+only relevant candidate history; do not read every issue, exhaustively debug, run
+full builds, or try to prove every hypothesis. Once the next action is supported,
+put unresolved questions in diagnosis.missing for the deep stage and finalize the
+artifact. If time is short, state the actual observations and remaining gaps
+instead of continuing the investigation. Choose observe only for a confirmed
+external-only failure with no unresolved evidence gaps. For other cases choose investigate or fix as justified.
 For deep/review jobs, establish whether a patch is justified, add a regression
 check of the promised behavior, and make the smallest complete fix. Follow Rust
 1.95 and the existing architecture. Run cargo fmt --all, workspace clippy and
