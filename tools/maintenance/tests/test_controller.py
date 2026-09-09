@@ -6,7 +6,7 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
-from tools.maintenance.controller import Controller, review_ready, main
+from tools.maintenance.controller import Controller, issue_body, review_ready, main
 from tools.maintenance.state import State
 from tools.maintenance.contracts import Deferred, InvalidResult, QuotaUnavailable, fingerprint
 from tools.maintenance.tests.test_github import issue, dispatch, ReviewGitHub
@@ -56,6 +56,7 @@ class GH:
     def add_label(self, *args): return {}
     def pr(self, number): return self.prs[number]
     def prepare_patch(self, job, result, round_number): return {'sha': 'b'*40, 'branch': 'fix/issue-7-'+job['id'][:12], 'directory': '/local'}
+    def validate_prepared(self, job, prepared): pass
     def remote_sha(self, branch): return self.remote.get(branch)
     def push(self, prepared, previous=None):
         self.remote[prepared['branch']] = prepared['sha']
@@ -296,6 +297,7 @@ class ControllerTests(unittest.TestCase):
         artifact=github.review_snapshot(8)['artifacts'][0]
         prepared={'sha':'b'*40,'branch':'fix/issue-7','directory':'/offline'}
         github.prepare_patch=lambda *args: prepared
+        github.validate_prepared=lambda *args: None
         github.remote_sha=lambda branch: github.head
         def push(prepared,previous=None): github.head=prepared['sha']; return {'sha':github.head}
         github.push=push
@@ -648,3 +650,73 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(review_ready(snapshot, ['Rust workspace'],{'comment:1':{'hash':'old','head':BASE}}))
         snapshot['artifacts'][0]['hash']='edited'; self.assertFalse(review_ready(snapshot,['Rust workspace'],{'comment:1':{'hash':'old','head':BASE}}))
         snapshot['artifacts']=[]; snapshot['head']='b'*40; self.assertFalse(review_ready(snapshot,['Rust workspace'],{}))
+
+    def test_public_issue_body_contains_functional_sections_without_private_inventory(self):
+        value = diagnosis('fix', 'not_observed', 'confirmed')
+        value.update(
+            title='Timeout on glm-private-27 at gpu-01.internal.invalid',
+            summary='Requests fail while provider-alpha.invalid serves model glm-private-27 at https://gpu-01.internal.invalid:8443.',
+            observations=['worker_id=worker-7f91c2 observed a queue timeout.'],
+            acceptance=['The request path recovers without provider-alpha.invalid or model glm-private-27.'],
+        )
+        job = {
+            'base_sha': BASE,
+            'signature': 'synthetic-signature',
+            'context': {
+                'deployed': {'revision': 'd' * 40, 'host': 'gpu-01.internal.invalid'},
+                'private': {'identifiers': ['provider-alpha.invalid', 'glm-private-27', 'gpu-01.internal.invalid', 'worker-7f91c2']},
+            },
+        }
+        body = issue_body(value, job, '<!-- maintenance:origin:opaque -->')
+        self.assertIn('## Problem', body)
+        self.assertIn('## Impact', body)
+        self.assertIn('## Acceptance', body)
+        self.assertNotIn('Versions:', body)
+        self.assertNotIn('Independent causes:', body)
+        for secret in ('provider-alpha.invalid', 'glm-private-27', 'gpu-01.internal.invalid', 'worker-7f91c2', 'd' * 40):
+            self.assertNotIn(secret, body)
+        self.assertIn('Requests fail', body)
+        self.assertIn('maintenance:origin:opaque', body)
+
+    def test_restart_hydrates_private_initial_diagnosis_without_global_inventory(self):
+        self.incident()
+        self.api.evidence = lambda _: {'route': {'provider': 'Acme-Gateway', 'model': 'model-27'}}
+        self.runner.value['summary'] = 'Acme-Gateway stops before fallback.'
+        self.controller.run_next()
+        deep = self.controller.enqueue(7, '123')
+        self.assertNotIn('Acme-Gateway', self.gh.items[7]['body'])
+        self.api.evidence = lambda _: {'available': False}
+        unrelated = self.state.new_job('initial', 'unrelated', 800, result={'diagnosis': diagnosis()})
+        self.state.update_job(unrelated['id'], result={'diagnosis': {'summary': 'Unrelated confidential diagnosis'}})
+        self.state.close()
+        self.state = State(Path(self.temp.name)/'state.sqlite3', clock=lambda:self.now)
+        self.addCleanup(self.state.close)
+        config = {**self.controller.config, 'private_inventory': {'identifiers': ['unrelated-private-provider']}}
+        controller = Controller(config, self.state, self.api, self.gh, self.runner)
+        context = controller.context(self.state.job(deep['id']))
+        self.assertEqual(context['private']['initial_diagnosis']['summary'], 'Acme-Gateway stops before fallback.')
+        self.assertFalse(context['evidence']['available'])
+        self.assertEqual(context['private']['initial_evidence']['evidence']['route']['model'], 'model-27')
+        self.assertNotIn('Acme', issue_body(self.runner.value, {'context': context}, '<!-- maintenance:origin:opaque -->'))
+        self.assertNotIn('unrelated-private-provider', json.dumps(context))
+        self.assertNotIn('Unrelated confidential diagnosis', json.dumps(context))
+
+    def test_recovered_prepared_commit_is_checked_before_push_or_pr(self):
+        self.incident(); self.controller.run_next()
+        deep = self.controller.enqueue(7, '123')
+        prepared = {'sha': 'b'*40, 'branch': 'fix/issue-7', 'directory': '/offline'}
+        value = diagnosis('fix', 'not_observed', 'confirmed')
+        result = {'diagnosis': value, 'outcome': 'patch', 'feedback': [],
+                  'checks': [{'name': name, 'passed': True} for name in ('fmt', 'clippy', 'tests')]}
+        self.state.update_job(deep['id'], status='result', base_sha=BASE, prepared=prepared, result=result)
+        checks = []
+        def reject(job, commit):
+            checks.append(commit['sha'])
+            raise InvalidResult('publication contains private infrastructure identifiers')
+        self.gh.validate_prepared = reject
+        self.controller.process_results()
+        self.assertEqual(checks, ['b'*40])
+        self.assertEqual(self.gh.remote, {})
+        self.assertEqual(self.gh.prs, {})
+        self.assertEqual(self.state.job(deep['id'])['status'], 'needs_human')
+        self.assertEqual(self.state.job(deep['id'])['prepared'], prepared)

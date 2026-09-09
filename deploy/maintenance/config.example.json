@@ -8,6 +8,7 @@
   "maintenance_token_file": "/etc/openplotva-maintenance/maintenance.token",
   "maintenance_ca": "/etc/openplotva-maintenance/runtime-api.crt",
   "github_token_file": "/etc/openplotva-maintenance/github.token",
+  "private_inventory_file": "/etc/openplotva-maintenance/private-identifiers.json",
   "production_container": "REPLACE_WITH_VERIFIED_PRODUCTION_CONTAINER_NAME",
   "git_name": "iamwavecut",
   "git_email": "239034+iamwavecut@users.noreply.github.com",
