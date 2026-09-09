@@ -9,12 +9,14 @@ import unittest
 
 
 class ReviewWorkflowTests(unittest.TestCase):
+    step_id = "target"
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         source = Path(__file__).resolve().parents[3] / '.github/workflows/pr-automation.yml'
-        block = source.read_text().split('        id: target\n')[1].split('        run: |\n')[1]
+        block = source.read_text().split('        id: ' + self.step_id + '\n')[1].split('        run: |\n')[1]
         lines = []
         for line in block.splitlines():
             if line.strip() and not line.startswith('          '):
@@ -97,6 +99,31 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(called)
         self.assertEqual(values['wrapper_sha'], self.base)
+        self.assertEqual(values['base_sha'], self.base)
+
+
+class DangerWorkflowTests(ReviewWorkflowTests):
+    step_id = "danger_target"
+
+    def test_owner_can_review_exact_head_while_configuration_stays_on_base(self):
+        code, values, called = self.resolve()
+        self.assertEqual(code, 0)
+        self.assertTrue(called)
+        self.assertEqual(values['base_sha'], self.base)
+        self.assertEqual(values['pr_url'], self.fixture['html_url'])
+
+    def test_owner_can_review_from_current_base(self):
+        code, values, _ = self.resolve(REVIEW_EXECUTION_SHA=self.base)
+        self.assertEqual(code, 0)
+        self.assertEqual(values['base_sha'], self.base)
+
+    def test_automatic_review_always_uses_base_without_manual_lookup(self):
+        code, values, called = self.resolve(
+            REVIEW_EVENT='pull_request', REVIEW_ACTOR='contributor',
+            PULL_REQUEST_URL=self.fixture['html_url'], PULL_REQUEST_BASE_SHA=self.base,
+        )
+        self.assertEqual(code, 0)
+        self.assertFalse(called)
         self.assertEqual(values['base_sha'], self.base)
 
 

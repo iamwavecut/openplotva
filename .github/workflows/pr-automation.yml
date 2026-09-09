@@ -25,7 +25,7 @@ concurrency:
 jobs:
   danger:
     name: Danger PR rules
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.repository == 'iamwavecut/openplotva' && github.actor == 'iamwavecut' && inputs.pr_number != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,10 +33,44 @@ jobs:
       pull-requests: write
       statuses: write
     steps:
+      - name: Resolve Danger target
+        id: danger_target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_EVENT: ${{ github.event_name }}
+          REVIEW_ACTOR: ${{ github.actor }}
+          REVIEW_EXECUTION_SHA: ${{ github.sha }}
+          PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$REVIEW_EVENT" == "workflow_dispatch" ]]; then
+            [[ "$GH_REPO" == iamwavecut/openplotva && "$REVIEW_ACTOR" == iamwavecut ]] || exit 1
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 1
+            pr_json="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")"
+            jq -e --arg repo "$GH_REPO" '.head.repo.full_name == $repo and .base.repo.full_name == $repo' <<< "$pr_json" >/dev/null
+            pr_url="$(jq -r .html_url <<< "$pr_json")"
+            base_sha="$(jq -r .base.sha <<< "$pr_json")"
+            head_sha="$(jq -r .head.sha <<< "$pr_json")"
+            [[ "$REVIEW_EXECUTION_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$REVIEW_EXECUTION_SHA" == "$base_sha" || "$REVIEW_EXECUTION_SHA" == "$head_sha" ]] || exit 1
+          else
+            pr_url="$PULL_REQUEST_URL"
+            base_sha="$PULL_REQUEST_BASE_SHA"
+          fi
+          test -n "$pr_url"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          {
+            echo "pr_url=$pr_url"
+            echo "base_sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout trusted base revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.danger_target.outputs.base_sha }}
           persist-credentials: false
 
       - name: Setup Node
@@ -47,7 +81,15 @@ jobs:
       - name: Run Danger JS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx --yes danger@13.0.10 ci
+          DANGER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_EVENT: ${{ github.event_name }}
+          PR_URL: ${{ steps.danger_target.outputs.pr_url }}
+        run: |
+          if [[ "$REVIEW_EVENT" == "workflow_dispatch" ]]; then
+            npx --yes danger@13.0.10 pr "$PR_URL" --failOnErrors
+          else
+            npx --yes danger@13.0.10 ci
+          fi
 
   pr-agent:
     name: PR-Agent review and suggestions
