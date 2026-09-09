@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from functools import partial
 
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from pr_agent.algo.pr_processing import retry_with_fallback_models
@@ -14,6 +15,7 @@ from pr_agent.log import get_logger, setup_logger
 from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from pr_agent.tools.pr_reviewer import PRReviewer
 
+from glm_coding_plan import MODEL as GLM_MODEL, GlmCodingPlanHandler, GlmCompletionError
 
 NO_MAJOR_ISSUES_MARKER = "No major issues detected"
 
@@ -94,18 +96,37 @@ def configure_settings(pr_url: str) -> None:
         settings.set("PR_CODE_SUGGESTIONS.EXTRA_INSTRUCTIONS", review_instructions)
 
 
+def ai_handler_options() -> dict:
+    settings = get_settings()
+    if settings.config.model != GLM_MODEL:
+        return {}
+    return {"ai_handler": partial(
+        GlmCodingPlanHandler,
+        api_key=settings.get("OPENAI.KEY") or os.environ.get("OPENAI_KEY"),
+        timeout=settings.config.ai_timeout,
+    )}
+
+
 async def generate_review(pr_url: str) -> ReviewResult:
-    reviewer = PRReviewer(pr_url)
+    reviewer = PRReviewer(pr_url, **ai_handler_options())
     if not reviewer.git_provider.get_files():
         get_logger().info("PR has no files, skipping review")
         return ReviewResult(reviewer=None, body="", has_findings=False)
 
     get_logger().info("Generating PR review")
-    await retry_with_fallback_models(reviewer._prepare_prediction, model_type=ModelType.REGULAR)
+    if isinstance(reviewer.ai_handler, GlmCodingPlanHandler):
+        await reviewer._prepare_prediction(GLM_MODEL)
+        reviewer.ai_handler.ensure_complete()
+    else:
+        await retry_with_fallback_models(reviewer._prepare_prediction, model_type=ModelType.REGULAR)
     if not reviewer.prediction:
+        if isinstance(reviewer.ai_handler, GlmCodingPlanHandler):
+            raise GlmCompletionError("empty_review")
         return ReviewResult(reviewer=reviewer, body="", has_findings=False)
 
     body = reviewer._prepare_pr_review()
+    if isinstance(reviewer.ai_handler, GlmCodingPlanHandler) and not body.strip():
+        raise GlmCompletionError("invalid_review")
     has_findings = bool(body.strip()) and NO_MAJOR_ISSUES_MARKER not in body
     return ReviewResult(reviewer=reviewer, body=body, has_findings=has_findings)
 
@@ -115,13 +136,19 @@ async def generate_suggestions(pr_url: str) -> SuggestionsResult:
         get_logger().info("Skipping code suggestions because the PR exceeds configured improve limits")
         return SuggestionsResult(suggester=None, data={"code_suggestions": []}, has_findings=False)
 
-    suggester = PRCodeSuggestions(pr_url)
+    suggester = PRCodeSuggestions(pr_url, **ai_handler_options())
     if not suggester.git_provider.get_files():
         get_logger().info("PR has no files, skipping code suggestions")
         return SuggestionsResult(suggester=suggester, data={"code_suggestions": []}, has_findings=False)
 
     get_logger().info("Generating PR code suggestions")
-    data = await retry_with_fallback_models(suggester.prepare_prediction_main, model_type=ModelType.REGULAR)
+    if isinstance(suggester.ai_handler, GlmCodingPlanHandler):
+        data = await suggester.prepare_prediction_main(GLM_MODEL)
+        suggester.ai_handler.ensure_complete()
+        if not isinstance(data, dict) or not isinstance(data.get("code_suggestions"), list):
+            raise GlmCompletionError("invalid_suggestions")
+    else:
+        data = await retry_with_fallback_models(suggester.prepare_prediction_main, model_type=ModelType.REGULAR)
     if not data or "code_suggestions" not in data:
         data = {"code_suggestions": []}
 
