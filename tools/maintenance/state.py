@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .contracts import DAY, DEEP_LIMIT, DEEP_SECONDS, INITIAL_LIMIT, INITIAL_SECONDS, Deferred
+from .contracts import DAY, DEEP_LIMIT, DEEP_SECONDS, INITIAL_LIMIT, INITIAL_SECONDS, Deferred, identifier
 from .quota import retry_after
 
 TERMINAL = {'done', 'observing', 'needs_human', 'cancelled', 'ready', 'wait_deploy'}
@@ -183,12 +183,35 @@ class State:
     def launch_after(self, job):
         if job['stage'] in ('initial', 'triage'):
             if job.get('quota_resume'): return 0
-            query, limit = 'SELECT count(*),min(at) FROM initial_launches WHERE at>?', INITIAL_LIMIT
+            count, oldest = self.initial_allowance()
+            limit = INITIAL_LIMIT
         else:
             if self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job['id'],)).fetchone(): return 0
-            query, limit = "SELECT count(*),min(at) FROM starts WHERE kind='deep' AND at>?", DEEP_LIMIT
-        count, oldest = self.db.execute(query, (self.clock()-DAY,)).fetchone()
+            count, oldest = self.db.execute("SELECT count(*),min(at) FROM starts WHERE kind='deep' AND at>?",
+                                           (self.clock()-DAY,)).fetchone()
+            limit = DEEP_LIMIT
         return oldest+DAY if count >= limit else 0
+
+    def initial_allowance(self):
+        reset_id = self.setting('initial_quota_reset', {}).get('through_launch_id', 0)
+        return self.db.execute('SELECT count(*),min(at) FROM initial_launches WHERE at>? AND id>?',
+                               (self.clock()-DAY, reset_id)).fetchone()
+
+    def reset_initial_quota(self, request_id):
+        key = 'initial_quota_reset_'+identifier(request_id)
+        with self.transaction():
+            previous = self.setting(key)
+            if previous is not None: return previous
+            receipt = {'request_id': request_id, 'at': self.clock(), 'previous_count': self.initial_allowance()[0],
+                       'through_launch_id': self.db.execute('SELECT coalesce(max(id),0) FROM initial_launches').fetchone()[0],
+                       'released_jobs': 0}
+            for job in self.jobs({'queued'}):
+                if job['stage'] in ('initial', 'triage') and job.get('reason', '').startswith('waiting for rolling daily launch allowance'):
+                    self.update_job(job['id'], next_at=0, reason='daily launch allowance reset by operator')
+                    receipt['released_jobs'] += 1
+            self.set_setting('initial_quota_reset', receipt)
+            self.set_setting(key, receipt)
+            return receipt
 
     def claim(self, job_id):
         with self.transaction():
@@ -309,8 +332,10 @@ class State:
                 'active_seconds': sum(j['active_seconds'] for j in jobs), 'usage': usage,
                 'provider_quota': self.setting('provider_quota', {}),
                 'review_waits': self.setting('review_waits', {}),
-                'starts': {'initial':self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0],
+                'starts': {'initial':self.initial_allowance()[0],
                            'deep':self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]},
+                'initial_launches_last_24h': self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?', (self.clock()-DAY,)).fetchone()[0],
+                'initial_quota_reset': self.setting('initial_quota_reset'),
                 'job_status': [{'id':j['id'],'stage':j['stage'],'status':j['status'],'issue_number':j.get('issue_number'),
                                 'pr_number':j.get('pr_number'),'active_seconds':j['active_seconds'],'rounds':j['rounds']} for j in jobs],
                 'pending_notifications': sum(n['state'] not in ('sent', 'superseded') for n in self.records('notifications'))}

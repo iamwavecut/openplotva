@@ -574,11 +574,12 @@ class ControllerTests(unittest.TestCase):
     def test_cli_status_pause_and_cancel_use_only_durable_state(self):
         config=Path(self.temp.name)/'config.json'; config.write_text(json.dumps({'state_dir':self.temp.name}))
         job=self.state.new_job('initial','sig',1)
-        for args in (['disable'],['status'],['cancel',job['id']]):
+        for args in (['reset-short-quota','test-request'],['disable'],['status'],['cancel',job['id']]):
             output=io.StringIO()
             with contextlib.redirect_stdout(output): result=main(['--config',str(config),*args])
             self.assertEqual(result,0); self.assertIsInstance(json.loads(output.getvalue()),dict)
         self.assertFalse(self.state.enabled()); self.assertTrue(self.state.cancelled(job['id']))
+        self.assertEqual(self.state.setting('initial_quota_reset')['request_id'], 'test-request')
 
     def test_hundred_events_create_one_issue_and_duplicate_dispatch_one_deep_job(self):
         self.incident(); self.controller.run_next()

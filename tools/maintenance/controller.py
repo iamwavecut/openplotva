@@ -691,6 +691,7 @@ def main(argv=None):
     parser.add_argument('--config',default='/etc/openplotva-maintenance/config.json')
     sub=parser.add_subparsers(dest='command',required=True)
     for name in ('status','enable','disable','serve'): sub.add_parser(name)
+    reset=sub.add_parser('reset-short-quota'); reset.add_argument('request_id')
     cancel=sub.add_parser('cancel'); cancel.add_argument('job_id')
     enqueue=sub.add_parser('enqueue'); enqueue.add_argument('issue_number',type=int); enqueue.add_argument('event_run_id')
     args=parser.parse_args(argv)
@@ -698,6 +699,7 @@ def main(argv=None):
     try:
         config=json.loads(Path(args.config).read_text()); state=State(Path(config['state_dir'])/'state.sqlite3')
         if args.command=='status': print(json.dumps(state.status(),sort_keys=True)); return 0
+        if args.command=='reset-short-quota': print(json.dumps(state.reset_initial_quota(args.request_id))); return 0
         if args.command in ('enable','disable'):
             state.set_enabled(args.command=='enable'); print(json.dumps({'enabled':state.enabled()})); return 0
         if args.command=='cancel':

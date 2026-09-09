@@ -226,6 +226,13 @@ Launch admission is checked before source refresh or GitHub context loading, and
 checked again inside the atomic reservation. A full daily window leaves the job
 queued until its next slot without spending dependency retries or repeatedly
 querying GitHub.
+An operator can reset only this short-job allowance with
+`sudo python3 /opt/openplotva-maintenance/controller.py reset-short-quota REQUEST_ID`.
+Use a unique request ID for each authorized reset and reuse it after an uncertain
+response. The reset records a launch-ledger watermark and wakes jobs waiting on
+daily admission; it does not delete launches, usage, repair budgets, provider
+cooldowns or ordinary retry delays. `status.starts.initial` reports the current
+allowance usage, while `initial_launches_last_24h` retains the full launch count.
 New deep investigations have a 10-start rolling limit. An issue has at most
 14,400 active seconds and five repair/revision rounds across retries and manual
 requeues. Waiting for CI releases the single compute slot. Status includes usage
@@ -312,6 +319,14 @@ The next short triage receives the discussion, original private evidence,
 previous replies, the managed PR and remaining repair budget. Before each public
 action the controller rechecks the owner comments, issue scope and PR identity.
 Changes during a run invalidate its decision and require a fresh triage.
+
+After persisting accepted feedback, the controller adds an eyes reaction to the
+owner's comment, including while quota or the new-start switch delays inference.
+This means received and queued, not completed. Reaction receipts are journaled;
+edits and repeated polls do not add another reaction. Failed acknowledgements are
+retried on later polls without blocking triage. The fixed-content GitHub
+[reaction endpoint](https://docs.github.com/en/rest/reactions/reactions#create-reaction-for-an-issue-comment)
+returns the existing reaction after a lost response.
 
 The bounded decision is one of:
 
