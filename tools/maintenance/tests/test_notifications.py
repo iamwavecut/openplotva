@@ -6,6 +6,8 @@ from tools.maintenance.api import MaintenanceAPI
 from tools.maintenance.contracts import InvalidResult
 from tools.maintenance.controller import Controller
 from tools.maintenance.state import State
+from tools.maintenance.notifications import reason_code
+from tools.maintenance.tests.test_controller import API
 
 
 class NotificationTests(unittest.TestCase):
@@ -61,3 +63,46 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(api.notify(payload)['state'], 'pending')
         for value in ('private-canary', [], None):
             with self.assertRaises(InvalidResult): api.notify({**payload, 'reason_code': value})
+
+    def test_pending_legacy_notices_coalesce_without_replacing_delivery_keys(self):
+        api = API(); self.controller.api = api
+        for number in range(3):
+            job = self.state.new_job('initial', str(number), number+1,
+                reason='source or context dependency unavailable; retry budget exhausted')
+            key = str(number)*64
+            payload = {'key': key, 'run_id': job['id'], 'status': 'needs_human'}
+            if number == 1: api.notify(payload)
+            self.state.put_record('notifications', key,
+                {'key': key, 'payload': payload, 'posted': number == 1, 'state': 'pending'})
+        self.controller.notify(job, 'needs_human')
+        self.controller.poll_notifications()
+        self.assertEqual(set(api.receipts), {'1'*64})
+        self.assertEqual(self.state.status()['pending_notifications'], 1)
+        api.delivery = 'sent'
+        self.controller.poll_notifications()
+        other = State(self.path)
+        try:
+            controller = Controller({}, other, api, None, None)
+            controller.notify(job, 'needs_human'); controller.poll_notifications()
+            self.assertEqual(set(api.receipts), {'1'*64})
+            self.assertEqual(other.status()['pending_notifications'], 0)
+        finally:
+            other.close()
+
+    def test_missing_execution_receipt_has_review_guidance(self):
+        self.assertEqual(reason_code({'reason': 'required PR-Agent execution proof unavailable'},
+                                     'needs_human'), 'review_incomplete')
+
+    def test_unacknowledged_legacy_post_reuses_the_same_transport_key(self):
+        api = API(); self.controller.api = api
+        for number in range(2):
+            job = self.state.new_job('initial', str(number), number+1, reason='invalid isolated result')
+            key = str(number)*64
+            payload = {'key': key, 'run_id': job['id'], 'status': 'needs_human'}
+            if number == 0: api.notify(payload)  # Dispatcher accepted it before the process stopped.
+            self.state.put_record('notifications', key,
+                {'key': key, 'payload': payload, 'posted': False, 'state': 'pending'})
+        self.controller.poll_notifications()
+        self.controller.notify(job, 'needs_human')
+        self.assertEqual(set(api.receipts), {'0'*64})
+        self.assertEqual(self.state.status()['pending_notifications'], 1)

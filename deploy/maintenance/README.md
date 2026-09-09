@@ -377,6 +377,9 @@ new quota episode can produce a new actionable notice. The payload contains no
 free-form diagnostic text. A repeat initial diagnosis recovers an unambiguous
 known issue link from the origin journal. When no issue can be linked, the message says
 so and links to the issue queue; it never claims an issue was left open.
+Pending legacy notices are coalesced before delivery. Their original transport
+keys and payloads remain unchanged to reconcile a lost acknowledgement; duplicate
+unposted notices are suppressed. Already posted receipts continue to be polled.
 Deploy the runtime's optional `reason_code` notification support before upgrading
 the controller. Older controllers remain compatible with the new runtime.
 

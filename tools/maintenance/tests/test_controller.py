@@ -462,6 +462,18 @@ class ControllerTests(unittest.TestCase):
         self.state.set_enabled(False); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
         self.state.set_enabled(True); self.state.cancel(job['id']); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
 
+    def test_ordinary_retry_after_quota_recovery_counts_as_another_short_launch(self):
+        job = self.incident()
+        self.runner.run = lambda *_: (_ for _ in ()).throw(QuotaUnavailable(retry_after_seconds=120))
+        self.controller.run_next(); self.now += 121
+        self.runner.run = lambda *_: (_ for _ in ()).throw(Deferred('ordinary dependency failure'))
+        self.controller.run_next()
+        self.assertFalse(self.state.job(job['id']).get('quota_resume'))
+        self.assertEqual(self.state.status()['starts']['initial'], 1)
+        self.now += 31
+        self.controller.run_next()
+        self.assertEqual(self.state.status()['starts']['initial'], 2)
+
     def test_quota_blocks_other_jobs_and_restart_does_not_lose_cooldown(self):
         job = self.incident()
         self.runner.run = lambda *_: (_ for _ in ()).throw(QuotaUnavailable(retry_after_seconds=120))

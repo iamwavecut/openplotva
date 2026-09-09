@@ -313,4 +313,4 @@ class State:
                            'deep':self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]},
                 'job_status': [{'id':j['id'],'stage':j['stage'],'status':j['status'],'issue_number':j.get('issue_number'),
                                 'pr_number':j.get('pr_number'),'active_seconds':j['active_seconds'],'rounds':j['rounds']} for j in jobs],
-                'pending_notifications': sum(n['state'] != 'sent' for n in self.records('notifications'))}
+                'pending_notifications': sum(n['state'] not in ('sent', 'superseded') for n in self.records('notifications'))}

@@ -29,7 +29,7 @@ from .privacy import (boundary_for_job, hydrate_private_context, public_feedback
 from .state import State
 from .review_queue import ReviewQueue
 from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
-from .notifications import notification_payload
+from .notifications import coalesce_pending, notification_payload
 
 DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
                   'Danger PR rules', 'PR-Agent review and suggestions', 'CodeQL Rust', 'Semgrep CE', 'Maintenance automation']
@@ -330,7 +330,7 @@ class Controller:
         if not current['cancelled']: self.state.update_job(job['id'], status='result', attempts=0, next_at=0, quota_resume=False)
 
     def retry(self, job, reason):
-        current = self.state.job(job['id'])
+        current = self.state.update_job(job['id'], quota_resume=False)
         if self.conversation.blocked(current):
             self.state.update_job(job['id'], status='result' if current.get('result') else 'queued',
                                   reason='awaiting owner feedback'); return
@@ -348,8 +348,10 @@ class Controller:
     def notify(self, job, status):
         payload = notification_payload(self.state, job, status)
         key = payload['key']
-        if self.state.record('notifications', key): return
-        self.state.put_record('notifications', key, {'key': key, 'payload': payload, 'state': 'pending', 'posted': False})
+        with self.state.transaction():
+            if any(record.get('identity_key', record['key']) == key for record in coalesce_pending(self.state)): return
+            self.state.put_record('notifications', key,
+                {'key': key, 'identity_key': key, 'payload': payload, 'state': 'pending', 'posted': False})
 
     def needs_human(self, job, reason):
         if self.state.cancelled(job['id']): return
@@ -640,8 +642,8 @@ class Controller:
                 if failures>=self.config.get('dependency_retries',3): self.needs_human(job,'review polling unavailable; readiness is unconfirmed')
 
     def poll_notifications(self):
-        for record in self.state.records('notifications'):
-            if record['state'] in ('sent','ambiguous'): continue
+        for record in coalesce_pending(self.state):
+            if record['state'] in ('sent','ambiguous','superseded'): continue
             try:
                 if record['posted']:
                     receipt=self.api.notification(record['key'])
