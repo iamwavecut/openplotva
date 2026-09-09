@@ -212,10 +212,12 @@ class Controller:
             already_started=self.state.db.execute('SELECT 1 FROM starts WHERE job_id=?',(job['id'],)).fetchone() is not None
             if spent['active_seconds'] >= budget or spent['cycles']+(0 if already_started else 1)>MAX_ROUNDS:
                 self.needs_human(job, 'active time or repair cycle budget exhausted'); continue
-            launch_after = self.state.launch_after(job)
-            if launch_after > self.clock():
-                self.state.update_job(job['id'], next_at=launch_after, reason='waiting for rolling daily launch allowance')
-                continue
+            # Serialize wait scheduling with an operator's quota reset.
+            with self.state.transaction():
+                launch_after = self.state.launch_after(job)
+                if launch_after > self.clock():
+                    self.state.update_job(job['id'], next_at=launch_after, reason='waiting for rolling daily launch allowance')
+                    continue
             try:
                 if job['stage'] in ('deep', 'revise'):
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')

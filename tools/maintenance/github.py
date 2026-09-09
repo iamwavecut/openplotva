@@ -186,12 +186,13 @@ class GitHub:
         self.assert_owner()
         path = 'repos/'+REPOSITORY+'/issues/comments/'+str(comment_id)
         comment = self.api(path)
+        if not isinstance(comment, dict): raise Deferred('comment response unavailable')
         if (not is_owner(comment.get('user')) or comment.get('id') != comment_id
                 or comment.get('issue_url') != 'https://api.github.com/repos/'+REPOSITORY+'/issues/'+str(number)):
             raise InvalidResult('comment outside owner conversation')
         # GitHub returns the existing reaction for the same user/content after a lost acknowledgement.
         receipt = self.api(path+'/reactions', 'POST', {'content': 'eyes'})
-        if (type(receipt.get('id')) is not int or receipt['id'] <= 0
+        if (not isinstance(receipt, dict) or type(receipt.get('id')) is not int or receipt['id'] <= 0
                 or receipt.get('content') != 'eyes' or not is_owner(receipt.get('user'))):
             raise Deferred('comment reaction receipt unconfirmed')
         return {'id': receipt['id']}

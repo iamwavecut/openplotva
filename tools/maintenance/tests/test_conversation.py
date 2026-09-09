@@ -137,6 +137,37 @@ class ConversationTests(unittest.TestCase):
         receipt['content'] = 'heart'
         with self.assertRaises(Deferred): github.acknowledge_comment(7, comment['id'])
 
+    def test_malformed_reaction_responses_are_retryable(self):
+        from tools.maintenance.github import GitHub
+        github = GitHub({}); comment = self.comment()
+        for malformed in ([], None, 'unavailable'):
+            for stage in ('comment', 'receipt'):
+                with self.subTest(stage=stage, malformed=malformed):
+                    def api(path, method='GET', payload=None):
+                        if path == 'user': return owner()
+                        if method == 'GET': return malformed if stage == 'comment' else comment
+                        return malformed
+                    github.api = api
+                    with self.assertRaises(Deferred): github.acknowledge_comment(7, comment['id'])
+
+    def test_revoked_scope_after_comment_fetch_does_not_acknowledge(self):
+        for target in ('issue', 'pr'):
+            with self.subTest(target=target):
+                self.gh.items[7]['labels'] = [{'name': name} for name in ('agent:created', 'agent:queued')]
+                self.comments = {7: []}; self.reactions.clear()
+                if target == 'pr': self.managed_pr()
+                accepted = self.comment(number=8 if target == 'pr' else 7)
+                if target == 'pr': accepted['id'] += 100
+                def comments(number):
+                    values = copy.deepcopy(self.comments.get(number, []))
+                    if values:
+                        if target == 'issue': self.gh.items[7]['labels'] = []
+                        else: self.gh.prs[8]['state'] = 'closed'
+                    return values
+                self.gh.comments = comments
+                self.poll()
+                self.assertEqual(self.reactions, {})
+
     def test_agent_reply_is_not_owner_feedback_and_legacy_comments_are_not_replayed(self):
         self.assertTrue(hasattr(self.controller, 'conversation'), 'owner comment triage is absent')
         legacy = self.comment(); legacy['updated_at'] = '1970-01-01T00:00:00Z'

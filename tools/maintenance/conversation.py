@@ -96,7 +96,13 @@ class Conversation:
                 for comment in comments:
                     key = fingerprint({'owner_comment_ack': comment['id']})
                     if self.state.record('effects', key): continue
-                    try: receipt = self.github.acknowledge_comment(comment['number'], comment['id'])
+                    try:
+                        validate_issue(self.github.issue(number), number)
+                        if comment['number'] != number:
+                            current = self.managed_pr(number)
+                            if not current or current[1]['number'] != comment['number']:
+                                raise InvalidResult('comment target is no longer managed')
+                        receipt = self.github.acknowledge_comment(comment['number'], comment['id'])
                     except Deferred: continue
                     self.state.put_record('effects', key, {'kind': 'reaction', 'state': 'done',
                         'payload': {'number': comment['number'], 'comment_id': comment['id'], 'content': 'eyes'},
