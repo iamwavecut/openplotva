@@ -42,31 +42,38 @@ def prepare_cargo():
 def launch_instruction(seconds):
     context = json.loads((WORK / "context.json").read_text())
     stage = context.get("stage") if isinstance(context, dict) else None
-    if stage not in ("initial", "deep", "review"):
+    if stage not in ("initial", "deep", "revise", "triage"):
         raise ValueError("invalid worker stage")
-    limit = INITIAL_SECONDS if stage == "initial" else DEEP_SECONDS
+    limit = INITIAL_SECONDS if stage in ("initial", "triage") else DEEP_SECONDS
     if type(seconds) is not int or not 1 <= seconds <= limit:
         raise ValueError("invalid worker time budget")
     # Only validated controller metadata and our clock enter the trusted instruction.
     now = time.time()
-    reserve = min(60, max(1, seconds // 5)) if stage == "initial" else min(300, max(1, seconds // 10))
-    checkpoint = min(60 if stage == "initial" else 300, seconds // 4, seconds - reserve)
+    reserve = min(60, max(1, seconds // 5)) if stage in ("initial", "triage") else min(300, max(1, seconds // 10))
+    checkpoint = min(60 if stage in ("initial", "triage") else 300, seconds // 4, seconds - reserve)
 
     def timestamp(offset):
         return datetime.datetime.fromtimestamp(now + offset, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     scope = (
+        "This is owner feedback triage. Read context.conversation, the current discussion and relevant "
+        "private incident facts. Do not edit code or run builds. Decide reply (answer or ask a precise "
+        "question and wait), continue (investigate or revise the existing fix), or close_pr (only the "
+        "supplied managed PR is no longer justified). Write exactly action, reply, reason to result.json. "
+        "Use the owner's language for reply. Never claim an action has completed; the controller "
+        "validates and performs it after you exit. Reply should state the decision and its rationale."
+        if stage == "triage" else
         "This is bounded initial triage, not exhaustive debugging. Read the incident and scoped evidence, "
         "then inspect only directly relevant code and selected candidate history. Do not edit code, "
         "run full builds, or exhaustively traverse the repository/history. Transfer unresolved causal "
         "questions to diagnosis.missing for the deep stage; finish once the next action is justified."
-        if stage == "initial" else
+        if stage in ("initial", "triage") else
         "Review the supplied current feedback at the assigned revision. If it only needs an explanation, "
         "return outcome no_fix with factual feedback action rebuttal. Do not create a patch or repeat "
         "full builds merely to acknowledge an informational or clean review. Repair concrete valid "
         "findings when present; any actual patch still needs real code work and the required checks "
         "before it is a verified fix. Address all supplied actionable feedback within this budget."
-        if stage == "review" else
+        if stage == "revise" else
         "Use the exact target issue and current acceptance criteria. A verified fix still requires "
         "real code work and the required checks within this remaining budget. If evidence or checks "
         "cannot finish in time, retain the partial patch and report needs_human; never claim a verified fix."
@@ -106,6 +113,7 @@ def agent(seconds):
 
 def _agent(seconds, diagnostic):
     instruction = launch_instruction(seconds)
+    stage = json.loads((WORK / 'context.json').read_text())['stage']
     prepare_cargo()
     directory = WORK / "omp" / "agent"
     directory.mkdir(parents=True, exist_ok=True)
@@ -177,14 +185,16 @@ def _agent(seconds, diagnostic):
     diagnostic["status"] = "result_json_invalid"
     output = json.loads(data)
     diagnostic["status"] = "result_diagnosis_invalid" if isinstance(output, dict) else "result_shape_invalid"
-    diagnosis(output.get("diagnosis"))
-    diagnostic["status"] = "diagnosis_valid"
+    if stage == 'triage': validate_output(output, stage)
+    else: diagnosis(output.get("diagnosis"))
+    diagnostic["status"] = "decision_valid" if stage == 'triage' else "diagnosis_valid"
     return 0
 
 
 def validate_result():
     """Advisory artifact precheck; the controller remains the acceptance authority."""
     hint = "Read valid JSON from the fixed context.json and result.json paths."
+    stage = None
     try:
         documents = []
         for name, limit in (("context.json", 8 * 1024 * 1024), ("result.json", 256 * 1024)):
@@ -198,13 +208,17 @@ def validate_result():
                 raise ValueError("artifact exceeds limit")
             documents.append(json.loads(data))
         context, value = documents
-        hint = "The context stage must be initial, deep, or review."
+        hint = "The context stage must be initial, deep, revise, or triage."
         stage = context.get("stage") if isinstance(context, dict) else None
-        if stage not in ("initial", "deep", "review"):
+        if stage not in ("initial", "deep", "revise", "triage"):
             raise ValueError("invalid stage")
         hint = ("Follow the canonical root, diagnosis, and feedback schemas and the allowed values in the policy. "
                 "matches belongs inside diagnosis; use observed facts and state uncertainty.")
+        if stage == 'triage': hint = 'Use exactly action (reply, continue, close_pr), reply, reason; no patch or diagnosis.'
         validate_output(value, stage)
+        if stage == "triage":
+            print(json.dumps({"valid": True, "hint": "Decision schema passed; the controller rechecks owner scope and current state."}))
+            return 0
         hint = "Without a patch, use outcome no_fix and feedback action rebuttal for explanations; do not claim fixed."
         if value["outcome"] != "patch" and any(item["action"] == "fixed" for item in value["feedback"]):
             raise InvalidResult("fixed feedback has no patch")
@@ -228,7 +242,7 @@ def validate_result():
                 raise InvalidResult("empty patch")
     except (OSError, ValueError, TypeError, KeyError, RecursionError, InvalidResult, subprocess.SubprocessError):
         print(json.dumps({"valid": False, "hint": hint,
-            "expected_root_fields": ["diagnosis", "outcome", "feedback"],
+            "expected_root_fields": ["action", "reply", "reason"] if stage == 'triage' else ["diagnosis", "outcome", "feedback"],
             "expected_diagnosis_fields": ["external_cause", "code_defect", "observations", "hypotheses",
                 "supporting", "contradicting", "related_changes", "missing", "next_action", "title", "summary",
                 "matches", "acceptance"], "expected_feedback_fields": ["kind", "id", "action", "body"]}))

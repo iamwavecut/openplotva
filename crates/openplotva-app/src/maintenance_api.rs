@@ -48,6 +48,50 @@ enum NotificationStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NotificationReason {
+    UsageQuota,
+    WorkBudget,
+    DependencyUnavailable,
+    UnverifiedFix,
+    ScopeChanged,
+    InvalidResult,
+    ReviewIncomplete,
+    Unspecified,
+}
+
+impl NotificationReason {
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::UsageQuota => {
+                "Исчерпана квота модели. Продолжу автоматически после восстановления; ничего делать не нужно."
+            }
+            Self::WorkBudget => {
+                "Достигнут лимит автоматической работы. Нужны ваше решение или новые вводные."
+            }
+            Self::DependencyUnavailable => {
+                "Не удалось получить необходимые данные. Проверьте доступность GitHub и сервисов автоматизации перед повторным запуском."
+            }
+            Self::UnverifiedFix => {
+                "Проверенное исправление не получено. Нужны дополнительные факты или ваше решение о дальнейшем разборе."
+            }
+            Self::ScopeChanged => {
+                "Issue или PR изменился во время работы. Уточните дальнейшую задачу в комментарии."
+            }
+            Self::InvalidResult => {
+                "Результат агента не прошёл проверку. Нужен технический разбор сбоя автоматизации."
+            }
+            Self::ReviewIncomplete => {
+                "Не удалось подтвердить результат ревью. Проверьте проверки и обсуждение PR."
+            }
+            Self::Unspecified => {
+                "Автоматический этап остановлен. Нужен разбор причины остановки перед продолжением."
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotificationRequest {
@@ -56,6 +100,7 @@ struct NotificationRequest {
     status: NotificationStatus,
     issue_number: Option<i64>,
     pr_number: Option<i64>,
+    reason_code: Option<NotificationReason>,
 }
 
 impl NotificationRequest {
@@ -78,15 +123,35 @@ impl NotificationRequest {
         }
         let mut text = match self.status {
             NotificationStatus::PrCreated => "Автоисправление: создан PR, идут проверки.",
-            NotificationStatus::PrReady => "Автоисправление: PR прошёл проверки и ревью, можно сливать вручную.",
-            NotificationStatus::NeedsHuman => "Авторазбор завершён: требуется ваше решение. Issue оставлен открытым.",
-            NotificationStatus::Paused => "Авторазбор приостановлен: исчерпан лимит или недоступны ресурсы. Прогресс сохранён.",
-            NotificationStatus::Failed => "Авторазбор не завершён: требуется ваше вмешательство. Прогресс сохранён.",
-        }.to_owned();
+            NotificationStatus::PrReady => {
+                "Автоисправление: PR прошёл проверки и ревью, можно сливать вручную."
+            }
+            NotificationStatus::NeedsHuman => "Авторазбор: требуется ваше решение.",
+            NotificationStatus::Paused => "Авторазбор приостановлен. Прогресс сохранён.",
+            NotificationStatus::Failed => {
+                "Авторазбор не завершён: требуется ваше вмешательство. Прогресс сохранён."
+            }
+        }
+        .to_owned();
+        if matches!(
+            self.status,
+            NotificationStatus::NeedsHuman
+                | NotificationStatus::Paused
+                | NotificationStatus::Failed
+        ) {
+            text.push('\n');
+            text.push_str(
+                self.reason_code
+                    .unwrap_or(NotificationReason::Unspecified)
+                    .guidance(),
+            );
+        }
         if let Some(number) = self.issue_number {
             text.push_str(&format!(
                 "\nIssue: https://github.com/iamwavecut/openplotva/issues/{number}"
             ));
+        } else {
+            text.push_str("\nДля этого разбора issue пока не указан. Очередь авторазборов: https://github.com/iamwavecut/openplotva/issues?q=is%3Aissue+is%3Aopen+label%3Aagent%3Acreated");
         }
         if let Some(number) = self.pr_number {
             text.push_str(&format!(
@@ -460,7 +525,10 @@ mod tests {
         let receipt: serde_json::Value = client
             .post(format!("{base}/notifications"))
             .bearer_auth(&config.maintenance.token)
-            .json(&json!({"key": "a".repeat(64), "run_id": "no-bot", "status": "needs_human"}))
+            .json(
+                &json!({"key": "a".repeat(64), "run_id": "no-bot", "status": "needs_human",
+                "reason_code": "dependency_unavailable"}),
+            )
             .send()
             .await?
             .error_for_status()?
@@ -471,6 +539,16 @@ mod tests {
             Some("pending" | "queued")
         ));
         assert!(receipt["telegram_message_id"].is_null());
+        let saved = MaintenanceNotificationStore::new(pool.clone())
+            .get(&"a".repeat(64))
+            .await?
+            .expect("persisted notification");
+        assert!(
+            saved
+                .body
+                .contains("Для этого разбора issue пока не указан")
+        );
+        assert!(saved.body.contains("Проверьте доступность GitHub"));
         stop.send(true)?;
         tokio::time::timeout(Duration::from_secs(2), capture).await??;
         tokio::time::timeout(Duration::from_secs(2), server).await??;
@@ -505,6 +583,7 @@ mod tests {
             status: NotificationStatus::PrReady,
             issue_number: Some(12),
             pr_number: None,
+            reason_code: None,
         };
         assert!(request.text().is_err());
         request.pr_number = Some(13);
@@ -514,6 +593,31 @@ mod tests {
         assert!(serde_json::from_value::<NotificationRequest>(json!({
             "key": "a".repeat(64), "run_id": "run-123", "status": "needs_human", "text": "private"
         })).is_err());
+    }
+
+    #[test]
+    fn maintenance_notification_explains_missing_issue_and_typed_reason() {
+        let mut request: NotificationRequest = serde_json::from_value(json!({
+            "key": "b".repeat(64), "run_id": "safe-run", "status": "needs_human",
+            "reason_code": "dependency_unavailable"
+        }))
+        .expect("bounded notification");
+        let text = request.text().expect("text");
+        assert!(text.contains("Для этого разбора issue пока не указан"));
+        assert!(!text.contains("Issue оставлен открытым"));
+        assert!(text.contains("Проверьте доступность GitHub"));
+        assert!(text.contains("https://github.com/iamwavecut/openplotva/issues?"));
+        request.issue_number = Some(12);
+        let text = request.text().expect("linked text");
+        assert!(text.contains("openplotva/issues/12"));
+        assert!(!text.contains("Для этого разбора issue пока не указан"));
+        assert!(
+            serde_json::from_value::<NotificationRequest>(json!({
+                "key": "b".repeat(64), "run_id": "safe-run", "status": "needs_human",
+                "reason_code": "private-provider-canary"
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]

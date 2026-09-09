@@ -12,6 +12,37 @@ from gateway import RunGateway
 
 
 class GatewayTests(unittest.TestCase):
+    def test_stream_quota_stops_job_before_provider_closes_connection(self):
+        release = threading.Event()
+        class Provider(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                self.wfile.write(b'data: {"error":{"type":"rate_limit_error"}}\n\n')
+                self.wfile.flush()
+                release.wait(5)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with RunGateway(('127.0.0.1', 0), 'http://127.0.0.1:' + str(server.server_port),
+                            'synthetic-token', 1, None, None, 10) as gateway:
+                request = urllib.request.Request('http://127.0.0.1:' + str(gateway.address[1]) + '/v1/chat/completions',
+                    data=b'{"model":"glm-5.3","messages":[]}', headers={'Authorization': 'Bearer ' + gateway.token})
+                with urllib.request.urlopen(request, timeout=3):
+                    self.assertTrue(gateway.quota_unavailable.wait(1), 'quota must not wait for stream EOF')
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_native_quota_response_defers_without_exposing_provider_body(self):
         class Provider(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -75,6 +106,19 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.usage["input_tokens"], 12)
         self.assertEqual(gateway.usage["output_tokens"], 3)
         self.assertNotIn("secret", json.dumps(gateway.usage))
+
+    def test_stream_quota_is_not_mistaken_for_successful_http(self):
+        gateway = RunGateway(("127.0.0.1", 0), "http://127.0.0.1:1", "secret", 1, None, None, 10)
+        self.addCleanup(gateway.server.server_close)
+        gateway.observe_usage(b'data: {"error":{"type":"rate_limit_error","message":"private-canary"}}\n\n')
+        self.assertTrue(gateway.quota_unavailable.is_set())
+        self.assertNotIn("private-canary", json.dumps(gateway.usage))
+
+    def test_non_quota_stream_error_does_not_pause_shared_plan(self):
+        gateway = RunGateway(("127.0.0.1", 0), "http://127.0.0.1:1", "secret", 1, None, None, 10)
+        self.addCleanup(gateway.server.server_close)
+        gateway.observe_usage(b'data: {"error":{"type":"authentication_error","message":"private-canary"}}\n\n')
+        self.assertFalse(gateway.quota_unavailable.is_set())
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ class API:
         self.receipts[payload['key']] = {'key': payload['key'], 'state': self.delivery, 'telegram_message_id': 1 if self.delivery == 'sent' else None}
         return self.receipts[payload['key']]
     def notification(self, key):
+        if key not in self.receipts: raise Deferred('notification unavailable')
         self.receipts[key]['state'] = self.delivery
         self.receipts[key]['telegram_message_id'] = 1 if self.delivery == 'sent' else None
         return self.receipts[key]
@@ -39,6 +40,7 @@ class GH:
     def index(self): return list(self.items.values())+list(self.prs.values())
     def discussion(self, item): return {**item, 'comments': [], 'linked_prs': item.get('linked_prs', [])}
     def issue(self, number): return self.items[number]
+    def comments(self, number): return [value for value in self.comment_values.values() if value['number'] == number]
     def run(self, _): return dispatch()
     def ensure_labels(self): return {}
     def labels_ready(self): return True
@@ -92,6 +94,28 @@ class ControllerTests(unittest.TestCase):
         self.controller.poll_incidents(); self.controller.schedule_incidents()
         return self.state.jobs()[0]
 
+    def test_exhausted_launch_limit_waits_without_context_io_or_failure_attempts(self):
+        for stage, count in (('initial', 30), ('deep', 10)):
+            with self.subTest(stage=stage):
+                self.state.db.execute('DELETE FROM jobs')
+                self.state.db.execute('DELETE FROM starts')
+                self.state.db.execute('DELETE FROM initial_launches')
+                for number in range(count):
+                    prior = self.state.new_job(stage, str(number), number+1)
+                    self.state.claim(prior['id'])
+                    self.state.finish_run(prior['id'], 0, {})
+                    self.state.update_job(prior['id'], status='done')
+                job = self.state.new_job(stage, 'waiting', 100)
+                def forbidden(*args): raise AssertionError('No external context IO before launch admission')
+                self.runner.refresh_source = forbidden
+                self.gh.issue = forbidden
+                self.controller.prepare_run()
+                current = self.state.job(job['id'])
+                self.assertEqual(current['status'], 'queued')
+                self.assertEqual(current['attempts'], 0)
+                self.assertEqual(current['next_at'], self.now+86400)
+                self.assertNotIn('context', current)
+
     def known_ready_incident(self):
         self.incident(); self.controller.run_next()
         deep=self.controller.enqueue(7,'123')
@@ -107,7 +131,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_review_loads_linked_pr_discussion_when_rest_comments_is_a_count(self):
         deep = self.known_ready_incident()
-        self.state.update_job(deep['id'], stage='review', status='queued')
+        self.state.update_job(deep['id'], stage='revise', status='queued')
         self.gh.prs[8]['comments'] = 2
         comments = [{'id': 20, 'body': 'Clarify the affected route.'},
                     {'id': 21, 'body': 'The existing patch needs no behavioral change.'}]
@@ -306,7 +330,7 @@ class ControllerTests(unittest.TestCase):
         result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,'patch_path':'/offline',
             'checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],
             'feedback':[{'kind':'thread','id':'THREAD_1','action':'fixed','body':'The reproduced lock inversion is fixed and checked.'}]}
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             branch='fix/issue-7',rounds=4,feedback=[artifact],result=result,status='result')
         controller.process_results(); controller.poll_reviews()
         current=self.state.job(job['id'])
@@ -318,6 +342,23 @@ class ControllerTests(unittest.TestCase):
         self.now+=61; controller.poll_reviews()
         self.assertEqual(self.state.job(job['id'])['status'],'queued')
         self.assertEqual(self.state.job(job['id'])['rounds'],5)
+
+    def test_review_quota_wait_preserves_rounds_and_failed_resumption_requests_human(self):
+        self.gh.items[7] = issue()
+        execution = {'state': 'quota_wait', 'check_id': 19, 'head_sha': BASE}
+        self.gh.review_snapshot = lambda _: {'head': BASE, 'pr': {'state': 'open'},
+            'review_execution': execution, 'checks': [], 'threads': [], 'artifacts': []}
+        job = self.state.new_job('revise', 'sig', 1, issue_number=7, pr_number=8,
+            published_sha=BASE, status='waiting_ci', rounds=3)
+        self.controller.poll_reviews()
+        self.assertEqual(self.state.job(job['id'])['status'], 'waiting_ci')
+        self.assertEqual(self.state.job(job['id'])['rounds'], 3)
+        self.state.set_setting('review_waits', {'8': {'phase': 'needs_human', 'receipt': execution}})
+        self.now += 61
+        self.controller.poll_reviews()
+        self.assertEqual(self.state.job(job['id'])['status'], 'needs_human')
+        self.assertEqual(self.state.job(job['id'])['rounds'], 3)
+        self.assertEqual([n['payload']['status'] for n in self.state.records('notifications')], ['paused', 'needs_human'])
 
     def test_diagnostic_fix_acknowledges_previous_check_after_push_then_reviews_new_head(self):
         github=self.gh; github.items[7]=issue(); github.prs[8]={'state':'open','head':{'sha':BASE}}
@@ -334,7 +375,7 @@ class ControllerTests(unittest.TestCase):
         result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,'patch_path':'/offline',
             'checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],
             'feedback':[{'kind':'comment','id':'check_2','action':'fixed','body':'The failing case is fixed and tested.'}]}
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             branch='fix/issue-7',feedback=[artifact],result=result,status='result')
         self.controller.process_results()
         current=self.state.job(job['id'])
@@ -350,7 +391,7 @@ class ControllerTests(unittest.TestCase):
                 github=ReviewGitHub(); github.resolved=False
                 artifact=github.review_snapshot(8)['artifacts'][0]
                 controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
-                job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+                job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
                     feedback=[artifact],result={'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The reproduction disproves this finding.'}]})
                 original=github.reply_thread
                 def concurrent_change(thread_id,body):
@@ -367,7 +408,7 @@ class ControllerTests(unittest.TestCase):
     def test_feedback_rejects_concurrent_head_change_even_when_body_matches(self):
         github=ReviewGitHub(); artifact=github.review_snapshot(8)['artifacts'][0]
         controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             feedback=[artifact],result={'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The original interleaving was disproved.'}]})
         github.head='c'*40
         with self.assertRaises(InvalidResult): controller.handle_feedback(job)
@@ -418,9 +459,33 @@ class ControllerTests(unittest.TestCase):
             self.now+=901
         self.assertEqual(current['active_seconds'],12)
         self.assertEqual(current['usage'],{'tokens':28})
-        self.assertEqual(self.state.status()['starts']['initial'],4)
+        self.assertEqual(self.state.status()['starts']['initial'],1)
         self.state.set_enabled(False); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
         self.state.set_enabled(True); self.state.cancel(job['id']); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
+
+    def test_ordinary_retry_after_quota_recovery_counts_as_another_short_launch(self):
+        job = self.incident()
+        self.runner.run = lambda *_: (_ for _ in ()).throw(QuotaUnavailable(retry_after_seconds=120))
+        self.controller.run_next(); self.now += 121
+        self.runner.run = lambda *_: (_ for _ in ()).throw(Deferred('ordinary dependency failure'))
+        self.controller.run_next()
+        self.assertFalse(self.state.job(job['id']).get('quota_resume'))
+        self.assertEqual(self.state.status()['starts']['initial'], 1)
+        self.now += 31
+        self.controller.run_next()
+        self.assertEqual(self.state.status()['starts']['initial'], 2)
+
+    def test_quota_blocks_other_jobs_and_restart_does_not_lose_cooldown(self):
+        job = self.incident()
+        self.runner.run = lambda *_: (_ for _ in ()).throw(QuotaUnavailable(retry_after_seconds=120))
+        self.controller.run_next()
+        second = self.state.new_job('initial', 'other', 102)
+        self.state.recover()
+        self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(self.state.job(second['id'])['status'], 'queued')
+        self.assertEqual(self.state.status()['starts']['initial'], 1)
+        self.now += 121
+        self.assertEqual(self.controller.prepare_run()['id'], job['id'])
 
     def test_service_future_quota_backoff_survives_recovery(self):
         job=self.state.new_job('initial','sig',1,attempts=2)
@@ -438,6 +503,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_service_future_quota_deferral_honors_cancel_and_active_budget(self):
         for cancelled in (False,True):
+            self.state.provider_recovered()
             job=self.state.new_job('deep','sig',1,issue_number=7,active_seconds=14398)
             self.gh.items[7]=issue()
             # Use distinct issue budgets for the second case.
@@ -474,7 +540,7 @@ class ControllerTests(unittest.TestCase):
         controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
         # Snapshot comes from the real GitHub adapter, including the external thread body.
         artifact=github.review_snapshot(8)['artifacts'][0]
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             feedback=[artifact],result={'diagnosis':diagnosis(),'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The tested lock ordering excludes this interleaving.'}]})
         with self.assertRaises(Deferred): controller.handle_feedback(job)
         self.assertEqual(github.resolve_calls,0)
@@ -497,7 +563,7 @@ class ControllerTests(unittest.TestCase):
         target={**issue(),'number':99,'kind':'issue','title':'Specific target','body':'Current owner requirements.\n\n## Acceptance\n\n- Cancellation survives concurrent result writes.\n\n## Impact\n\nOne worker.'}
         self.gh.items[99]=target
         self.gh.index=lambda: [{'kind':'issue','number':n,'title':'queue timeout','body':'Older investigation'} for n in range(1,31)]
-        for stage in ('deep','review'):
+        for stage in ('deep','revise'):
             job=self.state.new_job(stage,'sig',1,issue_number=99)
             context=self.controller.context(job)
             self.assertNotIn(99,[i['number'] for i in context['history']])

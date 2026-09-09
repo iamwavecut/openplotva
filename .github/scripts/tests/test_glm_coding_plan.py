@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'tools'))
 try:
     glm = importlib.import_module("glm_coding_plan")
 except ModuleNotFoundError:
@@ -87,6 +88,19 @@ class GlmCodingPlanTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assert_safe()
 
+    async def test_flash_review_uses_coding_plan_without_changing_worker_model(self):
+        from maintenance.contracts import MODEL
+        with self.client(), contextlib.redirect_stdout(self.output):
+            try:
+                answer, finish = await glm.GlmCodingPlanHandler("PRIVATE_KEY").chat_completion(
+                    "openai/glm-5.3-flash", "system", "user")
+            except glm.GlmCompletionError:
+                self.fail("Flash review was rejected instead of using the Coding Plan adapter")
+        self.assertTrue(answer)
+        self.assertEqual(finish, "stop")
+        self.assertEqual(json.loads(self.requests[0].content)["model"], "glm-5.3-flash")
+        self.assertEqual(MODEL, "glm-5.3")
+
     async def test_rejects_error_eof_truncation_and_empty_without_retry(self):
         cases = [
             ([{"type": "error", "error": {"message": "PRIVATE_KEY"}}], "stream_error"),
@@ -107,9 +121,17 @@ class GlmCodingPlanTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_error_is_safe_and_not_retried(self):
         with self.client(status=429), self.assertRaises(glm.GlmCompletionError) as raised:
             await self.invoke()
-        self.assertEqual(str(raised.exception), "http_error")
+        self.assertEqual(str(raised.exception), "quota_unavailable")
+        self.assertIsNone(raised.exception.retry_after_seconds)
         self.assertEqual(len(self.requests), 1)
         self.assert_safe(raised.exception)
+
+    async def test_stream_rate_limit_is_deferred_but_auth_failure_is_not(self):
+        for code, expected in (("rate_limit_error", "quota_unavailable"), ("authentication_error", "stream_error")):
+            with self.client([{"type": "error", "error": {"type": code, "message": "PRIVATE_KEY"}}]), self.assertRaises(glm.GlmCompletionError) as raised:
+                await self.invoke()
+            self.assertEqual(str(raised.exception), expected)
+            self.assert_safe(raised.exception)
 
     async def test_whole_call_deadline_and_latched_failure(self):
         class Stalled(httpx.AsyncByteStream):
@@ -239,6 +261,43 @@ class PairIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ai_handler", self.suggester.call_args.kwargs)
         self.fallback.assert_not_awaited()
 
+    async def test_flash_injected_into_review_and_suggestions_with_no_model_fallback(self):
+        self.settings.config.model = 'openai/glm-5.3-flash'
+        review_tool, suggestion_tool = self.tool(**self.pair.ai_handler_options()), self.tool(**self.pair.ai_handler_options())
+        self.reviewer.return_value, self.suggester.return_value = review_tool, suggestion_tool
+        await self.pair.generate_review('public-pr')
+        await self.pair.generate_suggestions('public-pr')
+        self.assertEqual(review_tool._prepare_prediction.call_args.args, ('openai/glm-5.3-flash',))
+        self.assertEqual(suggestion_tool.prepare_prediction_main.call_args.args, ('openai/glm-5.3-flash',))
+        self.fallback.assert_not_awaited()
+
+    async def test_quota_main_publishes_deferred_receipt_and_exits_without_success(self):
+        self.pair.GLOBAL_LOGGING_WORKER.flush = AsyncMock()
+        self.pair.GLOBAL_LOGGING_WORKER.stop = AsyncMock()
+        self.pair.run = AsyncMock(side_effect=glm.GlmQuotaUnavailable(120))
+        env = {'PR_NUMBER': '8', 'PR_HEAD_SHA': 'a'*40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+               'GITHUB_TOKEN': 'PRIVATE_KEY', 'PR_URL': 'https://github.com/iamwavecut/openplotva/pull/8'}
+        requests = []
+        async def receive(request):
+            requests.append(request)
+            data = json.loads(request.content) if request.content else {}
+            if request.method == 'GET':
+                return httpx.Response(200, json={'state': 'open', 'draft': False,
+                    'head': {'sha': 'a'*40, 'repo': {'full_name': 'iamwavecut/openplotva'}},
+                    'base': {'repo': {'full_name': 'iamwavecut/openplotva'}}})
+            return httpx.Response(201 if request.method == 'POST' else 200, json={
+                **data, 'id': 9, 'head_sha': 'a'*40, 'external_id': 'pr-agent:123:1'})
+        real_client = httpx.AsyncClient
+        with patch.dict(self.pair.os.environ, env), patch.object(httpx, 'AsyncClient', lambda **kwargs:
+                real_client(**kwargs, transport=httpx.MockTransport(receive))), contextlib.redirect_stdout(io.StringIO()):
+            status = await self.pair.main()
+        self.assertEqual(status, 75)
+        self.assertEqual([r.method for r in requests], ['GET', 'POST', 'PATCH'])
+        payload = json.loads(requests[-1].content)
+        self.assertEqual(payload['conclusion'], 'neutral')
+        self.assertEqual(json.loads(payload['output']['summary'])['state'], 'quota_wait')
+        self.assertNotIn('PRIVATE_KEY', requests[-1].content.decode())
+
     async def test_swallowed_reflection_failure_still_fails_pair(self):
         handler = glm.GlmCodingPlanHandler("PRIVATE_KEY")
         tool = self.tool()
@@ -251,15 +310,15 @@ class PairIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(glm.GlmCompletionError):
             await self.pair.generate_suggestions("public-pr")
 
-    async def test_other_model_keeps_existing_handler_and_dispatch(self):
+    async def test_other_model_cannot_escape_the_coding_plan_adapter(self):
         self.settings.config.model = "openai/other-model"
         self.reviewer.side_effect = lambda *_, **kwargs: self.tool(**kwargs)
         self.suggester.side_effect = lambda *_, **kwargs: self.tool(**kwargs)
-        await self.pair.generate_review("public-pr")
-        await self.pair.generate_suggestions("public-pr")
-        self.assertEqual(self.reviewer.call_args.kwargs, {})
-        self.assertEqual(self.suggester.call_args.kwargs, {})
-        self.assertEqual(self.fallback.await_count, 2)
+        with self.assertRaises(glm.GlmCompletionError):
+            await self.pair.generate_review("public-pr")
+        with self.assertRaises(glm.GlmCompletionError):
+            await self.pair.generate_suggestions("public-pr")
+        self.fallback.assert_not_awaited()
 
 
 if __name__ == "__main__":

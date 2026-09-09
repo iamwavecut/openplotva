@@ -28,11 +28,11 @@ class Deferred(Exception):
 class QuotaUnavailable(Deferred):
     """The Coding Plan must recover before this retained job can run again."""
 
-    def __init__(self, *, usage=None, active_seconds=0, retry_after_seconds=3600):
+    def __init__(self, *, usage=None, active_seconds=0, retry_after_seconds=None):
         super().__init__("GLM Coding Plan quota is temporarily unavailable")
         self.usage = dict(usage or {})
         self.active_seconds = active_seconds
-        self.retry_after_seconds = max(60, min(86400, retry_after_seconds))
+        self.retry_after_seconds = retry_after_seconds
 
 
 class InvalidResult(Exception):
@@ -115,6 +115,14 @@ def diagnosis(value: object) -> dict:
 
 
 def validate_output(value, stage):
+    if stage == 'triage':
+        if not isinstance(value, dict) or set(value) != {'action', 'reply', 'reason'}:
+            raise InvalidResult('unexpected owner feedback decision fields')
+        if value['action'] not in ('reply', 'continue', 'close_pr'):
+            raise InvalidResult('invalid owner feedback action')
+        text(value['reply'], 12000)
+        text(value['reason'], 4000)
+        return value
     if not isinstance(value, dict) or set(value) != {"diagnosis", "outcome", "feedback"}:
         raise InvalidResult("unexpected worker result fields")
     diagnosis(value["diagnosis"])

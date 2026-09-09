@@ -5,14 +5,22 @@ import math
 import time
 
 import httpx
+from maintenance.quota import limited, retry_after
 
 
-MODEL = "openai/glm-5.3"
+MODEL = "openai/glm-5.3-flash"
+MODELS = {MODEL, "openai/glm-5.3"}
 ENDPOINT = "https://api.z.ai/api/anthropic/v1/messages"
 
 
 class GlmCompletionError(RuntimeError):
     """A static failure classification safe for PR-Agent's exception logging."""
+
+
+class GlmQuotaUnavailable(GlmCompletionError):
+    def __init__(self, delay=None):
+        super().__init__('quota_unavailable')
+        self.retry_after_seconds = delay
 
 
 class GlmCodingPlanHandler:
@@ -40,12 +48,12 @@ class GlmCodingPlanHandler:
         started = time.monotonic()
         receipt = {"phase": "starting", "attempts": 1, "usage": {}}
         try:
-            if model != MODEL or img_path is not None:
+            if model not in MODELS or img_path is not None:
                 raise GlmCompletionError("unsupported_request")
             if not isinstance(system, str) or not isinstance(user, str):
                 raise GlmCompletionError("invalid_prompt")
             payload = {
-                "model": "glm-5.3", "system": system,
+                "model": model.removeprefix('openai/'), "system": system,
                 "messages": [{"role": "user", "content": user}],
                 "max_tokens": 131072, "stream": True,
                 "thinking": {"type": "enabled", "budget_tokens": 4096, "display": "summarized"},
@@ -65,6 +73,17 @@ class GlmCodingPlanHandler:
                         receipt["http_status"] = response.status_code
                         receipt["headers_seconds"] = round(time.monotonic() - started, 3)
                         if response.status_code != 200:
+                            raw = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                raw.extend(chunk[:8192-len(raw)])
+                                if len(raw) >= 8192:
+                                    break
+                            try:
+                                document = json.loads(raw)
+                            except ValueError:
+                                document = None
+                            if limited(response.status_code, document):
+                                raise GlmQuotaUnavailable(retry_after(response.headers.get('retry-after')))
                             raise GlmCompletionError("http_error")
                         if response.headers.get("content-type", "").split(";")[0].strip() != "text/event-stream":
                             raise GlmCompletionError("invalid_content_type")
@@ -112,6 +131,8 @@ class GlmCodingPlanHandler:
             data_lines.clear()
             kind = event["type"]
             if kind == "error":
+                if limited(200, event):
+                    raise GlmQuotaUnavailable()
                 raise GlmCompletionError("stream_error")
             if kind == "ping":
                 continue

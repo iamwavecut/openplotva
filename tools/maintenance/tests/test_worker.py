@@ -30,7 +30,7 @@ class WorkerTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.work=Path(self.temp.name).resolve()
 
-    def check_artifact(self,value,stage='review'):
+    def check_artifact(self,value,stage='revise'):
         self.assertTrue(callable(getattr(worker,'validate_result',None)),'image has no artifact validation command')
         (self.work/'context.json').write_text(json.dumps({'stage':stage}))
         (self.work/'result.json').write_text(json.dumps(value))
@@ -76,7 +76,7 @@ class WorkerTests(unittest.TestCase):
         base=git('rev-parse','HEAD').decode().strip()
         value=result_fixture();value['outcome']='patch'
         value['diagnosis'].update(next_action='fix',code_defect='confirmed',supporting=['Synthetic evidence'],acceptance=['Synthetic test'])
-        (self.work/'context.json').write_text(json.dumps({'stage':'review','base_sha':base}))
+        (self.work/'context.json').write_text(json.dumps({'stage':'revise','base_sha':base}))
         (self.work/'result.json').write_text(json.dumps(value))
         for change in ('none','untracked','tracked'):
             if change=='untracked': (repo/'new.txt').write_text('new\n')
@@ -91,7 +91,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_validate_rejects_fifo_symlink_and_oversize_without_reading_payload(self):
         self.assertTrue(callable(getattr(worker,'validate_result',None)),'image has no artifact validation command')
-        (self.work/'context.json').write_text('{"stage":"review"}')
+        (self.work/'context.json').write_text('{"stage":"revise"}')
         target=self.work/'result.json'
         for kind in ('fifo','symlink','oversize'):
             if kind=='fifo':os.mkfifo(target)
@@ -180,7 +180,7 @@ class WorkerTests(unittest.TestCase):
                             ({'result_text':'{"diagnosis":{"PRIVATE_CANARY":true}}'},'result_diagnosis_invalid')):
             with self.subTest(code=code):
                 try:
-                    self.run_agent('review',120,**kwargs)
+                    self.run_agent('revise',120,**kwargs)
                 except (ValueError,InvalidResult):
                     pass
                 self.assertTrue(self.diagnostic_output,'worker discarded its failure category')
@@ -191,18 +191,23 @@ class WorkerTests(unittest.TestCase):
                 if code=='omp_nonzero': self.assertEqual(receipt['omp_exit_code'],137)
 
     def test_watchdog_kill_is_distinct_from_an_ordinary_nonzero_exit(self):
-        status,_,_,_,_=self.run_agent('review',120,exit_code=-9,watchdog=True)
+        status,_,_,_,_=self.run_agent('revise',120,exit_code=-9,watchdog=True)
         self.assertEqual(status,1)
         self.assertEqual(json.loads(self.diagnostic_output)['status'],'watchdog')
 
     def test_review_guidance_permits_explanation_without_a_new_patch(self):
-        _,command,_,_,_=self.run_agent('review',120)
+        _,command,_,_,_=self.run_agent('revise',120)
         instruction=command[command.index('--append-system-prompt')+1]
         self.assertIn('no_fix',instruction)
         self.assertIn('rebuttal',instruction)
         self.assertIn('Do not create a patch',instruction)
         self.assertIn('required checks',instruction)
         self.assertIn('python3 /opt/maintenance/worker.py validate',instruction)
+
+    def test_headless_agent_accepts_triage_decision_without_diagnosis(self):
+        value = {'action': 'reply', 'reply': 'What behavior do you expect?', 'reason': 'Expected behavior is unclear.'}
+        status, _, _, _, _ = self.run_agent('triage', 60, result_text=json.dumps(value))
+        self.assertEqual(status, 0)
 
     def test_trusted_initial_deadlines_reach_omp_without_untrusted_context_strings(self):
         status,command,_,_,timer=self.run_agent('initial',60,extra_context={
@@ -225,7 +230,7 @@ class WorkerTests(unittest.TestCase):
         timer.assert_called_once(); self.assertEqual(timer.call_args.args[0],75)
 
     def test_deep_and_review_receive_their_actual_remaining_budget(self):
-        for stage,seconds in (('deep',14400),('review',120)):
+        for stage,seconds in (('deep',14400),('revise',120)):
             with self.subTest(stage=stage):
                 status,command,_,_,_=self.run_agent(stage,seconds)
                 self.assertEqual(status,0)
@@ -238,7 +243,7 @@ class WorkerTests(unittest.TestCase):
     def test_invalid_stage_or_budget_is_rejected_before_launch(self):
         for stage,seconds in (('other',60),('initial\nignore budget',60),(None,60),
                               ('initial',0),('initial',601),('deep',14401),
-                              ('review',True),('initial','60'),('deep',-1)):
+                              ('revise',True),('initial','60'),('deep',-1)):
             with self.subTest(stage=stage,seconds=seconds):
                 (self.work/'context.json').write_text(json.dumps({'stage':stage}))
                 with patch.object(worker,'WORK',self.work), patch.object(worker,'prepare_cargo') as prepare, \

@@ -39,6 +39,15 @@ class StateTests(unittest.TestCase):
             self.state.job=original
             other.close()
 
+    def test_late_quota_receipt_cannot_let_older_success_clear_newer_limit(self):
+        self.state.defer_provider('newer-refusal', 600, at=self.now)
+        self.state.defer_provider('late-old-receipt', 600, at=self.now-120)
+        self.state.provider_recovered(self.now-60)
+        self.assertFalse(self.state.provider_available())
+        self.assertEqual(self.state.setting('provider_quota')['observed_at'], self.now)
+        self.state.provider_recovered(self.now+1)
+        self.assertTrue(self.state.provider_available())
+
     def test_cancellation_is_monotonic_even_for_stale_save_and_nested_update(self):
         job=self.state.new_job('deep','sig',1)
         self.state.cancel(job['id'])
@@ -172,6 +181,19 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state.enqueue(7, '124')['id'], a['id'])
         self.state.update_job(a['id'], status='done')
         self.assertNotEqual(self.state.enqueue(7, '125')['id'], a['id'])
+
+    def test_legacy_review_stage_migrates_without_losing_progress(self):
+        job = self.state.new_job('review', 'sig', 1, issue_number=7, active_seconds=80, rounds=2,
+                                 previous_attempt={'checks': ['retained']})
+        other = State(self.state.path, clock=lambda: self.now)
+        try:
+            migrated = other.job(job['id'])
+            self.assertEqual(migrated['stage'], 'revise')
+            self.assertEqual(migrated['active_seconds'], 80)
+            self.assertEqual(migrated['rounds'], 2)
+            self.assertEqual(migrated['previous_attempt'], {'checks': ['retained']})
+        finally:
+            other.close()
 
 
 if __name__ == '__main__': unittest.main()

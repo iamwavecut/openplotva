@@ -21,11 +21,15 @@ from pathlib import Path
 
 from .api import MaintenanceAPI
 from .contracts import (DEEP_SECONDS, INITIAL_SECONDS, MAX_ROUNDS, REPOSITORY,
-                        Deferred, InvalidResult, QuotaUnavailable, diagnosis, fingerprint, identifier, sha, text)
+                        Deferred, InvalidResult, QuotaUnavailable, diagnosis, fingerprint, identifier, sha, text, validate_output)
+from .conversation import Conversation
 from .github import GitHub, is_owner, select_candidates, validate_dispatch, validate_issue
 from .privacy import (boundary_for_job, hydrate_private_context, public_feedback,
                       public_issue_body, public_title)
 from .state import State
+from .review_queue import ReviewQueue
+from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
+from .notifications import coalesce_pending, notification_payload
 
 DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
                   'Danger PR rules', 'PR-Agent review and suggestions', 'CodeQL Rust', 'Semgrep CE', 'Maintenance automation']
@@ -68,15 +72,23 @@ class Controller:
         self.last_incidents = self.last_review = self.last_history = 0
         self.future = None
         self.future_job = None
+        self.conversation = Conversation(self)
+        self.last_conversation = 0
+        self.review_queue = ReviewQueue(state, github)
+        self.last_review_queue = 0
 
     def effect(self, key, kind, payload, reconcile, mutate, job=None):
         if job and self.state.cancelled(job['id']): raise InvalidResult('cancelled job cannot publish')
+        if job and job['stage'] in ('deep', 'revise') and job.get('issue_number'):
+            self.conversation.poll(job['issue_number'])
+        if job and self.conversation.blocked(job): raise Deferred('publication awaits owner feedback')
         record = self.state.record('effects', key)
         if record and record['payload'] != payload: raise InvalidResult('durable effect intent changed')
         if record and record['state'] == 'done': return record['result']
         if record is None:
             record = {'key': key, 'kind': kind, 'payload': payload, 'state': 'intent', 'attempts': 0}
             self.state.put_record('effects', key, record)
+        if job and job['stage'] == 'triage': self.conversation.current(job)
         found = reconcile()
         if found is not None:
             record.update(state='done', result=found); self.state.put_record('effects', key, record); return found
@@ -87,6 +99,7 @@ class Controller:
         # Persist the crash boundary before sending even the first mutation.
         record.update(state='uncertain'); self.state.put_record('effects', key, record)
         if job and self.state.cancelled(job['id']): raise InvalidResult('cancelled job cannot publish')
+        if job and job['stage'] == 'triage': self.conversation.current(job)
         value = mutate()
         record.update(state='done', result=value); self.state.put_record('effects', key, record)
         return value
@@ -167,7 +180,7 @@ class Controller:
             safe_history.append(projected)
         context = {'incident': incident, 'history': safe_history, 'evidence': self.api.evidence(job['incident_id']),
                    'deployed': self.runner.host_snapshot(), 'feedback': job.get('feedback', [])}
-        if job['stage'] in ('deep','review'):
+        if job['stage'] in ('deep','revise','triage'):
             target=self.github.issue(job['issue_number'])
             validate_issue(target,job['issue_number'])
             body=target.get('body') or ''
@@ -176,27 +189,35 @@ class Controller:
                 'state':target['state'],'body':body,'acceptance_criteria':'\n\n'.join(section.strip() for section in sections).strip() or None}
         if job.get('previous_attempt'): context['previous_attempt'] = job['previous_attempt']
         # Keep the exact initial diagnosis in the private job context so a
-        # deep/review worker can repair from the original facts after a restart.
+        # Repair workers can use the original facts after a restart.
         initial = [candidate for candidate in self.state.jobs()
                    if candidate['stage'] == 'initial' and candidate['signature'] == job['signature']
                    and isinstance(candidate.get('result'), dict)
                    and isinstance(candidate['result'].get('diagnosis'), dict)]
         initial_job = max(initial, key=lambda candidate: (candidate.get('incident_id', 0), candidate['id'])) if initial else None
         context = hydrate_private_context(context, initial_job)
+        if job['stage'] == 'triage': context['conversation'] = self.conversation.context(job)
+        elif job['stage'] in ('deep', 'revise'): context['owner_guidance'] = self.conversation.guidance(job['issue_number'])
         text(json.dumps(context), 1024*1024)
         return context
 
     def prepare_run(self):
-        if not self.state.enabled(): return None
-        for job in self.state.jobs({'queued'}):
+        if not self.state.enabled() or not self.state.provider_available(): return None
+        for job in sorted(self.state.jobs({'queued'}), key=lambda item: item['stage'] != 'triage'):
+            if self.conversation.blocked(job): continue
             if job['next_at'] > self.clock(): continue
-            budget = INITIAL_SECONDS if job['stage'] == 'initial' else DEEP_SECONDS
-            spent=self.state.issue_usage(job['issue_number']) if job['stage']!='initial' and job.get('issue_number') else {'active_seconds':job['active_seconds'],'cycles':job['rounds']}
+            short = job['stage'] in ('initial', 'triage')
+            budget = INITIAL_SECONDS if short else DEEP_SECONDS
+            spent=self.state.issue_usage(job['issue_number']) if not short and job.get('issue_number') else {'active_seconds':job['active_seconds'],'cycles':job['rounds']}
             already_started=self.state.db.execute('SELECT 1 FROM starts WHERE job_id=?',(job['id'],)).fetchone() is not None
             if spent['active_seconds'] >= budget or spent['cycles']+(0 if already_started else 1)>MAX_ROUNDS:
                 self.needs_human(job, 'active time or repair cycle budget exhausted'); continue
+            launch_after = self.state.launch_after(job)
+            if launch_after > self.clock():
+                self.state.update_job(job['id'], next_at=launch_after, reason='waiting for rolling daily launch allowance')
+                continue
             try:
-                if job['stage'] != 'initial':
+                if job['stage'] in ('deep', 'revise'):
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')
                     validate_issue(self.github.issue(job['issue_number']), job['issue_number'])
                     if self.reuse_known_work(job): continue
@@ -250,17 +271,19 @@ class Controller:
         return self.state.finish_run(job['id'],active,usage)
 
     def defer_quota(self, job, error):
-        delay=getattr(error,'retry_after_seconds',3600)
-        if not isinstance(delay,(int,float)) or isinstance(delay,bool) or not math.isfinite(delay): delay=3600
-        delay=max(60,min(86400,delay))
+        first_pause = not self.state.setting('provider_quota')
         # Accounting and rescheduling share a transaction so recovery cannot skip the quota delay.
         with self.state.transaction():
+            quota = self.state.defer_provider('worker:'+job['id']+':'+str(job.get('lease_started')),
+                                             getattr(error, 'retry_after_seconds', None))
             current=self.finish_failed_run(job,error)
             if current['cancelled']: return
-            current=self.state.update_job(job['id'],status='queued',next_at=self.clock()+delay,
+            current=self.state.update_job(job['id'],status='queued',next_at=quota['until'],quota_resume=True,
                 reason='GLM Coding Plan quota unavailable; waiting for quota recovery')
-        spent=self.state.issue_usage(current['issue_number'])['active_seconds'] if current['stage']!='initial' and current.get('issue_number') else current['active_seconds']
-        budget=INITIAL_SECONDS if current['stage']=='initial' else DEEP_SECONDS
+        if first_pause: self.notify(current, 'paused')
+        short = current['stage'] in ('initial', 'triage')
+        spent=self.state.issue_usage(current['issue_number'])['active_seconds'] if not short and current.get('issue_number') else current['active_seconds']
+        budget=INITIAL_SECONDS if short else DEEP_SECONDS
         if spent>=budget: self.needs_human(current,'active time budget exhausted while waiting for provider quota')
 
     def complete_future(self):
@@ -282,10 +305,16 @@ class Controller:
 
     def accept_result(self, job, result):
         try:
-            diagnosis(result['diagnosis'])
-            if set(result)-{'diagnosis','outcome','patch_path','base_sha','checks','usage','active_seconds','feedback','artifact_dir'}:
+            if job['stage'] == 'triage':
+                validate_output({key: result[key] for key in ('action', 'reply', 'reason')}, 'triage')
+                if result.get('patch_path') or result.get('checks'): raise InvalidResult('triage cannot produce a patch')
+                fields = {'action', 'reply', 'reason'}
+            else:
+                diagnosis(result['diagnosis'])
+                if result['outcome'] not in ('patch','no_fix','needs_human'): raise InvalidResult('invalid outcome')
+                fields = {'diagnosis', 'outcome', 'feedback'}
+            if set(result)-fields-{'patch_path','base_sha','checks','usage','active_seconds','artifact_dir'}:
                 raise InvalidResult('unexpected result receipt fields')
-            if result['outcome'] not in ('patch','no_fix','needs_human'): raise InvalidResult('invalid outcome')
             for feedback in result.get('feedback',[]): text(feedback['body'])
             text(json.dumps(result),3*1024*1024)
         except (InvalidResult,ValueError,KeyError,TypeError):
@@ -297,10 +326,14 @@ class Controller:
         active = result.get('active_seconds', 0)
         if not isinstance(active, (int, float)) or not math.isfinite(active) or active < 0: active = 0
         current = self.state.finish_run(job['id'], active, result.get('usage', {}))
-        if not current['cancelled']: self.state.update_job(job['id'], status='result', attempts=0, next_at=0)
+        self.state.provider_recovered(job.get('lease_started'))
+        if not current['cancelled']: self.state.update_job(job['id'], status='result', attempts=0, next_at=0, quota_resume=False)
 
     def retry(self, job, reason):
-        current = self.state.job(job['id'])
+        current = self.state.update_job(job['id'], quota_resume=False)
+        if self.conversation.blocked(current):
+            self.state.update_job(job['id'], status='result' if current.get('result') else 'queued',
+                                  reason='awaiting owner feedback'); return
         attempts = current['attempts']+1
         if attempts >= self.config.get('dependency_retries', 3): self.needs_human(current, reason+'; retry budget exhausted')
         else: self.state.update_job(job['id'], status='result' if current.get('result') else 'queued', attempts=attempts,
@@ -313,12 +346,12 @@ class Controller:
             self.state.put_incident(incident)
 
     def notify(self, job, status):
-        key = fingerprint({'run_id': job['id'], 'status': status})
-        if self.state.record('notifications', key): return
-        payload = {'key': key, 'run_id': job['id'], 'status': status}
-        for field in ('issue_number', 'pr_number'):
-            if job.get(field): payload[field] = job[field]
-        self.state.put_record('notifications', key, {'key': key, 'payload': payload, 'state': 'pending', 'posted': False})
+        payload = notification_payload(self.state, job, status)
+        key = payload['key']
+        with self.state.transaction():
+            if any(record.get('identity_key', record['key']) == key for record in coalesce_pending(self.state)): return
+            self.state.put_record('notifications', key,
+                {'key': key, 'identity_key': key, 'payload': payload, 'state': 'pending', 'posted': False})
 
     def needs_human(self, job, reason):
         if self.state.cancelled(job['id']): return
@@ -546,14 +579,18 @@ class Controller:
     def process_results(self):
         for job in self.state.jobs({'result'}):
             if job['next_at'] > self.clock() or job['cancelled']: continue
+            if self.conversation.blocked(job): continue
             try:
+                if job['stage'] == 'triage':
+                    self.conversation.process(job)
+                    continue
                 value = diagnosis(job['result']['diagnosis'])
                 if job['stage']=='initial': self.initial_result(job,value)
                 elif job['result']['outcome']=='patch': self.publish_patch(job,value)
-                elif job['stage']=='review' and job['result'].get('feedback') and not any(not c.get('passed') for c in job['result'].get('checks',[])):
+                elif job['stage']=='revise' and job['result'].get('feedback') and not any(not c.get('passed') for c in job['result'].get('checks',[])):
                     self.handle_feedback(job); self.state.update_job(job['id'],status='waiting_ci',result=None,last_poll=0)
                 elif job['result'].get('patch_path') and any(not c.get('passed') for c in job['result'].get('checks',[])) and job['rounds']+1 < MAX_ROUNDS:
-                    self.state.update_job(job['id'],stage='review',status='queued',rounds=job['rounds']+1,result=None,
+                    self.state.update_job(job['id'],stage='revise',status='queued',rounds=job['rounds']+1,result=None,
                         previous_attempt={'diagnosis':value,'checks':job['result']['checks']},
                         feedback=[{'kind':'check','id':c['name'],'body':'Isolated verification failed: '+c['name']} for c in job['result']['checks'] if not c.get('passed')])
                 else: self.needs_human(job,'deep investigation produced no verified fix; issue remains open')
@@ -562,20 +599,33 @@ class Controller:
 
     def poll_reviews(self):
         for job in self.state.jobs({'waiting_ci','ready'}):
+            if self.conversation.blocked(job): continue
             if job.get('last_poll',0)+self.config.get('review_poll_seconds',60)>self.clock(): continue
             try:
-                snapshot=self.github.review_snapshot(job['pr_number'])
+                snapshot=self.conversation.filter_review(self.github.review_snapshot(job['pr_number']), job['issue_number'])
                 self.state.update_job(job['id'],last_poll=self.clock())
                 if snapshot['pr']['state']!='open':
                     self.state.update_job(job['id'],status='done',reason='pull request closed externally'); continue
                 if snapshot['head'] != job['published_sha']:
                     self.needs_human(job,'pull request HEAD changed outside controller'); continue
                 self.state.update_job(job['id'],poll_failures=0)
+                execution = snapshot.get('review_execution') or {}
+                review_wait = self.state.setting('review_waits', {}).get(str(job['pr_number']), {})
+                previous = review_wait.get('receipt', {})
+                if (review_wait.get('phase') == 'needs_human' and previous.get('head_sha') == snapshot['head']
+                        and (not execution or execution.get('check_id') == previous.get('check_id'))
+                        and execution.get('state') != 'complete'):
+                    self.needs_human(job, 'PR review resumption failed or could not be confirmed'); continue
+                if execution.get('state') == 'quota_wait':
+                    self.state.update_job(job['id'], status='waiting_ci', reason='PR review waiting for usage quota')
+                    self.notify(job, 'paused')
+                    continue
                 handled=job.get('handled',{})
                 if review_ready(snapshot,self.config.get('required_checks',DEFAULT_CHECKS),handled):
                     self.state.update_job(job['id'],status='ready'); self.notify(job,'pr_ready'); continue
                 feedback=[a for a in snapshot['artifacts'] if handled.get(a['kind']+':'+str(a['id'])) != {'hash':a['hash'],'head':snapshot['head']}]
-                failures=[c for c in snapshot['checks'] if c.get('status')=='completed' and c.get('conclusion') not in ('success','neutral','skipped')]
+                failures=[c for c in snapshot['checks'] if c['name'] not in (REVIEW_CHECK, EXECUTION_CHECK)
+                          and c.get('status')=='completed' and c.get('conclusion') not in ('success','neutral','skipped')]
                 feedback += [{'kind':'check','id':str(c.get('id',c['name'])),'body':text(c['name']+': '+str(c.get('conclusion'))+'\n'+str((c.get('output') or {}).get('summary') or '')[:12000]),'head':snapshot['head']} for c in failures]
                 if not feedback and all(c.get('status')=='completed' for c in snapshot['checks']) and not snapshot.get('review_completed'):
                     missing=job.get('missing_review_polls',0)+1
@@ -584,7 +634,7 @@ class Controller:
                 if feedback:
                     if job['rounds']>=MAX_ROUNDS or job['active_seconds']>=DEEP_SECONDS:
                         self.needs_human(job,'review repair budget exhausted'); continue
-                    self.state.update_job(job['id'],status='queued',stage='review',feedback=feedback,rounds=job['rounds']+1,
+                    self.state.update_job(job['id'],status='queued',stage='revise',feedback=feedback,rounds=job['rounds']+1,
                                           result=None,prepared=None,next_at=0,attempts=0)
             except (Deferred,InvalidResult,ValueError,KeyError,TypeError):
                 failures=job.get('poll_failures',0)+1
@@ -592,13 +642,15 @@ class Controller:
                 if failures>=self.config.get('dependency_retries',3): self.needs_human(job,'review polling unavailable; readiness is unconfirmed')
 
     def poll_notifications(self):
-        for record in self.state.records('notifications'):
-            if record['state'] in ('sent','ambiguous'): continue
+        for record in coalesce_pending(self.state):
+            if record['state'] in ('sent','ambiguous','superseded'): continue
             try:
                 if record['posted']:
                     receipt=self.api.notification(record['key'])
                 else:
-                    receipt=self.api.notify(record['payload']); record['posted']=True
+                    try: receipt=self.api.notification(record['key'])
+                    except Deferred: receipt=self.api.notify(record['payload'])
+                    record['posted']=True
                 if receipt.get('key') != record['key']: raise Deferred('notification receipt key mismatch')
                 if receipt['state']=='sent' and not receipt.get('telegram_message_id'): raise Deferred('notification not confirmed by dispatcher')
                 record.update(state=receipt['state'],telegram_message_id=receipt.get('telegram_message_id'))
@@ -618,6 +670,10 @@ class Controller:
                 while True:
                     try:
                         if self.future and self.future.done(): self.complete_future()
+                        if self.clock()-self.last_review_queue>=self.config.get('review_poll_seconds',60):
+                            self.last_review_queue=self.clock(); self.review_queue.poll()
+                        if self.clock()-self.last_conversation>=self.config.get('review_poll_seconds',60):
+                            self.last_conversation=self.clock(); self.conversation.poll()
                         if self.clock()-self.last_incidents>=self.config.get('incident_poll_seconds',30):
                             self.last_incidents=self.clock(); self.poll_incidents(); self.schedule_incidents()
                         self.process_results(); self.poll_reviews(); self.poll_notifications()
@@ -648,7 +704,7 @@ def main(argv=None):
             state.cancel(identifier(args.job_id)); print(json.dumps({'cancelled':args.job_id})); return 0
         from .runner import Runner
         api=MaintenanceAPI(config); github=GitHub(config)
-        runner=Runner(config,api,cancelled=state.cancelled)
+        runner=Runner(config,api,cancelled=state.stop_requested)
         controller=Controller(config,state,api,github,runner)
         if args.command=='enqueue': print(json.dumps({'job_id':controller.enqueue(args.issue_number,args.event_run_id)['id']})); return 0
         controller.serve()

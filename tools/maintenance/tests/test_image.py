@@ -12,12 +12,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 @unittest.skipUnless(os.environ.get("MAINTENANCE_TEST_IMAGE"), "set MAINTENANCE_TEST_IMAGE to a built image")
 class ImageTests(unittest.TestCase):
     def test_pinned_omp_runs_headless_and_writes_validated_artifact(self):
-        calls = []
         result = {"diagnosis": {"external_cause": "confirmed", "code_defect": "not_observed",
             "observations": ["Synthetic provider outage"], "hypotheses": [], "supporting": ["Synthetic failure"],
             "contradicting": [], "related_changes": [], "missing": [], "acceptance": [],
             "next_action": "observe", "title": "Synthetic outage", "summary": "Synthetic fixture only", "matches": []},
             "outcome": "no_fix", "feedback": []}
+        self.run_fixture("initial", result)
+
+    def test_pinned_omp_runs_owner_feedback_triage(self):
+        self.run_fixture("triage", {"action": "reply", "reply": "Which behavior should change?",
+                                     "reason": "Expected behavior needs clarification."})
+
+    def run_fixture(self, stage, result):
+        calls = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -60,8 +67,8 @@ class ImageTests(unittest.TestCase):
                 "--env", "MAINTENANCE_RUN_TOKEN=synthetic-revocable-capability", "--env", "MAINTENANCE_INCIDENT_ID=1",
                 "--env", "MAINTENANCE_GATEWAY=http://host.docker.internal:" + str(server.server_port),
                 os.environ["MAINTENANCE_TEST_IMAGE"], "sh", "-c",
-                "mkdir /work/repo /work/tmp && printf '{\"stage\":\"initial\"}' > /work/context.json && "
-                "python3 /opt/maintenance/worker.py agent 60; result=$?; "
+                "mkdir /work/repo /work/tmp && printf '" + json.dumps({"stage": stage}) + "' > /work/context.json && "
+                "python3 /opt/maintenance/worker.py agent 60 && python3 /opt/maintenance/worker.py validate; result=$?; "
                 "if [ $result -ne 0 ]; then tail -c 4000 /work/agent-events.jsonl; fi; exit $result"],
                 capture_output=True, text=True, timeout=90)
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
@@ -70,7 +77,7 @@ class ImageTests(unittest.TestCase):
             system = "\n".join(message["content"] for message in calls[0]["messages"]
                                if message["role"] == "system" and isinstance(message.get("content"), str))
             self.assertIn("Trusted launch budget", system)
-            self.assertIn("Stage: initial", system)
+            self.assertIn("Stage: " + stage, system)
             self.assertIn("Available runtime: 60 seconds", system)
             self.assertIn("Checkpoint deadline (UTC):", system)
             self.assertIn("Hard deadline (UTC):", system)

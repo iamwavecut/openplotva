@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 
 from .contracts import Deferred, InvalidResult, identifier
+from .notifications import REASONS
 
 
 def secret_file(path):
@@ -75,11 +76,13 @@ class MaintenanceAPI:
 
     def notify(self, payload):
         required = {'key', 'run_id', 'status'}
-        if not required <= payload.keys() or payload.keys()-required-{'issue_number', 'pr_number'}:
+        if not required <= payload.keys() or payload.keys()-required-{'issue_number', 'pr_number', 'reason_code'}:
             raise InvalidResult('invalid notification fields')
         if not re.fullmatch('[a-f0-9]{64}', payload['key']) or payload['status'] not in ('pr_created', 'pr_ready', 'needs_human', 'paused', 'failed'):
             raise InvalidResult('invalid notification scope')
         identifier(payload['run_id'])
+        if 'reason_code' in payload and (not isinstance(payload['reason_code'], str) or payload['reason_code'] not in REASONS):
+            raise InvalidResult('invalid notification reason')
         for field in ('issue_number', 'pr_number'):
             if field in payload and (type(payload[field]) is not int or payload[field] <= 0): raise InvalidResult('invalid notification reference')
         return self.receipt(self.request('POST', '/notifications', payload), payload['key'])
