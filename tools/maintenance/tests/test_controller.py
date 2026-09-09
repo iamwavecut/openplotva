@@ -39,6 +39,7 @@ class GH:
     def index(self): return list(self.items.values())+list(self.prs.values())
     def discussion(self, item): return {**item, 'comments': [], 'linked_prs': item.get('linked_prs', [])}
     def issue(self, number): return self.items[number]
+    def comments(self, number): return [value for value in self.comment_values.values() if value['number'] == number]
     def run(self, _): return dispatch()
     def ensure_labels(self): return {}
     def labels_ready(self): return True

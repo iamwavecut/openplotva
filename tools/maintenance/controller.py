@@ -21,7 +21,8 @@ from pathlib import Path
 
 from .api import MaintenanceAPI
 from .contracts import (DEEP_SECONDS, INITIAL_SECONDS, MAX_ROUNDS, REPOSITORY,
-                        Deferred, InvalidResult, QuotaUnavailable, diagnosis, fingerprint, identifier, sha, text)
+                        Deferred, InvalidResult, QuotaUnavailable, diagnosis, fingerprint, identifier, sha, text, validate_output)
+from .conversation import Conversation
 from .github import GitHub, is_owner, select_candidates, validate_dispatch, validate_issue
 from .privacy import (boundary_for_job, hydrate_private_context, public_feedback,
                       public_issue_body, public_title)
@@ -68,15 +69,21 @@ class Controller:
         self.last_incidents = self.last_review = self.last_history = 0
         self.future = None
         self.future_job = None
+        self.conversation = Conversation(self)
+        self.last_conversation = 0
 
     def effect(self, key, kind, payload, reconcile, mutate, job=None):
         if job and self.state.cancelled(job['id']): raise InvalidResult('cancelled job cannot publish')
+        if job and job['stage'] in ('deep', 'review') and job.get('issue_number'):
+            self.conversation.poll(job['issue_number'])
+        if job and self.conversation.blocked(job): raise Deferred('publication awaits owner feedback')
         record = self.state.record('effects', key)
         if record and record['payload'] != payload: raise InvalidResult('durable effect intent changed')
         if record and record['state'] == 'done': return record['result']
         if record is None:
             record = {'key': key, 'kind': kind, 'payload': payload, 'state': 'intent', 'attempts': 0}
             self.state.put_record('effects', key, record)
+        if job and job['stage'] == 'triage': self.conversation.current(job)
         found = reconcile()
         if found is not None:
             record.update(state='done', result=found); self.state.put_record('effects', key, record); return found
@@ -87,6 +94,7 @@ class Controller:
         # Persist the crash boundary before sending even the first mutation.
         record.update(state='uncertain'); self.state.put_record('effects', key, record)
         if job and self.state.cancelled(job['id']): raise InvalidResult('cancelled job cannot publish')
+        if job and job['stage'] == 'triage': self.conversation.current(job)
         value = mutate()
         record.update(state='done', result=value); self.state.put_record('effects', key, record)
         return value
@@ -167,7 +175,7 @@ class Controller:
             safe_history.append(projected)
         context = {'incident': incident, 'history': safe_history, 'evidence': self.api.evidence(job['incident_id']),
                    'deployed': self.runner.host_snapshot(), 'feedback': job.get('feedback', [])}
-        if job['stage'] in ('deep','review'):
+        if job['stage'] in ('deep','review','triage'):
             target=self.github.issue(job['issue_number'])
             validate_issue(target,job['issue_number'])
             body=target.get('body') or ''
@@ -183,20 +191,24 @@ class Controller:
                    and isinstance(candidate['result'].get('diagnosis'), dict)]
         initial_job = max(initial, key=lambda candidate: (candidate.get('incident_id', 0), candidate['id'])) if initial else None
         context = hydrate_private_context(context, initial_job)
+        if job['stage'] == 'triage': context['conversation'] = self.conversation.context(job)
+        elif job['stage'] in ('deep', 'review'): context['owner_guidance'] = self.conversation.guidance(job['issue_number'])
         text(json.dumps(context), 1024*1024)
         return context
 
     def prepare_run(self):
         if not self.state.enabled(): return None
-        for job in self.state.jobs({'queued'}):
+        for job in sorted(self.state.jobs({'queued'}), key=lambda item: item['stage'] != 'triage'):
+            if self.conversation.blocked(job): continue
             if job['next_at'] > self.clock(): continue
-            budget = INITIAL_SECONDS if job['stage'] == 'initial' else DEEP_SECONDS
-            spent=self.state.issue_usage(job['issue_number']) if job['stage']!='initial' and job.get('issue_number') else {'active_seconds':job['active_seconds'],'cycles':job['rounds']}
+            short = job['stage'] in ('initial', 'triage')
+            budget = INITIAL_SECONDS if short else DEEP_SECONDS
+            spent=self.state.issue_usage(job['issue_number']) if not short and job.get('issue_number') else {'active_seconds':job['active_seconds'],'cycles':job['rounds']}
             already_started=self.state.db.execute('SELECT 1 FROM starts WHERE job_id=?',(job['id'],)).fetchone() is not None
             if spent['active_seconds'] >= budget or spent['cycles']+(0 if already_started else 1)>MAX_ROUNDS:
                 self.needs_human(job, 'active time or repair cycle budget exhausted'); continue
             try:
-                if job['stage'] != 'initial':
+                if job['stage'] in ('deep', 'review'):
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')
                     validate_issue(self.github.issue(job['issue_number']), job['issue_number'])
                     if self.reuse_known_work(job): continue
@@ -259,8 +271,9 @@ class Controller:
             if current['cancelled']: return
             current=self.state.update_job(job['id'],status='queued',next_at=self.clock()+delay,
                 reason='GLM Coding Plan quota unavailable; waiting for quota recovery')
-        spent=self.state.issue_usage(current['issue_number'])['active_seconds'] if current['stage']!='initial' and current.get('issue_number') else current['active_seconds']
-        budget=INITIAL_SECONDS if current['stage']=='initial' else DEEP_SECONDS
+        short = current['stage'] in ('initial', 'triage')
+        spent=self.state.issue_usage(current['issue_number'])['active_seconds'] if not short and current.get('issue_number') else current['active_seconds']
+        budget=INITIAL_SECONDS if short else DEEP_SECONDS
         if spent>=budget: self.needs_human(current,'active time budget exhausted while waiting for provider quota')
 
     def complete_future(self):
@@ -282,10 +295,16 @@ class Controller:
 
     def accept_result(self, job, result):
         try:
-            diagnosis(result['diagnosis'])
-            if set(result)-{'diagnosis','outcome','patch_path','base_sha','checks','usage','active_seconds','feedback','artifact_dir'}:
+            if job['stage'] == 'triage':
+                validate_output({key: result[key] for key in ('action', 'reply', 'reason')}, 'triage')
+                if result.get('patch_path') or result.get('checks'): raise InvalidResult('triage cannot produce a patch')
+                fields = {'action', 'reply', 'reason'}
+            else:
+                diagnosis(result['diagnosis'])
+                if result['outcome'] not in ('patch','no_fix','needs_human'): raise InvalidResult('invalid outcome')
+                fields = {'diagnosis', 'outcome', 'feedback'}
+            if set(result)-fields-{'patch_path','base_sha','checks','usage','active_seconds','artifact_dir'}:
                 raise InvalidResult('unexpected result receipt fields')
-            if result['outcome'] not in ('patch','no_fix','needs_human'): raise InvalidResult('invalid outcome')
             for feedback in result.get('feedback',[]): text(feedback['body'])
             text(json.dumps(result),3*1024*1024)
         except (InvalidResult,ValueError,KeyError,TypeError):
@@ -301,6 +320,9 @@ class Controller:
 
     def retry(self, job, reason):
         current = self.state.job(job['id'])
+        if self.conversation.blocked(current):
+            self.state.update_job(job['id'], status='result' if current.get('result') else 'queued',
+                                  reason='awaiting owner feedback'); return
         attempts = current['attempts']+1
         if attempts >= self.config.get('dependency_retries', 3): self.needs_human(current, reason+'; retry budget exhausted')
         else: self.state.update_job(job['id'], status='result' if current.get('result') else 'queued', attempts=attempts,
@@ -546,7 +568,11 @@ class Controller:
     def process_results(self):
         for job in self.state.jobs({'result'}):
             if job['next_at'] > self.clock() or job['cancelled']: continue
+            if self.conversation.blocked(job): continue
             try:
+                if job['stage'] == 'triage':
+                    self.conversation.process(job)
+                    continue
                 value = diagnosis(job['result']['diagnosis'])
                 if job['stage']=='initial': self.initial_result(job,value)
                 elif job['result']['outcome']=='patch': self.publish_patch(job,value)
@@ -562,9 +588,10 @@ class Controller:
 
     def poll_reviews(self):
         for job in self.state.jobs({'waiting_ci','ready'}):
+            if self.conversation.blocked(job): continue
             if job.get('last_poll',0)+self.config.get('review_poll_seconds',60)>self.clock(): continue
             try:
-                snapshot=self.github.review_snapshot(job['pr_number'])
+                snapshot=self.conversation.filter_review(self.github.review_snapshot(job['pr_number']), job['issue_number'])
                 self.state.update_job(job['id'],last_poll=self.clock())
                 if snapshot['pr']['state']!='open':
                     self.state.update_job(job['id'],status='done',reason='pull request closed externally'); continue
@@ -618,6 +645,8 @@ class Controller:
                 while True:
                     try:
                         if self.future and self.future.done(): self.complete_future()
+                        if self.clock()-self.last_conversation>=self.config.get('review_poll_seconds',60):
+                            self.last_conversation=self.clock(); self.conversation.poll()
                         if self.clock()-self.last_incidents>=self.config.get('incident_poll_seconds',30):
                             self.last_incidents=self.clock(); self.poll_incidents(); self.schedule_incidents()
                         self.process_results(); self.poll_reviews(); self.poll_notifications()
@@ -648,7 +677,7 @@ def main(argv=None):
             state.cancel(identifier(args.job_id)); print(json.dumps({'cancelled':args.job_id})); return 0
         from .runner import Runner
         api=MaintenanceAPI(config); github=GitHub(config)
-        runner=Runner(config,api,cancelled=state.cancelled)
+        runner=Runner(config,api,cancelled=state.stop_requested)
         controller=Controller(config,state,api,github,runner)
         if args.command=='enqueue': print(json.dumps({'job_id':controller.enqueue(args.issue_number,args.event_run_id)['id']})); return 0
         controller.serve()

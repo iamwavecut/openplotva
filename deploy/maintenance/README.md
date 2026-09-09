@@ -22,6 +22,10 @@ flowchart LR
   Worker --> Checks[Fresh isolated verification]
   Checks --> PR[Ready PR / CI / full review loop]
   PR --> Controller
+  Owner[Owner issue / PR comment] --> Conversation[Bounded feedback triage]
+  Controller -->|poll current comments| Conversation
+  Conversation -->|continue investigation / fix| Controller
+  Conversation -->|answer / ask / close managed PR| GitHub
   Controller --> Dispatcher[Bot dispatcher / delivery receipt]
 ```
 
@@ -190,7 +194,8 @@ sudo python3 /opt/openplotva-maintenance/controller.py enable
 blanket Docker cleanup. After a process/host restart, journaled containers,
 workspaces and GitHub effects are reconciled before another job starts.
 
-Initial diagnosis has a 600-second limit and 30 starts per rolling 24 hours.
+Initial diagnosis and owner feedback triage share a 30-start rolling 24-hour
+quota; each short job has a 600-second active limit, including retries.
 New deep investigations have a 10-start rolling limit. An issue has at most
 14,400 active seconds and five repair/review rounds across retries and manual
 requeues. Waiting for CI releases the single compute slot. Status includes usage
@@ -211,6 +216,55 @@ permits only the per-job proxy. Verification gets a fresh container, cleared
 workspace, no network or model capability, pinned source and validated patch.
 
 ## Outcome and recovery semantics
+
+### Owner conversations
+
+The controller reads current issue comments about once per minute, including
+edited comments, on its open issues with both `agent:created` and `agent:queued`.
+It also reads general discussion comments on open PRs whose creation is recorded
+in its publication journal. Only `iamwavecut` with the configured numeric owner
+ID can initiate a conversation. Comments from GitHub Apps and the controller's
+own exact journaled replies are excluded; a quoted marker alone does not identify
+an automated reply. Other reviewers remain inputs to the existing PR review
+loop, but cannot initiate issue triage or authorize closing a PR.
+
+First activation records a durable timestamp; older comments are not replayed.
+Edit an older comment or write a new one to provide feedback. Repeated polling
+and service restarts reuse the stored comment version. Pending edits are combined
+before invoking OMP. Every new owner comment holds repair publication and stops
+any running repair container while preserving its partial patch and usage.
+The next short triage receives the discussion, original private evidence,
+previous replies, the managed PR and remaining repair budget. Before each public
+action the controller rechecks the owner comments, issue scope and PR identity.
+Changes during a run invalidate its decision and require a fresh triage.
+
+The bounded decision is one of:
+
+- **reply**: answer or ask for missing facts in the discussion where the owner
+  commented, and wait for further feedback. Existing repair work remains held.
+- **continue**: resume diagnosis or revise the managed PR using the owner's
+  latest guidance. The normal defect evidence, tests and lifetime repair budgets
+  still apply. A new attempt after a closed PR does not reopen that PR.
+- **close_pr**: close only the supplied controller-created PR after checking
+  its recorded branch and unchanged HEAD; publish an explanation and retain the
+  open issue, branch and artifacts. The action is journaled before transmission,
+  including recovery from a lost GitHub acknowledgement. The API supports
+  [updating PR state](https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request);
+  merge, issue closure and branch deletion are outside this decision contract.
+
+Answers and questions pass through the same functional-description privacy
+boundary as incident reports. No model, provider, host or internal identifier
+belongs in a public response, including HTML comments or edit history. Diagnosis
+and feedback are read-only evidence, never a grant of credentials or expanded
+tool permissions. Short conversation jobs do not consume repair rounds. Exhausted
+short-job quota leaves feedback queued; exhausted repair budget permits discussion
+but prevents another automatic fix. Removing either service label revokes the
+conversation scope. Disabling the service's new-start switch also defers triage.
+The `status` command includes `owner_holds`, the issue numbers waiting on owner
+feedback, alongside queued triage jobs, active time and usage counters.
+A fresh owner re-add of `agent:queued` remains an explicit manual repair request:
+it releases the conversation hold and supersedes pending short triage. Replayed
+workflow events or a previously reserved label generation cannot release a hold.
 
 Deterministic signatures coalesce repeats before OMP; the GitHub history index
 supports semantic matching across open/closed issues and open/merged PRs.

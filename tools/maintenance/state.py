@@ -142,6 +142,18 @@ class State:
             row=connection.execute('SELECT data FROM jobs WHERE id=?',(job_id,)).fetchone()
         return not row or json.loads(row[0])['cancelled']
 
+    def stop_requested(self, job_id):
+        with contextlib.closing(sqlite3.connect(self.path, timeout=30)) as connection:
+            row = connection.execute('SELECT data FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not row: return True
+            job = json.loads(row[0])
+            hold = connection.execute('SELECT value FROM settings WHERE key=?',
+                                      ('owner_hold_'+str(job.get('issue_number')),)).fetchone()
+            return job['cancelled'] or (job['stage'] != 'triage' and bool(hold and json.loads(hold[0])))
+
+    def owner_hold(self, issue_number):
+        return self.setting('owner_hold_'+str(issue_number), False)
+
     def cancel(self, job_id):
         with self.transaction(): self.update_job(job_id, cancelled=True, status='cancelled')
 
@@ -151,16 +163,17 @@ class State:
             if not self.enabled(): raise Deferred('new agent starts are disabled')
             if job['cancelled'] or job['status'] != 'queued': raise Deferred('job cannot start')
             if self.jobs({'running'}): raise Deferred('another agent owns the durable lease')
-            limit = INITIAL_SECONDS if job['stage'] == 'initial' else DEEP_SECONDS
-            if job['stage']!='initial' and job.get('issue_number'):
-                limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage']!='initial' and j.get('issue_number')==job['issue_number'])
+            short = job['stage'] in ('initial', 'triage')
+            limit = INITIAL_SECONDS if short else DEEP_SECONDS
+            if not short and job.get('issue_number'):
+                limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage'] in ('deep', 'review') and j.get('issue_number')==job['issue_number'])
             if job['active_seconds'] >= limit: raise Deferred('active budget exhausted')
-            if job['stage']=='initial':
+            if short:
                 count=self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0]
                 if count>=INITIAL_LIMIT: raise Deferred('rolling daily quota exhausted')
                 self.db.execute('INSERT INTO initial_launches(job_id,at) VALUES(?,?)',(job_id,self.clock()))
             if not self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job_id,)).fetchone():
-                kind = 'initial' if job['stage'] == 'initial' else 'deep'
+                kind = 'initial' if short else 'deep'
                 if kind=='deep':
                     count=self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]
                     if count>=DEEP_LIMIT: raise Deferred('rolling daily quota exhausted')
@@ -168,7 +181,7 @@ class State:
             return self.update_job(job_id, status='running', lease_started=self.clock(), remaining_seconds=limit-job['active_seconds'])
 
     def issue_usage(self, issue_number):
-        jobs=[j for j in self.jobs() if j['stage']!='initial' and j.get('issue_number')==issue_number]
+        jobs=[j for j in self.jobs() if j['stage'] in ('deep', 'review') and j.get('issue_number')==issue_number]
         started={r[0] for r in self.db.execute('SELECT job_id FROM starts')}
         return {'active_seconds':sum(j['active_seconds'] for j in jobs),
                 'cycles':sum(1+j['rounds'] for j in jobs if j['id'] in started)}
@@ -177,7 +190,7 @@ class State:
         with self.transaction():
             job = self.job(job_id)
             elapsed = max(0, self.clock()-job.get('lease_started', self.clock()), float(active_seconds))
-            limit = INITIAL_SECONDS if job['stage'] == 'initial' else DEEP_SECONDS
+            limit = INITIAL_SECONDS if job['stage'] in ('initial', 'triage') else DEEP_SECONDS
             total = dict(job['usage'])
             for key, value in usage.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
@@ -216,8 +229,19 @@ class State:
             if reserved:
                 self.db.execute('INSERT INTO dispatches VALUES(?,?,?)', (event_id,issue_number,reserved[0]))
                 return self.job(reserved[0])
-            active = [j for j in self.jobs() if j.get('issue_number') == issue_number and j['status'] not in TERMINAL]
+            manual_resume = str(event_id).isdigit() and self.owner_hold(issue_number)
+            if manual_resume:
+                for previous in self.jobs():
+                    if previous['stage'] == 'triage' and previous['issue_number'] == issue_number and previous['status'] not in TERMINAL:
+                        self.cancel(previous['id'])
+                self.set_setting('owner_hold_'+str(issue_number), False)
+            active = [j for j in self.jobs() if j.get('issue_number') == issue_number
+                      and j['stage'] in ('deep', 'review') and j['status'] not in TERMINAL]
             job = active[0] if active else self.new_job('deep', origin['signature'], origin['incident_id'], issue_number=issue_number)
+            if manual_resume and active and job['status'] != 'running':
+                started = self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job['id'],)).fetchone()
+                job = self.update_job(job['id'], status='queued', result=None, prepared=None, next_at=0, attempts=0,
+                                      rounds=job['rounds']+(1 if started else 0))
             self.db.execute('INSERT INTO dispatches VALUES(?,?,?)', (event_id, issue_number, job['id']))
             if generation: self.db.execute('INSERT INTO queue_reservations VALUES(?,?,?)', (issue_number,generation,job['id']))
             return job
@@ -249,6 +273,9 @@ class State:
             counts[job['status']] = counts.get(job['status'], 0)+1
             for key, value in job['usage'].items(): usage[key] = usage.get(key, 0)+value
         return {'enabled': self.enabled(), 'cursor': self.cursor(), 'jobs': counts,
+                'owner_holds': [int(row['key'].removeprefix('owner_hold_')) for row in
+                    self.db.execute("SELECT key,value FROM settings WHERE key LIKE 'owner_hold_%'")
+                    if row['key'].removeprefix('owner_hold_').isdigit() and json.loads(row['value'])],
                 'active_seconds': sum(j['active_seconds'] for j in jobs), 'usage': usage,
                 'starts': {'initial':self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0],
                            'deep':self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]},

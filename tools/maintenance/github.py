@@ -153,6 +153,10 @@ class GitHub:
         self.assert_owner()
         return self.api('repos/'+REPOSITORY+'/issues/'+str(number)+'/labels', 'POST', {'labels': [label]})
 
+    def close_pr(self, number):
+        self.assert_owner()
+        return self.api('repos/'+REPOSITORY+'/pulls/'+str(number), 'PATCH', {'state': 'closed'})
+
     def prepare_patch(self, job, result, round_number):
         from .runner import validate_patch
         patch_path = Path(result['patch_path'])

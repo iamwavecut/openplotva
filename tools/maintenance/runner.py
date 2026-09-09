@@ -114,7 +114,7 @@ def worker_diagnostic(data):
     statuses = ("setup_failed", "omp_launch_failed", "omp_driver_failed", "omp_nonzero",
                 "watchdog", "output_limit", "result_read_failed", "result_missing",
                 "result_not_regular", "result_too_large", "result_json_invalid",
-                "result_shape_invalid", "result_diagnosis_invalid", "diagnosis_valid")
+                "result_shape_invalid", "result_diagnosis_invalid", "diagnosis_valid", "decision_valid")
     if len(data) > 4096:
         return None
     try:
@@ -387,9 +387,9 @@ class Runner:
         job_id = identifier(job["id"])
         base = sha(job["base_sha"])
         stage = job["stage"]
-        if stage not in ("initial", "deep", "review") or type(job["incident_id"]) is not int or job["incident_id"] <= 0:
+        if stage not in ("initial", "deep", "review", "triage") or type(job["incident_id"]) is not int or job["incident_id"] <= 0:
             raise InvalidResult("invalid job scope")
-        seconds = min(int(job["remaining_seconds"]), INITIAL_SECONDS if stage == "initial" else DEEP_SECONDS)
+        seconds = min(int(job["remaining_seconds"]), INITIAL_SECONDS if stage in ("initial", "triage") else DEEP_SECONDS)
         if seconds <= 0 or self.cancelled(job_id):
             raise Deferred("job has no remaining active budget")
         with self.slot():
@@ -423,7 +423,7 @@ class Runner:
                 command(["mount", "-o", "loop,nodev,nosuid", str(volume), str(work)])
                 mounted = True
                 self._checkout(work, base)
-                if stage != "initial":
+                if stage in ("deep", "review"):
                     previous = sorted((self.state / "artifacts" / job_id).glob("*/attempt.json"),
                                       key=lambda path: path.stat().st_mtime, reverse=True)
                     for attempt in previous:
@@ -483,7 +483,9 @@ class Runner:
                 saved_patch = True
                 (artifacts / "result.json").write_text(json.dumps(value))
                 checks = []
-                if value["outcome"] == "patch":
+                if stage == "triage" and patch:
+                    raise InvalidResult("owner feedback triage cannot edit code")
+                if value.get("outcome") == "patch":
                     phase = "patch_validation"
                     paths = validate_patch(patch)
                     phase = "verification_prepare"
