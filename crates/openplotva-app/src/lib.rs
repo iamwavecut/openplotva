@@ -27,6 +27,7 @@ pub mod history_summary;
 pub mod image_jobs;
 pub mod ingestion_telemetry;
 pub mod inline;
+mod maintenance_api;
 pub mod media;
 pub mod members;
 pub mod memory_runtime;
@@ -11436,6 +11437,37 @@ async fn start_runtime_workers(
         );
     }
 
+    let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
+        go_dispatcher_config(),
+    ));
+    if config.maintenance.enabled {
+        let (server, capture) = maintenance_api::start(
+            &config.maintenance,
+            &config.runtime_api,
+            service_clients.postgres.clone(),
+            Arc::clone(&dispatcher_queue),
+            worker_stops.subscribe(RuntimeWorkerPhase::Server),
+            worker_stops.subscribe(RuntimeWorkerPhase::Processor),
+        )
+        .await
+        .context("start incident maintenance API and capture worker")?;
+        worker_registry.register("maintenance-api", RuntimeWorkerPhase::Server, server);
+        worker_registry.register(
+            "maintenance-capture",
+            RuntimeWorkerPhase::Processor,
+            capture,
+        );
+        readiness_checks.push(ReadinessCheck::ok(
+            "maintenance",
+            "sanitized incident capture and dedicated authenticated API enabled",
+        ));
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "maintenance",
+            "MAINTENANCE_ENABLED=false",
+        ));
+    }
+
     let Some(bot_key) = config.bot.key.as_deref() else {
         readiness_checks.push(ReadinessCheck::skipped("pending_ops", "BOT_KEY is not set"));
         readiness_checks.push(ReadinessCheck::skipped(
@@ -11662,9 +11694,6 @@ async fn start_runtime_workers(
         openplotva_telegram::DEFAULT_DISPATCHER_QUEUE_KEY,
         GO_DISPATCHER_MAX_QUEUE_SIZE,
     );
-    let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
-        go_dispatcher_config(),
-    ));
     let routing_admin_report_store =
         openplotva_storage::llm_routing::PostgresRoutingAdminReportStore::new(
             service_clients.postgres.clone(),
@@ -14335,6 +14364,19 @@ where
     let bypass_chat_restrictions = item.bypasses_chat_restrictions();
     let virtual_id = item.metadata().virtual_id.clone();
     let protected = item.metadata().protected;
+    if virtual_id.starts_with(openplotva_storage::maintenance_notifications::NOTIFICATION_PREFIX) {
+        let Some(store) = routing_admin_reports.as_ref() else {
+            return openplotva_telegram::DispatcherSendStatus::Failed;
+        };
+        match maintenance_api::begin_notification(store.pool(), &virtual_id).await {
+            Ok(true) => {}
+            Ok(false) => return openplotva_telegram::DispatcherSendStatus::Sent,
+            Err(error) => {
+                tracing::warn!(%error, "failed to claim maintenance notification send");
+                return openplotva_telegram::DispatcherSendStatus::Failed;
+            }
+        }
+    }
     let reply_to_message_id =
         reply_message_id_from_fingerprint_key(&item.metadata().fingerprint_key);
     let method_kind_label = item
@@ -14372,6 +14414,18 @@ where
                 "skipped send for rate-limited chat".to_owned(),
                 DISPATCH_FAILURE_CLASS_CHAT_RATE_LIMITED,
             );
+            if let Some(store) = routing_admin_reports.as_ref()
+                && let Err(error) = maintenance_api::finish_notification(
+                    store.pool(),
+                    &virtual_id,
+                    None,
+                    true,
+                    false,
+                )
+                .await
+            {
+                tracing::warn!(%error, "failed to defer rate-limited maintenance notification");
+            }
             if let Some(store) = routing_admin_reports.as_ref()
                 && let Err(error) = routing_admin_reports::record_routing_admin_dispatch_failure(
                     store,
@@ -14412,6 +14466,18 @@ where
                     format!("skipped send: chat permission settings deny {action}"),
                     openplotva_telegram::OutboundSendErrorClass::TerminalPermission.as_str(),
                 );
+                if let Some(store) = routing_admin_reports.as_ref()
+                    && let Err(error) = maintenance_api::finish_notification(
+                        store.pool(),
+                        &virtual_id,
+                        None,
+                        true,
+                        true,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "failed to defer denied maintenance notification");
+                }
                 if let Some(store) = routing_admin_reports.as_ref()
                     && let Err(error) =
                         routing_admin_reports::record_routing_admin_dispatch_failure(
@@ -14529,6 +14595,11 @@ where
             ephemeral_track_error = ?report.ephemeral_track_error,
             "failed to track outbound ephemeral message"
         );
+    }
+    if let Some(store) = routing_admin_reports.as_ref()
+        && let Err(error) = maintenance_api::record_dispatch(store.pool(), &report).await
+    {
+        tracing::warn!(%error, "failed to record maintenance notification delivery receipt");
     }
     if matches!(
         report.status,
@@ -15561,6 +15632,89 @@ mod tests {
 
         assert_eq!(status, DispatcherSendStatus::Sent);
         assert_eq!(*lock(&calls), 2, "one inline retry after the short 429");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_dispatch_receipt_confirms_one_actual_send_after_replay()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            include_str!("../../../migrations/186_maintenance_notifications.up.sql").replace(
+                "CREATE TABLE maintenance_notifications",
+                "CREATE TEMP TABLE maintenance_notifications",
+            ),
+        ))
+        .execute(&pool)
+        .await?;
+        let store =
+            openplotva_storage::maintenance_notifications::MaintenanceNotificationStore::new(
+                pool.clone(),
+            );
+        let key = "e".repeat(64);
+        store.create(&key, 42, "Synthetic PR ready").await?;
+        store
+            .claim_due(OffsetDateTime::now_utc() + time::Duration::seconds(1))
+            .await?;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..2 {
+            let queue = DispatcherQueue::new(DispatcherConfig::default());
+            let digest = crate::routing_admin_reports::FormattedIncidentDigest {
+                fingerprint: key.clone(),
+                text: "Synthetic PR ready".into(),
+                latest_occurrence: None,
+                has_incidents: true,
+            };
+            let message = crate::routing_admin_reports::build_admin_report_dispatch(
+                42,
+                &digest,
+                crate::routing_admin_reports::AdminReportDeliveryPlan::Send,
+                &format!("maintenance-notification:{key}"),
+            )?;
+            queue.enqueue(message, true);
+            let item = queue.dequeue_immediate().expect("notification queued");
+            let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+            let permissions = Arc::new(ChatPermissionPolicy::new(
+                PermissionStoreStub::with_context(ChatPermissionContext {
+                    chat_type: Some("private".into()),
+                    settings: Some(ChatSettings::defaults(42)),
+                }),
+            ));
+            let calls = Arc::clone(&calls);
+            let status = send_dispatcher_work_item_with_transport_and_history(
+                virtual_messages::NoopEditHistorySink,
+                virtual_messages::NoopEphemeralMessageTracker,
+                rate_limits,
+                permissions,
+                None,
+                Some(
+                    openplotva_storage::llm_routing::PostgresRoutingAdminReportStore::new(
+                        pool.clone(),
+                    ),
+                ),
+                item,
+                move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async {
+                        Ok::<_, openplotva_telegram::TelegramOutboundExecuteError>(
+                            TelegramOutboundResponse::Message(Box::new(telegram_message(42, 999))),
+                        )
+                    }
+                },
+            )
+            .await;
+            assert_eq!(status, DispatcherSendStatus::Sent);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let receipt = store.get(&key).await?.expect("receipt");
+        assert_eq!(receipt.state, "sent");
+        assert_eq!(receipt.telegram_message_id, Some(999));
         Ok(())
     }
 

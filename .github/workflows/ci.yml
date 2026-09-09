@@ -18,6 +18,24 @@ permissions:
   contents: read
 
 jobs:
+  maintenance-automation:
+    name: Maintenance automation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Test incident automation without external credentials
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s tools/maintenance/tests -v
+          bash -n deploy/maintenance/install.sh
+          python3 tools/maintenance/controller.py --help
+          python3 tools/maintenance/preflight.py --help
+
   rust-workspace:
     name: Rust workspace
     runs-on: ubuntu-22.04
@@ -211,6 +229,7 @@ jobs:
         run: |
           cargo test -p openplotva-storage outbox_roundtrip_is_idempotent_ordered_and_fenced -- --test-threads=1
           cargo test -p openplotva-storage live_ -- --test-threads=1
+          cargo test -p openplotva-app maintenance -- --test-threads=1
 
   rust-dependencies:
     name: Rust dependencies

@@ -1,5 +1,57 @@
 //! Environment-backed configuration for OpenPlotva.
 
+#[cfg(test)]
+mod maintenance_config_tests {
+    use super::{AppConfig, RawConfig};
+
+    #[test]
+    fn maintenance_is_disabled_without_credentials() {
+        let config = AppConfig::from_raw(RawConfig::default()).expect("default config");
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn maintenance_requires_a_private_admin_recipient_and_strong_token() {
+        let raw = RawConfig {
+            maintenance_enabled: Some("true".into()),
+            maintenance_token: Some("short".into()),
+            maintenance_notify_user_id: Some("42".into()),
+            admins_admin_ids: Some("42".into()),
+            ..RawConfig::default()
+        };
+        assert!(AppConfig::from_raw(raw).is_err());
+        let raw = RawConfig {
+            maintenance_enabled: Some("true".into()),
+            maintenance_token: Some("a".repeat(64)),
+            maintenance_notify_user_id: Some("43".into()),
+            admins_admin_ids: Some("42".into()),
+            ..RawConfig::default()
+        };
+        assert!(AppConfig::from_raw(raw).is_err());
+    }
+
+    #[test]
+    fn maintenance_config_does_not_expose_credential_in_debug_or_json() {
+        let secret = "test-maintenance-secret-never-serialize-123456789";
+        let config = AppConfig::from_raw(RawConfig {
+            maintenance_enabled: Some("true".into()),
+            maintenance_token: Some(secret.into()),
+            maintenance_notify_user_id: Some("42".into()),
+            admins_admin_ids: Some("42".into()),
+            ..RawConfig::default()
+        })
+        .expect("valid maintenance config");
+        assert!(config.maintenance.enabled);
+        assert!(!format!("{:?}", config.maintenance).contains(secret));
+        assert!(
+            !serde_json::to_string(&config.maintenance)
+                .expect("config json")
+                .contains(secret)
+        );
+    }
+}
+
 use std::{
     fmt, io,
     num::{ParseFloatError, ParseIntError, TryFromIntError},
@@ -7,6 +59,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod maintenance;
+pub use maintenance::MaintenanceConfig;
 
 pub const DEFAULT_WEBAPP_HOST: &str = "0.0.0.0";
 
@@ -357,6 +412,8 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// Runtime diagnostic API configuration.
     pub runtime_api: RuntimeApiConfig,
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
     /// Logging and tracing configuration.
     pub observability: ObservabilityConfig,
     /// Postgres configuration.
@@ -1024,6 +1081,11 @@ pub struct ServiceProbeConfig {
 /// Raw optional config values used by tests and environment loading.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RawConfig {
+    pub maintenance_enabled: Option<String>,
+    pub maintenance_host: Option<String>,
+    pub maintenance_port: Option<String>,
+    pub maintenance_token: Option<String>,
+    pub maintenance_notify_user_id: Option<String>,
     /// Rust-only full bind-address override for local shell work.
     pub openplotva_bind_addr: Option<String>,
     /// Rust-only tracing filter override.
@@ -1566,6 +1628,8 @@ pub struct RawConfig {
 /// Configuration loading failures.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid maintenance configuration: {reason}")]
+    InvalidMaintenance { reason: &'static str },
     /// `.env` exists but could not be loaded.
     #[error("failed to load .env: {source}")]
     Dotenv {
@@ -1682,6 +1746,7 @@ impl AppConfig {
 
     /// Build configuration from raw optional values.
     pub fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let maintenance = MaintenanceConfig::from_raw(&raw)?;
         let webapp_host = raw
             .webapp_host
             .unwrap_or_else(|| DEFAULT_WEBAPP_HOST.to_owned());
@@ -2131,6 +2196,7 @@ impl AppConfig {
         };
 
         Ok(Self {
+            maintenance,
             server: ServerConfig {
                 host: webapp_host,
                 port: webapp_port,
@@ -3003,6 +3069,11 @@ impl RawConfig {
             webapp_url: env("WEBAPP_URL"),
             settings_require_init_data: env("SETTINGS_REQUIRE_INIT_DATA"),
             runtime_api_enabled: env("RUNTIME_API_ENABLED"),
+            maintenance_enabled: env("MAINTENANCE_ENABLED"),
+            maintenance_host: env("MAINTENANCE_HOST"),
+            maintenance_port: env("MAINTENANCE_PORT"),
+            maintenance_token: env("MAINTENANCE_TOKEN"),
+            maintenance_notify_user_id: env("MAINTENANCE_NOTIFY_USER_ID"),
             runtime_api_host: env("RUNTIME_API_HOST"),
             runtime_api_port: env("RUNTIME_API_PORT"),
             runtime_api_log_buffer_size: env("RUNTIME_API_LOG_BUFFER_SIZE"),

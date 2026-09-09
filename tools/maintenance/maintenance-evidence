@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+import urllib.request
+
+if len(sys.argv) != 2 or sys.argv[1] not in ("incident", "host"):
+    sys.exit("usage: maintenance-evidence incident|host")
+path = "/host" if sys.argv[1] == "host" else "/incidents/" + os.environ["MAINTENANCE_INCIDENT_ID"] + "/evidence"
+request = urllib.request.Request(os.environ["MAINTENANCE_GATEWAY"] + path,
+    headers={"Authorization": "Bearer " + os.environ["MAINTENANCE_RUN_TOKEN"]})
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        print(json.dumps(json.load(response)))
+except Exception:
+    print('{"available":false,"reason":"scoped_read_unavailable"}')
+    sys.exit(1)

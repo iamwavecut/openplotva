@@ -1,0 +1,10 @@
+services:
+  openplotva:
+    environment:
+      MAINTENANCE_ENABLED: ${MAINTENANCE_ENABLED:-false}
+      MAINTENANCE_HOST: 0.0.0.0
+      MAINTENANCE_PORT: 9092
+      MAINTENANCE_TOKEN: ${MAINTENANCE_TOKEN:?maintenance token must be provisioned}
+      MAINTENANCE_NOTIFY_USER_ID: ${MAINTENANCE_NOTIFY_USER_ID:?private administrator recipient must be set}
+    ports:
+      - "127.0.0.1:9092:9092"
