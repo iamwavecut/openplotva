@@ -173,5 +173,18 @@ class StateTests(unittest.TestCase):
         self.state.update_job(a['id'], status='done')
         self.assertNotEqual(self.state.enqueue(7, '125')['id'], a['id'])
 
+    def test_legacy_review_stage_migrates_without_losing_progress(self):
+        job = self.state.new_job('review', 'sig', 1, issue_number=7, active_seconds=80, rounds=2,
+                                 previous_attempt={'checks': ['retained']})
+        other = State(self.state.path, clock=lambda: self.now)
+        try:
+            migrated = other.job(job['id'])
+            self.assertEqual(migrated['stage'], 'revise')
+            self.assertEqual(migrated['active_seconds'], 80)
+            self.assertEqual(migrated['rounds'], 2)
+            self.assertEqual(migrated['previous_attempt'], {'checks': ['retained']})
+        finally:
+            other.close()
+
 
 if __name__ == '__main__': unittest.main()

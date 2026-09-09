@@ -108,7 +108,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_review_loads_linked_pr_discussion_when_rest_comments_is_a_count(self):
         deep = self.known_ready_incident()
-        self.state.update_job(deep['id'], stage='review', status='queued')
+        self.state.update_job(deep['id'], stage='revise', status='queued')
         self.gh.prs[8]['comments'] = 2
         comments = [{'id': 20, 'body': 'Clarify the affected route.'},
                     {'id': 21, 'body': 'The existing patch needs no behavioral change.'}]
@@ -307,7 +307,7 @@ class ControllerTests(unittest.TestCase):
         result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,'patch_path':'/offline',
             'checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],
             'feedback':[{'kind':'thread','id':'THREAD_1','action':'fixed','body':'The reproduced lock inversion is fixed and checked.'}]}
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             branch='fix/issue-7',rounds=4,feedback=[artifact],result=result,status='result')
         controller.process_results(); controller.poll_reviews()
         current=self.state.job(job['id'])
@@ -335,7 +335,7 @@ class ControllerTests(unittest.TestCase):
         result={'diagnosis':diagnosis('fix','not_observed','confirmed'),'outcome':'patch','base_sha':BASE,'patch_path':'/offline',
             'checks':[{'name':name,'passed':True} for name in ('fmt','clippy','tests')],
             'feedback':[{'kind':'comment','id':'check_2','action':'fixed','body':'The failing case is fixed and tested.'}]}
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             branch='fix/issue-7',feedback=[artifact],result=result,status='result')
         self.controller.process_results()
         current=self.state.job(job['id'])
@@ -351,7 +351,7 @@ class ControllerTests(unittest.TestCase):
                 github=ReviewGitHub(); github.resolved=False
                 artifact=github.review_snapshot(8)['artifacts'][0]
                 controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
-                job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+                job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
                     feedback=[artifact],result={'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The reproduction disproves this finding.'}]})
                 original=github.reply_thread
                 def concurrent_change(thread_id,body):
@@ -368,7 +368,7 @@ class ControllerTests(unittest.TestCase):
     def test_feedback_rejects_concurrent_head_change_even_when_body_matches(self):
         github=ReviewGitHub(); artifact=github.review_snapshot(8)['artifacts'][0]
         controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             feedback=[artifact],result={'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The original interleaving was disproved.'}]})
         github.head='c'*40
         with self.assertRaises(InvalidResult): controller.handle_feedback(job)
@@ -419,9 +419,21 @@ class ControllerTests(unittest.TestCase):
             self.now+=901
         self.assertEqual(current['active_seconds'],12)
         self.assertEqual(current['usage'],{'tokens':28})
-        self.assertEqual(self.state.status()['starts']['initial'],4)
+        self.assertEqual(self.state.status()['starts']['initial'],1)
         self.state.set_enabled(False); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
         self.state.set_enabled(True); self.state.cancel(job['id']); self.controller.run_next(); self.assertEqual(self.runner.calls,4)
+
+    def test_quota_blocks_other_jobs_and_restart_does_not_lose_cooldown(self):
+        job = self.incident()
+        self.runner.run = lambda *_: (_ for _ in ()).throw(QuotaUnavailable(retry_after_seconds=120))
+        self.controller.run_next()
+        second = self.state.new_job('initial', 'other', 102)
+        self.state.recover()
+        self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(self.state.job(second['id'])['status'], 'queued')
+        self.assertEqual(self.state.status()['starts']['initial'], 1)
+        self.now += 121
+        self.assertEqual(self.controller.prepare_run()['id'], job['id'])
 
     def test_service_future_quota_backoff_survives_recovery(self):
         job=self.state.new_job('initial','sig',1,attempts=2)
@@ -439,6 +451,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_service_future_quota_deferral_honors_cancel_and_active_budget(self):
         for cancelled in (False,True):
+            self.state.provider_recovered()
             job=self.state.new_job('deep','sig',1,issue_number=7,active_seconds=14398)
             self.gh.items[7]=issue()
             # Use distinct issue budgets for the second case.
@@ -475,7 +488,7 @@ class ControllerTests(unittest.TestCase):
         controller=Controller(self.controller.config,self.state,self.api,github,self.runner)
         # Snapshot comes from the real GitHub adapter, including the external thread body.
         artifact=github.review_snapshot(8)['artifacts'][0]
-        job=self.state.new_job('review','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
+        job=self.state.new_job('revise','sig',1,issue_number=7,pr_number=8,base_sha=BASE,published_sha=BASE,
             feedback=[artifact],result={'diagnosis':diagnosis(),'outcome':'no_fix','feedback':[{'kind':'thread','id':'THREAD_1','action':'rebuttal','body':'The tested lock ordering excludes this interleaving.'}]})
         with self.assertRaises(Deferred): controller.handle_feedback(job)
         self.assertEqual(github.resolve_calls,0)
@@ -498,7 +511,7 @@ class ControllerTests(unittest.TestCase):
         target={**issue(),'number':99,'kind':'issue','title':'Specific target','body':'Current owner requirements.\n\n## Acceptance\n\n- Cancellation survives concurrent result writes.\n\n## Impact\n\nOne worker.'}
         self.gh.items[99]=target
         self.gh.index=lambda: [{'kind':'issue','number':n,'title':'queue timeout','body':'Older investigation'} for n in range(1,31)]
-        for stage in ('deep','review'):
+        for stage in ('deep','revise'):
             job=self.state.new_job(stage,'sig',1,issue_number=99)
             context=self.controller.context(job)
             self.assertNotIn(99,[i['number'] for i in context['history']])

@@ -76,6 +76,19 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.usage["output_tokens"], 3)
         self.assertNotIn("secret", json.dumps(gateway.usage))
 
+    def test_stream_quota_is_not_mistaken_for_successful_http(self):
+        gateway = RunGateway(("127.0.0.1", 0), "http://127.0.0.1:1", "secret", 1, None, None, 10)
+        self.addCleanup(gateway.server.server_close)
+        gateway.observe_usage(b'data: {"error":{"type":"rate_limit_error","message":"private-canary"}}\n\n')
+        self.assertTrue(gateway.quota_unavailable.is_set())
+        self.assertNotIn("private-canary", json.dumps(gateway.usage))
+
+    def test_non_quota_stream_error_does_not_pause_shared_plan(self):
+        gateway = RunGateway(("127.0.0.1", 0), "http://127.0.0.1:1", "secret", 1, None, None, 10)
+        self.addCleanup(gateway.server.server_close)
+        gateway.observe_usage(b'data: {"error":{"type":"authentication_error","message":"private-canary"}}\n\n')
+        self.assertFalse(gateway.quota_unavailable.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

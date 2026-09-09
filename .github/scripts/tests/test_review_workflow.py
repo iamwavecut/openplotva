@@ -65,8 +65,8 @@ class ReviewWorkflowTests(unittest.TestCase):
 
     def test_owner_can_review_from_current_base(self):
         code, values, _ = self.resolve(REVIEW_EXECUTION_SHA=self.base)
-        self.assertEqual(code, 0)
-        self.assertEqual(values['wrapper_sha'], self.base)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(values, {})
 
     def test_other_actor_repository_and_non_numeric_issue_are_rejected_before_lookup(self):
         for overrides in ({'REVIEW_ACTOR': 'someone-else'}, {'GH_REPO': 'someone/repo'},
@@ -94,6 +94,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         code, values, called = self.resolve(
             REVIEW_EVENT='pull_request', REVIEW_ACTOR='contributor',
             PULL_REQUEST_URL=self.fixture['html_url'], PULL_REQUEST_BASE_SHA=self.base,
+            EVENT_PR_NUMBER='123', EVENT_HEAD_SHA=self.head,
             PULL_REQUEST_ADDITIONS='5', PULL_REQUEST_DELETIONS='2', PULL_REQUEST_CHANGED_FILES='1',
         )
         self.assertEqual(code, 0)

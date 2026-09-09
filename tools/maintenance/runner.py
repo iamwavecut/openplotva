@@ -387,7 +387,7 @@ class Runner:
         job_id = identifier(job["id"])
         base = sha(job["base_sha"])
         stage = job["stage"]
-        if stage not in ("initial", "deep", "review", "triage") or type(job["incident_id"]) is not int or job["incident_id"] <= 0:
+        if stage not in ("initial", "deep", "revise", "triage") or type(job["incident_id"]) is not int or job["incident_id"] <= 0:
             raise InvalidResult("invalid job scope")
         seconds = min(int(job["remaining_seconds"]), INITIAL_SECONDS if stage in ("initial", "triage") else DEEP_SECONDS)
         if seconds <= 0 or self.cancelled(job_id):
@@ -423,7 +423,7 @@ class Runner:
                 command(["mount", "-o", "loop,nodev,nosuid", str(volume), str(work)])
                 mounted = True
                 self._checkout(work, base)
-                if stage in ("deep", "review"):
+                if stage in ("deep", "revise"):
                     previous = sorted((self.state / "artifacts" / job_id).glob("*/attempt.json"),
                                       key=lambda path: path.stat().st_mtime, reverse=True)
                     for attempt in previous:

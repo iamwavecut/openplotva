@@ -27,6 +27,8 @@ from .github import GitHub, is_owner, select_candidates, validate_dispatch, vali
 from .privacy import (boundary_for_job, hydrate_private_context, public_feedback,
                       public_issue_body, public_title)
 from .state import State
+from .review_queue import ReviewQueue
+from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
 
 DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
                   'Danger PR rules', 'PR-Agent review and suggestions', 'CodeQL Rust', 'Semgrep CE', 'Maintenance automation']
@@ -71,10 +73,12 @@ class Controller:
         self.future_job = None
         self.conversation = Conversation(self)
         self.last_conversation = 0
+        self.review_queue = ReviewQueue(state, github)
+        self.last_review_queue = 0
 
     def effect(self, key, kind, payload, reconcile, mutate, job=None):
         if job and self.state.cancelled(job['id']): raise InvalidResult('cancelled job cannot publish')
-        if job and job['stage'] in ('deep', 'review') and job.get('issue_number'):
+        if job and job['stage'] in ('deep', 'revise') and job.get('issue_number'):
             self.conversation.poll(job['issue_number'])
         if job and self.conversation.blocked(job): raise Deferred('publication awaits owner feedback')
         record = self.state.record('effects', key)
@@ -175,7 +179,7 @@ class Controller:
             safe_history.append(projected)
         context = {'incident': incident, 'history': safe_history, 'evidence': self.api.evidence(job['incident_id']),
                    'deployed': self.runner.host_snapshot(), 'feedback': job.get('feedback', [])}
-        if job['stage'] in ('deep','review','triage'):
+        if job['stage'] in ('deep','revise','triage'):
             target=self.github.issue(job['issue_number'])
             validate_issue(target,job['issue_number'])
             body=target.get('body') or ''
@@ -184,7 +188,7 @@ class Controller:
                 'state':target['state'],'body':body,'acceptance_criteria':'\n\n'.join(section.strip() for section in sections).strip() or None}
         if job.get('previous_attempt'): context['previous_attempt'] = job['previous_attempt']
         # Keep the exact initial diagnosis in the private job context so a
-        # deep/review worker can repair from the original facts after a restart.
+        # Repair workers can use the original facts after a restart.
         initial = [candidate for candidate in self.state.jobs()
                    if candidate['stage'] == 'initial' and candidate['signature'] == job['signature']
                    and isinstance(candidate.get('result'), dict)
@@ -192,12 +196,12 @@ class Controller:
         initial_job = max(initial, key=lambda candidate: (candidate.get('incident_id', 0), candidate['id'])) if initial else None
         context = hydrate_private_context(context, initial_job)
         if job['stage'] == 'triage': context['conversation'] = self.conversation.context(job)
-        elif job['stage'] in ('deep', 'review'): context['owner_guidance'] = self.conversation.guidance(job['issue_number'])
+        elif job['stage'] in ('deep', 'revise'): context['owner_guidance'] = self.conversation.guidance(job['issue_number'])
         text(json.dumps(context), 1024*1024)
         return context
 
     def prepare_run(self):
-        if not self.state.enabled(): return None
+        if not self.state.enabled() or not self.state.provider_available(): return None
         for job in sorted(self.state.jobs({'queued'}), key=lambda item: item['stage'] != 'triage'):
             if self.conversation.blocked(job): continue
             if job['next_at'] > self.clock(): continue
@@ -208,7 +212,7 @@ class Controller:
             if spent['active_seconds'] >= budget or spent['cycles']+(0 if already_started else 1)>MAX_ROUNDS:
                 self.needs_human(job, 'active time or repair cycle budget exhausted'); continue
             try:
-                if job['stage'] in ('deep', 'review'):
+                if job['stage'] in ('deep', 'revise'):
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')
                     validate_issue(self.github.issue(job['issue_number']), job['issue_number'])
                     if self.reuse_known_work(job): continue
@@ -262,15 +266,16 @@ class Controller:
         return self.state.finish_run(job['id'],active,usage)
 
     def defer_quota(self, job, error):
-        delay=getattr(error,'retry_after_seconds',3600)
-        if not isinstance(delay,(int,float)) or isinstance(delay,bool) or not math.isfinite(delay): delay=3600
-        delay=max(60,min(86400,delay))
+        first_pause = not self.state.setting('provider_quota')
         # Accounting and rescheduling share a transaction so recovery cannot skip the quota delay.
         with self.state.transaction():
+            quota = self.state.defer_provider('worker:'+job['id']+':'+str(job.get('lease_started')),
+                                             getattr(error, 'retry_after_seconds', None))
             current=self.finish_failed_run(job,error)
             if current['cancelled']: return
-            current=self.state.update_job(job['id'],status='queued',next_at=self.clock()+delay,
+            current=self.state.update_job(job['id'],status='queued',next_at=quota['until'],quota_resume=True,
                 reason='GLM Coding Plan quota unavailable; waiting for quota recovery')
+        if first_pause: self.notify(current, 'paused')
         short = current['stage'] in ('initial', 'triage')
         spent=self.state.issue_usage(current['issue_number'])['active_seconds'] if not short and current.get('issue_number') else current['active_seconds']
         budget=INITIAL_SECONDS if short else DEEP_SECONDS
@@ -316,7 +321,8 @@ class Controller:
         active = result.get('active_seconds', 0)
         if not isinstance(active, (int, float)) or not math.isfinite(active) or active < 0: active = 0
         current = self.state.finish_run(job['id'], active, result.get('usage', {}))
-        if not current['cancelled']: self.state.update_job(job['id'], status='result', attempts=0, next_at=0)
+        self.state.provider_recovered(job.get('lease_started'))
+        if not current['cancelled']: self.state.update_job(job['id'], status='result', attempts=0, next_at=0, quota_resume=False)
 
     def retry(self, job, reason):
         current = self.state.job(job['id'])
@@ -576,10 +582,10 @@ class Controller:
                 value = diagnosis(job['result']['diagnosis'])
                 if job['stage']=='initial': self.initial_result(job,value)
                 elif job['result']['outcome']=='patch': self.publish_patch(job,value)
-                elif job['stage']=='review' and job['result'].get('feedback') and not any(not c.get('passed') for c in job['result'].get('checks',[])):
+                elif job['stage']=='revise' and job['result'].get('feedback') and not any(not c.get('passed') for c in job['result'].get('checks',[])):
                     self.handle_feedback(job); self.state.update_job(job['id'],status='waiting_ci',result=None,last_poll=0)
                 elif job['result'].get('patch_path') and any(not c.get('passed') for c in job['result'].get('checks',[])) and job['rounds']+1 < MAX_ROUNDS:
-                    self.state.update_job(job['id'],stage='review',status='queued',rounds=job['rounds']+1,result=None,
+                    self.state.update_job(job['id'],stage='revise',status='queued',rounds=job['rounds']+1,result=None,
                         previous_attempt={'diagnosis':value,'checks':job['result']['checks']},
                         feedback=[{'kind':'check','id':c['name'],'body':'Isolated verification failed: '+c['name']} for c in job['result']['checks'] if not c.get('passed')])
                 else: self.needs_human(job,'deep investigation produced no verified fix; issue remains open')
@@ -598,11 +604,16 @@ class Controller:
                 if snapshot['head'] != job['published_sha']:
                     self.needs_human(job,'pull request HEAD changed outside controller'); continue
                 self.state.update_job(job['id'],poll_failures=0)
+                if (snapshot.get('review_execution') or {}).get('state') == 'quota_wait':
+                    self.state.update_job(job['id'], status='waiting_ci', reason='PR review waiting for usage quota')
+                    self.notify(job, 'paused')
+                    continue
                 handled=job.get('handled',{})
                 if review_ready(snapshot,self.config.get('required_checks',DEFAULT_CHECKS),handled):
                     self.state.update_job(job['id'],status='ready'); self.notify(job,'pr_ready'); continue
                 feedback=[a for a in snapshot['artifacts'] if handled.get(a['kind']+':'+str(a['id'])) != {'hash':a['hash'],'head':snapshot['head']}]
-                failures=[c for c in snapshot['checks'] if c.get('status')=='completed' and c.get('conclusion') not in ('success','neutral','skipped')]
+                failures=[c for c in snapshot['checks'] if c['name'] not in (REVIEW_CHECK, EXECUTION_CHECK)
+                          and c.get('status')=='completed' and c.get('conclusion') not in ('success','neutral','skipped')]
                 feedback += [{'kind':'check','id':str(c.get('id',c['name'])),'body':text(c['name']+': '+str(c.get('conclusion'))+'\n'+str((c.get('output') or {}).get('summary') or '')[:12000]),'head':snapshot['head']} for c in failures]
                 if not feedback and all(c.get('status')=='completed' for c in snapshot['checks']) and not snapshot.get('review_completed'):
                     missing=job.get('missing_review_polls',0)+1
@@ -611,7 +622,7 @@ class Controller:
                 if feedback:
                     if job['rounds']>=MAX_ROUNDS or job['active_seconds']>=DEEP_SECONDS:
                         self.needs_human(job,'review repair budget exhausted'); continue
-                    self.state.update_job(job['id'],status='queued',stage='review',feedback=feedback,rounds=job['rounds']+1,
+                    self.state.update_job(job['id'],status='queued',stage='revise',feedback=feedback,rounds=job['rounds']+1,
                                           result=None,prepared=None,next_at=0,attempts=0)
             except (Deferred,InvalidResult,ValueError,KeyError,TypeError):
                 failures=job.get('poll_failures',0)+1
@@ -645,6 +656,8 @@ class Controller:
                 while True:
                     try:
                         if self.future and self.future.done(): self.complete_future()
+                        if self.clock()-self.last_review_queue>=self.config.get('review_poll_seconds',60):
+                            self.last_review_queue=self.clock(); self.review_queue.poll()
                         if self.clock()-self.last_conversation>=self.config.get('review_poll_seconds',60):
                             self.last_conversation=self.clock(); self.conversation.poll()
                         if self.clock()-self.last_incidents>=self.config.get('incident_poll_seconds',30):

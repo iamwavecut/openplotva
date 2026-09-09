@@ -11,6 +11,7 @@ from pathlib import Path
 from .api import secret_file
 from .contracts import Deferred, InvalidResult, OWNER, OWNER_ID, REPOSITORY, fingerprint, identifier, sha, text
 from .privacy import PublicationPrivacy
+from .review_receipt import REVIEW_CHECK, execution_receipt
 
 
 def is_owner(value): return isinstance(value, dict) and value.get('login') == OWNER and value.get('id') == OWNER_ID
@@ -82,6 +83,46 @@ class GitHub:
     def issue(self, number): return self.api('repos/'+REPOSITORY+'/issues/'+str(number))
     def pr(self, number): return self.api('repos/'+REPOSITORY+'/pulls/'+str(number))
     def run(self, event_id): return self.api('repos/'+REPOSITORY+'/actions/runs/'+str(event_id))
+
+    def checks(self, head):
+        checks = []
+        for page in range(1, 1001):
+            data = self.api('repos/'+REPOSITORY+'/commits/'+sha(head)+'/check-runs?per_page=100&page='+str(page))
+            checks.extend(data['check_runs'])
+            if len(data['check_runs']) < 100:
+                return checks
+        raise Deferred('check history exceeds bounded pagination')
+
+    def review_execution(self, pr):
+        return execution_receipt(self.checks(pr['head']['sha']), pr['head']['sha'], pr['number'])
+
+    def validate_review_retry(self, expected):
+        pr = self.pr(expected['pr_number'])
+        if (pr.get('state') != 'open' or pr.get('draft') or not is_owner(pr.get('user'))
+                or pr.get('head', {}).get('sha') != expected['head_sha']
+                or any(pr.get(side, {}).get('repo', {}).get('full_name') != REPOSITORY for side in ('head', 'base'))
+                or self.review_execution(pr) != expected):
+            raise InvalidResult('review target changed or outside owner scope')
+        run = self.run(expected['run_id'])
+        if (run.get('id') != expected['run_id'] or run.get('run_attempt') != expected['run_attempt']
+                or run.get('status') != 'completed' or run.get('conclusion') != 'failure'
+                or run.get('event') not in {'pull_request', 'workflow_dispatch'}
+                or run.get('path') != '.github/workflows/pr-automation.yml'
+                or not is_owner(run.get('actor')) or not is_owner(run.get('triggering_actor'))
+                or any((run.get(k) or {}).get('full_name') != REPOSITORY for k in ('repository', 'head_repository'))):
+            raise InvalidResult('untrusted review workflow execution')
+        job = self.api('repos/'+REPOSITORY+'/actions/jobs/'+str(expected['job_id']))
+        if (job.get('id') != expected['job_id'] or job.get('run_id') != expected['run_id']
+                or job.get('run_attempt') != expected['run_attempt'] or job.get('name') != REVIEW_CHECK
+                or job.get('head_sha') != expected['head_sha'] or job.get('status') != 'completed'
+                or job.get('conclusion') != 'failure'):
+            raise InvalidResult('review job provenance changed')
+
+    def rerun_review(self, expected):
+        self.assert_owner()
+        self.validate_review_retry(expected)
+        return self.api('repos/'+REPOSITORY+'/actions/jobs/'+str(expected['job_id'])+'/rerun', 'POST',
+                        {'enable_debug_logging': False})
 
     def queue_generation(self, number, run):
         try: started=datetime.datetime.fromisoformat(run['created_at'].replace('Z','+00:00'))
@@ -262,11 +303,7 @@ class GitHub:
 
     def review_snapshot(self, number):
         pr = self.pr(number); head = sha(pr['head']['sha'])
-        checks = []
-        for page in range(1, 1001):
-            data = self.api('repos/'+REPOSITORY+'/commits/'+head+'/check-runs?per_page=100&page='+str(page))
-            checks.extend(data['check_runs'])
-            if len(data['check_runs']) < 100: break
+        checks = self.checks(head)
         statuses = self.pages('repos/'+REPOSITORY+'/commits/'+head+'/statuses')
         comments = self.comments(number)
         reviews = self.pages('repos/'+REPOSITORY+'/pulls/'+str(number)+'/reviews')
@@ -311,19 +348,10 @@ class GitHub:
                 artifacts.append({'kind':'thread','id':thread['id'],'body':'\n\n'.join(external),'head':head})
         # Content identity survives a fix push; readiness separately binds handling to exact HEAD.
         for artifact in artifacts: artifact['hash'] = fingerprint({key:value for key,value in artifact.items() if key not in ('head','hash')})
-        review_checks=[c for c in checks if c['name']=='PR-Agent review and suggestions']
-        completed=False
-        if review_checks:
-            check=max(review_checks,key=lambda c:c.get('id',0))
-            if check.get('head_sha')==head and check.get('status')=='completed' and check.get('conclusion')=='success':
-                match=re.fullmatch(r'https://github.com/iamwavecut/openplotva/actions/runs/[0-9]+/job/([0-9]+)',check.get('details_url',''))
-                if match:
-                    logs=self.command(['gh','api','repos/'+REPOSITORY+'/actions/jobs/'+match[1]+'/logs'],authenticated=True)
-                    if len(logs)>16*1024*1024: raise Deferred('PR-Agent execution log exceeds limit')
-                    completed=(b'Generating PR review' in logs and
-                        any(marker in logs for marker in (b'Published PR-Agent review comment',b'No actionable review findings to publish')) and
-                        any(marker in logs for marker in (b'Published PR-Agent inline code suggestions',b'No actionable code suggestions to publish')))
-        return {'pr': pr, 'head': head, 'checks': checks, 'statuses': statuses, 'artifacts': artifacts, 'threads': threads,'review_completed':completed}
+        execution = execution_receipt(checks, head, number)
+        return {'pr': pr, 'head': head, 'checks': checks, 'statuses': statuses, 'artifacts': artifacts,
+                'threads': threads, 'review_execution': execution,
+                'review_completed': bool(execution and execution['state'] == 'complete')}
 
     def reply_thread(self, thread_id, body):
         self.assert_owner()

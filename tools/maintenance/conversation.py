@@ -18,7 +18,7 @@ class Conversation:
 
     def repair_jobs(self, number):
         return [job for job in self.state.jobs() if job.get('issue_number') == number
-                and job['stage'] in ('deep', 'review') and not job['cancelled']]
+                and job['stage'] in ('deep', 'revise') and not job['cancelled']]
 
     def managed_pr(self, number, include_closed=False):
         candidates = [job for job in self.repair_jobs(number) if job.get('pr_number')]
@@ -206,7 +206,7 @@ class Conversation:
             if action == 'continue':
                 if repair:
                     started = self.state.db.execute('SELECT 1 FROM starts WHERE job_id=?', (repair['id'],)).fetchone()
-                    self.state.update_job(repair['id'], stage='review' if repair.get('pr_number') else 'deep',
+                    self.state.update_job(repair['id'], stage='revise' if repair.get('pr_number') else 'deep',
                         status='queued', result=None, prepared=None, next_at=0, attempts=0,
                         rounds=repair['rounds']+(1 if started else 0), feedback=feedback)
                 else:

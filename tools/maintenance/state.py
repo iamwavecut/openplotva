@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .contracts import DAY, DEEP_LIMIT, DEEP_SECONDS, INITIAL_LIMIT, INITIAL_SECONDS, Deferred
+from .quota import retry_after
 
 TERMINAL = {'done', 'observing', 'needs_human', 'cancelled', 'ready', 'wait_deploy'}
 
@@ -41,6 +42,7 @@ class State:
         CREATE TABLE IF NOT EXISTS notifications(key TEXT PRIMARY KEY,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS history(kind TEXT NOT NULL,number INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(kind,number));
         ''')
+        self.db.execute("UPDATE jobs SET data=json_set(data,'$.stage','revise') WHERE json_extract(data,'$.stage')='review'")
 
     def close(self): self.db.close()
 
@@ -67,6 +69,26 @@ class State:
     def enabled(self): return self.setting('enabled', False)
     def set_enabled(self, value): self.set_setting('enabled', bool(value))
     def cursor(self): return self.setting('cursor', 0)
+
+    def provider_available(self):
+        return not self.setting('review_slot') and self.setting('provider_quota', {}).get('until', 0) <= self.clock()
+
+    def defer_provider(self, source, delay=None, at=None):
+        with self.transaction():
+            previous = self.setting('provider_quota', {})
+            if previous.get('source') == source:
+                return previous
+            failures = min(16, previous.get('failures', 0) + 1)
+            delay = retry_after(delay) or min(3600, 600 * 2 ** (failures - 1))
+            at = self.clock() if at is None else at
+            value = {'source': source, 'failures': failures, 'since': previous.get('since', at), 'observed_at': at,
+                     'until': max(previous.get('until', 0), at + delay), 'retry_after_seconds': delay}
+            self.set_setting('provider_quota', value)
+            return value
+
+    def provider_recovered(self, started_at=None):
+        if started_at is None or started_at >= self.setting('provider_quota', {}).get('observed_at', 0):
+            self.set_setting('provider_quota', {})
 
     def ingest(self, events, cursor, debounce):
         with self.transaction():
@@ -161,14 +183,15 @@ class State:
         with self.transaction():
             job = self.job(job_id)
             if not self.enabled(): raise Deferred('new agent starts are disabled')
+            if not self.provider_available(): raise Deferred('waiting for shared Coding Plan quota')
             if job['cancelled'] or job['status'] != 'queued': raise Deferred('job cannot start')
             if self.jobs({'running'}): raise Deferred('another agent owns the durable lease')
             short = job['stage'] in ('initial', 'triage')
             limit = INITIAL_SECONDS if short else DEEP_SECONDS
             if not short and job.get('issue_number'):
-                limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage'] in ('deep', 'review') and j.get('issue_number')==job['issue_number'])
+                limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage'] in ('deep', 'revise') and j.get('issue_number')==job['issue_number'])
             if job['active_seconds'] >= limit: raise Deferred('active budget exhausted')
-            if short:
+            if short and not job.get('quota_resume'):
                 count=self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0]
                 if count>=INITIAL_LIMIT: raise Deferred('rolling daily quota exhausted')
                 self.db.execute('INSERT INTO initial_launches(job_id,at) VALUES(?,?)',(job_id,self.clock()))
@@ -181,7 +204,7 @@ class State:
             return self.update_job(job_id, status='running', lease_started=self.clock(), remaining_seconds=limit-job['active_seconds'])
 
     def issue_usage(self, issue_number):
-        jobs=[j for j in self.jobs() if j['stage'] in ('deep', 'review') and j.get('issue_number')==issue_number]
+        jobs=[j for j in self.jobs() if j['stage'] in ('deep', 'revise') and j.get('issue_number')==issue_number]
         started={r[0] for r in self.db.execute('SELECT job_id FROM starts')}
         return {'active_seconds':sum(j['active_seconds'] for j in jobs),
                 'cycles':sum(1+j['rounds'] for j in jobs if j['id'] in started)}
@@ -236,7 +259,7 @@ class State:
                         self.cancel(previous['id'])
                 self.set_setting('owner_hold_'+str(issue_number), False)
             active = [j for j in self.jobs() if j.get('issue_number') == issue_number
-                      and j['stage'] in ('deep', 'review') and j['status'] not in TERMINAL]
+                      and j['stage'] in ('deep', 'revise') and j['status'] not in TERMINAL]
             job = active[0] if active else self.new_job('deep', origin['signature'], origin['incident_id'], issue_number=issue_number)
             if manual_resume and active and job['status'] != 'running':
                 started = self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job['id'],)).fetchone()
@@ -277,6 +300,8 @@ class State:
                     self.db.execute("SELECT key,value FROM settings WHERE key LIKE 'owner_hold_%'")
                     if row['key'].removeprefix('owner_hold_').isdigit() and json.loads(row['value'])],
                 'active_seconds': sum(j['active_seconds'] for j in jobs), 'usage': usage,
+                'provider_quota': self.setting('provider_quota', {}),
+                'review_waits': self.setting('review_waits', {}),
                 'starts': {'initial':self.db.execute('SELECT count(*) FROM initial_launches WHERE at>?',(self.clock()-DAY,)).fetchone()[0],
                            'deep':self.db.execute("SELECT count(*) FROM starts WHERE kind='deep' AND at>?",(self.clock()-DAY,)).fetchone()[0]},
                 'job_status': [{'id':j['id'],'stage':j['stage'],'status':j['status'],'issue_number':j.get('issue_number'),

@@ -100,6 +100,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+      checks: write
     steps:
       - name: Resolve PR target
         id: target
@@ -107,6 +108,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
           PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PULL_REQUEST_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
@@ -127,13 +130,16 @@ jobs:
             head_sha="$(jq -r .head.sha <<< "$pr_json")"
             [[ "$REVIEW_EXECUTION_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
             [[ "$REVIEW_EXECUTION_SHA" == "$base_sha" || "$REVIEW_EXECUTION_SHA" == "$head_sha" ]] || exit 1
-            # An owner dispatch may test this PR's exact wrapper before merge.
+            # Receipts and the Actions job must refer to the same PR HEAD.
+            [[ "$REVIEW_EXECUTION_SHA" == "$head_sha" ]] || exit 1
             wrapper_sha="$REVIEW_EXECUTION_SHA"
             additions="$(jq -r .additions <<< "$pr_json")"
             deletions="$(jq -r .deletions <<< "$pr_json")"
             changed_files="$(jq -r .changed_files <<< "$pr_json")"
           else
             pr_url="$PULL_REQUEST_URL"
+            PR_NUMBER="$EVENT_PR_NUMBER"
+            head_sha="$EVENT_HEAD_SHA"
             base_sha="$PULL_REQUEST_BASE_SHA"
             wrapper_sha="$base_sha"
             additions="$PULL_REQUEST_ADDITIONS"
@@ -142,9 +148,12 @@ jobs:
           fi
           test -n "$pr_url"
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ && "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 1
           changed_lines="$(( additions + deletions ))"
           {
             echo "pr_url=$pr_url"
+            echo "pr_number=$PR_NUMBER"
+            echo "head_sha=$head_sha"
             echo "base_sha=$base_sha"
             echo "wrapper_sha=$wrapper_sha"
             echo "changed_lines=$changed_lines"
@@ -162,9 +171,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
           OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
-          OPENAI__API_BASE: ${{ secrets.PR_AGENT_OPENAI_BASE_URL }}
-          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.3' }}
-          PR_AGENT_FALLBACK_MODELS: ${{ vars.PR_AGENT_FALLBACK_MODELS || '[]' }}
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.3-flash' }}
           PR_AGENT_AI_TIMEOUT: ${{ vars.PR_AGENT_AI_TIMEOUT || '600' }}
           PR_AGENT_REASONING_EFFORT: ${{ vars.PR_AGENT_REASONING_EFFORT || 'low' }}
           PR_AGENT_CUSTOM_MODEL_MAX_TOKENS: ${{ vars.PR_AGENT_CUSTOM_MODEL_MAX_TOKENS || '1000000' }}
@@ -182,6 +189,8 @@ jobs:
             refactors, cleanup, or tests. Do not repeat dependency advisories or SAST
             findings already handled by reviewdog and CI. Keep any findings concise.
           PR_URL: ${{ steps.target.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          PR_HEAD_SHA: ${{ steps.target.outputs.head_sha }}
           PR_CHANGED_LINES: ${{ steps.target.outputs.changed_lines }}
           PR_CHANGED_FILES: ${{ steps.target.outputs.changed_files }}
         run: |
@@ -200,15 +209,19 @@ jobs:
             -i \
             --entrypoint python \
             -v "$PWD/.github/scripts:/tmp/pr-agent-scripts:ro" \
+            -v "$PWD/tools:/tmp/repository-tools:ro" \
+            -e PYTHONPATH=/tmp/repository-tools \
             -e GITHUB_TOKEN \
             -e "GITHUB.USER_TOKEN=$GITHUB_TOKEN" \
             -e "GITHUB.DEPLOYMENT_TYPE=user" \
             -e OPENAI__KEY \
             -e OPENAI_KEY \
-            -e OPENAI__API_BASE \
             -e PR_URL \
+            -e PR_NUMBER \
+            -e PR_HEAD_SHA \
+            -e GITHUB_RUN_ID \
+            -e GITHUB_RUN_ATTEMPT \
             -e PR_AGENT_MODEL \
-            -e PR_AGENT_FALLBACK_MODELS \
             -e PR_AGENT_AI_TIMEOUT \
             -e PR_AGENT_REASONING_EFFORT \
             -e PR_AGENT_CUSTOM_MODEL_MAX_TOKENS \

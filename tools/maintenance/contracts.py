@@ -28,11 +28,11 @@ class Deferred(Exception):
 class QuotaUnavailable(Deferred):
     """The Coding Plan must recover before this retained job can run again."""
 
-    def __init__(self, *, usage=None, active_seconds=0, retry_after_seconds=3600):
+    def __init__(self, *, usage=None, active_seconds=0, retry_after_seconds=None):
         super().__init__("GLM Coding Plan quota is temporarily unavailable")
         self.usage = dict(usage or {})
         self.active_seconds = active_seconds
-        self.retry_after_seconds = max(60, min(86400, retry_after_seconds))
+        self.retry_after_seconds = retry_after_seconds
 
 
 class InvalidResult(Exception):

@@ -37,13 +37,13 @@ put unresolved questions in diagnosis.missing for the deep stage and finalize th
 artifact. If time is short, state the actual observations and remaining gaps
 instead of continuing the investigation. Choose observe only for a confirmed
 external-only failure with no unresolved evidence gaps. For other cases choose investigate or fix as justified.
-For review jobs, inspect the supplied current feedback at the assigned revision.
+For revise jobs, inspect the supplied current feedback at the assigned revision.
 When the feedback only needs an explanation, do not invent code changes or repeat
 full builds: return outcome no_fix and factual feedback with action rebuttal.
 Do not use outcome patch or action fixed without an actual code change. Address
 all actionable findings; a clean or informational comment does not justify a new
 patch. The controller still checks the current review contents and revision.
-For deep jobs and review jobs that require a code change, establish whether a patch is justified, add a regression
+For deep jobs and revise jobs that require a code change, establish whether a patch is justified, add a regression
 check of the promised behavior, and make the smallest complete fix. Follow Rust
 1.95 and the existing architecture. Run cargo fmt --all, workspace clippy and
 relevant tests; the controller independently repeats checks. If the fix involves

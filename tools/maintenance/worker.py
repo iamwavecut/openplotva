@@ -42,7 +42,7 @@ def prepare_cargo():
 def launch_instruction(seconds):
     context = json.loads((WORK / "context.json").read_text())
     stage = context.get("stage") if isinstance(context, dict) else None
-    if stage not in ("initial", "deep", "review", "triage"):
+    if stage not in ("initial", "deep", "revise", "triage"):
         raise ValueError("invalid worker stage")
     limit = INITIAL_SECONDS if stage in ("initial", "triage") else DEEP_SECONDS
     if type(seconds) is not int or not 1 <= seconds <= limit:
@@ -73,7 +73,7 @@ def launch_instruction(seconds):
         "full builds merely to acknowledge an informational or clean review. Repair concrete valid "
         "findings when present; any actual patch still needs real code work and the required checks "
         "before it is a verified fix. Address all supplied actionable feedback within this budget."
-        if stage == "review" else
+        if stage == "revise" else
         "Use the exact target issue and current acceptance criteria. A verified fix still requires "
         "real code work and the required checks within this remaining budget. If evidence or checks "
         "cannot finish in time, retain the partial patch and report needs_human; never claim a verified fix."
@@ -208,9 +208,9 @@ def validate_result():
                 raise ValueError("artifact exceeds limit")
             documents.append(json.loads(data))
         context, value = documents
-        hint = "The context stage must be initial, deep, review, or triage."
+        hint = "The context stage must be initial, deep, revise, or triage."
         stage = context.get("stage") if isinstance(context, dict) else None
-        if stage not in ("initial", "deep", "review", "triage"):
+        if stage not in ("initial", "deep", "revise", "triage"):
             raise ValueError("invalid stage")
         hint = ("Follow the canonical root, diagnosis, and feedback schemas and the allowed values in the policy. "
                 "matches belongs inside diagnosis; use observed facts and state uncertainty.")

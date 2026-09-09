@@ -12,8 +12,10 @@ from urllib.parse import urlsplit
 
 if __package__:
     from .contracts import MODEL
+    from .quota import limited, retry_after
 else:
     from contracts import MODEL
+    from quota import limited, retry_after
 
 
 class LimitedServer(ThreadingHTTPServer):
@@ -55,7 +57,7 @@ class RunGateway:
         self.upstream_token = upstream_token
         self.usage = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "rate_limited": 0}
         self.quota_unavailable = threading.Event()
-        self.retry_after_seconds = 3600
+        self.retry_after_seconds = None
         self.lock = threading.Lock()
         self.connections = set()
         self.requests = threading.BoundedSemaphore(1)
@@ -100,6 +102,8 @@ class RunGateway:
                     return self.reply(401, {"error": "expired or invalid job capability"})
                 if self.path != "/v1/chat/completions":
                     return self.reply(404, {"error": "route not allowed"})
+                if gateway.quota_unavailable.is_set():
+                    return self.reply(429, {"error": "job waiting for quota recovery"})
                 if not gateway.requests.acquire(blocking=False):
                     return self.reply(429, {"error": "one provider request at a time"})
                 connection = None
@@ -124,13 +128,13 @@ class RunGateway:
                     response = connection.getresponse()
                     with gateway.lock:
                         gateway.usage["requests"] += 1
-                        gateway.usage["rate_limited"] += int(response.status == 429)
-                        if response.status == 429:
-                            retry_after = response.getheader("Retry-After", "3600")
-                            if retry_after.isdigit():
-                                gateway.retry_after_seconds = max(60, min(86400, int(retry_after)))
-                            gateway.quota_unavailable.set()
                     if response.status != 200:
+                        try:
+                            error = json.loads(response.read(8192))
+                        except (ValueError, OSError):
+                            error = None
+                        if limited(response.status, error):
+                            gateway.mark_quota(retry_after(response.getheader("Retry-After"), gateway.clock()))
                         connection.close()
                         return self.reply(response.status, {"error": "GLM gateway unavailable"})
                     self.send_response(200)
@@ -182,7 +186,10 @@ class RunGateway:
             line[5:].strip() for line in body.splitlines() if line.startswith(b"data:")]
         for document in documents:
             try:
-                usage = json.loads(document).get("usage", {})
+                event = json.loads(document)
+                if limited(200, event):
+                    self.mark_quota()
+                usage = event.get("usage", {})
                 if isinstance(usage, dict):
                     with self.lock:
                         for dest, source in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
@@ -191,6 +198,13 @@ class RunGateway:
                                 self.usage[dest] += amount
             except (ValueError, AttributeError):
                 continue
+
+    def mark_quota(self, delay=None):
+        with self.lock:
+            if not self.quota_unavailable.is_set():
+                self.usage['rate_limited'] += 1
+            self.retry_after_seconds = delay
+            self.quota_unavailable.set()
 
     def __enter__(self):
         self.thread.start()

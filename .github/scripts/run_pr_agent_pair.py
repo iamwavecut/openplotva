@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 import asyncio
-import json
 import os
 import sys
 from dataclasses import dataclass
 from functools import partial
 
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-from pr_agent.algo.pr_processing import retry_with_fallback_models
-from pr_agent.algo.utils import ModelType
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import get_logger, setup_logger
 from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from pr_agent.tools.pr_reviewer import PRReviewer
 
-from glm_coding_plan import MODEL as GLM_MODEL, GlmCodingPlanHandler, GlmCompletionError
+from glm_coding_plan import MODEL as GLM_MODEL, MODELS as GLM_MODELS, GlmCodingPlanHandler, GlmCompletionError, GlmQuotaUnavailable
+from review_execution import ReviewExecution
 
 NO_MAJOR_ISSUES_MARKER = "No major issues detected"
 
@@ -48,16 +46,6 @@ def env_int(name: str, default: int) -> int:
     return int(value)
 
 
-def env_json_list(name: str, default: list[str]) -> list[str]:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    parsed = json.loads(value)
-    if not isinstance(parsed, list):
-        raise ValueError(f"{name} must be a JSON list")
-    return parsed
-
-
 def configure_settings(pr_url: str) -> None:
     settings = get_settings()
     settings.set("CONFIG.CLI_MODE", True)
@@ -66,8 +54,8 @@ def configure_settings(pr_url: str) -> None:
 
     apply_repo_settings(pr_url)
 
-    settings.set("CONFIG.MODEL", os.environ.get("PR_AGENT_MODEL", "openai/glm-5.3"))
-    settings.set("CONFIG.FALLBACK_MODELS", env_json_list("PR_AGENT_FALLBACK_MODELS", []))
+    settings.set("CONFIG.MODEL", os.environ.get("PR_AGENT_MODEL", GLM_MODEL))
+    settings.set("CONFIG.FALLBACK_MODELS", [])
     settings.set("CONFIG.AI_TIMEOUT", env_int("PR_AGENT_AI_TIMEOUT", 600))
     settings.set("CONFIG.REASONING_EFFORT", os.environ.get("PR_AGENT_REASONING_EFFORT", "low"))
     settings.set("CONFIG.CUSTOM_MODEL_MAX_TOKENS", env_int("PR_AGENT_CUSTOM_MODEL_MAX_TOKENS", 1000000))
@@ -98,8 +86,8 @@ def configure_settings(pr_url: str) -> None:
 
 def ai_handler_options() -> dict:
     settings = get_settings()
-    if settings.config.model != GLM_MODEL:
-        return {}
+    if settings.config.model not in GLM_MODELS:
+        raise GlmCompletionError('unsupported_model')
     return {"ai_handler": partial(
         GlmCodingPlanHandler,
         api_key=settings.get("OPENAI.KEY") or os.environ.get("OPENAI_KEY"),
@@ -114,18 +102,13 @@ async def generate_review(pr_url: str) -> ReviewResult:
         return ReviewResult(reviewer=None, body="", has_findings=False)
 
     get_logger().info("Generating PR review")
-    if isinstance(reviewer.ai_handler, GlmCodingPlanHandler):
-        await reviewer._prepare_prediction(GLM_MODEL)
-        reviewer.ai_handler.ensure_complete()
-    else:
-        await retry_with_fallback_models(reviewer._prepare_prediction, model_type=ModelType.REGULAR)
+    await reviewer._prepare_prediction(get_settings().config.model)
+    reviewer.ai_handler.ensure_complete()
     if not reviewer.prediction:
-        if isinstance(reviewer.ai_handler, GlmCodingPlanHandler):
-            raise GlmCompletionError("empty_review")
-        return ReviewResult(reviewer=reviewer, body="", has_findings=False)
+        raise GlmCompletionError("empty_review")
 
     body = reviewer._prepare_pr_review()
-    if isinstance(reviewer.ai_handler, GlmCodingPlanHandler) and not body.strip():
+    if not body.strip():
         raise GlmCompletionError("invalid_review")
     has_findings = bool(body.strip()) and NO_MAJOR_ISSUES_MARKER not in body
     return ReviewResult(reviewer=reviewer, body=body, has_findings=has_findings)
@@ -142,15 +125,10 @@ async def generate_suggestions(pr_url: str) -> SuggestionsResult:
         return SuggestionsResult(suggester=suggester, data={"code_suggestions": []}, has_findings=False)
 
     get_logger().info("Generating PR code suggestions")
-    if isinstance(suggester.ai_handler, GlmCodingPlanHandler):
-        data = await suggester.prepare_prediction_main(GLM_MODEL)
-        suggester.ai_handler.ensure_complete()
-        if not isinstance(data, dict) or not isinstance(data.get("code_suggestions"), list):
-            raise GlmCompletionError("invalid_suggestions")
-    else:
-        data = await retry_with_fallback_models(suggester.prepare_prediction_main, model_type=ModelType.REGULAR)
-    if not data or "code_suggestions" not in data:
-        data = {"code_suggestions": []}
+    data = await suggester.prepare_prediction_main(get_settings().config.model)
+    suggester.ai_handler.ensure_complete()
+    if not isinstance(data, dict) or not isinstance(data.get("code_suggestions"), list):
+        raise GlmCompletionError("invalid_suggestions")
 
     suggestions = data.get("code_suggestions") or []
     return SuggestionsResult(suggester=suggester, data=data, has_findings=bool(suggestions))
@@ -191,7 +169,19 @@ async def run() -> int:
 
 async def main() -> int:
     try:
-        return await run()
+        execution = ReviewExecution(os.environ)
+        await execution.start()
+        try:
+            status = await run()
+        except GlmQuotaUnavailable as error:
+            await execution.finish('quota_wait', error.retry_after_seconds)
+            print('Review deferred: usage quota unavailable; the controller will resume this review.', flush=True)
+            return 75
+        except Exception:
+            await execution.finish('failed')
+            raise
+        await execution.finish('complete')
+        return status
     finally:
         await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=15)
         await GLOBAL_LOGGING_WORKER.stop()

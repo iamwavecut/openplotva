@@ -20,14 +20,29 @@ flowchart LR
   Actions -->|restricted SSH identifiers| Controller
   Controller --> Worker[Isolated OMP container]
   Worker --> Checks[Fresh isolated verification]
-  Checks --> PR[Ready PR / CI / full review loop]
-  PR --> Controller
+  Checks --> PR[Pull request]
+  PR --> CI[GitHub CI]
+  PR --> Review[PR Agent / Flash]
+  CI --> Controller
+  Review -->|versioned execution receipt| Controller
+  Controller -->|valid findings / revise stage| Worker
   Owner[Owner issue / PR comment] --> Conversation[Bounded feedback triage]
   Controller -->|poll current comments| Conversation
   Conversation -->|continue investigation / fix| Controller
   Conversation -->|answer / ask / close managed PR| GitHub
   Controller --> Dispatcher[Bot dispatcher / delivery receipt]
 ```
+
+The controller is the single owner of task state, continuation, publication and
+quota recovery. OMP uses the full `glm-5.3` for incident diagnosis, owner feedback
+triage, repair and revision. PR Agent alone reviews the PR and generates code
+suggestions, using `openai/glm-5.3-flash`. CI performs deterministic checks.
+The worker stages are `initial` (diagnosis), `triage` (owner conversation), `deep`
+(investigation/repair), and `revise` (address current CI/review feedback). Existing
+SQLite jobs using the old `review` stage migrate to `revise` without changing
+their identity, budgets or retained artifacts. Worker and controller must be
+upgraded together. Improvements to this harness itself use a separately reviewed
+PR and an operator deployment; the incident worker cannot modify its own rules.
 
 ## Runtime deployment
 
@@ -107,7 +122,7 @@ scoped evidence. The full inventory never enters a worker container.
 
 Public issues, PR descriptions and review replies describe functional behavior,
 evidence, hypotheses and acceptance checks. Identifying production specifics
-remain in private incident evidence and SQLite job results. Deep/review workers
+remain in private incident evidence and SQLite job results. Deep/revise workers
 receive the original same-incident diagnosis through
 `context.private.initial_diagnosis` and the original scoped evidence through
 `context.private.initial_evidence`, including after a restart or expiration of
@@ -128,7 +143,8 @@ new publication boundary against retained private results and queued commits.
 
 Provision a fine-grained **user** GitHub token belonging to `iamwavecut` (numeric
 ID 239034), restricted to `iamwavecut/openplotva`: repository contents, issues and
-pull requests write; Actions and checks read; metadata read. Store it in
+pull requests write; Actions write for deferred-review resumption; checks and
+metadata read. Store it in
 `github.token`, mode 0600. The controller verifies the authenticated identity.
 It uses the token only in trusted `gh` processes; neither token nor credential
 helper enters the agent container. `GITHUB_TOKEN` is unsuitable for publication:
@@ -156,6 +172,14 @@ configured. Native configuration and protocol references are pinned to
 [OMP 18.1.14 CLI](https://github.com/can1357/oh-my-pi/blob/v18.1.14/docs/cli-reference.md),
 [auth broker/gateway](https://github.com/can1357/oh-my-pi/blob/v18.1.14/docs/auth-broker-gateway.md),
 and [environment variables](https://github.com/can1357/oh-my-pi/blob/v18.1.14/docs/environment-variables.md).
+
+PR Agent uses the same Coding Plan through its bounded Anthropic-protocol
+adapter. Set repository variable `PR_AGENT_MODEL=openai/glm-5.3-flash` when
+upgrading an installation with an older explicit model override. Review and
+suggestions use this one selected model; no generic fallback handler, alternate
+paid endpoint or automatic model substitution is available. Official
+[Coding Plan model and usage rules](https://docs.z.ai/devpack/overview) cover both
+models, the shared five-hour/weekly limits and their credit multipliers.
 
 ## Restricted Actions ingress
 
@@ -196,8 +220,10 @@ workspaces and GitHub effects are reconciled before another job starts.
 
 Initial diagnosis and owner feedback triage share a 30-start rolling 24-hour
 quota; each short job has a 600-second active limit, including retries.
+Resuming the same job after provider quota exhaustion reuses its recorded launch;
+ordinary dependency retries still count toward the short-job daily limit.
 New deep investigations have a 10-start rolling limit. An issue has at most
-14,400 active seconds and five repair/review rounds across retries and manual
+14,400 active seconds and five repair/revision rounds across retries and manual
 requeues. Waiting for CI releases the single compute slot. Status includes usage
 counters and active time; model-reported usage is accounting, not an invoice.
 
@@ -216,6 +242,47 @@ permits only the per-job proxy. Verification gets a fresh container, cleared
 workspace, no network or model capability, pinned source and validated patch.
 
 ## Outcome and recovery semantics
+
+### Shared quota and deferred reviews
+
+A Coding Plan limit pauses new inference starts across controller jobs and queued
+PR review retries. HTTP and structured streaming errors use the same classifier;
+known credential, subscription and permission errors are not treated as a quota
+reset. `Retry-After` supports seconds and HTTP dates, bounded to seven days.
+Without a reset hint, probes back off from 10 to 20 to 40 minutes, then at most
+once per hour. The controller persists the shared cooldown and counters in
+SQLite. A completed inference that started after the observed limit clears the
+cooldown. There is no balance top-up, quota-reset purchase or paid fallback.
+
+The current container stops and exports its partial patch through the existing
+recovery path. Waiting holds neither a container nor a GitHub runner, and does
+not consume active time, dependency attempts or repair cycles. Actual work before
+the refusal remains accounted. Incidents and owner comments continue to queue;
+publication reconciliation and notification delivery continue. Pause messages
+for managed jobs reuse the existing dispatcher deduplication.
+
+The PR Agent wrapper creates a `PR-Agent execution` check with a versioned JSON
+receipt: `complete`, `quota_wait`, or `failed`, bound to the PR number, exact HEAD,
+workflow run and attempt. No prompt, provider error body or private incident data
+is in that receipt. A quota refusal releases the GitHub runner with a nonzero
+exit; it cannot become a green review or an OMP code-repair cycle. The controller
+polls owner-authored, same-repository open PRs about once a minute, validates the
+receipt and matching GitHub Actions job, and
+[reruns only the deferred review job](https://docs.github.com/en/rest/actions/workflow-runs#re-run-a-job-from-a-workflow-run)
+after the cooldown. It checks the current author, HEAD, workflow and execution
+again before dispatch. A changed/closed PR or disabled new-start switch prevents
+automatic resumption. Owner `workflow_dispatch` reviews must use the exact PR
+head ref so Actions and receipt identities agree.
+
+Only one deferred review retry is dispatched at a time, and controller workers
+wait for that execution to finish. The controller journals the dispatch before
+POST and reconciles the incremented run attempt after a restart or lost response.
+An unconfirmed dispatch is marked `needs_human` after three minutes; a retry still
+unresolved after thirty minutes also requires inspection. Neither condition
+causes repeated POSTs. The status command exposes `provider_quota` and
+`review_waits`. Readiness requires a successful matching receipt, the successful
+review job and the complete latest review contents; it no longer searches logs
+for phrases that look like success.
 
 ### Owner conversations
 

@@ -28,7 +28,7 @@ class RunnerTests(unittest.TestCase):
                 runner = Runner({'state_dir':tmp,'source_dir':tmp+'/source','image':'sha256:'+'a'*64,
                                  'gateway_url':'http://127.0.0.1:4000','gateway_token_file':'unused'},
                                 SimpleNamespace(evidence=None))
-                job={'id':'receipt-test','base_sha':'b'*40,'stage':'review','incident_id':1,'remaining_seconds':14400}
+                job={'id':'receipt-test','base_sha':'b'*40,'stage':'revise','incident_id':1,'remaining_seconds':14400}
                 gateway=SimpleNamespace(address=('127.0.0.1',1234),usage={})
                 def checkout(work,base):
                     (work/'repo').mkdir()
