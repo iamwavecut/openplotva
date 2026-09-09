@@ -132,11 +132,36 @@ class Controller:
         self.state.replace_history(index)
         self.last_history = self.clock()
 
+    def known_issues(self, job):
+        self.reconcile_origins()
+        own_marker = '<!-- maintenance:origin:'+job['id']+' -->'
+        issues = []
+        jobs = self.state.jobs()
+        for origin in self.state.origins_for_signature(job['signature']):
+            # The current initial result must finish its own journaled publication.
+            if job['stage']=='initial' and origin['marker']==own_marker: continue
+            number = origin['issue_number']
+            if number is None: raise Deferred('known issue publication needs reconciliation')
+            remote = self.github.issue(number)
+            if (remote.get('number')!=number or not is_owner(remote.get('user'))
+                    or remote.get('repository_url')!='https://api.github.com/repos/'+REPOSITORY):
+                raise InvalidResult('known issue provenance changed')
+            item = self.github.discussion({**remote,'kind':'issue'})
+            linked = set(item.get('linked_prs',[]))
+            linked.update(j['pr_number'] for j in jobs if j['signature']==job['signature']
+                          and j.get('issue_number')==number and j.get('pr_number'))
+            issues.append({**item,'linked_prs':sorted(linked)})
+        return issues
+
     def context(self, job):
         self.refresh_history()
         incident = self.state.incident(job['signature']) or {'signature': job['signature'], 'incident_id': job['incident_id'], 'snapshot': {}}
         candidates = select_candidates(self.state.history(), incident['snapshot'], self.config.get('history_limit', 20))
-        history = [self.github.discussion(item) for item in candidates]
+        known = self.known_issues(job)
+        history = known + [{**self.github.pr(number),'kind':'pr'}
+                           for number in sorted({n for item in known for n in item['linked_prs']})]
+        known_keys = {(item['kind'],item['number']) for item in history}
+        history += [self.github.discussion(item) for item in candidates if (item['kind'],item['number']) not in known_keys]
         # Discussion is untrusted evidence and cannot authorize publication by itself.
         safe_history = []
         for item in history:
@@ -170,6 +195,7 @@ class Controller:
                 if job['stage'] != 'initial':
                     if not self.state.origin(job['issue_number']): raise InvalidResult('job has no durable issue origin')
                     validate_issue(self.github.issue(job['issue_number']), job['issue_number'])
+                    if self.reuse_known_work(job): continue
                     if job.get('pr_number'):
                         pr = self.github.pr(job['pr_number'])
                         if pr['state'] != 'open' or pr.get('head', {}).get('ref') != job.get('branch'):
@@ -313,16 +339,47 @@ class Controller:
             lambda: (found if (found := self.github.find_comment(number, marker)) and found['body'] == body else None),
             lambda: self.github.comment(number, body, existing['id'] if existing else None), job)
 
+    def reuse_known_work(self, job, value=None):
+        known = [(item,[self.github.pr(n) for n in item['linked_prs']]) for item in self.known_issues(job)]
+        own_pr = job.get('pr_number')
+        if own_pr is None:
+            intent = self.state.record('effects',fingerprint({'pr':job['id']}))
+            if intent:
+                recovered = self.github.find_pr(intent['payload']['branch'],intent['payload']['marker'])
+                if recovered: own_pr = recovered['number']
+        target = next((item for item,prs in known if any(pr['state']=='open' and pr['number']!=own_pr for pr in prs)),None)
+        if target is None:
+            # An older open issue remains canonical until its fix is merged or the owner closes it.
+            target = next((item for item,prs in known if item['state']=='open'
+                           and item['number']<job['issue_number'] and not any(pr.get('merged_at') for pr in prs)),None)
+        if target is None: return False
+        if value is not None: self.facts_comment(job,target['number'],value)
+        self.state.update_job(job['id'],status='done',reason='existing work for incident signature',
+                              reused_issue_number=target['number'])
+        self.incident_status(job,'done')
+        return True
+
     def handle_matches(self, job, value):
         candidates = {(c['kind'], c['number']): c for c in job['context']['history']}
         matches=[]
         for match in value['matches']:
             key=(match['kind'],match['number'])
             if key not in candidates: raise InvalidResult('semantic reference is outside supplied history candidates')
+        declared = {(match['kind'],match['number']):match for match in value['matches']}
+        references = []
+        for item in sorted(self.known_issues(job),key=lambda item:(item['state']!='open',item['number'])):
+            match = declared.pop(('issue',item['number']),None)
+            if not match or match['relationship']=='related':
+                match = {'kind':'issue','number':item['number'],'relationship':'same_cause',
+                         'reason':'Durable controller origin records this incident signature.'}
+            references.append((match,item))
+        references += [(match,None) for match in declared.values()]
+        for match,known in references:
+            key=(match['kind'],match['number'])
             if match['relationship']=='related': continue
-            remote=self.github.issue(key[1]) if key[0]=='issue' else self.github.pr(key[1])
-            linked=candidates[key].get('linked_prs') or []
-            if key[0]=='issue': linked=self.github.discussion({**remote,'kind':'issue'}).get('linked_prs',linked)
+            remote=known or (self.github.issue(key[1]) if key[0]=='issue' else self.github.pr(key[1]))
+            linked=(known or candidates[key]).get('linked_prs') or []
+            if key[0]=='issue' and known is None: linked=self.github.discussion({**remote,'kind':'issue'}).get('linked_prs',linked)
             prs=[remote] if key[0]=='pr' else [self.github.pr(n) for n in linked]
             matches.append((match,remote,prs))
         # Examine all related PRs before any issue can authorize another deep run.
@@ -359,7 +416,7 @@ class Controller:
             self.state.update_job(job['id'],status='done',reason='existing issue records this cause')
             self.incident_status(job,'done'); return True
         if links:
-            value={**value,'related_changes':value['related_changes']+links}
+            value={**value,'related_changes':list(dict.fromkeys(value['related_changes']+links))}
             self.state.update_job(job['id'],result={**job['result'],'diagnosis':value})
         return False
 
@@ -386,6 +443,7 @@ class Controller:
         if value['next_action'] != 'fix' or {c['name'] for c in result.get('checks',[]) if c.get('passed') is True} != {'fmt','clippy','tests'}:
             raise InvalidResult('patch has no complete verification receipt')
         validate_issue(self.github.issue(job['issue_number']),job['issue_number'])
+        if self.reuse_known_work(job,value): return
         prepared = job.get('prepared')
         if prepared is None:
             prepared = self.github.prepare_patch(job,result,job['rounds'])
@@ -396,6 +454,7 @@ class Controller:
                     lambda:self.github.push(prepared,job.get('published_sha')),job)
         job = self.state.update_job(job['id'],published_sha=prepared['sha'])
         if not job.get('pr_number'):
+            if self.reuse_known_work(job,value): return
             marker = '<!-- maintenance:pr:'+job['id']+' -->'
             body = issue_body(value,job,marker)+'\n\nCloses #'+str(job['issue_number'])+'\n\nValidation: cargo fmt; workspace clippy with warnings denied; affected tests passed.'
             payload = {'branch':prepared['branch'],'marker':marker,'title':value['title'],'body':body}
