@@ -25,7 +25,7 @@ IPV4 = re.compile(r'(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]+)?(?![\w.])
 IPV6 = re.compile(r'(?<![\w:])(?:[a-f0-9]{0,4}:){2,}[a-f0-9:.]+(?:%[a-z0-9]+)?', re.I)
 UUID = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I)
 INTERNAL_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)[ _-]?(?:id|reference)[`"\']?\s*[:=#]\s*[`"\']?[-\w:.]+', re.I)
-NUMERIC_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)(?:[ _-]?(?:id|reference))?[`"\']?\s*(?:[:=#]\s*)?[`"\']?[0-9]+\b[`"\']?', re.I)
+NUMERIC_ID = re.compile(r'\b(?:provider|model|worker|container|request|job|user|chat|message|incident)(?:[ _-]?(?:id|identifier|reference|number|no\.?))?[`"\']?\s*(?:[:=#]\s*)?(?:\(\s*)?[`"\']?[0-9]+\b[`"\']?(?:\s*\))?', re.I)
 INCIDENT_REF = re.compile(r'\bincident:[0-9]+(?::[\w-]+)*', re.I)
 
 

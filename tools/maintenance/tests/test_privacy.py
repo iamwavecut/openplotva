@@ -101,6 +101,8 @@ class PublicationPrivacyTests(unittest.TestCase):
         job = {'context': {'incident': {'incident_id': 123, 'count': 123}}}
         boundary = PublicationPrivacy().with_context(job)
         for value in ('Incident 123 failed', 'incident #123 failed', 'incident `123` failed',
+                      'incident number 123 failed', 'incident no. 123 failed', 'incident (123) failed',
+                      'incident identifier 123 failed',
                       'Provider 27 failed', 'job ID 912 failed', '"incident_id": 123'):
             with self.subTest(value=value), self.assertRaises(InvalidResult): boundary.assert_public(value)
         self.assertEqual(public_title('Incident 123 stops before fallback', job), '[private reference] stops before fallback')
