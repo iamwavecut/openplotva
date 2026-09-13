@@ -543,7 +543,10 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
 const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "topic",
     required: true,
-    description: "Song topic or concise idea to turn into a song.",
+    description: "The song brief in the user's own words: the topic or story plus every wish the \
+                  user stated about genre, mood, language of the lyrics, vocals (male, female, \
+                  instrumental), length and references. Keep names and specific details; do not \
+                  summarize them away.",
 }];
 
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {

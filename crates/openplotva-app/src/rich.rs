@@ -310,9 +310,12 @@ pub fn compose_rates_table(header: &str, rows: &[RateRow], footer: &str) -> Stri
 #[derive(Clone, Debug)]
 pub struct SongMessage<'a> {
     pub title: &'a str,
+    /// Compact style line (genre · BPM · key · vocals).
     pub styles: &'a str,
     pub audio_url: &'a str,
     pub lyrics: &'a str,
+    /// Full tag list the music model heard; shown collapsed.
+    pub tags: &'a str,
     /// Pre-built rich HTML for the author/credit footer (already escaped/sanitized fragments).
     pub footer_html: &'a str,
 }
@@ -324,13 +327,19 @@ pub fn compose_song_message(song: &SongMessage<'_>) -> String {
     let mut html = String::new();
     html.push_str(&format!("<h3>🎵 {}</h3>", esc(song.title)));
     if !song.styles.trim().is_empty() {
-        html.push_str(&format!("<p><b>Стили:</b> <i>{}</i></p>", esc(song.styles)));
+        html.push_str(&format!("<p>🎛 <i>{}</i></p>", esc(song.styles)));
     }
     html.push_str(&format!("<audio src=\"{}\"></audio>", esc(song.audio_url)));
     if !song.lyrics.trim().is_empty() {
         html.push_str(&format!(
             "<details><summary>📜 Текст песни</summary><blockquote>{}</blockquote></details>",
             esc_multiline(song.lyrics),
+        ));
+    }
+    if !song.tags.trim().is_empty() {
+        html.push_str(&format!(
+            "<details><summary>🏷 Теги генерации</summary><blockquote>{}</blockquote></details>",
+            esc(song.tags),
         ));
     }
     if !song.footer_html.trim().is_empty() {
@@ -440,19 +449,32 @@ mod tests {
     fn song_has_audio_details_and_footer_in_order() {
         let song = SongMessage {
             title: "Песня",
-            styles: "synthwave, dreamy",
+            styles: "synthwave · 102 BPM · female vocals",
             audio_url: "https://plotva.geta.moe/x.mp3",
             lyrics: "строка 1\nстрока 2",
+            tags: "synthwave, 102 BPM, female clean vocals, synth bass",
             footer_html: "за авторством <i>Автор</i>",
         };
         let html = compose_song_message(&song);
         let audio = html.find("<audio").expect("song should include audio");
         let details = html.find("<details>").expect("song should include details");
+        let tags = html
+            .find("🏷 Теги генерации")
+            .expect("song should include tags");
         let footer = html.find("<footer>").expect("song should include footer");
-        assert!(audio < details && details < footer);
+        assert!(audio < details && details < tags && tags < footer);
+        assert!(html.contains("<p>🎛 <i>synthwave · 102 BPM · female vocals</i></p>"));
         assert!(html.contains(r#"<audio src="https://plotva.geta.moe/x.mp3"></audio>"#));
         assert!(html.contains("<blockquote>строка 1<br/>строка 2</blockquote>"));
+        assert!(html.contains(
+            "<blockquote>synthwave, 102 BPM, female clean vocals, synth bass</blockquote>"
+        ));
         assert!(html.contains("<footer>за авторством <i>Автор</i></footer>"));
+
+        let instrumental = SongMessage { lyrics: "", ..song };
+        let html = compose_song_message(&instrumental);
+        assert!(!html.contains("📜 Текст песни"));
+        assert!(html.contains("🏷 Теги генерации"));
     }
 
     #[test]

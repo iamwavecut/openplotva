@@ -215,7 +215,7 @@ openplotva/
 │   ├── openplotva-web/            # Web asset registry + sha256 guards + Telegram signature/cookie primitives
 │   ├── openplotva-memory/         # Memory extraction pipeline: cards, episodes, links, bitemporal retrieval
 │   ├── openplotva-history/        # Chat-history summary cascade (token fitting, coverage-cursor merge)
-│   ├── openplotva-media/          # Image optimizer, ACE-Step song client, public uploader
+│   ├── openplotva-media/          # Image optimizer, song director contract + farm music client, public uploader
 │   ├── openplotva-shield/         # Content-safety retrieval scoring + XML context injection
 │   ├── openplotva-updates/        # Redis update queue + enqueue-update CLI binary
 │   ├── openplotva-config/         # Typed AppConfig tree + env loader (single source of truth)
@@ -331,7 +331,7 @@ queueing glue).
 | `runtime_llm_runs.rs` | 512-entry run ring for admin "LLM Dialogs" view; 30min stale-run watchdog |
 | `runtime_llm_analytics.rs` | Postgres analytics reader (raw + hourly rollups, percentile reconstruction) |
 | `memory_runtime.rs` (~5.4k) | Memory consolidation wiring: extractor composition, daily-run scheduling, claim/process pipeline, 6-op resolution resolver (`write_memory_extraction_cards`), +2 workers (archival 1h, dup-collapse 6h) |
-| `agent_runtime.rs` (~1.6k) | `Reasoner`/`AgentTools` adapters; song/image agent optimizer providers |
+| `agent_runtime.rs` (~1.5k) | `Reasoner`/`AgentTools` adapters; image agent optimizer provider; `SongContextGatherer` (history + memory context for the song director) |
 | `history_summary.rs` (~1.7k) | Chat-history summary service (edge pre-summary cascade, AIFarm↔GenKit fallback) |
 | `embedder.rs` | Discovery-routed embedder + process-wide cooling circuit breaker (shared by retrieval/shield/consolidation) |
 
@@ -414,10 +414,12 @@ flush.
 **Memory consolidation methods** *(2026-07-06, PR #15, not deployed)*: `update_card_text` / `reinforce_card` / `demote_card` (in-place op-set), `archive_expired_cards` (soft-delete: `status='expired'` + `retracted_at`), `collapse_duplicate_cards` (groups by `lower(btrim(fact_text))`, per-group transaction, sums `observation_count`). `memory_cards.expires_at` (mig 152) bound on upsert via `GREATEST` (durability promotion clears prior TTL); all retrieval queries filter `expires_at IS NULL OR expires_at > now()`.
 
 #### `openplotva-media`
-Image-prompt parsing/optimization (NSFW safe/adult/forbidden), ACE-Step song
-client (completion + native release-task modes, style/lyrics validators), and
-the `plotva.geta.moe` public uploader (Telegram-safe URLs, preserves caller
-filenames).
+Image-prompt parsing/optimization (NSFW safe/adult/forbidden), the song
+director contract (`SongPromptPayload` schema, tag compiler, lyrics
+canonicalization, instrumental/duration rules) plus the farm music client
+(completion + native release-task modes, `audio_config.max_seconds`, seed and
+duration from `usage`), and the `plotva.geta.moe` public uploader
+(Telegram-safe URLs, preserves caller filenames).
 
 #### `openplotva-memory`
 Extraction pipeline: `MemoryExtractor` → `ExtractOutput` (episode summary,

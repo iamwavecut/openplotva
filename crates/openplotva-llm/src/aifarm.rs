@@ -46,9 +46,12 @@ const DEFAULT_SERVICE_NAME: &str = "llm-openai";
 const DEFAULT_ENDPOINT_NAME: &str = "chat_completions";
 const DEFAULT_MODEL_NAME: &str = "Gemma 4 26B Heretic";
 const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 1024;
-// 6144, not 4096: the Gemma reprompt primary reasons at length before the
-// JSON and was observed truncating Russian lyrics at 1145 final chars.
+// 6144, not 4096: the Gemma primary reasons at length before the JSON and was
+// observed truncating Russian lyrics at 1145 final chars; the director payload
+// also carries the analysis and three tag layers before the lyrics.
 const SONG_OPTIMIZER_MAX_TOKENS: i32 = 6144;
+// Lyrics need more variety than prompt optimization; JSON stays well-formed at 0.7.
+const SONG_DIRECTOR_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TOP_P: f64 = 0.8;
 const DEFAULT_VRAM_CLOUD_TOP_K: f64 = 20.0;
@@ -2133,10 +2136,12 @@ where
         let (topic, language) = openplotva_media::acestep::normalize_song_prompt_input(&request)
             .map_err(|source| AifarmMediaOptimizerError::SongPrompt { source })?;
         let messages = match self.client.prompt_store() {
-            Some(prompts) => openplotva_media::acestep::render_song_reprompt_messages_with(
-                prompts, &topic, &language,
+            Some(prompts) => openplotva_media::acestep::render_song_director_messages_with(
+                prompts, &request, &topic, &language,
             )?,
-            None => openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?,
+            None => openplotva_media::acestep::render_song_director_messages(
+                &request, &topic, &language,
+            )?,
         }
         .into_iter()
         .map(|message| AifarmStructuredJsonMessage {
@@ -2144,15 +2149,15 @@ where
             content: message.content,
         })
         .collect();
-        let tool = openplotva_media::acestep::optimize_song_prompt_terminator_definition();
+        let tool = openplotva_media::acestep::song_director_terminator_definition();
         let content = self
             .generate_json(
                 AifarmStructuredJsonRequest {
-                    name: "optimize_song_prompt".to_owned(),
+                    name: "song_director".to_owned(),
                     messages,
                     schema: tool.input_schema,
                     max_tokens: SONG_OPTIMIZER_MAX_TOKENS,
-                    temperature: 0.5,
+                    temperature: SONG_DIRECTOR_TEMPERATURE,
                     ..AifarmStructuredJsonRequest::default()
                 },
                 on_status,
@@ -7462,29 +7467,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aifarm_structured_json_generator_executes_song_reprompt() -> Result<(), Box<dyn Error>>
+    async fn aifarm_structured_json_generator_executes_song_director() -> Result<(), Box<dyn Error>>
     {
         let lyrics = [
             "[Verse 1]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Neon rain on the windshield glass,",
+            "Every red light lets the night drive past,",
+            "Radio hums a forgotten tune,",
+            "Chrome and smoke under a paper moon.",
             "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Night city, keep the engine warm,",
+            "Night city, ride me through the storm,",
             "[Verse 2]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Static voices on a dead-end street,",
+            "Sodium halos and a steady beat,",
             "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Night city, keep the engine warm,",
+            "Night city, ride me through the storm,",
         ]
         .join("\n");
         let response = json!({
@@ -7492,10 +7491,19 @@ mod tests {
                 "message": {
                     "role": "assistant",
                     "content": serde_json::to_string(&json!({
+                        "analysis": "Synthwave with clean female vocals.",
                         "title": "Night City",
-                        "input_topic": "night city",
-                        "style": "synthwave, synth bass, neon mood, 102 bpm",
                         "vocal_language": "en",
+                        "vocals": "female",
+                        "genre": "synthwave",
+                        "bpm": 102,
+                        "key": "",
+                        "sound": ["synth bass", "gated reverb drums", "analog pads", "arpeggiated plucks", "bright lead synth"],
+                        "character": ["neon mood", "nostalgic 80s", "driving"],
+                        "structure": ["synth intro", "verse over a pulsing bass", "big chorus", "outro fades on the hook"],
+                        "vocal_style": "clean vocals with light reverb",
+                        "references": [],
+                        "duration_seconds": 180,
                         "lyrics": lyrics,
                     }))?
                 }
@@ -7518,14 +7526,15 @@ mod tests {
             transport.clone(),
         )
         .with_prompt_store(prompt_store_with(&[(
-            "music/song_reprompt.prompt",
-            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{vocalLanguage}}",
+            "music/song_director.prompt",
+            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{request}} {{languageHint}}",
         )]));
 
         let result = generator
             .optimize_song_prompt(
                 openplotva_media::acestep::SongPromptRequest {
                     topic: "night city".to_owned(),
+                    request_text: "!song night city".to_owned(),
                     language_hint: "en-US".to_owned(),
                     ..openplotva_media::acestep::SongPromptRequest::default()
                 },
@@ -7535,18 +7544,42 @@ mod tests {
 
         assert_eq!(result.title, "Night City");
         assert_eq!(result.vocal_language, "en");
-        assert_eq!(result.style, "synthwave, synth bass, neon mood, 102 BPM");
+        assert_eq!(result.vocals, "female");
+        assert_eq!(result.duration_seconds, 180);
+        assert!(
+            result.style.starts_with(
+                "synthwave, 102 BPM, female clean vocals with light reverb, synth bass"
+            ),
+            "{}",
+            result.style
+        );
+        assert!(result.lyrics.starts_with("[Verse 1]\nNeon rain"));
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body)?;
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
-            "optimize_song_prompt"
+            "song_director"
         );
         assert_eq!(
             body["response_format"]["json_schema"]["schema"]["required"],
-            json!(["title", "input_topic", "style", "vocal_language", "lyrics"])
+            json!([
+                "analysis",
+                "title",
+                "vocal_language",
+                "vocals",
+                "genre",
+                "bpm",
+                "key",
+                "sound",
+                "character",
+                "structure",
+                "vocal_style",
+                "references",
+                "duration_seconds",
+                "lyrics"
+            ])
         );
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
@@ -7554,9 +7587,12 @@ mod tests {
             "custom song system night city"
         );
         assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][1]["content"], "custom song user en");
+        assert_eq!(
+            body["messages"][1]["content"],
+            "custom song user !song night city en"
+        );
         assert_eq!(body["max_tokens"], 6144);
-        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["temperature"], 0.7);
         Ok(())
     }
 

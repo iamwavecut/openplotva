@@ -629,10 +629,14 @@ mod tests {
     #[test]
     fn render_messages_preserves_dotprompt_roles() -> Result<(), Box<dyn std::error::Error>> {
         let messages = render_messages(
-            "music/song_reprompt",
+            "music/song_director",
             &serde_json::json!({
+                "request": "!song ночной город",
                 "topic": "ночной город",
-                "vocalLanguage": "ru",
+                "userName": "Alice",
+                "languageHint": "ru",
+                "context": "",
+                "maxDuration": 360,
             }),
         )?;
 
@@ -641,11 +645,19 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("ACE-Step music prompt engineer")
+                .contains("You are the music director and lyricist")
         );
+        assert!(messages[0].content.contains("song_director_terminator"));
+        assert!(messages[0].content.contains("Hard maximum 360 seconds"));
         assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("Request: !song ночной город"));
         assert!(messages[1].content.contains("Topic: ночной город"));
-        assert!(messages[1].content.contains("Vocal language: ru"));
+        assert!(messages[1].content.contains("Requested by: Alice"));
+        assert!(messages[1].content.contains("Interface language hint: ru"));
+        assert!(
+            !messages[1].content.contains("Context from the chat"),
+            "empty context renders no context block"
+        );
         Ok(())
     }
 

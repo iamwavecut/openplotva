@@ -4153,6 +4153,151 @@ fn chat_user_pair_arrays(pairs: &[(i64, i64)]) -> (Vec<i64>, Vec<i64>) {
     (chat_ids, user_ids)
 }
 
+/// One generated song's material, persisted for retakes and tracing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneratedSongRecord {
+    pub id: i64,
+    pub job_id: Option<i64>,
+    pub retake_of: Option<i64>,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub user_id: i64,
+    pub user_full_name: String,
+    pub trigger_message_id: i32,
+    pub result_message_id: Option<i32>,
+    pub request_text: String,
+    pub topic: String,
+    pub title: String,
+    pub vocal_language: String,
+    pub vocals: String,
+    pub tags: String,
+    pub style_summary: String,
+    pub lyrics: String,
+    pub duration_seconds: i32,
+    pub brief: serde_json::Value,
+    pub seed: Option<i64>,
+    pub audio_seconds: Option<f32>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Insert payload for [`PostgresGeneratedSongStore::insert`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewGeneratedSong {
+    pub job_id: Option<i64>,
+    pub retake_of: Option<i64>,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub user_id: i64,
+    pub user_full_name: String,
+    pub trigger_message_id: i32,
+    pub request_text: String,
+    pub topic: String,
+    pub title: String,
+    pub vocal_language: String,
+    pub vocals: String,
+    pub tags: String,
+    pub style_summary: String,
+    pub lyrics: String,
+    pub duration_seconds: i32,
+    pub brief: serde_json::Value,
+    pub seed: Option<i64>,
+    pub audio_seconds: Option<f32>,
+}
+
+const SQL_INSERT_GENERATED_SONG: &str = "INSERT INTO generated_songs (job_id, retake_of, chat_id, thread_id, user_id, user_full_name, trigger_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING id";
+
+const SQL_GET_GENERATED_SONG: &str = "SELECT id, job_id, retake_of, chat_id, thread_id, user_id, user_full_name, trigger_message_id, result_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds, created_at FROM generated_songs WHERE id = $1";
+
+const SQL_SET_GENERATED_SONG_RESULT_MESSAGE: &str =
+    "UPDATE generated_songs SET result_message_id = $2 WHERE id = $1";
+
+/// Postgres store for generated song material.
+#[derive(Clone, Debug)]
+pub struct PostgresGeneratedSongStore {
+    pool: PgPool,
+}
+
+impl PostgresGeneratedSongStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn insert(&self, song: &NewGeneratedSong) -> Result<i64, StorageError> {
+        let row = sqlx::query(SQL_INSERT_GENERATED_SONG)
+            .bind(song.job_id)
+            .bind(song.retake_of)
+            .bind(song.chat_id)
+            .bind(song.thread_id)
+            .bind(song.user_id)
+            .bind(&song.user_full_name)
+            .bind(song.trigger_message_id)
+            .bind(&song.request_text)
+            .bind(&song.topic)
+            .bind(&song.title)
+            .bind(&song.vocal_language)
+            .bind(&song.vocals)
+            .bind(&song.tags)
+            .bind(&song.style_summary)
+            .bind(&song.lyrics)
+            .bind(song.duration_seconds)
+            .bind(&song.brief)
+            .bind(song.seed)
+            .bind(song.audio_seconds)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("id")?)
+    }
+
+    pub async fn get(&self, id: i64) -> Result<Option<GeneratedSongRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_GENERATED_SONG)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(generated_song_from_row).transpose()
+    }
+
+    pub async fn set_result_message(
+        &self,
+        id: i64,
+        result_message_id: i32,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_SET_GENERATED_SONG_RESULT_MESSAGE)
+            .bind(id)
+            .bind(result_message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+fn generated_song_from_row(row: PgRow) -> Result<GeneratedSongRecord, StorageError> {
+    Ok(GeneratedSongRecord {
+        id: row.try_get("id")?,
+        job_id: row.try_get("job_id")?,
+        retake_of: row.try_get("retake_of")?,
+        chat_id: row.try_get("chat_id")?,
+        thread_id: row.try_get("thread_id")?,
+        user_id: row.try_get("user_id")?,
+        user_full_name: row.try_get("user_full_name")?,
+        trigger_message_id: row.try_get("trigger_message_id")?,
+        result_message_id: row.try_get("result_message_id")?,
+        request_text: row.try_get("request_text")?,
+        topic: row.try_get("topic")?,
+        title: row.try_get("title")?,
+        vocal_language: row.try_get("vocal_language")?,
+        vocals: row.try_get("vocals")?,
+        tags: row.try_get("tags")?,
+        style_summary: row.try_get("style_summary")?,
+        lyrics: row.try_get("lyrics")?,
+        duration_seconds: row.try_get("duration_seconds")?,
+        brief: row.try_get("brief")?,
+        seed: row.try_get("seed")?,
+        audio_seconds: row.try_get("audio_seconds")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresTelegramFileStore {
     pool: PgPool,

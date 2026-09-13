@@ -1990,6 +1990,7 @@ async fn schedule_direct_song_shortcut(
             message_meta: context.meta,
             reference_file_id,
             reference_file_unique_id,
+            retake: None,
         })
         .await
         .map_err(|error| DialogMessageUpdateError::ScheduleSong {
@@ -6644,10 +6645,12 @@ mod tests {
             style: "synthwave, neon, 100 BPM".to_owned(),
             raw_style: "Synthwave, Neon, 100 bpm".to_owned(),
             vocal_language: "en".to_owned(),
+            ..crate::music_jobs::SongMaterial::default()
         });
         let generator = MusicGeneratorStub::success(crate::music_jobs::GeneratedSongAudio {
             data: b"MP3".to_vec(),
             file_name: "neon-rain.mp3".to_owned(),
+            ..crate::music_jobs::GeneratedSongAudio::default()
         });
         let permission_store = MusicPermissionStoreCapture::default();
         let permissions = Arc::new(crate::permissions::ChatPermissionPolicy::new(
@@ -6692,6 +6695,7 @@ mod tests {
                     style: "synthwave, neon, 100 BPM".to_owned(),
                     raw_style: "Synthwave, Neon, 100 bpm".to_owned(),
                     vocal_language: "en".to_owned(),
+                    ..crate::music_jobs::SongMaterial::default()
                 },
                 reference_audio: None,
             }]
