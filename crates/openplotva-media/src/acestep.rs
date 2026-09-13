@@ -22,8 +22,8 @@ const MAX_LOGGED_ERROR_BODY_BYTES: usize = 4096;
 const LOGGED_ERROR_BODY_SUFFIX: &str = "...[truncated]";
 const FILE_CANDIDATE_KEYS: [&str; 5] = ["file", "url", "audio", "audio_url", "path"];
 const ERROR_CANDIDATE_KEYS: [&str; 4] = ["error", "message", "detail", "status_message"];
-const SUPPORTED_SONG_LANGUAGES: [&str; 13] = [
-    "ru", "en", "es", "de", "fr", "it", "pt", "pl", "tr", "uk", "ja", "ko", "zh",
+const SUPPORTED_SONG_LANGUAGES: [&str; 14] = [
+    "ru", "en", "es", "de", "fr", "it", "pt", "pl", "tr", "uk", "be", "ja", "ko", "zh",
 ];
 const CONTRADICTORY_STYLE_PAIRS: [(&str, &str); 4] = [
     ("upbeat", "melancholic"),
@@ -719,7 +719,20 @@ pub fn detect_song_language(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    if text
+    let lowered = text.to_lowercase();
+    let count = |letters: &[char]| lowered.chars().filter(|ch| letters.contains(ch)).count();
+    // ў is Belarusian only, and і/ї/є/ґ never occur in Russian. Between the
+    // other two, Belarusian kept ы/э/ё that Ukrainian dropped, while Ukrainian
+    // kept и/щ that Belarusian dropped.
+    if lowered.contains('ў') {
+        return "be".to_owned();
+    }
+    if count(&['і', 'ї', 'є', 'ґ']) > 0 {
+        let belarusian = count(&['ы', 'э', 'ё']);
+        let ukrainian = count(&['ї', 'є', 'ґ', 'и', 'щ']);
+        return if belarusian > ukrainian { "be" } else { "uk" }.to_owned();
+    }
+    if lowered
         .chars()
         .any(|ch| ('\u{0400}'..='\u{04ff}').contains(&ch))
     {
@@ -2035,7 +2048,15 @@ mod tests {
         assert_eq!(topic, "ночной город");
         assert_eq!(lang, "ru");
         assert_eq!(detect_song_language("city lights"), "en");
+        assert_eq!(detect_song_language("ночной город"), "ru");
+        assert_eq!(detect_song_language("літній вечір над Дніпром"), "uk");
+        assert_eq!(detect_song_language("Київ уночі"), "uk");
+        assert_eq!(
+            detect_song_language("рэйв у закінутым заводзе да світання"),
+            "be"
+        );
         assert_eq!(normalize_song_language("PL-pl"), "pl");
+        assert_eq!(normalize_song_language("be-BY"), "be");
         assert_eq!(normalize_song_language("klingon"), "");
 
         let lyrics = [
