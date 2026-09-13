@@ -1141,7 +1141,6 @@ where
                 styles: &plan.material.raw_style,
                 audio_url: &audio_url,
                 lyrics: &plan.material.lyrics,
-                tags: &plan.material.style,
                 footer_html: &footer_html,
             });
             let reply_markup = plan
