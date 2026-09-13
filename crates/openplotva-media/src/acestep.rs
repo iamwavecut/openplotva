@@ -16,20 +16,30 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(360);
 pub const DEFAULT_AUDIO_FORMAT: &str = "mp3";
 pub const DEFAULT_MODEL: &str = "acemusic/acestep-v1.5-turbo";
-pub const OPTIMIZE_SONG_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_song_prompt_terminator";
+pub const SONG_DIRECTOR_TERMINATOR_TOOL_NAME: &str = "song_director_terminator";
+/// Hard cap of the music model (9000 semantic tokens at 25 tokens per second).
+pub const SONG_MAX_DURATION_SECONDS: u32 = 360;
+pub const SONG_MIN_TAGS: usize = 10;
+pub const SONG_MAX_TAGS: usize = 40;
+const SONG_MAX_TAG_CHARS: usize = 80;
+const SONG_MIN_LYRIC_LINES: usize = 8;
+const SONG_MAX_LYRIC_LINES: usize = 80;
+const SONG_MIN_INSTRUMENTAL_SECONDS: u32 = 45;
+const SONG_DEFAULT_INSTRUMENTAL_SECONDS: u32 = 180;
+const SONG_MIN_VOCAL_SECONDS: u32 = 60;
+const SONG_DEFAULT_VOCAL_SECONDS: u32 = 200;
+/// Vocal songs end with their lyrics; the farm cap only guards against runaway takes.
+const SONG_VOCAL_CAP_MARGIN_SECONDS: u32 = 45;
+pub const SONG_VOCALS: [&str; 5] = ["male", "female", "duet", "choir", "instrumental"];
+pub const DEFAULT_SONG_STYLE_TAGS: &str =
+    "indie pop, clear vocal, acoustic guitar, emotional, 96 BPM";
 
 const MAX_LOGGED_ERROR_BODY_BYTES: usize = 4096;
 const LOGGED_ERROR_BODY_SUFFIX: &str = "...[truncated]";
 const FILE_CANDIDATE_KEYS: [&str; 5] = ["file", "url", "audio", "audio_url", "path"];
 const ERROR_CANDIDATE_KEYS: [&str; 4] = ["error", "message", "detail", "status_message"];
-const SUPPORTED_SONG_LANGUAGES: [&str; 14] = [
+pub const SUPPORTED_SONG_LANGUAGES: [&str; 14] = [
     "ru", "en", "es", "de", "fr", "it", "pt", "pl", "tr", "uk", "be", "ja", "ko", "zh",
-];
-const CONTRADICTORY_STYLE_PAIRS: [(&str, &str); 4] = [
-    ("upbeat", "melancholic"),
-    ("happy", "sad"),
-    ("energetic", "ambient"),
-    ("aggressive", "tender"),
 ];
 
 /// ACE-Step API mode.
@@ -213,15 +223,21 @@ impl AceStepClient {
             .unwrap_or("en")
             .to_owned();
         let content = completion_content(&req)?;
+        let mut audio_config = json!({
+            "format": audio_format,
+            "vocal_language": vocal_language,
+        });
+        if let Some(max_seconds) = req.max_seconds.filter(|seconds| *seconds > 0)
+            && let Some(config) = audio_config.as_object_mut()
+        {
+            config.insert("max_seconds".to_owned(), json!(max_seconds));
+        }
         let body = json!({
             "model": model,
             "messages": [{"role": "user", "content": content}],
             "stream": false,
             "thinking": req.thinking,
-            "audio_config": {
-                "format": audio_format,
-                "vocal_language": vocal_language,
-            }
+            "audio_config": audio_config,
         });
         let response = self
             .auth(self.http.post(self.cfg.endpoint("/v1/chat/completions")))
@@ -414,14 +430,20 @@ pub struct CompletionRequest {
     pub audio_format: String,
     pub model: String,
     pub thinking: bool,
+    /// Farm-side cap on the generated length; instrumentals run up to it.
+    pub max_seconds: Option<u32>,
 }
 
 /// Completion-mode result.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionResult {
     pub audio_data: Vec<u8>,
     pub file_name: String,
     pub content: String,
+    /// Sampling seed reported by the farm, when present.
+    pub seed: Option<i64>,
+    /// Audio length reported by the farm, in seconds.
+    pub duration_seconds: Option<f64>,
 }
 
 /// Native release-task request.
@@ -473,37 +495,128 @@ pub struct DownloadedAudio {
     pub file_name: String,
 }
 
-/// Song-prompt input.
+/// Song Director input: the listener's request plus optional gathered context.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SongPromptRequest {
+    /// Topic as extracted by the command or the dialog tool.
     pub topic: String,
+    /// The listener's message as written; carries instructions the topic may lose.
+    pub request_text: String,
+    pub user_full_name: String,
+    /// Interface language hint; the director may override it from the request.
+    pub language_hint: String,
+    /// Pre-gathered chat/memory context, already trimmed to a budget.
+    pub context: String,
     pub user_id: i64,
     pub message_id: i32,
-    pub language_hint: String,
 }
 
-/// Normalized song material.
+/// Validated song material ready for the music model.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SongPromptResult {
     pub title: String,
     pub topic: String,
+    /// Compact human-readable style line (genre · BPM · key · vocals).
     pub raw_style: String,
+    /// Full compiled tag list sent to the music model.
     pub style: String,
     pub vocal_language: String,
+    /// One of [`SONG_VOCALS`], or empty when the model did not say.
+    pub vocals: String,
+    /// Section-marked lyrics; empty for instrumentals.
     pub lyrics: String,
+    /// Target length in seconds.
+    pub duration_seconds: u32,
+    /// The director's brief as returned by the model, kept for persistence and retakes.
+    pub brief: Value,
 }
 
-/// Provider payload for song reprompt.
+impl SongPromptResult {
+    #[must_use]
+    pub fn is_instrumental(&self) -> bool {
+        self.lyrics.trim().is_empty()
+    }
+
+    /// Farm-side length cap: instrumentals run to the target, vocal songs end with
+    /// their lyrics and only get a guard margin.
+    #[must_use]
+    pub fn max_audio_seconds(&self) -> u32 {
+        song_max_audio_seconds(self.duration_seconds, self.is_instrumental())
+    }
+}
+
+#[must_use]
+pub fn song_max_audio_seconds(duration_seconds: u32, instrumental: bool) -> u32 {
+    if instrumental {
+        duration_seconds.clamp(SONG_MIN_INSTRUMENTAL_SECONDS, SONG_MAX_DURATION_SECONDS)
+    } else {
+        duration_seconds
+            .saturating_add(SONG_VOCAL_CAP_MARGIN_SECONDS)
+            .clamp(SONG_MIN_VOCAL_SECONDS, SONG_MAX_DURATION_SECONDS)
+    }
+}
+
+/// Song Director tool payload (mirrors the terminator schema).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct SongPromptPayload {
+    pub analysis: String,
     pub title: String,
-    pub input_topic: String,
-    pub style: String,
     pub vocal_language: String,
+    pub vocals: String,
+    pub genre: String,
+    #[serde(deserialize_with = "lenient_u32")]
+    pub bpm: u32,
+    pub key: String,
+    pub sound: Vec<String>,
+    pub character: Vec<String>,
+    pub structure: Vec<String>,
+    pub vocal_style: String,
+    pub references: Vec<String>,
+    #[serde(deserialize_with = "lenient_u32")]
+    pub duration_seconds: u32,
     pub lyrics: String,
 }
 
-/// Tool schema for the song reprompt terminator.
+fn lenient_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(lenient_number(&value))
+}
+
+fn lenient_number(value: &Value) -> u32 {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(float_to_seconds))
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0),
+        Value::String(text) => lenient_number_text(text),
+        _ => 0,
+    }
+}
+
+fn float_to_seconds(value: f64) -> u64 {
+    if value.is_finite() && value > 0.0 {
+        // The value is bounded by the caller's clamp; the cast cannot overflow.
+        value.round() as u64
+    } else {
+        0
+    }
+}
+
+fn lenient_number_text(text: &str) -> u32 {
+    let text = text.trim();
+    if let Some((minutes, seconds)) = text.split_once(':')
+        && let (Ok(minutes), Ok(seconds)) =
+            (minutes.trim().parse::<u32>(), seconds.trim().parse::<u32>())
+    {
+        return minutes.saturating_mul(60).saturating_add(seconds);
+    }
+    let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().unwrap_or(0)
+}
+
+/// Tool schema for the song director terminator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SongPromptTerminatorDefinition {
     pub name: &'static str,
@@ -544,64 +657,102 @@ pub enum AceStepError {
     Prompt(#[from] openplotva_prompts::PromptError),
 }
 
-pub fn render_song_reprompt_prompt(
+fn song_director_template_data(
+    request: &SongPromptRequest,
     topic: &str,
-    vocal_language: &str,
-) -> Result<String, openplotva_prompts::PromptError> {
-    openplotva_prompts::render(
-        "music/song_reprompt",
-        &json!({
-            "topic": topic,
-            "vocalLanguage": vocal_language,
-        }),
-    )
+    language_hint: &str,
+) -> Value {
+    let request_text = request.request_text.trim();
+    let user_name = request.user_full_name.trim();
+    let language_hint = language_hint.trim();
+    json!({
+        "request": if request_text.is_empty() { topic } else { request_text },
+        "topic": topic,
+        "userName": if user_name.is_empty() { "listener" } else { user_name },
+        "languageHint": if language_hint.is_empty() { "unknown" } else { language_hint },
+        "context": request.context.trim(),
+        "maxDuration": SONG_MAX_DURATION_SECONDS,
+    })
 }
 
-pub fn render_song_reprompt_messages(
+pub fn render_song_director_messages(
+    request: &SongPromptRequest,
     topic: &str,
-    vocal_language: &str,
+    language_hint: &str,
 ) -> Result<Vec<openplotva_prompts::PromptMessage>, openplotva_prompts::PromptError> {
     openplotva_prompts::render_messages(
-        "music/song_reprompt",
-        &json!({
-            "topic": topic,
-            "vocalLanguage": vocal_language,
-        }),
+        "music/song_director",
+        &song_director_template_data(request, topic, language_hint),
     )
 }
 
-pub fn render_song_reprompt_messages_with(
+pub fn render_song_director_messages_with(
     prompts: &openplotva_prompts::PromptStore,
+    request: &SongPromptRequest,
     topic: &str,
-    vocal_language: &str,
+    language_hint: &str,
 ) -> Result<Vec<openplotva_prompts::PromptMessage>, openplotva_prompts::PromptError> {
     prompts.render_messages(
-        "music/song_reprompt",
-        &json!({
-            "topic": topic,
-            "vocalLanguage": vocal_language,
-        }),
+        "music/song_director",
+        &song_director_template_data(request, topic, language_hint),
     )
 }
 
 #[must_use]
-pub fn optimize_song_prompt_terminator_definition() -> SongPromptTerminatorDefinition {
+pub fn song_director_terminator_definition() -> SongPromptTerminatorDefinition {
     SongPromptTerminatorDefinition {
-        name: OPTIMIZE_SONG_PROMPT_TERMINATOR_TOOL_NAME,
-        description: "Finalize ACE-Step song prompt optimization with style tags and section-marked lyrics.",
+        name: SONG_DIRECTOR_TERMINATOR_TOOL_NAME,
+        description: "Deliver the complete song package: the analysis, the three-layer production brief for the music model and the lyrics.",
         input_schema: json!({
             "type": "object",
             "properties": {
-                "title": {
+                "analysis": {
                     "type": "string",
-                    "description": "Short catchy song title (2-5 words), matching vocal_language"
+                    "description": "2-4 sentences: the genre family chosen and why, vocals or instrumental, the lyrics language, the target duration and the story angle"
                 },
-                "input_topic": { "type": "string" },
-                "style": { "type": "string" },
-                "vocal_language": { "type": "string" },
-                "lyrics": { "type": "string" }
+                "title": { "type": "string", "description": "2-5 words in the lyrics language" },
+                "vocal_language": {
+                    "type": "string",
+                    "description": "ISO 639-1 code of the lyrics language: ru, en, uk, be, es, de, fr, it, pt, pl, tr, ja, ko, zh"
+                },
+                "vocals": { "type": "string", "enum": SONG_VOCALS },
+                "genre": { "type": "string", "description": "main genre and subgenre tags, comma-separated" },
+                "bpm": { "type": "integer" },
+                "key": { "type": "string", "description": "musical key such as F minor, or an empty string" },
+                "sound": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "5-10 instrument and sound-design tags"
+                },
+                "character": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "3-6 energy, mood, era and attitude tags"
+                },
+                "structure": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "4-8 arrangement tags in playback order"
+                },
+                "vocal_style": {
+                    "type": "string",
+                    "description": "one phrase describing the singer; empty for instrumentals"
+                },
+                "references": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "0-3 tags of the form 'in the style of ...'"
+                },
+                "duration_seconds": { "type": "integer" },
+                "lyrics": {
+                    "type": "string",
+                    "description": "section-marked lyrics, or an empty string for instrumentals"
+                }
             },
-            "required": ["title", "input_topic", "style", "vocal_language", "lyrics"]
+            "required": [
+                "analysis", "title", "vocal_language", "vocals", "genre", "bpm", "key", "sound",
+                "character", "structure", "vocal_style", "references", "duration_seconds", "lyrics"
+            ]
         }),
     }
 }
@@ -617,12 +768,12 @@ pub fn normalize_song_prompt_input(
     }
     let mut language = normalize_song_language(&req.language_hint);
     if language.is_empty() {
-        language = detect_song_language(topic);
-    }
-    if language.is_empty() {
-        return Err(AceStepError::InvalidRequest(
-            "song language is empty".to_owned(),
-        ));
+        let request_text = req.request_text.trim();
+        language = detect_song_language(if request_text.is_empty() {
+            topic
+        } else {
+            request_text
+        });
     }
     Ok((topic.to_owned(), language))
 }
@@ -632,69 +783,106 @@ pub fn normalize_song_prompt_payload(
     requested_topic: &str,
     requested_language: &str,
 ) -> Result<SongPromptResult, AceStepError> {
-    let mut result = SongPromptResult {
-        title: payload.title.trim().to_owned(),
-        topic: requested_topic.trim().to_owned(),
-        vocal_language: requested_language.trim().to_owned(),
-        ..SongPromptResult::default()
-    };
-    if !payload.input_topic.trim().is_empty() {
-        result.topic = payload.input_topic.trim().to_owned();
-    }
-    if result.topic.is_empty() {
+    let topic = requested_topic.trim();
+    if topic.is_empty() {
         return Err(AceStepError::InvalidResponse(
             "song topic is empty".to_owned(),
         ));
     }
-    if !payload.vocal_language.trim().is_empty() {
-        let language = normalize_song_language(&payload.vocal_language);
-        if language.is_empty() {
-            return Err(AceStepError::InvalidResponse(
-                "song vocal language is invalid".to_owned(),
-            ));
-        }
-        result.vocal_language = language;
+    let mut language = normalize_song_language(&payload.vocal_language);
+    if language.is_empty() {
+        language = normalize_song_language(requested_language);
     }
-    if result.vocal_language.is_empty() {
+    if language.is_empty() {
         return Err(AceStepError::InvalidResponse(
-            "song vocal language is empty".to_owned(),
+            SONG_LANGUAGE_INVALID_REJECTION.to_owned(),
         ));
     }
-    let raw_style = payload.style.trim().to_owned();
-    let style = normalize_song_style(&raw_style);
-    if style.is_empty() {
+    let lyrics = canonicalize_song_lyrics(&payload.lyrics);
+    let vocals_field = payload.vocals.trim().to_ascii_lowercase();
+    let instrumental = vocals_field == "instrumental" || lyrics.line_count == 0;
+    let vocals = if instrumental {
+        "instrumental".to_owned()
+    } else if SONG_VOCALS.contains(&vocals_field.as_str()) {
+        vocals_field
+    } else {
+        String::new()
+    };
+    if !instrumental {
+        if lyrics.line_count < SONG_MIN_LYRIC_LINES
+            || lyrics.line_count > SONG_MAX_LYRIC_LINES
+            || lyrics.sections < 2
+            || !lyrics.has_chorus
+        {
+            return Err(AceStepError::InvalidResponse(
+                SONG_LYRICS_STRUCTURE_REJECTION.to_owned(),
+            ));
+        }
+        if !lyrics_script_matches_language(&lyrics.text, &language) {
+            return Err(AceStepError::InvalidResponse(
+                SONG_LYRICS_LANGUAGE_REJECTION.to_owned(),
+            ));
+        }
+    }
+    let tags = compile_song_tags(&payload, &vocals, instrumental);
+    if tags.len() < SONG_MIN_TAGS {
         return Err(AceStepError::InvalidResponse(
             SONG_STYLE_INVALID_REJECTION.to_owned(),
         ));
     }
-    result.raw_style = raw_style;
-    result.style = style;
-    let lyrics = normalize_song_lyrics(&payload.lyrics);
-    if lyrics.is_empty() {
-        return Err(AceStepError::InvalidResponse(
-            SONG_LYRICS_EMPTY_REJECTION.to_owned(),
-        ));
-    }
-    if !has_song_minimum_structure(&lyrics) {
-        return Err(AceStepError::InvalidResponse(
-            SONG_LYRICS_STRUCTURE_REJECTION.to_owned(),
-        ));
-    }
-    result.lyrics = lyrics;
-    Ok(result)
+    let duration_seconds = if instrumental {
+        non_zero_or(payload.duration_seconds, SONG_DEFAULT_INSTRUMENTAL_SECONDS)
+            .clamp(SONG_MIN_INSTRUMENTAL_SECONDS, SONG_MAX_DURATION_SECONDS)
+    } else {
+        non_zero_or(payload.duration_seconds, SONG_DEFAULT_VOCAL_SECONDS)
+            .clamp(SONG_MIN_VOCAL_SECONDS, SONG_MAX_DURATION_SECONDS)
+    };
+    let title = payload.title.trim();
+    let title = if title.is_empty() {
+        topic
+            .split_whitespace()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        title.to_owned()
+    };
+    let raw_style = song_style_summary(&payload, &vocals, instrumental);
+    let brief = serde_json::to_value(&payload).unwrap_or(Value::Null);
+    Ok(SongPromptResult {
+        title,
+        topic: topic.to_owned(),
+        raw_style,
+        style: tags.join(", "),
+        vocal_language: language,
+        vocals,
+        lyrics: if instrumental {
+            String::new()
+        } else {
+            lyrics.text
+        },
+        duration_seconds,
+        brief,
+    })
+}
+
+const fn non_zero_or(value: u32, fallback: u32) -> u32 {
+    if value == 0 { fallback } else { value }
 }
 
 pub const SONG_STYLE_INVALID_REJECTION: &str = "song style is invalid";
-pub const SONG_LYRICS_EMPTY_REJECTION: &str = "song lyrics are empty";
 pub const SONG_LYRICS_STRUCTURE_REJECTION: &str = "song lyrics do not satisfy minimum structure";
+pub const SONG_LYRICS_LANGUAGE_REJECTION: &str = "song lyrics script does not match the language";
+pub const SONG_LANGUAGE_INVALID_REJECTION: &str = "song vocal language is invalid";
 
 /// The model answered but produced unusable song material. Retry classifiers
 /// key off these markers to fall through to another routed model; keeping them
 /// as the same constants the validator throws makes that contract compile-time.
 pub const INVALID_SONG_MATERIAL_MARKERS: &[&str] = &[
     SONG_STYLE_INVALID_REJECTION,
-    SONG_LYRICS_EMPTY_REJECTION,
     SONG_LYRICS_STRUCTURE_REJECTION,
+    SONG_LYRICS_LANGUAGE_REJECTION,
+    SONG_LANGUAGE_INVALID_REJECTION,
 ];
 
 #[must_use]
@@ -756,75 +944,297 @@ pub fn normalize_song_language(language: &str) -> String {
         .to_owned()
 }
 
-/// Normalize ACE-Step style tags.
+/// Compile the director's brief into the tag list the music model reads, in a
+/// fixed order: genre, tempo, key, vocals, sound, character, structure, references.
 #[must_use]
-pub fn normalize_song_style(style: &str) -> String {
-    let cleaned = style.replace(['|', ';', '\n'], ",");
-    let mut acc = SongStyleAccumulator::default();
-    for raw_tag in cleaned.split(',') {
-        if !acc.add(raw_tag) {
-            return String::new();
-        }
+pub fn compile_song_tags(
+    payload: &SongPromptPayload,
+    vocals: &str,
+    instrumental: bool,
+) -> Vec<String> {
+    let mut tags = SongTagList::default();
+    for tag in split_song_tag_field(&payload.genre) {
+        tags.push(&tag);
     }
-    if acc.valid() {
-        acc.tags.join(", ")
+    if (40..=300).contains(&payload.bpm) {
+        tags.push(&format!("{} BPM", payload.bpm));
+    }
+    tags.push(&payload.key);
+    if instrumental {
+        tags.push("instrumental");
     } else {
-        String::new()
+        tags.push(&vocal_descriptor(&payload.vocal_style, vocals));
     }
-}
-
-/// Normalize lyrics lines.
-#[must_use]
-pub fn normalize_song_lyrics(lyrics: &str) -> String {
-    lyrics
-        .trim()
-        .split('\n')
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[must_use]
-pub fn has_song_minimum_structure(lyrics: &str) -> bool {
-    let sections = parse_song_sections(lyrics);
-    if sections.is_empty() {
-        return false;
-    }
-    let mut has_verse_1 = false;
-    let mut has_verse_2 = false;
-    let mut chorus_count = 0;
-    for section in sections {
-        match section.name.trim().to_ascii_lowercase().as_str() {
-            "verse 1" => has_verse_1 = true,
-            "verse 2" => has_verse_2 = true,
-            "chorus" => chorus_count += 1,
-            _ => {}
-        }
-        if section.line_count < 4 || section.line_count > 8 {
-            return false;
+    for field in [
+        &payload.sound,
+        &payload.character,
+        &payload.structure,
+        &payload.references,
+    ] {
+        for raw in field {
+            for tag in split_song_tag_field(raw) {
+                tags.push(&tag);
+            }
         }
     }
-    has_verse_1 && has_verse_2 && chorus_count >= 2
+    tags.into_tags()
 }
 
-/// Build the prompt sent to ACE-Step.
-#[must_use]
-pub fn build_song_release_prompt(style: &str, topic: &str, vocal_language: &str) -> String {
-    let mut style = style.trim().to_owned();
-    let topic = topic.trim();
-    if style.is_empty() && topic.is_empty() {
-        return String::new();
-    }
+fn vocal_descriptor(vocal_style: &str, vocals: &str) -> String {
+    let style = vocal_style.trim();
     if style.is_empty() {
-        style = "indie pop, clear vocal, acoustic guitar, emotional, 96 BPM".to_owned();
+        return if vocals.is_empty() {
+            String::new()
+        } else {
+            format!("{vocals} vocals")
+        };
     }
-    if topic.is_empty() {
-        return style;
-    }
-    if vocal_language.trim().eq_ignore_ascii_case("ru") {
-        format!("{style}, песня о {topic}").trim().to_owned()
+    let lowered = style.to_ascii_lowercase();
+    let names_voice = [
+        "male", "female", "duet", "choir", "man", "woman", "girl", "boy",
+    ]
+    .iter()
+    .any(|word| {
+        lowered
+            .split(|ch: char| !ch.is_ascii_alphabetic())
+            .any(|w| w == *word)
+    });
+    if names_voice || vocals.is_empty() {
+        style.to_owned()
     } else {
-        format!("{style}, song about {topic}").trim().to_owned()
+        format!("{vocals} {style}")
+    }
+}
+
+fn split_song_tag_field(raw: &str) -> Vec<String> {
+    raw.split([',', ';', '\n', '|'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[derive(Default)]
+struct SongTagList {
+    tags: Vec<String>,
+    seen: BTreeSet<String>,
+}
+
+impl SongTagList {
+    fn push(&mut self, raw: &str) {
+        if self.tags.len() >= SONG_MAX_TAGS {
+            return;
+        }
+        let Some(tag) = normalize_song_tag(raw) else {
+            return;
+        };
+        if self.seen.insert(tag.to_ascii_lowercase()) {
+            self.tags.push(tag);
+        }
+    }
+
+    fn into_tags(self) -> Vec<String> {
+        self.tags
+    }
+}
+
+/// Clean one tag for the music model: ASCII words only, collapsed whitespace,
+/// numbering and quotes stripped. Returns `None` for anything that is not an
+/// English descriptor (empty, too long, no letters, non-Latin script).
+#[must_use]
+pub fn normalize_song_tag(raw: &str) -> Option<String> {
+    let raw = strip_list_numbering(raw.trim()).trim_matches(|ch: char| {
+        ch == '"' || ch == '\'' || ch == '`' || ch == '*' || ch == '-' || ch == '.'
+    });
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if !(ch.is_ascii_alphanumeric() || "#+&/'()-.".contains(ch)) {
+            return None;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    let count = out.chars().count();
+    if !(2..=SONG_MAX_TAG_CHARS).contains(&count) || !out.chars().any(|ch| ch.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(out)
+}
+
+fn strip_list_numbering(text: &str) -> &str {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > 3 {
+        return text;
+    }
+    let rest = &text[digits..];
+    rest.strip_prefix(". ")
+        .or_else(|| rest.strip_prefix(") "))
+        .unwrap_or(text)
+}
+
+fn song_style_summary(payload: &SongPromptPayload, vocals: &str, instrumental: bool) -> String {
+    let mut parts = Vec::new();
+    let genre: Vec<String> = split_song_tag_field(&payload.genre)
+        .iter()
+        .filter_map(|tag| normalize_song_tag(tag))
+        .collect();
+    if !genre.is_empty() {
+        parts.push(genre.join(", "));
+    }
+    if (40..=300).contains(&payload.bpm) {
+        parts.push(format!("{} BPM", payload.bpm));
+    }
+    if let Some(key) = normalize_song_tag(&payload.key) {
+        parts.push(key);
+    }
+    if instrumental {
+        parts.push("instrumental".to_owned());
+    } else if let Some(voice) = normalize_song_tag(&vocal_descriptor(&payload.vocal_style, vocals))
+    {
+        parts.push(voice);
+    }
+    parts.join(" · ")
+}
+
+/// Lyrics after section canonicalization and placeholder removal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalLyrics {
+    pub text: String,
+    pub sections: usize,
+    pub line_count: usize,
+    pub has_chorus: bool,
+}
+
+/// Canonicalize section markers, drop stage directions and placeholder lines,
+/// and lay the lyrics out one section per block.
+#[must_use]
+pub fn canonicalize_song_lyrics(raw: &str) -> CanonicalLyrics {
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for raw_line in raw.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(marker) = section_marker(line) {
+            if let Some(name) = canonical_section_name(marker) {
+                if let Some(section) = current.take().filter(|(_, lines)| !lines.is_empty()) {
+                    sections.push(section);
+                }
+                current = Some((name, Vec::new()));
+            }
+            continue;
+        }
+        if is_placeholder_lyric_line(line) {
+            continue;
+        }
+        let line = clean_lyric_line(line);
+        if line.is_empty() {
+            continue;
+        }
+        match current.as_mut() {
+            Some((_, lines)) => lines.push(line),
+            None => current = Some(("Verse".to_owned(), vec![line])),
+        }
+    }
+    if let Some(section) = current.filter(|(_, lines)| !lines.is_empty()) {
+        sections.push(section);
+    }
+    let line_count = sections.iter().map(|(_, lines)| lines.len()).sum();
+    let has_chorus = sections.iter().any(|(name, _)| name == "Chorus");
+    let text = sections
+        .iter()
+        .map(|(name, lines)| format!("[{name}]\n{}", lines.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    CanonicalLyrics {
+        text,
+        sections: sections.len(),
+        line_count,
+        has_chorus,
+    }
+}
+
+fn section_marker(line: &str) -> Option<&str> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    (!inner.contains('[') && !inner.contains(']')).then_some(inner)
+}
+
+fn canonical_section_name(marker: &str) -> Option<String> {
+    let lowered = marker.trim().to_lowercase();
+    let head: String = lowered
+        .chars()
+        .take_while(|ch| ch.is_alphabetic() || *ch == '-' || *ch == ' ')
+        .collect();
+    let head = head.trim().replace(' ', "-");
+    let number: String = lowered.chars().filter(char::is_ascii_digit).collect();
+    let numbered = |name: &str| {
+        if number.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name} {number}")
+        }
+    };
+    match head.as_str() {
+        "verse" | "куплет" => Some(numbered("Verse")),
+        "pre-chorus" | "prechorus" | "предприпев" => Some("Pre-Chorus".to_owned()),
+        "chorus" | "hook" | "refrain" | "drop" | "припев" => Some("Chorus".to_owned()),
+        "bridge" | "breakdown" | "бридж" => Some("Bridge".to_owned()),
+        "intro" | "интро" | "вступление" => Some("Intro".to_owned()),
+        "outro" | "ending" | "аутро" | "финал" => Some("Outro".to_owned()),
+        _ => None,
+    }
+}
+
+/// Stage directions and placeholders are never sung: a line wrapped entirely in
+/// parentheses, asterisks or angle brackets, or a line without any letters.
+fn is_placeholder_lyric_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    (trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('*') && trimmed.ends_with('*'))
+        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+}
+
+fn clean_lyric_line(line: &str) -> String {
+    let line = strip_list_numbering(line.trim());
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Cheap sanity check that the lyrics are written in the declared language's script.
+#[must_use]
+pub fn lyrics_script_matches_language(text: &str, language: &str) -> bool {
+    let cyrillic = text
+        .chars()
+        .filter(|ch| ('\u{0400}'..='\u{04ff}').contains(ch))
+        .count();
+    let latin = text.chars().filter(char::is_ascii_alphabetic).count();
+    match language {
+        "ru" | "uk" | "be" => cyrillic >= latin,
+        "ja" | "ko" | "zh" => true,
+        _ => latin >= cyrillic,
+    }
+}
+
+/// The prompt sent to the music model is the compiled tag list itself.
+#[must_use]
+pub fn build_song_release_prompt(style: &str) -> String {
+    let style = style.trim();
+    if style.is_empty() {
+        DEFAULT_SONG_STYLE_TAGS.to_owned()
+    } else {
+        style.to_owned()
     }
 }
 
@@ -957,6 +1367,10 @@ fn parse_completion_response(
         audio_data,
         file_name: format!("song.{ext}"),
         content,
+        seed: value.pointer("/usage/seed").and_then(Value::as_i64),
+        duration_seconds: value
+            .pointer("/usage/duration_seconds")
+            .and_then(Value::as_f64),
     })
 }
 
@@ -1399,166 +1813,6 @@ fn fallback_song_filename(fallback_ext: &str) -> String {
     }
 }
 
-#[derive(Default)]
-struct SongStyleAccumulator {
-    tags: Vec<String>,
-    has_bpm: bool,
-}
-
-impl SongStyleAccumulator {
-    fn add(&mut self, raw_tag: &str) -> bool {
-        let (tag, is_bpm) = normalize_song_style_tag(raw_tag);
-        if tag.is_empty() {
-            return true;
-        }
-        if !is_valid_song_style_tag(&tag, is_bpm) {
-            return false;
-        }
-        if self.tags.iter().any(|seen| seen == &tag) {
-            return true;
-        }
-        if is_bpm {
-            if self.has_bpm {
-                return false;
-            }
-            self.has_bpm = true;
-        }
-        self.tags.push(tag);
-        true
-    }
-
-    fn valid(&self) -> bool {
-        if self.tags.len() < 3 || self.tags.len() > 7 {
-            return false;
-        }
-        if self.has_bpm
-            && !self
-                .tags
-                .last()
-                .is_some_and(|tag| is_song_style_bpm_tag(tag))
-        {
-            return false;
-        }
-        !has_contradictory_song_style_tags(&self.tags)
-    }
-}
-
-fn normalize_song_style_tag(raw_tag: &str) -> (String, bool) {
-    if let Some(bpm) = normalize_raw_song_bpm_tag(raw_tag) {
-        return (bpm, true);
-    }
-    let tag = normalize_song_style_tag_text(raw_tag);
-    if tag.is_empty() {
-        return (String::new(), false);
-    }
-    if let Some(bpm) = normalize_song_bpm_tag(&tag) {
-        return (bpm, true);
-    }
-    (tag, false)
-}
-
-fn normalize_raw_song_bpm_tag(raw_tag: &str) -> Option<String> {
-    let mut fields = raw_tag.split_whitespace();
-    let value = fields.next()?;
-    let suffix = fields.next()?;
-    if fields.next().is_some()
-        || !suffix.eq_ignore_ascii_case("bpm")
-        || !valid_song_bpm_value(value)
-    {
-        None
-    } else {
-        Some(format!("{value} BPM"))
-    }
-}
-
-fn normalize_song_style_tag_text(raw_tag: &str) -> String {
-    let mut out = String::with_capacity(raw_tag.len());
-    let mut pending_space = false;
-    for ch in raw_tag.trim().chars() {
-        if ch.is_whitespace() {
-            if !out.is_empty() {
-                pending_space = true;
-            }
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.extend(ch.to_lowercase());
-    }
-    out
-}
-
-fn normalize_song_bpm_tag(tag: &str) -> Option<String> {
-    let value = tag.strip_suffix(" bpm")?.trim();
-    valid_song_bpm_value(value).then(|| format!("{value} BPM"))
-}
-
-fn valid_song_bpm_value(value: &str) -> bool {
-    (2..=3).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn is_valid_song_style_tag(tag: &str, is_bpm: bool) -> bool {
-    if is_bpm {
-        return true;
-    }
-    let mut has_letter = false;
-    for ch in tag.chars() {
-        let is_letter = ch.is_ascii_lowercase();
-        let ok = is_letter || ch.is_ascii_digit() || " +&/-'".contains(ch);
-        if !ok {
-            return false;
-        }
-        has_letter |= is_letter;
-    }
-    has_letter
-}
-
-fn is_song_style_bpm_tag(tag: &str) -> bool {
-    tag.ends_with(" BPM")
-}
-
-fn has_contradictory_song_style_tags(tags: &[String]) -> bool {
-    CONTRADICTORY_STYLE_PAIRS.iter().any(|(left, right)| {
-        tags.iter().any(|tag| tag == left) && tags.iter().any(|tag| tag == right)
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SongSection {
-    name: String,
-    line_count: usize,
-}
-
-fn parse_song_sections(lyrics: &str) -> Vec<SongSection> {
-    let mut sections = Vec::new();
-    let mut current: Option<usize> = None;
-    for raw in lyrics.split('\n') {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if is_song_section_tag(line) {
-            sections.push(SongSection {
-                name: line[1..line.len() - 1].trim().to_owned(),
-                line_count: 0,
-            });
-            current = sections.len().checked_sub(1);
-            continue;
-        }
-        let Some(index) = current else {
-            return Vec::new();
-        };
-        sections[index].line_count += 1;
-    }
-    sections
-}
-
-fn is_song_section_tag(line: &str) -> bool {
-    line.starts_with('[') && line.ends_with(']') && line.len() > 2
-}
-
 fn sanitize_song_file_name(value: &str) -> String {
     value
         .chars()
@@ -1608,13 +1862,15 @@ mod tests {
 
     use super::{
         AceStepApiMode, AceStepClient, AceStepConfig, CompletionRequest,
-        MAX_LOGGED_ERROR_BODY_BYTES, ReleaseTaskRequest, SongPromptPayload, SongPromptRequest,
-        TaskStatus, bounded_http_error_body, build_audio_url, build_song_file_name,
-        build_song_release_prompt, detect_song_language, extract_files, extract_task_id_list,
-        has_song_minimum_structure, normalize_song_language, normalize_song_lyrics,
-        normalize_song_prompt_input, normalize_song_prompt_payload, normalize_song_style,
-        parse_completion_response, parse_query_items, query_result_items, release_task_id,
-        render_song_reprompt_messages, render_song_reprompt_messages_with,
+        MAX_LOGGED_ERROR_BODY_BYTES, ReleaseTaskRequest, SONG_LANGUAGE_INVALID_REJECTION,
+        SONG_LYRICS_LANGUAGE_REJECTION, SONG_LYRICS_STRUCTURE_REJECTION, SONG_MAX_TAGS,
+        SONG_STYLE_INVALID_REJECTION, SongPromptPayload, SongPromptRequest, TaskStatus,
+        bounded_http_error_body, build_audio_url, build_song_file_name, build_song_release_prompt,
+        canonicalize_song_lyrics, compile_song_tags, detect_song_language, extract_files,
+        extract_task_id_list, lenient_number, normalize_song_language, normalize_song_prompt_input,
+        normalize_song_prompt_payload, normalize_song_tag, parse_completion_response,
+        parse_query_items, query_result_items, release_task_id, render_song_director_messages_with,
+        song_max_audio_seconds,
     };
 
     fn prompt_store_with(files: &[(&str, &str)]) -> openplotva_prompts::PromptStore {
@@ -1845,7 +2101,7 @@ mod tests {
     async fn completion_client_sends_go_shaped_request_and_decodes_audio()
     -> Result<(), Box<dyn std::error::Error>> {
         let (base_url, handle) = spawn_http_sequence(vec![FixtureHttpResponse::json(
-            r#"{"choices":[{"message":{"content":"ok","audio":[{"audio_url":{"url":"data:audio/mpeg;base64,TVAz"}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":"ok","audio":[{"audio_url":{"url":"data:audio/mpeg;base64,TVAz"}}]}}],"usage":{"seed":42,"duration_seconds":180.5}}"#,
         )]);
         let client = test_client(base_url, AceStepApiMode::Completion);
 
@@ -1857,12 +2113,15 @@ mod tests {
                 audio_format: "mp3".to_owned(),
                 model: "model-a".to_owned(),
                 thinking: false,
+                max_seconds: Some(200),
             })
             .await?;
         let requests = collect_requests(handle)?;
 
         assert_eq!(result.audio_data, b"MP3");
         assert_eq!(result.file_name, "song.mp3");
+        assert_eq!(result.seed, Some(42));
+        assert_eq!(result.duration_seconds, Some(180.5));
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.method, "POST");
@@ -1877,6 +2136,7 @@ mod tests {
         assert_eq!(body["thinking"], false);
         assert_eq!(body["audio_config"]["format"], "mp3");
         assert_eq!(body["audio_config"]["vocal_language"], "ru");
+        assert_eq!(body["audio_config"]["max_seconds"], 200);
         assert_eq!(body["messages"][0]["role"], "user");
         let content = body["messages"][0]["content"].as_str().unwrap_or_default();
         assert!(content.contains("<prompt>neon rain</prompt>"));
@@ -2039,130 +2299,356 @@ mod tests {
         );
     }
 
+    fn rap_payload() -> SongPromptPayload {
+        SongPromptPayload {
+            analysis: "Brostep with rap.".to_owned(),
+            title: "Bass To The Face".to_owned(),
+            vocal_language: "en".to_owned(),
+            vocals: "male".to_owned(),
+            genre: "brostep, dubstep".to_owned(),
+            bpm: 140,
+            key: "F minor".to_owned(),
+            sound: vec![
+                "distorted mid-range growl bass".to_owned(),
+                "wobble bass in call and response".to_owned(),
+                "half-time drums with a big clap".to_owned(),
+                "laser synths".to_owned(),
+                "clean sub".to_owned(),
+            ],
+            character: vec![
+                "aggressive".to_owned(),
+                "energetic".to_owned(),
+                "Aggressive".to_owned(),
+            ],
+            structure: vec![
+                "serene melodic synth intro".to_owned(),
+                "rap verse over a sparse beat".to_owned(),
+                "snare-roll build with a shouted vocal sample".to_owned(),
+                "second drop a whole step higher".to_owned(),
+            ],
+            vocal_style: "rap vocals with an aggressive chanted flow".to_owned(),
+            references: vec!["in the style of Skrillex".to_owned()],
+            duration_seconds: 190,
+            lyrics: [
+                "[Verse 1]",
+                "Sirens on the skyline, engine in the red,",
+                "Bass in the basement shaking every thread,",
+                "Call the doctor, call the cops,",
+                "When the sub drops low the whole block haunts.",
+                "[Hook]",
+                "Drop it! Drop it! Let the speakers bleed!",
+                "Wub wub, that's the only thing we need!",
+                "[verse 2]",
+                "Concrete jungle, lasers on the glass,",
+                "Every step a snare, every breath a bass,",
+                "(instrumental break)",
+                "Growl in the left, growl in the right,",
+                "[Chorus]",
+                "Drop it! Drop it! Let the speakers bleed!",
+                "Wub wub, that's the only thing we need!",
+            ]
+            .join("\n"),
+        }
+    }
+
     #[test]
-    fn song_prompt_normalization_matches_go_contract() -> Result<(), Box<dyn std::error::Error>> {
+    fn song_prompt_input_prefers_hint_then_detects_from_request()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (topic, lang) = normalize_song_prompt_input(&SongPromptRequest {
             topic: "ночной город".to_owned(),
+            language_hint: "PL-pl".to_owned(),
             ..SongPromptRequest::default()
         })?;
         assert_eq!(topic, "ночной город");
-        assert_eq!(lang, "ru");
+        assert_eq!(lang, "pl");
+        let (_, lang) = normalize_song_prompt_input(&SongPromptRequest {
+            topic: "sad song".to_owned(),
+            request_text: "!song сумна пісня про Київ уночі".to_owned(),
+            ..SongPromptRequest::default()
+        })?;
+        assert_eq!(lang, "uk");
         assert_eq!(detect_song_language("city lights"), "en");
         assert_eq!(detect_song_language("ночной город"), "ru");
-        assert_eq!(detect_song_language("літній вечір над Дніпром"), "uk");
-        assert_eq!(detect_song_language("Київ уночі"), "uk");
         assert_eq!(
             detect_song_language("рэйв у закінутым заводзе да світання"),
             "be"
         );
-        assert_eq!(normalize_song_language("PL-pl"), "pl");
         assert_eq!(normalize_song_language("be-BY"), "be");
         assert_eq!(normalize_song_language("klingon"), "");
-
-        let lyrics = [
-            "[Verse 1]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
-            "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
-            "[Verse 2]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
-            "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
-        ]
-        .join("\n");
-        let result = normalize_song_prompt_payload(
-            SongPromptPayload {
-                title: "City Lights".to_owned(),
-                input_topic: "city lights".to_owned(),
-                style: "synthwave|male vocal; synth bass\ndrum machine, atmospheric, 102 BPM"
-                    .to_owned(),
-                vocal_language: "en".to_owned(),
-                lyrics,
-            },
-            "fallback",
-            "en",
-        )?;
-        assert_eq!(
-            result.style,
-            "synthwave, male vocal, synth bass, drum machine, atmospheric, 102 BPM"
+        assert!(
+            normalize_song_prompt_input(&SongPromptRequest::default()).is_err(),
+            "empty topic is rejected"
         );
-        assert_eq!(result.vocal_language, "en");
         Ok(())
     }
 
     #[test]
-    fn song_reprompt_messages_preserve_go_roles_and_variables()
+    fn song_director_payload_compiles_tags_and_canonical_lyrics()
     -> Result<(), Box<dyn std::error::Error>> {
-        let messages = render_song_reprompt_messages("ночной город", "ru")?;
+        let result = normalize_song_prompt_payload(rap_payload(), "bass to the face", "ru")?;
+
+        assert_eq!(
+            result.style,
+            "brostep, dubstep, 140 BPM, F minor, male rap vocals with an aggressive chanted flow, \
+             distorted mid-range growl bass, wobble bass in call and response, \
+             half-time drums with a big clap, laser synths, clean sub, aggressive, energetic, \
+             serene melodic synth intro, rap verse over a sparse beat, \
+             snare-roll build with a shouted vocal sample, second drop a whole step higher, \
+             in the style of Skrillex"
+        );
+        assert_eq!(
+            result.raw_style,
+            "brostep, dubstep · 140 BPM · F minor · male rap vocals with an aggressive chanted flow"
+        );
+        assert_eq!(
+            result.vocal_language, "en",
+            "the director's language wins over the hint"
+        );
+        assert_eq!(result.vocals, "male");
+        assert_eq!(result.title, "Bass To The Face");
+        assert_eq!(result.duration_seconds, 190);
+        assert_eq!(result.max_audio_seconds(), 235);
+        assert_eq!(
+            result.lyrics,
+            "[Verse 1]\nSirens on the skyline, engine in the red,\nBass in the basement shaking every thread,\n\
+             Call the doctor, call the cops,\nWhen the sub drops low the whole block haunts.\n\n\
+             [Chorus]\nDrop it! Drop it! Let the speakers bleed!\nWub wub, that's the only thing we need!\n\n\
+             [Verse 2]\nConcrete jungle, lasers on the glass,\nEvery step a snare, every breath a bass,\n\
+             Growl in the left, growl in the right,\n\n\
+             [Chorus]\nDrop it! Drop it! Let the speakers bleed!\nWub wub, that's the only thing we need!"
+        );
+        assert_eq!(result.brief["bpm"], 140);
+        assert_eq!(result.brief["analysis"], "Brostep with rap.");
+        Ok(())
+    }
+
+    #[test]
+    fn song_director_payload_handles_instrumentals() -> Result<(), Box<dyn std::error::Error>> {
+        let mut payload = rap_payload();
+        payload.vocals = "instrumental".to_owned();
+        payload.vocal_style = String::new();
+        payload.duration_seconds = 0;
+        payload.lyrics =
+            "[Verse 1]\n[Instrumental - fast tremolo picking]\n(instrumental)".to_owned();
+
+        let result = normalize_song_prompt_payload(payload, "dark neurofunk", "en")?;
+
+        assert!(result.is_instrumental());
+        assert_eq!(result.lyrics, "");
+        assert_eq!(result.vocals, "instrumental");
+        assert!(
+            result.style.contains(", instrumental, "),
+            "{}",
+            result.style
+        );
+        assert!(!result.style.contains("rap vocals"));
+        assert_eq!(result.duration_seconds, 180);
+        assert_eq!(result.max_audio_seconds(), 180);
+        assert_eq!(
+            result.raw_style,
+            "brostep, dubstep · 140 BPM · F minor · instrumental"
+        );
+
+        let mut placeholder_only = rap_payload();
+        placeholder_only.lyrics = "(instrumental)\n---".to_owned();
+        let result = normalize_song_prompt_payload(placeholder_only, "dark neurofunk", "en")?;
+        assert!(
+            result.is_instrumental(),
+            "placeholder-only lyrics mean instrumental"
+        );
+
+        assert_eq!(song_max_audio_seconds(400, true), 360);
+        assert_eq!(song_max_audio_seconds(10, true), 45);
+        assert_eq!(song_max_audio_seconds(350, false), 360);
+        assert_eq!(song_max_audio_seconds(0, false), 60);
+        Ok(())
+    }
+
+    #[test]
+    fn song_director_payload_rejects_bad_material() {
+        let rejection = |payload: SongPromptPayload, language: &str| {
+            normalize_song_prompt_payload(payload, "topic", language)
+                .expect_err("rejected")
+                .to_string()
+        };
+
+        let mut short = rap_payload();
+        short.sound.clear();
+        short.structure.clear();
+        short.references.clear();
+        assert_eq!(rejection(short, "en"), SONG_STYLE_INVALID_REJECTION);
+
+        let mut no_chorus = rap_payload();
+        no_chorus.lyrics = no_chorus
+            .lyrics
+            .replace("[Hook]", "[Verse 3]")
+            .replace("[Chorus]", "[Bridge]");
+        assert_eq!(rejection(no_chorus, "en"), SONG_LYRICS_STRUCTURE_REJECTION);
+
+        let mut wrong_script = rap_payload();
+        wrong_script.lyrics = [
+            "[Verse 1]",
+            "Ночь, улица, фонарь, аптека,",
+            "Бессмысленный и тусклый свет,",
+            "Живи ещё хоть четверть века,",
+            "Всё будет так, исхода нет,",
+            "[Chorus]",
+            "Умрёшь, начнёшь опять сначала,",
+            "И повторится всё, как встарь,",
+            "Ночь, ледяная рябь канала,",
+            "Аптека, улица, фонарь.",
+        ]
+        .join("\n");
+        assert_eq!(
+            rejection(wrong_script, "en"),
+            SONG_LYRICS_LANGUAGE_REJECTION
+        );
+
+        let mut unsupported = rap_payload();
+        unsupported.vocal_language = "klingon".to_owned();
+        assert_eq!(
+            rejection(unsupported, "tlh"),
+            SONG_LANGUAGE_INVALID_REJECTION
+        );
+
+        let mut too_long = rap_payload();
+        too_long.lyrics = std::iter::once("[Chorus]".to_owned())
+            .chain((0..90).map(|index| format!("line {index}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rejection(too_long, "en"), SONG_LYRICS_STRUCTURE_REJECTION);
+    }
+
+    #[test]
+    fn song_tags_are_normalized_deduplicated_and_capped() {
+        assert_eq!(
+            normalize_song_tag("  1. Dark   sci-fi  atmosphere "),
+            Some("Dark sci-fi atmosphere".to_owned())
+        );
+        assert_eq!(
+            normalize_song_tag("\"flanged reese\""),
+            Some("flanged reese".to_owned())
+        );
+        assert_eq!(
+            normalize_song_tag("тёмный бас"),
+            None,
+            "non-Latin tags are dropped"
+        );
+        assert_eq!(
+            normalize_song_tag("808"),
+            None,
+            "digits alone are not a tag"
+        );
+        assert_eq!(normalize_song_tag("x"), None);
+        assert_eq!(
+            normalize_song_tag("A flat major"),
+            Some("A flat major".to_owned())
+        );
+
+        let mut payload = rap_payload();
+        payload.sound = (0..60)
+            .map(|index| format!("layer number {index}"))
+            .collect();
+        let tags = compile_song_tags(&payload, "male", false);
+        assert_eq!(tags.len(), SONG_MAX_TAGS);
+        assert_eq!(tags[0], "brostep");
+        assert_eq!(tags[1], "dubstep");
+        assert_eq!(tags[2], "140 BPM");
+
+        let mut no_voice_word = rap_payload();
+        no_voice_word.vocal_style = "clean pop vocals".to_owned();
+        let tags = compile_song_tags(&no_voice_word, "female", false);
+        assert!(tags.contains(&"female clean pop vocals".to_owned()));
+        let mut no_style = rap_payload();
+        no_style.vocal_style = String::new();
+        let tags = compile_song_tags(&no_style, "duet", false);
+        assert!(tags.contains(&"duet vocals".to_owned()));
+    }
+
+    #[test]
+    fn lyrics_canonicalization_maps_markers_and_drops_placeholders() {
+        let canonical = canonicalize_song_lyrics(
+            "[Intro]\n(soft piano)\n[Куплет 1]\n1. первая строка\nвторая строка\n[Припев]\nхук раз\nхук два\n[Guitar solo]\n[Instrumental - tremolo]\n[Outro]\n*fade out*\nпоследняя строка",
+        );
+        assert_eq!(
+            canonical.text,
+            "[Verse 1]\nпервая строка\nвторая строка\n\n[Chorus]\nхук раз\nхук два\n\n[Outro]\nпоследняя строка"
+        );
+        assert_eq!(canonical.sections, 3);
+        assert_eq!(canonical.line_count, 5);
+        assert!(canonical.has_chorus);
+
+        let orphan = canonicalize_song_lyrics("no markers here\nsecond line");
+        assert_eq!(orphan.text, "[Verse]\nno markers here\nsecond line");
+        assert!(!orphan.has_chorus);
+        assert_eq!(canonicalize_song_lyrics("").line_count, 0);
+    }
+
+    #[test]
+    fn lenient_numbers_parse_strings_and_timecodes() {
+        assert_eq!(lenient_number(&json!(140)), 140);
+        assert_eq!(lenient_number(&json!(174.4)), 174);
+        assert_eq!(lenient_number(&json!("140 BPM")), 140);
+        assert_eq!(lenient_number(&json!("3:00")), 180);
+        assert_eq!(lenient_number(&json!("about ninety")), 0);
+        assert_eq!(lenient_number(&json!(null)), 0);
+        let payload: SongPromptPayload = serde_json::from_str(
+            r#"{"title":"t","bpm":"128","duration_seconds":"2:30","sound":["a"]}"#,
+        )
+        .expect("lenient payload");
+        assert_eq!(payload.bpm, 128);
+        assert_eq!(payload.duration_seconds, 150);
+        assert_eq!(payload.sound, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn song_director_messages_render_with_injected_store() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let store = prompt_store_with(&[(
+            "music/song_director.prompt",
+            "{{role \"system\"}}director {{maxDuration}}{{role \"user\"}}{{request}}|{{topic}}|{{userName}}|{{languageHint}}|{{#if context}}ctx:{{context}}{{/if}}",
+        )]);
+        let request = SongPromptRequest {
+            topic: "night city".to_owned(),
+            request_text: "!song night city, female vocals".to_owned(),
+            user_full_name: "Alice".to_owned(),
+            context: "Alice likes synthwave".to_owned(),
+            ..SongPromptRequest::default()
+        };
+
+        let messages = render_song_director_messages_with(&store, &request, "night city", "en")?;
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
-        assert!(
-            messages[0]
-                .content
-                .contains("optimize_song_prompt_terminator")
-        );
+        assert_eq!(messages[0].content, "director 360");
         assert_eq!(messages[1].role, "user");
         assert_eq!(
             messages[1].content,
-            "Topic: ночной город\nVocal language: ru"
+            "!song night city, female vocals|night city|Alice|en|ctx:Alice likes synthwave"
         );
+
+        let bare = render_song_director_messages_with(
+            &store,
+            &SongPromptRequest {
+                topic: "night city".to_owned(),
+                ..SongPromptRequest::default()
+            },
+            "night city",
+            "",
+        )?;
+        assert_eq!(bare[1].content, "night city|night city|listener|unknown|");
         Ok(())
-    }
-
-    #[test]
-    fn song_reprompt_messages_use_injected_store() -> Result<(), Box<dyn std::error::Error>> {
-        let store = prompt_store_with(&[(
-            "music/song_reprompt.prompt",
-            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{vocalLanguage}}",
-        )]);
-
-        let messages = render_song_reprompt_messages_with(&store, "night city", "en")?;
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[0].content, "custom song system night city");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content, "custom song user en");
-        Ok(())
-    }
-
-    #[test]
-    fn song_prompt_rejects_invalid_style_and_structure() {
-        assert_eq!(
-            normalize_song_style("upbeat, melancholic, piano"),
-            String::new()
-        );
-        assert!(!has_song_minimum_structure(
-            "[Verse 1]\none\ntwo\n[Chorus]\none\ntwo"
-        ));
-        assert_eq!(
-            normalize_song_lyrics("  first line  \n\n second line\t\nthird line  "),
-            "first line\n\nsecond line\nthird line"
-        );
     }
 
     #[test]
     fn song_file_and_release_prompt_helpers_match_go_shapes() {
         assert_eq!(
-            build_song_release_prompt("indie pop", "ночной город", "ru"),
-            "indie pop, песня о ночной город"
+            build_song_release_prompt("  indie pop, 96 BPM "),
+            "indie pop, 96 BPM"
         );
         assert_eq!(
-            build_song_release_prompt("indie pop", "city lights", "en"),
-            "indie pop, song about city lights"
+            build_song_release_prompt(""),
+            "indie pop, clear vocal, acoustic guitar, emotional, 96 BPM"
         );
         assert_eq!(
             build_song_file_name("Alice/Bob", "Night:City", "mp3"),

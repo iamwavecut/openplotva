@@ -42,7 +42,10 @@ pub const MODEL_GEMINI_FLASH_LITE_PINNED: &str = "gemini-2.5-flash-lite";
 pub const MODEL_GEMINI_FLASH_FALLBACK: &str = MODEL_GEMINI_FLASH_LITE_PINNED;
 pub const GEMINI_OPTIMIZE_PROMPT_CACHE_USE_CASE: &str = "optimize_prompt_core_v2";
 pub const GEMINI_OPTIMIZE_EDIT_PROMPT_CACHE_USE_CASE: &str = "optimize_edit_core_v2";
-pub const GEMINI_SONG_REPROMPT_CACHE_USE_CASE: &str = "chat_core_song_reprompt";
+pub const GEMINI_SONG_REPROMPT_CACHE_USE_CASE: &str = "chat_core_song_director";
+// The director payload carries the analysis, three tag layers and full lyrics.
+const SONG_DIRECTOR_MAX_OUTPUT_TOKENS: i32 = 6144;
+const SONG_DIRECTOR_TEMPERATURE: f64 = 0.7;
 
 const LEGACY_MODEL_GEMINI_FLASH_LITE_LATEST: &str = "googleai/gemini-flash-lite-latest";
 const LEGACY_MODEL_GEMINI_FLASH_LITE_PREVIEW: &str = "gemini-2.5-flash-lite-preview-09-2025";
@@ -1296,12 +1299,14 @@ where
         let (topic, language) = openplotva_media::acestep::normalize_song_prompt_input(&request)
             .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()))?;
         let messages = match self.prompt_store.as_deref() {
-            Some(prompts) => openplotva_media::acestep::render_song_reprompt_messages_with(
-                prompts, &topic, &language,
+            Some(prompts) => openplotva_media::acestep::render_song_director_messages_with(
+                prompts, &request, &topic, &language,
             )?,
-            None => openplotva_media::acestep::render_song_reprompt_messages(&topic, &language)?,
+            None => openplotva_media::acestep::render_song_director_messages(
+                &request, &topic, &language,
+            )?,
         };
-        let tool = openplotva_media::acestep::optimize_song_prompt_terminator_definition();
+        let tool = openplotva_media::acestep::song_director_terminator_definition();
         let model = self.cfg.model.clone();
         let mut gemini_request = gemini_song_prompt_request(messages, &tool, &model)
             .map_err(GeminiMediaPromptOptimizerError::Generate)?;
@@ -2116,7 +2121,7 @@ fn gemini_song_prompt_request(
         }
     }
     if contents.is_empty() {
-        return Err("song reprompt prompt produced no user messages".to_owned());
+        return Err("song director prompt produced no user messages".to_owned());
     }
     Ok(GeminiGenerateContentRequest {
         cached_content: None,
@@ -2126,8 +2131,8 @@ fn gemini_song_prompt_request(
         }),
         contents,
         generation_config: GeminiGenerationConfig {
-            max_output_tokens: MEDIA_OPTIMIZER_MAX_OUTPUT_TOKENS,
-            temperature: MEDIA_OPTIMIZER_TEMPERATURE,
+            max_output_tokens: SONG_DIRECTOR_MAX_OUTPUT_TOKENS,
+            temperature: SONG_DIRECTOR_TEMPERATURE,
             top_p: 0.0,
             top_k: None,
         },
@@ -3577,25 +3582,19 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let lyrics = [
             "[Verse 1]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Neon rain on the windshield glass,",
+            "Every red light lets the night drive past,",
+            "Radio hums a forgotten tune,",
+            "Chrome and smoke under a paper moon.",
             "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Night city, keep the engine warm,",
+            "Night city, ride me through the storm,",
             "[Verse 2]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Static voices on a dead-end street,",
+            "Sodium halos and a steady beat,",
             "[Chorus]",
-            "line one",
-            "line two",
-            "line three",
-            "line four",
+            "Night city, keep the engine warm,",
+            "Night city, ride me through the storm,",
         ]
         .join("\n");
         let transport = FakeTransport::new(vec![
@@ -3608,12 +3607,21 @@ mod tests {
                         "role": "model",
                         "parts": [{
                             "functionCall": {
-                                "name": "optimize_song_prompt_terminator",
+                                "name": "song_director_terminator",
                                 "args": {
+                                    "analysis": "Synthwave with clean female vocals.",
                                     "title": "Night City",
-                                    "input_topic": "night city",
-                                    "style": "synthwave, synth bass, neon mood, 102 bpm",
                                     "vocal_language": "en-US",
+                                    "vocals": "female",
+                                    "genre": "synthwave",
+                                    "bpm": 102,
+                                    "key": "",
+                                    "sound": ["synth bass", "gated reverb drums", "analog pads", "arpeggiated plucks", "bright lead synth"],
+                                    "character": ["neon mood", "nostalgic 80s", "driving"],
+                                    "structure": ["synth intro", "verse over a pulsing bass", "big chorus", "outro fades on the hook"],
+                                    "vocal_style": "clean vocals with light reverb",
+                                    "references": [],
+                                    "duration_seconds": 180,
                                     "lyrics": lyrics
                                 }
                             }
@@ -3632,8 +3640,8 @@ mod tests {
             transport.clone(),
         )
         .with_prompt_store(prompt_store_with(&[(
-            "music/song_reprompt.prompt",
-            "{{role \"system\"}}custom gemini song {{topic}}{{role \"user\"}}custom gemini user {{vocalLanguage}}",
+            "music/song_director.prompt",
+            "{{role \"system\"}}custom gemini song {{topic}}{{role \"user\"}}custom gemini user {{languageHint}}",
         )]));
 
         let got = optimizer
@@ -3647,7 +3655,14 @@ mod tests {
         assert_eq!(got.title, "Night City");
         assert_eq!(got.topic, "night city");
         assert_eq!(got.vocal_language, "en");
-        assert_eq!(got.style, "synthwave, synth bass, neon mood, 102 BPM");
+        assert_eq!(got.vocals, "female");
+        assert!(
+            got.style.starts_with(
+                "synthwave, 102 BPM, female clean vocals with light reverb, synth bass"
+            ),
+            "{}",
+            got.style
+        );
         let state = transport.state();
         assert_eq!(state.requests.len(), 2);
         let cache_body: Value = serde_json::from_slice(&state.requests[0].body)?;
@@ -3655,7 +3670,7 @@ mod tests {
         assert!(
             cache_body["displayName"]
                 .as_str()
-                .is_some_and(|value| value.starts_with("pv|1|chat_core_song_reprompt|"))
+                .is_some_and(|value| value.starts_with("pv|1|chat_core_song_director|"))
         );
         assert_eq!(
             cache_body["systemInstruction"]["parts"][0]["text"],
@@ -3663,11 +3678,11 @@ mod tests {
         );
         assert_eq!(
             cache_body["tools"][0]["functionDeclarations"][0]["name"],
-            "optimize_song_prompt_terminator"
+            "song_director_terminator"
         );
         assert_eq!(
             cache_body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
-            json!(["optimize_song_prompt_terminator"])
+            json!(["song_director_terminator"])
         );
 
         let generate_body: Value = serde_json::from_slice(&state.requests[1].body)?;
@@ -3683,8 +3698,8 @@ mod tests {
             generate_body["contents"][0]["parts"][0]["text"],
             "custom gemini user en"
         );
-        assert_eq!(generate_body["generationConfig"]["maxOutputTokens"], 1024);
-        assert_eq!(generate_body["generationConfig"]["temperature"], 0.5);
+        assert_eq!(generate_body["generationConfig"]["maxOutputTokens"], 6144);
+        assert_eq!(generate_body["generationConfig"]["temperature"], 0.7);
         Ok(())
     }
 

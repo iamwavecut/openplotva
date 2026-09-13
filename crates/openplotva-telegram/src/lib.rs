@@ -19,15 +19,16 @@ pub use callback::{
     DELETE_DRAWING_ACTION_CLOSE, DELETE_DRAWING_ACTION_CONFIRM,
     DELETE_DRAWING_ACTION_FRAME_CONFIRM, DELETE_DRAWING_ACTION_FRAME_PICK,
     DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE, DELETE_LYRICS_ACTION_CONFIRM,
-    DELETE_LYRICS_ACTION_INIT, build_checkin_theme_selection_keyboard,
+    DELETE_LYRICS_ACTION_INIT, SONG_RETAKE_ACTION, build_checkin_theme_selection_keyboard,
     build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
     build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
-    build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard,
+    build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard, build_song_retake_keyboard,
     callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
     callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
     checkin_theme_selection_ack_method, checkin_theme_selection_alert,
     delete_drawing_callback_data, delete_lyrics_callback_data, parse_callback_action,
-    parse_callback_i64, settings_callback_ack_method,
+    parse_callback_i64, settings_callback_ack_method, song_retake_callback_data,
+    song_retake_callback_song_id,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -717,15 +718,17 @@ mod tests {
         DELETE_DRAWING_ACTION_CONFIRM, DELETE_DRAWING_ACTION_FRAME_CONFIRM,
         DELETE_DRAWING_ACTION_FRAME_PICK, DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE,
         DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, GROUP_ADMIN_COMMANDS,
-        GROUP_COMMANDS, PRIVATE_COMMANDS, build_delete_drawing_confirm_keyboard,
-        build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
-        build_delete_drawing_initial_keyboard, build_lyrics_delete_confirm_keyboard,
-        build_lyrics_delete_keyboard, callback_handler_for_action, callback_query_ack_method,
+        GROUP_COMMANDS, PRIVATE_COMMANDS, SONG_RETAKE_ACTION,
+        build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
+        build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
+        build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard,
+        build_song_retake_keyboard, callback_handler_for_action, callback_query_ack_method,
         callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
         checkin_theme_callback_theme, checkin_theme_selection_ack_method,
         checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
         delete_my_commands_method, empty_context, parse_callback_action, parse_callback_i64,
         parse_star_subscription_payment, set_my_commands_methods, settings_callback_ack_method,
+        song_retake_callback_data, song_retake_callback_song_id,
     };
 
     #[test]
@@ -906,6 +909,32 @@ mod tests {
         assert_eq!(
             callback_handler_for_action(DELETE_LYRICS_ACTION_CLOSE),
             None
+        );
+    }
+
+    #[test]
+    fn song_retake_callback_data_round_trips() {
+        let data = song_retake_callback_data(4242);
+        assert_eq!(data, r#"{"a":"song_rt","s":"4242"}"#);
+        assert!(
+            data.len() <= 64,
+            "callback data must fit Telegram's 64-byte limit"
+        );
+        let CallbackActionParse::Action { data, action } = parse_callback_action(&data) else {
+            panic!("song retake callback data must parse as an action");
+        };
+        assert_eq!(action, SONG_RETAKE_ACTION);
+        assert_eq!(song_retake_callback_song_id(&data), 4242);
+        assert_eq!(
+            callback_handler_for_action(SONG_RETAKE_ACTION),
+            Some(CallbackHandlerKind::SongRetake)
+        );
+        let keyboard = build_song_retake_keyboard(4242);
+        let json = serde_json::to_value(&keyboard).expect("keyboard json");
+        assert_eq!(json["inline_keyboard"][0][0]["text"], "🎲 Ещё тейк");
+        assert_eq!(
+            json["inline_keyboard"][0][0]["callback_data"],
+            r#"{"a":"song_rt","s":"4242"}"#
         );
     }
 

@@ -66,6 +66,7 @@ mod runtime_virtual_dialog;
 pub mod serper;
 pub mod settings;
 pub mod skipped;
+pub mod song_retake;
 pub mod subscription_sync;
 pub mod task_queue;
 pub mod telegram_activity;
@@ -110,10 +111,11 @@ use futures_util::{Stream, stream};
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessProbe, ReadinessResponse};
 use openplotva_storage::{
-    PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
-    PostgresPaymentStore, PostgresRuntimeTokenStore, PostgresRuntimeVirtualDialogStore,
-    PostgresShieldStore, PostgresTelegramFileStore, PostgresVipStore, PostgresVirtualMessageStore,
-    RedisBlockedChatStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
+    PostgresChatMemberStore, PostgresChatSettingsStore, PostgresGeneratedSongStore,
+    PostgresHistoryStore, PostgresMemoryStore, PostgresPaymentStore, PostgresRuntimeTokenStore,
+    PostgresRuntimeVirtualDialogStore, PostgresShieldStore, PostgresTelegramFileStore,
+    PostgresVipStore, PostgresVirtualMessageStore, RedisBlockedChatStore,
+    RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -13236,55 +13238,20 @@ async fn start_runtime_workers(
                 config,
                 Arc::clone(&prompt_store),
             ));
-        let base_song_material: Arc<dyn music_jobs::SongMaterialProvider + Send + Sync> =
-            Arc::new(music_jobs::AifarmSongMaterialProvider::new(
-                music_song_prompt_generator,
-                PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
+        let song_context: Arc<dyn music_jobs::SongContextProvider> =
+            Arc::new(agent_runtime::SongContextGatherer::new(
+                Arc::new(agent_runtime::PostgresHistorySearch::new(
+                    history_store.clone(),
+                )),
+                Arc::new(agent_runtime::PostgresMemorySearch::new(
+                    memory_store.clone(),
+                )),
             ));
-        let song_agent_settings = agent_runtime::SongAgentSettings::from_app_config(
-            config,
-            agent_runtime::SONG_SYSTEM_PROMPT.to_owned(),
-        );
-        let (song_agent_reasoner, song_agent_tools) = if song_agent_settings.enabled {
-            let registry = agent_runtime::build_routed_agent_provider_registry(
-                config,
-                routed_attempts::RoutedAttemptWalker::new(
-                    Arc::clone(&router_handle),
-                    Arc::clone(&router_breakers),
-                    Arc::clone(&router_triggers),
-                    Arc::clone(&router_pools),
-                )
-                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-                .with_reporter(routing_event_reporter.clone()),
-            );
-            let reasoner = registry.get(&song_agent_settings.reasoner_provider);
-            let tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
-                serper_client.as_ref().map(|serper| {
-                    let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
-                    let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-                    let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
-                        agent_runtime::PostgresHistorySearch::new(history_store.clone()),
-                    );
-                    let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
-                        agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
-                    );
-                    Arc::new(
-                        agent_runtime::AppAgentTools::new(web, crawl)
-                            .with_history_searcher(history)
-                            .with_memory_searcher(memory),
-                    ) as Arc<dyn openplotva_agent::AgentTools>
-                });
-            (reasoner, tools)
-        } else {
-            (None, None)
-        };
-        let music_material_provider = agent_runtime::SongAgentMaterialProvider::new(
-            song_agent_reasoner,
-            song_agent_settings,
-            song_agent_tools,
-            base_song_material,
+        let music_material_provider = music_jobs::AifarmSongMaterialProvider::new(
+            music_song_prompt_generator,
+            PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
         )
-        .with_run_buffer(llm_run_buffer.clone());
+        .with_context_provider(song_context);
         let music_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
             Arc::clone(&router_handle),
             Arc::clone(&router_breakers),
@@ -13302,7 +13269,10 @@ async fn start_runtime_workers(
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
             telegram.clone(),
             Arc::clone(&rich_sender),
-        );
+        )
+        .with_song_store(Arc::new(PostgresGeneratedSongStore::new(
+            service_clients.postgres.clone(),
+        )));
         {
             let reactions = &generation_reactions;
             music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
@@ -13658,10 +13628,18 @@ async fn start_runtime_workers(
             },
             skipped,
         ));
+        let song_retake = Arc::new(song_retake::SongRetakeCallbackUpdateHandler::new(
+            Arc::new(PostgresGeneratedSongStore::new(
+                service_clients.postgres.clone(),
+            )),
+            dialog_tool_adapter.clone() as Arc<dyn dialog_tools::SongScheduler>,
+            Arc::clone(&telegram_effects),
+            guest_handler,
+        ));
         let delete_lyrics = Arc::new(delete_lyrics::DeleteLyricsCallbackUpdateHandler::new(
             Arc::clone(&telegram_effects),
             Arc::clone(&telegram_effects),
-            guest_handler,
+            song_retake,
         ));
         let delete_drawing = Arc::new(delete_drawing::DeleteDrawingCallbackUpdateHandler::new(
             Arc::new(service_clients.redis.last_generation_store()),
