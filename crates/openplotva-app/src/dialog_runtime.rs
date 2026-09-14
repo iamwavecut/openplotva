@@ -427,9 +427,16 @@ pub fn router_dialog_provider(
         aifarm,
         prompt_store,
     ));
-    let primary_slot_wait = std::time::Duration::from_millis(
-        u64::try_from(config.llm.dialog.aifarm_pool_primary_capacity_wait_ms).unwrap_or(0),
-    );
+    // Zero disables the wait on purpose; a negative value is a config slip and
+    // keeps the documented default instead of silently disabling it.
+    let configured_wait_ms = config.llm.dialog.aifarm_pool_primary_capacity_wait_ms;
+    let primary_wait_ms = if configured_wait_ms < 0 {
+        openplotva_config::DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS
+    } else {
+        configured_wait_ms
+    };
+    let primary_slot_wait =
+        std::time::Duration::from_millis(u64::try_from(primary_wait_ms).unwrap_or(0));
     let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory)
         .with_primary_slot_wait(primary_slot_wait);
     let provider = match routing_events {
