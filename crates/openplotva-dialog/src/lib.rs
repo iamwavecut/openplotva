@@ -1907,6 +1907,7 @@ fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) ->
         "xmlish" => remove_leading_xmlish_named_call_protocol(content)
             .or_else(|| remove_xmlish_tool_protocol(content)),
         "inline" => remove_inline_tool_protocol(content),
+        "function_call" => remove_function_call_protocol(content),
         "bare_start" | "bare_block" => remove_bare_tool_protocol(content),
         "fenced" => remove_fenced_tool_protocol(content),
         "json" => Some(String::new()),
@@ -1920,7 +1921,9 @@ fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) ->
 fn remove_leading_xmlish_named_call_protocol(raw: &str) -> Option<String> {
     let protocol = strip_reasoning_channels(raw);
     let protocol = protocol.trim_start();
-    if !starts_with_xml_tag(&protocol.to_ascii_lowercase(), "call") {
+    if !starts_with_xml_tag(&protocol.to_ascii_lowercase(), "call")
+        || xmlish_tag_is_call_prefixed(protocol)
+    {
         return None;
     }
     let mut offset = raw.rfind(protocol)?;
@@ -1970,9 +1973,17 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
             offset = open_end;
             continue;
         }
-        let close = format!("</{name}>");
-        let relative_close = index_fold(&raw[open_end..], &close)?;
-        let end = open_end + relative_close + close.len();
+        let call_prefixed = xmlish_tag_is_call_prefixed(tag);
+        let Some((relative_close, close_len)) =
+            find_xmlish_tool_close(&raw[open_end..], &name, call_prefixed)
+        else {
+            if call_prefixed {
+                spans.push((start, raw.len()));
+                break;
+            }
+            return None;
+        };
+        let end = open_end + relative_close + close_len;
         spans.push((start, end));
         offset = end;
     }
@@ -2189,6 +2200,21 @@ fn detect_tool_steps_in(
         return Ok(Some((direct_steps, decision)));
     }
 
+    let function_steps = parse_function_call_steps(content)?;
+    if !function_steps.is_empty() {
+        let decision = ToolParseDecision {
+            form: "function_call".to_owned(),
+            tool: function_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
+        return Ok(Some((function_steps, decision)));
+    }
+
     detect_tool_step_in(content)
         .map(|maybe_step| maybe_step.map(|(step, decision)| (vec![step], decision)))
 }
@@ -2196,7 +2222,9 @@ fn detect_tool_steps_in(
 fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
     let protocol = strip_reasoning_channels(raw);
     let mut remaining = protocol.trim_start();
-    if !starts_with_xml_tag(&remaining.to_ascii_lowercase(), "call") {
+    if !starts_with_xml_tag(&remaining.to_ascii_lowercase(), "call")
+        || xmlish_tag_is_call_prefixed(remaining)
+    {
         return Ok(Vec::new());
     }
 
@@ -2220,7 +2248,7 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         let name = canonical_known_step(&raw_name)
             .ok_or_else(|| ToolParseError::new(format!("unknown step {raw_name:?}")))?;
         let arguments_body = xmlish_child_text(body, "arguments").unwrap_or_default();
-        let mut arguments = serde_json::Map::new();
+        let mut arguments = xmlish_named_arg_children(&arguments_body);
         for key in INLINE_TOOL_ARG_KEYS {
             if let Some(value) = xmlish_child_text(&arguments_body, key) {
                 arguments.insert((*key).to_owned(), Value::String(value));
@@ -2375,6 +2403,311 @@ fn parse_bare_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseErr
     };
     populate_inline_tool_args(&raw[open + 1..], &mut step);
     normalize_and_validate_step(step).map(|step| (step, true))
+}
+
+/// The model wrote the call as code: `generate_song(prompt='…')`, possibly wrapped
+/// in `print(...)`. Only calls with quoted string arguments count, so prose that
+/// merely mentions `generate_song(topic)` is left alone.
+fn parse_function_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
+    find_function_calls(raw)
+        .into_iter()
+        .map(|call| function_call_step(raw, call))
+        .collect()
+}
+
+fn function_call_step(raw: &str, call: FunctionCallSpan) -> Result<ToolStep, ToolParseError> {
+    let mut arguments = serde_json::Map::new();
+    for (index, (key, value)) in parse_function_call_arguments(&raw[call.args_start..call.args_end])
+        .into_iter()
+        .enumerate()
+    {
+        let key = key.or_else(|| {
+            (index == 0)
+                .then(|| primary_tool_arg_key(call.name))
+                .flatten()
+                .map(str::to_owned)
+        });
+        if let Some(key) = key {
+            arguments.insert(key, Value::String(value));
+        }
+    }
+    decode_tool_call_arguments(call.name, &Value::Object(arguments))
+}
+
+fn remove_function_call_protocol(raw: &str) -> Option<String> {
+    let spans: Vec<(usize, usize)> = find_function_calls(raw)
+        .into_iter()
+        .map(|call| {
+            // The call occupies its own line; take the line break with it.
+            let end = call.end + usize::from(raw[call.end..].starts_with('\n'));
+            (call.start, end)
+        })
+        .collect();
+    (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FunctionCallSpan {
+    name: &'static str,
+    /// Span of the whole call including a `print(` / `await` wrapper.
+    start: usize,
+    end: usize,
+    /// Span of the argument list between the parentheses.
+    args_start: usize,
+    args_end: usize,
+}
+
+/// All code-shaped tool calls in `raw`, earliest first, non-overlapping.
+fn find_function_calls(raw: &str) -> Vec<FunctionCallSpan> {
+    let mut calls: Vec<FunctionCallSpan> = Vec::new();
+    for step in ALL_STEPS {
+        let needle = format!("{step}(");
+        let mut offset = 0;
+        while let Some(idx) = raw[offset..].find(&needle) {
+            let name_start = offset + idx;
+            offset = name_start + needle.len();
+            if !is_function_call_boundary(raw, name_start) {
+                continue;
+            }
+            let (start, _) = function_call_wrapper_span(raw, name_start, name_start);
+            // A real call stands on its own line; a call quoted inside prose or a
+            // code example ("вызывать так: `web_search(\"…\")`") is not executed.
+            if !is_statement_start(raw, start) || is_inside_code_fence(raw, start) {
+                continue;
+            }
+            let args_start = name_start + needle.len();
+            let Some(args_end) = matching_paren_end(raw, args_start) else {
+                continue;
+            };
+            let args = &raw[args_start..args_end];
+            // `name({…})` is the legacy function_args form handled elsewhere; plain
+            // mentions without string literals are prose.
+            if args.trim_start().starts_with('{') || (!args.contains('\'') && !args.contains('"')) {
+                continue;
+            }
+            let (start, end) = function_call_wrapper_span(raw, name_start, args_end + 1);
+            calls.push(FunctionCallSpan {
+                name: step,
+                start,
+                end,
+                args_start,
+                args_end,
+            });
+        }
+    }
+    calls.sort_by_key(|call| call.start);
+    let mut cursor = 0;
+    calls.retain(|call| {
+        let keep = call.start >= cursor;
+        if keep {
+            cursor = call.end;
+        }
+        keep
+    });
+    calls
+}
+
+fn is_function_call_boundary(raw: &str, name_start: usize) -> bool {
+    raw[..name_start].chars().next_back().is_none_or(|prev| {
+        !(prev.is_alphanumeric() || prev == '_' || prev == '.' || prev == '<' || prev == '`')
+    })
+}
+
+/// Only whitespace between the start of the line and `start`.
+fn is_statement_start(raw: &str, start: usize) -> bool {
+    let line_start = raw[..start].rfind(['\n', '\r']).map_or(0, |idx| idx + 1);
+    raw[line_start..start].trim().is_empty()
+}
+
+/// Inside a ``` fenced block when an odd number of fences precede `start`.
+fn is_inside_code_fence(raw: &str, start: usize) -> bool {
+    raw[..start].matches("```").count() % 2 == 1
+}
+
+/// Index of the `)` matching the `(` just before `args_start`, honouring quotes.
+fn matching_paren_end(raw: &str, args_start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut depth = 1usize;
+    let mut quote: Option<u8> = None;
+    let mut idx = args_start;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        match quote {
+            Some(open) => {
+                if byte == b'\\' {
+                    idx += 1;
+                } else if byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            },
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Extend the span over `print(` / `await ` / `return ` wrappers and a trailing `;`.
+fn function_call_wrapper_span(raw: &str, name_start: usize, call_end: usize) -> (usize, usize) {
+    let mut start = name_start;
+    let mut end = call_end;
+    let before = raw[..name_start].trim_end_matches([' ', '\t']);
+    let mut wrapped = false;
+    for wrapper in ["print(", "await", "return"] {
+        if before.ends_with(wrapper)
+            && before[..before.len() - wrapper.len()]
+                .chars()
+                .next_back()
+                .is_none_or(|prev| !(prev.is_alphanumeric() || prev == '_'))
+        {
+            start = before.len() - wrapper.len();
+            wrapped = wrapper == "print(";
+            break;
+        }
+    }
+    let rest = &raw[end..];
+    let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if wrapped && rest[skipped..].starts_with(')') {
+        end += skipped + 1;
+    }
+    let rest = &raw[end..];
+    let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if rest[skipped..].starts_with(';') {
+        end += skipped + 1;
+    }
+    (start, end)
+}
+
+/// Split `key='value', "positional", n=3` into (key, value) pairs; positional
+/// values must be quoted strings.
+fn parse_function_call_arguments(args: &str) -> Vec<(Option<String>, String)> {
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut chars = args.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) => {
+                current.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    pieces.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+    pieces.push(current);
+    let mut arguments = Vec::new();
+    for piece in pieces {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (key, value) = match function_call_keyword(piece) {
+            Some((key, value)) => (Some(key.to_owned()), value.trim()),
+            None => (None, piece),
+        };
+        match unquote_code_string(value) {
+            Some(text) => arguments.push((key, text)),
+            None if key.is_some() => arguments.push((key, value.to_owned())),
+            None => {}
+        }
+    }
+    arguments
+}
+
+fn function_call_keyword(piece: &str) -> Option<(&str, &str)> {
+    let (key, value) = piece.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || value.starts_with('=')
+    {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Strip Python/JS string quoting (`'…'`, `"…"`, triple quotes) and escapes.
+fn unquote_code_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    let quote = value
+        .chars()
+        .next()
+        .filter(|ch| *ch == '\'' || *ch == '"')?;
+    let fence = quote.to_string().repeat(3);
+    let inner = if value.len() >= 6 && value.starts_with(&fence) && value.ends_with(&fence) {
+        &value[3..value.len() - 3]
+    } else if value.len() >= 2 && value.ends_with(quote) {
+        &value[1..value.len() - 1]
+    } else {
+        return None;
+    };
+    let mut text = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            text.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => text.push('\n'),
+            Some('t') => text.push('\t'),
+            Some(other) => text.push(other),
+            None => {}
+        }
+    }
+    Some(text)
+}
+
+/// The argument a positional call most likely means for each tool.
+fn primary_tool_arg_key(step: &str) -> Option<&'static str> {
+    match step {
+        STEP_DRAW_IMAGE => Some("prompt"),
+        STEP_GENERATE_SONG => Some("topic"),
+        STEP_UNDERSTAND_MEDIA | LEGACY_STEP_VISION_IMAGE => Some("file_id"),
+        STEP_WEB_SEARCH | STEP_HISTORY_SEARCH | STEP_MEMORY_SEARCH => Some("query"),
+        STEP_CRAWL_URL => Some("url"),
+        STEP_YOUTUBE_SUMMARY => Some("video"),
+        STEP_TRANSLATE_TEXT | STEP_SEND_MESSAGE => Some("text"),
+        STEP_REACT_TO_MESSAGE => Some("emoji"),
+        STEP_CURRENCY_RATES => Some("pairs"),
+        _ => None,
+    }
 }
 
 fn classify_bare_tool_call_form(raw: &str) -> String {
@@ -2758,7 +3091,7 @@ fn parse_xmlish_direct_tool_tag_steps(raw: &str) -> Result<Vec<ToolStep>, ToolPa
         let Some(body) = body else {
             continue;
         };
-        let mut arguments = serde_json::Map::new();
+        let mut arguments = xmlish_named_arg_children(&body);
         for key in INLINE_TOOL_ARG_KEYS {
             if let Some(value) = xmlish_child_text(&body, key) {
                 arguments.insert((*key).to_owned(), Value::String(value));
@@ -2767,6 +3100,42 @@ fn parse_xmlish_direct_tool_tag_steps(raw: &str) -> Result<Vec<ToolStep>, ToolPa
         steps.push(decode_tool_call_arguments(name, &Value::Object(arguments))?);
     }
     Ok(steps)
+}
+
+/// `<arg name="topic">…</arg>` children (also `argument`, `param`, `parameter`).
+fn xmlish_named_arg_children(body: &str) -> serde_json::Map<String, Value> {
+    let mut arguments = serde_json::Map::new();
+    let mut offset = 0;
+    while let Some(idx) = body[offset..].find('<') {
+        let start = offset + idx;
+        let Some(relative_end) = body[start..].find('>') else {
+            break;
+        };
+        let open_end = start + relative_end + 1;
+        let tag = &body[start..open_end];
+        let element = xmlish_tool_tag_name(tag).to_ascii_lowercase();
+        if !matches!(element.as_str(), "arg" | "argument" | "param" | "parameter")
+            || tag.trim_end().ends_with("/>")
+        {
+            offset = open_end;
+            continue;
+        }
+        let Some(key) = xmlish_tool_attr(tag, "name").or_else(|| xmlish_tool_attr(tag, "key"))
+        else {
+            offset = open_end;
+            continue;
+        };
+        let close = format!("</{element}>");
+        let Some(relative_close) = index_fold(&body[open_end..], &close) else {
+            break;
+        };
+        let value = unescape_xmlish(body[open_end..open_end + relative_close].trim());
+        if !value.is_empty() {
+            arguments.insert(key.trim().to_owned(), Value::String(value));
+        }
+        offset = open_end + relative_close + close.len();
+    }
+    arguments
 }
 
 fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)>, ToolParseError> {
@@ -2793,16 +3162,24 @@ fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)
             offset = open_end + 1;
             continue;
         }
-        let close_tag = format!("</{name}>");
         let body_start = open_end + 1;
-        let Some(relative_body_end) = index_fold(&raw[body_start..], &close_tag) else {
+        let call_prefixed = xmlish_tag_is_call_prefixed(&tag);
+        let Some((relative_body_end, close_len)) =
+            find_xmlish_tool_close(&raw[body_start..], &name, call_prefixed)
+        else {
+            if call_prefixed {
+                // An improvised `<call:name>` element often never gets closed; the
+                // rest of the content is its body.
+                elements.push((tag, Some(unescape_xmlish(raw[body_start..].trim()))));
+                break;
+            }
             return Err(ToolParseError::new(format!(
                 "unterminated XML-ish {name} tool element"
             )));
         };
         let body_end = body_start + relative_body_end;
         elements.push((tag, Some(unescape_xmlish(raw[body_start..body_end].trim()))));
-        offset = body_end + close_tag.len();
+        offset = body_end + close_len;
     }
     Ok(elements)
 }
@@ -2922,7 +3299,40 @@ fn xmlish_tool_tag_name(tag: &str) -> String {
     let Some(end) = tag.find([' ', '\t', '\n', '\r', '>', '/']) else {
         return String::new();
     };
-    tag[..end].trim().to_owned()
+    strip_call_prefix(tag[..end].trim()).to_owned()
+}
+
+/// `<call:generate_song …>` names the tool inside the tag itself (observed live
+/// from Gemma); the element is the tool element, `call:` is noise.
+fn strip_call_prefix(name: &str) -> &str {
+    name.get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("call:"))
+        .map_or(name, |_| name[5..].trim())
+}
+
+fn xmlish_tag_is_call_prefixed(tag: &str) -> bool {
+    tag.trim()
+        .trim_start_matches('<')
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("call:"))
+}
+
+/// Find the closing tag of a tool element: `</name>`, or for `call:`-prefixed
+/// elements also `</call:name>` and `</call>`. Returns (relative start, length).
+fn find_xmlish_tool_close(
+    after_open: &str,
+    name: &str,
+    call_prefixed: bool,
+) -> Option<(usize, usize)> {
+    let mut closers = vec![format!("</{name}>")];
+    if call_prefixed {
+        closers.push(format!("</call:{name}>"));
+        closers.push("</call>".to_owned());
+    }
+    closers
+        .iter()
+        .filter_map(|close| index_fold(after_open, close).map(|start| (start, close.len())))
+        .min_by_key(|(start, _)| *start)
 }
 
 fn index_fold(value: &str, needle: &str) -> Option<usize> {
@@ -3242,6 +3652,9 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
 
     if !is_known_step(&step.step) {
         return Err(ToolParseError::new(format!("unknown step {:?}", step.step)));
+    }
+    if step.step == STEP_GENERATE_SONG && step.topic.is_empty() && !step.prompt.is_empty() {
+        step.topic = std::mem::take(&mut step.prompt);
     }
     if step_contains_protocol_sentinel_argument(&step) {
         return Err(ToolParseError::new(format!(
@@ -4108,6 +4521,103 @@ mod tests {
         assert_eq!(parsed.tool_steps[1].emoji, "😂");
         assert_eq!(parsed.tool_steps[1].target_message_id, 999949);
         assert!(!parsed.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_recovers_code_shaped_and_call_prefixed_song_calls()
+    -> Result<(), ToolParseError> {
+        let wrapped = parse_assistant_content(
+            "Ну вот, сразу «дебил»... Исправляюсь и без лишних слов.\n\nprint(generate_song(prompt='Песня \"Карты, деньги, два ствола\", саундтрек к фильму, мрачная атмосфера, британский хип-хоп, Лондон'))",
+        )?;
+        assert_eq!(wrapped.tool_steps.len(), 1);
+        assert_eq!(wrapped.tool_steps[0].step, STEP_GENERATE_SONG);
+        assert_eq!(
+            wrapped.tool_steps[0].topic,
+            "Песня \"Карты, деньги, два ствола\", саундтрек к фильму, мрачная атмосфера, британский хип-хоп, Лондон"
+        );
+        assert!(wrapped.tool_steps[0].prompt.is_empty());
+        assert_eq!(
+            wrapped.text,
+            "Ну вот, сразу «дебил»... Исправляюсь и без лишних слов."
+        );
+        assert!(!wrapped.residual_protocol);
+
+        let attribute = parse_assistant_content(
+            r#"<call:generate_song aria-type="tool" args='{"topic": "Песня в стиле криминального боевика 90-х про карты, деньги и два ствола."}' />"#,
+        )?;
+        assert_eq!(attribute.tool_steps.len(), 1);
+        assert_eq!(attribute.tool_steps[0].step, STEP_GENERATE_SONG);
+        assert_eq!(
+            attribute.tool_steps[0].topic,
+            "Песня в стиле криминального боевика 90-х про карты, деньги и два ствола."
+        );
+        assert!(attribute.text.is_empty());
+        assert!(!attribute.residual_protocol);
+
+        let children = parse_assistant_content(
+            r#"<call:generate_song><arg name="topic">Песня в стиле драйвового русского шансона про азарт и удачу.</arg></call:generate_song>"#,
+        )?;
+        assert_eq!(children.tool_steps.len(), 1);
+        assert_eq!(children.tool_steps[0].step, STEP_GENERATE_SONG);
+        assert_eq!(
+            children.tool_steps[0].topic,
+            "Песня в стиле драйвового русского шансона про азарт и удачу."
+        );
+        assert!(children.text.is_empty());
+        assert!(!children.residual_protocol);
+
+        let unclosed = parse_assistant_content(
+            r#"Сейчас!<call:draw_image><arg name="prompt">a red fox in the snow</arg>"#,
+        )?;
+        assert_eq!(unclosed.tool_steps.len(), 1);
+        assert_eq!(unclosed.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(unclosed.tool_steps[0].prompt, "a red fox in the snow");
+        assert_eq!(unclosed.text, "Сейчас!");
+
+        let positional = parse_assistant_content("web_search(\"погода в Питере\")")?;
+        assert_eq!(positional.tool_steps.len(), 1);
+        assert_eq!(positional.tool_steps[0].step, STEP_WEB_SEARCH);
+        assert_eq!(positional.tool_steps[0].query, "погода в Питере");
+        assert!(positional.text.is_empty());
+
+        let prose = parse_assistant_content(
+            "Могу вызвать generate_song(topic) или draw_image(prompt), но ты не просил.",
+        )?;
+        assert!(prose.tool_steps.is_empty());
+        assert_eq!(
+            prose.text,
+            "Могу вызвать generate_song(topic) или draw_image(prompt), но ты не просил."
+        );
+
+        for quoted in [
+            "Вызывать так: web_search(\"погода в Питере\") — и всё.",
+            "Пример:\n```python\nweb_search(\"погода в Питере\")\n```\nВот так.",
+            "Например `web_search(\"погода в Питере\")`.",
+        ] {
+            let parsed = parse_assistant_content(quoted)?;
+            assert!(parsed.tool_steps.is_empty(), "{quoted}");
+            assert_eq!(parsed.text, quoted);
+        }
+
+        let awaited = parse_assistant_content("Ща.\nawait generate_song(topic='ночной город');")?;
+        assert_eq!(awaited.tool_steps.len(), 1);
+        assert_eq!(awaited.tool_steps[0].topic, "ночной город");
+        assert_eq!(awaited.text, "Ща.");
+        let returned = parse_assistant_content("return web_search(\"курс доллара\")")?;
+        assert_eq!(returned.tool_steps.len(), 1);
+        assert_eq!(returned.tool_steps[0].query, "курс доллара");
+        assert!(returned.text.is_empty());
+
+        let several = parse_assistant_content(
+            "Держи.\nreact_to_message(emoji='🔥')\ngenerate_song(topic='ночной город')\nГотово.",
+        )?;
+        assert_eq!(several.tool_steps.len(), 2);
+        assert_eq!(several.tool_steps[0].step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(several.tool_steps[0].emoji, "🔥");
+        assert_eq!(several.tool_steps[1].step, STEP_GENERATE_SONG);
+        assert_eq!(several.tool_steps[1].topic, "ночной город");
+        assert_eq!(several.text, "Держи.\nГотово.");
         Ok(())
     }
 
