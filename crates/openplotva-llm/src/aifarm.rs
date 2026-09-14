@@ -20,14 +20,14 @@ use url::Url;
 use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
-    DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
-    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
-    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, STEP_SEND_MESSAGE, SessionMessage,
-    ToolParseDecision, ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names,
-    alternative_dialog_tools, clone_history_messages, decode_plotva_final_response_with_salvage,
-    is_dialog_history_noise_tool_call_name, normalize_history_message, parse_assistant_content,
-    parse_native_tool_step, sanitize_tool_text, select_llm_history_messages_for_context,
-    tool_telemetry,
+    DialogLeak, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage,
+    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
+    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard,
+    STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolSpec, ToolStep, ToolsMode,
+    alternative_dialog_tool_names, alternative_dialog_tools, clone_history_messages,
+    decode_plotva_final_response_with_salvage, is_dialog_history_noise_tool_call_name,
+    normalize_history_message, parse_assistant_content, parse_native_tool_step, sanitize_tool_text,
+    select_llm_history_messages_for_context, tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
@@ -551,6 +551,9 @@ pub enum AifarmDialogError {
     /// Upstream final answer copied prompt context only.
     #[error("chat completion returned only copied context messages")]
     FinalAnswerContextLeak,
+    /// Upstream final answer reproduced the system contract or runtime context.
+    #[error("chat completion returned copied prompt context text")]
+    FinalAnswerPromptLeak,
     /// Upstream final answer contained protocol artifacts only.
     #[error("chat completion returned only protocol artifacts")]
     FinalAnswerProtocolOnly,
@@ -2782,6 +2785,7 @@ where
             )
             .map_err(|error| Box::new(error) as CompletionError)?;
         let model = completion_request.model.clone();
+        let guard = reply_leak_guard(&completion_request.messages, &request.input);
         let traced = self
             .client
             .complete_traced(completion_request, on_status)
@@ -2818,7 +2822,7 @@ where
             !request.input.disable_tools && matches!(request.tools, ToolsMode::Native(_));
         if !tools_offered {
             let strip_markup = !matches!(request.tools, ToolsMode::Disabled);
-            let text = match extract_final_answer_for_provider(response, self.provider()) {
+            let text = match extract_final_answer_for_provider(response, self.provider(), &guard) {
                 Ok(text) => text,
                 Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
             };
@@ -2839,10 +2843,11 @@ where
         match first_choice_tool_steps(response) {
             Ok(ToolStepSelection::None(decision)) => {
                 self.record_step_parser_decision(&model, iteration, &decision);
-                let text = match extract_final_answer_for_provider(response, self.provider()) {
-                    Ok(text) => text,
-                    Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
-                };
+                let text =
+                    match extract_final_answer_for_provider(response, self.provider(), &guard) {
+                        Ok(text) => text,
+                        Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
+                    };
                 Ok(ChatStepOutput {
                     provider: self.provider().to_owned(),
                     model,
@@ -2860,6 +2865,9 @@ where
                     let error = tool_protocol_completion_error(
                         "assistant content retained ambiguous protocol markup",
                     );
+                    return Err(aifarm_step_error_with_trace(error, trace));
+                }
+                if let Some(error) = tool_step_text_leak_error(&guard, &text, &steps) {
                     return Err(aifarm_step_error_with_trace(error, trace));
                 }
                 let mut tool_calls = Vec::with_capacity(steps.len());
@@ -4018,6 +4026,33 @@ pub fn build_initial_messages_with_prompt_store(
     build_initial_messages(input, history, mode, Some(prompts))
 }
 
+/// Leak guard for one step: the system messages and the runtime context
+/// message as rendered for this request are protected text, every transcript
+/// entry authored by a participant is a history entry, the bot is a speaker.
+#[must_use]
+pub fn reply_leak_guard(messages: &[ChatMessage], input: &DialogInput) -> ReplyLeakGuard {
+    let bot_name = fallback_string(&input.context.bot_name, "Plotva");
+    let mut guard = ReplyLeakGuard::builder().sender(&bot_name);
+    for message in messages {
+        let role = message.role.trim();
+        let is_runtime_context = role.eq_ignore_ascii_case("user")
+            && message.content.trim_start().starts_with("<chat_context");
+        if role.eq_ignore_ascii_case("system") || is_runtime_context {
+            guard = guard.protected_text(&message.content);
+        }
+    }
+    for turn in &input.history {
+        let is_participant_text =
+            turn.role != ROLE_MODEL && (turn.kind.is_empty() || turn.kind == MESSAGE_KIND_TEXT);
+        if is_participant_text {
+            guard = guard.history_entry(&turn.name, &turn.text);
+        }
+    }
+    guard
+        .history_entry(&input.user.full_name, &input.message.text)
+        .build()
+}
+
 fn build_initial_messages(
     input: &DialogInput,
     history: &[HistoryMessage],
@@ -4761,16 +4796,19 @@ fn dialog_response_semantic_error(
     let Some(response) = response else {
         return Some("chat completion response is nil".to_owned());
     };
+    let guard = ReplyLeakGuard::default();
     if !tools_offered {
-        return extract_final_answer_for_provider(response, provider)
+        return extract_final_answer_for_provider(response, provider, &guard)
             .err()
             .map(|error| error.to_string());
     }
     match first_choice_tool_steps(response) {
         Err(error) => Some(error.to_string()),
-        Ok(ToolStepSelection::None(_)) => extract_final_answer_for_provider(response, provider)
-            .err()
-            .map(|error| error.to_string()),
+        Ok(ToolStepSelection::None(_)) => {
+            extract_final_answer_for_provider(response, provider, &guard)
+                .err()
+                .map(|error| error.to_string())
+        }
         Ok(ToolStepSelection::Steps {
             residual_protocol: true,
             ..
@@ -4903,8 +4941,9 @@ fn native_tool_parse_decision(
 fn extract_final_answer_for_provider(
     response: &Value,
     provider: &str,
+    guard: &ReplyLeakGuard,
 ) -> Result<String, CompletionError> {
-    match extract_final_answer(response) {
+    match extract_final_answer(response, guard) {
         Ok(answer) => Ok(answer),
         Err(err) if is_retryable_final_answer_error(&err) => Err(Box::new(ProviderError::new(
             provider,
@@ -4915,10 +4954,13 @@ fn extract_final_answer_for_provider(
     }
 }
 
-fn extract_final_answer(response: &Value) -> Result<String, AifarmDialogError> {
+fn extract_final_answer(
+    response: &Value,
+    guard: &ReplyLeakGuard,
+) -> Result<String, AifarmDialogError> {
     let content = first_choice_content(response)?;
     let content = legacy_final_response_answer(&content).unwrap_or(content);
-    match openplotva_dialog::finalize_dialog_reply(&content) {
+    match openplotva_dialog::finalize_dialog_reply_with_guard(&content, guard) {
         openplotva_dialog::DialogReplyOutcome::Reply(answer) => Ok(answer),
         openplotva_dialog::DialogReplyOutcome::Suppressed(reason) => {
             Err(final_answer_error_from_suppression(reason))
@@ -4931,12 +4973,39 @@ fn final_answer_error_from_suppression(
 ) -> AifarmDialogError {
     use openplotva_dialog::DialogReplySuppression as Suppression;
     match reason {
-        Suppression::ContextLeak => AifarmDialogError::FinalAnswerContextLeak,
+        Suppression::ContextLeak | Suppression::TranscriptLeak => {
+            AifarmDialogError::FinalAnswerContextLeak
+        }
+        Suppression::PromptLeak => AifarmDialogError::FinalAnswerPromptLeak,
         Suppression::Pathological(reason) => AifarmDialogError::FinalAnswerPathological(reason),
         Suppression::Empty | Suppression::ProtocolOnly | Suppression::ReasoningLeak => {
             AifarmDialogError::FinalAnswerProtocolOnly
         }
     }
+}
+
+// Text that reaches the chat next to tool calls (the announcement and every
+// `send_message` body) is held to the same leak rules as a final answer.
+fn tool_step_text_leak_error(
+    guard: &ReplyLeakGuard,
+    text: &str,
+    steps: &[PendingToolStep],
+) -> Option<CompletionError> {
+    let announcement = (!text.trim().is_empty()).then_some(text);
+    let bodies = steps
+        .iter()
+        .filter(|pending| pending.step.step == STEP_SEND_MESSAGE)
+        .map(|pending| pending.step.text.as_str());
+    announcement
+        .into_iter()
+        .chain(bodies)
+        .find_map(|candidate| guard.detect(candidate))
+        .map(|leak| {
+            tool_protocol_completion_error(match leak {
+                DialogLeak::Prompt => "assistant text beside tool calls copied prompt context",
+                DialogLeak::Transcript => "assistant text beside tool calls copied the transcript",
+            })
+        })
 }
 
 fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
@@ -5364,6 +5433,7 @@ fn is_retryable_final_answer_error(err: &AifarmDialogError) -> bool {
     matches!(
         err,
         AifarmDialogError::FinalAnswerContextLeak
+            | AifarmDialogError::FinalAnswerPromptLeak
             | AifarmDialogError::FinalAnswerProtocolOnly
             | AifarmDialogError::FinalAnswerPathological(_)
             | AifarmDialogError::ReasoningBudgetExhausted { .. }
@@ -7782,6 +7852,108 @@ mod tests {
     }
 
     #[test]
+    fn reply_leak_guard_rejects_prompt_and_transcript_copies() {
+        let mut input = base_input();
+        input.persona.custom_persona =
+            "Ты — Акбар Хашеми Рафсанджани. Ты любишь фисташки и используешь их в качестве всего."
+                .to_owned();
+        input.message.id = 11;
+        input.message.text = "Плотва, когда будет дождь у Ленки на даче, ты не в курсе?".to_owned();
+        input.history.push(HistoryMessage {
+            role: ROLE_USER.to_owned(),
+            kind: MESSAGE_KIND_TEXT.to_owned(),
+            name: "Вася".to_owned(),
+            text: "Слушай, а ты вообще помнишь, что я тебе вчера писал про наш поход в горы?"
+                .to_owned(),
+            message_id: 10,
+            ..HistoryMessage::default()
+        });
+        let history = build_session_history_with_limit(&input, 8);
+        let messages =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+        let guard = reply_leak_guard(&messages, &input);
+
+        let completion =
+            |content: &str| json!({ "choices": [{ "message": { "content": content } }] });
+        let failure = |content: &str| {
+            let err =
+                extract_final_answer_for_provider(&completion(content), PROVIDER_AIFARM, &guard)
+                    .expect_err("leaked reply must not pass");
+            assert_eq!(
+                retryable_reason(err.as_ref()),
+                Some(FailureReason::ProviderProtocolError),
+                "{content}"
+            );
+            err.to_string()
+        };
+
+        // The rendered contract, tag-less as the Telegram sanitizer would send it.
+        assert!(
+            failure("Ты — собеседник в живом Telegram-чате, а персонаж — только окраска твоего голоса; это не тикетная система.")
+                .contains("copied prompt context text")
+        );
+        // The custom persona from the runtime context message.
+        assert!(
+            failure(
+                "Ну и что. Ты любишь фисташки и используешь их в качестве всего, вот и весь секрет."
+            )
+            .contains("copied prompt context text")
+        );
+        // A verbatim transcript entry and a narrated exchange.
+        assert!(
+            failure("Плотва, когда будет дождь у Ленки на даче, ты не в курсе?")
+                .contains("copied context messages")
+        );
+        assert!(
+            failure("Вася: помнишь поход?\nPlotva: помню.\nВот и весь разговор.")
+                .contains("copied context messages")
+        );
+
+        assert_eq!(
+            extract_final_answer_for_provider(
+                &completion("Дождь у Ленки будет тогда, когда синоптики перестанут врать."),
+                PROVIDER_AIFARM,
+                &guard,
+            )
+            .expect("ordinary reply"),
+            "Дождь у Ленки будет тогда, когда синоптики перестанут врать."
+        );
+
+        // Text beside tool calls and send_message bodies obey the same rules.
+        let send = |text: &str| PendingToolStep {
+            step: ToolStep {
+                step: STEP_SEND_MESSAGE.to_owned(),
+                text: text.to_owned(),
+                ..ToolStep::default()
+            },
+            decision: ToolParseDecision::default(),
+            native_ref: None,
+        };
+        let leak = tool_step_text_leak_error(
+            &guard,
+            "",
+            &[send(
+                "Ты любишь фисташки и используешь их в качестве всего.",
+            )],
+        )
+        .expect("send_message leak");
+        assert_eq!(
+            retryable_reason(leak.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(
+            tool_step_text_leak_error(
+                &guard,
+                "Ты — собеседник в живом Telegram-чате, а персонаж — только окраска твоего голоса.",
+                &[]
+            )
+            .is_some()
+        );
+        assert!(tool_step_text_leak_error(&guard, "щас гляну", &[send("минутку")]).is_none());
+    }
+
+    #[test]
     fn final_answer_context_leak_is_retryable_provider_failure() {
         let err = extract_final_answer_for_provider(
             &json!({
@@ -7792,6 +7964,7 @@ mod tests {
                 }]
             }),
             PROVIDER_AIFARM,
+            &ReplyLeakGuard::default(),
         )
         .expect_err("context leak");
 
@@ -7812,6 +7985,7 @@ mod tests {
                 }]
             }),
             PROVIDER_AIFARM,
+            &ReplyLeakGuard::default(),
         )
         .expect_err("duplicated block");
 
@@ -7851,6 +8025,7 @@ mod tests {
                 }]
             }),
             PROVIDER_AIFARM,
+            &ReplyLeakGuard::default(),
         )
         .expect_err("reasoning budget exhausted");
 
@@ -7869,12 +8044,15 @@ mod tests {
         // Some backends drop reasoning_content from the final payload; an empty
         // content with finish_reason="length" is still a burnt budget, not a
         // protocol violation.
-        let err = extract_final_answer(&json!({
-            "choices": [{
-                "finish_reason": "length",
-                "message": { "content": "" }
-            }]
-        }))
+        let err = extract_final_answer(
+            &json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": { "content": "" }
+                }]
+            }),
+            &ReplyLeakGuard::default(),
+        )
         .expect_err("length truncation");
 
         assert!(matches!(
@@ -7896,6 +8074,7 @@ mod tests {
             }]
             }),
             PROVIDER_AIFARM,
+            &ReplyLeakGuard::default(),
         )
         .expect_err("length-truncated content must not be consumed");
 
@@ -7935,13 +8114,16 @@ mod tests {
 
     #[test]
     fn final_answer_salvages_malformed_legacy_json_envelope() -> Result<(), AifarmDialogError> {
-        let answer = extract_final_answer(&json!({
-            "choices": [{
-                "message": {
-                    "content": r#"{"step":"final_response","answer":"Он сказал "Привет" и ушел"}"#
-                }
-            }]
-        }))?;
+        let answer = extract_final_answer(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "content": r#"{"step":"final_response","answer":"Он сказал "Привет" и ушел"}"#
+                    }
+                }]
+            }),
+            &ReplyLeakGuard::default(),
+        )?;
 
         assert_eq!(answer, r#"Он сказал "Привет" и ушел"#);
         Ok(())

@@ -8,12 +8,14 @@ use serde_json::{Map, Value, json};
 mod dispatch;
 mod history;
 mod json_codec;
+mod leak_guard;
 mod persona;
 pub mod tool_telemetry;
 pub mod transcript;
 pub mod turn;
 
 pub use dispatch::dispatch_dialog_tool;
+pub use leak_guard::{DialogLeak, ReplyLeakGuard, ReplyLeakGuardBuilder};
 
 pub use history::{
     CapturedMemory, DEFAULT_CONTEXT_HISTORY_LIMIT, DailyPersona, DialogContext, DialogInput,
@@ -1093,6 +1095,9 @@ pub struct SanitizedAssistantText {
     pub removed_scaffolding: bool,
     /// Whether an ambiguous protocol fragment remained.
     pub residual_protocol: bool,
+    /// Whether the text was recovered from an explicit answer envelope
+    /// (`<answer>…</answer>`) that the model wrapped around its reply.
+    pub answer_envelope: bool,
 }
 
 /// Extract only user-visible assistant text. This deliberately recognizes a
@@ -1157,9 +1162,29 @@ pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
     removed |= without_model_notes != cleaned;
     cleaned = without_model_notes;
 
+    let (without_reasoning, reasoning_removed, reasoning_malformed) =
+        strip_closed_reasoning_blocks(&cleaned);
+    removed |= reasoning_removed;
+    if reasoning_malformed {
+        return SanitizedAssistantText {
+            removed_scaffolding: true,
+            residual_protocol: true,
+            ..SanitizedAssistantText::default()
+        };
+    }
+    cleaned = without_reasoning;
+
+    let mut answer_envelope = false;
+    if let Some(inner) = extract_answer_envelope(&cleaned) {
+        cleaned = inner;
+        removed = true;
+        answer_envelope = true;
+    }
+
     if cleaned.is_empty() {
         return SanitizedAssistantText {
             removed_scaffolding: removed,
+            answer_envelope,
             ..SanitizedAssistantText::default()
         };
     }
@@ -1170,6 +1195,7 @@ pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
             residual_protocol: text.is_none(),
             text: text.unwrap_or_default(),
             removed_scaffolding: true,
+            answer_envelope,
         };
     }
 
@@ -1183,7 +1209,162 @@ pub fn sanitize_assistant_text(value: &str) -> SanitizedAssistantText {
         },
         removed_scaffolding: removed,
         residual_protocol,
+        answer_envelope,
     }
+}
+
+const REASONING_BLOCK_TAGS: &[&str] = &[
+    "think",
+    "thought",
+    "thinking",
+    "reasoning",
+    "analysis",
+    "eigen_thought",
+    "scratchpad",
+];
+
+// Block-form reasoning (opening a line or spanning lines) is removed wherever
+// the model put it; unclosed block-form is a reasoning dump. An inline mention
+// such as "в <think> теги" or "<think>x</think> — это тег" is prose and stays.
+// A closing tag with no opening one ends a reasoning run that started at the
+// top of the content; the reply is what follows it.
+fn strip_closed_reasoning_blocks(value: &str) -> (String, bool, bool) {
+    let mut cleaned = value.to_owned();
+    let mut removed = false;
+    let mut from = 0;
+    loop {
+        // Offsets of the masked copy map 1:1 onto `cleaned`; markup quoted
+        // inside code is an example and stays.
+        let lower = leak_guard::mask_code_spans(&cleaned).to_ascii_lowercase();
+        let next_open = next_reasoning_block_open(&lower, from);
+        if let Some(close_end) =
+            orphan_reasoning_close_end(&lower, from, next_open.map(|(at, _)| at))
+        {
+            cleaned.replace_range(..close_end, "");
+            if cleaned.trim().is_empty() {
+                return (String::new(), true, true);
+            }
+            removed = true;
+            from = 0;
+            continue;
+        }
+        let Some((open, tag)) = next_open else {
+            return (cleaned.trim().to_owned(), removed, false);
+        };
+        let Some(open_end) = lower[open..].find('>').map(|idx| open + idx + 1) else {
+            return (cleaned.trim().to_owned(), removed, false);
+        };
+        let opens_line = lower[..open]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|prefix| prefix.trim().is_empty());
+        let close = format!("</{tag}>");
+        if let Some(close_start) = lower[open_end..].find(&close).map(|idx| open_end + idx) {
+            if opens_line || lower[open_end..close_start].contains('\n') {
+                cleaned.replace_range(open..close_start + close.len(), "");
+                removed = true;
+                from = open;
+            } else {
+                from = close_start + close.len();
+            }
+            continue;
+        }
+        let block_form = lower[open_end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| ch == '\n' || ch == '\r');
+        if opens_line && block_form {
+            return (String::new(), true, true);
+        }
+        from = open_end;
+    }
+}
+
+fn next_reasoning_block_open(lower: &str, from: usize) -> Option<(usize, &'static str)> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for tag in REASONING_BLOCK_TAGS {
+        let mut search = from;
+        while let Some(rel) = lower[search..].find('<') {
+            let at = search + rel;
+            if starts_with_xml_tag(&lower[at..], tag) {
+                if best.is_none_or(|(prev, _)| at < prev) {
+                    best = Some((at, tag));
+                }
+                break;
+            }
+            search = at + 1;
+        }
+    }
+    best
+}
+
+// Only a close tag that ends its line closes a reasoning run; one mentioned
+// mid-sentence is prose about the tag.
+fn orphan_reasoning_close_end(lower: &str, from: usize, next_open: Option<usize>) -> Option<usize> {
+    let limit = next_open.unwrap_or(lower.len());
+    let mut best: Option<usize> = None;
+    for tag in REASONING_BLOCK_TAGS {
+        let close = format!("</{tag}>");
+        let mut search = from;
+        while let Some(rel) = lower[search..limit].find(&close) {
+            let end = search + rel + close.len();
+            search = end;
+            let ends_line = lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch == '\n' || ch == '\r');
+            if ends_line {
+                if best.is_none_or(|prev| end < prev) {
+                    best = Some(end);
+                }
+                break;
+            }
+        }
+    }
+    best
+}
+
+const ANSWER_ENVELOPE_TAGS: &[&str] = &["answer", "final_answer", "final_response", "response"];
+
+// The model sometimes wraps its reply in an explicit answer element next to a
+// self-review; only the last envelope's body is the reply. An envelope quoted
+// inside code is an example, not a wrapper.
+fn extract_answer_envelope(value: &str) -> Option<String> {
+    let lower = leak_guard::mask_code_spans(value).to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for tag in ANSWER_ENVELOPE_TAGS {
+        let mut search = 0;
+        while let Some(rel) = lower[search..].find('<') {
+            let at = search + rel;
+            // Only an element that opens a line is a wrapper; one mentioned
+            // mid-sentence is prose about the format.
+            let opens_line = lower[..at]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|prefix| prefix.trim().is_empty());
+            if opens_line
+                && starts_with_xml_tag(&lower[at..], tag)
+                && best.is_none_or(|(prev, _)| at > prev)
+            {
+                best = Some((at, tag));
+            }
+            search = at + 1;
+        }
+    }
+    let (open, tag) = best?;
+    let open_end = lower[open..].find('>')? + open + 1;
+    let close = format!("</{tag}>");
+    let close_start = lower[open_end..]
+        .find(&close)
+        .map_or(value.len(), |idx| open_end + idx);
+    let inner = value[open_end..close_start].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    if inner.to_ascii_lowercase().contains("<text>") {
+        return extract_protocol_text_bodies(inner);
+    }
+    Some(inner.to_owned())
 }
 
 fn starts_with_known_protocol(value: &str) -> bool {
@@ -1636,6 +1817,10 @@ pub enum DialogReplySuppression {
     ContextLeak,
     ProtocolOnly,
     ReasoningLeak,
+    /// The reply reproduces the system contract, runtime context or memory.
+    PromptLeak,
+    /// The reply reproduces the chat transcript it was shown.
+    TranscriptLeak,
     Pathological(String),
 }
 
@@ -1649,27 +1834,125 @@ pub enum DialogReplyOutcome {
 // content through here to recover the answer and refuse to emit internal leaks.
 #[must_use]
 pub fn finalize_dialog_reply(content: &str) -> DialogReplyOutcome {
+    finalize_dialog_reply_with_guard(content, &ReplyLeakGuard::default())
+}
+
+#[must_use]
+pub fn finalize_dialog_reply_with_guard(
+    content: &str,
+    guard: &ReplyLeakGuard,
+) -> DialogReplyOutcome {
+    use DialogReplySuppression::{
+        ContextLeak, Empty, Pathological, PromptLeak, ProtocolOnly, ReasoningLeak, TranscriptLeak,
+    };
     if content.trim().is_empty() {
-        return DialogReplyOutcome::Suppressed(DialogReplySuppression::Empty);
+        return DialogReplyOutcome::Suppressed(Empty);
     }
     let sanitized = sanitize_assistant_text(content);
-    let answer = sanitized.text;
+    let mut answer = sanitized.text;
     if answer.trim().is_empty() {
         if has_leading_context_message(content) {
-            return DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak);
+            return DialogReplyOutcome::Suppressed(ContextLeak);
         }
         if sanitized.residual_protocol {
-            return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
+            return DialogReplyOutcome::Suppressed(ReasoningLeak);
         }
-        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ProtocolOnly);
+        return DialogReplyOutcome::Suppressed(ProtocolOnly);
     }
     if reply_has_residual_leak(&answer) {
-        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
+        return DialogReplyOutcome::Suppressed(ReasoningLeak);
+    }
+    match recover_json_envelope(&answer) {
+        JsonEnvelope::Recovered(text) => answer = text,
+        JsonEnvelope::Empty => return DialogReplyOutcome::Suppressed(ProtocolOnly),
+        JsonEnvelope::None => {}
+    }
+    // A copied history block ahead of the text means the model narrated the
+    // transcript; only an explicit answer envelope separates a real reply from it.
+    if !sanitized.answer_envelope && has_leading_transcript_echo(content) {
+        return DialogReplyOutcome::Suppressed(ContextLeak);
+    }
+    match guard.detect(&answer) {
+        Some(DialogLeak::Prompt) => return DialogReplyOutcome::Suppressed(PromptLeak),
+        Some(DialogLeak::Transcript) => return DialogReplyOutcome::Suppressed(TranscriptLeak),
+        None => {}
     }
     if let Some(reason) = pathological_final_answer_reason(&answer) {
-        return DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(reason));
+        return DialogReplyOutcome::Suppressed(Pathological(reason));
     }
     DialogReplyOutcome::Reply(answer)
+}
+
+fn has_leading_transcript_echo(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    if starts_with_xml_tag(&lower, "last_message")
+        || starts_with_xml_tag(&lower, "attach_id")
+        || starts_with_xml_tag(&lower, "history")
+    {
+        return true;
+    }
+    starts_with_xml_tag(&lower, "message")
+        && lower.split_once('>').is_some_and(|(open, _)| {
+            ["id=", "thread_id=", "timestamp="]
+                .iter()
+                .any(|attr| open.contains(attr))
+        })
+}
+
+enum JsonEnvelope {
+    None,
+    Recovered(String),
+    Empty,
+}
+
+const JSON_ENVELOPE_TEXT_KEYS: &[&str] =
+    &["answer", "response", "text", "content", "message", "reply"];
+// Only the reply-target fields of the rendered history mark a copied
+// envelope; `sender`/`message_id`-style keys are plausible in JSON a user
+// asked for.
+const JSON_ENVELOPE_TRANSCRIPT_KEYS: &[&str] = &["reply_to_id", "reply_to_user"];
+
+// A reply that is one JSON document shaped like a history entry (it carries a
+// transcript key) yields its text under a known key; without any text it is
+// protocol only. JSON without transcript keys may be what the user asked for
+// and is left alone.
+fn recover_json_envelope(value: &str) -> JsonEnvelope {
+    let body = strip_code_fence(value.trim());
+    let is_document = (body.starts_with('{') && body.ends_with('}'))
+        || (body.starts_with('[') && body.ends_with(']'));
+    if !is_document {
+        return JsonEnvelope::None;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return JsonEnvelope::None;
+    };
+    if !matches!(parsed, Value::Object(_) | Value::Array(_)) {
+        return JsonEnvelope::None;
+    }
+    let history_shaped = JSON_ENVELOPE_TRANSCRIPT_KEYS
+        .iter()
+        .any(|key| json_codec::find_json_key_value(&parsed, key).is_some());
+    if !history_shaped {
+        return JsonEnvelope::None;
+    }
+    for key in JSON_ENVELOPE_TEXT_KEYS {
+        if let Some(text) =
+            json_codec::find_json_key_value(&parsed, key).and_then(json_codec::coerce_string_value)
+            && !text.trim().is_empty()
+        {
+            return JsonEnvelope::Recovered(text.trim().to_owned());
+        }
+    }
+    JsonEnvelope::Empty
+}
+
+fn strip_code_fence(value: &str) -> &str {
+    let Some(rest) = value.strip_prefix("```") else {
+        return value;
+    };
+    let body = rest.split_once('\n').map_or("", |(_, body)| body);
+    let body = body.trim_end();
+    body.strip_suffix("```").unwrap_or(body).trim()
 }
 
 fn trim_protocol_boundary_suffix(value: &str) -> String {
@@ -3799,10 +4082,27 @@ mod tests {
             finalize_dialog_reply("<type:analysis>внутренний протокол\nОтвет"),
             Suppressed(ReasoningLeak)
         );
-        // Persona terms in prose must NOT be suppressed (false-positive guard).
+        // Persona talk in prose is fine; naming an internal contract element
+        // (`base_voice`) narrates the prompt and regenerates.
+        assert_eq!(
+            finalize_dialog_reply("Моя кастомная персона важнее базового голоса, не при чём."),
+            Reply("Моя кастомная персона важнее базового голоса, не при чём.".to_owned())
+        );
         assert_eq!(
             finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
-            Reply("Моя кастомная персона важнее, base_voice не при чём.".to_owned())
+            Suppressed(DialogReplySuppression::PromptLeak)
+        );
+        // A close tag mentioned mid-sentence is prose; only one that ends its
+        // line closes a reasoning run, and then the reply follows it.
+        assert_eq!(
+            finalize_dialog_reply("Пиши после </think> рассуждений, а не до."),
+            Reply("Пиши после </think> рассуждений, а не до.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "Выглядит так, будто кто-то ищет третьего.<emoji_reaction_logic: smirk fits></emoji_reaction_logic></reasoning>\n\nВыглядит так, будто кто-то ищет третьего лишнего."
+            ),
+            Reply("Выглядит так, будто кто-то ищет третьего лишнего.".to_owned())
         );
         // A tag quoted mid-reply is not a leak — the marker must open the reply.
         assert_eq!(
@@ -3884,6 +4184,186 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("I thought so too."),
             Reply("I thought so too.".to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_recovers_envelopes_and_strips_reasoning_anywhere() {
+        use DialogReplyOutcome::{Reply, Suppressed};
+        use DialogReplySuppression::{ContextLeak, ProtocolOnly, ReasoningLeak};
+
+        // Production shapes from gemini-2.5-flash-lite: the answer travels in an
+        // explicit envelope next to a self-review that leaks the persona.
+        assert_eq!(
+            finalize_dialog_reply(
+                "<answer>\n  <text>\n    Ну, типа, кондей на фасад не разрешат.\n  </text>\n  <daily_persona_accent>\n    <rule>Use at most one minor trait.</rule>\n    <used>false</used>\n  </daily_persona_accent>\n</answer>"
+            ),
+            Reply("Ну, типа, кондей на фасад не разрешат.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "<context>\n  <message id=\"30909\" timestamp=\"2026-09-14T09:11:45Z\">\n    <user username=\"Плотва\" type=\"bot\">Плотва</user>\n    <text>Доброе. А что за картинка?</text>\n  </message>\n</context>\n<dialog_policy>\n  <anti_repeat><rule>Same first word.</rule></anti_repeat>\n</dialog_policy>\n\n<answer>\n  <text>Ты про ту, что я только что скинул? С танком.</text>\n</answer>"
+            ),
+            Reply("Ты про ту, что я только что скинул? С танком.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("<final_answer>Коротко и по делу.</final_answer>"),
+            Reply("Коротко и по делу.".to_owned())
+        );
+        // An envelope mentioned mid-sentence is prose about the format.
+        assert_eq!(
+            finalize_dialog_reply(
+                "Нужно оформить ответ в <answer><text>привет</text></answer> теги, и всё."
+            ),
+            Reply(
+                "Нужно оформить ответ в <answer><text>привет</text></answer> теги, и всё."
+                    .to_owned()
+            )
+        );
+        // Markup demonstrated inside code is an example: no envelope
+        // extraction, no reasoning-block stripping.
+        assert_eq!(
+            finalize_dialog_reply(
+                "Конверт выглядит так:\n```xml\n<answer><text>привет</text></answer>\n```\nА рассуждения — в <code><think>\n…</code>."
+            ),
+            Reply(
+                "Конверт выглядит так:\n```xml\n<answer><text>привет</text></answer>\n```\nА рассуждения — в <code><think>\n…</code>."
+                    .to_owned()
+            )
+        );
+
+        // Closed reasoning blocks vanish wherever they sit; a block-form
+        // unclosed one is a dump, an inline mention is prose.
+        assert_eq!(
+            finalize_dialog_reply(
+                "<think>\nThinking Process:\n- User posted a quote.\n</think>\nСлишком глубоко для утра понедельника."
+            ),
+            Reply("Слишком глубоко для утра понедельника.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("Начало ответа.\n<thinking>черновик</thinking>\nКонец ответа."),
+            Reply("Начало ответа.\n\nКонец ответа.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "No, too many.\n<think>\nThinking Process:\n- User posted a quote."
+            ),
+            Suppressed(ReasoningLeak)
+        );
+        assert_eq!(
+            finalize_dialog_reply("Тег <think> открывает рассуждение, а закрывает </think>."),
+            Reply("Тег <think> открывает рассуждение, а закрывает </think>.".to_owned())
+        );
+
+        // JSON envelopes shaped like history entries yield their text; without
+        // any text they are protocol only; user-requested JSON is untouched.
+        assert_eq!(
+            finalize_dialog_reply(
+                "{\n  \"reply_to_id\": \"1375391\",\n  \"reply_to_user\": \"сизиков\",\n  \"response\": {\n    \"content\": \"Хватит мучить людей этими вопросами.\",\n    \"style\": \"casual\"\n  }\n}"
+            ),
+            Reply("Хватит мучить людей этими вопросами.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply(
+                "```json\n[\n  {\n    \"reply_to_id\": \"28815\",\n    \"to_user\": \"Наталья\",\n    \"text\": \"Голова пухнет.\"\n  }\n]\n```"
+            ),
+            Reply("Голова пухнет.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"reply_to_id\": \"1\", \"to_user\": \"Ada\"}"),
+            Suppressed(ProtocolOnly)
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"temperature\": 21, \"unit\": \"C\"}"),
+            Reply("{\"temperature\": 21, \"unit\": \"C\"}".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"message\": \"ok\", \"code\": 1}"),
+            Reply("{\"message\": \"ok\", \"code\": 1}".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"sender\": \"Вася\", \"message\": \"привет\"}"),
+            Reply("{\"sender\": \"Вася\", \"message\": \"привет\"}".to_owned())
+        );
+
+        // A copied history block ahead of prose is a narrated transcript.
+        assert_eq!(
+            finalize_dialog_reply(
+                "<message id=\"28816\" thread_id=\"28806\">\n  <user username=\"NataliFeles\">Наталья</user>\n  <text>Голова пухнуть</text>\n</message>\n```json\n[{\"reply_to_id\": \"28815\"}]\n```\n\n// Ответ сформирован согласно инструкции.\n\nГолова пухнуть"
+            ),
+            Suppressed(ContextLeak)
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_with_guard_rejects_prompt_and_transcript_echo() {
+        use DialogReplyOutcome::{Reply, Suppressed};
+        use DialogReplySuppression::{PromptLeak, TranscriptLeak};
+
+        let guard = ReplyLeakGuard::builder()
+            .protected_text(
+                "<system_contract>\n  <identity>\n    Ты — собеседник в живом Telegram-чате, а персонаж — только окраска твоего голоса.\n  </identity>\n  <base_voice>\n    <core>Базовый голос Плотвы первичен: живая, остроумная, немного безумная собеседница в чате.</core>\n  </base_voice>\n</system_contract>",
+            )
+            .protected_text(
+                "<chat_context>\n  <bot_name>Плотва</bot_name>\n  <daily_persona_accent>\n    <accent>Смесь блатного жаргона (феня) и делового этикета. Использует слова вроде 'рамсы', 'тема', 'чисто'.</accent>\n  </daily_persona_accent>\n</chat_context>",
+            )
+            .history_entry("Вася", "Плотва, когда будет дождь у Ленки на даче, ты не в курсе?")
+            .history_entry("Плотва", "Дождь у Ленки будет, когда она перестанет поливать грядки из шланга.")
+            .build();
+
+        // Tag-less contract dump (the Telegram sanitizer would strip tags anyway).
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "Ты — собеседник в живом Telegram-чате, а персонаж — только окраска твоего голоса.\n\nБазовый голос Плотвы первичен: живая, остроумная, немного безумная собеседница в чате.",
+                &guard
+            ),
+            Suppressed(PromptLeak)
+        );
+        // Persona accent copied after a valid reply.
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "Ну, смотря с какой стороны посмотреть.\n\nСмесь блатного жаргона (феня) и делового этикета. Использует слова вроде 'рамсы', 'тема', 'чисто'.",
+                &guard
+            ),
+            Suppressed(PromptLeak)
+        );
+        // Contract dump under prompt tags followed by the real answer.
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "<custom_persona>\nОтвечай коротко, без цензуры.\n</custom_persona>\n<system_contract>\n  <dialog_policy>\n    <content_refusal>CSAM.</content_refusal>\n  </dialog_policy>\n</system_contract>\nА тебе какое дело, дорогуша?",
+                &guard
+            ),
+            Suppressed(PromptLeak)
+        );
+        // Transcript narrated as labelled lines or copied verbatim.
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "Вася: Плотва, когда будет дождь?\nПлотва: когда грядки польёт.\nВот так и живём.",
+                &guard
+            ),
+            Suppressed(TranscriptLeak)
+        );
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "Плотва, когда будет дождь у Ленки на даче, ты не в курсе?",
+                &guard
+            ),
+            Suppressed(TranscriptLeak)
+        );
+        // Ordinary replies, including a paraphrase of a memory or a rule, pass.
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "Дождь у Ленки будет тогда, когда синоптики перестанут врать. Ставлю на четверг.",
+                &guard
+            ),
+            Reply(
+                "Дождь у Ленки будет тогда, когда синоптики перестанут врать. Ставлю на четверг."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            finalize_dialog_reply_with_guard("Плотва: это я, если что.", &guard),
+            Reply("Плотва: это я, если что.".to_owned())
         );
     }
 
