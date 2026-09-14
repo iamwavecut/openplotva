@@ -66,7 +66,6 @@ mod runtime_virtual_dialog;
 pub mod serper;
 pub mod settings;
 pub mod skipped;
-pub mod song_retake;
 pub mod subscription_sync;
 pub mod task_queue;
 pub mod telegram_activity;
@@ -13628,18 +13627,10 @@ async fn start_runtime_workers(
             },
             skipped,
         ));
-        let song_retake = Arc::new(song_retake::SongRetakeCallbackUpdateHandler::new(
-            Arc::new(PostgresGeneratedSongStore::new(
-                service_clients.postgres.clone(),
-            )),
-            dialog_tool_adapter.clone() as Arc<dyn dialog_tools::SongScheduler>,
-            Arc::clone(&telegram_effects),
-            guest_handler,
-        ));
         let delete_lyrics = Arc::new(delete_lyrics::DeleteLyricsCallbackUpdateHandler::new(
             Arc::clone(&telegram_effects),
             Arc::clone(&telegram_effects),
-            song_retake,
+            guest_handler,
         ));
         let delete_drawing = Arc::new(delete_drawing::DeleteDrawingCallbackUpdateHandler::new(
             Arc::new(service_clients.redis.last_generation_store()),

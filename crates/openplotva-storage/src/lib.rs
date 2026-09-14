@@ -4153,12 +4153,11 @@ fn chat_user_pair_arrays(pairs: &[(i64, i64)]) -> (Vec<i64>, Vec<i64>) {
     (chat_ids, user_ids)
 }
 
-/// One generated song's material, persisted for retakes and tracing.
+/// One generated song's material, persisted for tracing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeneratedSongRecord {
     pub id: i64,
     pub job_id: Option<i64>,
-    pub retake_of: Option<i64>,
     pub chat_id: i64,
     pub thread_id: Option<i32>,
     pub user_id: i64,
@@ -4184,7 +4183,6 @@ pub struct GeneratedSongRecord {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NewGeneratedSong {
     pub job_id: Option<i64>,
-    pub retake_of: Option<i64>,
     pub chat_id: i64,
     pub thread_id: Option<i32>,
     pub user_id: i64,
@@ -4204,9 +4202,9 @@ pub struct NewGeneratedSong {
     pub audio_seconds: Option<f32>,
 }
 
-const SQL_INSERT_GENERATED_SONG: &str = "INSERT INTO generated_songs (job_id, retake_of, chat_id, thread_id, user_id, user_full_name, trigger_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING id";
+const SQL_INSERT_GENERATED_SONG: &str = "INSERT INTO generated_songs (job_id, chat_id, thread_id, user_id, user_full_name, trigger_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id";
 
-const SQL_GET_GENERATED_SONG: &str = "SELECT id, job_id, retake_of, chat_id, thread_id, user_id, user_full_name, trigger_message_id, result_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds, created_at FROM generated_songs WHERE id = $1";
+const SQL_GET_GENERATED_SONG: &str = "SELECT id, job_id, chat_id, thread_id, user_id, user_full_name, trigger_message_id, result_message_id, request_text, topic, title, vocal_language, vocals, tags, style_summary, lyrics, duration_seconds, brief, seed, audio_seconds, created_at FROM generated_songs WHERE id = $1";
 
 const SQL_SET_GENERATED_SONG_RESULT_MESSAGE: &str =
     "UPDATE generated_songs SET result_message_id = $2 WHERE id = $1";
@@ -4226,7 +4224,6 @@ impl PostgresGeneratedSongStore {
     pub async fn insert(&self, song: &NewGeneratedSong) -> Result<i64, StorageError> {
         let row = sqlx::query(SQL_INSERT_GENERATED_SONG)
             .bind(song.job_id)
-            .bind(song.retake_of)
             .bind(song.chat_id)
             .bind(song.thread_id)
             .bind(song.user_id)
@@ -4275,7 +4272,6 @@ fn generated_song_from_row(row: PgRow) -> Result<GeneratedSongRecord, StorageErr
     Ok(GeneratedSongRecord {
         id: row.try_get("id")?,
         job_id: row.try_get("job_id")?,
-        retake_of: row.try_get("retake_of")?,
         chat_id: row.try_get("chat_id")?,
         thread_id: row.try_get("thread_id")?,
         user_id: row.try_get("user_id")?,

@@ -734,23 +734,6 @@ pub struct SongScheduleRequest {
     pub reference_file_id: String,
     /// Telegram stable unique ID for optional audio reference.
     pub reference_file_unique_id: String,
-    /// Stored material of the song this request re-rolls (same tags and lyrics, new seed).
-    pub retake: Option<SongRetake>,
-}
-
-/// Stored song material replayed by a retake request.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SongRetake {
-    pub song_id: i64,
-    pub title: String,
-    pub lyrics: String,
-    /// Compiled tag list.
-    pub style: String,
-    pub style_summary: String,
-    pub vocal_language: String,
-    pub vocals: String,
-    pub duration_seconds: u32,
-    pub brief: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1382,33 +1365,10 @@ impl SongScheduler for TaskmanDialogToolAdapter {
             let reference_file_unique_id =
                 song_reference_unique_id(&request.reference_file_unique_id, &request.message_meta);
             let mut meta = serde_json::to_value(request.message_meta).unwrap_or_else(|_| json!({}));
-            let retake = request.retake;
             crate::music_jobs::SongJobMeta {
                 request_text: request.message_text.trim().to_owned(),
-                retake_of: retake.as_ref().map(|retake| retake.song_id),
-                title: retake
-                    .as_ref()
-                    .map(|retake| retake.title.clone())
-                    .unwrap_or_default(),
-                vocals: retake
-                    .as_ref()
-                    .map(|retake| retake.vocals.clone())
-                    .unwrap_or_default(),
-                style_summary: retake
-                    .as_ref()
-                    .map(|retake| retake.style_summary.clone())
-                    .unwrap_or_default(),
-                duration_seconds: retake.as_ref().map_or(0, |retake| retake.duration_seconds),
-                brief: retake
-                    .as_ref()
-                    .map(|retake| retake.brief.clone())
-                    .unwrap_or(serde_json::Value::Null),
             }
             .attach(&mut meta);
-            let (lyrics, style, vocal_language) = retake.map_or_else(
-                || (String::new(), String::new(), String::new()),
-                |retake| (retake.lyrics, retake.style, retake.vocal_language),
-            );
             let chat_id = request.chat_id;
             let user_id = request.user_id;
             let queue_depth = self
@@ -1428,13 +1388,11 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                     user_id: request.user_id,
                     user_full_name: request.user_full_name,
                     topic,
-                    lyrics,
-                    style,
-                    vocal_language,
                     reference_file_id: request.reference_file_id,
                     reference_file_unique_id,
                     meta,
                     thread_id: request.thread_id,
+                    ..MusicGenJobParams::default()
                 },
                 OffsetDateTime::now_utc(),
             )
@@ -2385,7 +2343,6 @@ where
                 message_meta: req.context.message_meta,
                 reference_file_id: String::new(),
                 reference_file_unique_id: String::new(),
-                retake: None,
             };
             match scheduler.schedule_song(request).await {
                 Ok(result) => Ok(dialog_generate_song_tool_result(&result)),
@@ -4309,7 +4266,6 @@ mod tests {
                 message_meta: meta,
                 reference_file_id: String::new(),
                 reference_file_unique_id: String::new(),
-                retake: None,
             }]
         );
         Ok(())
@@ -5530,7 +5486,6 @@ mod tests {
                 },
                 reference_file_id: "audio-file".to_owned(),
                 reference_file_unique_id: "audio-unique".to_owned(),
-                retake: None,
             })
             .await?;
 
@@ -5630,7 +5585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taskman_dialog_tool_adapter_replays_retake_material_into_the_job()
+    async fn taskman_dialog_tool_adapter_carries_the_request_text_into_the_job()
     -> Result<(), ToolboxError> {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let vip = Arc::new(DrawImageVipStatusStub::new(true));
@@ -5640,22 +5595,11 @@ mod tests {
         let scheduled = adapter
             .schedule_song(SongScheduleRequest {
                 chat_id: -100,
-                message_id: 11,
-                user_id: 42,
-                user_full_name: "Alice".to_owned(),
-                topic: "night city".to_owned(),
-                message_text: "!song night city, female vocals".to_owned(),
-                retake: Some(SongRetake {
-                    song_id: 9,
-                    title: "Night City".to_owned(),
-                    lyrics: "[Chorus]\nnight city".to_owned(),
-                    style: "synthwave, 102 BPM, female clean vocals".to_owned(),
-                    style_summary: "synthwave · 102 BPM".to_owned(),
-                    vocal_language: "en".to_owned(),
-                    vocals: "female".to_owned(),
-                    duration_seconds: 150,
-                    brief: json!({"bpm": 102}),
-                }),
+                message_id: 12,
+                user_id: 43,
+                user_full_name: "Bob".to_owned(),
+                topic: "rainy day".to_owned(),
+                message_text: "!song rainy day, female vocals".to_owned(),
                 ..SongScheduleRequest::default()
             })
             .await?;
@@ -5668,46 +5612,11 @@ mod tests {
             .music_data
             .as_ref()
             .expect("music job should carry music data");
-        assert_eq!(music.topic, "night city");
-        assert_eq!(music.lyrics, "[Chorus]\nnight city");
-        assert_eq!(music.style, "synthwave, 102 BPM, female clean vocals");
-        assert_eq!(music.vocal_language, "en");
-        assert_eq!(
-            music.meta["song"],
-            json!({
-                "request_text": "!song night city, female vocals",
-                "retake_of": 9,
-                "title": "Night City",
-                "vocals": "female",
-                "style_summary": "synthwave · 102 BPM",
-                "duration_seconds": 150,
-                "brief": {"bpm": 102},
-            })
-        );
-
-        let fresh = adapter
-            .schedule_song(SongScheduleRequest {
-                chat_id: -100,
-                message_id: 12,
-                user_id: 43,
-                user_full_name: "Bob".to_owned(),
-                topic: "rainy day".to_owned(),
-                message_text: "!song rainy day".to_owned(),
-                ..SongScheduleRequest::default()
-            })
-            .await?;
-        assert_eq!(fresh.status, "scheduled");
-        let records = queue.records();
-        let music = records[1]
-            .job
-            .data
-            .music_data
-            .as_ref()
-            .expect("music job should carry music data");
+        assert_eq!(music.topic, "rainy day");
         assert!(music.lyrics.is_empty() && music.style.is_empty());
         assert_eq!(
             music.meta["song"],
-            json!({"request_text": "!song rainy day", "duration_seconds": 0})
+            json!({"request_text": "!song rainy day, female vocals"})
         );
         Ok(())
     }

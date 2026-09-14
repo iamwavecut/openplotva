@@ -24,8 +24,6 @@ pub const DELETE_DRAWING_ACTION_CLOSE: &str = "del_x";
 pub const DELETE_LYRICS_ACTION_INIT: &str = "dl_i";
 pub const DELETE_LYRICS_ACTION_CONFIRM: &str = "dl_c";
 pub const DELETE_LYRICS_ACTION_CLOSE: &str = "dl_x";
-/// Ask for another take of a generated song (same material, new seed).
-pub const SONG_RETAKE_ACTION: &str = "song_rt";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallbackActionParse {
@@ -70,8 +68,6 @@ pub enum CallbackHandlerKind {
     DeleteDrawing,
     /// Generated lyrics deletion controls.
     DeleteLyrics,
-    /// Another take of a generated song.
-    SongRetake,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,30 +263,6 @@ pub fn build_lyrics_delete_confirm_keyboard(user_id: i64, chat_id: i64) -> Inlin
 }
 
 #[must_use]
-pub fn song_retake_callback_data(song_id: i64) -> String {
-    serde_json::to_string(&SongRetakeCallbackData {
-        action: SONG_RETAKE_ACTION,
-        song_id: song_id.to_string(),
-    })
-    .expect("song retake callback data serialization cannot fail")
-}
-
-/// Resolve the generated song id from retake callback data (`s`, or long `song`).
-#[must_use]
-pub fn song_retake_callback_song_id(data: &CallbackActionData) -> i64 {
-    data.get("s")
-        .or_else(|| data.get("song"))
-        .map_or(0, |raw| parse_callback_i64(raw))
-}
-
-#[must_use]
-pub fn build_song_retake_keyboard(song_id: i64) -> InlineKeyboardMarkup {
-    build_inline_keyboard_markup([build_inline_keyboard_row([
-        build_inline_keyboard_button_data("🎲 Ещё тейк", song_retake_callback_data(song_id)),
-    ])])
-}
-
-#[must_use]
 pub fn build_checkin_theme_selection_keyboard(user_id: i64) -> InlineKeyboardMarkup {
     let buttons = [
         ("Король горы", "king"),
@@ -326,14 +298,6 @@ struct DeleteCallbackData<'a> {
     user_id: String,
     #[serde(rename = "c")]
     chat_id: String,
-}
-
-#[derive(Serialize)]
-struct SongRetakeCallbackData<'a> {
-    #[serde(rename = "a")]
-    action: &'a str,
-    #[serde(rename = "s")]
-    song_id: String,
 }
 
 #[derive(Serialize)]
@@ -447,7 +411,6 @@ pub fn callback_handler_for_action(action: &str) -> Option<CallbackHandlerKind> 
         DELETE_LYRICS_ACTION_INIT | DELETE_LYRICS_ACTION_CONFIRM => {
             Some(CallbackHandlerKind::DeleteLyrics)
         }
-        SONG_RETAKE_ACTION => Some(CallbackHandlerKind::SongRetake),
         _ => None,
     }
 }

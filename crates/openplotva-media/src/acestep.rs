@@ -527,7 +527,7 @@ pub struct SongPromptResult {
     pub lyrics: String,
     /// Target length in seconds.
     pub duration_seconds: u32,
-    /// The director's brief as returned by the model, kept for persistence and retakes.
+    /// The director's brief as returned by the model, kept for tracing.
     pub brief: Value,
 }
 

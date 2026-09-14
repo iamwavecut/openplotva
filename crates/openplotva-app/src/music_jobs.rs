@@ -27,8 +27,8 @@ use openplotva_taskman::{
     TaskQueueJobEvent, TaskQueueWorkItem, music_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    TelegramOutboundMethod, TelegramOutboundResponse, build_song_retake_keyboard,
-    ensure_telegram_safe_text, escape_telegram_html_text, execute_telegram_method,
+    TelegramOutboundMethod, TelegramOutboundResponse, ensure_telegram_safe_text,
+    escape_telegram_html_text, execute_telegram_method,
 };
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,7 @@ pub struct SongMaterial {
     pub vocals: String,
     /// Target length in seconds; 0 applies the default cap.
     pub duration_seconds: u32,
-    /// Director brief for persistence and retakes; `Null` when unavailable.
+    /// Director brief kept for tracing; `Null` when unavailable.
     pub brief: Value,
 }
 
@@ -139,24 +139,13 @@ impl From<SongPromptResult> for SongMaterial {
 }
 
 /// Song-specific job metadata carried next to the dialog message meta under
-/// [`SONG_JOB_META_KEY`]: the listener's request as written and, for retakes,
-/// the stored material's descriptors.
+/// [`SONG_JOB_META_KEY`]: the listener's request as written, which the topic
+/// extraction may have shortened.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct SongJobMeta {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub request_text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retake_of: Option<i64>,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub title: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub vocals: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub style_summary: String,
-    pub duration_seconds: u32,
-    #[serde(skip_serializing_if = "Value::is_null")]
-    pub brief: Value,
 }
 
 impl SongJobMeta {
@@ -229,7 +218,7 @@ pub struct GeneratedSongSendPlan {
     pub material: SongMaterial,
     pub generated: GeneratedSongAudio,
     pub is_vip: bool,
-    /// Persisted song row; drives the retake button.
+    /// Persisted song row, linked to the delivered message after the send.
     pub song_id: Option<i64>,
 }
 
@@ -594,9 +583,6 @@ where
         topic: &'a str,
     ) -> SongMaterialFuture<'a> {
         Box::pin(async move {
-            if let Some(material) = song_material_from_retake_params(params) {
-                return Ok(material);
-            }
             let language_hint = self
                 .language_store
                 .song_language_hint(params.user_id)
@@ -856,7 +842,7 @@ pub trait MusicJobEffects {
     ) -> MusicJobEffectFuture<'a, Option<MusicReferenceAudio>>;
 
     /// Persist the material of a generated song before it is sent; the returned
-    /// row id drives the retake button. `None` disables the button.
+    /// row id is linked to the delivered message afterwards.
     fn persist_generated_song<'a>(
         &'a self,
         _song: NewGeneratedSong,
@@ -1002,7 +988,7 @@ impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sen
         self
     }
 
-    /// Persist generated songs so listeners can ask for another take.
+    /// Persist generated songs (material, seed, duration) for tracing.
     #[must_use]
     pub fn with_song_store(mut self, songs: Arc<PostgresGeneratedSongStore>) -> Self {
         self.songs = Some(songs);
@@ -1143,17 +1129,12 @@ where
                 lyrics: &plan.material.lyrics,
                 footer_html: &footer_html,
             });
-            let reply_markup = plan
-                .song_id
-                .map(|song_id| serde_json::to_value(build_song_retake_keyboard(song_id)))
-                .transpose()
-                .map_err(|error| error.to_string())?;
             let options = openplotva_telegram::RichSendOptions {
                 message_thread_id: plan.thread_id.map(i64::from),
                 reply_to_message_id: Some(i64::from(plan.message_id)),
                 allow_sending_without_reply: true,
                 disable_notification: false,
-                reply_markup,
+                reply_markup: None,
             };
             let message_id = self
                 .rich
@@ -1845,41 +1826,6 @@ fn song_material_from_reprompt(
     material
 }
 
-/// Material carried by a retake job: stored tags, lyrics and language make the
-/// director call unnecessary. `None` when the job needs the director.
-fn song_material_from_retake_params(params: &MusicGenJobParams) -> Option<SongMaterial> {
-    let song_meta = SongJobMeta::from_params(params);
-    let style = params.style.trim();
-    let vocal_language = params.vocal_language.trim();
-    let lyrics = params.lyrics.trim();
-    if style.is_empty()
-        || vocal_language.is_empty()
-        || (lyrics.is_empty() && song_meta.vocals != "instrumental")
-    {
-        return None;
-    }
-    let title = if song_meta.title.trim().is_empty() {
-        title_from_topic(&music_job_topic(params))
-    } else {
-        song_meta.title.trim().to_owned()
-    };
-    let raw_style = if song_meta.style_summary.trim().is_empty() {
-        style.to_owned()
-    } else {
-        song_meta.style_summary.trim().to_owned()
-    };
-    Some(SongMaterial {
-        title,
-        lyrics: lyrics.to_owned(),
-        style: style.to_owned(),
-        raw_style,
-        vocal_language: vocal_language.to_owned(),
-        vocals: song_meta.vocals,
-        duration_seconds: song_meta.duration_seconds,
-        brief: song_meta.brief,
-    })
-}
-
 fn new_generated_song(
     params: &MusicGenJobParams,
     job_id: Option<i64>,
@@ -1890,7 +1836,6 @@ fn new_generated_song(
     let song_meta = SongJobMeta::from_params(params);
     NewGeneratedSong {
         job_id,
-        retake_of: song_meta.retake_of,
         chat_id: params.chat_id,
         thread_id: params.thread_id,
         user_id: params.user_id,
@@ -2258,84 +2203,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aifarm_song_material_provider_skips_the_director_for_retake_material() {
-        let provider = AifarmSongMaterialProvider::new(
-            PromptGeneratorStub::new(openplotva_media::acestep::SongPromptResult::default()),
-            LanguageStoreStub::new(Some("pl-PL")),
-        );
-        let mut meta = json!({"annotation": "ignored"});
-        super::SongJobMeta {
-            request_text: "!song night city".to_owned(),
-            retake_of: Some(9),
-            title: "Night City".to_owned(),
-            vocals: "female".to_owned(),
-            style_summary: "synthwave · 102 BPM".to_owned(),
-            duration_seconds: 150,
-            brief: json!({"bpm": 102}),
-        }
-        .attach(&mut meta);
-
-        let material = provider
-            .build_song_material(
-                &MusicGenJobParams {
-                    user_id: 7,
-                    message_id: 42,
-                    topic: "night city".to_owned(),
-                    lyrics: " [Chorus]\nnight city ".to_owned(),
-                    style: " synthwave, 102 BPM, female clean vocals ".to_owned(),
-                    vocal_language: " en ".to_owned(),
-                    meta,
-                    ..MusicGenJobParams::default()
-                },
-                "night city",
-            )
-            .await
-            .expect("song material");
-
-        assert_eq!(material.title, "Night City");
-        assert_eq!(material.lyrics, "[Chorus]\nnight city");
-        assert_eq!(material.style, "synthwave, 102 BPM, female clean vocals");
-        assert_eq!(material.raw_style, "synthwave · 102 BPM");
-        assert_eq!(material.vocal_language, "en");
-        assert_eq!(material.vocals, "female");
-        assert_eq!(material.duration_seconds, 150);
-        assert_eq!(material.brief, json!({"bpm": 102}));
-        assert!(
-            provider.generator.requests().is_empty(),
-            "a retake replays stored material without calling the director"
-        );
-
-        let instrumental = AifarmSongMaterialProvider::new(
-            PromptGeneratorStub::new(openplotva_media::acestep::SongPromptResult::default()),
-            NoSongLanguageHintStore,
-        );
-        let mut meta = json!({});
-        super::SongJobMeta {
-            vocals: "instrumental".to_owned(),
-            duration_seconds: 180,
-            ..super::SongJobMeta::default()
-        }
-        .attach(&mut meta);
-        let material = instrumental
-            .build_song_material(
-                &MusicGenJobParams {
-                    topic: "dark neurofunk".to_owned(),
-                    style: "neurofunk, 174 BPM, instrumental".to_owned(),
-                    vocal_language: "en".to_owned(),
-                    meta,
-                    ..MusicGenJobParams::default()
-                },
-                "dark neurofunk",
-            )
-            .await
-            .expect("instrumental material");
-        assert!(material.is_instrumental());
-        assert_eq!(material.title, "dark neurofunk");
-        assert_eq!(material.max_audio_seconds(), 180);
-        assert!(instrumental.generator.requests().is_empty());
-    }
-
-    #[tokio::test]
     async fn aifarm_song_material_provider_passes_hint_request_and_context() {
         let provider = AifarmSongMaterialProvider::new(
             PromptGeneratorStub::new(openplotva_media::acestep::SongPromptResult {
@@ -2355,7 +2222,6 @@ mod tests {
         let mut meta = json!({});
         super::SongJobMeta {
             request_text: "!song ночной город, женский вокал".to_owned(),
-            ..super::SongJobMeta::default()
         }
         .attach(&mut meta);
 
@@ -2433,7 +2299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn music_executor_persists_the_song_and_arms_the_retake_button() {
+    async fn music_executor_persists_the_song_and_links_the_message() {
         let material_provider = HeuristicSongMaterialProvider;
         let generator = GeneratorStub::new(Ok(GeneratedSongAudio {
             data: b"MP3".to_vec(),
@@ -2445,8 +2311,6 @@ mod tests {
         let mut meta = json!({});
         super::SongJobMeta {
             request_text: "!song ночной город".to_owned(),
-            retake_of: Some(3),
-            ..super::SongJobMeta::default()
         }
         .attach(&mut meta);
 
@@ -2472,7 +2336,6 @@ mod tests {
         let persisted = effects.persisted();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].job_id, Some(555));
-        assert_eq!(persisted[0].retake_of, Some(3));
         assert_eq!(persisted[0].chat_id, 42);
         assert_eq!(persisted[0].thread_id, Some(77));
         assert_eq!(persisted[0].trigger_message_id, 9);
