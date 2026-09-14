@@ -2200,6 +2200,21 @@ fn detect_tool_steps_in(
         return Ok(Some((direct_steps, decision)));
     }
 
+    let function_steps = parse_function_call_steps(content)?;
+    if !function_steps.is_empty() {
+        let decision = ToolParseDecision {
+            form: "function_call".to_owned(),
+            tool: function_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
+        return Ok(Some((function_steps, decision)));
+    }
+
     detect_tool_step_in(content)
         .map(|maybe_step| maybe_step.map(|(step, decision)| (vec![step], decision)))
 }
@@ -2252,7 +2267,6 @@ fn detect_tool_step_in(
     for parser in [
         parse_xmlish_tool_step_attempt,
         parse_inline_tool_step_attempt,
-        parse_function_call_step_attempt,
         parse_normalized_tool_step_attempt,
         parse_bare_tool_step_attempt,
     ] {
@@ -2276,10 +2290,6 @@ fn parse_xmlish_tool_step_attempt(raw: &str) -> Result<(ToolStep, bool, String),
 
 fn parse_inline_tool_step_attempt(raw: &str) -> Result<(ToolStep, bool, String), ToolParseError> {
     parse_inline_tool_call_step(raw).map(|(step, ok)| (step, ok, "inline".to_owned()))
-}
-
-fn parse_function_call_step_attempt(raw: &str) -> Result<(ToolStep, bool, String), ToolParseError> {
-    parse_function_call_step(raw).map(|(step, ok)| (step, ok, "function_call".to_owned()))
 }
 
 fn parse_normalized_tool_step_attempt(
@@ -2398,10 +2408,14 @@ fn parse_bare_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseErr
 /// The model wrote the call as code: `generate_song(prompt='…')`, possibly wrapped
 /// in `print(...)`. Only calls with quoted string arguments count, so prose that
 /// merely mentions `generate_song(topic)` is left alone.
-fn parse_function_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseError> {
-    let Some(call) = find_function_calls(raw).into_iter().next() else {
-        return Ok((ToolStep::default(), false));
-    };
+fn parse_function_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
+    find_function_calls(raw)
+        .into_iter()
+        .map(|call| function_call_step(raw, call))
+        .collect()
+}
+
+fn function_call_step(raw: &str, call: FunctionCallSpan) -> Result<ToolStep, ToolParseError> {
     let mut arguments = serde_json::Map::new();
     for (index, (key, value)) in parse_function_call_arguments(&raw[call.args_start..call.args_end])
         .into_iter()
@@ -2417,13 +2431,17 @@ fn parse_function_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseErro
             arguments.insert(key, Value::String(value));
         }
     }
-    decode_tool_call_arguments(call.name, &Value::Object(arguments)).map(|step| (step, true))
+    decode_tool_call_arguments(call.name, &Value::Object(arguments))
 }
 
 fn remove_function_call_protocol(raw: &str) -> Option<String> {
     let spans: Vec<(usize, usize)> = find_function_calls(raw)
         .into_iter()
-        .map(|call| (call.start, call.end))
+        .map(|call| {
+            // The call occupies its own line; take the line break with it.
+            let end = call.end + usize::from(raw[call.end..].starts_with('\n'));
+            (call.start, end)
+        })
         .collect();
     (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
 }
@@ -4590,6 +4608,16 @@ mod tests {
         assert_eq!(returned.tool_steps.len(), 1);
         assert_eq!(returned.tool_steps[0].query, "курс доллара");
         assert!(returned.text.is_empty());
+
+        let several = parse_assistant_content(
+            "Держи.\nreact_to_message(emoji='🔥')\ngenerate_song(topic='ночной город')\nГотово.",
+        )?;
+        assert_eq!(several.tool_steps.len(), 2);
+        assert_eq!(several.tool_steps[0].step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(several.tool_steps[0].emoji, "🔥");
+        assert_eq!(several.tool_steps[1].step, STEP_GENERATE_SONG);
+        assert_eq!(several.tool_steps[1].topic, "ночной город");
+        assert_eq!(several.text, "Держи.\nГотово.");
         Ok(())
     }
 
