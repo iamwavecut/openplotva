@@ -1990,7 +1990,6 @@ async fn schedule_direct_song_shortcut(
             message_meta: context.meta,
             reference_file_id,
             reference_file_unique_id,
-            retake: None,
         })
         .await
         .map_err(|error| DialogMessageUpdateError::ScheduleSong {

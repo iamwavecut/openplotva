@@ -649,6 +649,10 @@ mod tests {
         );
         assert!(messages[0].content.contains("song_director_terminator"));
         assert!(messages[0].content.contains("Hard maximum 360 seconds"));
+        assert!(
+            messages[0].content.contains("Fet.Online"),
+            "the Russian versification rules live in the director prompt"
+        );
         assert_eq!(messages[1].role, "user");
         assert!(messages[1].content.contains("Request: !song ночной город"));
         assert!(messages[1].content.contains("Topic: ночной город"));

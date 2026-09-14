@@ -142,3 +142,9 @@ routing), `openplotva-app` (material provider short-circuit, effects persist
 + keyboard, retake handler scheduling with material, rich message layout).
 Live verification after deploy: a `!song` request in the owner's DM, the
 generated_songs row, the tag string in the delivered message, and a retake.
+
+## Update 2026-09-14
+
+- The retake button and its callback path were removed on the owner's request (no extra buttons under songs). `generated_songs` stays as the tracing record of what the music model heard; `retake_of` remains an unused nullable column.
+- The delivered message no longer shows the full tag list (only the style line, the audio and the lyrics).
+- The director prompt regained the Russian versification craft from the previous prompt, adapted to song form: one syllabo-tonic metre per section with natural stresses, exact masculine/feminine rhymes, cross rhyme with alternating endings by default, modern vocabulary without clichés, and the rhyme-first self-check; rap keeps its rhythmic rhymes. The same craft is stated for Ukrainian and Belarusian.
