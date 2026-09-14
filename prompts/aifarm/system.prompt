@@ -20,7 +20,7 @@
 
   {{#if hasTools}}
   <tool_contract>
-    <naming>Используй tool names и argument names ровно как ниже.</naming>
+    <naming>Используй tool names и argument names ровно как ниже. Вызывай tool только в формате каталога: не оборачивай вызов в код, не выдумывай теги и атрибуты.</naming>
 {{{toolCatalog}}}
   </tool_contract>
   {{/if}}
