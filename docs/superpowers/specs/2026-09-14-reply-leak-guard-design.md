@@ -68,7 +68,9 @@ so `finalize_dialog_reply(content)` keeps working with an empty guard.
 
 - Closed reasoning blocks (`<think>`, `<thought>`, `<analysis>`, `<thinking>`,
   `<reasoning>`) are removed wherever they appear; an unclosed one that opens a
-  line is a reasoning leak; an inline mention (`в <think> теги`) stays.
+  line is a reasoning leak; an inline mention (`в <think> теги`) stays. A close
+  tag with no opening one ends a reasoning run only when it ends its line: the
+  reply is what follows it; a close tag mentioned mid-sentence is prose.
 - An answer envelope (`<answer>`, `<final_answer>`, `<response>`,
   `<final_response>`, `<output>`) yields its inner text (the `<text>` bodies when
   present); sibling self-review elements are dropped.

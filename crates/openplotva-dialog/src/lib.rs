@@ -1298,15 +1298,26 @@ fn next_reasoning_block_open(lower: &str, from: usize) -> Option<(usize, &'stati
     best
 }
 
+// Only a close tag that ends its line closes a reasoning run; one mentioned
+// mid-sentence is prose about the tag.
 fn orphan_reasoning_close_end(lower: &str, from: usize, next_open: Option<usize>) -> Option<usize> {
     let limit = next_open.unwrap_or(lower.len());
     let mut best: Option<usize> = None;
     for tag in REASONING_BLOCK_TAGS {
         let close = format!("</{tag}>");
-        if let Some(rel) = lower[from..limit].find(&close) {
-            let end = from + rel + close.len();
-            if best.is_none_or(|prev| end < prev) {
-                best = Some(end);
+        let mut search = from;
+        while let Some(rel) = lower[search..limit].find(&close) {
+            let end = search + rel + close.len();
+            search = end;
+            let ends_line = lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch == '\n' || ch == '\r');
+            if ends_line {
+                if best.is_none_or(|prev| end < prev) {
+                    best = Some(end);
+                }
+                break;
             }
         }
     }
@@ -4081,7 +4092,12 @@ mod tests {
             finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
             Suppressed(DialogReplySuppression::PromptLeak)
         );
-        // An orphan reasoning close tag ends a reasoning run: the reply follows it.
+        // A close tag mentioned mid-sentence is prose; only one that ends its
+        // line closes a reasoning run, and then the reply follows it.
+        assert_eq!(
+            finalize_dialog_reply("Пиши после </think> рассуждений, а не до."),
+            Reply("Пиши после </think> рассуждений, а не до.".to_owned())
+        );
         assert_eq!(
             finalize_dialog_reply(
                 "Выглядит так, будто кто-то ищет третьего.<emoji_reaction_logic: smirk fits></emoji_reaction_logic></reasoning>\n\nВыглядит так, будто кто-то ищет третьего лишнего."
