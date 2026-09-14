@@ -503,6 +503,7 @@ where
             &request.transcript,
             false,
         ));
+        let guard = crate::aifarm::reply_leak_guard(&messages, input);
         let mut gemini_request = gemini_request_from_messages(
             messages,
             GeminiGenerationConfig {
@@ -560,7 +561,7 @@ where
             }
             Err(error) => return Err(Box::new(DialogTraceError::new(error, vec![trace]))),
         };
-        let answer = match gemini_final_answer(&text) {
+        let answer = match gemini_final_answer(&text, &guard) {
             GeminiFinalAnswer::Reply(answer) => answer,
             GeminiFinalAnswer::Suppressed(reason) => {
                 let error: ChatProviderError = Box::new(ProviderError::new(
@@ -2819,11 +2820,11 @@ enum GeminiFinalAnswer {
     Suppressed(String),
 }
 
-fn gemini_final_answer(raw: &str) -> GeminiFinalAnswer {
+fn gemini_final_answer(raw: &str, guard: &openplotva_dialog::ReplyLeakGuard) -> GeminiFinalAnswer {
     let content = decode_plotva_final_response_with_salvage(raw)
         .map(|decoded| decoded.answer.trim().to_owned())
         .unwrap_or_else(|_| raw.trim().to_owned());
-    match openplotva_dialog::finalize_dialog_reply(&content) {
+    match openplotva_dialog::finalize_dialog_reply_with_guard(&content, guard) {
         openplotva_dialog::DialogReplyOutcome::Reply(answer) => {
             let sanitized = sanitize_genkit_final_answer(&answer);
             if sanitized.trim().is_empty() {
@@ -2842,6 +2843,8 @@ fn gemini_suppression_message(reason: &openplotva_dialog::DialogReplySuppression
     use openplotva_dialog::DialogReplySuppression as Reason;
     match reason {
         Reason::ContextLeak => "chat completion returned only copied context messages".to_owned(),
+        Reason::PromptLeak => "final answer copied prompt context text".to_owned(),
+        Reason::TranscriptLeak => "final answer copied the chat transcript".to_owned(),
         Reason::Pathological(detail) => format!("pathological final answer: {detail}"),
         Reason::ReasoningLeak => "final answer leaked reasoning or protocol scaffolding".to_owned(),
         Reason::Empty | Reason::ProtocolOnly => "empty final text".to_owned(),
@@ -3173,11 +3176,17 @@ mod tests {
         use openplotva_dialog::DialogReplySuppression as Reason;
 
         assert_eq!(
-            gemini_final_answer("Привет, как дела?"),
+            gemini_final_answer(
+                "Привет, как дела?",
+                &openplotva_dialog::ReplyLeakGuard::default()
+            ),
             GeminiFinalAnswer::Reply("Привет, как дела?".to_owned())
         );
         assert!(matches!(
-            gemini_final_answer(&"а".repeat(30)),
+            gemini_final_answer(
+                &"а".repeat(30),
+                &openplotva_dialog::ReplyLeakGuard::default()
+            ),
             GeminiFinalAnswer::Suppressed(_)
         ));
 
@@ -3209,7 +3218,7 @@ mod tests {
         let raw = format!("Краткое введение.\n\n{block}\n\n{block}");
 
         assert_eq!(
-            gemini_final_answer(&raw),
+            gemini_final_answer(&raw, &openplotva_dialog::ReplyLeakGuard::default()),
             GeminiFinalAnswer::Suppressed("pathological final answer: repeated block".to_owned())
         );
     }
