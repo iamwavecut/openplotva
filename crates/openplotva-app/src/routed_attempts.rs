@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use openplotva_llm::retry::FailureReason;
 use openplotva_llm::router::{
-    BreakerLiveness, BreakerSet, InferenceOverrides, PoolRegistry, RouterHandle, TriggerState,
-    WorkflowRoute, select_chain,
+    Attempt, BreakerLiveness, BreakerSet, InferenceOverrides, PoolId, PoolPermit, PoolRegistry,
+    Role, RouterHandle, TriggerState, WorkflowRoute, select_chain,
 };
 use serde_json::{Value, json};
 
@@ -29,6 +29,7 @@ pub struct RoutedAttemptWalker {
     pools: Arc<PoolRegistry>,
     openrouter_free_gate: Option<Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     max_slot_wait: Duration,
+    primary_slot_wait: Duration,
     reporter: Option<crate::runtime_routing::RoutingEventReporter>,
 }
 
@@ -47,6 +48,7 @@ impl RoutedAttemptWalker {
             pools,
             openrouter_free_gate: None,
             max_slot_wait: DEFAULT_MAX_SLOT_WAIT,
+            primary_slot_wait: Duration::ZERO,
             reporter: None,
         }
     }
@@ -88,6 +90,62 @@ impl RoutedAttemptWalker {
     pub fn with_max_slot_wait(mut self, max_slot_wait: Duration) -> Self {
         self.max_slot_wait = max_slot_wait;
         self
+    }
+
+    /// How long a busy pool of a primary-role candidate is waited for before
+    /// the walker moves on to the fallback tail. Zero (the default) keeps the
+    /// instant skip.
+    #[must_use]
+    pub fn with_primary_slot_wait(mut self, primary_slot_wait: Duration) -> Self {
+        self.primary_slot_wait = primary_slot_wait;
+        self
+    }
+
+    // The fallback tail serves the request without the primary's tools or
+    // quality, so a bounded queue on a busy primary beats an instant downgrade.
+    // Slot time is charged to the caller's deadline, not to the retry wall.
+    async fn wait_for_primary_slot(
+        &self,
+        pool: Option<PoolId>,
+        context: &RoutedRequestContext,
+        attempt: &Attempt,
+        total_slot_wait: &mut Duration,
+    ) -> Option<PoolPermit> {
+        let started = Instant::now();
+        let budget = match context.deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(started)
+                .min(self.primary_slot_wait),
+            None => self.primary_slot_wait,
+        };
+        let mut permit = None;
+        while permit.is_none() {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() || !self.pools.wait_for_release(remaining).await {
+                break;
+            }
+            permit = self.pools.try_acquire(pool);
+        }
+        let waited = started.elapsed();
+        *total_slot_wait += waited;
+        self.record_event(routing_event_with_severity(
+            "primary_slot_wait",
+            "info",
+            context,
+            Some(attempt.provider),
+            Some(attempt.model),
+            if permit.is_some() {
+                "primary pool slot acquired after waiting"
+            } else {
+                "primary pool stayed busy for the whole wait budget; falling back"
+            },
+            json!({
+                "waited_ms": waited.as_millis(),
+                "budget_ms": budget.as_millis(),
+                "acquired": permit.is_some(),
+            }),
+        ));
+        permit
     }
 
     pub async fn run<T, E, F, Fut, Retry>(
@@ -208,7 +266,17 @@ impl RoutedAttemptWalker {
                 }
                 let provider = table.provider(attempt.provider);
                 let model = table.model(attempt.model);
-                let Some(permit) = self.pools.try_acquire(model.and_then(|row| row.pool_id)) else {
+                let pool_id = model.and_then(|row| row.pool_id);
+                let mut permit = self.pools.try_acquire(pool_id);
+                if permit.is_none()
+                    && attempt.role == Role::Primary
+                    && !self.primary_slot_wait.is_zero()
+                {
+                    permit = self
+                        .wait_for_primary_slot(pool_id, &context, &attempt, &mut total_slot_wait)
+                        .await;
+                }
+                let Some(permit) = permit else {
                     busy_skips += 1;
                     continue;
                 };
@@ -1364,6 +1432,72 @@ mod tests {
             .expect("walker must wake on the released slot");
 
         assert_eq!(output, "after wait");
+    }
+
+    fn primary_with_fallback_snapshot() -> RoutingSnapshot {
+        let mut snapshot = pooled_snapshot(3);
+        let fallback = &mut snapshot.assignments[1];
+        fallback.role = "fallback".to_owned();
+        fallback.weight = None;
+        fallback.fallback_order = Some(1);
+        snapshot
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_primary_is_waited_for_before_the_fallback_tail() {
+        let snapshot = primary_with_fallback_snapshot();
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
+            .with_primary_slot_wait(std::time::Duration::from_millis(200));
+        let busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(busy);
+        });
+        let started = tokio::time::Instant::now();
+
+        let served_by = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                |attempt| async move { Ok::<_, std::io::Error>(attempt.provider_id) },
+                |_error| None,
+            )
+            .await
+            .expect("the primary slot frees inside the wait budget");
+
+        assert_eq!(served_by, 1, "the primary must serve once its slot frees");
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_primary_falls_back_only_after_the_wait_budget() {
+        let snapshot = primary_with_fallback_snapshot();
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
+            .with_primary_slot_wait(std::time::Duration::from_millis(200));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+        let started = tokio::time::Instant::now();
+
+        let served_by = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                |attempt| async move { Ok::<_, std::io::Error>(attempt.provider_id) },
+                |_error| None,
+            )
+            .await
+            .expect("the fallback serves after the primary wait budget");
+
+        assert_eq!(
+            served_by, 2,
+            "the fallback serves a permanently busy primary"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(200));
     }
 
     #[tokio::test(start_paused = true)]

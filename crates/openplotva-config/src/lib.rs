@@ -76,6 +76,9 @@ pub const DEFAULT_SETTINGS_REQUIRE_INIT_DATA: bool = false;
 pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
+/// Default `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
+/// router waits for a busy primary pool before falling back.
+pub const DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS: i32 = 12_000;
 
 pub const DEFAULT_RUNTIME_API_PORT: u16 = 9091;
 
@@ -1347,7 +1350,9 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_base_urls: Option<String>,
     /// `DIALOG_AIFARM_POOL_API_KEY`.
     pub dialog_aifarm_pool_api_key: Option<String>,
-    /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`.
+    /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
+    /// router waits for a busy primary-role pool slot before it falls back to
+    /// the next candidate. Default 12000.
     pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
     /// `DIALOG_TURN_BUDGET_SECS`.
     pub dialog_turn_budget_secs: Option<String>,
@@ -2566,7 +2571,7 @@ impl AppConfig {
                     aifarm_pool_primary_capacity_wait_ms: parse_i32(
                         "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
                         raw.dialog_aifarm_pool_primary_capacity_wait_ms,
-                        500,
+                        DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS,
                     )?,
                     turn_budget_secs: parse_i32(
                         "DIALOG_TURN_BUDGET_SECS",
@@ -4000,7 +4005,10 @@ mod tests {
         assert_eq!(config.llm.dialog.task_timeout_seconds, 720);
         assert_eq!(config.llm.dialog.aifarm_capacity_wait_seconds, 60);
         assert_eq!(config.llm.dialog.aifarm_capacity_poll_seconds, 1);
-        assert_eq!(config.llm.dialog.aifarm_pool_primary_capacity_wait_ms, 500);
+        assert_eq!(
+            config.llm.dialog.aifarm_pool_primary_capacity_wait_ms,
+            crate::DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS
+        );
         assert_eq!(
             config.llm.dialog.aifarm_pool_models,
             parse_string_list_or_default(None, DEFAULT_DIALOG_AIFARM_POOL_MODELS)
