@@ -1887,13 +1887,10 @@ enum JsonEnvelope {
 
 const JSON_ENVELOPE_TEXT_KEYS: &[&str] =
     &["answer", "response", "text", "content", "message", "reply"];
-const JSON_ENVELOPE_TRANSCRIPT_KEYS: &[&str] = &[
-    "reply_to_id",
-    "reply_to_user",
-    "to_user",
-    "message_id",
-    "sender",
-];
+// Only the reply-target fields of the rendered history mark a copied
+// envelope; `sender`/`message_id`-style keys are plausible in JSON a user
+// asked for.
+const JSON_ENVELOPE_TRANSCRIPT_KEYS: &[&str] = &["reply_to_id", "reply_to_user"];
 
 // A reply that is one JSON document shaped like a history entry (it carries a
 // transcript key) yields its text under a known key; without any text it is
@@ -4248,6 +4245,10 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("{\"message\": \"ok\", \"code\": 1}"),
             Reply("{\"message\": \"ok\", \"code\": 1}".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"sender\": \"Вася\", \"message\": \"привет\"}"),
+            Reply("{\"sender\": \"Вася\", \"message\": \"привет\"}".to_owned())
         );
 
         // A copied history block ahead of prose is a narrated transcript.
