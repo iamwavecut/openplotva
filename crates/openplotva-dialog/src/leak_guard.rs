@@ -551,6 +551,8 @@ mod tests {
             "<b>Жирный</b> текст и <a href=\"https://example.com\">ссылка</a>.",
             "Ты хотел выйти в пять утра, а потом проспал до обеда — классика.",
             "Наталья: ну ты и загнула, конечно.",
+            // Long tag names guard the tag form only; the bare words stay prose.
+            "What does your identity mean to you? Any description would do.",
         ] {
             assert_eq!(guard.detect(reply), None, "{reply}");
         }
