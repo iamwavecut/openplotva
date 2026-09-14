@@ -2451,6 +2451,12 @@ fn find_function_calls(raw: &str) -> Vec<FunctionCallSpan> {
             if !is_function_call_boundary(raw, name_start) {
                 continue;
             }
+            let (start, _) = function_call_wrapper_span(raw, name_start, name_start);
+            // A real call stands on its own line; a call quoted inside prose or a
+            // code example ("вызывать так: `web_search(\"…\")`") is not executed.
+            if !is_statement_start(raw, start) || is_inside_code_fence(raw, start) {
+                continue;
+            }
             let args_start = name_start + needle.len();
             let Some(args_end) = matching_paren_end(raw, args_start) else {
                 continue;
@@ -2484,10 +2490,20 @@ fn find_function_calls(raw: &str) -> Vec<FunctionCallSpan> {
 }
 
 fn is_function_call_boundary(raw: &str, name_start: usize) -> bool {
-    raw[..name_start]
-        .chars()
-        .next_back()
-        .is_none_or(|prev| !(prev.is_alphanumeric() || prev == '_' || prev == '.' || prev == '<'))
+    raw[..name_start].chars().next_back().is_none_or(|prev| {
+        !(prev.is_alphanumeric() || prev == '_' || prev == '.' || prev == '<' || prev == '`')
+    })
+}
+
+/// Only whitespace between the start of the line and `start`.
+fn is_statement_start(raw: &str, start: usize) -> bool {
+    let line_start = raw[..start].rfind(['\n', '\r']).map_or(0, |idx| idx + 1);
+    raw[line_start..start].trim().is_empty()
+}
+
+/// Inside a ``` fenced block when an odd number of fences precede `start`.
+fn is_inside_code_fence(raw: &str, start: usize) -> bool {
+    raw[..start].matches("```").count() % 2 == 1
 }
 
 /// Index of the `)` matching the `(` just before `args_start`, honouring quotes.
@@ -2529,8 +2545,13 @@ fn function_call_wrapper_span(raw: &str, name_start: usize, call_end: usize) -> 
     let mut end = call_end;
     let before = raw[..name_start].trim_end_matches([' ', '\t']);
     let mut wrapped = false;
-    for wrapper in ["print(", "await ", "return "] {
-        if before.ends_with(wrapper) {
+    for wrapper in ["print(", "await", "return"] {
+        if before.ends_with(wrapper)
+            && before[..before.len() - wrapper.len()]
+                .chars()
+                .next_back()
+                .is_none_or(|prev| !(prev.is_alphanumeric() || prev == '_'))
+        {
             start = before.len() - wrapper.len();
             wrapped = wrapper == "print(";
             break;
@@ -4550,6 +4571,25 @@ mod tests {
             prose.text,
             "Могу вызвать generate_song(topic) или draw_image(prompt), но ты не просил."
         );
+
+        for quoted in [
+            "Вызывать так: web_search(\"погода в Питере\") — и всё.",
+            "Пример:\n```python\nweb_search(\"погода в Питере\")\n```\nВот так.",
+            "Например `web_search(\"погода в Питере\")`.",
+        ] {
+            let parsed = parse_assistant_content(quoted)?;
+            assert!(parsed.tool_steps.is_empty(), "{quoted}");
+            assert_eq!(parsed.text, quoted);
+        }
+
+        let awaited = parse_assistant_content("Ща.\nawait generate_song(topic='ночной город');")?;
+        assert_eq!(awaited.tool_steps.len(), 1);
+        assert_eq!(awaited.tool_steps[0].topic, "ночной город");
+        assert_eq!(awaited.text, "Ща.");
+        let returned = parse_assistant_content("return web_search(\"курс доллара\")")?;
+        assert_eq!(returned.tool_steps.len(), 1);
+        assert_eq!(returned.tool_steps[0].query, "курс доллара");
+        assert!(returned.text.is_empty());
         Ok(())
     }
 
