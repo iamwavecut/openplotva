@@ -42,10 +42,13 @@ Built once per model step from the rendered request and the dialog input:
 | `<reference_context>` chunks (memory), `<custom_persona>`, `<daily_persona_accent>` | 8-word shingles | shingle hit → `PromptLeak` (short facts and persona catchphrases stay reusable) |
 | participant-authored history turns (sender, text) and the current message; the bot only as a speaker label | per-entry 8-word shingles, exact normalised text, sender names | exact echo of one entry, ≥2 distinct entries echoed, or ≥2 lines labelled `<known sender>:` → `TranscriptLeak` |
 
-Tags, identifiers and labels are matched outside code spans (``` fences,
-`<pre>`, `<code>`), so a reply explaining markup is not a leak; the
-reasoning-block and answer-envelope recoveries below skip those spans for the
-same reason (the masked copy keeps byte offsets, so edits land on the original).
+Tags, identifiers and labels are matched outside closed code spans (``` fences,
+`<pre>`, `<code>`), so a reply explaining markup is not a leak; an opener
+without a close masks nothing, so a dump behind a stray fence stays visible.
+The reasoning-block and answer-envelope recoveries below skip those spans for
+the same reason (the masked copy keeps byte offsets, so edits land on the
+original), and both act only on elements that open a line: an `<answer>` or
+`<think>` mentioned mid-sentence is prose about the format.
 
 Normalisation: tags removed, lowercase, every non-alphanumeric run is a word
 separator. Shingles are hashed with `DefaultHasher`; the index lives only for

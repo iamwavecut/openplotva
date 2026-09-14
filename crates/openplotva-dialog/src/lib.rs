@@ -1325,7 +1325,16 @@ fn extract_answer_envelope(value: &str) -> Option<String> {
         let mut search = 0;
         while let Some(rel) = lower[search..].find('<') {
             let at = search + rel;
-            if starts_with_xml_tag(&lower[at..], tag) && best.is_none_or(|(prev, _)| at > prev) {
+            // Only an element that opens a line is a wrapper; one mentioned
+            // mid-sentence is prose about the format.
+            let opens_line = lower[..at]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|prefix| prefix.trim().is_empty());
+            if opens_line
+                && starts_with_xml_tag(&lower[at..], tag)
+                && best.is_none_or(|(prev, _)| at > prev)
+            {
                 best = Some((at, tag));
             }
             search = at + 1;
@@ -4184,6 +4193,16 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("<final_answer>Коротко и по делу.</final_answer>"),
             Reply("Коротко и по делу.".to_owned())
+        );
+        // An envelope mentioned mid-sentence is prose about the format.
+        assert_eq!(
+            finalize_dialog_reply(
+                "Нужно оформить ответ в <answer><text>привет</text></answer> теги, и всё."
+            ),
+            Reply(
+                "Нужно оформить ответ в <answer><text>привет</text></answer> теги, и всё."
+                    .to_owned()
+            )
         );
         // Markup demonstrated inside code is an example: no envelope
         // extraction, no reasoning-block stripping.

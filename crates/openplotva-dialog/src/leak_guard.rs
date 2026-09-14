@@ -402,8 +402,9 @@ fn tag_names(text: &str) -> Vec<TagName> {
     tags
 }
 
-// Blanks fenced/`<pre>`/`<code>` spans byte-for-byte (newlines kept), so
-// offsets found in the masked copy address the original text.
+// Blanks closed fenced/`<pre>`/`<code>` spans byte-for-byte (newlines kept),
+// so offsets found in the masked copy address the original text. An opener
+// without a close masks nothing: a dump behind a stray fence must stay visible.
 pub(crate) fn mask_code_spans(text: &str) -> String {
     const SPANS: &[(&str, &str)] = &[("```", "```"), ("<pre", "</pre>"), ("<code", "</code>")];
     let mut masked = text.to_owned();
@@ -415,9 +416,12 @@ pub(crate) fn mask_code_spans(text: &str) -> String {
                 break;
             };
             let start = from + rel;
-            let end = lower[start + open.len()..]
+            let Some(end) = lower[start + open.len()..]
                 .find(close)
-                .map_or(masked.len(), |idx| start + open.len() + idx + close.len());
+                .map(|idx| start + open.len() + idx + close.len())
+            else {
+                break;
+            };
             let blank = masked[start..end]
                 .bytes()
                 .map(|byte| if byte == b'\n' { '\n' } else { ' ' })
@@ -695,6 +699,11 @@ mod tests {
         assert_eq!(
             guard.detect("Так выглядит запись: <pre>&lt;message id=\"1\"&gt;</pre> <code><to_user>x</to_user></code>"),
             None
+        );
+        // A stray opener without a close hides nothing.
+        assert_eq!(
+            guard.detect("```xml\n<system_contract>\n<identity>Ты — собеседник</identity>"),
+            Some(DialogLeak::Prompt)
         );
     }
 
