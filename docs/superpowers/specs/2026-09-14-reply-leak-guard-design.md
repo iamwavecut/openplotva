@@ -43,7 +43,9 @@ Built once per model step from the rendered request and the dialog input:
 | participant-authored history turns (sender, text) and the current message; the bot only as a speaker label | per-entry 8-word shingles, exact normalised text, sender names | exact echo of one entry, ≥2 distinct entries echoed, or ≥2 lines labelled `<known sender>:` → `TranscriptLeak` |
 
 Tags, identifiers and labels are matched outside code spans (``` fences,
-`<pre>`, `<code>`), so a reply explaining markup is not a leak.
+`<pre>`, `<code>`), so a reply explaining markup is not a leak; the
+reasoning-block and answer-envelope recoveries below skip those spans for the
+same reason (the masked copy keeps byte offsets, so edits land on the original).
 
 Normalisation: tags removed, lowercase, every non-alphanumeric run is a word
 separator. Shingles are hashed with `DefaultHasher`; the index lives only for

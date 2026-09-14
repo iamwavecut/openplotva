@@ -1233,7 +1233,9 @@ fn strip_closed_reasoning_blocks(value: &str) -> (String, bool, bool) {
     let mut removed = false;
     let mut from = 0;
     loop {
-        let lower = cleaned.to_ascii_lowercase();
+        // Offsets of the masked copy map 1:1 onto `cleaned`; markup quoted
+        // inside code is an example and stays.
+        let lower = leak_guard::mask_code_spans(&cleaned).to_ascii_lowercase();
         let next_open = next_reasoning_block_open(&lower, from);
         if let Some(close_end) =
             orphan_reasoning_close_end(&lower, from, next_open.map(|(at, _)| at))
@@ -1314,9 +1316,10 @@ fn orphan_reasoning_close_end(lower: &str, from: usize, next_open: Option<usize>
 const ANSWER_ENVELOPE_TAGS: &[&str] = &["answer", "final_answer", "final_response", "response"];
 
 // The model sometimes wraps its reply in an explicit answer element next to a
-// self-review; only the last envelope's body is the reply.
+// self-review; only the last envelope's body is the reply. An envelope quoted
+// inside code is an example, not a wrapper.
 fn extract_answer_envelope(value: &str) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
+    let lower = leak_guard::mask_code_spans(value).to_ascii_lowercase();
     let mut best: Option<(usize, &str)> = None;
     for tag in ANSWER_ENVELOPE_TAGS {
         let mut search = 0;
@@ -4184,6 +4187,17 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("<final_answer>Коротко и по делу.</final_answer>"),
             Reply("Коротко и по делу.".to_owned())
+        );
+        // Markup demonstrated inside code is an example: no envelope
+        // extraction, no reasoning-block stripping.
+        assert_eq!(
+            finalize_dialog_reply(
+                "Конверт выглядит так:\n```xml\n<answer><text>привет</text></answer>\n```\nА рассуждения — в <code><think>\n…</code>."
+            ),
+            Reply(
+                "Конверт выглядит так:\n```xml\n<answer><text>привет</text></answer>\n```\nА рассуждения — в <code><think>\n…</code>."
+                    .to_owned()
+            )
         );
 
         // Closed reasoning blocks vanish wherever they sit; a block-form

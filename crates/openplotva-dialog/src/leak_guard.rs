@@ -402,7 +402,9 @@ fn tag_names(text: &str) -> Vec<TagName> {
     tags
 }
 
-fn mask_code_spans(text: &str) -> String {
+// Blanks fenced/`<pre>`/`<code>` spans byte-for-byte (newlines kept), so
+// offsets found in the masked copy address the original text.
+pub(crate) fn mask_code_spans(text: &str) -> String {
     const SPANS: &[(&str, &str)] = &[("```", "```"), ("<pre", "</pre>"), ("<code", "</code>")];
     let mut masked = text.to_owned();
     for (open, close) in SPANS {
@@ -416,7 +418,10 @@ fn mask_code_spans(text: &str) -> String {
             let end = lower[start + open.len()..]
                 .find(close)
                 .map_or(masked.len(), |idx| start + open.len() + idx + close.len());
-            let blank = " ".repeat(end - start);
+            let blank = masked[start..end]
+                .bytes()
+                .map(|byte| if byte == b'\n' { '\n' } else { ' ' })
+                .collect::<String>();
             masked.replace_range(start..end, &blank);
             from = end;
         }
