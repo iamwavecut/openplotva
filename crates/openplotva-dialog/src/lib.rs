@@ -1892,9 +1892,10 @@ const JSON_ENVELOPE_TRANSCRIPT_KEYS: &[&str] = &[
     "sender",
 ];
 
-// A reply that is one JSON document shaped like a history entry carries its
-// text under a known key; without one it is protocol only. JSON the user asked
-// for (no such keys at all) is left alone.
+// A reply that is one JSON document shaped like a history entry (it carries a
+// transcript key) yields its text under a known key; without any text it is
+// protocol only. JSON without transcript keys may be what the user asked for
+// and is left alone.
 fn recover_json_envelope(value: &str) -> JsonEnvelope {
     let body = strip_code_fence(value.trim());
     let is_document = (body.starts_with('{') && body.ends_with('}'))
@@ -1908,6 +1909,12 @@ fn recover_json_envelope(value: &str) -> JsonEnvelope {
     if !matches!(parsed, Value::Object(_) | Value::Array(_)) {
         return JsonEnvelope::None;
     }
+    let history_shaped = JSON_ENVELOPE_TRANSCRIPT_KEYS
+        .iter()
+        .any(|key| json_codec::find_json_key_value(&parsed, key).is_some());
+    if !history_shaped {
+        return JsonEnvelope::None;
+    }
     for key in JSON_ENVELOPE_TEXT_KEYS {
         if let Some(text) =
             json_codec::find_json_key_value(&parsed, key).and_then(json_codec::coerce_string_value)
@@ -1916,13 +1923,7 @@ fn recover_json_envelope(value: &str) -> JsonEnvelope {
             return JsonEnvelope::Recovered(text.trim().to_owned());
         }
     }
-    if JSON_ENVELOPE_TRANSCRIPT_KEYS
-        .iter()
-        .any(|key| json_codec::find_json_key_value(&parsed, key).is_some())
-    {
-        return JsonEnvelope::Empty;
-    }
-    JsonEnvelope::None
+    JsonEnvelope::Empty
 }
 
 fn strip_code_fence(value: &str) -> &str {
@@ -4229,6 +4230,10 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("{\"temperature\": 21, \"unit\": \"C\"}"),
             Reply("{\"temperature\": 21, \"unit\": \"C\"}".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("{\"message\": \"ok\", \"code\": 1}"),
+            Reply("{\"message\": \"ok\", \"code\": 1}".to_owned())
         );
 
         // A copied history block ahead of prose is a narrated transcript.

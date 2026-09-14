@@ -67,9 +67,12 @@ so `finalize_dialog_reply(content)` keeps working with an empty guard.
 - An answer envelope (`<answer>`, `<final_answer>`, `<response>`,
   `<final_response>`, `<output>`) yields its inner text (the `<text>` bodies when
   present); sibling self-review elements are dropped.
-- A reply that is one JSON object/array (optionally fenced) yields the first
-  string under `answer`/`response`/`text`/`content`/`message`/`reply`; a JSON
-  reply without such a field is `ProtocolOnly`.
+- A reply that is one JSON object/array (optionally fenced) carrying a
+  transcript key (`reply_to_id`, `reply_to_user`, `to_user`, `message_id`,
+  `sender`) yields the first string under
+  `answer`/`response`/`text`/`content`/`message`/`reply`; such a document
+  without any text is `ProtocolOnly`. JSON without transcript keys may be what
+  the user asked for and is left alone.
 
 ### `finalize_dialog_reply_with_guard(content, &guard)`
 

@@ -151,17 +151,17 @@ impl ReplyLeakGuard {
     }
 
     // Snake_case element names of the contract or context (`base_voice`,
-    // `daily_persona_accent`) are internal identifiers; a reply that names one
-    // is narrating the prompt even without markup.
+    // `daily_persona_accent`) are internal identifiers only the prompt knows; a
+    // reply that names one is narrating the prompt even without markup.
+    // Transcript wrapper names (`message_type`, `to_user`) are ordinary protocol
+    // vocabulary a user may ask about, so only their tag form counts.
     fn names_internal_identifier(&self, text: &str) -> bool {
         let lower = text.to_lowercase();
         lower
             .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
             .filter(|word| word.contains('_') && !GENERIC_IDENTIFIERS.contains(word))
             .any(|word| {
-                PROMPT_SCAFFOLDING_TAGS.contains(&word)
-                    || TRANSCRIPT_SCAFFOLDING_TAGS.contains(&word)
-                    || self.protected_tags.contains(word)
+                PROMPT_SCAFFOLDING_TAGS.contains(&word) || self.protected_tags.contains(word)
             })
     }
 
@@ -610,6 +610,10 @@ mod tests {
         );
         assert_eq!(
             guard.detect("thread_id у этого сообщения — 5, а message_id — 7."),
+            None
+        );
+        assert_eq!(
+            guard.detect("Поле message_type говорит, текст это или стикер; to_user — адресат."),
             None
         );
         assert_eq!(
