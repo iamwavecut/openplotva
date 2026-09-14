@@ -243,6 +243,13 @@ impl RouterChatProvider {
         }
     }
 
+    /// Bounded wait for a busy primary pool before the fallback tail is used.
+    #[must_use]
+    pub fn with_primary_slot_wait(mut self, primary_slot_wait: std::time::Duration) -> Self {
+        self.walker = self.walker.with_primary_slot_wait(primary_slot_wait);
+        self
+    }
+
     #[must_use]
     pub fn with_routing_event_reporter(
         mut self,
@@ -420,7 +427,11 @@ pub fn router_dialog_provider(
         aifarm,
         prompt_store,
     ));
-    let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory);
+    let primary_slot_wait = std::time::Duration::from_millis(
+        u64::try_from(config.llm.dialog.aifarm_pool_primary_capacity_wait_ms).unwrap_or(0),
+    );
+    let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory)
+        .with_primary_slot_wait(primary_slot_wait);
     let provider = match routing_events {
         Some(reporter) => provider.with_routing_event_reporter(reporter),
         None => provider,
