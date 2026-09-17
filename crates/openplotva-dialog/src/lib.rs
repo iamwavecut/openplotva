@@ -1423,6 +1423,9 @@ fn strip_transcript_scaffolding(body: &str) -> String {
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
         let Some(close) = rest[open..].find('>') else {
+            // Unterminated markup is kept verbatim, once: everything before it is already
+            // in `out`, so the trailing push must start at the stray tag.
+            rest = &rest[open..];
             break;
         };
         let tag = &rest[open..open + close + 1];
@@ -5354,6 +5357,24 @@ mod tests {
         match finalize_dialog_reply_with_guard(nested, &guard) {
             DialogReplyOutcome::Reply(text) => assert_eq!(text, "ладно, уговорил"),
             other => panic!("expected the innermost reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unwrapped_text_with_unterminated_markup_is_not_doubled() {
+        let guard = ReplyLeakGuard::default();
+        // No `<text>` element, so the body keeps whatever the model wrote — here an
+        // unterminated tag, which the scaffolding strip must emit exactly once.
+        let wrapped = concat!(
+            "<message id=\"1\" timestamp=\"t\">\n",
+            "  <user username=\"Vasia\" type=\"user\">Vasia</user>\n",
+            "  сравни 3 < 5 сама\n",
+            "</message>"
+        );
+
+        match finalize_dialog_reply_with_guard(wrapped, &guard) {
+            DialogReplyOutcome::Reply(text) => assert_eq!(text, "сравни 3 < 5 сама"),
+            other => panic!("expected the reply once, got {other:?}"),
         }
     }
 
