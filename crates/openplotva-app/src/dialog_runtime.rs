@@ -250,6 +250,13 @@ impl RouterChatProvider {
         self
     }
 
+    /// Extra samples from the same model after a validator rejects its output.
+    #[must_use]
+    pub fn with_model_output_retries(mut self, retries: usize) -> Self {
+        self.walker = self.walker.with_model_output_retries(retries);
+        self
+    }
+
     #[must_use]
     pub fn with_routing_event_reporter(
         mut self,
@@ -437,8 +444,17 @@ pub fn router_dialog_provider(
     };
     let primary_slot_wait =
         std::time::Duration::from_millis(u64::try_from(primary_wait_ms).unwrap_or(0));
+    // A negative value is a config slip, not a way to disable the re-sampling;
+    // zero disables it on purpose.
+    let configured_retries = config.llm.dialog.model_output_retries;
+    let model_output_retries = if configured_retries < 0 {
+        openplotva_config::DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES
+    } else {
+        configured_retries
+    };
     let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory)
-        .with_primary_slot_wait(primary_slot_wait);
+        .with_primary_slot_wait(primary_slot_wait)
+        .with_model_output_retries(usize::try_from(model_output_retries).unwrap_or(0));
     let provider = match routing_events {
         Some(reporter) => provider.with_routing_event_reporter(reporter),
         None => provider,
