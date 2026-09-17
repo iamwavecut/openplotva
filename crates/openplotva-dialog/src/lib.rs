@@ -1344,6 +1344,40 @@ fn transcript_envelope_element(trimmed: &str) -> Option<&'static str> {
     opens_message.then_some("message")
 }
 
+/// Where the element opened at the start of `lower` closes, counting nesting. Two entries
+/// in a row therefore close at the first tag and leave the second outside, which is what
+/// tells a copied transcript from a single reply wrapped in one element.
+fn matching_close(lower: &str, element: &str, open_end: usize) -> Option<usize> {
+    let open_tag = format!("<{element}");
+    let close_tag = format!("</{element}>");
+    let mut depth = 1usize;
+    let mut at = open_end;
+    while at < lower.len() {
+        let next_open = lower[at..]
+            .match_indices(open_tag.as_str())
+            .map(|(offset, _)| at + offset)
+            .find(|start| {
+                lower[start + open_tag.len()..].starts_with([' ', '\t', '\r', '\n', '>', '/'])
+            });
+        let next_close = lower[at..].find(close_tag.as_str()).map(|off| at + off);
+        match (next_open, next_close) {
+            (Some(open), Some(close)) if open < close => {
+                depth += 1;
+                at = open + open_tag.len();
+            }
+            (_, Some(close)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(close);
+                }
+                at = close + close_tag.len();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The reply the model wrapped in the prompt's own history element.
 ///
 /// Models continue in the shape they were handed: with `<last_message><message …>` as the
@@ -1355,11 +1389,8 @@ fn unwrap_transcript_envelope(value: &str) -> Option<String> {
     let element = transcript_envelope_element(trimmed)?;
     let open_end = trimmed.find('>')? + 1;
     let close = format!("</{element}>");
-    // The outer element closes last; an inner one would cut a nested reply short.
-    let (body_end, close_len) = trimmed
-        .to_ascii_lowercase()
-        .rfind(&close)
-        .filter(|at| *at >= open_end)
+    let lower = trimmed.to_ascii_lowercase();
+    let (body_end, close_len) = matching_close(&lower, element, open_end)
         .map_or((trimmed.len(), 0), |at| (at, close.len()));
     // Only a reply that is nothing but the envelope was wrapped; prose or code after the
     // closing tag means the transcript was narrated next to an answer.
@@ -5324,6 +5355,21 @@ mod tests {
             DialogReplyOutcome::Reply(text) => assert_eq!(text, "ладно, уговорил"),
             other => panic!("expected the innermost reply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn finalize_keeps_two_copied_entries_suppressed() {
+        // One element wrapping the answer is contagion; two in a row are the transcript
+        // itself, and the second one lives outside the first element's close.
+        let copied = concat!(
+            "<message id=\"1\" timestamp=\"t\"><text>И швырять забудешь )</text></message>\n",
+            "<message id=\"2\" timestamp=\"t\"><text>И швырять забудешь )</text></message>"
+        );
+
+        assert_eq!(
+            finalize_dialog_reply(copied),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak)
+        );
     }
 
     #[test]
