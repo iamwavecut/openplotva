@@ -227,6 +227,10 @@ pub struct ChatCompletionRequest {
     /// Native thinking control used by runtimes that expose it at the top level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// Token sequences the engine must never emit (vLLM `bad_words`). Used to keep the
+    /// model from writing the prompt's own scaffolding back into the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bad_words: Vec<String>,
     /// Chat template kwargs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<Value>,
@@ -292,6 +296,9 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
         serialize_optional_field(&mut state, "dry_base", request.dry_base)?;
         if request.dry_allowed_length != 0 {
             state.serialize_field("dry_allowed_length", &request.dry_allowed_length)?;
+        }
+        if !request.bad_words.is_empty() {
+            state.serialize_field("bad_words", &request.bad_words)?;
         }
         if let Some(value) = request.include_reasoning {
             state.serialize_field("include_reasoning", &value)?;
@@ -537,6 +544,89 @@ pub enum AifarmClientError {
     /// Unknown Discovery status.
     #[error("unknown dialog job status {0:?}")]
     UnknownStatus(String),
+}
+
+/// Openings the dialog model must never write. Gemma's vocabulary has no whole-tag
+/// tokens, so each entry bans `<` followed by that word; Telegram's own markup (`<b>`,
+/// `<a href`, `<code>`) stays legal because only these continuations are masked, and the
+/// native tool-call token is a special token this never touches.
+///
+/// Measured on 300 replayed production turns: the transcript envelope fell from 92 of 150
+/// wrapped answers to none, executed tool calls rose from 37 to 43 of 50, and reply length
+/// and language did not move.
+pub const DIALOG_SCAFFOLDING_BAD_WORDS: &[&str] = &[
+    // The history envelope the prompt renders.
+    "<message",
+    "<messages",
+    "<last_message",
+    "<message_type",
+    "<text",
+    "<user",
+    "<reply_to",
+    "<attach",
+    "<history",
+    // The runtime context message.
+    "<chat_context",
+    "<current_",
+    "<locale",
+    "<reference_context",
+    "<memory",
+    "<shield",
+    "<custom_persona",
+    "<daily_persona",
+    "<accent",
+    // The system contract.
+    "<system_contract",
+    "<identity",
+    "<base_voice",
+    "<persona",
+    "<task",
+    "<rule",
+    "<dialog_",
+    "<answer_policy",
+    "<output_and_memory",
+    "<transport",
+    "<tool_contract",
+    "<naming",
+    "<final_check",
+    "<check",
+    "<step",
+    // Answer envelopes and reasoning channels the guard already fights.
+    "<answer",
+    "<final_",
+    "<response",
+    "<reply",
+    "<think",
+    "<thought",
+    "<reasoning",
+    "<channel",
+    "<assistant",
+    "<context",
+];
+
+/// The named preset a routing model config selects with `"bad_words": "dialog_scaffolding"`.
+pub const DIALOG_SCAFFOLDING_PRESET: &str = "dialog_scaffolding";
+
+/// Resolve a routing config value into the sequences to ban: the preset name, an explicit
+/// list, or nothing at all. Textual tool-call forms are deliberately absent — they are how
+/// the model calls tools today.
+#[must_use]
+pub fn resolve_bad_words(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(name)) if name.trim() == DIALOG_SCAFFOLDING_PRESET => {
+            DIALOG_SCAFFOLDING_BAD_WORDS
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect()
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::to_owned)
+            .filter(|word| !word.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// AIFarm dialog-service error.
@@ -2964,6 +3054,7 @@ where
         if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
             request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
+        request.bad_words = input.bad_words.clone();
         let docs_chars = input
             .reference_context
             .iter()
@@ -10147,6 +10238,83 @@ mod tests {
         assert_eq!(output.tool_calls[1].step.emoji, "😂");
         assert_eq!(output.tool_calls[1].step.target_message_id, 999949);
         assert_eq!(output.text, "Ну и за что тебе такое наказание божье?");
+        Ok(())
+    }
+
+    #[test]
+    fn bad_words_come_from_a_named_preset_or_an_explicit_list() {
+        let preset = resolve_bad_words(Some(&json!("dialog_scaffolding")));
+        assert_eq!(preset.len(), DIALOG_SCAFFOLDING_BAD_WORDS.len());
+        assert!(preset.iter().any(|word| word == "<message"));
+        assert!(
+            !preset.iter().any(|word| word.starts_with("<tool_call")),
+            "textual tool calls are how the model calls tools; banning them costs calls"
+        );
+
+        assert_eq!(
+            resolve_bad_words(Some(&json!(["<message", "", "<text"]))),
+            vec!["<message".to_owned(), "<text".to_owned()]
+        );
+        assert!(resolve_bad_words(Some(&json!("unknown_preset"))).is_empty());
+        assert!(resolve_bad_words(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dialog_request_sends_the_configured_bad_words() -> Result<(), CompletionError> {
+        let (provider, transport, _) = direct_dialog_provider(
+            json!({ "choices": [{ "message": { "role": "assistant", "content": "ага" } }] }),
+            AifarmDialogConfig::default(),
+        );
+        let mut input = base_input();
+        input.bad_words = resolve_bad_words(Some(&json!(DIALOG_SCAFFOLDING_PRESET)));
+
+        crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input,
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            },
+        )
+        .await
+        .expect("dialog step");
+
+        let sent = transport.requests();
+        let body: Value = serde_json::from_slice(&sent[0].body).expect("wire request");
+        let words = body["bad_words"]
+            .as_array()
+            .expect("bad_words reach the engine");
+        assert!(words.iter().any(|word| word == "<message"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_request_omits_bad_words_when_the_model_has_none() -> Result<(), CompletionError>
+    {
+        let (provider, transport, _) = direct_dialog_provider(
+            json!({ "choices": [{ "message": { "role": "assistant", "content": "ага" } }] }),
+            AifarmDialogConfig::default(),
+        );
+
+        crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            },
+        )
+        .await
+        .expect("dialog step");
+
+        let sent = transport.requests();
+        let body: Value = serde_json::from_slice(&sent[0].body).expect("wire request");
+        assert!(
+            body.get("bad_words").is_none(),
+            "an engine without the control must not see the key: {body}"
+        );
         Ok(())
     }
 

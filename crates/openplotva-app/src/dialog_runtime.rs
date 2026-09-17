@@ -350,6 +350,9 @@ impl ChatStepProvider for RouterChatProvider {
                         {
                             step_request.input.enable_thinking = Some(enable_thinking);
                         }
+                        step_request.input.bad_words = openplotva_llm::aifarm::resolve_bad_words(
+                            attempt.overrides.extra.get("bad_words"),
+                        );
                         async move {
                             let client = match resolved {
                                 Ok(client) => client,
@@ -1220,6 +1223,47 @@ mod tests {
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn model_config_selects_the_bad_words_preset() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Ok(DialogOutput {
+                provider: "aifarm".to_owned(),
+                answer: "ok".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.models[0].config = json!({ "bad_words": "dialog_scaffolding" });
+        let provider = router_provider_for_test(
+            snapshot,
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+            ),
+        );
+
+        provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .expect("dialog output");
+
+        let inputs = routed_provider.inputs();
+        assert!(
+            inputs[0].bad_words.iter().any(|word| word == "<message"),
+            "the model's own config decides whether its engine gets the control"
+        );
     }
 
     #[tokio::test]
