@@ -1,0 +1,13 @@
+{{#ifEquals verdict "context_leak"}}Прошлый вариант не дошёл до чата: он повторял оформление переписки вместо твоей реплики.{{/ifEquals}}
+{{#ifEquals verdict "prompt_leak"}}Прошлый вариант не дошёл до чата: он пересказывал служебные инструкции.{{/ifEquals}}
+{{#ifEquals verdict "protocol_only"}}Прошлый вариант не дошёл до чата: в нём не осталось слов для собеседника, одно служебное оформление.{{/ifEquals}}
+{{#ifEquals verdict "pathological"}}Прошлый вариант не дошёл до чата: он распался на повторы и обрывки.{{/ifEquals}}
+{{#ifEquals verdict "empty"}}Прошлый вариант не дошёл до чата: в нём не было текста ответа.{{/ifEquals}}
+{{#ifEquals verdict "no_tool_calls"}}Прошлый вариант не дошёл до чата: запрос требует действия инструментом, а вызова в ответе не было.{{/ifEquals}}
+{{#ifEquals verdict "budget_exhausted"}}Прошлый вариант не дошёл до чата: он оборвался на середине, не уложившись в лимит.{{/ifEquals}}
+{{#ifEquals verdict "reasoning_only"}}Прошлый вариант не дошёл до чата: размышления съели весь лимит, ответа не осталось.{{/ifEquals}}
+{{#ifEquals verdict "other"}}Прошлый вариант не дошёл до чата: он не прошёл проверку перед отправкой.{{/ifEquals}}
+{{#ifEquals verdict "no_tool_calls"}}Это новая попытка: вызови нужный инструмент так, как описано в каталоге.{{/ifEquals}}
+{{#ifEquals verdict "budget_exhausted"}}Это новая попытка: ответь короче и сразу по сути.{{/ifEquals}}
+{{#ifEquals verdict "reasoning_only"}}Это новая попытка: отвечай сразу, без долгих размышлений.{{/ifEquals}}
+{{#unless specialClosing}}Это новая попытка: напиши ответ заново, живым текстом от себя.{{/unless}}

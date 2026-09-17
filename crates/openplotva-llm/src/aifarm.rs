@@ -4082,7 +4082,64 @@ fn build_initial_messages(
             messages.push(message);
         }
     }
+    if let Some(note) = render_resample_note(input, prompts)? {
+        append_resample_note(&mut messages, &note);
+    }
     Ok(messages)
+}
+
+/// The note a re-sample carries: what the previous sample got wrong, in plain words. It
+/// names no markup, so it cannot teach the shape it exists to prevent.
+fn render_resample_note(
+    input: &DialogInput,
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<Option<String>, AifarmMessageError> {
+    let verdict = input.resample_verdict.trim();
+    if verdict.is_empty() {
+        return Ok(None);
+    }
+    let data = json!({
+        "verdict": verdict,
+        "specialClosing": matches!(verdict, "no_tool_calls" | "budget_exhausted" | "reasoning_only"),
+    });
+    let rendered = match prompts {
+        Some(prompts) => prompts.render("aifarm/resample_note", &data)?,
+        None => openplotva_prompts::render("aifarm/resample_note", &data)?,
+    };
+    let note = rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok((!note.is_empty()).then_some(note))
+}
+
+/// The note goes inside the last user message, after the rendered transcript element, so
+/// the cached prefix is untouched and the generation point follows prose rather than a
+/// closing tag. A multimodal turn carries its text in the trailing part, so it gets the
+/// note too.
+fn append_resample_note(messages: &mut [ChatMessage], note: &str) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role.eq_ignore_ascii_case("user"))
+    else {
+        return;
+    };
+    if !message.content.trim().is_empty() {
+        message.content.push_str("\n\n");
+        message.content.push_str(note);
+    }
+    if let Some(part) = message
+        .content_parts
+        .iter_mut()
+        .rev()
+        .find(|part| part.part_type == "text")
+    {
+        part.text.push_str("\n\n");
+        part.text.push_str(note);
+    }
 }
 
 pub fn build_system_prompt_with_tool_prompt(
@@ -7849,6 +7906,78 @@ mod tests {
             transport,
             FakeToolbox::new(Vec::new()),
         )
+    }
+
+    #[test]
+    fn resample_note_follows_the_last_message_and_leaves_the_prefix_alone() {
+        let mut input = base_input();
+        input.message.id = 11;
+        input.message.text = "Плотва, напиши трек про то, как нас всех убьёт ИИ".to_owned();
+        let history = build_session_history_with_limit(&input, 8);
+        let plain =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        input.resample_verdict = "context_leak".to_owned();
+        let hinted =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        assert_eq!(hinted.len(), plain.len());
+        assert_eq!(
+            hinted[..hinted.len() - 1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            plain[..plain.len() - 1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            "the cached prefix must not move"
+        );
+
+        let last_plain = &plain[plain.len() - 1].content;
+        let last_hinted = &hinted[hinted.len() - 1].content;
+        let note = last_hinted
+            .strip_prefix(last_plain.as_str())
+            .expect("the note is appended after the rendered last message")
+            .trim();
+        assert!(note.starts_with("Прошлый вариант"), "note: {note}");
+        assert!(
+            !note.contains('<'),
+            "the note must not spell out the markup it exists to prevent: {note}"
+        );
+    }
+
+    #[test]
+    fn resample_note_reaches_the_text_part_of_a_multimodal_turn() {
+        let mut input = base_input();
+        input.message.id = 12;
+        input.message.text = "что на картинке?".to_owned();
+        input
+            .multimodal_images
+            .push(openplotva_dialog::MultimodalImage {
+                data_url: "data:image/png;base64,AAAA".to_owned(),
+                ..openplotva_dialog::MultimodalImage::default()
+            });
+        input.resample_verdict = "empty".to_owned();
+        let history = build_session_history_with_limit(&input, 8);
+        let messages =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        let last = messages.last().expect("last message");
+        let text_part = last
+            .content_parts
+            .iter()
+            .rev()
+            .find(|part| part.part_type == "text")
+            .expect("multimodal turn carries its text in a part");
+        assert!(
+            text_part.text.contains("Прошлый вариант"),
+            "the note must reach the part that sits at the generation point: {}",
+            text_part.text
+        );
     }
 
     #[test]

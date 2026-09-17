@@ -168,6 +168,36 @@ pub fn retryable_reason_from_message(message: &str) -> Option<FailureReason> {
     None
 }
 
+/// Which validator rejected a model output, as a stable code. A re-sample carries it
+/// back to the model as a plain-language note, so the next sample is told what was wrong
+/// instead of being asked the same question again.
+#[must_use]
+pub fn rejection_verdict_code(message: &str) -> &'static str {
+    for (code, phrases) in REJECTION_VERDICT_RULES {
+        if contains_any_ascii_fold(message, phrases) {
+            return code;
+        }
+    }
+    "other"
+}
+
+const REJECTION_VERDICT_RULES: &[(&str, &[&str])] = &[
+    ("context_leak", &["only copied context messages"]),
+    ("prompt_leak", &["copied prompt context text"]),
+    (
+        "protocol_only",
+        &["only protocol artifacts", "tool protocol error"],
+    ),
+    ("pathological", &["pathological final text"]),
+    ("empty", &["empty final text"]),
+    ("no_tool_calls", &["no tool calls"]),
+    ("budget_exhausted", &["output token budget exhausted"]),
+    (
+        "reasoning_only",
+        &["returned reasoning without final content"],
+    ),
+];
+
 fn find_provider_error<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a ProviderError> {
     find_error::<ProviderError>(err)
 }
@@ -279,6 +309,45 @@ fn contains_ascii_fold(haystack: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_rejection_verdict_has_its_own_code() {
+        for (message, expected) in [
+            (
+                "chat completion returned only copied context messages",
+                "context_leak",
+            ),
+            (
+                "chat completion returned copied prompt context text",
+                "prompt_leak",
+            ),
+            (
+                "chat completion returned only protocol artifacts",
+                "protocol_only",
+            ),
+            (
+                "dialog tool protocol error: unterminated call",
+                "protocol_only",
+            ),
+            (
+                "chat completion returned pathological final text: repeated block",
+                "pathological",
+            ),
+            ("chat completion returned empty final text", "empty"),
+            ("dialog step returned no tool calls", "no_tool_calls"),
+            (
+                "chat completion output token budget exhausted with truncated final content (12 chars)",
+                "budget_exhausted",
+            ),
+            (
+                "chat completion returned reasoning without final content (900 reasoning chars)",
+                "reasoning_only",
+            ),
+            ("some unfamiliar rejection", "other"),
+        ] {
+            assert_eq!(rejection_verdict_code(message), expected, "{message}");
+        }
+    }
     use super::*;
 
     #[test]
