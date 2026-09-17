@@ -2257,14 +2257,20 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
             continue;
         }
         let call_prefixed = xmlish_tag_is_call_prefixed(tag);
-        // A wrapper closed by a sibling tag (`<tool_calls>` … `</tool_call>`) or never closed at
-        // all still ends the protocol span: everything after it is the reply text.
+        // A wrapper closed by a sibling tag (`<tool_calls>` … `</tool_call>`) still ends the
+        // protocol span there. An unterminated one only removes its own open tag, so the scan
+        // keeps stripping the call elements inside it and the prose after them survives.
         let Some((relative_close, close_len)) =
             find_xmlish_tool_close(&raw[open_end..], &name, call_prefixed)
                 .or_else(|| xmlish_sibling_tool_close(&raw[open_end..]))
         else {
-            spans.push((start, raw.len()));
-            break;
+            if call_prefixed || xmlish_has_argument_children(&raw[open_end..]) {
+                spans.push((start, raw.len()));
+                break;
+            }
+            spans.push((start, open_end));
+            offset = open_end;
+            continue;
         };
         let end = open_end + relative_close + close_len;
         spans.push((start, end));
@@ -3523,6 +3529,14 @@ fn xmlish_direct_tool_tag_has_args(tag: &str, step: &str) -> bool {
             .any(|key| xmlish_tool_attr(tag, key).is_some())
         || xmlish_tool_attr(tag, "arg").is_some()
         || xmlish_tool_attr(tag, "args").is_some()
+}
+
+/// Whether an unterminated tool element carries its arguments as child elements, which makes the
+/// rest of the content part of the call rather than reply text.
+fn xmlish_has_argument_children(body: &str) -> bool {
+    ["<arg", "<arguments", "<name>", "<tool_name>"]
+        .iter()
+        .any(|marker| index_fold(body, marker).is_some())
 }
 
 /// Closing tag of a sibling tool wrapper, for models that close `<tool_calls>` with
@@ -5048,6 +5062,12 @@ mod tests {
         )?;
         assert_eq!(matching.tool_steps.len(), 1);
         assert_eq!(matching.text, "готово, лови.");
+
+        let unterminated_with_reply = parse_assistant_content(
+            "<tool_calls><tool_call name=\"draw_image\" args='{\"prompt\": \"a red fox\"}'/>\n\nготово, лови.",
+        )?;
+        assert_eq!(unterminated_with_reply.tool_steps.len(), 1);
+        assert_eq!(unterminated_with_reply.text, "готово, лови.");
         Ok(())
     }
 
