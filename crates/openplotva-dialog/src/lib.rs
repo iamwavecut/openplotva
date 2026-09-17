@@ -2523,6 +2523,9 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
             .ok_or_else(|| ToolParseError::new("unterminated XML-ish call tag"))?
             + 1;
         if remaining[..open_end].trim_end().ends_with("/>") {
+            if legacy_call {
+                return Err(ToolParseError::new("unterminated XML-ish call element"));
+            }
             break;
         }
         let close = format!("</{wrapper}>");
@@ -5096,6 +5099,10 @@ mod tests {
         assert!(args_container.tool_steps[0].query.is_empty());
         assert!(args_container.tool_steps[0].text.is_empty());
         assert_eq!(args_container.text, "смотрю.");
+
+        // A self-closing legacy <call/> stays a loud protocol error, so the turn is
+        // re-sampled instead of being delivered as if the model had said nothing.
+        assert!(parse_assistant_content("<call/>").is_err());
 
         let plural_container = parse_assistant_content(
             "<tool_calls><tool_call><name>web_search</name><args><query>погода</query></args></tool_call><tool_call><name>draw_image</name><args><prompt>a fox</prompt></args></tool_call></tool_calls>",
