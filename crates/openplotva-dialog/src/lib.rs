@@ -5084,6 +5084,21 @@ mod tests {
         );
         assert_eq!(args_container.text, "смотрю.");
 
+        // A reply mixing an attribute-shaped call with a named one executes the first of
+        // the two, whichever shape it is: each parser owns its own form, and the one that
+        // matches first wins.
+        let attribute_first = parse_assistant_content(
+            "<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>\n<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>",
+        )?;
+        assert_eq!(attribute_first.tool_steps.len(), 1);
+        assert_eq!(attribute_first.tool_steps[0].step, STEP_DRAW_IMAGE);
+
+        let named_first = parse_assistant_content(
+            "<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>\n<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>",
+        )?;
+        assert_eq!(named_first.tool_steps.len(), 1);
+        assert_eq!(named_first.tool_steps[0].step, STEP_WEB_SEARCH);
+
         // The legacy <call> element still reads arguments only from <arguments>: a sibling
         // child stays out of them, exactly as before.
         let legacy_without_arguments = parse_assistant_content(
