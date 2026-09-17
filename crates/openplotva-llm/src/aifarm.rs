@@ -4246,8 +4246,8 @@ fn render_resample_note(
 
 /// The note goes inside the last user message, after the rendered transcript element, so
 /// the cached prefix is untouched and the generation point follows prose rather than a
-/// closing tag. A multimodal turn carries its text in the trailing part, so it gets the
-/// note too.
+/// closing tag. Content parts replace the string when they exist — on the wire and in the
+/// trace alike — so the note goes to whichever of the two the request will actually carry.
 fn append_resample_note(messages: &mut [ChatMessage], note: &str) {
     let Some(message) = messages
         .iter_mut()
@@ -4256,10 +4256,6 @@ fn append_resample_note(messages: &mut [ChatMessage], note: &str) {
     else {
         return;
     };
-    if !message.content.trim().is_empty() {
-        message.content.push_str("\n\n");
-        message.content.push_str(note);
-    }
     if let Some(part) = message
         .content_parts
         .iter_mut()
@@ -4268,6 +4264,9 @@ fn append_resample_note(messages: &mut [ChatMessage], note: &str) {
     {
         part.text.push_str("\n\n");
         part.text.push_str(note);
+    } else if !message.content.trim().is_empty() {
+        message.content.push_str("\n\n");
+        message.content.push_str(note);
     }
 }
 
@@ -8106,6 +8105,17 @@ mod tests {
             text_part.text.contains("Прошлый вариант"),
             "the note must reach the part that sits at the generation point: {}",
             text_part.text
+        );
+        // Parts replace the string on the wire, so the note belongs to exactly one of them.
+        let wire: Value = serde_json::to_value(last).expect("wire message");
+        assert_eq!(
+            wire["content"]
+                .to_string()
+                .matches("Прошлый вариант")
+                .count(),
+            1,
+            "the request must carry the note once: {}",
+            wire["content"]
         );
     }
 
