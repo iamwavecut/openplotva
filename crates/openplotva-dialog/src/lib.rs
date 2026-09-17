@@ -5042,6 +5042,12 @@ mod tests {
         assert_eq!(unterminated.tool_steps.len(), 1);
         assert_eq!(unterminated.tool_steps[0].step, STEP_DRAW_IMAGE);
         assert_eq!(unterminated.tool_steps[0].prompt, "a red fox");
+
+        let matching = parse_assistant_content(
+            "<tool_calls><tool_call name=\"draw_image\" args='{\"prompt\": \"a red fox\"}'/></tool_calls>\n\nготово, лови.",
+        )?;
+        assert_eq!(matching.tool_steps.len(), 1);
+        assert_eq!(matching.text, "готово, лови.");
         Ok(())
     }
 
