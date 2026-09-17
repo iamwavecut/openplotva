@@ -5082,6 +5082,9 @@ mod tests {
             args_container.tool_steps[0].file_id,
             "message_434005_video_1"
         );
+        // The element naming the tool stays structural: it never lands in an argument.
+        assert!(args_container.tool_steps[0].query.is_empty());
+        assert!(args_container.tool_steps[0].text.is_empty());
         assert_eq!(args_container.text, "смотрю.");
 
         // A reply mixing an attribute-shaped call with a named one executes the first of
