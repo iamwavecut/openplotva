@@ -20,6 +20,9 @@ const DEFAULT_MAX_SLOT_WAIT: Duration = Duration::from_secs(300);
 /// Minimum share of the caller's budget an attempt must have received for a
 /// deadline cut to count against the provider's circuit breaker.
 const ATTEMPT_BREAKER_MIN_SLICE: Duration = Duration::from_secs(30);
+/// A re-sample is only worth starting when the turn still has room for it and for
+/// the fallback behind it.
+const MODEL_OUTPUT_RETRY_MIN_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct RoutedAttemptWalker {
@@ -30,6 +33,7 @@ pub struct RoutedAttemptWalker {
     openrouter_free_gate: Option<Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     max_slot_wait: Duration,
     primary_slot_wait: Duration,
+    model_output_retries: usize,
     reporter: Option<crate::runtime_routing::RoutingEventReporter>,
 }
 
@@ -49,6 +53,7 @@ impl RoutedAttemptWalker {
             openrouter_free_gate: None,
             max_slot_wait: DEFAULT_MAX_SLOT_WAIT,
             primary_slot_wait: Duration::ZERO,
+            model_output_retries: 0,
             reporter: None,
         }
     }
@@ -89,6 +94,15 @@ impl RoutedAttemptWalker {
     #[must_use]
     pub fn with_max_slot_wait(mut self, max_slot_wait: Duration) -> Self {
         self.max_slot_wait = max_slot_wait;
+        self
+    }
+
+    /// How many extra samples the same model gets when a validator rejects what it
+    /// wrote, before the chain walks on to another provider. Zero (the default) keeps
+    /// the immediate walk.
+    #[must_use]
+    pub fn with_model_output_retries(mut self, retries: usize) -> Self {
+        self.model_output_retries = retries;
         self
     }
 
@@ -188,6 +202,9 @@ impl RoutedAttemptWalker {
         let mut last_reason = None;
         let mut deadline_cut = false;
         let mut attempted_targets = HashSet::new();
+        // Re-sampling budget for the whole turn, not per candidate: the primary spends it
+        // first, and whatever is left still covers a fallback that answers badly.
+        let mut model_output_retry = 0usize;
 
         // Selection-pass loop: walk a fresh chain, skipping candidates whose
         // capacity pool is full. A busy skip touches neither the breaker nor
@@ -267,28 +284,40 @@ impl RoutedAttemptWalker {
                 let provider = table.provider(attempt.provider);
                 let model = table.model(attempt.model);
                 let pool_id = model.and_then(|row| row.pool_id);
-                let mut permit = self.pools.try_acquire(pool_id);
-                if permit.is_none()
-                    && attempt.role == Role::Primary
-                    && !self.primary_slot_wait.is_zero()
-                {
-                    permit = self
-                        .wait_for_primary_slot(pool_id, &context, &attempt, &mut total_slot_wait)
-                        .await;
-                }
-                let Some(permit) = permit else {
-                    busy_skips += 1;
-                    continue;
-                };
-                if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model) {
-                    match gate.check_model(&model.model_name, &model.config).await {
-                        crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Allowed => {}
-                        crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Denied {
-                            reason,
-                            retry_after,
-                        } => {
-                            quota_skips += 1;
-                            self.record_event(routing_event_with_severity(
+                // A rejected model output is not a sick provider: the same model gets a
+                // bounded number of fresh samples before the chain walks on, so a guard
+                // rejection does not hand a tool-shaped turn to a tool-less fallback.
+                let mut first_execution = true;
+                loop {
+                    let mut permit = self.pools.try_acquire(pool_id);
+                    if permit.is_none()
+                        && attempt.role == Role::Primary
+                        && !self.primary_slot_wait.is_zero()
+                    {
+                        permit = self
+                            .wait_for_primary_slot(
+                                pool_id,
+                                &context,
+                                &attempt,
+                                &mut total_slot_wait,
+                            )
+                            .await;
+                    }
+                    let Some(permit) = permit else {
+                        if first_execution {
+                            busy_skips += 1;
+                        }
+                        break;
+                    };
+                    if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model) {
+                        match gate.check_model(&model.model_name, &model.config).await {
+                            crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Allowed => {}
+                            crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Denied {
+                                reason,
+                                retry_after,
+                            } => {
+                                quota_skips += 1;
+                                self.record_event(routing_event_with_severity(
                                 "openrouter_free_quota_limited",
                                 "warn",
                                 &context,
@@ -300,143 +329,188 @@ impl RoutedAttemptWalker {
                                     "retry_after_ms": retry_after.map(|duration| duration.as_millis()),
                                 }),
                             ));
-                            continue;
-                        }
-                    }
-                }
-                let routed = RoutedAttempt {
-                    provider_id: attempt.provider,
-                    model_id: attempt.model,
-                    provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
-                    model_name: model.map(|row| row.model_name.clone()).unwrap_or_default(),
-                    provider_runtime_hint: provider.and_then(|row| row.runtime_hint.clone()),
-                    provider_endpoint: provider.and_then(|row| row.endpoint.clone()),
-                    discovery_service_name: provider
-                        .and_then(|row| row.discovery_service_name.clone()),
-                    discovery_endpoint_name: provider
-                        .and_then(|row| row.discovery_endpoint_name.clone()),
-                    provider_api_key_ref: provider.and_then(|row| row.api_key_ref.clone()),
-                    provider_api_key_encrypted: provider
-                        .and_then(|row| row.api_key_encrypted.clone()),
-                    model_base_url: model.and_then(|row| row.base_url.clone()),
-                    embedding_dim: model.and_then(|row| row.embedding_dim),
-                    provider_config: provider
-                        .map(|row| row.config.clone())
-                        .unwrap_or_else(|| json!({})),
-                    model_config: model
-                        .map(|row| row.config.clone())
-                        .unwrap_or_else(|| json!({})),
-                    overrides: model
-                        .map(|row| {
-                            merge_model_and_assignment_overrides(&row.config, &attempt.overrides)
-                        })
-                        .unwrap_or_else(|| attempt.overrides.clone()),
-                    variant: attempt.variant.clone(),
-                };
-                attempted_targets.insert((routed.provider_id, routed.model_id));
-                last_provider_model = Some((routed.provider_id, routed.model_id));
-                started_attempts += 1;
-                executed_this_pass += 1;
-
-                // A started attempt must not outlive the caller's deadline
-                // either: a hung provider connection otherwise pins the worker
-                // long past the turn budget (2026-07-02 latency incident).
-                let result = match context.deadline {
-                    Some(deadline) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        match tokio::time::timeout(remaining, execute(routed)).await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                drop(permit);
-                                // Charge the breaker only when the provider had
-                                // a meaningful slice of the budget; a fallback
-                                // handed the last few seconds of a turn is not
-                                // unhealthy, and penalizing it opens its circuit
-                                // in lockstep with a degraded primary.
-                                let charged = remaining >= ATTEMPT_BREAKER_MIN_SLICE;
-                                if charged {
-                                    self.breakers.record_failure(
-                                        attempt.provider,
-                                        attempt.model,
-                                        attempt.breaker,
-                                    );
-                                }
-                                failed_attempts += 1;
-                                last_reason = Some("attempt_deadline_exceeded".to_owned());
-                                deadline_cut = true;
-                                self.record_event(routing_event(
-                                    "attempt_deadline_exceeded",
-                                    &context,
-                                    Some(attempt.provider),
-                                    Some(attempt.model),
-                                    "attempt aborted at the caller deadline",
-                                    json!({
-                                        "failed_attempts": failed_attempts,
-                                        "attempt_slice_ms": remaining.as_millis(),
-                                        "breaker_charged": charged,
-                                    }),
-                                ));
-                                break 'passes;
+                                break;
                             }
                         }
                     }
-                    None => execute(routed).await,
-                };
-                drop(permit);
-                match result {
-                    Ok(output) => {
-                        self.breakers
-                            .record_success(attempt.provider, attempt.model);
-                        return Ok(output);
+                    let routed = RoutedAttempt {
+                        provider_id: attempt.provider,
+                        model_id: attempt.model,
+                        provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
+                        model_name: model.map(|row| row.model_name.clone()).unwrap_or_default(),
+                        provider_runtime_hint: provider.and_then(|row| row.runtime_hint.clone()),
+                        provider_endpoint: provider.and_then(|row| row.endpoint.clone()),
+                        discovery_service_name: provider
+                            .and_then(|row| row.discovery_service_name.clone()),
+                        discovery_endpoint_name: provider
+                            .and_then(|row| row.discovery_endpoint_name.clone()),
+                        provider_api_key_ref: provider.and_then(|row| row.api_key_ref.clone()),
+                        provider_api_key_encrypted: provider
+                            .and_then(|row| row.api_key_encrypted.clone()),
+                        model_base_url: model.and_then(|row| row.base_url.clone()),
+                        embedding_dim: model.and_then(|row| row.embedding_dim),
+                        provider_config: provider
+                            .map(|row| row.config.clone())
+                            .unwrap_or_else(|| json!({})),
+                        model_config: model
+                            .map(|row| row.config.clone())
+                            .unwrap_or_else(|| json!({})),
+                        overrides: model
+                            .map(|row| {
+                                merge_model_and_assignment_overrides(
+                                    &row.config,
+                                    &attempt.overrides,
+                                )
+                            })
+                            .unwrap_or_else(|| attempt.overrides.clone()),
+                        variant: attempt.variant.clone(),
+                    };
+                    attempted_targets.insert((routed.provider_id, routed.model_id));
+                    last_provider_model = Some((routed.provider_id, routed.model_id));
+                    if first_execution {
+                        started_attempts += 1;
+                        executed_this_pass += 1;
+                        first_execution = false;
                     }
-                    Err(error) => {
-                        let Some(reason) = retryable(&error) else {
-                            return Err(RoutedAttemptRunError::Attempt(error));
-                        };
-                        self.breakers.record_failure(
-                            attempt.provider,
-                            attempt.model,
-                            attempt.breaker,
-                        );
-                        self.record_event(routing_event_with_severity(
-                            "attempt_failed",
-                            "info",
-                            &context,
-                            Some(attempt.provider),
-                            Some(attempt.model),
-                            "routed provider attempt failed",
-                            json!({
-                                "attempt": failed_attempts + 1,
-                                "retryable_reason": reason.as_str(),
-                            }),
-                        ));
-                        if reason == FailureReason::CapacityUnavailable
-                            && let Some(cooldown) =
-                                provider_capacity_cooldown(route, attempt.provider, attempt.model)
-                        {
-                            self.triggers.mark_capacity_unavailable(
-                                attempt.provider,
-                                attempt.model,
-                                cooldown,
-                            );
-                            self.record_event(routing_event(
-                                "capacity_unavailable",
+
+                    // A started attempt must not outlive the caller's deadline
+                    // either: a hung provider connection otherwise pins the worker
+                    // long past the turn budget (2026-07-02 latency incident).
+                    let result = match context.deadline {
+                        Some(deadline) => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            match tokio::time::timeout(remaining, execute(routed)).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    drop(permit);
+                                    // Charge the breaker only when the provider had
+                                    // a meaningful slice of the budget; a fallback
+                                    // handed the last few seconds of a turn is not
+                                    // unhealthy, and penalizing it opens its circuit
+                                    // in lockstep with a degraded primary.
+                                    let charged = remaining >= ATTEMPT_BREAKER_MIN_SLICE;
+                                    if charged {
+                                        self.breakers.record_failure(
+                                            attempt.provider,
+                                            attempt.model,
+                                            attempt.breaker,
+                                        );
+                                    }
+                                    failed_attempts += 1;
+                                    last_reason = Some("attempt_deadline_exceeded".to_owned());
+                                    deadline_cut = true;
+                                    self.record_event(routing_event(
+                                        "attempt_deadline_exceeded",
+                                        &context,
+                                        Some(attempt.provider),
+                                        Some(attempt.model),
+                                        "attempt aborted at the caller deadline",
+                                        json!({
+                                            "failed_attempts": failed_attempts,
+                                            "attempt_slice_ms": remaining.as_millis(),
+                                            "breaker_charged": charged,
+                                        }),
+                                    ));
+                                    break 'passes;
+                                }
+                            }
+                        }
+                        None => execute(routed).await,
+                    };
+                    drop(permit);
+                    match result {
+                        Ok(output) => {
+                            self.breakers
+                                .record_success(attempt.provider, attempt.model);
+                            return Ok(output);
+                        }
+                        Err(error) => {
+                            let Some(reason) = retryable(&error) else {
+                                return Err(RoutedAttemptRunError::Attempt(error));
+                            };
+                            // A rejected output leaves the breaker alone: the provider answered
+                            // in time, so counting these opens its circuit and exiles a healthy
+                            // model from every turn for the cooldown.
+                            if reason == FailureReason::ModelOutputRejected
+                                && model_output_retry < self.model_output_retries
+                                && context.deadline.is_none_or(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                        >= MODEL_OUTPUT_RETRY_MIN_BUDGET
+                                })
+                                && started.elapsed().saturating_sub(total_slot_wait)
+                                    <= route.retry.wall_clock
+                            {
+                                model_output_retry += 1;
+                                failed_attempts += 1;
+                                last_reason = Some(reason.as_str().to_owned());
+                                last_error = Some(error);
+                                self.record_event(routing_event_with_severity(
+                                    "model_output_retry",
+                                    "info",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "model output rejected; re-sampling the same model",
+                                    json!({
+                                        "retry": model_output_retry,
+                                        "limit": self.model_output_retries,
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                ));
+                                continue;
+                            }
+                            // Not even the sample that spends the budget charges the breaker:
+                            // the model answered every time, and opening its circuit would
+                            // hand the next turns to the fallback this policy exists to avoid.
+                            if reason != FailureReason::ModelOutputRejected {
+                                self.breakers.record_failure(
+                                    attempt.provider,
+                                    attempt.model,
+                                    attempt.breaker,
+                                );
+                            }
+                            self.record_event(routing_event_with_severity(
+                                "attempt_failed",
+                                "info",
                                 &context,
                                 Some(attempt.provider),
                                 Some(attempt.model),
-                                "provider capacity unavailable",
+                                "routed provider attempt failed",
                                 json!({
-                                    "cooldown_ms": cooldown.as_millis(),
+                                    "attempt": failed_attempts + 1,
                                     "retryable_reason": reason.as_str(),
                                 }),
                             ));
-                        }
-                        if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model)
-                            && model.config.get("managed_by").and_then(Value::as_str)
-                                == Some(crate::openrouter_free_pool::MANAGED_BY)
-                        {
-                            let message = format!("{error:?}");
-                            if crate::openrouter_free_pool::message_indicates_openrouter_pool_cooldown(
+                            if reason == FailureReason::CapacityUnavailable
+                                && let Some(cooldown) = provider_capacity_cooldown(
+                                    route,
+                                    attempt.provider,
+                                    attempt.model,
+                                )
+                            {
+                                self.triggers.mark_capacity_unavailable(
+                                    attempt.provider,
+                                    attempt.model,
+                                    cooldown,
+                                );
+                                self.record_event(routing_event(
+                                    "capacity_unavailable",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "provider capacity unavailable",
+                                    json!({
+                                        "cooldown_ms": cooldown.as_millis(),
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                ));
+                            }
+                            if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model)
+                                && model.config.get("managed_by").and_then(Value::as_str)
+                                    == Some(crate::openrouter_free_pool::MANAGED_BY)
+                            {
+                                let message = format!("{error:?}");
+                                if crate::openrouter_free_pool::message_indicates_openrouter_pool_cooldown(
                                 &message,
                             ) {
                                 let cooldown = match crate::openrouter_free_pool::retry_after_from_error_message(
@@ -480,10 +554,12 @@ impl RoutedAttemptWalker {
                                     }),
                                 ));
                             }
+                            }
+                            failed_attempts += 1;
+                            last_reason = Some(reason.as_str().to_owned());
+                            last_error = Some(error);
+                            break;
                         }
-                        failed_attempts += 1;
-                        last_reason = Some(reason.as_str().to_owned());
-                        last_error = Some(error);
                     }
                 }
             }
@@ -909,6 +985,194 @@ mod tests {
             Arc::new(TriggerState::new()),
             Arc::new(PoolRegistry::new()),
         )
+    }
+
+    fn snapshot_with_fallback() -> RoutingSnapshot {
+        let mut snap = snapshot(json!({}), json!({}));
+        snap.providers.push(provider(2, "genkit"));
+        let mut fallback_model = model(20, 2, json!({}));
+        fallback_model.model_name = "db/fallback".to_owned();
+        snap.models.push(fallback_model);
+        let mut fallback = assignment(json!({}));
+        fallback.id = 200;
+        fallback.role = "fallback".to_owned();
+        fallback.provider_model_id = 20;
+        fallback.weight = None;
+        fallback.fallback_order = Some(0);
+        snap.assignments.push(fallback);
+        snap.workflows[0].retry_max_hops = 2;
+        snap
+    }
+
+    #[tokio::test]
+    async fn walker_resamples_the_same_model_when_a_validator_rejects_its_output() {
+        let mut snap = snapshot(json!({}), json!({}));
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers)).with_model_output_retries(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |_attempt| {
+                    let call_count = Arc::clone(&call_count);
+                    async move {
+                        if call_count.fetch_add(1, Ordering::Relaxed) < 2 {
+                            Err("rejected".to_owned())
+                        } else {
+                            Ok("answer")
+                        }
+                    }
+                },
+                |_error: &String| Some(FailureReason::ModelOutputRejected),
+            )
+            .await
+            .expect("the re-sampled answer");
+
+        assert_eq!(output, "answer");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(
+            breakers.is_live_at(1, 10, Instant::now()),
+            "a rejected output leaves the provider healthy, so its circuit stays closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_walks_the_chain_once_re_sampling_is_exhausted() {
+        let walker = walker_for(snapshot_with_fallback()).with_model_output_retries(1);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_models = Arc::clone(&seen);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let seen_models = Arc::clone(&seen_models);
+                    async move {
+                        seen_models.lock().expect("models").push(attempt.model_id);
+                        if attempt.model_id == 10 {
+                            Err("rejected".to_owned())
+                        } else {
+                            Ok("fallback answer")
+                        }
+                    }
+                },
+                |_error: &String| Some(FailureReason::ModelOutputRejected),
+            )
+            .await
+            .expect("the fallback answer");
+
+        assert_eq!(output, "fallback answer");
+        assert_eq!(*seen.lock().expect("models"), vec![10, 10, 20]);
+    }
+
+    #[tokio::test]
+    async fn walker_keeps_the_circuit_closed_after_the_re_sampling_budget_is_spent() {
+        let mut snap = snapshot_with_fallback();
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers)).with_model_output_retries(1);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| async move {
+                    if attempt.model_id == 10 {
+                        Err("rejected".to_owned())
+                    } else {
+                        Ok("fallback answer")
+                    }
+                },
+                |_error: &String| Some(FailureReason::ModelOutputRejected),
+            )
+            .await
+            .expect("the fallback answer");
+
+        assert_eq!(output, "fallback answer");
+        assert!(
+            breakers.is_live_at(1, 10, Instant::now()),
+            "spending the re-sampling budget must not exile a model that kept answering"
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_does_not_resample_an_infrastructure_failure() {
+        let walker = walker_for(snapshot_with_fallback()).with_model_output_retries(3);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_models = Arc::clone(&seen);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let seen_models = Arc::clone(&seen_models);
+                    async move {
+                        seen_models.lock().expect("models").push(attempt.model_id);
+                        if attempt.model_id == 10 {
+                            Err("unavailable".to_owned())
+                        } else {
+                            Ok("fallback answer")
+                        }
+                    }
+                },
+                |_error: &String| Some(FailureReason::ProviderUnavailable),
+            )
+            .await
+            .expect("the fallback answer");
+
+        assert_eq!(output, "fallback answer");
+        assert_eq!(
+            *seen.lock().expect("models"),
+            vec![10, 20],
+            "a dead provider is walked past immediately, not re-sampled"
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_skips_re_sampling_when_the_turn_budget_is_nearly_spent() {
+        let walker = walker_for(snapshot_with_fallback()).with_model_output_retries(3);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_models = Arc::clone(&seen);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(Instant::now() + Duration::from_secs(5)),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let seen_models = Arc::clone(&seen_models);
+                    async move {
+                        seen_models.lock().expect("models").push(attempt.model_id);
+                        if attempt.model_id == 10 {
+                            Err("rejected".to_owned())
+                        } else {
+                            Ok("fallback answer")
+                        }
+                    }
+                },
+                |_error: &String| Some(FailureReason::ModelOutputRejected),
+            )
+            .await
+            .expect("the fallback answer");
+
+        assert_eq!(output, "fallback answer");
+        assert_eq!(*seen.lock().expect("models"), vec![10, 20]);
     }
 
     #[tokio::test]

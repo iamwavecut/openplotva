@@ -2511,32 +2511,65 @@ fn detect_tool_steps_in(
 fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
     let protocol = strip_reasoning_channels(raw);
     let mut remaining = protocol.trim_start();
-    if !starts_with_xml_tag(&remaining.to_ascii_lowercase(), "call")
-        || xmlish_tag_is_call_prefixed(remaining)
-    {
+    if xmlish_named_call_wrapper(remaining).is_none() || xmlish_tag_is_call_prefixed(remaining) {
         return Ok(Vec::new());
     }
 
     let mut steps = Vec::new();
-    loop {
-        let lower = remaining.to_ascii_lowercase();
-        if !starts_with_xml_tag(&lower, "call") {
-            break;
-        }
+    while let Some(wrapper) = xmlish_named_call_wrapper(remaining) {
+        let legacy_call = wrapper == "call";
         let open_end = remaining
             .find('>')
             .ok_or_else(|| ToolParseError::new("unterminated XML-ish call tag"))?
             + 1;
-        let close = "</call>";
-        let body_end = index_fold(&remaining[open_end..], close)
-            .map(|offset| open_end + offset)
-            .ok_or_else(|| ToolParseError::new("unterminated XML-ish call element"))?;
+        if remaining[..open_end].trim_end().ends_with("/>") {
+            if legacy_call {
+                return Err(ToolParseError::new("unterminated XML-ish call element"));
+            }
+            break;
+        }
+        let close = format!("</{wrapper}>");
+        let Some(body_end) = index_fold(&remaining[open_end..], &close).map(|at| open_end + at)
+        else {
+            if legacy_call {
+                return Err(ToolParseError::new("unterminated XML-ish call element"));
+            }
+            break;
+        };
         let body = &remaining[open_end..body_end];
-        let raw_name = xmlish_child_text(body, "tool_name")
-            .ok_or_else(|| ToolParseError::new("XML-ish call has no tool_name"))?;
+        // A plural container holds calls rather than being one, so its children are parsed
+        // in turn; a body that yields none falls through to the single-call reading below.
+        if wrapper == "tool_calls" {
+            let nested = parse_xmlish_named_call_steps(body)?;
+            if !nested.is_empty() {
+                steps.extend(nested);
+                remaining = remaining[body_end + close.len()..].trim_start();
+                continue;
+            }
+        }
+        // `<tool_call>` and friends also carry attribute-shaped calls that other parsers
+        // own; only an element naming its tool in a child belongs to this one.
+        let Some(raw_name) =
+            xmlish_child_text(body, "tool_name").or_else(|| xmlish_child_text(body, "name"))
+        else {
+            if legacy_call {
+                return Err(ToolParseError::new("XML-ish call has no tool_name"));
+            }
+            break;
+        };
         let name = canonical_known_step(&raw_name)
             .ok_or_else(|| ToolParseError::new(format!("unknown step {raw_name:?}")))?;
-        let arguments_body = xmlish_child_text(body, "arguments").unwrap_or_default();
+        // Arguments live in `<arguments>`, in `<args>`, or as `<arg name="...">` children
+        // of the call element itself.
+        let arguments_body = xmlish_child_text(body, "arguments")
+            .or_else(|| xmlish_child_text(body, "args"))
+            .unwrap_or_else(|| {
+                if legacy_call {
+                    String::new()
+                } else {
+                    body.to_owned()
+                }
+            });
         let mut arguments = xmlish_named_arg_children(&arguments_body);
         for key in INLINE_TOOL_ARG_KEYS {
             if let Some(value) = xmlish_child_text(&arguments_body, key) {
@@ -2548,6 +2581,18 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         remaining = remaining[body_end + close.len()..].trim_start();
     }
     Ok(steps)
+}
+
+/// Element names models wrap a named tool call in. `starts_with_xml_tag` requires the
+/// whole name, so `<tool_call>` never matches `call` and the list needs no ordering.
+const XMLISH_NAMED_CALL_WRAPPERS: &[&str] = &["call", "tool_call", "tool_calls", "tool"];
+
+fn xmlish_named_call_wrapper(raw: &str) -> Option<&'static str> {
+    let lower = raw.to_ascii_lowercase();
+    XMLISH_NAMED_CALL_WRAPPERS
+        .iter()
+        .copied()
+        .find(|wrapper| starts_with_xml_tag(&lower, wrapper))
 }
 
 fn detect_tool_step_in(
@@ -5025,6 +5070,77 @@ mod tests {
         assert_eq!(parsed.tool_steps[1].emoji, "😂");
         assert_eq!(parsed.tool_steps[1].target_message_id, 999949);
         assert!(!parsed.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_recovers_tool_call_elements_naming_their_tool()
+    -> Result<(), ToolParseError> {
+        // Production 2026-09-17: the named-call form arrives wrapped in <tool_call> with the
+        // tool in a <tool_name>/<name> child and arguments as <arg>/<args> children.
+        let arg_children = parse_assistant_content(
+            "<tool_call>\n  <tool_name>draw_image</tool_name>\n  <arg name=\"prompt\">Bees dancing a waltz</arg>\n</tool_call>",
+        )?;
+        assert_eq!(arg_children.tool_steps.len(), 1);
+        assert_eq!(arg_children.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(arg_children.tool_steps[0].prompt, "Bees dancing a waltz");
+        assert!(arg_children.text.is_empty());
+
+        let args_container = parse_assistant_content(
+            "<tool_call>\n  <name>understand_media</name>\n  <args>\n    <file_id>message_434005_video_1</file_id>\n  </args>\n</tool_call>\n\nсмотрю.",
+        )?;
+        assert_eq!(args_container.tool_steps.len(), 1);
+        assert_eq!(args_container.tool_steps[0].step, STEP_UNDERSTAND_MEDIA);
+        assert_eq!(
+            args_container.tool_steps[0].file_id,
+            "message_434005_video_1"
+        );
+        // The element naming the tool stays structural: it never lands in an argument.
+        assert!(args_container.tool_steps[0].query.is_empty());
+        assert!(args_container.tool_steps[0].text.is_empty());
+        assert_eq!(args_container.text, "смотрю.");
+
+        // A self-closing legacy <call/> stays a loud protocol error, so the turn is
+        // re-sampled instead of being delivered as if the model had said nothing.
+        assert!(parse_assistant_content("<call/>").is_err());
+
+        let plural_container = parse_assistant_content(
+            "<tool_calls><tool_call><name>web_search</name><args><query>погода</query></args></tool_call><tool_call><name>draw_image</name><args><prompt>a fox</prompt></args></tool_call></tool_calls>",
+        )?;
+        assert_eq!(plural_container.tool_steps.len(), 2);
+        assert_eq!(plural_container.tool_steps[0].query, "погода");
+        assert_eq!(plural_container.tool_steps[1].prompt, "a fox");
+
+        // A reply mixing an attribute-shaped call with a named one executes the first of
+        // the two, whichever shape it is: each parser owns its own form, and the one that
+        // matches first wins.
+        let attribute_first = parse_assistant_content(
+            "<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>\n<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>",
+        )?;
+        assert_eq!(attribute_first.tool_steps.len(), 1);
+        assert_eq!(attribute_first.tool_steps[0].step, STEP_DRAW_IMAGE);
+
+        let named_first = parse_assistant_content(
+            "<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>\n<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>",
+        )?;
+        assert_eq!(named_first.tool_steps.len(), 1);
+        assert_eq!(named_first.tool_steps[0].step, STEP_WEB_SEARCH);
+
+        // The legacy <call> element still reads arguments only from <arguments>: a sibling
+        // child stays out of them, exactly as before.
+        let legacy_without_arguments = parse_assistant_content(
+            "<call><tool_name>draw_image</tool_name><prompt>a red fox</prompt></call>",
+        )?;
+        assert_eq!(legacy_without_arguments.tool_steps.len(), 1);
+        assert_eq!(legacy_without_arguments.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert!(legacy_without_arguments.tool_steps[0].prompt.is_empty());
+
+        // The attribute-shaped calls inside the same wrapper stay with their own parser.
+        let attributes = parse_assistant_content(
+            "<tool_calls><tool_call name=\"draw_image\" args=\'{\"prompt\": \"a red fox\"}\'/></tool_calls>",
+        )?;
+        assert_eq!(attributes.tool_steps.len(), 1);
+        assert_eq!(attributes.tool_steps[0].prompt, "a red fox");
         Ok(())
     }
 

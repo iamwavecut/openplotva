@@ -4947,7 +4947,7 @@ fn extract_final_answer_for_provider(
         Ok(answer) => Ok(answer),
         Err(err) if is_retryable_final_answer_error(&err) => Err(Box::new(ProviderError::new(
             provider,
-            FailureReason::ProviderProtocolError,
+            FailureReason::ModelOutputRejected,
             err.to_string(),
         ))),
         Err(err) => Err(Box::new(err)),
@@ -7882,7 +7882,7 @@ mod tests {
                     .expect_err("leaked reply must not pass");
             assert_eq!(
                 retryable_reason(err.as_ref()),
-                Some(FailureReason::ProviderProtocolError),
+                Some(FailureReason::ModelOutputRejected),
                 "{content}"
             );
             err.to_string()
@@ -7940,7 +7940,7 @@ mod tests {
         .expect("send_message leak");
         assert_eq!(
             retryable_reason(leak.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(
             tool_step_text_leak_error(
@@ -7970,7 +7970,7 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
     }
 
@@ -7991,7 +7991,7 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(
             err.to_string().contains("repeated block"),
@@ -8031,7 +8031,7 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(
             err.to_string().contains("reasoning without final content"),
@@ -8080,7 +8080,7 @@ mod tests {
 
         assert_eq!(
             retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(
             err.to_string().contains("output token budget exhausted"),
@@ -9701,11 +9701,11 @@ mod tests {
             },
         )
         .await
-        .expect_err("malformed native tool call should be retryable provider protocol error");
+        .expect_err("a malformed native tool call must be re-sampled on the same model");
 
         assert_eq!(
             crate::retry::retryable_reason(error.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(error.to_string().contains("tool protocol error"), "{error}");
     }
@@ -10051,11 +10051,11 @@ mod tests {
             },
         )
         .await
-        .expect_err("malformed named call must be a retryable provider protocol error");
+        .expect_err("a malformed named call must be re-sampled on the same model");
 
         assert_eq!(
             crate::retry::retryable_reason(error.as_ref()),
-            Some(FailureReason::ProviderProtocolError)
+            Some(FailureReason::ModelOutputRejected)
         );
         assert!(error.to_string().contains("tool protocol error"), "{error}");
     }

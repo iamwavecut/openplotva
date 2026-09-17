@@ -14,6 +14,10 @@ pub enum FailureReason {
     ProviderTimeout,
     /// Provider returned a protocol-level invalid response.
     ProviderProtocolError,
+    /// The provider answered, but our validators rejected what the model wrote.
+    /// The provider is healthy, so a fresh sample from the same model is the
+    /// cheapest repair; walking to another model usually lands on a weaker one.
+    ModelOutputRejected,
 }
 
 impl FailureReason {
@@ -25,6 +29,7 @@ impl FailureReason {
             Self::ProviderOverloaded => "provider_overloaded",
             Self::ProviderTimeout => "provider_timeout",
             Self::ProviderProtocolError => "provider_protocol_error",
+            Self::ModelOutputRejected => "model_output_rejected",
         }
     }
 }
@@ -193,11 +198,22 @@ const RETRYABLE_MESSAGE_RULES: &[(FailureReason, &[&str])] = &[
         ],
     ),
     (
-        FailureReason::ProviderProtocolError,
+        FailureReason::ModelOutputRejected,
         &[
             "tool protocol error",
+            "only copied context messages",
+            "copied prompt context text",
+            "only protocol artifacts",
+            "pathological final text",
             "empty final text",
             "no tool calls",
+            "output token budget exhausted",
+            "returned reasoning without final content",
+        ],
+    ),
+    (
+        FailureReason::ProviderProtocolError,
+        &[
             "decode chat completion payload",
             "decode memory extractor response",
             "response body is empty",
@@ -299,7 +315,11 @@ mod tests {
             ),
             (
                 "tool protocol error: empty final text on iteration 2".to_owned(),
-                FailureReason::ProviderProtocolError,
+                FailureReason::ModelOutputRejected,
+            ),
+            (
+                "chat completion returned only copied context messages".to_owned(),
+                FailureReason::ModelOutputRejected,
             ),
             (
                 "extract memory batch: decode memory extractor response".to_owned(),
