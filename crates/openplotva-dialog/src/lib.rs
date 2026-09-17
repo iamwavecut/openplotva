@@ -2257,14 +2257,14 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
             continue;
         }
         let call_prefixed = xmlish_tag_is_call_prefixed(tag);
+        // A wrapper closed by a sibling tag (`<tool_calls>` … `</tool_call>`) or never closed at
+        // all still ends the protocol span: everything after it is the reply text.
         let Some((relative_close, close_len)) =
             find_xmlish_tool_close(&raw[open_end..], &name, call_prefixed)
+                .or_else(|| xmlish_sibling_tool_close(&raw[open_end..]))
         else {
-            if call_prefixed {
-                spans.push((start, raw.len()));
-                break;
-            }
-            return None;
+            spans.push((start, raw.len()));
+            break;
         };
         let end = open_end + relative_close + close_len;
         spans.push((start, end));
@@ -3525,6 +3525,15 @@ fn xmlish_direct_tool_tag_has_args(tag: &str, step: &str) -> bool {
         || xmlish_tool_attr(tag, "args").is_some()
 }
 
+/// Closing tag of a sibling tool wrapper, for models that close `<tool_calls>` with
+/// `</tool_call>`. Returns (relative start, length).
+fn xmlish_sibling_tool_close(rest: &str) -> Option<(usize, usize)> {
+    ["</tool_calls>", "</tool_call>", "</tool>"]
+        .iter()
+        .filter_map(|close| index_fold(rest, close).map(|start| (start, close.len())))
+        .min_by_key(|(start, _)| *start)
+}
+
 fn first_xmlish_tool_tag(raw: &str) -> Option<String> {
     let mut offset = 0;
     while let Some(idx) = raw[offset..].find("<tool") {
@@ -3564,15 +3573,14 @@ fn first_xmlish_tool_body(raw: &str) -> Option<String> {
             offset = open_end + 1;
             continue;
         }
-        let close_tag = format!("</{name}>");
         let body_start = open_end + 1;
-        let Some(body_end) = index_fold(&raw[body_start..], &close_tag) else {
-            offset = body_start;
-            continue;
-        };
-        return Some(unescape_xmlish(
-            raw[body_start..body_start + body_end].trim(),
-        ));
+        let rest = &raw[body_start..];
+        // Models open `<tool_calls>` and close `</tool_call>`, or never close it at all;
+        // an unterminated wrapper runs to the end so the call inside it survives.
+        let body_end = index_fold(rest, &format!("</{name}>"))
+            .or_else(|| xmlish_sibling_tool_close(rest).map(|(start, _)| start))
+            .unwrap_or(rest.len());
+        return Some(unescape_xmlish(rest[..body_end].trim()));
     }
     None
 }
@@ -3696,8 +3704,10 @@ fn populate_xmlish_tool_attrs(tag: &str, step: &mut ToolStep) -> Result<(), Tool
     if let Some(arg) = xmlish_tool_attr(tag, "arg") {
         populate_jsonish_or_inline_args(&arg, step)?;
     }
-    if let Some(args) = xmlish_tool_attr(tag, "args") {
-        populate_jsonish_or_inline_args(&args, step)?;
+    for attr in ["args", "arguments"] {
+        if let Some(args) = xmlish_tool_attr(tag, attr) {
+            populate_jsonish_or_inline_args(&args, step)?;
+        }
     }
     Ok(())
 }
@@ -5001,6 +5011,37 @@ mod tests {
         assert_eq!(parsed.tool_steps[1].emoji, "😂");
         assert_eq!(parsed.tool_steps[1].target_message_id, 999949);
         assert!(!parsed.residual_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_content_parser_recovers_wrapper_closed_by_a_sibling_tag() -> Result<(), ToolParseError>
+    {
+        // Production 2026-09-17: Gemma opened <tool_calls> and closed </tool_call>, so the
+        // whole call was dropped and the turn fell back to a tool-less provider.
+        let raw = r#"<tool_calls>
+  <tool_call name="generate_song" arguments='{"topic": "Instrumental chill step and future bass track."}'/>
+</tool_call>
+
+заказал, лови."#;
+
+        let parsed = parse_assistant_content(raw)?;
+
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_GENERATE_SONG);
+        assert_eq!(
+            parsed.tool_steps[0].topic,
+            "Instrumental chill step and future bass track."
+        );
+        assert_eq!(parsed.text, "заказал, лови.");
+        assert!(!parsed.residual_protocol);
+
+        let unterminated = parse_assistant_content(
+            r#"<tool_calls><tool_call name="draw_image" args='{"prompt": "a red fox"}'/>"#,
+        )?;
+        assert_eq!(unterminated.tool_steps.len(), 1);
+        assert_eq!(unterminated.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(unterminated.tool_steps[0].prompt, "a red fox");
         Ok(())
     }
 
