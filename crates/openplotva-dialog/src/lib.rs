@@ -2550,7 +2550,13 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         // of the call element itself.
         let arguments_body = xmlish_child_text(body, "arguments")
             .or_else(|| xmlish_child_text(body, "args"))
-            .unwrap_or_else(|| body.to_owned());
+            .unwrap_or_else(|| {
+                if legacy_call {
+                    String::new()
+                } else {
+                    body.to_owned()
+                }
+            });
         let mut arguments = xmlish_named_arg_children(&arguments_body);
         for key in INLINE_TOOL_ARG_KEYS {
             if let Some(value) = xmlish_child_text(&arguments_body, key) {
@@ -5077,6 +5083,15 @@ mod tests {
             "message_434005_video_1"
         );
         assert_eq!(args_container.text, "смотрю.");
+
+        // The legacy <call> element still reads arguments only from <arguments>: a sibling
+        // child stays out of them, exactly as before.
+        let legacy_without_arguments = parse_assistant_content(
+            "<call><tool_name>draw_image</tool_name><prompt>a red fox</prompt></call>",
+        )?;
+        assert_eq!(legacy_without_arguments.tool_steps.len(), 1);
+        assert_eq!(legacy_without_arguments.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert!(legacy_without_arguments.tool_steps[0].prompt.is_empty());
 
         // The attribute-shaped calls inside the same wrapper stay with their own parser.
         let attributes = parse_assistant_content(

@@ -459,11 +459,16 @@ impl RoutedAttemptWalker {
                                 ));
                                 continue;
                             }
-                            self.breakers.record_failure(
-                                attempt.provider,
-                                attempt.model,
-                                attempt.breaker,
-                            );
+                            // Not even the sample that spends the budget charges the breaker:
+                            // the model answered every time, and opening its circuit would
+                            // hand the next turns to the fallback this policy exists to avoid.
+                            if reason != FailureReason::ModelOutputRejected {
+                                self.breakers.record_failure(
+                                    attempt.provider,
+                                    attempt.model,
+                                    attempt.breaker,
+                                );
+                            }
                             self.record_event(routing_event_with_severity(
                                 "attempt_failed",
                                 "info",
@@ -1067,6 +1072,38 @@ mod tests {
 
         assert_eq!(output, "fallback answer");
         assert_eq!(*seen.lock().expect("models"), vec![10, 10, 20]);
+    }
+
+    #[tokio::test]
+    async fn walker_keeps_the_circuit_closed_after_the_re_sampling_budget_is_spent() {
+        let mut snap = snapshot_with_fallback();
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers)).with_model_output_retries(1);
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| async move {
+                    if attempt.model_id == 10 {
+                        Err("rejected".to_owned())
+                    } else {
+                        Ok("fallback answer")
+                    }
+                },
+                |_error: &String| Some(FailureReason::ModelOutputRejected),
+            )
+            .await
+            .expect("the fallback answer");
+
+        assert_eq!(output, "fallback answer");
+        assert!(
+            breakers.is_live_at(1, 10, Instant::now()),
+            "spending the re-sampling budget must not exile a model that kept answering"
+        );
     }
 
     #[tokio::test]
