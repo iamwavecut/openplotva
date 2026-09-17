@@ -14,13 +14,13 @@ use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatStepFuture, ChatStepProvider,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
-        normalize_chat_completions_url,
+        normalize_chat_completions_url, rejection_verdict_for,
     },
     gemini::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
         is_gemini_provider_model,
     },
-    retry::{FailureReason, rejection_verdict_code, retryable_reason},
+    retry::{FailureReason, retryable_reason},
     router::{BreakerSet, PoolRegistry, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
 };
@@ -391,7 +391,7 @@ impl ChatStepProvider for RouterChatProvider {
                                     {
                                         *last = Some((
                                             attempt_model_id,
-                                            rejection_verdict_code(&error.to_string()).to_owned(),
+                                            rejection_verdict_for(error.as_ref()).to_owned(),
                                         ));
                                     }
                                     Err(error)

@@ -629,6 +629,44 @@ pub fn resolve_bad_words(value: Option<&Value>) -> Vec<String> {
     }
 }
 
+/// Which validator rejected this output, as the stable code a re-sample carries back to
+/// the model. The typed variant answers it; only a `Response` message falls back to
+/// matching, and then on its own leading sentence, because the tail of one can quote the
+/// model's text and would otherwise pick the verdict.
+#[must_use]
+pub fn rejection_verdict_for(error: &(dyn Error + 'static)) -> &'static str {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(dialog) = err.downcast_ref::<AifarmDialogError>() {
+            return match dialog {
+                AifarmDialogError::FinalAnswerContextLeak => "context_leak",
+                AifarmDialogError::FinalAnswerPromptLeak => "prompt_leak",
+                AifarmDialogError::FinalAnswerProtocolOnly => "protocol_only",
+                AifarmDialogError::FinalAnswerPathological(_) => "pathological",
+                AifarmDialogError::ReasoningBudgetExhausted { .. } => "reasoning_only",
+                AifarmDialogError::OutputBudgetExhausted { .. } => "budget_exhausted",
+                AifarmDialogError::Response(message) => response_rejection_verdict(message),
+                _ => "other",
+            };
+        }
+        current = err.source();
+    }
+    crate::retry::rejection_verdict_code(&error.to_string())
+}
+
+fn response_rejection_verdict(message: &str) -> &'static str {
+    const RESPONSE_VERDICTS: &[(&str, &str)] = &[
+        ("tool protocol error", "protocol_only"),
+        ("chat completion returned empty final text", "empty"),
+        ("chat completion returned no message", "empty"),
+    ];
+    let message = message.trim_start();
+    RESPONSE_VERDICTS
+        .iter()
+        .find(|(prefix, _)| message.starts_with(prefix))
+        .map_or("other", |(_, code)| *code)
+}
+
 /// AIFarm dialog-service error.
 #[derive(Debug, Error)]
 pub enum AifarmDialogError {
@@ -10239,6 +10277,30 @@ mod tests {
         assert_eq!(output.tool_calls[1].step.target_message_id, 999949);
         assert_eq!(output.text, "Ну и за что тебе такое наказание божье?");
         Ok(())
+    }
+
+    #[test]
+    fn the_verdict_comes_from_the_error_variant_not_from_quoted_model_text() {
+        let leak: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::FinalAnswerContextLeak);
+        assert_eq!(rejection_verdict_for(leak.as_ref()), "context_leak");
+
+        let pathological: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            AifarmDialogError::FinalAnswerPathological("repeated block".to_owned()),
+        );
+        assert_eq!(rejection_verdict_for(pathological.as_ref()), "pathological");
+
+        // The tail of a protocol error quotes what the model wrote; that text must not
+        // choose the verdict.
+        let quoted: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::Response(
+                "tool protocol error: returned only copied context messages".to_owned(),
+            ));
+        assert_eq!(rejection_verdict_for(quoted.as_ref()), "protocol_only");
+
+        let budget: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::OutputBudgetExhausted { output_chars: 12 });
+        assert_eq!(rejection_verdict_for(budget.as_ref()), "budget_exhausted");
     }
 
     #[test]
