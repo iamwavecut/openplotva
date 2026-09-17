@@ -2534,6 +2534,16 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
             break;
         };
         let body = &remaining[open_end..body_end];
+        // A plural container holds calls rather than being one, so its children are parsed
+        // in turn; a body that yields none falls through to the single-call reading below.
+        if wrapper == "tool_calls" {
+            let nested = parse_xmlish_named_call_steps(body)?;
+            if !nested.is_empty() {
+                steps.extend(nested);
+                remaining = remaining[body_end + close.len()..].trim_start();
+                continue;
+            }
+        }
         // `<tool_call>` and friends also carry attribute-shaped calls that other parsers
         // own; only an element naming its tool in a child belongs to this one.
         let Some(raw_name) =
@@ -5086,6 +5096,13 @@ mod tests {
         assert!(args_container.tool_steps[0].query.is_empty());
         assert!(args_container.tool_steps[0].text.is_empty());
         assert_eq!(args_container.text, "смотрю.");
+
+        let plural_container = parse_assistant_content(
+            "<tool_calls><tool_call><name>web_search</name><args><query>погода</query></args></tool_call><tool_call><name>draw_image</name><args><prompt>a fox</prompt></args></tool_call></tool_calls>",
+        )?;
+        assert_eq!(plural_container.tool_steps.len(), 2);
+        assert_eq!(plural_container.tool_steps[0].query, "погода");
+        assert_eq!(plural_container.tool_steps[1].prompt, "a fox");
 
         // A reply mixing an attribute-shaped call with a named one executes the first of
         // the two, whichever shape it is: each parser owns its own form, and the one that
