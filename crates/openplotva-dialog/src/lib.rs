@@ -1324,6 +1324,131 @@ fn orphan_reasoning_close_end(lower: &str, from: usize, next_open: Option<usize>
     best
 }
 
+/// How deep a reply may nest the transcript envelope before we stop unwrapping it.
+const TRANSCRIPT_ENVELOPE_MAX_DEPTH: usize = 3;
+
+/// The transcript element a reply is wrapped in, when the reply opens with one. Siblings
+/// outside it (`<attach_id>`, a second element) mean copied context rather than a reply
+/// wearing the shape it was handed, so those keep their leak verdict.
+fn transcript_envelope_element(trimmed: &str) -> Option<&'static str> {
+    let lower = trimmed.to_ascii_lowercase();
+    if starts_with_xml_tag(&lower, "last_message") {
+        return Some("last_message");
+    }
+    let opens_message = starts_with_xml_tag(&lower, "message")
+        && lower.split_once('>').is_some_and(|(open, _)| {
+            ["id=", "thread_id=", "timestamp="]
+                .iter()
+                .any(|attr| open.contains(attr))
+        });
+    opens_message.then_some("message")
+}
+
+/// Where the element opened at the start of `lower` closes, counting nesting. Two entries
+/// in a row therefore close at the first tag and leave the second outside, which is what
+/// tells a copied transcript from a single reply wrapped in one element.
+fn matching_close(lower: &str, element: &str, open_end: usize) -> Option<usize> {
+    let open_tag = format!("<{element}");
+    let close_tag = format!("</{element}>");
+    let mut depth = 1usize;
+    let mut at = open_end;
+    while at < lower.len() {
+        let next_open = lower[at..]
+            .match_indices(open_tag.as_str())
+            .map(|(offset, _)| at + offset)
+            .find(|start| {
+                lower[start + open_tag.len()..].starts_with([' ', '\t', '\r', '\n', '>', '/'])
+            });
+        let next_close = lower[at..].find(close_tag.as_str()).map(|off| at + off);
+        match (next_open, next_close) {
+            (Some(open), Some(close)) if open < close => {
+                depth += 1;
+                at = open + open_tag.len();
+            }
+            (_, Some(close)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(close);
+                }
+                at = close + close_tag.len();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The reply the model wrapped in the prompt's own history element.
+///
+/// Models continue in the shape they were handed: with `<last_message><message …>` as the
+/// last thing before the generation point, the answer comes back inside that element. The
+/// body is returned as-is so the caller can judge it — an actual transcript copy is still
+/// caught by the leak guard, and a tool call inside it still has to be parsed.
+fn unwrap_transcript_envelope(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let element = transcript_envelope_element(trimmed)?;
+    let open_end = trimmed.find('>')? + 1;
+    let close = format!("</{element}>");
+    let lower = trimmed.to_ascii_lowercase();
+    let (body_end, close_len) = matching_close(&lower, element, open_end)
+        .map_or((trimmed.len(), 0), |at| (at, close.len()));
+    // Only a reply that is nothing but the envelope was wrapped; prose or code after the
+    // closing tag means the transcript was narrated next to an answer.
+    if !trimmed[(body_end + close_len).min(trimmed.len())..]
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+    let body = trimmed[open_end..body_end].trim();
+    if body.is_empty() {
+        return None;
+    }
+    // `<text>` carries the reply; without it the element body is the reply, minus the
+    // scaffolding elements that describe the message rather than say anything.
+    let inner =
+        extract_protocol_text_bodies(body).unwrap_or_else(|| strip_transcript_scaffolding(body));
+    let inner = inner.trim();
+    if inner.is_empty() || inner == trimmed {
+        return None;
+    }
+    Some(inner.to_owned())
+}
+
+/// Drop the elements that describe a history entry (`<user>`, `<message_type>`, …) and keep
+/// what the model actually wrote.
+fn strip_transcript_scaffolding(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            // Unterminated markup is kept verbatim, once: everything before it is already
+            // in `out`, so the trailing push must start at the stray tag.
+            rest = &rest[open..];
+            break;
+        };
+        let tag = &rest[open..open + close + 1];
+        let name = xmlish_tool_tag_name(tag);
+        let name = name.trim_start_matches('/');
+        if matches!(
+            name,
+            "user" | "message_type" | "reply_to" | "reply_to_id" | "attach_id" | "sender"
+        ) {
+            let closing = format!("</{name}>");
+            let after_open = open + close + 1;
+            let skip_to = index_fold(&rest[after_open..], &closing)
+                .map_or(after_open, |at| after_open + at + closing.len());
+            rest = &rest[skip_to..];
+            continue;
+        }
+        out.push_str(tag);
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 const ANSWER_ENVELOPE_TAGS: &[&str] = &["answer", "final_answer", "final_response", "response"];
 
 // The model sometimes wraps its reply in an explicit answer element next to a
@@ -1842,11 +1967,26 @@ pub fn finalize_dialog_reply_with_guard(
     content: &str,
     guard: &ReplyLeakGuard,
 ) -> DialogReplyOutcome {
+    finalize_dialog_reply_at_depth(content, guard, 0)
+}
+
+fn finalize_dialog_reply_at_depth(
+    content: &str,
+    guard: &ReplyLeakGuard,
+    depth: usize,
+) -> DialogReplyOutcome {
     use DialogReplySuppression::{
         ContextLeak, Empty, Pathological, PromptLeak, ProtocolOnly, ReasoningLeak, TranscriptLeak,
     };
     if content.trim().is_empty() {
         return DialogReplyOutcome::Suppressed(Empty);
+    }
+    // An answer wearing the history element is judged by what it says, not by the shape it
+    // copied: the guard below still suppresses an actual transcript copy.
+    if depth < TRANSCRIPT_ENVELOPE_MAX_DEPTH
+        && let Some(inner) = unwrap_transcript_envelope(content)
+    {
+        return finalize_dialog_reply_at_depth(&inner, guard, depth + 1);
     }
     let sanitized = sanitize_assistant_text(content);
     let mut answer = sanitized.text;
@@ -2153,6 +2293,20 @@ impl Error for ToolParseError {}
 pub fn parse_assistant_content(
     raw_content: &str,
 ) -> Result<ParsedAssistantContent, ToolParseError> {
+    parse_assistant_content_at_depth(raw_content, 0)
+}
+
+fn parse_assistant_content_at_depth(
+    raw_content: &str,
+    depth: usize,
+) -> Result<ParsedAssistantContent, ToolParseError> {
+    // A reply that is nothing but the history element is judged by its contents, so a call
+    // wrapped in it still runs and keeps the text that travels with it.
+    if depth < TRANSCRIPT_ENVELOPE_MAX_DEPTH
+        && let Some(inner) = unwrap_transcript_envelope(raw_content)
+    {
+        return parse_assistant_content_at_depth(&inner, depth + 1);
+    }
     let (tool_steps, decision) = extract_content_tool_steps(raw_content)?;
     let sanitized = if tool_steps.is_empty() {
         sanitize_assistant_text(raw_content)
@@ -4179,10 +4333,22 @@ mod tests {
             Reply("Оберни мысли в <think> теги, чтобы их скрыть.".to_owned())
         );
 
-        // Copied context echo → context leak; blank → empty.
+        // A reply that merely wears the history element is unwrapped; a copy of a known
+        // history entry inside the same element is still a leak.
         assert_eq!(
             finalize_dialog_reply("<message id=\"1\"><text>old</text></message>"),
-            Suppressed(ContextLeak)
+            Reply("old".to_owned())
+        );
+        let guard = ReplyLeakGuard::builder()
+            .sender("Плотва")
+            .history_entry("Наталья", "у меня от этого голова пухнет уже неделю")
+            .build();
+        assert_eq!(
+            finalize_dialog_reply_with_guard(
+                "<message id=\"1\" thread_id=\"2\"><text>у меня от этого голова пухнет уже неделю</text></message>",
+                &guard
+            ),
+            Suppressed(DialogReplySuppression::TranscriptLeak)
         );
         assert_eq!(
             finalize_dialog_reply(
@@ -5141,6 +5307,108 @@ mod tests {
         )?;
         assert_eq!(attributes.tool_steps.len(), 1);
         assert_eq!(attributes.tool_steps[0].prompt, "a red fox");
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_unwraps_a_reply_wrapped_in_the_history_envelope() {
+        // Production 2026-09-17: format contagion — the model answers, but continues in
+        // the XML the prompt hands it. The reply inside is new text, not a copy.
+        let guard = ReplyLeakGuard::builder()
+            .sender("Плотва")
+            .history_entry("Веселое время", "Нет, серьезно, это кринж какой-то.")
+            .build();
+        let envelope = concat!(
+            "<message id=\"136767\" thread_id=\"136412\" timestamp=\"2026-09-17T22:10:05Z\">\n",
+            "  <user type=\"user\">Веселое время</user>\n",
+            "  <message_type>text</message_type>\n",
+            "  <text>Кринж, конечно, но зато честно.</text>\n",
+            "</message>"
+        );
+
+        match finalize_dialog_reply_with_guard(envelope, &guard) {
+            DialogReplyOutcome::Reply(text) => {
+                assert_eq!(text, "Кринж, конечно, но зато честно.");
+            }
+            other => panic!("expected the unwrapped reply, got {other:?}"),
+        }
+
+        // The same envelope carrying a participant's own line is still a transcript copy.
+        let copied = envelope.replace(
+            "Кринж, конечно, но зато честно.",
+            "Нет, серьезно, это кринж какой-то.",
+        );
+        assert!(matches!(
+            finalize_dialog_reply_with_guard(&copied, &guard),
+            DialogReplyOutcome::Suppressed(_)
+        ));
+    }
+
+    #[test]
+    fn finalize_unwraps_nested_envelopes_without_running_away() {
+        let guard = ReplyLeakGuard::default();
+        let nested = concat!(
+            "<message id=\"1\" thread_id=\"2\" timestamp=\"t\">\n",
+            "  <text><message id=\"3\" thread_id=\"4\" timestamp=\"t\"><text>",
+            "ладно, уговорил</text></message></text>\n",
+            "</message>"
+        );
+
+        match finalize_dialog_reply_with_guard(nested, &guard) {
+            DialogReplyOutcome::Reply(text) => assert_eq!(text, "ладно, уговорил"),
+            other => panic!("expected the innermost reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unwrapped_text_with_unterminated_markup_is_not_doubled() {
+        let guard = ReplyLeakGuard::default();
+        // No `<text>` element, so the body keeps whatever the model wrote — here an
+        // unterminated tag, which the scaffolding strip must emit exactly once.
+        let wrapped = concat!(
+            "<message id=\"1\" timestamp=\"t\">\n",
+            "  <user username=\"Vasia\" type=\"user\">Vasia</user>\n",
+            "  сравни 3 < 5 сама\n",
+            "</message>"
+        );
+
+        match finalize_dialog_reply_with_guard(wrapped, &guard) {
+            DialogReplyOutcome::Reply(text) => assert_eq!(text, "сравни 3 < 5 сама"),
+            other => panic!("expected the reply once, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_keeps_two_copied_entries_suppressed() {
+        // One element wrapping the answer is contagion; two in a row are the transcript
+        // itself, and the second one lives outside the first element's close.
+        let copied = concat!(
+            "<message id=\"1\" timestamp=\"t\"><text>И швырять забудешь )</text></message>\n",
+            "<message id=\"2\" timestamp=\"t\"><text>И швырять забудешь )</text></message>"
+        );
+
+        assert_eq!(
+            finalize_dialog_reply(copied),
+            DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak)
+        );
+    }
+
+    #[test]
+    fn parser_executes_a_tool_call_wrapped_in_the_history_envelope() -> Result<(), ToolParseError> {
+        let raw = concat!(
+            "<message id=\"1\" thread_id=\"2\" timestamp=\"t\">\n",
+            "  <user type=\"user\">WaveCut</user>\n",
+            "  <text><tool_call name=\"generate_song\" args=\'{\"topic\": \"chill step\"}\'/>",
+            "заказал, лови.</text>\n",
+            "</message>"
+        );
+
+        let parsed = parse_assistant_content(raw)?;
+
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_GENERATE_SONG);
+        assert_eq!(parsed.tool_steps[0].topic, "chill step");
+        assert_eq!(parsed.text, "заказал, лови.");
         Ok(())
     }
 

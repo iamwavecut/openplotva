@@ -6632,7 +6632,7 @@ mod tests {
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": "<message id=\"1\"><text>copied context</text></message>"
+                    "content": "<attach_id>1</attach_id>\n<message id=\"1\"><text>copied context</text></message>"
                 }
             }]
         });
@@ -7955,11 +7955,13 @@ mod tests {
 
     #[test]
     fn final_answer_context_leak_is_retryable_provider_failure() {
+        // Copied context, not an answer wearing the transcript element: two entries in a
+        // row are the transcript itself, which no re-render of a single reply produces.
         let err = extract_final_answer_for_provider(
             &json!({
                 "choices": [{
                     "message": {
-                        "content": "<message id=\"1\"><text>old</text></message>"
+                        "content": "<message id=\"1\"><text>old</text></message>\n<message id=\"2\"><text>older</text></message>"
                     }
                 }]
             }),
