@@ -2516,10 +2516,7 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
     }
 
     let mut steps = Vec::new();
-    loop {
-        let Some(wrapper) = xmlish_named_call_wrapper(remaining) else {
-            break;
-        };
+    while let Some(wrapper) = xmlish_named_call_wrapper(remaining) {
         let legacy_call = wrapper == "call";
         let open_end = remaining
             .find('>')
