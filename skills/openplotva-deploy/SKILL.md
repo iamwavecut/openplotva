@@ -5,7 +5,7 @@ description: Use this skill to trigger, monitor, and triage OpenPlotva productio
 
 # OpenPlotva Deploy
 
-Use this skill when deploying OpenPlotva to `geta.moe` or another Docker Compose target.
+Use this skill when deploying OpenPlotva to `<production-host>` or another Docker Compose target.
 
 ## Rules
 
@@ -14,7 +14,7 @@ Use this skill when deploying OpenPlotva to `geta.moe` or another Docker Compose
 - Do not deploy by direct SSH unless the user explicitly asks for a direct server action.
 - Direct SSH is allowed for read-only triage: container status, logs, health checks, and server file presence.
 - Never print `.env.production`, tokens, provider keys, or Telegram credentials.
-- The production env file is server-local. The deploy script creates `/home/wavecut/openplotva/.env.production` from `OPENPLOTVA_PRODUCTION_ENV_B64` only when the file is absent.
+- The production env file is server-local. The deploy script creates `<deploy-root>/.env.production` from `OPENPLOTVA_PRODUCTION_ENV_B64` only when the file is absent.
 - The deploy job is an idempotent apply: it starts missing backing services, preserves already-running backing services, recreates only the `openplotva` app service, and verifies `/api/health` plus `/api/ready`.
 - When OpenPlotva-owned volumes are empty and matching older production volumes exist on the target, the script performs a one-time data import before starting the new stack.
 - After a successful deploy, the workflow deletes old GHCR app image versions older than 24 hours unless they match the current or deployed image tag.
@@ -54,7 +54,7 @@ Required GitHub secrets:
 - `GETA_SSH_PRIVATE_KEY`
 - `GETA_SSH_KNOWN_HOSTS`
 - `GHCR_PULL_TOKEN` for server-side app image pulls.
-- `OPENPLOTVA_PRODUCTION_ENV_B64` for first deploy to a target without an existing `/home/wavecut/openplotva/.env.production`.
+- `OPENPLOTVA_PRODUCTION_ENV_B64` for first deploy to a target without an existing `<deploy-root>/.env.production`.
 
 Target server requirements:
 
@@ -88,19 +88,19 @@ gh run watch "$run_id" --repo iamwavecut/openplotva --exit-status
 Check production containers:
 
 ```bash
-ssh geta.moe 'docker ps --format "{{.Names}} {{.Status}} {{.Ports}}" | grep -E "openplotva|postgresql|dragonfly|redis-ingress"'
+ssh <production-host> 'docker ps --format "{{.Names}} {{.Status}} {{.Ports}}" | grep -E "openplotva|postgresql|dragonfly|redis-ingress"'
 ```
 
 Check health:
 
 ```bash
-ssh geta.moe 'curl -fsS http://127.0.0.1:8080/api/health && curl -fsS http://127.0.0.1:8080/api/ready'
+ssh <production-host> 'curl -fsS http://127.0.0.1:8080/api/health && curl -fsS http://127.0.0.1:8080/api/ready'
 ```
 
 Check routing invariants without printing secrets:
 
 ```bash
-ssh geta.moe 'docker exec openplotva-openplotva-1 sh -lc '"'"'
+ssh <production-host> 'docker exec openplotva-openplotva-1 sh -lc '"'"'
 for k in DISCOVERY_BASE_URL DIALOG_PROVIDER DIALOG_DISCOVERY_SERVICE_NAME DIALOG_MODEL \
   DIALOG_AIFARM_POOL_BASE_URLS DIALOG_AIFARM_POOL_MODELS \
   PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS RUNTIME_API_HOST RUNTIME_API_PORT; do
@@ -120,7 +120,7 @@ done
 Check logs without exposing env:
 
 ```bash
-ssh geta.moe 'docker logs --tail=160 openplotva-openplotva-1'
+ssh <production-host> 'docker logs --tail=160 openplotva-openplotva-1'
 ```
 
 ## Acceptance

@@ -4688,7 +4688,7 @@ mod tests {
         // Exact production message envelope: only the text node is visible.
         assert_eq!(
             finalize_dialog_reply(
-                r#"<reply to_id="6877"><to_user>WaveCut</to_user></reply>
+                r#"<reply to_id="6877"><to_user>someone</to_user></reply>
 <assistant id="6878">Плотва</assistant>
 <message_type>text</message_type>
 <text>Да, это уже нормальный ответ.</text>"#
@@ -4846,7 +4846,7 @@ mod tests {
         // A copied history block ahead of prose is a narrated transcript.
         assert_eq!(
             finalize_dialog_reply(
-                "<message id=\"28816\" thread_id=\"28806\">\n  <user username=\"NataliFeles\">Наталья</user>\n  <text>Голова пухнуть</text>\n</message>\n```json\n[{\"reply_to_id\": \"28815\"}]\n```\n\n// Ответ сформирован согласно инструкции.\n\nГолова пухнуть"
+                "<message id=\"11\" thread_id=\"10\">\n  <user username=\"someone\">Собеседник</user>\n  <text>Голова болит</text>\n</message>\n```json\n[{\"reply_to_id\": \"28815\"}]\n```\n\n// Ответ сформирован согласно инструкции.\n\nГолова пухнуть"
             ),
             Suppressed(ContextLeak)
         );
@@ -5408,12 +5408,12 @@ mod tests {
                 "xmlish",
             ),
             (
-                r#"<react_to_message chat_id="-1001680667629" emoji="🤣" message_id="316691" />"#.to_owned(),
+                r#"<react_to_message chat_id="-1009876543210" emoji="🤣" message_id="424242" />"#.to_owned(),
                 ToolStep {
                     step: STEP_REACT_TO_MESSAGE.to_owned(),
                     emoji: "🤣".to_owned(),
-                    target_chat_id: -1001680667629,
-                    target_message_id: 316691,
+                    target_chat_id: -1009876543210,
+                    target_message_id: 424242,
                     ..ToolStep::default()
                 },
                 "xmlish",
@@ -5458,19 +5458,19 @@ mod tests {
                 "xmlish",
             ),
             (
-                "<tool_calls>\n  <tool_call name=\"history_search\" arg=\"query: CherryCherry123\"></tool_call>\n</tool_calls>".to_owned(),
+                "<tool_calls>\n  <tool_call name=\"history_search\" arg=\"query: cherry_example\"></tool_call>\n</tool_calls>".to_owned(),
                 ToolStep {
                     step: STEP_HISTORY_SEARCH.to_owned(),
-                    query: "CherryCherry123".to_owned(),
+                    query: "cherry_example".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",
             ),
             (
-                "<tool_call name=\"history_search\" args='{\"query\":\"CherryCherry123\"}' />".to_owned(),
+                "<tool_call name=\"history_search\" args='{\"query\":\"cherry_example\"}' />".to_owned(),
                 ToolStep {
                     step: STEP_HISTORY_SEARCH.to_owned(),
-                    query: "CherryCherry123".to_owned(),
+                    query: "cherry_example".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",
@@ -5691,7 +5691,7 @@ mod tests {
         // unterminated tag, which the scaffolding strip must emit exactly once.
         let wrapped = concat!(
             "<message id=\"1\" timestamp=\"t\">\n",
-            "  <user username=\"Vasia\" type=\"user\">Vasia</user>\n",
+            "  <user username=\"someone\" type=\"user\">Собеседник</user>\n",
             "  сравни 3 < 5 сама\n",
             "</message>"
         );
@@ -5916,7 +5916,7 @@ mod tests {
     fn parser_executes_a_tool_call_wrapped_in_the_history_envelope() -> Result<(), ToolParseError> {
         let raw = concat!(
             "<message id=\"1\" thread_id=\"2\" timestamp=\"t\">\n",
-            "  <user type=\"user\">WaveCut</user>\n",
+            "  <user type=\"user\">Собеседник</user>\n",
             "  <text><tool_call name=\"generate_song\" args=\'{\"topic\": \"chill step\"}\'/>",
             "заказал, лови.</text>\n",
             "</message>"

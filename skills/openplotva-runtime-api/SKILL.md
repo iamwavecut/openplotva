@@ -12,11 +12,11 @@ Use this skill when inspecting the deployed Rust bot through the runtime debug A
 Default base URL:
 
 ```text
-https://100.77.77.51:9091
+https://<runtime-api-host>:9091
 ```
 
 Production may publish the runtime API on another host, for example
-`https://geta.moe:9091`, when `OPENPLOTVA_RUNTIME_API_PUBLISH_HOST` is set in the
+`https://<production-host>:9091`, when `OPENPLOTVA_RUNTIME_API_PUBLISH_HOST` is set in the
 server-local env. Verify the live published address before concluding the
 runtime API is down.
 
@@ -60,7 +60,7 @@ completed while the user still receives no picture. Check all boundaries:
 Use pinned self-signed HTTPS:
 
 ```bash
-BASE_URL="${BASE_URL:-https://100.77.77.51:9091}"
+BASE_URL="${BASE_URL:?set BASE_URL=https://<runtime-api-host>:9091}"
 TOKEN="${TOKEN:?TOKEN is required}"
 TLS_PIN="${TLS_PIN:?TLS_PIN is required}"
 

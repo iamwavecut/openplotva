@@ -1437,14 +1437,14 @@ mod tests {
     #[test]
     fn history_search_query_detects_author_username_mentions() {
         assert_eq!(
-            author_username_from_history_query("@CherryCherry123"),
-            Some("CherryCherry123".to_owned())
+            author_username_from_history_query("@cherry_example"),
+            Some("cherry_example".to_owned())
         );
         assert_eq!(
-            author_username_from_history_query("сообщения от @CherryCherry123"),
-            Some("CherryCherry123".to_owned())
+            author_username_from_history_query("сообщения от @cherry_example"),
+            Some("cherry_example".to_owned())
         );
-        assert_eq!(author_username_from_history_query("CherryCherry123"), None);
+        assert_eq!(author_username_from_history_query("cherry_example"), None);
         assert_eq!(author_username_from_history_query("@"), None);
     }
 

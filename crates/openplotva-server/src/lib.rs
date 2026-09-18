@@ -2173,7 +2173,7 @@ mod tests {
                 id: -100,
                 chat_type: "supergroup".to_owned(),
                 title: Some("Plotva Lab".to_owned()),
-                username: Some("plotva_lab".to_owned()),
+                username: Some("example_lab".to_owned()),
                 is_forum: Some(true),
                 discovered_at: Some("2026-05-21T00:00:00Z".to_owned()),
                 updated_at: Some("2026-05-21T00:00:00Z".to_owned()),
@@ -2711,7 +2711,7 @@ mod tests {
                         top_chats: vec![RuntimeLlmAnalyticsTopChatData {
                             chat_id: -100,
                             title: Some("Plotva Lab".to_owned()),
-                            username: Some("plotva_lab".to_owned()),
+                            username: Some("example_lab".to_owned()),
                             request_count: 4,
                         }],
                         models: vec![RuntimeLlmAnalyticsModelStatData {

@@ -35,4 +35,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAINTENANCE_SSH_KEY: ${{ secrets.MAINTENANCE_SSH_KEY }}
           MAINTENANCE_SSH_KNOWN_HOSTS: ${{ secrets.MAINTENANCE_SSH_KNOWN_HOSTS }}
+          MAINTENANCE_DISPATCH_TARGET: ${{ secrets.MAINTENANCE_DISPATCH_TARGET }}
         run: python3 .github/scripts/dispatch_incident.py

@@ -2698,13 +2698,17 @@ mod tests {
         let resolver = AdminChatTargetResolverStub::with_target(AdminChatSettingsTarget {
             id: -100777,
             title: "Target Lab".to_owned(),
-            username: "target_lab".to_owned(),
+            username: "example_target".to_owned(),
             first_name: String::new(),
             last_name: String::new(),
         });
         let communication = ChatCommunicationEffectsStub::default();
-        let authorized =
-            sample_command_update("/admin_enable_chat @target_lab", 5, private_chat(), None)?;
+        let authorized = sample_command_update(
+            "/admin_enable_chat @example_target",
+            5,
+            private_chat(),
+            None,
+        )?;
 
         let outcome = handle_admin_enable_chat_command_update_or_else_at(
             AdminEnableChatRuntime {
@@ -2723,7 +2727,7 @@ mod tests {
             outcome,
             AdminEnableChatCommandOutcome::Enabled { chat_id: -100777 }
         );
-        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(resolver.calls(), vec!["@example_target".to_owned()]);
         assert_eq!(communication.enabled(), vec![-100777]);
         let plans = effects.plans();
         assert_eq!(plans.len(), 1);
@@ -3630,7 +3634,7 @@ mod tests {
             .await?;
         update_queue
             .enqueue_update(&sample_command_update(
-                "/admin_enable_chat@PlotvaBot @target_lab",
+                "/admin_enable_chat@PlotvaBot @example_target",
                 5,
                 group_chat(),
                 Some(7),
@@ -3643,7 +3647,7 @@ mod tests {
             AdminChatSettingsTarget {
                 id: -100777,
                 title: "Target Lab".to_owned(),
-                username: "target_lab".to_owned(),
+                username: "example_target".to_owned(),
                 first_name: String::new(),
                 last_name: String::new(),
             },
@@ -3716,7 +3720,7 @@ mod tests {
         );
         assert_eq!(plans[1].reply_to.message_thread_id, 7);
         assert_eq!(plans[1].ephemeral_delete_after, None);
-        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(resolver.calls(), vec!["@example_target".to_owned()]);
         assert_eq!(communication.enabled(), vec![-100777]);
         assert_eq!(terminal.calls(), 0);
         assert_eq!(

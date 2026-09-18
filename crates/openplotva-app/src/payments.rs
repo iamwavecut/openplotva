@@ -917,6 +917,12 @@ pub trait SuccessfulPaymentEffects {
 
     /// Invalidate cached VIP status after subscription activation.
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Where a user whose payment could not be applied is sent for help; empty sends the
+    /// message without a link.
+    fn support_url(&self) -> &str {
+        ""
+    }
 }
 
 pub trait VipCacheInvalidator {
@@ -1171,6 +1177,11 @@ pub trait PaymentInvoiceEffects {
         &'a self,
         request: &'a openplotva_telegram::SubscriptionInvoiceLinkRequest,
     ) -> PaymentInvoiceLinkFuture<'a, Self::Error>;
+
+    /// A price that replaces the subscription price for this user, if any.
+    fn subscription_price_override(&self, _user_id: i64) -> Option<i64> {
+        None
+    }
 
     /// Create a Telegram invoice link for a donation.
     fn create_donation_invoice_link<'a>(
@@ -2091,6 +2102,7 @@ pub struct SuccessfulPaymentDispatcherEffects<Invalidator = NoopVipCacheInvalida
     queue: Arc<openplotva_telegram::DispatcherQueue>,
     invalidator: Invalidator,
     next_virtual_id: PaymentVirtualIdFactory,
+    support_url: String,
 }
 
 impl<Invalidator> SuccessfulPaymentDispatcherEffects<Invalidator> {
@@ -2100,7 +2112,15 @@ impl<Invalidator> SuccessfulPaymentDispatcherEffects<Invalidator> {
             queue,
             invalidator,
             next_virtual_id: monotonic_payment_virtual_id_factory(),
+            support_url: String::new(),
         }
+    }
+
+    /// Send users whose payment could not be applied to this support link.
+    #[must_use]
+    pub fn with_support_url(mut self, support_url: impl Into<String>) -> Self {
+        self.support_url = support_url.into();
+        self
     }
 
     /// Override virtual-message ID generation for deterministic tests.
@@ -2116,6 +2136,10 @@ where
     Invalidator: VipCacheInvalidator + Send + Sync,
 {
     type Error = SuccessfulPaymentDispatchEffectError;
+
+    fn support_url(&self) -> &str {
+        &self.support_url
+    }
 
     fn send_text<'a>(
         &'a self,
@@ -2175,6 +2199,7 @@ where
 pub struct PaymentRuntimeEffects<Invoice, Successful> {
     invoice: Invoice,
     successful: Successful,
+    test_price_users: Arc<[i64]>,
 }
 
 impl<Invoice, Successful> PaymentRuntimeEffects<Invoice, Successful> {
@@ -2184,7 +2209,16 @@ impl<Invoice, Successful> PaymentRuntimeEffects<Invoice, Successful> {
         Self {
             invoice,
             successful,
+            test_price_users: Arc::from(Vec::new()),
         }
+    }
+
+    /// Charge these users the test price for a subscription, so an operator can walk the
+    /// real payment flow without paying the full price.
+    #[must_use]
+    pub fn with_subscription_test_price_users(mut self, user_ids: impl Into<Arc<[i64]>>) -> Self {
+        self.test_price_users = user_ids.into();
+        self
     }
 }
 
@@ -2200,6 +2234,12 @@ where
         request: &'a openplotva_telegram::SubscriptionInvoiceLinkRequest,
     ) -> PaymentInvoiceLinkFuture<'a, Self::Error> {
         self.invoice.create_subscription_invoice_link(request)
+    }
+
+    fn subscription_price_override(&self, user_id: i64) -> Option<i64> {
+        self.test_price_users
+            .contains(&user_id)
+            .then_some(SUBSCRIPTION_TEST_PRICE_STARS)
     }
 
     fn create_donation_invoice_link<'a>(
@@ -2244,6 +2284,10 @@ where
 
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error> {
         self.successful.invalidate_vip_cache(user_id)
+    }
+
+    fn support_url(&self) -> &str {
+        self.successful.support_url()
     }
 }
 
@@ -3291,7 +3335,9 @@ where
     let request = openplotva_telegram::SubscriptionInvoiceLinkRequest {
         user_id: params.user_id,
         user_name: params.data.user_name.clone(),
-        amount_stars: params.data.amount,
+        amount_stars: effects
+            .subscription_price_override(params.user_id)
+            .unwrap_or(params.data.amount),
     };
     let invoice_url = match effects.create_subscription_invoice_link(&request).await {
         Ok(invoice_url) => invoice_url,
@@ -4096,7 +4142,7 @@ fn vip_invoice_control_job_from_message_at(
     let data = payment_control_data_from_message(
         message,
         ControlKind::VipInvoice,
-        subscription_price_stars_for_user(user),
+        SUBSCRIPTION_PRICE_STARS,
     );
     control_job_from_message_at(message, data, "vip invoice", created)
         .map(Box::new)
@@ -4872,18 +4918,6 @@ fn payment_command_from_message(message: &TelegramMessage) -> Option<PaymentComm
         target: command.target,
         arguments: command.arguments,
     })
-}
-
-fn subscription_price_stars_for_user(user: &TelegramUser) -> i64 {
-    if user
-        .username
-        .as_ref()
-        .is_some_and(|username| username == "WaveCut")
-    {
-        1
-    } else {
-        SUBSCRIPTION_PRICE_STARS
-    }
 }
 
 fn donation_amount_stars_from_command_arguments(arguments: &str) -> Result<i64, ()> {
@@ -6483,7 +6517,7 @@ where
                     send_payment_text(
                         effects,
                         message,
-                        SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                        &with_support_link(SUBSCRIPTION_DETAILS_ERROR_TEXT, effects.support_url()),
                         openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
                     )
                     .await;
@@ -6496,7 +6530,7 @@ where
                     send_payment_text(
                         effects,
                         message,
-                        SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                        &with_support_link(SUBSCRIPTION_DETAILS_ERROR_TEXT, effects.support_url()),
                         openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
                     )
                     .await;
@@ -6511,7 +6545,7 @@ where
             send_payment_text(
                 effects,
                 message,
-                SUBSCRIPTION_SAVE_ERROR_TEXT,
+                &with_support_link(SUBSCRIPTION_SAVE_ERROR_TEXT, effects.support_url()),
                 openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
             )
             .await;
@@ -6544,7 +6578,7 @@ where
             send_payment_text(
                 effects,
                 message,
-                SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                &with_support_link(SUBSCRIPTION_DETAILS_ERROR_TEXT, effects.support_url()),
                 openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
             )
             .await;
@@ -6561,7 +6595,7 @@ where
             send_payment_text(
                 effects,
                 message,
-                SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                &with_support_link(SUBSCRIPTION_DETAILS_ERROR_TEXT, effects.support_url()),
                 openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
             )
             .await;
@@ -6593,7 +6627,7 @@ where
             send_payment_text(
                 effects,
                 message,
-                SUBSCRIPTION_LEDGER_ERROR_TEXT,
+                &with_support_link(SUBSCRIPTION_LEDGER_ERROR_TEXT, effects.support_url()),
                 openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
             )
             .await;
@@ -6648,7 +6682,7 @@ where
                     send_payment_text(
                         effects,
                         message,
-                        DONATION_DETAILS_ERROR_TEXT,
+                        &with_support_link(DONATION_DETAILS_ERROR_TEXT, effects.support_url()),
                         openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
                     )
                     .await;
@@ -6661,7 +6695,7 @@ where
                     send_payment_text(
                         effects,
                         message,
-                        DONATION_DETAILS_ERROR_TEXT,
+                        &with_support_link(DONATION_DETAILS_ERROR_TEXT, effects.support_url()),
                         openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
                     )
                     .await;
@@ -6676,7 +6710,7 @@ where
             send_payment_text(
                 effects,
                 message,
-                DONATION_SAVE_ERROR_TEXT,
+                &with_support_link(DONATION_SAVE_ERROR_TEXT, effects.support_url()),
                 openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
             )
             .await;
@@ -6859,15 +6893,28 @@ fn vip_display_days_left_at(expires_at: OffsetDateTime, now: OffsetDateTime) -> 
         .max(0.0) as i64
 }
 
-const SUBSCRIPTION_SAVE_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при активации подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
-const SUBSCRIPTION_DETAILS_ERROR_TEXT: &str = "✅ Платеж успешно обработан, но возникла ошибка при получении деталей подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
-const SUBSCRIPTION_LEDGER_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при фиксации VIP периода. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
+/// What an operator's test purchase of a subscription costs.
+const SUBSCRIPTION_TEST_PRICE_STARS: i64 = 1;
+
+/// Close a payment error with the configured support link, or with the plain word when none
+/// is configured.
+fn with_support_link(text: &str, support_url: &str) -> String {
+    if support_url.is_empty() {
+        format!("{text}поддержку")
+    } else {
+        format!("{text}[поддержку]({support_url})")
+    }
+}
+
+const SUBSCRIPTION_SAVE_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при активации подписки. Пожалуйста, обратитесь в ";
+const SUBSCRIPTION_DETAILS_ERROR_TEXT: &str = "✅ Платеж успешно обработан, но возникла ошибка при получении деталей подписки. Пожалуйста, обратитесь в ";
+const SUBSCRIPTION_LEDGER_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при фиксации VIP периода. Пожалуйста, обратитесь в ";
 const VIP_SUBSCRIPTION_DETAILS_ERROR_TEXT: &str =
     "❌ Не удалось получить информацию о вашей подписке.";
 const VIP_STATUS_DETAILS_ERROR_TEXT: &str =
     "❌ Не удалось получить информацию о вашем VIP статусе.";
-const DONATION_SAVE_ERROR_TEXT: &str = "❤️ Спасибо за донат! К сожалению, возникла ошибка при сохранении информации о платеже. Можете сообщить об этом в [поддержку](https://t.me/WaveCut)";
-const DONATION_DETAILS_ERROR_TEXT: &str = "❤️ Спасибо за ваш донат! Платеж успешно обработан, но возникла ошибка при получении деталей. Можете сообщить об этом в [поддержку](https://t.me/WaveCut)";
+const DONATION_SAVE_ERROR_TEXT: &str = "❤️ Спасибо за донат! К сожалению, возникла ошибка при сохранении информации о платеже. Можете сообщить об этом в ";
+const DONATION_DETAILS_ERROR_TEXT: &str = "❤️ Спасибо за ваш донат! Платеж успешно обработан, но возникла ошибка при получении деталей. Можете сообщить об этом в ";
 const USER_IDENTIFICATION_ERROR_TEXT: &str = "❌ Не удалось определить пользователя.";
 const SUBSCRIPTION_INVOICE_CREATE_ERROR_TEXT: &str =
     "❌ Не удалось создать счет для подписки. Пожалуйста, попробуйте позже.";
@@ -7395,7 +7442,7 @@ mod tests {
             vec![SentPaymentText {
                 chat_id: 42,
                 reply_to_message_id: 100,
-                text: super::SUBSCRIPTION_SAVE_ERROR_TEXT.to_owned(),
+                text: super::with_support_link(super::SUBSCRIPTION_SAVE_ERROR_TEXT, ""),
                 parse_mode: openplotva_telegram::TELEGRAM_PARSE_MODE_HTML.to_owned(),
             }]
         );
@@ -7747,20 +7794,22 @@ mod tests {
     }
 
     #[test]
-    fn vip_invoice_command_preserves_wavecut_price_override() -> Result<(), Box<dyn Error>> {
+    fn vip_invoice_command_prices_by_the_standard_rate_whatever_the_username()
+    -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
 
         let PaymentInvoiceControlJobBuild::Job(job) = payment_invoice_control_job_from_update_at(
-            &sample_payment_command_update_with_username("/vip", "WaveCut")?,
+            &sample_payment_command_update_with_username("/vip", "someone")?,
             created,
         ) else {
             panic!("VIP command should build a control job");
         };
 
+        // A username is not an identity: the test price is decided by user id at invoicing.
         let control_data = job.data.control_data.as_ref().expect("control data");
         assert_eq!(control_data.kind, ControlKind::VipInvoice);
-        assert_eq!(control_data.amount, 1);
-        assert_eq!(control_data.user_name, "WaveCut");
+        assert_eq!(control_data.amount, super::SUBSCRIPTION_PRICE_STARS);
+        assert_eq!(control_data.user_name, "someone");
         Ok(())
     }
 
@@ -11712,6 +11761,43 @@ mod tests {
         );
         assert!(effects.invoice_error_texts().is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn vip_invoice_charges_the_test_price_only_to_configured_users()
+    -> Result<(), Box<dyn Error>> {
+        let stub = EffectsStub::default()
+            .with_next_invoice_url("https://t.me/invoice-vip")
+            .with_next_invoice_url("https://t.me/invoice-vip");
+        let effects = PaymentRuntimeEffects::new(stub.clone(), stub.clone())
+            .with_subscription_test_price_users(vec![42_i64]);
+
+        let configured = sample_invoice_job(ControlKind::VipInvoice);
+        execute_vip_invoice_control_job(&effects, &configured).await;
+        let mut other = sample_invoice_job(ControlKind::VipInvoice);
+        other.user_id = 43;
+        execute_vip_invoice_control_job(&effects, &other).await;
+
+        let requests = stub.subscription_invoice_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].amount_stars,
+            super::SUBSCRIPTION_TEST_PRICE_STARS
+        );
+        assert_eq!(requests[1].amount_stars, configured.data.amount);
+        Ok(())
+    }
+
+    #[test]
+    fn payment_errors_link_the_configured_support_contact() {
+        assert_eq!(
+            super::with_support_link("обратитесь в ", "https://t.me/example_support"),
+            "обратитесь в [поддержку](https://t.me/example_support)"
+        );
+        assert_eq!(
+            super::with_support_link("обратитесь в ", ""),
+            "обратитесь в поддержку"
+        );
     }
 
     #[tokio::test]

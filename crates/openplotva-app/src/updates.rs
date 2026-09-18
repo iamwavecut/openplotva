@@ -2177,11 +2177,11 @@ mod tests {
             br#"{
                 "update_id": 1521135730,
                 "message": {
-                    "message_id": 529364,
+                    "message_id": 4242,
                     "date": 1783909208,
-                    "chat": {"id": -1002633257301, "type": "supergroup", "title": "Chat"},
+                    "chat": {"id": -1009876543211, "type": "supergroup", "title": "Chat"},
                     "from": {"id": 777000, "is_bot": false, "first_name": "Telegram"},
-                    "sender_chat": {"id": -1002689651729, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -1009876543212, "type": "channel", "title": "News"},
                     "text": "automatic forward",
                     "is_automatic_forward": true
                 }
@@ -2194,9 +2194,9 @@ mod tests {
         assert!(report.inbound_entry_persisted);
         let entries = store.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sender_id, -1002689651729);
+        assert_eq!(entries[0].sender_id, -1009876543212);
         let payload: Value = serde_json::from_slice(&entries[0].payload)?;
-        assert_eq!(payload["sender_chat"]["id"], -1002689651729_i64);
+        assert_eq!(payload["sender_chat"]["id"], -1009876543212_i64);
         assert!(payload.get("from").is_none());
         assert_eq!(payload["meta"]["sender_type"], "channel");
         Ok(())
@@ -2210,7 +2210,7 @@ mod tests {
                 "message": {
                     "message_id": 529365,
                     "date": 1783909208,
-                    "chat": {"id": -1002633257301, "type": "supergroup", "title": "Chat"},
+                    "chat": {"id": -1009876543211, "type": "supergroup", "title": "Chat"},
                     "from": {"id": 42, "is_bot": false, "first_name": "Forwarder"},
                     "sticker": {
                         "file_id": "sticker-file",
@@ -2323,7 +2323,7 @@ mod tests {
             let mut message = json!({
                 "message_id": 600_000 + index,
                 "date": 1_783_909_208,
-                "chat": {"id": -1002633257301_i64, "type": "supergroup", "title": "Chat"},
+                "chat": {"id": -1009876543211_i64, "type": "supergroup", "title": "Chat"},
                 "from": {"id": 42, "is_bot": false, "first_name": "Forwarder"},
                 "forward_origin": {
                     "type": "channel",

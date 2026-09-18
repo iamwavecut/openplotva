@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GETA_SSH_TARGET: wavecut@geta.moe
-  GETA_DEPLOY_ROOT: /home/wavecut/openplotva
+  GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+  GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
 
 permissions: {}
 

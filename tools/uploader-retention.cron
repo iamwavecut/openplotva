@@ -1,5 +1,5 @@
 # Install as /etc/cron.d/openplotva-uploader-retention, owned by root, mode 0644.
-# geta.moe uses UTC. Media URLs in old messages expire when their files are deleted.
+# The production host uses UTC. Media URLs in old messages expire when their files are deleted.
 # Preserve the existing -mtime +7 policy: delete at eight complete days of age.
 # Do not follow symlinks or cross filesystems. A lock and deadline bound each run.
 SHELL=/bin/sh

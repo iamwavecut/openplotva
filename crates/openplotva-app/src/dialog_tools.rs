@@ -3912,7 +3912,7 @@ mod tests {
         let result = toolbox
             .history_search(HistorySearchRequest {
                 context: context(),
-                query: "  CherryCherry123  ".to_owned(),
+                query: "  cherry_example  ".to_owned(),
             })
             .await?;
 
@@ -3921,13 +3921,13 @@ mod tests {
         assert_eq!(
             result.data,
             Some(json!({
-                "query": "CherryCherry123",
+                "query": "cherry_example",
                 "results": "- Cherry: hello",
             }))
         );
         assert_eq!(
             searcher.calls(),
-            vec![(-100, Some(7), "CherryCherry123".to_owned())]
+            vec![(-100, Some(7), "cherry_example".to_owned())]
         );
         Ok(())
     }

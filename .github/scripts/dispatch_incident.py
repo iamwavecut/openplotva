@@ -47,7 +47,7 @@ def main():
         hosts.chmod(0o600)
         subprocess.run(["ssh", "-T", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(hosts),
-                        "-o", "ConnectTimeout=15", "openplotva-maintenance-dispatch@geta.moe",
+                        "-o", "ConnectTimeout=15", os.environ["MAINTENANCE_DISPATCH_TARGET"],
                         f"enqueue {number} {run_id}"], check=True, timeout=90)
     print("Accepted by the durable maintenance controller; this is not a repair result.")
 

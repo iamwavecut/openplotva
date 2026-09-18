@@ -36,7 +36,7 @@ services:
       OPENPLOTVA_PRODUCE_UPDATES: "true"
     ports:
       - "127.0.0.1:8080:8080"
-      - "${OPENPLOTVA_RUNTIME_API_PUBLISH_HOST:-100.77.77.51}:9091:9091"
+      - "${OPENPLOTVA_RUNTIME_API_PUBLISH_HOST:?set OPENPLOTVA_RUNTIME_API_PUBLISH_HOST in the production env}:9091:9091"
     volumes:
       - openplotva-state:/home/openplotva/.plotva
     depends_on:

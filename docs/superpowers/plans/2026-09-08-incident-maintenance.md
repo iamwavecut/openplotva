@@ -11,7 +11,7 @@ remain manual. No production data or credentials belong in GitHub artifacts.
 - OMP 18.1.14, GLM 5.3, Rust 1.95.0; no automatic paid-provider fallback.
 - One active agent, 30 initial / 10 deep starts per rolling 24 hours.
 - Initial diagnosis: 600 seconds; deep work: 14,400 active seconds, 5 feedback rounds.
-- Runtime: geta.moe, GitHub-hosted dispatch over restricted SSH.
+- Runtime: the production host, GitHub-hosted dispatch over restricted SSH.
 - Worker: non-root, 2 CPU, 4 GiB RAM, 8 GiB workspace, no host mounts or Docker socket.
 - Before start: 6 GiB available RAM, 8 GiB disk reserve beyond workspace allocation.
 - All GitHub and notification publication is performed by trusted controller code.

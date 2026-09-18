@@ -255,7 +255,7 @@ impl RichSender for MockRichSender {
         _content_type: &'a str,
         _explicit_name: Option<&'a str>,
     ) -> RichUploadFuture<'a> {
-        Box::pin(async { Ok("https://plotva.geta.moe/media/mock.bin".to_owned()) })
+        Box::pin(async { Ok("https://uploader.example.com/media/mock.bin".to_owned()) })
     }
 
     fn upload_url<'a>(
@@ -442,7 +442,7 @@ mod tests {
         let song = SongMessage {
             title: "Песня",
             styles: "synthwave · 102 BPM · female vocals",
-            audio_url: "https://plotva.geta.moe/x.mp3",
+            audio_url: "https://uploader.example.com/x.mp3",
             lyrics: "строка 1\nстрока 2",
             footer_html: "за авторством <i>Автор</i>",
         };
@@ -452,7 +452,7 @@ mod tests {
         let footer = html.find("<footer>").expect("song should include footer");
         assert!(audio < details && details < footer);
         assert!(html.contains("<p>🎛 <i>synthwave · 102 BPM · female vocals</i></p>"));
-        assert!(html.contains(r#"<audio src="https://plotva.geta.moe/x.mp3"></audio>"#));
+        assert!(html.contains(r#"<audio src="https://uploader.example.com/x.mp3"></audio>"#));
         assert!(html.contains("<blockquote>строка 1<br/>строка 2</blockquote>"));
         assert!(html.contains("<footer>за авторством <i>Автор</i></footer>"));
         assert!(

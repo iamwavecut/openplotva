@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-deploy_root="${OPENPLOTVA_DEPLOY_ROOT:-/home/wavecut/openplotva}"
+deploy_root="${OPENPLOTVA_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 compose_file="${OPENPLOTVA_BACKUP_COMPOSE_FILE:-${deploy_root}/compose.production.yml}"
 env_file="${OPENPLOTVA_BACKUP_ENV_FILE:-${deploy_root}/.env.production}"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"

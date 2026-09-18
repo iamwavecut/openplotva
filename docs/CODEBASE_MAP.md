@@ -420,7 +420,7 @@ Image-prompt parsing/optimization (NSFW safe/adult/forbidden), the song
 director contract (`SongPromptPayload` schema, tag compiler, lyrics
 canonicalization, instrumental/duration rules) plus the farm music client
 (completion + native release-task modes, `audio_config.max_seconds`, seed and
-duration from `usage`), and the `plotva.geta.moe` public uploader
+duration from `usage`), and the public media uploader
 (Telegram-safe URLs, preserves caller filenames).
 
 #### `openplotva-memory`
