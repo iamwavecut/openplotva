@@ -2580,12 +2580,59 @@ pub fn extract_content_tool_step(
 
 /// Parse model content for one or more XML-ish, inline, normalized, JSON, or
 /// bare tool calls.
+/// The same call written twice in one reply is one action: a model that loops writes the
+/// identical element a dozen times, and executing each one only spends the turn.
+fn dedupe_tool_steps(steps: Vec<ToolStep>) -> Vec<ToolStep> {
+    let mut seen: Vec<ToolStep> = Vec::with_capacity(steps.len());
+    for step in steps {
+        if !seen.contains(&step) {
+            seen.push(step);
+        }
+    }
+    seen
+}
+
 pub fn extract_content_tool_steps(
+    raw_content: &str,
+) -> Result<(Vec<ToolStep>, ToolParseDecision), ToolParseError> {
+    let (steps, decision) = extract_content_tool_steps_raw(raw_content)?;
+    Ok((dedupe_tool_steps(steps), decision))
+}
+
+fn extract_content_tool_steps_raw(
     raw_content: &str,
 ) -> Result<(Vec<ToolStep>, ToolParseDecision), ToolParseError> {
     let raw_content = raw_content.trim();
     if let Some((steps, decision)) = detect_tool_steps_in(raw_content)? {
+        let scanned = scan_xmlish_tool_steps(raw_content, 0);
+        if scanned.len() > steps.len() {
+            let decision = ToolParseDecision {
+                form: "xmlish_scan".to_owned(),
+                tool: scanned
+                    .iter()
+                    .map(|step| step.step.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                outcome: "detected".to_owned(),
+                reason: String::new(),
+            };
+            return Ok((scanned, decision));
+        }
         return Ok((steps, decision));
+    }
+    let scanned = scan_xmlish_tool_steps(raw_content, 0);
+    if !scanned.is_empty() {
+        let decision = ToolParseDecision {
+            form: "xmlish_scan".to_owned(),
+            tool: scanned
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
+        return Ok((scanned, decision));
     }
     // Some backends leak a tool call as HTML-entity-encoded markup in the
     // assistant text (e.g. `&lt;tool_calls&gt;web_search{...}&lt;/tool_calls&gt;`).
@@ -2660,6 +2707,199 @@ fn detect_tool_steps_in(
 
     detect_tool_step_in(content)
         .map(|maybe_step| maybe_step.map(|(step, decision)| (vec![step], decision)))
+}
+
+/// Elements a reply copies from the prompt's transcript. They carry no call, but a call
+/// can follow them, so the scan steps over them instead of ending there.
+const TRANSCRIPT_ECHO_ELEMENTS: &[&str] = &[
+    "message",
+    "last_message",
+    "messages",
+    "message_type",
+    "text",
+    "user",
+    "reply",
+    "reply_to",
+    "to_user",
+    "attach_id",
+    "attachment",
+    "history",
+];
+
+/// How deep a plural call container may nest before the scan gives up.
+const XMLISH_CONTAINER_MAX_DEPTH: usize = 3;
+
+/// Every tool call an XML-ish reply carries, in the order the model wrote them.
+///
+/// Each shape-specific parser owns one form and the first one to find anything wins, so a
+/// reply that mixes forms — an attribute-named call beside a tool-named element — keeps one
+/// call and drops the rest. This walks the elements once and reads whichever form each of
+/// them carries. Anything it cannot read it skips: the result is only used when it recovers
+/// more calls than the shape parsers did.
+fn scan_xmlish_tool_steps(raw: &str, depth: usize) -> Vec<ToolStep> {
+    let mut steps = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = raw[offset..].find('<') {
+        let start = offset + relative;
+        // The call protocol leads a reply; a call quoted inside prose is prose. Anything
+        // but whitespace before an element ends the protocol run.
+        if depth == 0 && !raw[offset..start].trim().is_empty() {
+            break;
+        }
+        if raw[start..].starts_with("</") {
+            offset = start + 2;
+            continue;
+        }
+        let Some(relative_open_end) = raw[start..].find('>') else {
+            break;
+        };
+        let open_end = start + relative_open_end + 1;
+        let tag = &raw[start..open_end];
+        let name = xmlish_tool_tag_name(tag);
+        let lower = name.to_ascii_lowercase();
+        let direct = canonical_known_step(&name);
+        let is_wrapper = matches!(lower.as_str(), "call" | "tool" | "tool_call" | "tool_calls");
+        let names_its_tool = matches!(lower.as_str(), "call_name" | "tool_name" | "name");
+        if !is_wrapper && direct.is_none() && !names_its_tool {
+            // A reply that first echoes the transcript and then calls a tool still calls it:
+            // the echo is copied context, not prose, and the guard judges it separately.
+            if depth == 0 && !TRANSCRIPT_ECHO_ELEMENTS.contains(&lower.as_str()) {
+                break;
+            }
+            offset = open_end;
+            continue;
+        }
+        let self_closing = tag.trim_end().ends_with("/>");
+        let close = (!self_closing)
+            .then(|| find_xmlish_tool_close(&raw[open_end..], &name, false))
+            .flatten()
+            .map(|(at, len)| (open_end + at, len));
+        let body = close.map_or("", |(body_end, _)| &raw[open_end..body_end]);
+        let after = close.map_or(open_end, |(body_end, close_len)| body_end + close_len);
+
+        if names_its_tool {
+            // `<call_name>draw_image</call_name>` with `<arg name="...">` siblings after it:
+            // the name element is the call and the arguments follow it.
+            if let Some(step) = xmlish_sibling_named_step(body, &raw[after..]) {
+                steps.push(step);
+            }
+            offset = after.max(open_end);
+            continue;
+        }
+
+        let mut found = None;
+        if let Some(step_name) = direct {
+            found = xmlish_direct_element_step(tag, body, step_name);
+        }
+        if found.is_none() && is_wrapper {
+            found = xmlish_wrapper_element_step(tag, body);
+        }
+        match found {
+            Some(step) => steps.push(step),
+            None if is_wrapper && depth < XMLISH_CONTAINER_MAX_DEPTH && !body.trim().is_empty() => {
+                // A plural container holds the calls rather than being one.
+                steps.extend(scan_xmlish_tool_steps(body, depth + 1));
+            }
+            None => {}
+        }
+        offset = after.max(open_end);
+    }
+    steps
+}
+
+/// A tool-named element (`<draw_image prompt="...">`, `<send_message><text>…</text>`).
+fn xmlish_direct_element_step(tag: &str, body: &str, name: &'static str) -> Option<ToolStep> {
+    if let Ok(Some(step)) = parse_xmlish_direct_tool_tag_step(tag) {
+        return Some(step);
+    }
+    let arguments = xmlish_element_arguments(tag, body);
+    (!arguments.is_empty())
+        .then(|| decode_tool_call_arguments(name, &Value::Object(arguments)).ok())
+        .flatten()
+}
+
+/// A wrapper element that names its tool in an attribute (`name=`, `call=`), in a child, or
+/// in a JSON body.
+fn xmlish_wrapper_element_step(tag: &str, body: &str) -> Option<ToolStep> {
+    let named = xmlish_tool_attr(tag, "name")
+        .or_else(|| xmlish_tool_attr(tag, "call"))
+        .or_else(|| xmlish_tool_attr(tag, "tool"))
+        .and_then(|value| canonical_known_step(value.trim()));
+    if let Some(name) = named {
+        let mut step = ToolStep {
+            step: name.to_owned(),
+            ..ToolStep::default()
+        };
+        populate_xmlish_tool_attrs(tag, &mut step).ok()?;
+        for (key, value) in xmlish_element_arguments(tag, body) {
+            if let Value::String(value) = value {
+                populate_tool_args(|wanted| (wanted == key).then(|| value.clone()), &mut step);
+            }
+        }
+        return normalize_and_validate_step(step).ok();
+    }
+    if let Some(raw_name) =
+        xmlish_child_text(body, "tool_name").or_else(|| xmlish_child_text(body, "name"))
+        && let Some(name) = canonical_known_step(&raw_name)
+    {
+        let arguments_body = xmlish_child_text(body, "arguments")
+            .or_else(|| xmlish_child_text(body, "args"))
+            .unwrap_or_else(|| body.to_owned());
+        let mut arguments = xmlish_named_arg_children(&arguments_body);
+        for key in INLINE_TOOL_ARG_KEYS {
+            if let Some(value) = xmlish_child_text(&arguments_body, key) {
+                arguments.insert((*key).to_owned(), Value::String(value));
+            }
+        }
+        return decode_tool_call_arguments(name, &Value::Object(arguments)).ok();
+    }
+    // `<tool_call>{ "name": "draw_image", "arguments": { … } }</tool_call>`
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed)
+    {
+        let raw_name = ["name", "tool", "tool_name", "function"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))?;
+        let name = canonical_known_step(raw_name.trim())?;
+        let arguments = ["arguments", "args", "parameters", "input"]
+            .iter()
+            .find_map(|key| object.get(*key))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return decode_tool_call_arguments(name, &arguments).ok();
+    }
+    None
+}
+
+/// Arguments of one element: `<arg name="...">` children plus the argument elements the
+/// catalog knows (`<prompt>`, `<topic>`, …).
+fn xmlish_element_arguments(tag: &str, body: &str) -> serde_json::Map<String, Value> {
+    let mut arguments = xmlish_named_arg_children(body);
+    for key in INLINE_TOOL_ARG_KEYS {
+        if let Some(value) = xmlish_child_text(body, key) {
+            arguments.insert((*key).to_owned(), Value::String(value));
+        }
+        if let Some(value) = xmlish_tool_attr(tag, key) {
+            arguments.insert((*key).to_owned(), Value::String(value));
+        }
+    }
+    arguments
+}
+
+/// `<call_name>NAME</call_name>` followed by its `<arg name="...">` siblings, up to the next
+/// name element.
+fn xmlish_sibling_named_step(name_body: &str, rest: &str) -> Option<ToolStep> {
+    let name = canonical_known_step(unescape_xmlish(name_body.trim()).trim())?;
+    let end = ["<call_name", "<tool_name"]
+        .iter()
+        .filter_map(|marker| index_fold(rest, marker))
+        .min()
+        .unwrap_or(rest.len());
+    let arguments = xmlish_named_arg_children(&rest[..end]);
+    (!arguments.is_empty())
+        .then(|| decode_tool_call_arguments(name, &Value::Object(arguments)).ok())
+        .flatten()
 }
 
 fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
@@ -3602,9 +3842,7 @@ fn xmlish_named_arg_children(body: &str) -> serde_json::Map<String, Value> {
         let open_end = start + relative_end + 1;
         let tag = &body[start..open_end];
         let element = xmlish_tool_tag_name(tag).to_ascii_lowercase();
-        if !matches!(element.as_str(), "arg" | "argument" | "param" | "parameter")
-            || tag.trim_end().ends_with("/>")
-        {
+        if !matches!(element.as_str(), "arg" | "argument" | "param" | "parameter") {
             offset = open_end;
             continue;
         }
@@ -3613,6 +3851,20 @@ fn xmlish_named_arg_children(body: &str) -> serde_json::Map<String, Value> {
             offset = open_end;
             continue;
         };
+        // A self-closing argument carries its value in an attribute instead of a body.
+        if tag.trim_end().ends_with("/>") {
+            if let Some(value) = ["value", "arg_value", "val"]
+                .iter()
+                .find_map(|attr| xmlish_tool_attr(tag, attr))
+            {
+                let value = unescape_xmlish(value.trim());
+                if !value.is_empty() {
+                    arguments.insert(key.trim().to_owned(), Value::String(value));
+                }
+            }
+            offset = open_end;
+            continue;
+        }
         let close = format!("</{element}>");
         let Some(relative_close) = index_fold(&body[open_end..], &close) else {
             break;
@@ -3917,7 +4169,7 @@ fn populate_xmlish_tool_attrs(tag: &str, step: &mut ToolStep) -> Result<(), Tool
     if let Some(arg) = xmlish_tool_attr(tag, "arg") {
         populate_jsonish_or_inline_args(&arg, step)?;
     }
-    for attr in ["args", "arguments"] {
+    for attr in ["args", "arguments", "args_json", "arguments_json"] {
         if let Some(args) = xmlish_tool_attr(tag, attr) {
             populate_jsonish_or_inline_args(&args, step)?;
         }
@@ -5277,20 +5529,22 @@ mod tests {
         assert_eq!(plural_container.tool_steps[0].query, "погода");
         assert_eq!(plural_container.tool_steps[1].prompt, "a fox");
 
-        // A reply mixing an attribute-shaped call with a named one executes the first of
-        // the two, whichever shape it is: each parser owns its own form, and the one that
-        // matches first wins.
+        // A reply mixing an attribute-shaped call with a named one runs both, in the order
+        // written. Production wrote exactly this and lost a song: the attribute-shaped
+        // `generate_song` sat next to a tool-named `send_message`, and only one survived.
         let attribute_first = parse_assistant_content(
             "<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>\n<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>",
         )?;
-        assert_eq!(attribute_first.tool_steps.len(), 1);
+        assert_eq!(attribute_first.tool_steps.len(), 2);
         assert_eq!(attribute_first.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(attribute_first.tool_steps[1].step, STEP_WEB_SEARCH);
 
         let named_first = parse_assistant_content(
             "<tool_call><name>web_search</name><args><query>погода</query></args></tool_call>\n<tool_call name=\"draw_image\" args='{\"prompt\": \"a fox\"}'/>",
         )?;
-        assert_eq!(named_first.tool_steps.len(), 1);
+        assert_eq!(named_first.tool_steps.len(), 2);
         assert_eq!(named_first.tool_steps[0].step, STEP_WEB_SEARCH);
+        assert_eq!(named_first.tool_steps[1].step, STEP_DRAW_IMAGE);
 
         // The legacy <call> element still reads arguments only from <arguments>: a sibling
         // child stays out of them, exactly as before.
@@ -5376,6 +5630,97 @@ mod tests {
             DialogReplyOutcome::Reply(text) => assert_eq!(text, "сравни 3 < 5 сама"),
             other => panic!("expected the reply once, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_reads_every_call_a_mixed_reply_carries() -> Result<(), ToolParseError> {
+        // Production, 2026-09-17: the song was lost because the attribute-shaped call and
+        // the tool-named element belong to different parsers and only one could win.
+        let mixed = parse_assistant_content(concat!(
+            "<tool_call name=\"generate_song\" args_json='{\"topic\": \"pro kotov\"}'></tool_call>\n",
+            "<send_message text=\"Песня уже в работе, жди релиз\"></send_message>"
+        ))?;
+        assert_eq!(
+            mixed
+                .tool_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>(),
+            vec![STEP_GENERATE_SONG, STEP_SEND_MESSAGE]
+        );
+        assert_eq!(mixed.tool_steps[0].topic, "pro kotov");
+
+        // The call follows a copied transcript: the echo is context, not prose, so the
+        // call behind it still runs. ("Где моя песня?" — production, same evening.)
+        let after_echo = parse_assistant_content(concat!(
+            "<message id=\"212994\" thread_id=\"212946\" timestamp=\"t\">\n",
+            "  <user username=\"AndrewDI8\" type=\"user\">Конь в пальто</user>\n",
+            "  <text>Где моя песня ?</text>\n",
+            "</message>\n\n",
+            "<tool_call name=\"generate_song\" args='{ \"topic\": \"pro smurfov\" }'></tool_call>"
+        ))?;
+        assert_eq!(after_echo.tool_steps.len(), 1);
+        assert_eq!(after_echo.tool_steps[0].step, STEP_GENERATE_SONG);
+
+        // Stepping over the echo does not loosen the named-call protocol: that form runs
+        // only when it leads, so an example of one written in prose stays prose.
+        let quoted_after_echo = parse_assistant_content(concat!(
+            "<message id=\"1\" timestamp=\"t\"><text>привет</text></message>\n\n",
+            "Вот так это пишется: <call><tool_name>draw_image</tool_name></call>"
+        ))?;
+        assert!(quoted_after_echo.tool_steps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parser_reads_the_call_shapes_production_improvises() -> Result<(), ToolParseError> {
+        // Arguments in a self-closing element's attribute, named by a sibling element.
+        let sibling_named = parse_assistant_content(concat!(
+            "<call_name>draw_image</call_name>",
+            "<arg name=\"prompt\" arg_value=\"two sad cats in suits\"/>",
+            "<arg name=\"aspect_ratio\" arg_value=\"16:9\"/>"
+        ))?;
+        assert_eq!(sibling_named.tool_steps.len(), 1);
+        assert_eq!(sibling_named.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(sibling_named.tool_steps[0].prompt, "two sad cats in suits");
+
+        // A JSON body inside the call element.
+        let json_body = parse_assistant_content(
+            "<tool_call>\n{ \"name\": \"draw_image\", \"arguments\": { \"prompt\": \"a red apple\" } }\n</tool_call>",
+        )?;
+        assert_eq!(json_body.tool_steps.len(), 1);
+        assert_eq!(json_body.tool_steps[0].prompt, "a red apple");
+
+        // An opening tag whose attributes are complete but whose `>` never arrived.
+        let unterminated_open = parse_assistant_content(concat!(
+            "<tool_calls>\n",
+            "  <tool_call name=\"chat_history_summary\" args='{ \"window\": \"day\" }</tool_call>\n",
+            "</tool_call>"
+        ))?;
+        assert_eq!(unterminated_open.tool_steps.len(), 1);
+        assert_eq!(
+            unterminated_open.tool_steps[0].step,
+            STEP_CHAT_HISTORY_SUMMARY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_call_written_twice_runs_once() -> Result<(), ToolParseError> {
+        // A looping model wrote this one thirteen times; each extra copy only spends the
+        // turn on another round trip.
+        let repeated =
+            "<react_to_message chat_id=\"current\" emoji=\"🤣\" message_id=\"25451\">\n".repeat(13);
+        let parsed = parse_assistant_content(&repeated)?;
+        assert_eq!(parsed.tool_steps.len(), 1);
+
+        // Reactions that differ are different actions and all of them stay.
+        let distinct = parse_assistant_content(concat!(
+            "<react_to_message chat_id=\"c\" emoji=\"🤣\" message_id=\"1\" />\n",
+            "<react_to_message chat_id=\"c\" emoji=\"😂\" message_id=\"2\" />"
+        ))?;
+        assert_eq!(distinct.tool_steps.len(), 2);
+        Ok(())
     }
 
     #[test]
