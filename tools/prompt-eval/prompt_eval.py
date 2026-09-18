@@ -37,6 +37,8 @@ IF_EQ_RE = re.compile(
 )
 RAW_VAR_RE = re.compile(r"\{\{\{\s*(\w+)\s*\}\}\}|\{\{&\s*(\w+)\s*\}\}")
 VAR_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+EACH_RE = re.compile(r"\{\{#each\s+(\w+)\s*\}\}(.*?)\{\{/each\}\}", re.S)
+THIS_RE = re.compile(r"\{\{\s*this\.(\w+)\s*\}\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 CYRILLIC = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґЎў]")
 LATIN = re.compile(r"[A-Za-z]")
@@ -59,6 +61,16 @@ def render_template(text: str, variables: dict[str, Any]) -> str:
         value = variables.get(name)
         return bool(value) and value not in ("0", "false")
 
+    def each(match: re.Match) -> str:
+        items = variables.get(match.group(1)) or []
+        body = match.group(2)
+        return "".join(
+            THIS_RE.sub(lambda f: handlebars_escape(str(item.get(f.group(1), ""))), body)
+            for item in items
+            if isinstance(item, dict)
+        )
+
+    text = EACH_RE.sub(each, text)
     text = IF_EQ_RE.sub(
         lambda m: (m.group(3) if str(variables.get(m.group(1), "")) == m.group(2) else (m.group(4) or "")),
         text,
@@ -358,11 +370,15 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
         texts = strings_in(walk(parsed, path)) if (path and parsed is not None) else [raw]
         share = script_share(texts, lang)
         return share >= 0.9, f"{lang} share {share:.2f}"
-    if name == "no_phrases":
-        hits = [p for p in arg.split(";") if p and p.lower() in raw.lower()]
+    if name in ("no_phrases", "no_substring"):
+        needle, scoped, field = arg.rpartition("@") if "@" in arg else (arg, "", "")
+        if scoped and parsed is None:
+            return False, "no json"
+        haystack = "\n".join(strings_in(walk(parsed, field))) if scoped else raw
+        if name == "no_substring":
+            return needle not in haystack, f"found {needle!r}" if needle in haystack else "ok"
+        hits = [p for p in needle.split(";") if p and p.lower() in haystack.lower()]
         return not hits, ", ".join(hits) or "ok"
-    if name == "no_substring":
-        return arg not in raw, f"found {arg!r}" if arg in raw else "ok"
     if name in ("max_items", "min_items"):
         path, _, limit = arg.rpartition(":")
         items = walk(parsed, path)
@@ -512,6 +528,9 @@ SELF_TEST_CASES = [
     ("no_phrases:but wait;let me think", '{"x": "but wait, no"}', False),
     ("no_substring:|", '{"outputs": ["a cat"]}', True),
     ("no_substring:|", '{"outputs": ["a cat | ugly"]}', False),
+    ("no_substring:|@outputs[]", '{"input": "cat | ugly", "outputs": ["a cat"]}', True),
+    ("no_phrases:ugly@outputs[]", '{"input": "cat | ugly", "outputs": ["a cat"]}', True),
+    ("no_phrases:ugly@outputs[]", '{"input": "cat", "outputs": ["an ugly cat"]}', False),
     ("max_items:candidate_cards:1", '{"candidate_cards": []}', True),
     ("max_items:candidate_cards:1", '{"candidate_cards": [1, 2]}', False),
     ("label:PROMPT:", "PROMPT: a cat", True),
@@ -535,6 +554,11 @@ SELF_TEST_CASES = [
 
 
 def self_test() -> int:
+    rendered = render_template(
+        "{{#each slots}}- slot {{this.index}}: {{this.model}}\n{{/each}}{{#if klein}}K{{/if}}",
+        {"slots": [{"index": 0, "model": "A"}, {"index": 1, "model": "B"}], "klein": True},
+    )
+    assert rendered == "- slot 0: A\n- slot 1: B\nK", rendered
     fixture = Fixture(Path("self-test.json"), {"flow": "self_test", "user": {"cards": [{"id": 7}]}})
     failures = 0
     for check, raw, expected in SELF_TEST_CASES:

@@ -44,8 +44,8 @@ fixtures (for example exported production requests) and is never committed.
 | `strict_json` | the output is bare JSON |
 | `schema` | the parsed output satisfies the fixture schema (type, required, properties, items, enum, min/maxItems, additionalProperties) |
 | `lang:<ru\|uk\|be\|en>[:<path>]` | ≥ 90 % of letters at the path (or the whole output) are in the language's script |
-| `no_phrases:<a;b>` | none of the phrases occur (case-insensitive) |
-| `no_substring:<s>` | the literal substring is absent |
+| `no_phrases:<a;b>[@<path>]` | none of the phrases occur (case-insensitive), in the raw output or only at the path |
+| `no_substring:<s>[@<path>]` | the literal substring is absent, from the raw output or only at the path |
 | `max_items:<path>:<n>` / `min_items:<path>:<n>` | the array at the path has at most / at least n items |
 | `ids_from_input` | every integer under a `*_id` / `*_ids` key occurs in the user payload (0 allowed) |
 | `partition_ids` | subject merge: every input card id appears exactly once across clusters, `demote_ids`, `keep_ids` |
