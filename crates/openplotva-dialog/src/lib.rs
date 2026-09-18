@@ -2381,12 +2381,40 @@ fn remove_leading_xmlish_named_call_protocol(raw: &str) -> Option<String> {
     (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
 }
 
+/// Element names that belong to the call protocol rather than to the reply.
+fn is_recognized_tool_element(name: &str) -> bool {
+    matches!(
+        name,
+        "tool"
+            | "tool_call"
+            | "tool_calls"
+            | "call_name"
+            | "tool_name"
+            | "arg"
+            | "argument"
+            | "param"
+            | "parameter"
+    ) || name.starts_with("tool:")
+        || canonical_known_step(name).is_some()
+}
+
 fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
     let mut spans = Vec::new();
     let mut offset = 0;
     while let Some(relative_start) = raw[offset..].find('<') {
         let start = offset + relative_start;
         if raw[start..].starts_with("</") {
+            // A closing tag whose element was removed is protocol too: left behind it would
+            // travel to the chat as an orphan.
+            if let Some(relative_end) = raw[start..].find('>') {
+                let close_end = start + relative_end + 1;
+                let closed = raw[start + 2..close_end - 1].trim().to_ascii_lowercase();
+                if is_recognized_tool_element(strip_call_prefix(&closed)) {
+                    spans.push((start, close_end));
+                    offset = close_end;
+                    continue;
+                }
+            }
             offset = start + 2;
             continue;
         }
@@ -2394,9 +2422,7 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
         let open_end = start + relative_open_end + 1;
         let tag = &raw[start..open_end];
         let name = xmlish_tool_tag_name(tag);
-        let recognized = matches!(name.as_str(), "tool" | "tool_call" | "tool_calls")
-            || name.starts_with("tool:")
-            || canonical_known_step(&name).is_some();
+        let recognized = is_recognized_tool_element(&name);
         if !recognized {
             offset = open_end;
             continue;
@@ -2607,7 +2633,7 @@ fn extract_content_tool_steps_raw(
         let scanned = scan_xmlish_tool_steps(raw_content, 0);
         if scanned.len() > steps.len() {
             let decision = ToolParseDecision {
-                form: "xmlish_scan".to_owned(),
+                form: "xmlish".to_owned(),
                 tool: scanned
                     .iter()
                     .map(|step| step.step.as_str())
@@ -2623,7 +2649,7 @@ fn extract_content_tool_steps_raw(
     let scanned = scan_xmlish_tool_steps(raw_content, 0);
     if !scanned.is_empty() {
         let decision = ToolParseDecision {
-            form: "xmlish_scan".to_owned(),
+            form: "xmlish".to_owned(),
             tool: scanned
                 .iter()
                 .map(|step| step.step.as_str())
@@ -5702,6 +5728,28 @@ mod tests {
             unterminated_open.tool_steps[0].step,
             STEP_CHAT_HISTORY_SUMMARY
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_recovered_call_leaves_no_protocol_behind() -> Result<(), ToolParseError> {
+        // Reading a call is only half the turn: production refuses a reply whose text still
+        // carries protocol markup, so every shape the scan reads must also be strippable.
+        for raw in [
+            "<call_name>draw_image</call_name><arg name=\"prompt\" arg_value=\"a fox\"/>",
+            "<tool_call>\n{ \"name\": \"draw_image\", \"arguments\": { \"prompt\": \"a fox\" } }\n</tool_call>",
+            "<tool_calls>\n  <tool_call name=\"chat_history_summary\" args='{ \"window\": \"day\" }</tool_call>\n</tool_call>",
+            "<tool_call name=\"generate_song\" args_json='{\"topic\": \"kot\"}'></tool_call>\n<send_message text=\"lovi\"></send_message>",
+        ] {
+            let parsed = parse_assistant_content(raw)?;
+            assert!(!parsed.tool_steps.is_empty(), "{raw}");
+            assert!(
+                !parsed.residual_protocol,
+                "a call the parser reads must leave no markup behind: {raw} -> {:?}",
+                parsed.text
+            );
+            assert!(parsed.text.trim().is_empty(), "{raw} -> {:?}", parsed.text);
+        }
         Ok(())
     }
 
