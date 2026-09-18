@@ -52,6 +52,15 @@ use crate::telegram_activity::{
 use crate::vision::TelegramVisionDataUrlProvider;
 
 /// Boxed future returned by image generation providers.
+/// Future returned by [`ImageContextProvider::image_context`].
+pub type ImageContextFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+
+/// Best-effort chat context for the image prompt optimizer: recent messages and
+/// what is known about the requester, as plain text (empty when nothing helps).
+pub trait ImageContextProvider: Send + Sync {
+    fn image_context<'a>(&'a self, request: &'a ImageGenerationRequest) -> ImageContextFuture<'a>;
+}
+
 pub type ImageGenerationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ImageGenerationResult, ImageGenerationError>> + Send + 'a>>;
 /// Boxed future returned by image edit providers.
@@ -144,7 +153,9 @@ pub struct ImageGenerationRequest {
     /// Optimized prompt variants.
     pub prompt_variants: Vec<String>,
     pub is_nsfw: bool,
-    /// Raw negative prompt.
+    /// Raw negative prompt. No current image backend takes one (they run without
+    /// classifier-free guidance), so it is never sent to the image model; the
+    /// optimizer sees it as exclusions to express positively.
     pub negative_prompt: String,
     /// Raw aspect ratio.
     pub aspect_ratio: String,
@@ -1743,10 +1754,23 @@ fn image_edit_retryable_reason(error: &ImageEditError) -> Option<FailureReason> 
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OptimizingImageGenerator<Generator, Optimizer> {
     generator: Generator,
     optimizer: MediaPromptOptimizerService<Optimizer>,
+    context: Option<Arc<dyn ImageContextProvider>>,
+}
+
+impl<Generator: fmt::Debug, Optimizer: fmt::Debug> fmt::Debug
+    for OptimizingImageGenerator<Generator, Optimizer>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OptimizingImageGenerator")
+            .field("generator", &self.generator)
+            .field("optimizer", &self.optimizer)
+            .field("context", &self.context.is_some())
+            .finish()
+    }
 }
 
 impl<Generator, Optimizer> OptimizingImageGenerator<Generator, Optimizer> {
@@ -1759,7 +1783,15 @@ impl<Generator, Optimizer> OptimizingImageGenerator<Generator, Optimizer> {
         Self {
             generator,
             optimizer,
+            context: None,
         }
+    }
+
+    /// Feed chat and requester context into the optimizer call.
+    #[must_use]
+    pub fn with_context_provider(mut self, context: Arc<dyn ImageContextProvider>) -> Self {
+        self.context = Some(context);
+        self
     }
 }
 
@@ -1776,6 +1808,7 @@ where
         Box::pin(async move {
             let request = optimized_image_generation_request(
                 &self.optimizer,
+                self.context.as_deref(),
                 request,
                 self.generator.expected_image_count().max(1),
             )
@@ -1792,6 +1825,7 @@ where
         Box::pin(async move {
             let request = optimized_image_generation_request(
                 &self.optimizer,
+                self.context.as_deref(),
                 request,
                 self.generator.expected_image_count().max(1),
             )
@@ -1836,31 +1870,51 @@ where
 
 async fn optimized_image_generation_request<Optimizer>(
     optimizer: &MediaPromptOptimizerService<Optimizer>,
+    context: Option<&dyn ImageContextProvider>,
     mut request: ImageGenerationRequest,
     variant_count: usize,
 ) -> Result<ImageGenerationRequest, ImageGenerationError>
 where
     Optimizer: MediaPromptOptimizer,
 {
-    if request
+    extract_prompt_modifiers(&mut request);
+    let preset: Vec<String> = request
         .prompt_variants
         .iter()
-        .any(|value| !value.trim().is_empty())
-    {
+        .filter_map(|variant| non_empty(openplotva_media::part_image_prompt(variant).prompt))
+        .collect();
+    if !preset.is_empty() {
+        // `!draw` keeps the user's prompt verbatim; the optimizer only classifies it.
+        let classified = optimizer
+            .enhance_image_prompt(&preset[0], &preset[0], &request.aspect_ratio, 1)
+            .await;
+        if let Some(error) = classified.provider_error.as_deref() {
+            tracing::debug!(%error, "image prompt classification failed; treating as adult");
+        }
+        apply_image_nsfw_result(classified.value.nsfw_result, &mut request)?;
+        request.prompt_variants = preset;
         return Ok(request);
     }
-    extract_prompt_modifiers(&mut request);
-    let original_prompt = build_draw_prompt_text(
+    let request_text = build_draw_prompt_text(
         &request.prompt,
         &request.negative_prompt,
         &request.aspect_ratio,
         &request.seed,
     );
-    if original_prompt.trim().is_empty() {
+    if request_text.trim().is_empty() {
         return Ok(request);
     }
+    let context = match context {
+        Some(provider) => provider.image_context(&request).await,
+        None => String::new(),
+    };
     let optimized = optimizer
-        .enhance_image_prompt(&original_prompt, &request.aspect_ratio, variant_count)
+        .enhance_image_prompt(
+            &optimizer_input(&context, &request_text),
+            &request.prompt,
+            &request.aspect_ratio,
+            variant_count,
+        )
         .await;
     if let Some(error) = optimized.provider_error.as_deref() {
         tracing::debug!(%error, "image prompt optimization failed; using original prompt");
@@ -1876,6 +1930,16 @@ where
         request.aspect_ratio = optimized.aspect_ratio.trim().to_owned();
     }
     Ok(request)
+}
+
+/// The optimizer's user turn: gathered context first, the request last, in the
+/// `Context:` / `Request:` layout both image optimizer prompts document.
+fn optimizer_input(context: &str, request_text: &str) -> String {
+    let context = context.trim();
+    if context.is_empty() {
+        return request_text.to_owned();
+    }
+    format!("Context:\n{context}\n\nRequest:\n{request_text}")
 }
 
 /// Split user-typed modifiers out of the prompt before optimization so an
@@ -4443,12 +4507,7 @@ pub fn draw_api_prompt_text(request: &ImageGenerationRequest) -> String {
     }) {
         return variant;
     }
-    build_draw_prompt_text(
-        &request.prompt,
-        &request.negative_prompt,
-        &request.aspect_ratio,
-        &request.seed,
-    )
+    request.prompt.trim().to_owned()
 }
 
 pub fn decode_draw_api_result_payload(payload: &[u8]) -> Result<DrawApiGenerateResult, String> {
@@ -5670,9 +5729,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optimizing_image_generator_preserves_pre_resolved_prompt() {
+    async fn bang_draw_prompt_is_kept_verbatim_but_classified() {
         let generator = GeneratorStub::success("https://img.test/1.png");
-        let optimizer = OptimizerStub::default();
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "cat".to_owned(),
+                outputs: vec!["a rewritten cat".to_owned()],
+                aspect_ratio: "1:1".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
             crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
@@ -5683,14 +5748,115 @@ mod tests {
             .generate_image(ImageGenerationRequest {
                 prompt: prompt.to_owned(),
                 prompt_variants: vec![prompt.to_owned()],
+                is_nsfw: true,
                 ..ImageGenerationRequest::default()
             })
             .await;
 
         assert!(result.is_ok());
-        assert!(optimizer.calls().is_empty());
-        assert_eq!(generator.requests()[0].prompt, prompt);
-        assert_eq!(generator.requests()[0].prompt_variants, [prompt]);
+        assert_eq!(optimizer.calls(), vec!["image:cat:1".to_owned()]);
+        let request = &generator.requests()[0];
+        assert_eq!(request.prompt_variants, ["cat"]);
+        assert_eq!(request.aspect_ratio, "16:9");
+        assert!(!request.is_nsfw);
+    }
+
+    #[tokio::test]
+    async fn bang_draw_forbidden_prompt_is_blocked() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                nsfw_result: openplotva_media::NsfwResult::Forbidden,
+                ..openplotva_media::ImageOptimize::default()
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer)),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "blocked request".to_owned(),
+                prompt_variants: vec!["blocked request".to_owned()],
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(matches!(result, Err(ImageGenerationError::Forbidden)));
+        assert!(generator.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimizer_failure_sends_only_the_prompt_text() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer = OptimizerStub::default();
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer)),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "cat portrait seed:123 16:9 | blurry lowres".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        let request = &generator.requests()[0];
+        assert_eq!(request.prompt_variants, ["cat portrait"]);
+        assert_eq!(draw_api_prompt_text(request), "cat portrait");
+        assert!(request.is_nsfw);
+    }
+
+    struct ContextStub(&'static str);
+
+    impl ImageContextProvider for ContextStub {
+        fn image_context<'a>(
+            &'a self,
+            _request: &'a ImageGenerationRequest,
+        ) -> ImageContextFuture<'a> {
+            Box::pin(async move { self.0.to_owned() })
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_optimizer_input_has_context_then_request() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "our cat".to_owned(),
+                outputs: vec!["a ginger cat on a windowsill".to_owned()],
+                aspect_ratio: "1:1".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        )
+        .with_context_provider(Arc::new(ContextStub(
+            "Recent chat context:\nAnna: our cat Barsik is ginger",
+        )));
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "draw our cat".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            optimizer.calls(),
+            vec![
+                "image:Context:\nRecent chat context:\nAnna: our cat Barsik is ginger\n\nRequest:\ndraw our cat:1"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(
+            generator.requests()[0].prompt_variants,
+            ["a ginger cat on a windowsill"]
+        );
     }
 
     #[tokio::test]
@@ -7012,7 +7178,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_api_prompt_text_matches_go_variant_and_option_fallback() {
+    fn draw_api_prompt_text_sends_only_prompt_text_to_the_image_model() {
         let with_variant = ImageGenerationRequest {
             prompt: "castle".to_owned(),
             prompt_variants: vec!["  ".to_owned(), " neon castle ".to_owned()],
@@ -7030,10 +7196,7 @@ mod tests {
         };
 
         assert_eq!(draw_api_prompt_text(&with_variant), "neon castle");
-        assert_eq!(
-            draw_api_prompt_text(&without_variant),
-            "castle | blur 16:9 42"
-        );
+        assert_eq!(draw_api_prompt_text(&without_variant), "castle");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+{
+  "id": "optimize_prompt/context-only-subject",
+  "flow": "optimize_prompt",
+  "prompt": "image/optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_prompt",
+  "tool_name": "optimize_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 1024
+  },
+  "notes": "Request points at context only; draw the latest concrete subject.",
+  "user": "Context:\nRecent chat context:\nКирилл: вчера видел маяк на скале во время шторма, волны до неба\n\nRequest:\nнарисуй это",
+  "checks": [
+    "json",
+    "schema",
+    "contains:lighthouse",
+    "no_substring:|@outputs[]",
+    "max_blank_run:3"
+  ]
+}

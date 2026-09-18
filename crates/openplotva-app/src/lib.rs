@@ -13001,62 +13001,16 @@ async fn start_runtime_workers(
         as media::AppMediaPromptOptimizer));
     let media_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
 
-    // Drawing-prompt agent: refine the draw prompt with the user's memory and chat
-    // history before generation. Web search is intentionally stubbed until the search
-    // pipeline is reworked. Built once and wraps both the VIP and regular image
-    // generators; when disabled or the reasoner is missing it is a transparent
-    // pass-through that leaves the single-pass optimizer in charge.
-    let image_agent_settings = agent_runtime::ImageAgentSettings::from_app_config(
-        config,
-        agent_runtime::IMAGE_SYSTEM_PROMPT.to_owned(),
-    );
-    let (image_agent_reasoner, image_agent_tools) = if image_agent_settings.enabled {
-        let registry = agent_runtime::build_routed_agent_provider_registry(
-            config,
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
-            )
-            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_reporter(routing_event_reporter.clone()),
-        );
-        let reasoner = registry.get(&image_agent_settings.reasoner_provider);
-        let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
-            agent_runtime::PostgresHistorySearch::new(history_store.clone()),
-        );
-        let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
-            agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
-        );
-        let tools: Arc<dyn openplotva_agent::AgentTools> = Arc::new(
-            agent_runtime::AppAgentTools::new(
-                agent_runtime::unavailable_web_search(),
-                agent_runtime::unavailable_url_crawler(),
-            )
-            .with_history_searcher(history)
-            .with_memory_searcher(memory),
-        );
-        (reasoner, Some(tools))
-    } else {
-        (None, None)
-    };
-    if image_agent_settings.enabled && image_agent_reasoner.is_some() {
-        readiness_checks.push(ReadinessCheck::ok(
-            "image_agent",
-            "Drawing-prompt agent active (memory + chat history; web search stubbed) wrapping VIP and regular generators",
-        ));
-    } else if image_agent_settings.enabled {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "image_agent",
-            "Drawing-prompt agent enabled but the reasoner provider is missing from the registry",
-        ));
-    } else {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "image_agent",
-            "LLM_AGENTIC_IMAGE_ENABLED=false",
-        ));
-    }
+    // Chat history and requester memory for the image optimizer and the song
+    // director: two concurrent, time-boxed searches rendered as a Context block.
+    let chat_context = Arc::new(agent_runtime::ChatContextGatherer::new(
+        Arc::new(agent_runtime::PostgresHistorySearch::new(
+            history_store.clone(),
+        )),
+        Arc::new(agent_runtime::PostgresMemorySearch::new(
+            memory_store.clone(),
+        )),
+    ));
     let vip_image_queue = Arc::clone(&task_queue_for_updates);
     let image_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
         Arc::clone(&router_handle),
@@ -13082,14 +13036,8 @@ async fn start_runtime_workers(
             routed_vip_boogu_image_generator,
         ),
         media_prompt_optimizer.clone(),
-    );
-    let vip_image_generator = agent_runtime::ImageAgentImageGenerator::new(
-        vip_image_generator,
-        image_agent_reasoner.clone(),
-        image_agent_tools.clone(),
-        image_agent_settings.clone(),
     )
-    .with_run_buffer(llm_run_buffer.clone());
+    .with_context_provider(chat_context.clone());
     let mut vip_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
@@ -13170,14 +13118,8 @@ async fn start_runtime_workers(
         )
         .with_workflow_key(REGULAR_IMAGE_GENERATION_WORKFLOW_KEY),
         media_prompt_optimizer,
-    );
-    let regular_image_generator = agent_runtime::ImageAgentImageGenerator::new(
-        regular_image_generator,
-        image_agent_reasoner,
-        image_agent_tools,
-        image_agent_settings,
     )
-    .with_run_buffer(llm_run_buffer.clone());
+    .with_context_provider(chat_context.clone());
     let mut regular_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
@@ -13239,15 +13181,7 @@ async fn start_runtime_workers(
                 config,
                 Arc::clone(&prompt_store),
             ));
-        let song_context: Arc<dyn music_jobs::SongContextProvider> =
-            Arc::new(agent_runtime::SongContextGatherer::new(
-                Arc::new(agent_runtime::PostgresHistorySearch::new(
-                    history_store.clone(),
-                )),
-                Arc::new(agent_runtime::PostgresMemorySearch::new(
-                    memory_store.clone(),
-                )),
-            ));
+        let song_context: Arc<dyn music_jobs::SongContextProvider> = chat_context.clone();
         let music_material_provider = music_jobs::AifarmSongMaterialProvider::new(
             music_song_prompt_generator,
             PostgresVirtualMessageStore::new(service_clients.postgres.clone()),

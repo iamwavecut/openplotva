@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openplotva_agent::{
-    AgentBudgets, AgentError, AgentMessage, AgentOrigin, AgentOutcome, AgentProfile, AgentRole,
-    AgentState, AgentTools, Reasoner, ReasonerCall, ReasonerFuture, ReasonerReply, StepProgress,
-    ToolDispatchFuture, advance_one_step,
+    AgentError, AgentMessage, AgentRole, AgentTools, Reasoner, ReasonerCall, ReasonerFuture,
+    ReasonerReply, ToolDispatchFuture,
 };
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
@@ -34,17 +33,13 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use openplotva_taskman::MusicGenJobParams;
 
-use crate::dialog_tools::{CrawlUrlFuture, UrlCrawler, WebSearchFuture, WebSearchProvider};
-use crate::image_jobs::{
-    ImageGenerationFuture, ImageGenerationProgressSink, ImageGenerationRequest, ImageGenerator,
-};
+use crate::dialog_tools::{UrlCrawler, WebSearchProvider};
+use crate::image_jobs::{ImageContextFuture, ImageContextProvider, ImageGenerationRequest};
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
 use crate::music_jobs::{SongContextFuture, SongContextProvider};
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
-
-const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
@@ -68,10 +63,6 @@ pub const DEFAULT_QWEN_SERVICE_NAME: &str = DEFAULT_LOCAL_REASONER_SERVICE_NAME;
 /// Legacy Rust API alias; use [`DEFAULT_LOCAL_REASONER_MODEL`].
 #[deprecated(note = "use DEFAULT_LOCAL_REASONER_MODEL")]
 pub const DEFAULT_QWEN_MODEL: &str = DEFAULT_LOCAL_REASONER_MODEL;
-
-/// System prompt for the song-writing agent.
-/// System prompt for the image-prompt agent.
-pub const IMAGE_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/image_system.prompt");
 
 /// A single-completion LLM client plus the request defaults for one provider.
 #[derive(Clone)]
@@ -628,147 +619,110 @@ fn format_memory(memory: &RetrievedMemory) -> String {
     }
 }
 
-static AGENT_RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_agent_run_id(prefix: &str) -> String {
-    let counter = AGENT_RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    format!("{prefix}-{}-{counter}", now_unix_ms())
-}
-
-fn agent_run_origin(
-    origin: &AgentOrigin,
-    trigger_preview: &str,
-) -> crate::runtime_llm_runs::RunOrigin {
-    crate::runtime_llm_runs::RunOrigin {
-        chat_id: origin.chat_id,
-        thread_id: origin.thread_id,
-        chat_title: None,
-        user_id: origin.user_id,
-        user_full_name: (!origin.user_full_name.trim().is_empty())
-            .then(|| origin.user_full_name.clone()),
-        trigger_message_id: origin.message_id,
-        trigger_preview: (!trigger_preview.trim().is_empty())
-            .then(|| trigger_preview.chars().take(120).collect()),
-        queue_name: None,
-        job_id: None,
-    }
-}
-
-fn finish_agent_run(
-    runs: Option<&crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
-    run_id: &str,
-    result: &Result<AgentState, String>,
-) {
-    let Some(runs) = runs else {
-        return;
-    };
-    let (status, outcome, error) = match result {
-        Err(error) => (
-            crate::runtime_llm_runs::RunStatus::Failed,
-            None,
-            Some(error.clone()),
-        ),
-        Ok(state) => match &state.outcome {
-            Some(AgentOutcome::Completed { .. }) => (
-                crate::runtime_llm_runs::RunStatus::Completed,
-                Some(crate::runtime_llm_runs::RunOutcome {
-                    outcome: "completed".to_owned(),
-                    ..crate::runtime_llm_runs::RunOutcome::default()
-                }),
-                None,
-            ),
-            Some(AgentOutcome::Stopped { reason, .. }) => (
-                crate::runtime_llm_runs::RunStatus::Completed,
-                Some(crate::runtime_llm_runs::RunOutcome {
-                    outcome: "stopped".to_owned(),
-                    reason: Some(format!("{reason:?}")),
-                    ..crate::runtime_llm_runs::RunOutcome::default()
-                }),
-                None,
-            ),
-            Some(AgentOutcome::Failed { reason }) => (
-                crate::runtime_llm_runs::RunStatus::Failed,
-                None,
-                Some(reason.clone()),
-            ),
-            None => (
-                crate::runtime_llm_runs::RunStatus::Completed,
-                Some(crate::runtime_llm_runs::RunOutcome {
-                    outcome: "empty".to_owned(),
-                    ..crate::runtime_llm_runs::RunOutcome::default()
-                }),
-                None,
-            ),
-        },
-    };
-    runs.finish_run(run_id, status, outcome, error, OffsetDateTime::now_utc());
-}
-
-fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
-    line.get(..label.len())
-        .filter(|head| head.eq_ignore_ascii_case(label))
-        .map(|_| line[label.len()..].trim())
-}
-
-/// Best-effort chat history and listener memory for the song director: two
-/// time-boxed searches whose results are trimmed and handed over as plain text.
-pub struct SongContextGatherer {
+/// Best-effort chat history and requester memory for the song director and the
+/// image prompt optimizer: two concurrent time-boxed searches whose results are
+/// trimmed and handed over as plain text.
+pub struct ChatContextGatherer {
     history: Arc<dyn HistorySearcher>,
     memory: Arc<dyn MemorySearcher>,
 }
 
 const SONG_CONTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const IMAGE_CONTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const SONG_CONTEXT_MAX_CHARS: usize = 1500;
-const SONG_CONTEXT_QUERY_MAX_CHARS: usize = 200;
+const IMAGE_CONTEXT_MAX_CHARS: usize = 1200;
+const CONTEXT_QUERY_MAX_CHARS: usize = 200;
 
-impl SongContextGatherer {
+struct ContextScope<'a> {
+    chat_id: i64,
+    user_id: i64,
+    thread_id: Option<i32>,
+    query: &'a str,
+    person_label: &'a str,
+    timeout: std::time::Duration,
+    max_chars: usize,
+}
+
+impl ChatContextGatherer {
     #[must_use]
     pub fn new(history: Arc<dyn HistorySearcher>, memory: Arc<dyn MemorySearcher>) -> Self {
         Self { history, memory }
     }
+
+    async fn gather(&self, scope: ContextScope<'_>) -> String {
+        let query: String = scope.query.chars().take(CONTEXT_QUERY_MAX_CHARS).collect();
+        if query.trim().is_empty() {
+            return String::new();
+        }
+        let (history, memory) = tokio::join!(
+            tokio::time::timeout(
+                scope.timeout,
+                self.history
+                    .search(scope.chat_id, scope.thread_id, query.clone()),
+            ),
+            tokio::time::timeout(
+                scope.timeout,
+                self.memory
+                    .search(scope.chat_id, scope.user_id, scope.thread_id, query),
+            ),
+        );
+        let mut blocks = Vec::new();
+        push_context_block(
+            &mut blocks,
+            "Recent chat context",
+            history,
+            "history",
+            scope.max_chars,
+        );
+        push_context_block(
+            &mut blocks,
+            scope.person_label,
+            memory,
+            "memory",
+            scope.max_chars,
+        );
+        blocks.join("\n\n")
+    }
 }
 
-impl SongContextProvider for SongContextGatherer {
+impl SongContextProvider for ChatContextGatherer {
     fn song_context<'a>(
         &'a self,
         params: &'a MusicGenJobParams,
         topic: &'a str,
     ) -> SongContextFuture<'a> {
-        Box::pin(async move {
-            let query: String = topic.chars().take(SONG_CONTEXT_QUERY_MAX_CHARS).collect();
-            if query.trim().is_empty() {
-                return String::new();
-            }
-            let history = tokio::time::timeout(
-                SONG_CONTEXT_TIMEOUT,
-                self.history
-                    .search(params.chat_id, params.thread_id, query.clone()),
-            )
-            .await;
-            let memory = tokio::time::timeout(
-                SONG_CONTEXT_TIMEOUT,
-                self.memory
-                    .search(params.chat_id, params.user_id, params.thread_id, query),
-            )
-            .await;
-            let mut blocks = Vec::new();
-            push_song_context_block(&mut blocks, "Recent chat context", history, "history");
-            push_song_context_block(
-                &mut blocks,
-                "What is known about the listener",
-                memory,
-                "memory",
-            );
-            blocks.join("\n\n")
-        })
+        Box::pin(self.gather(ContextScope {
+            chat_id: params.chat_id,
+            user_id: params.user_id,
+            thread_id: params.thread_id,
+            query: topic,
+            person_label: "What is known about the listener",
+            timeout: SONG_CONTEXT_TIMEOUT,
+            max_chars: SONG_CONTEXT_MAX_CHARS,
+        }))
     }
 }
 
-fn push_song_context_block(
+impl ImageContextProvider for ChatContextGatherer {
+    fn image_context<'a>(&'a self, request: &'a ImageGenerationRequest) -> ImageContextFuture<'a> {
+        Box::pin(self.gather(ContextScope {
+            chat_id: request.chat_id,
+            user_id: request.user_id,
+            thread_id: request.thread_id,
+            query: &request.prompt,
+            person_label: "What is known about the requester",
+            timeout: IMAGE_CONTEXT_TIMEOUT,
+            max_chars: IMAGE_CONTEXT_MAX_CHARS,
+        }))
+    }
+}
+
+fn push_context_block(
     blocks: &mut Vec<String>,
     label: &str,
     result: Result<Result<String, AgentError>, tokio::time::error::Elapsed>,
     source: &'static str,
+    max_chars: usize,
 ) {
     match result {
         Ok(Ok(text)) => {
@@ -776,321 +730,15 @@ fn push_song_context_block(
             if text.is_empty() {
                 return;
             }
-            let mut text: String = text.chars().take(SONG_CONTEXT_MAX_CHARS).collect();
-            if text.chars().count() == SONG_CONTEXT_MAX_CHARS {
+            let mut text: String = text.chars().take(max_chars).collect();
+            if text.chars().count() == max_chars {
                 text.push('…');
             }
             blocks.push(format!("{label}:\n{text}"));
         }
-        Ok(Err(error)) => tracing::debug!(%error, source, "song context search failed"),
-        Err(_) => tracing::debug!(source, "song context search timed out"),
+        Ok(Err(error)) => tracing::debug!(%error, source, "context search failed"),
+        Err(_) => tracing::debug!(source, "context search timed out"),
     }
-}
-
-/// Notice returned by the stubbed search tools so the agent degrades gracefully
-/// instead of erroring when live web search is intentionally disabled.
-const SEARCH_UNAVAILABLE_NOTICE: &str = "Web search is currently unavailable. Continue using the user's memory, the chat \
-     history, and your own knowledge.";
-
-/// Web-search provider that performs no live search. Used by flows where search is
-/// intentionally stubbed (the image agent, until the search pipeline is reworked);
-/// swap it for the real Serper client to turn search on.
-pub(crate) struct UnavailableWebSearch;
-
-impl WebSearchProvider for UnavailableWebSearch {
-    fn search<'a>(&'a self, _query: &'a str) -> WebSearchFuture<'a> {
-        Box::pin(async { Ok(SEARCH_UNAVAILABLE_NOTICE.to_owned()) })
-    }
-}
-
-/// URL crawler counterpart to [`UnavailableWebSearch`]; performs no live fetch.
-pub(crate) struct UnavailableUrlCrawler;
-
-impl UrlCrawler for UnavailableUrlCrawler {
-    fn crawl<'a>(&'a self, _url: &'a str) -> CrawlUrlFuture<'a> {
-        Box::pin(async { Ok(SEARCH_UNAVAILABLE_NOTICE.to_owned()) })
-    }
-}
-
-/// Build the stubbed web searcher as a trait object.
-#[must_use]
-pub fn unavailable_web_search() -> Arc<dyn WebSearchProvider> {
-    Arc::new(UnavailableWebSearch)
-}
-
-/// Build the stubbed URL crawler as a trait object.
-#[must_use]
-pub fn unavailable_url_crawler() -> Arc<dyn UrlCrawler> {
-    Arc::new(UnavailableUrlCrawler)
-}
-
-/// Settings for the image-prompt agent (prompt + reasoner + budgets).
-#[derive(Clone)]
-pub struct ImageAgentSettings {
-    pub enabled: bool,
-    pub system_prompt: String,
-    pub reasoner_provider: String,
-    pub budgets: AgentBudgets,
-    pub reasoner_max_tokens: i32,
-}
-
-impl ImageAgentSettings {
-    #[must_use]
-    pub fn from_app_config(config: &AppConfig, system_prompt: String) -> Self {
-        let reasoner_provider = if config.llm.agentic.reasoner_provider.trim().is_empty() {
-            openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER.to_owned()
-        } else {
-            config.llm.agentic.reasoner_provider.clone()
-        };
-        Self {
-            enabled: config.llm.agentic.image_enabled,
-            system_prompt,
-            reasoner_provider,
-            budgets: AgentBudgets {
-                max_steps: 6,
-                max_total_tokens: 30_000,
-                max_wall_ms: 90_000,
-                max_tool_calls: 3,
-                max_tool_errors: 2,
-            },
-            reasoner_max_tokens: 2048,
-        }
-    }
-
-    fn profile(&self, reasoner_model: String) -> AgentProfile {
-        AgentProfile {
-            id: "image".to_owned(),
-            system_prompt: self.system_prompt.clone(),
-            allowed_tools: vec![
-                STEP_MEMORY_SEARCH.to_owned(),
-                STEP_HISTORY_SEARCH.to_owned(),
-                STEP_WEB_SEARCH.to_owned(),
-                STEP_CRAWL_URL.to_owned(),
-            ],
-            reasoner_model: reasoner_model.clone(),
-            writer_model: reasoner_model,
-            budgets: self.budgets,
-            reasoner_max_tokens: self.reasoner_max_tokens,
-            writer_max_tokens: self.reasoner_max_tokens,
-        }
-    }
-}
-
-/// An [`ImageGenerator`] wrapper that refines the draw prompt with the multi-step
-/// image agent (using the user's memory and chat history; web search stubbed) before
-/// delegating to the inner generator. The refined prompt is written into
-/// `prompt_variants`, which makes the inner optimizing generator skip its own
-/// single-pass reprompt. When the agent is disabled, unavailable, or yields nothing
-/// usable, the request passes through unchanged and the inner optimizer runs as before.
-pub struct ImageAgentImageGenerator<Inner> {
-    inner: Inner,
-    reasoner: Option<Arc<AgentProviderClient>>,
-    tools: Option<Arc<dyn AgentTools>>,
-    settings: ImageAgentSettings,
-    llm_runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
-}
-
-impl<Inner> ImageAgentImageGenerator<Inner> {
-    #[must_use]
-    pub fn new(
-        inner: Inner,
-        reasoner: Option<Arc<AgentProviderClient>>,
-        tools: Option<Arc<dyn AgentTools>>,
-        settings: ImageAgentSettings,
-    ) -> Self {
-        Self {
-            inner,
-            reasoner,
-            tools,
-            settings,
-            llm_runs: None,
-        }
-    }
-
-    /// Record image-agent runs in the admin LLM Dialogs buffer.
-    #[must_use]
-    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
-        self.llm_runs = Some(runs);
-        self
-    }
-}
-
-impl<Inner> ImageAgentImageGenerator<Inner>
-where
-    Inner: ImageGenerator + Sync,
-{
-    async fn refine_prompt(
-        &self,
-        reasoner: &Arc<AgentProviderClient>,
-        tools: &Arc<dyn AgentTools>,
-        request: &ImageGenerationRequest,
-    ) -> Option<String> {
-        let origin = AgentOrigin {
-            chat_id: request.chat_id,
-            message_id: request.message_id,
-            user_id: request.user_id,
-            thread_id: request.thread_id,
-            user_full_name: request.user_full_name.clone(),
-        };
-        let profile = self.settings.profile(reasoner.model.clone());
-        let reasoner_adapter = AifarmReasoner::with_context(
-            Arc::clone(reasoner),
-            RoutedRequestContext {
-                workflow_key: AGENTIC_IMAGE_WORKFLOW.to_owned(),
-                chat_id: (request.chat_id != 0).then_some(request.chat_id),
-                user_id: (request.user_id != 0).then_some(request.user_id),
-                thread_id: request.thread_id,
-                message_id: (request.message_id != 0).then_some(request.message_id),
-                suppress_all_attempts_exhausted_admin_report: true,
-                suppressed_all_attempts_exhausted_reason: Some("image_agent_fallback".to_owned()),
-                ..RoutedRequestContext::default()
-            },
-        );
-        let run_id = next_agent_run_id("image");
-        if let Some(runs) = &self.llm_runs {
-            runs.begin_run(
-                run_id.clone(),
-                "image_optimizer",
-                agent_run_origin(&origin, request.prompt.as_str()),
-                OffsetDateTime::now_utc(),
-            );
-        }
-        let result = openplotva_llm::with_run_scope(
-            openplotva_llm::LlmRunScope {
-                run_id: run_id.clone(),
-                run_kind: "image_optimizer".to_owned(),
-            },
-            async {
-                let mut state =
-                    AgentState::new("image", request.prompt.as_str(), origin, now_unix_ms());
-                loop {
-                    match advance_one_step(
-                        &profile,
-                        &reasoner_adapter,
-                        tools.as_ref(),
-                        state,
-                        now_unix_ms(),
-                    )
-                    .await
-                    {
-                        Ok(StepProgress::Continue(next)) => state = next,
-                        Ok(StepProgress::Terminal(next)) => return Ok(next),
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-            },
-        )
-        .await;
-        finish_agent_run(self.llm_runs.as_ref(), &run_id, &result);
-        let state = match result {
-            Ok(state) => state,
-            Err(error) => {
-                tracing::warn!(%error, "image agent step failed");
-                return None;
-            }
-        };
-        match &state.outcome {
-            Some(AgentOutcome::Completed { answer }) => parse_image_prompt(answer),
-            Some(AgentOutcome::Stopped { partial, .. }) => parse_image_prompt(partial),
-            _ => None,
-        }
-    }
-
-    /// Run the agent when active and return the request with `prompt_variants` filled
-    /// by the refined prompt; otherwise return the request unchanged.
-    async fn maybe_refined_request(
-        &self,
-        mut request: ImageGenerationRequest,
-    ) -> ImageGenerationRequest {
-        if !self.settings.enabled || request.prompt.trim().is_empty() {
-            return request;
-        }
-        if request
-            .prompt_variants
-            .iter()
-            .any(|variant| !variant.trim().is_empty())
-        {
-            return request;
-        }
-        let (Some(reasoner), Some(tools)) = (&self.reasoner, &self.tools) else {
-            return request;
-        };
-        match self.refine_prompt(reasoner, tools, &request).await {
-            Some(refined) if !refined.trim().is_empty() => {
-                let count = self.inner.expected_image_count().max(1);
-                request.prompt_variants = vec![refined; count];
-            }
-            _ => tracing::debug!("image agent inactive or empty; using reprompt fallback"),
-        }
-        request
-    }
-}
-
-impl<Inner> ImageGenerator for ImageAgentImageGenerator<Inner>
-where
-    Inner: ImageGenerator + Sync,
-{
-    fn expected_image_count(&self) -> usize {
-        self.inner.expected_image_count()
-    }
-
-    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let request = self.maybe_refined_request(request).await;
-            self.inner.generate_image(request).await
-        })
-    }
-
-    fn generate_image_streaming<'a>(
-        &'a self,
-        request: ImageGenerationRequest,
-        progress: ImageGenerationProgressSink,
-    ) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let request = self.maybe_refined_request(request).await;
-            self.inner.generate_image_streaming(request, progress).await
-        })
-    }
-}
-
-/// Parse the image agent's structured final answer into a refined prompt. Returns
-/// `None` when no `PROMPT:` block is present, so the caller falls back to the optimizer.
-fn parse_image_prompt(answer: &str) -> Option<String> {
-    const MAX_IMAGE_AGENT_PROMPT_CHARS: usize = 2_048;
-
-    let mut prompt = String::new();
-    let mut in_prompt = false;
-    for line in answer.lines() {
-        let trimmed = line.trim();
-        if in_prompt {
-            if strip_label(trimmed, "NEGATIVE:").is_some() {
-                break;
-            }
-            prompt.push_str(line);
-            prompt.push('\n');
-            continue;
-        }
-        if let Some(rest) = strip_label(trimmed, "PROMPT:") {
-            in_prompt = true;
-            if !rest.is_empty() {
-                prompt.push_str(rest);
-                prompt.push('\n');
-            }
-        }
-    }
-    let prompt = prompt.trim().to_owned();
-    if prompt.is_empty() {
-        return None;
-    }
-    if prompt.chars().count() > MAX_IMAGE_AGENT_PROMPT_CHARS {
-        tracing::warn!(
-            prompt_chars = prompt.chars().count(),
-            max_prompt_chars = MAX_IMAGE_AGENT_PROMPT_CHARS,
-            "image agent prompt exceeds generation boundary; using reprompt fallback"
-        );
-        return None;
-    }
-    Some(prompt)
 }
 
 /// Current unix time in milliseconds for budget accounting.
@@ -1403,40 +1051,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_image_prompt_block_and_drops_negative() {
-        let answer = "PROMPT: a red fox in a snowy pine forest, soft morning light, \
-                      watercolor, detailed\nNEGATIVE: blurry, text, watermark";
-        let prompt = parse_image_prompt(answer).expect("parsed");
-        assert!(prompt.starts_with("a red fox"));
-        assert!(prompt.contains("watercolor"));
-        assert!(!prompt.contains("NEGATIVE"));
-        assert!(!prompt.contains("watermark"));
-    }
-
-    #[test]
-    fn parses_multiline_image_prompt() {
-        let answer = "PROMPT:\na lighthouse at dusk\nstormy sea, dramatic clouds";
-        let prompt = parse_image_prompt(answer).expect("parsed");
-        assert!(prompt.contains("lighthouse"));
-        assert!(prompt.contains("stormy sea"));
-    }
-
-    #[test]
-    fn rejects_image_prompt_without_marker() {
-        assert!(parse_image_prompt("just some prose with no marker").is_none());
-        assert!(parse_image_prompt("PROMPT:\n   ").is_none());
-    }
-
-    #[test]
-    fn rejects_runaway_image_prompt_instead_of_forwarding_it_to_draw() {
-        let at_limit = format!("PROMPT: {}", "x".repeat(2_048));
-        let over_limit = format!("PROMPT: {}", "x".repeat(2_049));
-
-        assert!(parse_image_prompt(&at_limit).is_some());
-        assert!(parse_image_prompt(&over_limit).is_none());
-    }
-
-    #[test]
     fn history_search_query_detects_author_username_mentions() {
         assert_eq!(
             author_username_from_history_query("@cherry_example"),
@@ -1448,16 +1062,6 @@ mod tests {
         );
         assert_eq!(author_username_from_history_query("cherry_example"), None);
         assert_eq!(author_username_from_history_query("@"), None);
-    }
-
-    #[tokio::test]
-    async fn stubbed_search_tools_return_unavailable_notice() {
-        let web = unavailable_web_search();
-        let crawl = unavailable_url_crawler();
-        let search = web.search("anything").await.expect("ok");
-        let fetched = crawl.crawl("https://example.com").await.expect("ok");
-        assert!(search.contains("unavailable"));
-        assert!(fetched.contains("unavailable"));
     }
 
     #[test]

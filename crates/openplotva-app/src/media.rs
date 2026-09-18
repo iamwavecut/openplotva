@@ -441,15 +441,18 @@ impl<Optimizer> MediaPromptOptimizerService<Optimizer>
 where
     Optimizer: MediaPromptOptimizer,
 {
+    /// Optimize `original_prompt`; on failure fall back to `fallback_prompt`,
+    /// which must already be safe to send to the image model as-is.
     pub async fn enhance_image_prompt(
         &self,
         original_prompt: &str,
+        fallback_prompt: &str,
         aspect_ratio: &str,
         variant_count: usize,
     ) -> MediaPromptOptimization<ImageOptimize> {
         let fallback = ImageOptimize {
             input: original_prompt.to_owned(),
-            outputs: vec![original_prompt.to_owned()],
+            outputs: vec![fallback_prompt.to_owned()],
             aspect_ratio: aspect_ratio.to_owned(),
             nsfw_result: openplotva_media::NsfwResult::Adult,
         };
@@ -1174,13 +1177,13 @@ mod tests {
         }));
         let service = MediaPromptOptimizerService::new(Some(optimizer));
 
-        let got = service.enhance_image_prompt("cat", "16:9", 2).await;
+        let got = service.enhance_image_prompt("cat", "cat", "16:9", 2).await;
 
         assert_eq!(got.provider_error, None);
         assert_eq!(got.value.outputs, vec!["cinematic cat"]);
         assert_eq!(got.value.aspect_ratio, "16:9");
 
-        let got = service.enhance_image_prompt("cat", "1:1", 1).await;
+        let got = service.enhance_image_prompt("cat", "cat", "1:1", 1).await;
 
         assert_eq!(got.provider_error.as_deref(), Some("boom"));
         assert_eq!(

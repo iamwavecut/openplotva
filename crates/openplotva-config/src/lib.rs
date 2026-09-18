@@ -280,8 +280,6 @@ pub const DEFAULT_LLM_PROVIDER_MAX_TOKENS: i32 = 8192;
 
 pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
 
-pub const DEFAULT_AGENTIC_IMAGE_ENABLED: bool = true;
-
 /// Qwen3.8 model exposed by the dedicated GPU2 NInfer service.
 pub const DEFAULT_NINFER_MODEL: &str = "qwen3.8-27b";
 
@@ -836,11 +834,9 @@ pub struct NamedProviderConfig {
 /// Agentic-workflow configuration root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgenticConfig {
-    /// Named provider the song/image prompt agents reason with, from
+    /// Named provider the prompt agents reason with, from
     /// `LLM_AGENT_REASONER_PROVIDER`.
     pub reasoner_provider: String,
-    /// When true, draw requests are refined by the multi-step image-prompt agent.
-    pub image_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1454,8 +1450,6 @@ pub struct RawConfig {
     pub llm_provider_temperatures: Option<String>,
     /// `LLM_PROVIDERS_TASK_TIMEOUT_SECONDS`.
     pub llm_provider_task_timeout_seconds: Option<String>,
-    /// `LLM_AGENTIC_IMAGE_ENABLED`.
-    pub llm_agentic_image_enabled: Option<String>,
     /// `LLM_AGENT_REASONER_PROVIDER`.
     pub llm_agent_reasoner_provider: Option<String>,
     /// `GENKIT_DEFAULT_MODEL`.
@@ -2730,11 +2724,6 @@ impl AppConfig {
                 agentic: AgenticConfig {
                     reasoner_provider: parse_scalar_value(raw.llm_agent_reasoner_provider)
                         .unwrap_or_else(|| DEFAULT_AGENT_REASONER_PROVIDER.to_owned()),
-                    image_enabled: parse_bool(
-                        "LLM_AGENTIC_IMAGE_ENABLED",
-                        raw.llm_agentic_image_enabled,
-                        DEFAULT_AGENTIC_IMAGE_ENABLED,
-                    )?,
                 },
             },
             vision: VisionConfig {
@@ -3300,7 +3289,6 @@ impl RawConfig {
             llm_provider_max_tokens: env("LLM_PROVIDERS_MAX_TOKENS"),
             llm_provider_temperatures: env("LLM_PROVIDERS_TEMPERATURES"),
             llm_provider_task_timeout_seconds: env("LLM_PROVIDERS_TASK_TIMEOUT_SECONDS"),
-            llm_agentic_image_enabled: env("LLM_AGENTIC_IMAGE_ENABLED"),
             llm_agent_reasoner_provider: env("LLM_AGENT_REASONER_PROVIDER"),
             genkit_default_model: env("GENKIT_DEFAULT_MODEL"),
             genkit_history_summary_provider: env("GENKIT_HISTORY_SUMMARY_PROVIDER"),

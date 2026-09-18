@@ -1,0 +1,24 @@
+{
+  "id": "optimize_prompt/context-pet",
+  "flow": "optimize_prompt",
+  "prompt": "image/optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_prompt",
+  "tool_name": "optimize_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 1024
+  },
+  "notes": "Context resolves 'our cat'; the output must describe the ginger cat from context.",
+  "user": "Context:\nRecent chat context:\nАня: наш кот Барсик рыжий и толстый, спит на батарее\nДима: ахах, Барсик король батареи\n\nRequest:\nнарисуй нашего кота",
+  "checks": [
+    "json",
+    "schema",
+    "contains:ginger",
+    "no_substring:|@outputs[]",
+    "lang:en:outputs[]",
+    "max_blank_run:3"
+  ]
+}
