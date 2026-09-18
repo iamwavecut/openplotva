@@ -5640,11 +5640,11 @@ mod tests {
         // the XML the prompt hands it. The reply inside is new text, not a copy.
         let guard = ReplyLeakGuard::builder()
             .sender("Плотва")
-            .history_entry("Веселое время", "Нет, серьезно, это кринж какой-то.")
+            .history_entry("Собеседник", "Нет, серьезно, это кринж какой-то.")
             .build();
         let envelope = concat!(
-            "<message id=\"136767\" thread_id=\"136412\" timestamp=\"2026-09-17T22:10:05Z\">\n",
-            "  <user type=\"user\">Веселое время</user>\n",
+            "<message id=\"1\" thread_id=\"2\" timestamp=\"2026-09-17T22:10:05Z\">\n",
+            "  <user type=\"user\">Собеседник</user>\n",
             "  <message_type>text</message_type>\n",
             "  <text>Кринж, конечно, но зато честно.</text>\n",
             "</message>"
@@ -5723,8 +5723,8 @@ mod tests {
         // The call follows a copied transcript: the echo is context, not prose, so the
         // call behind it still runs. ("Где моя песня?" — production, same evening.)
         let after_echo = parse_assistant_content(concat!(
-            "<message id=\"212994\" thread_id=\"212946\" timestamp=\"t\">\n",
-            "  <user username=\"AndrewDI8\" type=\"user\">Конь в пальто</user>\n",
+            "<message id=\"1\" thread_id=\"2\" timestamp=\"t\">\n",
+            "  <user username=\"someone\" type=\"user\">Собеседник</user>\n",
             "  <text>Где моя песня ?</text>\n",
             "</message>\n\n",
             "<tool_call name=\"generate_song\" args='{ \"topic\": \"pro smurfov\" }'></tool_call>"
@@ -5796,7 +5796,7 @@ mod tests {
 
         // Beside a call, the emoticon is part of the line that travels with it.
         let beside_call = parse_assistant_content(concat!(
-            "<react_to_message chat_id=\"chat_94548\" emoji=\"🤣\" message_id=\"94548\"/>",
+            "<react_to_message chat_id=\"chat_1\" emoji=\"🤣\" message_id=\"1\"/>",
             "Судя по его лицу, он сам в себя влюбился (>_<)"
         ))?;
         assert_eq!(beside_call.tool_steps.len(), 1);
@@ -5840,7 +5840,7 @@ mod tests {
         // ordinary. Reading it as the end of the tag lost both calls and killed the turn.
         let parsed = parse_assistant_content(concat!(
             "<react_to_message chat_id=\"chat_id\" emoji=\"👀\" message_id=\"309825\"/>\n",
-            "<send_message text=\"<a href='https://t.me/+ZSIWzItm9YtiOGMy'>Ссылка</a> на новый круг общения?\"/>"
+            "<send_message text=\"<a href='https://t.me/+example'>Ссылка</a> на новый круг общения?\"/>"
         ))?;
 
         assert_eq!(
@@ -5851,7 +5851,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE]
         );
-        assert!(parsed.tool_steps[1].text.contains("t.me/+ZSIWzItm9YtiOGMy"));
+        assert!(parsed.tool_steps[1].text.contains("t.me/+example"));
         assert!(!parsed.residual_protocol);
         assert!(parsed.text.trim().is_empty());
         Ok(())
