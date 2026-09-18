@@ -2381,6 +2381,23 @@ fn remove_leading_xmlish_named_call_protocol(raw: &str) -> Option<String> {
     (!spans.is_empty()).then(|| remove_content_spans(raw, &spans))
 }
 
+/// Where the tag opened at `start` ends, ignoring a `>` inside a quoted attribute value.
+/// The bot's own messages carry Telegram markup, so `text="<a href='…'>…"` is ordinary.
+fn xmlish_tag_end(raw: &str, start: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (offset, ch) in raw[start..].char_indices() {
+        match (quote, ch) {
+            (Some(open), _) if ch == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '>') => return Some(start + offset),
+            (None, _) => {}
+        }
+    }
+    // An unbalanced quote leaves the tag unterminated; the first `>` is the best guess.
+    raw[start..].find('>').map(|at| start + at)
+}
+
 /// Element names that belong to the call protocol rather than to the reply.
 fn is_recognized_tool_element(name: &str) -> bool {
     matches!(
@@ -2418,8 +2435,7 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
             offset = start + 2;
             continue;
         }
-        let relative_open_end = raw[start..].find('>')?;
-        let open_end = start + relative_open_end + 1;
+        let open_end = xmlish_tag_end(raw, start)? + 1;
         let tag = &raw[start..open_end];
         let name = xmlish_tool_tag_name(tag);
         let recognized = is_recognized_tool_element(&name);
@@ -2776,10 +2792,10 @@ fn scan_xmlish_tool_steps(raw: &str, depth: usize) -> Vec<ToolStep> {
             offset = start + 2;
             continue;
         }
-        let Some(relative_open_end) = raw[start..].find('>') else {
+        let Some(tag_end) = xmlish_tag_end(raw, start) else {
             break;
         };
-        let open_end = start + relative_open_end + 1;
+        let open_end = tag_end + 1;
         let tag = &raw[start..open_end];
         let name = xmlish_tool_tag_name(tag);
         let lower = name.to_ascii_lowercase();
@@ -3913,10 +3929,9 @@ fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)
             offset = start + 2;
             continue;
         }
-        let Some(relative_end) = raw[start..].find('>') else {
+        let Some(open_end) = xmlish_tag_end(raw, start) else {
             return Err(ToolParseError::new("unterminated XML-ish tool tag"));
         };
-        let open_end = start + relative_end;
         let tag = raw[start..=open_end].to_owned();
         let name = xmlish_tool_tag_name(&tag);
         if canonical_known_step(&name).is_none() {
@@ -5728,6 +5743,29 @@ mod tests {
             unterminated_open.tool_steps[0].step,
             STEP_CHAT_HISTORY_SUMMARY
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_telegram_link_inside_an_argument_does_not_end_the_tag() -> Result<(), ToolParseError> {
+        // Production, 2026-09-18: the bot sends links, so `>` inside a quoted argument is
+        // ordinary. Reading it as the end of the tag lost both calls and killed the turn.
+        let parsed = parse_assistant_content(concat!(
+            "<react_to_message chat_id=\"chat_id\" emoji=\"👀\" message_id=\"309825\"/>\n",
+            "<send_message text=\"<a href='https://t.me/+ZSIWzItm9YtiOGMy'>Ссылка</a> на новый круг общения?\"/>"
+        ))?;
+
+        assert_eq!(
+            parsed
+                .tool_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>(),
+            vec![STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE]
+        );
+        assert!(parsed.tool_steps[1].text.contains("t.me/+ZSIWzItm9YtiOGMy"));
+        assert!(!parsed.residual_protocol);
+        assert!(parsed.text.trim().is_empty());
         Ok(())
     }
 
