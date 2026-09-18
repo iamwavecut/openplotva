@@ -5,8 +5,6 @@ on:
 
 env:
   RUST_VERSION: "1.95.0"
-  GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
-  GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
 
 permissions: {}
 
@@ -163,6 +161,9 @@ jobs:
 
       - name: Upload deploy assets
         shell: bash
+        env:
+          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2029
@@ -176,6 +177,8 @@ jobs:
       - name: Apply production deployment
         shell: bash
         env:
+          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           OPENPLOTVA_PRODUCTION_ENV_B64: ${{ secrets.OPENPLOTVA_PRODUCTION_ENV_B64 }}
         run: |
