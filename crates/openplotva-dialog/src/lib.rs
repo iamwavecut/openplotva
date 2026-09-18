@@ -1856,16 +1856,22 @@ fn strip_http_urls_for_repetition(value: &str) -> String {
     }
 }
 
+/// Whether the `<` that `rest` starts with can open markup. A tag name starts with a letter
+/// and a closing tag with `/`; anything else — the `>_<` and `<3` of chat, or `a < b` — is text.
+fn opens_xmlish_tag(rest: &str) -> bool {
+    rest.strip_prefix('<')
+        .and_then(|after| after.chars().next())
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '/' | '!' | '?'))
+}
+
 fn strip_html_tags_for_repetition(value: &str) -> String {
     let mut stripped = String::with_capacity(value.len());
     let mut remainder = value;
     while let Some(tag_start) = remainder.find('<') {
         let after_start = &remainder[tag_start + 1..];
-        let starts_tag = after_start
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '/' | '!' | '?'));
-        if starts_tag && let Some(tag_end) = after_start.find('>') {
+        if opens_xmlish_tag(&remainder[tag_start..])
+            && let Some(tag_end) = after_start.find('>')
+        {
             stripped.push_str(&remainder[..tag_start]);
             remainder = &after_start[tag_end + 1..];
         } else {
@@ -2420,6 +2426,10 @@ fn remove_xmlish_tool_protocol(raw: &str) -> Option<String> {
     let mut offset = 0;
     while let Some(relative_start) = raw[offset..].find('<') {
         let start = offset + relative_start;
+        if !opens_xmlish_tag(&raw[start..]) {
+            offset = start + 1;
+            continue;
+        }
         if raw[start..].starts_with("</") {
             // A closing tag whose element was removed is protocol too: left behind it would
             // travel to the chat as an orphan.
@@ -2787,6 +2797,13 @@ fn scan_xmlish_tool_steps(raw: &str, depth: usize) -> Vec<ToolStep> {
         // but whitespace before an element ends the protocol run.
         if depth == 0 && !raw[offset..start].trim().is_empty() {
             break;
+        }
+        if !opens_xmlish_tag(&raw[start..]) {
+            if depth == 0 {
+                break;
+            }
+            offset = start + 1;
+            continue;
         }
         if raw[start..].starts_with("</") {
             offset = start + 2;
@@ -3933,6 +3950,10 @@ fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)
     let mut offset = 0;
     while let Some(idx) = raw[offset..].find('<') {
         let start = offset + idx;
+        if !opens_xmlish_tag(&raw[start..]) {
+            offset = start + 1;
+            continue;
+        }
         if raw[start..].starts_with("</") {
             offset = start + 2;
             continue;
@@ -5751,6 +5772,43 @@ mod tests {
             unterminated_open.tool_steps[0].step,
             STEP_CHAT_HISTORY_SUMMARY
         );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_emoticons_are_text_not_tags() -> Result<(), ToolParseError> {
+        // Production, 2026-09-18: the parser read the `<` of `>_<` as a tag that never
+        // closed and refused the reply; the model kept its style, so one line was refused
+        // five times in a row and the turn spent its whole re-sampling budget.
+        for reply in [
+            "В одном вольере им точно будет тесно, устроят там битву титанов! >_<",
+            "Согласна, с земли всё ощущается иначе (>_<)",
+            "люблю этот чат <3",
+            "если 5 < 6, то всё в порядке",
+        ] {
+            let parsed = parse_assistant_content(reply)?;
+            assert!(parsed.tool_steps.is_empty(), "{reply}");
+            assert_eq!(
+                finalize_dialog_reply(reply),
+                DialogReplyOutcome::Reply(reply.to_owned())
+            );
+        }
+
+        // Beside a call, the emoticon is part of the line that travels with it.
+        let beside_call = parse_assistant_content(concat!(
+            "<react_to_message chat_id=\"chat_94548\" emoji=\"🤣\" message_id=\"94548\"/>",
+            "Судя по его лицу, он сам в себя влюбился (>_<)"
+        ))?;
+        assert_eq!(beside_call.tool_steps.len(), 1);
+        assert_eq!(beside_call.tool_steps[0].step, STEP_REACT_TO_MESSAGE);
+        assert!(!beside_call.residual_protocol);
+        assert_eq!(
+            beside_call.text,
+            "Судя по его лицу, он сам в себя влюбился (>_<)"
+        );
+
+        // A tag that really opens and never closes is still loud.
+        assert!(parse_assistant_content("<draw_image prompt=\"a fox").is_err());
         Ok(())
     }
 
