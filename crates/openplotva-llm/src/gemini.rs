@@ -1194,7 +1194,9 @@ impl GeminiMediaPromptOptimizer<ReqwestAifarmTransport> {
     /// Build a reqwest-backed Gemini media-prompt optimizer.
     #[must_use]
     pub fn new(cfg: GeminiMediaPromptOptimizerConfig) -> Self {
-        Self::with_transport(cfg, ReqwestAifarmTransport::default())
+        // Google keeps connections open for minutes; the farm's short idle cutoff would only
+        // add a handshake here.
+        Self::with_transport(cfg, ReqwestAifarmTransport::new(reqwest::Client::new()))
     }
 }
 
