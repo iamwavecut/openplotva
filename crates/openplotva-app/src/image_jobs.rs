@@ -1170,7 +1170,11 @@ where
     }
 
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        self.first.image_targets().then(self.second.image_targets())
+        self.first.image_targets().followed_by(
+            self.first.expected_image_count(),
+            self.second.image_targets(),
+            self.second.expected_image_count(),
+        )
     }
 
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
@@ -1319,7 +1323,11 @@ where
     }
 
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        self.first.image_targets().then(self.second.image_targets())
+        self.first.image_targets().followed_by(
+            self.first.expected_image_count(),
+            self.second.image_targets(),
+            self.second.expected_image_count(),
+        )
     }
 
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
@@ -1382,7 +1390,11 @@ where
     }
 
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        self.first.image_targets().then(self.second.image_targets())
+        self.first.image_targets().followed_by(
+            self.first.expected_image_count(),
+            self.second.image_targets(),
+            self.second.expected_image_count(),
+        )
     }
 
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
@@ -1455,7 +1467,7 @@ pub trait ImageGenerator {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::Klein
+        openplotva_media::ImageTargets::KLEIN
     }
 
     /// Generate and send an image.
@@ -1490,7 +1502,7 @@ pub trait ImageEditor {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::Klein
+        openplotva_media::ImageTargets::KLEIN
     }
 
     /// Edit and send an image.
@@ -1663,9 +1675,9 @@ fn image_generation_context(
 fn image_targets_for_workflow(workflow_key: &str) -> openplotva_media::ImageTargets {
     match workflow_key {
         IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY | IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY => {
-            openplotva_media::ImageTargets::Boogu
+            openplotva_media::ImageTargets::BOOGU
         }
-        _ => openplotva_media::ImageTargets::Klein,
+        _ => openplotva_media::ImageTargets::KLEIN,
     }
 }
 

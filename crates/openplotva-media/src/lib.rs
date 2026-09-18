@@ -80,40 +80,63 @@ impl ImageModel {
     }
 }
 
+/// Most output slots one optimizer call is written for.
+pub const MAX_IMAGE_SLOTS: usize = 4;
+
 /// Which model each output slot targets, in slot order.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ImageTargets {
-    #[default]
-    Klein,
-    Boogu,
-    /// Slot 0 for FLUX.2 [klein], slot 1 for Boogu-Image (the VIP pair).
-    KleinThenBoogu,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageTargets {
+    models: [ImageModel; MAX_IMAGE_SLOTS],
+    len: usize,
+}
+
+impl Default for ImageTargets {
+    fn default() -> Self {
+        Self::KLEIN
+    }
 }
 
 impl ImageTargets {
+    pub const KLEIN: Self = Self::single(ImageModel::Klein);
+    pub const BOOGU: Self = Self::single(ImageModel::Boogu);
+
     #[must_use]
-    pub const fn models(self) -> &'static [ImageModel] {
-        match self {
-            Self::Klein => &[ImageModel::Klein],
-            Self::Boogu => &[ImageModel::Boogu],
-            Self::KleinThenBoogu => &[ImageModel::Klein, ImageModel::Boogu],
+    pub const fn single(model: ImageModel) -> Self {
+        Self {
+            models: [model; MAX_IMAGE_SLOTS],
+            len: 1,
         }
+    }
+
+    #[must_use]
+    pub fn models(&self) -> &[ImageModel] {
+        &self.models[..self.len]
     }
 
     /// Model for output slot `index`; slots past the list reuse the last model.
     #[must_use]
     pub fn model_for_slot(self, index: usize) -> ImageModel {
-        let models = self.models();
-        models[index.min(models.len() - 1)]
+        self.models[index.min(self.len - 1)]
     }
 
-    /// Targets for two generators run side by side, first slots first.
+    /// Targets for two generators rendered side by side: `own_slots` slots
+    /// written for these targets, then `next_slots` slots for `next`.
     #[must_use]
-    pub const fn then(self, second: Self) -> Self {
-        match (self, second) {
-            (Self::Klein, Self::Boogu) => Self::KleinThenBoogu,
-            (first, _) => first,
+    pub fn followed_by(self, own_slots: usize, next: Self, next_slots: usize) -> Self {
+        let own_slots = own_slots.clamp(1, MAX_IMAGE_SLOTS);
+        let mut out = self;
+        for index in 0..own_slots {
+            out.models[index] = self.model_for_slot(index);
         }
+        out.len = own_slots;
+        for index in 0..next_slots {
+            if out.len == MAX_IMAGE_SLOTS {
+                break;
+            }
+            out.models[out.len] = next.model_for_slot(index);
+            out.len += 1;
+        }
+        out
     }
 }
 
@@ -734,7 +757,7 @@ mod tests {
     fn optimizer_prompt_renders_rules_for_each_slot_target() {
         let pair = render_image_optimizer_prompt(OptimizePromptOptions {
             variant_count: 2,
-            targets: ImageTargets::KleinThenBoogu,
+            targets: ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1),
         })
         .expect("render pair");
         assert!(pair.contains("`outputs[0]` is rendered by FLUX.2 [klein]"));
@@ -746,7 +769,7 @@ mod tests {
 
         let boogu = render_image_optimizer_prompt(OptimizePromptOptions {
             variant_count: 1,
-            targets: ImageTargets::Boogu,
+            targets: ImageTargets::BOOGU,
         })
         .expect("render boogu");
         assert!(boogu.contains("`outputs[0]` is rendered by Boogu-Image"));
@@ -756,7 +779,7 @@ mod tests {
 
         let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
             variant_count: 1,
-            targets: ImageTargets::Klein,
+            targets: ImageTargets::KLEIN,
         })
         .expect("render edit");
         assert!(edit.contains("`outputs[0]` is carried out by FLUX.2 [klein]"));
@@ -778,20 +801,27 @@ mod tests {
     }
 
     #[test]
-    fn image_targets_map_slots_and_pairs() {
+    fn image_targets_follow_each_side_slot_count() {
+        let pair = ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1);
+        assert_eq!(pair.models(), [ImageModel::Klein, ImageModel::Boogu]);
+
+        let wide_first = ImageTargets::KLEIN.followed_by(2, ImageTargets::BOOGU, 1);
         assert_eq!(
-            ImageTargets::Klein.then(ImageTargets::Boogu),
-            ImageTargets::KleinThenBoogu
+            wide_first.models(),
+            [ImageModel::Klein, ImageModel::Klein, ImageModel::Boogu]
         );
+        assert_eq!(wide_first.model_for_slot(1), ImageModel::Klein);
+        assert_eq!(wide_first.model_for_slot(2), ImageModel::Boogu);
+
+        assert_eq!(ImageTargets::KLEIN.model_for_slot(3), ImageModel::Klein);
+        assert_eq!(ImageTargets::default(), ImageTargets::KLEIN);
         assert_eq!(
-            ImageTargets::Boogu.then(ImageTargets::Klein),
-            ImageTargets::Boogu
+            ImageTargets::BOOGU
+                .followed_by(3, ImageTargets::KLEIN, 3)
+                .models()
+                .len(),
+            MAX_IMAGE_SLOTS
         );
-        assert_eq!(
-            ImageTargets::KleinThenBoogu.model_for_slot(1),
-            ImageModel::Boogu
-        );
-        assert_eq!(ImageTargets::Klein.model_for_slot(3), ImageModel::Klein);
     }
 
     #[test]
