@@ -1169,6 +1169,10 @@ where
         self.first.expected_image_count() + self.second.expected_image_count()
     }
 
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.first.image_targets().then(self.second.image_targets())
+    }
+
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
             let mut combined = ImageGenerationResult::default();
@@ -1314,6 +1318,10 @@ where
         self.first.expected_image_count() + self.second.expected_image_count()
     }
 
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.first.image_targets().then(self.second.image_targets())
+    }
+
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
             let first_slot = 0;
@@ -1371,6 +1379,10 @@ where
 {
     fn expected_image_count(&self) -> usize {
         self.first.expected_image_count() + self.second.expected_image_count()
+    }
+
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.first.image_targets().then(self.second.image_targets())
     }
 
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
@@ -1441,6 +1453,11 @@ pub trait ImageGenerator {
         1
     }
 
+    /// Image model each prompt slot is written for, in slot order.
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        openplotva_media::ImageTargets::Klein
+    }
+
     /// Generate and send an image.
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a>;
 
@@ -1469,6 +1486,11 @@ pub trait ImageEditor {
     /// Number of placeholder/result slots this workflow should reserve.
     fn expected_image_count(&self) -> usize {
         1
+    }
+
+    /// Image model each prompt slot is written for, in slot order.
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        openplotva_media::ImageTargets::Klein
     }
 
     /// Edit and send an image.
@@ -1510,6 +1532,10 @@ impl RoutedImageGenerator {
 impl ImageGenerator for RoutedImageGenerator {
     fn expected_image_count(&self) -> usize {
         self.expected_image_count
+    }
+
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        image_targets_for_workflow(&self.workflow_key)
     }
 
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
@@ -1577,6 +1603,10 @@ where
     DataUrl: TelegramVisionDataUrlProvider + Clone + Send + Sync + 'static,
     DataUrl::Error: fmt::Display,
 {
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        image_targets_for_workflow(&self.workflow_key)
+    }
+
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
         Box::pin(async move {
             let request_for_attempts = request.clone();
@@ -1625,6 +1655,17 @@ fn image_generation_context(
         thread_id: request.thread_id,
         message_id: (request.message_id != 0).then_some(request.message_id),
         ..RoutedRequestContext::default()
+    }
+}
+
+/// Boogu slots get Boogu-Image prompts; FLUX slots and the generic workflows,
+/// whose backend is chosen by routing, get the stricter FLUX.2 [klein] ones.
+fn image_targets_for_workflow(workflow_key: &str) -> openplotva_media::ImageTargets {
+    match workflow_key {
+        IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY | IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY => {
+            openplotva_media::ImageTargets::Boogu
+        }
+        _ => openplotva_media::ImageTargets::Klein,
     }
 }
 
@@ -1804,13 +1845,20 @@ where
         self.generator.expected_image_count()
     }
 
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.generator.image_targets()
+    }
+
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
             let request = optimized_image_generation_request(
                 &self.optimizer,
                 self.context.as_deref(),
                 request,
-                self.generator.expected_image_count().max(1),
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: self.generator.expected_image_count().max(1),
+                    targets: self.generator.image_targets(),
+                },
             )
             .await?;
             self.generator.generate_image(request).await
@@ -1827,7 +1875,10 @@ where
                 &self.optimizer,
                 self.context.as_deref(),
                 request,
-                self.generator.expected_image_count().max(1),
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: self.generator.expected_image_count().max(1),
+                    targets: self.generator.image_targets(),
+                },
             )
             .await?;
             self.generator
@@ -1860,9 +1911,15 @@ where
         self.editor.expected_image_count()
     }
 
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.editor.image_targets()
+    }
+
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
         Box::pin(async move {
-            let request = optimized_image_edit_request(&self.optimizer, request).await?;
+            let request =
+                optimized_image_edit_request(&self.optimizer, request, self.editor.image_targets())
+                    .await?;
             self.editor.edit_image(request).await
         })
     }
@@ -1872,7 +1929,7 @@ async fn optimized_image_generation_request<Optimizer>(
     optimizer: &MediaPromptOptimizerService<Optimizer>,
     context: Option<&dyn ImageContextProvider>,
     mut request: ImageGenerationRequest,
-    variant_count: usize,
+    options: openplotva_media::OptimizePromptOptions,
 ) -> Result<ImageGenerationRequest, ImageGenerationError>
 where
     Optimizer: MediaPromptOptimizer,
@@ -1886,7 +1943,15 @@ where
     if !preset.is_empty() {
         // `!draw` keeps the user's prompt verbatim; the optimizer only classifies it.
         let classified = optimizer
-            .enhance_image_prompt(&preset[0], &preset[0], &request.aspect_ratio, 1)
+            .enhance_image_prompt(
+                &preset[0],
+                &preset[0],
+                &request.aspect_ratio,
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: 1,
+                    ..options
+                },
+            )
             .await;
         if let Some(error) = classified.provider_error.as_deref() {
             tracing::debug!(%error, "image prompt classification failed; treating as adult");
@@ -1913,7 +1978,7 @@ where
             &optimizer_input(&context, &request_text),
             &request.prompt,
             &request.aspect_ratio,
-            variant_count,
+            options,
         )
         .await;
     if let Some(error) = optimized.provider_error.as_deref() {
@@ -1961,6 +2026,7 @@ fn extract_prompt_modifiers(request: &mut ImageGenerationRequest) {
 async fn optimized_image_edit_request<Optimizer>(
     optimizer: &MediaPromptOptimizerService<Optimizer>,
     mut request: ImageEditRequest,
+    targets: openplotva_media::ImageTargets,
 ) -> Result<ImageEditRequest, ImageEditError>
 where
     Optimizer: MediaPromptOptimizer,
@@ -1970,7 +2036,13 @@ where
         return Ok(request);
     }
     let optimized = optimizer
-        .enhance_image_edit_prompt(&original_prompt, 1)
+        .enhance_image_edit_prompt(
+            &original_prompt,
+            openplotva_media::OptimizePromptOptions {
+                variant_count: 1,
+                targets,
+            },
+        )
         .await;
     if let Some(error) = optimized.provider_error.as_deref() {
         tracing::debug!(%error, "image edit prompt optimization failed; using original prompt");

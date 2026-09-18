@@ -2207,11 +2207,15 @@ where
             return Err(AifarmMediaOptimizerError::EmptyText);
         }
         let variant_count = openplotva_media::normalize_variant_count(options.variant_count);
+        let render_options = openplotva_media::OptimizePromptOptions {
+            variant_count,
+            ..options
+        };
         let prompt = match self.client.prompt_store() {
             Some(prompts) => {
-                openplotva_media::render_image_optimizer_prompt_with(prompts, variant_count)?
+                openplotva_media::render_image_optimizer_prompt_with(prompts, render_options)?
             }
-            None => openplotva_media::render_image_optimizer_prompt(variant_count)?,
+            None => openplotva_media::render_image_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let content = self
@@ -2219,7 +2223,10 @@ where
                 AifarmStructuredJsonRequest {
                     name: "optimize_prompt".to_owned(),
                     messages: optimizer_messages(&prompt, text),
-                    schema: tool.input_schema,
+                    schema: openplotva_media::with_output_max_chars(
+                        tool.input_schema,
+                        openplotva_media::IMAGE_PROMPT_MAX_CHARS,
+                    ),
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
                     ..AifarmStructuredJsonRequest::default()
@@ -2246,11 +2253,15 @@ where
             return Err(AifarmMediaOptimizerError::EmptyText);
         }
         let variant_count = openplotva_media::normalize_variant_count(options.variant_count);
+        let render_options = openplotva_media::OptimizePromptOptions {
+            variant_count,
+            ..options
+        };
         let prompt = match self.client.prompt_store() {
             Some(prompts) => {
-                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, variant_count)?
+                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, render_options)?
             }
-            None => openplotva_media::render_image_edit_optimizer_prompt(variant_count)?,
+            None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
         let content = self
@@ -2258,7 +2269,10 @@ where
                 AifarmStructuredJsonRequest {
                     name: "optimize_edit_prompt".to_owned(),
                     messages: optimizer_messages(&prompt, text),
-                    schema: tool.input_schema,
+                    schema: openplotva_media::with_output_max_chars(
+                        tool.input_schema,
+                        openplotva_media::IMAGE_PROMPT_MAX_CHARS,
+                    ),
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
                     ..AifarmStructuredJsonRequest::default()
@@ -7725,7 +7739,10 @@ mod tests {
         let image = generator
             .optimize_image_prompt(
                 " cat ",
-                openplotva_media::OptimizePromptOptions { variant_count: 2 },
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: 2,
+                    ..Default::default()
+                },
                 &mut |status| statuses.push(status),
             )
             .await?;
@@ -7737,7 +7754,10 @@ mod tests {
         let edit = generator
             .optimize_image_edit_prompt(
                 " edit it ",
-                openplotva_media::OptimizePromptOptions { variant_count: 2 },
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: 2,
+                    ..Default::default()
+                },
                 &mut |status| statuses.push(status),
             )
             .await?;
