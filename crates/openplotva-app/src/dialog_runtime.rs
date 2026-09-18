@@ -1,6 +1,9 @@
 //! App-level dialog provider construction.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
@@ -11,13 +14,13 @@ use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatStepFuture, ChatStepProvider,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
-        normalize_chat_completions_url,
+        normalize_chat_completions_url, rejection_verdict_for,
     },
     gemini::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
         is_gemini_provider_model,
     },
-    retry::retryable_reason,
+    retry::{FailureReason, retryable_reason},
     router::{BreakerSet, PoolRegistry, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
 };
@@ -296,6 +299,9 @@ impl ChatStepProvider for RouterChatProvider {
                 vec!["vision".to_owned()]
             };
             let factory = Arc::clone(&self.factory);
+            // Feedback for a re-sample, kept per model: the note tells the model that
+            // rejected sample what was wrong with it, and means nothing to a different one.
+            let rejected: Arc<Mutex<Option<(i64, String)>>> = Arc::new(Mutex::new(None));
             let result = self
                 .walker
                 .run(
@@ -316,6 +322,18 @@ impl ChatStepProvider for RouterChatProvider {
                     move |attempt| {
                         let resolved = factory.resolve(&attempt);
                         let mut step_request = request_for_attempts.clone();
+                        let rejected = Arc::clone(&rejected);
+                        if let Some(verdict) =
+                            rejected.lock().ok().and_then(|last| match last.as_ref() {
+                                Some((model_id, verdict)) if *model_id == attempt.model_id => {
+                                    Some(verdict.clone())
+                                }
+                                _ => None,
+                            })
+                        {
+                            step_request.input.resample_verdict = verdict;
+                        }
+                        let attempt_model_id = attempt.model_id;
                         if !attempt.model_name.trim().is_empty() {
                             step_request.input.model = attempt.model_name.clone();
                         }
@@ -332,6 +350,9 @@ impl ChatStepProvider for RouterChatProvider {
                         {
                             step_request.input.enable_thinking = Some(enable_thinking);
                         }
+                        step_request.input.bad_words = openplotva_llm::aifarm::resolve_bad_words(
+                            attempt.overrides.extra.get("bad_words"),
+                        );
                         async move {
                             let client = match resolved {
                                 Ok(client) => client,
@@ -363,7 +384,18 @@ impl ChatStepProvider for RouterChatProvider {
                                     }
                                     Ok(output)
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => {
+                                    if retryable_reason(error.as_ref())
+                                        == Some(FailureReason::ModelOutputRejected)
+                                        && let Ok(mut last) = rejected.lock()
+                                    {
+                                        *last = Some((
+                                            attempt_model_id,
+                                            rejection_verdict_for(error.as_ref()).to_owned(),
+                                        ));
+                                    }
+                                    Err(error)
+                                }
                             }
                         }
                     },
@@ -1191,6 +1223,98 @@ mod tests {
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn model_config_selects_the_bad_words_preset() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Ok(DialogOutput {
+                provider: "aifarm".to_owned(),
+                answer: "ok".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.models[0].config = json!({ "bad_words": "dialog_scaffolding" });
+        let provider = router_provider_for_test(
+            snapshot,
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+            ),
+        );
+
+        provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .expect("dialog output");
+
+        let inputs = routed_provider.inputs();
+        assert!(
+            inputs[0].bad_words.iter().any(|word| word == "<message"),
+            "the model's own config decides whether its engine gets the control"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_sample_carries_the_verdict_that_rejected_the_previous_sample() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let rejection: ChatProviderError =
+            Box::new(openplotva_llm::aifarm::AifarmDialogError::FinalAnswerContextLeak);
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![
+                Err(rejection),
+                Ok(DialogOutput {
+                    provider: "aifarm".to_owned(),
+                    answer: "ладно, по делу".to_owned(),
+                    ..DialogOutput::default()
+                }),
+            ],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+            ),
+        )
+        .with_model_output_retries(1);
+
+        let output = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .expect("dialog output");
+
+        assert_eq!(output.text, "ладно, по делу");
+        let inputs = routed_provider.inputs();
+        assert_eq!(inputs.len(), 2, "the rejected sample must be re-sampled");
+        assert!(
+            inputs[0].resample_verdict.is_empty(),
+            "the first sample has nothing to be told about"
+        );
+        assert_eq!(
+            inputs[1].resample_verdict, "context_leak",
+            "the re-sample must carry what the guard rejected"
+        );
     }
 
     #[tokio::test]

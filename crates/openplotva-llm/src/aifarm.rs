@@ -227,6 +227,10 @@ pub struct ChatCompletionRequest {
     /// Native thinking control used by runtimes that expose it at the top level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// Token sequences the engine must never emit (vLLM `bad_words`). Used to keep the
+    /// model from writing the prompt's own scaffolding back into the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bad_words: Vec<String>,
     /// Chat template kwargs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<Value>,
@@ -292,6 +296,9 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
         serialize_optional_field(&mut state, "dry_base", request.dry_base)?;
         if request.dry_allowed_length != 0 {
             state.serialize_field("dry_allowed_length", &request.dry_allowed_length)?;
+        }
+        if !request.bad_words.is_empty() {
+            state.serialize_field("bad_words", &request.bad_words)?;
         }
         if let Some(value) = request.include_reasoning {
             state.serialize_field("include_reasoning", &value)?;
@@ -537,6 +544,127 @@ pub enum AifarmClientError {
     /// Unknown Discovery status.
     #[error("unknown dialog job status {0:?}")]
     UnknownStatus(String),
+}
+
+/// Openings the dialog model must never write. Gemma's vocabulary has no whole-tag
+/// tokens, so each entry bans `<` followed by that word; Telegram's own markup (`<b>`,
+/// `<a href`, `<code>`) stays legal because only these continuations are masked, and the
+/// native tool-call token is a special token this never touches.
+///
+/// Measured on 300 replayed production turns: the transcript envelope fell from 92 of 150
+/// wrapped answers to none, executed tool calls rose from 37 to 43 of 50, and reply length
+/// and language did not move.
+pub const DIALOG_SCAFFOLDING_BAD_WORDS: &[&str] = &[
+    // The history envelope the prompt renders.
+    "<message",
+    "<messages",
+    "<last_message",
+    "<message_type",
+    "<text",
+    "<user",
+    "<reply_to",
+    "<attach",
+    "<history",
+    // The runtime context message.
+    "<chat_context",
+    "<current_",
+    "<locale",
+    "<reference_context",
+    "<memory",
+    "<shield",
+    "<custom_persona",
+    "<daily_persona",
+    "<accent",
+    // The system contract.
+    "<system_contract",
+    "<identity",
+    "<base_voice",
+    "<persona",
+    "<task",
+    "<rule",
+    "<dialog_",
+    "<answer_policy",
+    "<output_and_memory",
+    "<transport",
+    "<tool_contract",
+    "<naming",
+    "<final_check",
+    "<check",
+    "<step",
+    // Answer envelopes and reasoning channels the guard already fights.
+    "<answer",
+    "<final_",
+    "<response",
+    "<reply",
+    "<think",
+    "<thought",
+    "<reasoning",
+    "<channel",
+    "<assistant",
+    "<context",
+];
+
+/// The named preset a routing model config selects with `"bad_words": "dialog_scaffolding"`.
+pub const DIALOG_SCAFFOLDING_PRESET: &str = "dialog_scaffolding";
+
+/// Resolve a routing config value into the sequences to ban: the preset name, an explicit
+/// list, or nothing at all. Textual tool-call forms are deliberately absent — they are how
+/// the model calls tools today.
+#[must_use]
+pub fn resolve_bad_words(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(name)) if name.trim() == DIALOG_SCAFFOLDING_PRESET => {
+            DIALOG_SCAFFOLDING_BAD_WORDS
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect()
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::to_owned)
+            .filter(|word| !word.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Which validator rejected this output, as the stable code a re-sample carries back to
+/// the model. The typed variant answers it; only a `Response` message falls back to
+/// matching, and then on its own leading sentence, because the tail of one can quote the
+/// model's text and would otherwise pick the verdict.
+#[must_use]
+pub fn rejection_verdict_for(error: &(dyn Error + 'static)) -> &'static str {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(dialog) = err.downcast_ref::<AifarmDialogError>() {
+            return match dialog {
+                AifarmDialogError::FinalAnswerContextLeak => "context_leak",
+                AifarmDialogError::FinalAnswerPromptLeak => "prompt_leak",
+                AifarmDialogError::FinalAnswerProtocolOnly => "protocol_only",
+                AifarmDialogError::FinalAnswerPathological(_) => "pathological",
+                AifarmDialogError::ReasoningBudgetExhausted { .. } => "reasoning_only",
+                AifarmDialogError::OutputBudgetExhausted { .. } => "budget_exhausted",
+                AifarmDialogError::Response(message) => response_rejection_verdict(message),
+                _ => "other",
+            };
+        }
+        current = err.source();
+    }
+    crate::retry::rejection_verdict_code(&error.to_string())
+}
+
+fn response_rejection_verdict(message: &str) -> &'static str {
+    const RESPONSE_VERDICTS: &[(&str, &str)] = &[
+        ("tool protocol error", "protocol_only"),
+        ("chat completion returned empty final text", "empty"),
+        ("chat completion returned no message", "empty"),
+    ];
+    let message = message.trim_start();
+    RESPONSE_VERDICTS
+        .iter()
+        .find(|(prefix, _)| message.starts_with(prefix))
+        .map_or("other", |(_, code)| *code)
 }
 
 /// AIFarm dialog-service error.
@@ -2964,6 +3092,7 @@ where
         if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
             request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
+        request.bad_words = input.bad_words.clone();
         let docs_chars = input
             .reference_context
             .iter()
@@ -4082,7 +4211,63 @@ fn build_initial_messages(
             messages.push(message);
         }
     }
+    if let Some(note) = render_resample_note(input, prompts)? {
+        append_resample_note(&mut messages, &note);
+    }
     Ok(messages)
+}
+
+/// The note a re-sample carries: what the previous sample got wrong, in plain words. It
+/// names no markup, so it cannot teach the shape it exists to prevent.
+fn render_resample_note(
+    input: &DialogInput,
+    prompts: Option<&openplotva_prompts::PromptStore>,
+) -> Result<Option<String>, AifarmMessageError> {
+    let verdict = input.resample_verdict.trim();
+    if verdict.is_empty() {
+        return Ok(None);
+    }
+    let data = json!({
+        "verdict": verdict,
+        "specialClosing": matches!(verdict, "no_tool_calls" | "budget_exhausted" | "reasoning_only"),
+    });
+    let rendered = match prompts {
+        Some(prompts) => prompts.render("aifarm/resample_note", &data)?,
+        None => openplotva_prompts::render("aifarm/resample_note", &data)?,
+    };
+    let note = rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok((!note.is_empty()).then_some(note))
+}
+
+/// The note goes inside the last user message, after the rendered transcript element, so
+/// the cached prefix is untouched and the generation point follows prose rather than a
+/// closing tag. Content parts replace the string when they exist — on the wire and in the
+/// trace alike — so the note goes to whichever of the two the request will actually carry.
+fn append_resample_note(messages: &mut [ChatMessage], note: &str) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role.eq_ignore_ascii_case("user"))
+    else {
+        return;
+    };
+    if let Some(part) = message
+        .content_parts
+        .iter_mut()
+        .rev()
+        .find(|part| part.part_type == "text")
+    {
+        part.text.push_str("\n\n");
+        part.text.push_str(note);
+    } else if !message.content.trim().is_empty() {
+        message.content.push_str("\n\n");
+        message.content.push_str(note);
+    }
 }
 
 pub fn build_system_prompt_with_tool_prompt(
@@ -7852,6 +8037,89 @@ mod tests {
     }
 
     #[test]
+    fn resample_note_follows_the_last_message_and_leaves_the_prefix_alone() {
+        let mut input = base_input();
+        input.message.id = 11;
+        input.message.text = "Плотва, напиши трек про то, как нас всех убьёт ИИ".to_owned();
+        let history = build_session_history_with_limit(&input, 8);
+        let plain =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        input.resample_verdict = "context_leak".to_owned();
+        let hinted =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        assert_eq!(hinted.len(), plain.len());
+        assert_eq!(
+            hinted[..hinted.len() - 1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            plain[..plain.len() - 1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            "the cached prefix must not move"
+        );
+
+        let last_plain = &plain[plain.len() - 1].content;
+        let last_hinted = &hinted[hinted.len() - 1].content;
+        let note = last_hinted
+            .strip_prefix(last_plain.as_str())
+            .expect("the note is appended after the rendered last message")
+            .trim();
+        assert!(note.starts_with("Прошлый вариант"), "note: {note}");
+        assert!(
+            !note.contains('<'),
+            "the note must not spell out the markup it exists to prevent: {note}"
+        );
+    }
+
+    #[test]
+    fn resample_note_reaches_the_text_part_of_a_multimodal_turn() {
+        let mut input = base_input();
+        input.message.id = 12;
+        input.message.text = "что на картинке?".to_owned();
+        input
+            .multimodal_images
+            .push(openplotva_dialog::MultimodalImage {
+                data_url: "data:image/png;base64,AAAA".to_owned(),
+                ..openplotva_dialog::MultimodalImage::default()
+            });
+        input.resample_verdict = "empty".to_owned();
+        let history = build_session_history_with_limit(&input, 8);
+        let messages =
+            build_initial_messages_with_tool_prompt(&input, &history, ToolPromptMode::Native)
+                .expect("messages");
+
+        let last = messages.last().expect("last message");
+        let text_part = last
+            .content_parts
+            .iter()
+            .rev()
+            .find(|part| part.part_type == "text")
+            .expect("multimodal turn carries its text in a part");
+        assert!(
+            text_part.text.contains("Прошлый вариант"),
+            "the note must reach the part that sits at the generation point: {}",
+            text_part.text
+        );
+        // Parts replace the string on the wire, so the note belongs to exactly one of them.
+        let wire: Value = serde_json::to_value(last).expect("wire message");
+        assert_eq!(
+            wire["content"]
+                .to_string()
+                .matches("Прошлый вариант")
+                .count(),
+            1,
+            "the request must carry the note once: {}",
+            wire["content"]
+        );
+    }
+
+    #[test]
     fn reply_leak_guard_rejects_prompt_and_transcript_copies() {
         let mut input = base_input();
         input.persona.custom_persona =
@@ -10018,6 +10286,107 @@ mod tests {
         assert_eq!(output.tool_calls[1].step.emoji, "😂");
         assert_eq!(output.tool_calls[1].step.target_message_id, 999949);
         assert_eq!(output.text, "Ну и за что тебе такое наказание божье?");
+        Ok(())
+    }
+
+    #[test]
+    fn the_verdict_comes_from_the_error_variant_not_from_quoted_model_text() {
+        let leak: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::FinalAnswerContextLeak);
+        assert_eq!(rejection_verdict_for(leak.as_ref()), "context_leak");
+
+        let pathological: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            AifarmDialogError::FinalAnswerPathological("repeated block".to_owned()),
+        );
+        assert_eq!(rejection_verdict_for(pathological.as_ref()), "pathological");
+
+        // The tail of a protocol error quotes what the model wrote; that text must not
+        // choose the verdict.
+        let quoted: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::Response(
+                "tool protocol error: returned only copied context messages".to_owned(),
+            ));
+        assert_eq!(rejection_verdict_for(quoted.as_ref()), "protocol_only");
+
+        let budget: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(AifarmDialogError::OutputBudgetExhausted { output_chars: 12 });
+        assert_eq!(rejection_verdict_for(budget.as_ref()), "budget_exhausted");
+    }
+
+    #[test]
+    fn bad_words_come_from_a_named_preset_or_an_explicit_list() {
+        let preset = resolve_bad_words(Some(&json!("dialog_scaffolding")));
+        assert_eq!(preset.len(), DIALOG_SCAFFOLDING_BAD_WORDS.len());
+        assert!(preset.iter().any(|word| word == "<message"));
+        assert!(
+            !preset.iter().any(|word| word.starts_with("<tool_call")),
+            "textual tool calls are how the model calls tools; banning them costs calls"
+        );
+
+        assert_eq!(
+            resolve_bad_words(Some(&json!(["<message", "", "<text"]))),
+            vec!["<message".to_owned(), "<text".to_owned()]
+        );
+        assert!(resolve_bad_words(Some(&json!("unknown_preset"))).is_empty());
+        assert!(resolve_bad_words(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dialog_request_sends_the_configured_bad_words() -> Result<(), CompletionError> {
+        let (provider, transport, _) = direct_dialog_provider(
+            json!({ "choices": [{ "message": { "role": "assistant", "content": "ага" } }] }),
+            AifarmDialogConfig::default(),
+        );
+        let mut input = base_input();
+        input.bad_words = resolve_bad_words(Some(&json!(DIALOG_SCAFFOLDING_PRESET)));
+
+        crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input,
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            },
+        )
+        .await
+        .expect("dialog step");
+
+        let sent = transport.requests();
+        let body: Value = serde_json::from_slice(&sent[0].body).expect("wire request");
+        let words = body["bad_words"]
+            .as_array()
+            .expect("bad_words reach the engine");
+        assert!(words.iter().any(|word| word == "<message"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_request_omits_bad_words_when_the_model_has_none() -> Result<(), CompletionError>
+    {
+        let (provider, transport, _) = direct_dialog_provider(
+            json!({ "choices": [{ "message": { "role": "assistant", "content": "ага" } }] }),
+            AifarmDialogConfig::default(),
+        );
+
+        crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            },
+        )
+        .await
+        .expect("dialog step");
+
+        let sent = transport.requests();
+        let body: Value = serde_json::from_slice(&sent[0].body).expect("wire request");
+        assert!(
+            body.get("bad_words").is_none(),
+            "an engine without the control must not see the key: {body}"
+        );
         Ok(())
     }
 

@@ -251,6 +251,20 @@ pub struct DialogInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub enable_thinking: Option<bool>,
+    /// Token sequences the engine must not emit for this turn, chosen by the routing
+    /// config of the model that serves it; empty for engines without the control.
+    #[serde(default, rename = "BadWords", skip_serializing_if = "Vec::is_empty")]
+    pub bad_words: Vec<String>,
+    /// Verdict that rejected the previous sample of this turn, as a stable code
+    /// (`context_leak`, `empty`, …); empty on the first attempt. The message builder
+    /// turns it into a short note after the rendered last message, so a re-sample is
+    /// told what was wrong instead of being asked the same question again.
+    #[serde(
+        default,
+        rename = "ResampleVerdict",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub resample_verdict: String,
     /// Capture-only X-ray of what fed this turn (memories recalled, persona,
     /// settings). Never serialized into the LLM request; the runtime lifts it
     /// onto the in-memory run record for the admin "Context X-ray".
