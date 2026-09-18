@@ -642,7 +642,9 @@ mod tests {
     #[test]
     fn optimizer_prompt_rendering_and_tool_schemas_match_contract() {
         let prompt = render_image_optimizer_prompt(2).expect("render image optimizer prompt");
-        assert!(prompt.contains("optimize_prompt_terminator"));
+        assert!(prompt.contains(
+            "The JSON object has exactly the fields `input`, `outputs`, `nsfw_result`, and `aspect_ratio`."
+        ));
         assert!(prompt.contains("must contain exactly `2` optimized prompts"));
         assert!(prompt.contains("Aspect Ratio Selection"));
         assert!(prompt.contains("`9:16`, `16:9`, `1:2`, `2:1`"));
@@ -654,7 +656,9 @@ mod tests {
 
         let edit_prompt =
             render_image_edit_optimizer_prompt(0).expect("render image edit optimizer prompt");
-        assert!(edit_prompt.contains("optimize_edit_prompt_terminator"));
+        assert!(edit_prompt.contains(
+            "The JSON object has exactly the fields `input`, `outputs`, and `nsfw_result`."
+        ));
         assert!(edit_prompt.contains("must contain exactly `1` final edit instructions"));
         assert!(edit_prompt.contains("Closed-gate decision tree"));
         assert!(edit_prompt.contains("Both gates must be present for `forbidden`"));
