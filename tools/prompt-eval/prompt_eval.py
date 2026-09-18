@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import html
 import http.client
 import json
@@ -16,6 +17,7 @@ import os
 import re
 import statistics
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -421,6 +423,7 @@ class Result:
     checks: dict[str, tuple[bool, str]] = field(default_factory=dict)
     raw: str = ""
     skipped: bool = False
+    finish_reason: str = ""
 
 
 def run_suite(fixtures: list[Fixture], prompt_dir: Path, args: argparse.Namespace, out_dir: Path, label: str) -> list[Result]:
@@ -432,31 +435,40 @@ def run_suite(fixtures: list[Fixture], prompt_dir: Path, args: argparse.Namespac
     for item in args.header or []:
         key, _, value = item.partition(":")
         headers[key.strip()] = value.strip()
-    results = []
     out_dir.mkdir(parents=True, exist_ok=True)
+    jobs = [(fixture, attempt) for fixture in fixtures for attempt in range(args.runs)]
+    lock = threading.Lock()
     log = (out_dir / f"{label}.jsonl").open("a", encoding="utf-8")
-    for fixture in fixtures:
-        for attempt in range(args.runs):
-            request = build_request(fixture, prompt_dir, args)
-            if request is None:
-                results.append(Result(fixture.id, fixture.flow, 0, 0.0, {}, skipped=True))
-                continue
-            status, payload, latency = post(args.endpoint, request, headers, args.timeout)
-            raw = response_text(payload) if status == 200 else json.dumps(payload)[:500]
-            parsed, note = parse_json_output(raw) if status == 200 else (None, "http error")
-            result = Result(fixture.id, fixture.flow, status, latency, payload.get("usage", {}) if isinstance(payload, dict) else {}, raw=raw)
-            for check in fixture.data.get("checks", []):
-                result.checks[check] = run_check(check, fixture, raw, parsed, note) if status == 200 else (False, f"HTTP {status}")
-            results.append(result)
+
+    def run_one(job: tuple[Fixture, int]) -> Result:
+        fixture, attempt = job
+        request = build_request(fixture, prompt_dir, args)
+        if request is None:
+            return Result(fixture.id, fixture.flow, 0, 0.0, {}, skipped=True)
+        status, payload, latency = post(args.endpoint, request, headers, args.timeout)
+        raw = response_text(payload) if status == 200 else json.dumps(payload)[:500]
+        parsed, note = parse_json_output(raw) if status == 200 else (None, "http error")
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        finish = ""
+        if isinstance(payload, dict) and payload.get("choices"):
+            finish = str(payload["choices"][0].get("finish_reason") or "")
+        result = Result(fixture.id, fixture.flow, status, latency, usage, raw=raw, finish_reason=finish)
+        for check in fixture.data.get("checks", []):
+            result.checks[check] = run_check(check, fixture, raw, parsed, note) if status == 200 else (False, f"HTTP {status}")
+        with lock:
             log.write(json.dumps({
                 "fixture": fixture.id, "attempt": attempt, "label": label, "status": status,
-                "latency_s": round(latency, 3), "usage": result.usage, "raw": raw,
+                "latency_s": round(latency, 3), "usage": result.usage, "finish_reason": finish, "raw": raw,
                 "checks": {k: {"ok": v[0], "note": v[1]} for k, v in result.checks.items()},
             }, ensure_ascii=False) + "\n")
             log.flush()
-            print(f"  {label} {fixture.id} #{attempt} HTTP {status} {latency:.1f}s "
+            print(f"  {label} {fixture.id} #{attempt} HTTP {status} {latency:.1f}s {finish} "
                   + " ".join(f"{'✓' if ok else '✗'}{name.split(':')[0]}" for name, (ok, _) in result.checks.items()),
                   flush=True)
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+        results = list(pool.map(run_one, jobs))
     log.close()
     return results
 
@@ -481,6 +493,8 @@ def summarize(results: list[Result], label: str) -> str:
             tokens_out = [r.usage.get("completion_tokens", 0) for r in done]
             lines.append(f"| {flow} | {len(done)} | latency p50/p95 s | {statistics.median(latencies):.1f}/{p95:.1f} | "
                          f"tokens in/out avg {statistics.mean(tokens_in):.0f}/{statistics.mean(tokens_out):.0f} |")
+            truncated = sum(1 for r in done if r.finish_reason == "length")
+            lines.append(f"| {flow} | {len(done)} | finish_reason=length | {truncated}/{len(done)} | |")
         skipped = [r for r in items if r.skipped]
         if skipped:
             lines.append(f"| {flow} | 0 | skipped | {len(skipped)} | missing local media |")
@@ -577,6 +591,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=["response_format", "tools", "prompt_only"], default="response_format")
     parser.add_argument("--set", action="append", help="override a request field, e.g. temperature=0.7")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--concurrency", type=int, default=1, help="parallel requests")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--out", type=Path, default=LOCAL_DIR / "runs" / time.strftime("%Y%m%d-%H%M%S"))
     args = parser.parse_args()
