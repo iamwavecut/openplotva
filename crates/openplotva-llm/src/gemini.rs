@@ -511,6 +511,7 @@ where
                 temperature: self.cfg.temperature,
                 top_p: self.cfg.top_p,
                 top_k: Some(self.cfg.top_k),
+                thinking_config: None,
             },
             safety_settings_for_model(&model),
         );
@@ -1107,6 +1108,17 @@ pub struct GeminiGenerationConfig {
     /// Top-k.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
+    /// Thinking control; see [`thinking_config_for_model`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<GeminiThinkingConfig>,
+}
+
+/// Gemini thinking control (`generationConfig.thinkingConfig`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiThinkingConfig {
+    /// Thinking token budget; 0 disables thinking on 2.5 Flash models.
+    pub thinking_budget: i32,
 }
 
 /// Gemini safety setting.
@@ -1171,6 +1183,10 @@ pub enum GeminiMediaPromptOptimizerError {
     /// Gemini did not return the required tool call.
     #[error("{0}")]
     Tool(String),
+    /// Gemini stopped with `MALFORMED_FUNCTION_CALL`: the forced call had
+    /// arguments it could not serialize. Stochastic, so worth one resend.
+    #[error("malformed function call: {0}")]
+    MalformedFunctionCall(String),
     /// Tool payload could not be decoded.
     #[error("decode optimizer payload: {0}")]
     Decode(serde_json::Error),
@@ -1315,10 +1331,9 @@ where
             .map_err(GeminiMediaPromptOptimizerError::Generate)?;
         self.resolve_and_apply_optimizer_cache(&self.song_cache, &model, &mut gemini_request)
             .await;
-        let response = self
-            .send_optimizer_request(&model, &gemini_request, "optimize_song_prompt")
+        let payload = self
+            .send_forced_tool_request(&model, &gemini_request, tool.name, "optimize_song_prompt")
             .await?;
-        let payload = decode_gemini_optimizer_tool_payload(&response, tool.name)?;
         let payload: openplotva_media::acestep::SongPromptPayload =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
         openplotva_media::acestep::normalize_song_prompt_payload(payload, &topic, &language)
@@ -1337,8 +1352,27 @@ where
         let mut request = gemini_optimizer_request(text, prompt, tool, &model);
         self.resolve_and_apply_optimizer_cache(cache, &model, &mut request)
             .await;
-        let response = self.send_optimizer_request(&model, &request, flow).await?;
-        decode_gemini_optimizer_tool_payload(&response, tool.name)
+        self.send_forced_tool_request(&model, &request, tool.name, flow)
+            .await
+    }
+
+    /// Send a forced-tool request and decode the call, resending once when
+    /// Gemini reports `MALFORMED_FUNCTION_CALL`.
+    async fn send_forced_tool_request(
+        &self,
+        model: &str,
+        request: &GeminiGenerateContentRequest,
+        tool_name: &str,
+        flow: &str,
+    ) -> Result<Value, GeminiMediaPromptOptimizerError> {
+        let response = self.send_optimizer_request(model, request, flow).await?;
+        match decode_gemini_optimizer_tool_payload(&response, tool_name) {
+            Err(GeminiMediaPromptOptimizerError::MalformedFunctionCall(_)) => {
+                let response = self.send_optimizer_request(model, request, flow).await?;
+                decode_gemini_optimizer_tool_payload(&response, tool_name)
+            }
+            decoded => decoded,
+        }
     }
 
     async fn resolve_and_apply_optimizer_cache(
@@ -1631,6 +1665,7 @@ where
                 temperature: self.cfg.temperature,
                 top_p: self.cfg.top_p,
                 top_k: None,
+                thinking_config: thinking_config_for_model(&self.cfg.model),
             },
             safety_settings: safety_settings_for_model(&self.cfg.model),
             tools: Vec::new(),
@@ -1874,6 +1909,7 @@ where
                 temperature: self.cfg.temperature,
                 top_p: self.cfg.top_p,
                 top_k: None,
+                thinking_config: thinking_config_for_model(&self.cfg.model),
             },
             safety_settings: safety_settings_for_model(&self.cfg.model),
             tools: Vec::new(),
@@ -2080,6 +2116,7 @@ fn gemini_optimizer_request(
             temperature: MEDIA_OPTIMIZER_TEMPERATURE,
             top_p: 0.0,
             top_k: None,
+            thinking_config: thinking_config_for_model(model),
         },
         safety_settings: safety_settings_for_model(model),
         tools: vec![GeminiTool {
@@ -2138,6 +2175,7 @@ fn gemini_song_prompt_request(
             temperature: SONG_DIRECTOR_TEMPERATURE,
             top_p: 0.0,
             top_k: None,
+            thinking_config: thinking_config_for_model(model),
         },
         safety_settings: safety_settings_for_model(model),
         tools: vec![GeminiTool {
@@ -2177,21 +2215,27 @@ fn decode_gemini_optimizer_tool_payload(
             "empty model response".to_owned(),
         ));
     };
-    if candidate.content.is_none() {
-        return Err(GeminiMediaPromptOptimizerError::Tool(
-            "candidate has no content".to_owned(),
-        ));
-    }
     if candidate.is_blocked() {
         return Err(GeminiMediaPromptOptimizerError::Generate(
             ContentBlockedError::new(candidate.blocked_reason()).to_string(),
         ));
     }
+    if candidate.finish_reason.trim() == "MALFORMED_FUNCTION_CALL" {
+        return Err(GeminiMediaPromptOptimizerError::MalformedFunctionCall(
+            candidate.finish_message.trim().to_owned(),
+        ));
+    }
+    let finish = candidate.finish_reason_suffix();
+    if candidate.content.is_none() {
+        return Err(GeminiMediaPromptOptimizerError::Tool(format!(
+            "candidate has no content{finish}"
+        )));
+    }
     let calls = candidate.function_calls();
     if calls.is_empty() {
-        return Err(GeminiMediaPromptOptimizerError::Tool(
-            "no tool calls in optimizer response".to_owned(),
-        ));
+        return Err(GeminiMediaPromptOptimizerError::Tool(format!(
+            "no tool calls in optimizer response{finish}"
+        )));
     }
     for call in calls {
         if call.function.name.trim() == tool_name.trim() {
@@ -2199,7 +2243,7 @@ fn decode_gemini_optimizer_tool_payload(
         }
     }
     Err(GeminiMediaPromptOptimizerError::Tool(format!(
-        "expected tool call {tool_name:?} was not produced"
+        "expected tool call {tool_name:?} was not produced{finish}"
     )))
 }
 
@@ -2310,8 +2354,11 @@ fn gemini_role(role: &str) -> &'static str {
     }
 }
 
+/// Google's default block threshold is already off for 2.5+ models; sending
+/// `BLOCK_NONE` pins that. `PROHIBITED_CONTENT` and SPII blocks are not
+/// configurable and still surface as blocked finishes.
 fn safety_settings_for_model(model: &str) -> Vec<GeminiSafetySetting> {
-    if !has_prefix_fold(model, "googleai/") && !has_prefix_fold(model, "vertexai/") {
+    if !is_gemini_model(model) {
         return Vec::new();
     }
     [
@@ -2326,6 +2373,27 @@ fn safety_settings_for_model(model: &str) -> Vec<GeminiSafetySetting> {
         threshold: "BLOCK_NONE".to_owned(),
     })
     .collect()
+}
+
+fn bare_gemini_model_id(model: &str) -> &str {
+    let model = model.trim();
+    strip_provider_prefix_fold(model, "googleai/")
+        .or_else(|| strip_provider_prefix_fold(model, "vertexai/"))
+        .unwrap_or(model)
+}
+
+fn is_gemini_model(model: &str) -> bool {
+    has_prefix_fold(model, "googleai/")
+        || has_prefix_fold(model, "vertexai/")
+        || has_prefix_fold(bare_gemini_model_id(model), "gemini-")
+}
+
+/// Worker calls (optimizers, summaries, memory) run without thinking. 2.5 Flash
+/// thinks by default and 2.5 Flash-Lite accepts an explicit zero budget, so both
+/// get `thinkingBudget: 0`; other generations and the dialog keep their defaults.
+fn thinking_config_for_model(model: &str) -> Option<GeminiThinkingConfig> {
+    has_prefix_fold(bare_gemini_model_id(model), "gemini-2.5-flash")
+        .then_some(GeminiThinkingConfig { thinking_budget: 0 })
 }
 
 #[must_use]
@@ -3022,6 +3090,15 @@ impl GeminiCandidate {
         )
     }
 
+    /// ` (finish reason X)` for diagnostics when the model stopped for anything
+    /// other than a normal stop, e.g. `MAX_TOKENS` truncating a tool call.
+    fn finish_reason_suffix(&self) -> String {
+        match self.finish_reason.trim() {
+            "" | "STOP" => String::new(),
+            reason => format!(" (finish reason {reason})"),
+        }
+    }
+
     fn blocked_reason(&self) -> &str {
         if self.finish_message.trim().is_empty() {
             self.finish_reason.trim()
@@ -3236,6 +3313,7 @@ mod tests {
                 temperature: 0.0,
                 top_p: 0.0,
                 top_k: None,
+                thinking_config: None,
             },
             safety_settings: Vec::new(),
             tools: Vec::new(),
@@ -3278,6 +3356,7 @@ mod tests {
                 temperature: 0.0,
                 top_p: 0.0,
                 top_k: None,
+                thinking_config: None,
             },
             safety_settings: Vec::new(),
             tools: Vec::new(),
@@ -3481,6 +3560,158 @@ mod tests {
         assert!(!sanitized.is_empty());
     }
 
+    fn assert_block_none_safety_settings(body: &Value) {
+        let settings = body["safetySettings"]
+            .as_array()
+            .expect("safetySettings array");
+        assert_eq!(settings.len(), 4);
+        assert!(
+            settings
+                .iter()
+                .all(|setting| setting["threshold"] == "BLOCK_NONE")
+        );
+    }
+
+    fn optimizer_tool_call_response() -> AifarmHttpResponse {
+        json_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "optimize_prompt_terminator",
+                            "args": {
+                                "input": "cat",
+                                "outputs": ["cinematic cat"],
+                                "aspect_ratio": "1:1",
+                                "nsfw_result": "safe"
+                            }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        }))
+    }
+
+    fn malformed_function_call_response() -> AifarmHttpResponse {
+        json_response(json!({
+            "candidates": [{
+                "finishReason": "MALFORMED_FUNCTION_CALL",
+                "finishMessage": "Malformed function call: print(optimize_prompt_terminator(outputs=[\"a\"))"
+            }]
+        }))
+    }
+
+    fn uncached_optimizer(transport: FakeTransport) -> GeminiMediaPromptOptimizer<FakeTransport> {
+        GeminiMediaPromptOptimizer::with_transport(
+            GeminiMediaPromptOptimizerConfig {
+                api_key: "key".to_owned(),
+                model: MODEL_GEMINI_FLASH_LITE.to_owned(),
+                ..GeminiMediaPromptOptimizerConfig::default()
+            },
+            transport,
+        )
+        .with_prompt_store(prompt_store_with(&[(
+            "image/optimizer.prompt",
+            "short prompt {{variant_count}}",
+        )]))
+    }
+
+    #[test]
+    fn bare_gemini_ids_get_block_none_safety_settings() {
+        for model in [
+            "gemini-2.5-flash-lite",
+            " googleai/gemini-2.5-flash-lite",
+            "vertexai/gemini-2.5-flash",
+            "GEMINI-2.5-FLASH-LITE",
+        ] {
+            assert_eq!(safety_settings_for_model(model).len(), 4, "{model}");
+        }
+        for model in ["gemma-3-27b-it", "openrouter/google/gemini-2.5-flash", ""] {
+            assert!(safety_settings_for_model(model).is_empty(), "{model}");
+        }
+    }
+
+    #[test]
+    fn thinking_is_disabled_only_for_2_5_flash_workers() {
+        for model in [
+            "gemini-2.5-flash-lite",
+            "googleai/gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+            "vertexai/gemini-2.5-flash-preview-09-2025",
+        ] {
+            assert_eq!(
+                thinking_config_for_model(model),
+                Some(GeminiThinkingConfig { thinking_budget: 0 }),
+                "{model}"
+            );
+        }
+        for model in ["gemini-2.5-pro", "gemini-3.1-flash-lite", "gemma-3-27b-it"] {
+            assert_eq!(thinking_config_for_model(model), None, "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_function_call_is_resent_once() -> Result<(), Box<dyn std::error::Error>> {
+        let transport = FakeTransport::new(vec![
+            Ok(json_response(
+                json!({"name": "cachedContents/optimizer-core"}),
+            )),
+            Ok(malformed_function_call_response()),
+            Ok(optimizer_tool_call_response()),
+        ]);
+        let optimizer = uncached_optimizer(transport.clone());
+
+        let got = optimizer
+            .optimize_image_prompt("cat", openplotva_media::OptimizePromptOptions::default())
+            .await?;
+
+        assert_eq!(got.outputs, vec!["cinematic cat".to_owned()]);
+        let state = transport.state();
+        assert_eq!(state.requests.len(), 3);
+        assert_eq!(state.requests[1].body, state.requests[2].body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_malformed_function_call_fails_after_one_resend() {
+        let transport = FakeTransport::new(vec![
+            Ok(json_response(
+                json!({"name": "cachedContents/optimizer-core"}),
+            )),
+            Ok(malformed_function_call_response()),
+            Ok(malformed_function_call_response()),
+        ]);
+        let optimizer = uncached_optimizer(transport.clone());
+
+        let error = optimizer
+            .optimize_image_prompt("cat", openplotva_media::OptimizePromptOptions::default())
+            .await
+            .expect_err("second malformed call must fail");
+
+        assert!(matches!(
+            error,
+            GeminiMediaPromptOptimizerError::MalformedFunctionCall(_)
+        ));
+        assert_eq!(transport.state().requests.len(), 3);
+    }
+
+    #[test]
+    fn truncated_optimizer_response_names_the_finish_reason() {
+        let response = json_response(json!({
+            "candidates": [{"finishReason": "MAX_TOKENS"}]
+        }));
+
+        let error = decode_gemini_optimizer_tool_payload(&response, "optimize_prompt_terminator")
+            .expect_err("no content");
+
+        assert_eq!(
+            error.to_string(),
+            "candidate has no content (finish reason MAX_TOKENS)"
+        );
+    }
+
     #[tokio::test]
     async fn gemini_media_prompt_optimizer_uses_required_tool_and_cache()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3584,7 +3815,11 @@ mod tests {
         assert_eq!(generate_body["generationConfig"]["temperature"], 0.5);
         assert!(generate_body["generationConfig"].get("topP").is_none());
         assert!(generate_body["generationConfig"].get("topK").is_none());
-        assert!(generate_body.get("safetySettings").is_none());
+        assert_eq!(
+            generate_body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget": 0})
+        );
+        assert_block_none_safety_settings(&generate_body);
         Ok(())
     }
 
@@ -3758,7 +3993,11 @@ mod tests {
         assert_eq!(body["generationConfig"]["temperature"], 0.2);
         assert_eq!(body["generationConfig"]["topP"], 0.9);
         assert!(body["generationConfig"].get("topK").is_none());
-        assert!(body.get("safetySettings").is_none());
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget": 0})
+        );
+        assert_block_none_safety_settings(&body);
         Ok(())
     }
 
