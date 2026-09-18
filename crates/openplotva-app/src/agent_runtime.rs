@@ -1143,6 +1143,8 @@ fn agent_client_config_from_attempt(
     }
     client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
     client.supports_message_name = attempt.supports_message_name();
+    client.gateway_fields =
+        openplotva_llm::aifarm::GatewayRequestFields::from_overrides(&attempt.overrides.extra);
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         client.endpoint_name = endpoint.to_owned();
     }

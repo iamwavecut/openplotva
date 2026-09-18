@@ -6,7 +6,7 @@ use openplotva_config::AppConfig;
 use openplotva_dialog::{PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX};
 use openplotva_llm::aifarm::{
     AifarmClientConfig, AifarmDialogConfig, AifarmHttpTransport, AifarmStructuredJsonConfig,
-    AifarmStructuredJsonGenerator, ReqwestAifarmTransport, StatusUpdate,
+    AifarmStructuredJsonGenerator, GatewayRequestFields, ReqwestAifarmTransport, StatusUpdate,
 };
 use openplotva_llm::gemini::{GeminiMediaPromptOptimizer, GeminiMediaPromptOptimizerConfig};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
@@ -299,9 +299,7 @@ fn media_optimizer_for_attempt_with_prompt_store(
 ) -> Result<AppMediaPromptOptimizer, MediaPromptOptimizerError> {
     if routed_attempt_is_genkit(attempt) {
         let model = genkit_model_for_attempt(attempt);
-        if let Some((cfg, _)) =
-            genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(config, &model)
-        {
+        if let Some(cfg) = gateway_structured_json_config_for_attempt(config, attempt) {
             let optimizer =
                 AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
             return Ok(Arc::new(optimizer) as AppMediaPromptOptimizer);
@@ -342,6 +340,20 @@ pub(crate) fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
     }
 }
 
+/// Structured-JSON config for a genkit-family attempt served by an
+/// OpenAI-compatible gateway (OpenRouter), carrying the routed model's gateway
+/// fields. `None` when the attempt's model is not a gateway model.
+pub(crate) fn gateway_structured_json_config_for_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> Option<AifarmStructuredJsonConfig> {
+    let model = genkit_model_for_attempt(attempt);
+    let (mut cfg, _) =
+        genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(config, &model)?;
+    cfg.client.gateway_fields = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
+    Some(cfg)
+}
+
 pub(crate) fn aifarm_structured_json_config_for_attempt(
     config: &AppConfig,
     attempt: &RoutedAttempt,
@@ -375,6 +387,7 @@ pub(crate) fn aifarm_structured_json_config_for_attempt(
     }
     cfg.client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
     cfg.client.supports_message_name = attempt.supports_message_name();
+    cfg.client.gateway_fields = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         cfg.client.endpoint_name = endpoint.to_owned();
     }
@@ -1090,6 +1103,65 @@ mod tests {
         assert_eq!(cfg.client.request_timeout, Duration::from_secs(333));
         assert_eq!(cfg.client.service_name, "svc");
         assert_eq!(cfg.client.endpoint_name, "endpoint");
+    }
+
+    fn openrouter_attempt(overrides: serde_json::Value) -> RoutedAttempt {
+        RoutedAttempt {
+            provider_id: 3,
+            model_id: 5,
+            provider_name: "openrouter".to_owned(),
+            model_name: "vendor/model-flash".to_owned(),
+            provider_runtime_hint: None,
+            provider_endpoint: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            provider_api_key_ref: None,
+            provider_api_key_encrypted: None,
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: serde_json::json!({}),
+            model_config: serde_json::json!({}),
+            overrides: openplotva_llm::router::InferenceOverrides {
+                extra: overrides,
+                ..Default::default()
+            },
+            variant: None,
+        }
+    }
+
+    #[test]
+    fn gateway_attempt_carries_routed_model_gateway_fields() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            openrouter_key: Some("openrouter-key".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+        let attempt = openrouter_attempt(serde_json::json!({
+            "provider": {"require_parameters": true, "quantizations": ["fp8"]},
+            "reasoning": {"enabled": false},
+            "temperature": 0.4
+        }));
+
+        let cfg =
+            gateway_structured_json_config_for_attempt(&config, &attempt).expect("gateway config");
+
+        assert_eq!(cfg.model, "vendor/model-flash");
+        assert_eq!(cfg.client.direct_url, OPENROUTER_CHAT_COMPLETIONS_URL);
+        assert_eq!(
+            cfg.client.gateway_fields.provider,
+            Some(serde_json::json!({"require_parameters": true, "quantizations": ["fp8"]}))
+        );
+        assert_eq!(
+            cfg.client.gateway_fields.reasoning,
+            Some(serde_json::json!({"enabled": false}))
+        );
+
+        let plain = gateway_structured_json_config_for_attempt(
+            &config,
+            &openrouter_attempt(serde_json::json!({})),
+        )
+        .expect("gateway config");
+        assert_eq!(plain.client.gateway_fields, GatewayRequestFields::default());
     }
 
     #[tokio::test]
