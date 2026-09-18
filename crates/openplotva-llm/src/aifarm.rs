@@ -918,11 +918,20 @@ impl ReqwestAifarmTransport {
     }
 }
 
+/// Discovery and the services behind it run on uvicorn, which closes a keep-alive connection
+/// after 5 s idle. A pooled connection reused past that point fails before the request is
+/// read ("error sending request"), and the walker then hands the turn to the next model, one
+/// without tools. Idle connections retire just before the server's cutoff instead of after
+/// reqwest's 90 s default.
+const FARM_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
 impl Default for ReqwestAifarmTransport {
     fn default() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(FARM_POOL_IDLE_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 }
 
