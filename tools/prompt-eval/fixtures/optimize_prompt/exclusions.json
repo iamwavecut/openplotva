@@ -1,0 +1,24 @@
+{
+  "id": "optimize_prompt/exclusions",
+  "flow": "optimize_prompt",
+  "prompt": "image/optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_prompt",
+  "tool_name": "optimize_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 1024
+  },
+  "notes": "Text after | lists exclusions; no pipe and no negative syntax in outputs.",
+  "user": "портрет пожилого рыбака | blurry, cartoon 3:4",
+  "checks": [
+    "json",
+    "schema",
+    "no_substring:|",
+    "no_phrases:blurry;cartoon",
+    "equals:aspect_ratio=3:4",
+    "max_blank_run:3"
+  ]
+}
