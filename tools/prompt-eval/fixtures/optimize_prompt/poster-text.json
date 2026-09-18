@@ -1,0 +1,24 @@
+{
+  "flow": "optimize_prompt",
+  "id": "optimize_prompt/poster-text",
+  "prompt": "image/optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_prompt",
+  "tool_name": "optimize_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 2048
+  },
+  "notes": "Quoted Cyrillic text and explicit ratio must survive.",
+  "user": "плакат с надписью «Скидки до 50%» 2:3",
+  "checks": [
+    "json",
+    "schema",
+    "contains:Скидки до 50%",
+    "equals:aspect_ratio=2:3",
+    "no_substring:|",
+    "max_blank_run:3"
+  ]
+}

@@ -1,0 +1,158 @@
+{
+  "flow": "memory_extraction",
+  "id": "memory_extraction/debate",
+  "prompt": "memory/extraction",
+  "schema": "memory_extraction",
+  "tool_name": "memory_extraction",
+  "request": {
+    "temperature": 0.2,
+    "max_tokens": 4000
+  },
+  "notes": "A heated two-person debate: at most one stance card per person, never one per message.",
+  "user": {
+    "chat_type": "supergroup",
+    "existing_cards": [],
+    "messages": [
+      {
+        "entry_id": "msg:1001",
+        "message_id": 1001,
+        "occurred_at": "2026-09-01T18:00:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "удалёнка лучше, я дома делаю в два раза больше",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1002",
+        "message_id": 1002,
+        "occurred_at": "2026-09-01T18:01:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "да ладно, в офисе команда сильнее",
+        "thread_id": 0,
+        "user_id": 7002
+      },
+      {
+        "entry_id": "msg:1003",
+        "message_id": 1003,
+        "occurred_at": "2026-09-01T18:02:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "в офисе только кофе и болтовня",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1004",
+        "message_id": 1004,
+        "occurred_at": "2026-09-01T18:03:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "а на удалёнке все пропадают и не отвечают",
+        "thread_id": 0,
+        "user_id": 7002
+      },
+      {
+        "entry_id": "msg:1005",
+        "message_id": 1005,
+        "occurred_at": "2026-09-01T18:04:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "мне никто не мешает, это главное",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1006",
+        "message_id": 1006,
+        "occurred_at": "2026-09-01T18:05:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "а мне скучно одной",
+        "thread_id": 0,
+        "user_id": 7002
+      },
+      {
+        "entry_id": "msg:1007",
+        "message_id": 1007,
+        "occurred_at": "2026-09-01T18:06:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "зато не надо ехать час",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1008",
+        "message_id": 1008,
+        "occurred_at": "2026-09-01T18:07:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "зато вечером есть граница между работой и домом",
+        "thread_id": 0,
+        "user_id": 7002
+      },
+      {
+        "entry_id": "msg:1009",
+        "message_id": 1009,
+        "occurred_at": "2026-09-01T18:08:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "границу можно и дома сделать",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1010",
+        "message_id": 1010,
+        "occurred_at": "2026-09-01T18:09:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "у тебя кот на клавиатуре, какая граница",
+        "thread_id": 0,
+        "user_id": 7002
+      },
+      {
+        "entry_id": "msg:1011",
+        "message_id": 1011,
+        "occurred_at": "2026-09-01T18:10:00Z",
+        "sender_name": "Олег",
+        "sender_type": "user",
+        "text": "кот — полноценный коллега",
+        "thread_id": 0,
+        "user_id": 7001
+      },
+      {
+        "entry_id": "msg:1012",
+        "message_id": 1012,
+        "occurred_at": "2026-09-01T18:11:00Z",
+        "sender_name": "Марина",
+        "sender_type": "user",
+        "text": "🙄",
+        "thread_id": 0,
+        "user_id": 7002
+      }
+    ],
+    "run": {
+      "attempts": 0,
+      "chat_id": -1000000000001,
+      "cursor_after_at": "2026-09-01T00:00:00Z",
+      "cursor_entry_id": "",
+      "cursor_message_id": 0,
+      "id": 1,
+      "message_count": 12,
+      "prompt_version": "eval",
+      "range_end_at": "2026-09-02T00:00:00Z",
+      "range_start_at": "2026-09-01T00:00:00Z"
+    }
+  },
+  "checks": [
+    "json",
+    "schema",
+    "max_items:candidate_cards:2",
+    "ids_from_input",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "flow": "song_director",
+  "id": "song_director/ru-pop-cat",
+  "prompt": "music/song_director",
+  "schema": "song_director",
+  "tool_name": "song_director",
+  "request": {
+    "temperature": 0.7,
+    "max_tokens": 6144
+  },
+  "vars": {
+    "request": "!song песня про кота, который ворует носки, весёлый поп, женский вокал",
+    "topic": "кот, который ворует носки",
+    "userName": "Аня",
+    "languageHint": "ru",
+    "maxDuration": 360,
+    "context": ""
+  },
+  "checks": [
+    "json",
+    "schema",
+    "equals:vocal_language=ru",
+    "lang:ru:lyrics",
+    "no_phrases:[Gregorian;(instrumental)",
+    "max_blank_run:3"
+  ]
+}

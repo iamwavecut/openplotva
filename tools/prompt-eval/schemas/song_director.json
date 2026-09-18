@@ -1,0 +1,93 @@
+{
+  "properties": {
+    "analysis": {
+      "description": "2-4 sentences: the genre family chosen and why, vocals or instrumental, the lyrics language, the target duration and the story angle",
+      "type": "string"
+    },
+    "bpm": {
+      "type": "integer"
+    },
+    "character": {
+      "description": "3-6 energy, mood, era and attitude tags",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "duration_seconds": {
+      "type": "integer"
+    },
+    "genre": {
+      "description": "main genre and subgenre tags, comma-separated",
+      "type": "string"
+    },
+    "key": {
+      "description": "musical key such as F minor, or an empty string",
+      "type": "string"
+    },
+    "lyrics": {
+      "description": "section-marked lyrics, or an empty string for instrumentals",
+      "type": "string"
+    },
+    "references": {
+      "description": "0-3 tags of the form 'in the style of ...'",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "sound": {
+      "description": "5-10 instrument and sound-design tags",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "structure": {
+      "description": "4-8 arrangement tags in playback order",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "title": {
+      "description": "2-5 words in the lyrics language",
+      "type": "string"
+    },
+    "vocal_language": {
+      "description": "ISO 639-1 code of the lyrics language: ru, en, uk, be, es, de, fr, it, pt, pl, tr, ja, ko, zh",
+      "type": "string"
+    },
+    "vocal_style": {
+      "description": "one phrase describing the singer; empty for instrumentals",
+      "type": "string"
+    },
+    "vocals": {
+      "enum": [
+        "male",
+        "female",
+        "duet",
+        "choir",
+        "instrumental"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "analysis",
+    "title",
+    "vocal_language",
+    "vocals",
+    "genre",
+    "bpm",
+    "key",
+    "sound",
+    "character",
+    "structure",
+    "vocal_style",
+    "references",
+    "duration_seconds",
+    "lyrics"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,69 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/opposing-stances",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.2,
+    "max_tokens": 4000
+  },
+  "notes": "Two people with opposite stances must stay separate; one throwaway card can be demoted.",
+  "user": {
+    "subject": "удалёнка",
+    "cards": [
+      {
+        "id": 21,
+        "type": "recurring_topic",
+        "predicate": "считает",
+        "fact": "Олег считает удалёнку продуктивнее офиса",
+        "salience": 0.6,
+        "obs": 3,
+        "age": "1mo"
+      },
+      {
+        "id": 22,
+        "type": "recurring_topic",
+        "predicate": "повторяет",
+        "fact": "Олег снова говорит, что дома работает лучше",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "id": 23,
+        "type": "recurring_topic",
+        "predicate": "считает",
+        "fact": "Марина уверена, что в офисе команда сильнее",
+        "salience": 0.6,
+        "obs": 2,
+        "age": "1mo"
+      },
+      {
+        "id": 24,
+        "type": "recurring_topic",
+        "predicate": "считает",
+        "fact": "Марина считает, что удалёнка разрушает общение",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "id": 25,
+        "type": "event",
+        "predicate": "написал",
+        "fact": "Кто-то написал «ну такое» про удалёнку",
+        "salience": 0.2,
+        "obs": 1,
+        "age": "2w"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "partition_ids",
+    "ids_from_input",
+    "no_phrases:but wait;let me think;let me check;the prompt says"
+  ]
+}

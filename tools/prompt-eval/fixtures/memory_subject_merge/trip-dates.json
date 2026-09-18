@@ -1,0 +1,69 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/trip-dates",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.2,
+    "max_tokens": 4000
+  },
+  "notes": "Date change should stay distinguishable; duplicate tent cards fold.",
+  "user": {
+    "subject": "поездка в Карелию",
+    "cards": [
+      {
+        "id": 31,
+        "type": "project",
+        "predicate": "планирует",
+        "fact": "Группа планирует поездку в Карелию в июле",
+        "salience": 0.6,
+        "obs": 2,
+        "age": "1mo"
+      },
+      {
+        "id": 32,
+        "type": "decision",
+        "predicate": "решили",
+        "fact": "Решили ехать в Карелию 12 июля",
+        "salience": 0.7,
+        "obs": 1,
+        "age": "3w"
+      },
+      {
+        "id": 33,
+        "type": "decision",
+        "predicate": "перенесли",
+        "fact": "Поездку в Карелию перенесли на 19 июля",
+        "salience": 0.7,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "id": 34,
+        "type": "project",
+        "predicate": "берёт",
+        "fact": "Катя берёт палатку",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "id": 35,
+        "type": "project",
+        "predicate": "берёт",
+        "fact": "Катя берёт палатку на поездку",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "1w"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "partition_ids",
+    "ids_from_input",
+    "no_phrases:but wait;let me think;let me check;the prompt says"
+  ]
+}

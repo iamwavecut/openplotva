@@ -1,0 +1,26 @@
+{
+  "flow": "song_director",
+  "id": "song_director/neurofunk-instrumental",
+  "prompt": "music/song_director",
+  "schema": "song_director",
+  "tool_name": "song_director",
+  "request": {
+    "temperature": 0.7,
+    "max_tokens": 6144
+  },
+  "vars": {
+    "request": "!song мрачный нейрофанк без слов, минуты на две",
+    "topic": "мрачный нейрофанк без слов",
+    "userName": "Дима",
+    "languageHint": "ru",
+    "maxDuration": 360,
+    "context": ""
+  },
+  "checks": [
+    "json",
+    "schema",
+    "equals:vocals=instrumental",
+    "equals:lyrics=",
+    "max_blank_run:3"
+  ]
+}

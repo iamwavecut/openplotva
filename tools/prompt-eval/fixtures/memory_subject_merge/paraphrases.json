@@ -1,0 +1,79 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/paraphrases",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.2,
+    "max_tokens": 4000
+  },
+  "notes": "Five paraphrases of one fact plus one distinct fact.",
+  "user": {
+    "subject": "кот Барсик",
+    "cards": [
+      {
+        "id": 11,
+        "type": "joke",
+        "predicate": "спит",
+        "fact": "Кот Барсик любит спать на батарее",
+        "salience": 0.7,
+        "obs": 4,
+        "age": "2mo"
+      },
+      {
+        "id": 12,
+        "type": "joke",
+        "predicate": "спит",
+        "fact": "Барсик опять спит на батарее",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "3w"
+      },
+      {
+        "id": 13,
+        "type": "joke",
+        "predicate": "спит",
+        "fact": "Кот Барсик всю зиму провёл на батарее",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "id": 14,
+        "type": "joke",
+        "predicate": "лежит",
+        "fact": "Барсик лежит на батарее, как обычно",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "1w"
+      },
+      {
+        "id": 15,
+        "type": "joke",
+        "predicate": "спит",
+        "fact": "Любимое место Барсика — батарея",
+        "salience": 0.6,
+        "obs": 2,
+        "age": "1w"
+      },
+      {
+        "id": 16,
+        "type": "preference",
+        "predicate": "боится",
+        "fact": "Кот Барсик боится пылесоса",
+        "salience": 0.6,
+        "obs": 2,
+        "age": "1mo"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "partition_ids",
+    "ids_from_input",
+    "min_items:clusters:1",
+    "no_phrases:but wait;let me think;let me check;the prompt says"
+  ]
+}

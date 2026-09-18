@@ -1,0 +1,21 @@
+{
+  "flow": "optimize_edit_prompt",
+  "id": "optimize_edit_prompt/replace-text",
+  "prompt": "image/edit_optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_edit_prompt",
+  "tool_name": "optimize_edit_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 2048
+  },
+  "user": "поменяй надпись «Кафе» на «Бар»",
+  "checks": [
+    "json",
+    "schema",
+    "contains:Бар",
+    "max_blank_run:3"
+  ]
+}

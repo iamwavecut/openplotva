@@ -1,0 +1,189 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "candidate_cards": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "card_type": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "durability": {
+            "type": "string"
+          },
+          "fact_text": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "portable": {
+            "type": "boolean"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "salience": {
+            "type": "number"
+          },
+          "scope_type": {
+            "enum": [
+              "chat",
+              "thread",
+              "user"
+            ],
+            "type": "string"
+          },
+          "source_entry_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_message_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope_type",
+          "card_type",
+          "subject",
+          "predicate",
+          "object",
+          "fact_text",
+          "confidence",
+          "salience",
+          "source_entry_ids",
+          "source_message_ids"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "episode_summary": {
+      "type": "string"
+    },
+    "links": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "type": "number"
+          },
+          "from_fact_text": {
+            "type": "string"
+          },
+          "relation": {
+            "type": "string"
+          },
+          "to_fact_text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_fact_text",
+          "to_fact_text",
+          "relation",
+          "confidence"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "participants": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "resolutions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "conflict_score": {
+            "type": "number"
+          },
+          "decision": {
+            "enum": [
+              "supersede",
+              "competing",
+              "update",
+              "merge",
+              "reinforce",
+              "demote"
+            ],
+            "type": "string"
+          },
+          "into_card_id": {
+            "type": "integer"
+          },
+          "new_fact_text": {
+            "type": "string"
+          },
+          "old_card_id": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "old_card_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "supersessions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "new_fact_text": {
+            "type": "string"
+          },
+          "old_card_id": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "old_card_id",
+          "new_fact_text",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "topics": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "episode_summary",
+    "topics",
+    "participants",
+    "candidate_cards",
+    "supersessions",
+    "links"
+  ],
+  "type": "object"
+}

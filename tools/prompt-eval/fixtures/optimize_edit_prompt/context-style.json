@@ -1,0 +1,21 @@
+{
+  "flow": "optimize_edit_prompt",
+  "id": "optimize_edit_prompt/context-style",
+  "prompt": "image/edit_optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_edit_prompt",
+  "tool_name": "optimize_edit_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 2048
+  },
+  "user": "Context:\nVision: a portrait of a man in a red jacket standing on a snowy street at dusk\nRequest:\nсделай в стиле Ван Гога",
+  "checks": [
+    "json",
+    "schema",
+    "word_range:outputs[]:10:140",
+    "max_blank_run:3"
+  ]
+}

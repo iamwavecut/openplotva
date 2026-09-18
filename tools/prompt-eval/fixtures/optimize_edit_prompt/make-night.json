@@ -1,0 +1,22 @@
+{
+  "flow": "optimize_edit_prompt",
+  "id": "optimize_edit_prompt/make-night",
+  "prompt": "image/edit_optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_edit_prompt",
+  "tool_name": "optimize_edit_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 2048
+  },
+  "user": "сделай ночь",
+  "checks": [
+    "json",
+    "schema",
+    "word_range:outputs[]:10:140",
+    "lang:en:outputs[]",
+    "max_blank_run:3"
+  ]
+}
