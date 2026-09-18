@@ -647,7 +647,11 @@ mod tests {
                 .content
                 .contains("You are the music director and lyricist")
         );
-        assert!(messages[0].content.contains("song_director_terminator"));
+        assert!(
+            messages[0]
+                .content
+                .contains("Return the whole package as exactly one JSON object")
+        );
         assert!(messages[0].content.contains("Hard maximum 360 seconds"));
         assert!(
             messages[0].content.contains("Fet.Online"),

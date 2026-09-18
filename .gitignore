@@ -12,3 +12,4 @@
 /run.log
 
 /tools/prompt-eval/local/
+__pycache__/

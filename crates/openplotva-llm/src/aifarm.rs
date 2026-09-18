@@ -2321,6 +2321,7 @@ where
         } else {
             request.max_tokens
         };
+        let (top_p, top_k) = worker_nucleus_for_model(&model);
         ChatCompletionRequest {
             model,
             messages: request
@@ -2343,6 +2344,8 @@ where
             })),
             max_tokens,
             temperature: Some(request.temperature),
+            top_p,
+            top_k,
             include_reasoning: Some(false),
             chat_template_kwargs: Some(json!({ "enable_thinking": false })),
             extra_body: Some(json!({
@@ -2350,6 +2353,18 @@ where
             })),
             ..ChatCompletionRequest::default()
         }
+    }
+}
+
+/// Gemma 4 publishes top_p 0.95 and top_k 64. The farm serves it with
+/// `--generation-config vllm`, which ignores the model's own defaults, so unsent
+/// values fall back to top_p 1.0 and no top_k, and structured workers sampled
+/// from the whole tail.
+fn worker_nucleus_for_model(model: &str) -> (Option<f64>, Option<f64>) {
+    if model.to_ascii_lowercase().contains("gemma") {
+        (Some(0.95), Some(64.0))
+    } else {
+        (None, None)
     }
 }
 
@@ -8740,6 +8755,19 @@ mod tests {
         let status_headers = direct_status_headers(&cfg);
         assert_eq!(status_headers["Accept"], "application/json");
         assert_eq!(status_headers["Authorization"], "Bearer direct-secret");
+    }
+
+    #[test]
+    fn gemma_structured_requests_carry_nucleus_defaults() {
+        assert_eq!(
+            worker_nucleus_for_model("Gemma 4 26B Heretic"),
+            (Some(0.95), Some(64.0))
+        );
+        assert_eq!(
+            worker_nucleus_for_model("google/gemma-4-26b-a4b-it"),
+            (Some(0.95), Some(64.0))
+        );
+        assert_eq!(worker_nucleus_for_model("qwen3.8-27b"), (None, None));
     }
 
     #[test]
