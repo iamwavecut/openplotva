@@ -896,9 +896,6 @@ pub fn classify_payment_payload(payload: &str) -> PaymentPayloadKind {
 
 #[must_use]
 pub fn subscription_invoice_price_stars(req: &SubscriptionInvoiceLinkRequest) -> i64 {
-    if req.user_name == "WaveCut" {
-        return 1;
-    }
     if req.amount_stars > 0 {
         req.amount_stars
     } else {
@@ -3000,9 +2997,9 @@ mod tests {
         let id_payload = serde_json::to_value(id_method)?;
         assert_eq!(id_payload["chat_id"], json!(-10042));
 
-        let username_method = build_get_chat_method("@plotva_lab");
+        let username_method = build_get_chat_method("@example_lab");
         let username_payload = serde_json::to_value(username_method)?;
-        assert_eq!(username_payload["chat_id"], json!("@plotva_lab"));
+        assert_eq!(username_payload["chat_id"], json!("@example_lab"));
         Ok(())
     }
 
@@ -3141,18 +3138,16 @@ mod tests {
         );
         assert_eq!(subscription_payload["prices"][0]["amount"], json!(300));
 
-        let wavecut_subscription =
+        // A test price is decided by the app and arrives as the requested amount.
+        let test_price_subscription =
             build_subscription_invoice_link_method(&SubscriptionInvoiceLinkRequest {
-                user_id: 1717359759,
-                user_name: "WaveCut".to_owned(),
-                amount_stars: 300,
+                user_id: 7,
+                user_name: "someone".to_owned(),
+                amount_stars: 1,
             });
-        let wavecut_payload = serde_json::to_value(wavecut_subscription)?;
-        assert_eq!(wavecut_payload["prices"][0]["amount"], json!(1));
-        assert_eq!(
-            wavecut_payload["payload"],
-            json!("subscription_v1_1717359759_1")
-        );
+        let test_price_payload = serde_json::to_value(test_price_subscription)?;
+        assert_eq!(test_price_payload["prices"][0]["amount"], json!(1));
+        assert_eq!(test_price_payload["payload"], json!("subscription_v1_7_1"));
 
         let donation = build_donation_invoice_link_method(&DonationInvoiceLinkRequest {
             user_id: 42,

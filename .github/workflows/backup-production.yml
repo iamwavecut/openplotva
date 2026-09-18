@@ -9,10 +9,6 @@ concurrency:
   group: production-backup
   cancel-in-progress: false
 
-env:
-  GETA_SSH_TARGET: wavecut@geta.moe
-  GETA_DEPLOY_ROOT: /home/wavecut/openplotva
-
 permissions: {}
 
 jobs:
@@ -55,6 +51,9 @@ jobs:
 
       - name: Upload backup script
         shell: bash
+        env:
+          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2029
@@ -65,6 +64,9 @@ jobs:
 
       - name: Create production backup
         shell: bash
+        env:
+          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
         run: |
           set -euo pipefail
           ssh \

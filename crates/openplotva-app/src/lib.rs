@@ -11805,9 +11805,11 @@ async fn start_runtime_workers(
     let payment_successful_effects = payments::SuccessfulPaymentDispatcherEffects::new(
         Arc::clone(&dispatcher_queue),
         payments::NoopVipCacheInvalidator,
-    );
+    )
+    .with_support_url(config.payments.support_url.clone());
     let payment_effects =
-        payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
+        payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects)
+            .with_subscription_test_price_users(config.admins.admin_ids.clone());
     let subscription_sync_config = subscription_sync_config_from_app_config(config);
     if subscription_sync_config.enabled {
         let subscription_sync_source = subscription_sync::TelegramStarSubscriptionSyncSource::new(
@@ -17050,7 +17052,7 @@ mod tests {
             -10042,
             "supergroup",
             Some("Plotva Lab".to_owned()),
-            Some("plotvalab".to_owned()),
+            Some("examplelab".to_owned()),
             None,
             None,
             None,
@@ -17144,7 +17146,7 @@ mod tests {
             "accent_color_id": 1,
             "max_reaction_count": 11,
             "title": " Plotva Lab ",
-            "username": "plotvalab",
+            "username": "examplelab",
             "is_forum": true
         }))?;
         let state = settings_chat_state_from_full_info(chat);
@@ -17152,7 +17154,7 @@ mod tests {
         assert_eq!(state.id, -100123);
         assert_eq!(state.chat_type, "supergroup");
         assert_eq!(state.title.as_deref(), Some(" Plotva Lab "));
-        assert_eq!(state.username.as_deref(), Some("plotvalab"));
+        assert_eq!(state.username.as_deref(), Some("examplelab"));
         assert_eq!(state.is_forum, Some(true));
         Ok(())
     }

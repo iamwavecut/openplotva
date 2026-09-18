@@ -4000,11 +4000,11 @@ mod tests {
         let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
             id: -100777,
             title: "Target Lab".to_owned(),
-            username: "target_lab".to_owned(),
+            username: "example_target".to_owned(),
             first_name: String::new(),
             last_name: String::new(),
         });
-        let update = admin_chat_settings_update("/admin_chat_settings @target_lab")?;
+        let update = admin_chat_settings_update("/admin_chat_settings @example_target")?;
 
         let outcome = super::handle_admin_chat_settings_command_update(
             &dispatcher,
@@ -4019,7 +4019,7 @@ mod tests {
             return Err(format!("expected queued admin settings link, got {outcome:?}").into());
         };
         assert_eq!(report.enqueued_count(), 1);
-        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(resolver.calls(), vec!["@example_target".to_owned()]);
 
         let item = dispatcher
             .dequeue_immediate()
@@ -4136,7 +4136,7 @@ mod tests {
                 web_app_url: "https://plotva.example",
                 next_virtual_id: &next_virtual_id,
             },
-            admin_chat_settings_update("/admin_chat_settings @target_lab")?,
+            admin_chat_settings_update("/admin_chat_settings @example_target")?,
             |update| next.handle_update(update),
         )
         .await?;
@@ -4165,7 +4165,7 @@ mod tests {
         let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
             id: -100777,
             title: "Target Lab".to_owned(),
-            username: "target_lab".to_owned(),
+            username: "example_target".to_owned(),
             first_name: String::new(),
             last_name: String::new(),
         });
@@ -4182,7 +4182,7 @@ mod tests {
                 web_app_url: "https://plotva.example",
                 next_virtual_id: &next_virtual_id,
             },
-            admin_chat_settings_update("/admin_chat_settings @target_lab")?,
+            admin_chat_settings_update("/admin_chat_settings @example_target")?,
             |update| next.handle_update(update),
         )
         .await?;
@@ -4194,7 +4194,7 @@ mod tests {
             )
         ));
         assert!(next.calls().is_empty());
-        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(resolver.calls(), vec!["@example_target".to_owned()]);
         assert!(dispatcher.dequeue_immediate().is_some());
         Ok(())
     }
@@ -4216,7 +4216,7 @@ mod tests {
 
         handler
             .handle_update(group_admin_chat_settings_update(
-                "/admin_chat_settings @target_lab",
+                "/admin_chat_settings @example_target",
             )?)
             .await?;
 
@@ -4240,12 +4240,12 @@ mod tests {
 
         update_queue
             .enqueue_update(&admin_chat_settings_update(
-                "/admin_chat_settings @target_lab",
+                "/admin_chat_settings @example_target",
             )?)
             .await?;
         update_queue
             .enqueue_update(&group_admin_chat_settings_update(
-                "/admin_chat_settings@PlotvaBot @target_lab",
+                "/admin_chat_settings@PlotvaBot @example_target",
             )?)
             .await?;
         assert_eq!(update_queue.len().await?, 2);
@@ -4255,7 +4255,7 @@ mod tests {
             super::AdminChatSettingsTarget {
                 id: -100777,
                 title: "Target Lab".to_owned(),
-                username: "target_lab".to_owned(),
+                username: "example_target".to_owned(),
                 first_name: String::new(),
                 last_name: String::new(),
             },
@@ -4319,7 +4319,7 @@ mod tests {
         );
         assert_eq!(
             resolver.calls(),
-            vec!["@target_lab".to_owned(), "@target_lab".to_owned()]
+            vec!["@example_target".to_owned(), "@example_target".to_owned()]
         );
         let private_item = dispatcher
             .dequeue_immediate()
@@ -6017,13 +6017,13 @@ mod tests {
                     "id": -10042,
                     "type": "supergroup",
                     "title": "Plotva Lab",
-                    "username": "plotva_lab"
+                    "username": "example_lab"
                 },
                 "sender_chat": {
                     "id": -10042,
                     "type": "supergroup",
                     "title": "Plotva Lab",
-                    "username": "plotva_lab"
+                    "username": "example_lab"
                 },
                 "text": "/settings@PlotvaBot",
                 "entities": [

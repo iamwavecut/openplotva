@@ -375,7 +375,8 @@ mod tests {
                 FailureReason::ProviderUnavailable,
             ),
             (
-                "error sending request for url (http://aifarm.barb-gray.ts.net:50051/v1/jobs/blocking)".to_owned(),
+                "error sending request for url (http://discovery.invalid/v1/jobs/blocking)"
+                    .to_owned(),
                 FailureReason::ProviderUnavailable,
             ),
             (

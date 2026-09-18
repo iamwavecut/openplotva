@@ -2317,7 +2317,7 @@ fn prepare_dialog_chat_response_matches_go_dialog_send_sanitizer() {
     assert_eq!(prepare_dialog_chat_response("`hello`"), "hello");
     assert_eq!(
         prepare_dialog_chat_response(
-            r#"<reply to_id="6877"><to_user>WaveCut</to_user></reply>
+            r#"<reply to_id="6877"><to_user>someone</to_user></reply>
 <assistant id="6878">Плотва</assistant>
 <message_type>text</message_type>
 <text>Только этот текст должен дойти.</text>"#

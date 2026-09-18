@@ -679,7 +679,7 @@ mod tests {
         );
         assert_eq!(
             guard.detect(
-                "<message id=\"28816\" timestamp=\"2026-09-14T08:56:10Z\">\n  <user>Наталья</user>\n  <text>Голова</text>\n</message>\nответ"
+                "<message id=\"11\" timestamp=\"2026-09-14T08:56:10Z\">\n  <user>Собеседник</user>\n  <text>Голова</text>\n</message>\nответ"
             ),
             Some(DialogLeak::Transcript)
         );

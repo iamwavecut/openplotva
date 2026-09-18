@@ -6,8 +6,8 @@ Every rejected Gemma dialog reply since the 2026-09-17 deploy is the same shape:
 model answers, but wraps the answer in the XML envelope the prompt uses for history.
 
 ```
-<message id="136767" thread_id="136412" timestamp="2026-09-17T22:10:05Z">
-  <user type="user">Веселое время</user>
+<message id="…" thread_id="…" timestamp="…">
+  <user type="user">…</user>
   <message_type>text</message_type>
   <text>Кринж, конечно, но зато честно.</text>
 </message>
@@ -40,7 +40,7 @@ Three layers, each measured before it ships.
 
 ### A. The engine must not be able to write the envelope
 
-`bad_words` in the vLLM chat request (present in 0.25.1, forwarded by the farm proxy).
+`bad_words` in the vLLM chat request (supported by the farm's engine and forwarded by its proxy).
 Gemma 4's vocabulary has no whole-tag tokens, so `<message` is banned as the sequence
 `<` + `message`; Telegram HTML (`<b>`, `<a href`, `<code>`) stays legal because only the
 listed continuations are masked after `<`. The native tool call is the special token
@@ -96,8 +96,7 @@ genuine transcript copy is still suppressed — the guard fingerprints the actua
 
 ## Experiment (RunPod 3090, one hour)
 
-Same stack as the farm: vLLM 0.25.1, transformers 5.8.0, compressed-tensors 0.17.0, the
-pinned checkpoint, prefix caching on.
+Same engine build and checkpoint as the farm, prefix caching on.
 
 Replay set: ~300 production requests — 150 rejected-as-envelope turns, 100 ordinary turns,
 50 turns where a tool was expected. Stored images are redacted in `raw_request`, so
@@ -120,8 +119,7 @@ output is an answer, not necessarily code.
 
 ## What the measurement said
 
-A rented RTX 3090 ran the farm's stack (vLLM 0.25.1, the pinned checkpoint, prefix caching
-on) and replayed 300 production requests from 2026-09-17 per arm: 150 turns production
+A rented RTX 3090 ran the farm's engine build and checkpoint (prefix caching on) and replayed 300 production requests from 2026-09-17 per arm: 150 turns production
 rejected as a wrapped answer, 100 ordinary turns, 50 turns where a tool was expected. Every
 reply was scored by the production code — `finalize_dialog_reply_with_guard` with a guard
 rebuilt from each request's own messages, plus `parse_assistant_content`. Multimodal turns

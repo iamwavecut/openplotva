@@ -1,4 +1,4 @@
-//! Client for the `plotva.geta.moe` media uploader.
+//! Client for the media uploader.
 //!
 //! Telegram Rich Messages embed media only by HTTPS URL (no `file_id`, no multipart).
 //! Generated images/songs therefore have to be published to a public URL first. This
@@ -19,7 +19,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Configuration for the media uploader client.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UploaderConfig {
-    /// Public base URL of the uploader (e.g. `https://plotva.geta.moe`).
+    /// Public base URL of the uploader (e.g. `https://uploader.example.com`).
     pub base_url: String,
     /// Shared upload secret (sent as a bearer token).
     pub secret: String,
@@ -184,12 +184,12 @@ mod tests {
     #[test]
     fn config_defaults_and_configured() {
         let cfg = UploaderConfig {
-            base_url: "https://plotva.geta.moe/".to_owned(),
+            base_url: "https://uploader.example.com/".to_owned(),
             secret: " s ".to_owned(),
             timeout: Duration::ZERO,
         }
         .with_defaults();
-        assert_eq!(cfg.base_url, "https://plotva.geta.moe");
+        assert_eq!(cfg.base_url, "https://uploader.example.com");
         assert_eq!(cfg.secret, "s");
         assert_eq!(cfg.timeout, DEFAULT_TIMEOUT);
         assert!(cfg.configured());
@@ -199,12 +199,12 @@ mod tests {
     #[test]
     fn endpoint_is_base_plus_upload() {
         let client = UploaderClient::new(UploaderConfig {
-            base_url: "https://plotva.geta.moe".to_owned(),
+            base_url: "https://uploader.example.com".to_owned(),
             secret: "s".to_owned(),
             timeout: Duration::ZERO,
         })
         .expect("valid uploader config should create client");
-        assert_eq!(client.endpoint(), "https://plotva.geta.moe/upload");
+        assert_eq!(client.endpoint(), "https://uploader.example.com/upload");
     }
 
     #[test]
@@ -212,10 +212,10 @@ mod tests {
         let url = parse_upload_response(
             true,
             200,
-            r#"{"url":"https://plotva.geta.moe/abc.png","name":"abc.png"}"#,
+            r#"{"url":"https://uploader.example.com/abc.png","name":"abc.png"}"#,
         )
         .expect("ok upload response should contain url");
-        assert_eq!(url, "https://plotva.geta.moe/abc.png");
+        assert_eq!(url, "https://uploader.example.com/abc.png");
     }
 
     #[test]
@@ -223,13 +223,13 @@ mod tests {
         let url = parse_upload_response(
             true,
             200,
-            r#"{"url":"https://plotva.geta.moe/media/ЧиХПыХ - Величественная кошачья.mp3"}"#,
+            r#"{"url":"https://uploader.example.com/media/ЧиХПыХ - Величественная кошачья.mp3"}"#,
         )
         .expect("ok upload response should produce telegram-safe url");
 
         assert_eq!(
             url,
-            "https://plotva.geta.moe/media/%D0%A7%D0%B8%D0%A5%D0%9F%D1%8B%D0%A5%20-%20%D0%92%D0%B5%D0%BB%D0%B8%D1%87%D0%B5%D1%81%D1%82%D0%B2%D0%B5%D0%BD%D0%BD%D0%B0%D1%8F%20%D0%BA%D0%BE%D1%88%D0%B0%D1%87%D1%8C%D1%8F.mp3"
+            "https://uploader.example.com/media/%D0%A7%D0%B8%D0%A5%D0%9F%D1%8B%D0%A5%20-%20%D0%92%D0%B5%D0%BB%D0%B8%D1%87%D0%B5%D1%81%D1%82%D0%B2%D0%B5%D0%BD%D0%BD%D0%B0%D1%8F%20%D0%BA%D0%BE%D1%88%D0%B0%D1%87%D1%8C%D1%8F.mp3"
         );
     }
 

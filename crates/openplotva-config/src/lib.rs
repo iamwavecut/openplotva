@@ -446,8 +446,10 @@ pub struct AppConfig {
     pub translation: TranslationConfig,
     pub google_ai: GoogleAiConfig,
     pub open_router: OpenRouterConfig,
-    /// Media uploader (plotva.geta.moe) configuration.
+    /// Media uploader configuration.
     pub uploader: UploaderConfig,
+    /// Telegram Stars payment configuration.
+    pub payments: PaymentsConfig,
     pub white_circle: WhiteCircleConfig,
     /// Privacy-preserving native advertising configuration.
     pub gradius: GradiusConfig,
@@ -749,7 +751,15 @@ pub struct OpenRouterConfig {
     pub request_timeout_seconds: i32,
 }
 
-/// Media uploader (plotva.geta.moe) configuration.
+/// Telegram Stars payment configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaymentsConfig {
+    /// Where a user whose payment could not be applied is sent for help, from
+    /// `PAYMENTS_SUPPORT_URL`; empty leaves the messages without a link.
+    pub support_url: String,
+}
+
+/// Media uploader configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UploaderConfig {
     /// Public base URL, from `PLOTVA_UPLOADER_URL`.
@@ -1287,6 +1297,8 @@ pub struct RawConfig {
     pub uploader_secret: Option<String>,
     /// `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
     pub uploader_timeout_seconds: Option<String>,
+    /// `PAYMENTS_SUPPORT_URL`.
+    pub payments_support_url: Option<String>,
     /// `WHITECIRCLE_ENABLED`.
     pub whitecircle_enabled: Option<String>,
     /// `WHITECIRCLE_API_KEY`.
@@ -2430,6 +2442,12 @@ impl AppConfig {
                     DEFAULT_UPLOADER_TIMEOUT_SECONDS,
                 )?,
             },
+            payments: PaymentsConfig {
+                support_url: raw
+                    .payments_support_url
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_default(),
+            },
             white_circle: WhiteCircleConfig {
                 enabled: parse_bool("WHITECIRCLE_ENABLED", raw.whitecircle_enabled, false)?,
                 api_key: raw.whitecircle_api_key.unwrap_or_default(),
@@ -3203,6 +3221,7 @@ impl RawConfig {
             uploader_url: env("PLOTVA_UPLOADER_URL"),
             uploader_secret: env("PLOTVA_UPLOADER_SECRET"),
             uploader_timeout_seconds: env("PLOTVA_UPLOADER_TIMEOUT_SECONDS"),
+            payments_support_url: env("PAYMENTS_SUPPORT_URL"),
             whitecircle_enabled: env("WHITECIRCLE_ENABLED"),
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),

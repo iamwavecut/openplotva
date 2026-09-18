@@ -13,7 +13,7 @@ main-SHA image; they do not maintain rollback image history.
 
 `.github/workflows/backup-production.yml` runs separately on a daily schedule or by
 manual dispatch. Its backup is stored under
-`${OPENPLOTVA_BACKUP_ROOT:-/home/wavecut/openplotva/backups}` and contains:
+`${OPENPLOTVA_BACKUP_ROOT:-<deploy-root>/backups}` and contains:
 
 - `postgres.dump` — PostgreSQL custom-format logical dump;
 - `dragonfly-snapshot.tar.gz` — native Dragonfly DFS snapshot set;
@@ -24,7 +24,7 @@ manual dispatch. Its backup is stored under
 The default retention is the newest 14 complete `scheduled-*` directories.
 Override it with `OPENPLOTVA_BACKUP_KEEP`.
 
-The uploader's media volume has a separate daily retention job on `geta.moe`:
+The uploader's media volume has a separate daily retention job on the production host:
 
 ```sh
 sudo install -o root -g root -m 0644 tools/uploader-retention.cron \

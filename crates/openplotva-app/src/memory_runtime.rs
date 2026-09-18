@@ -5722,8 +5722,8 @@ mod tests {
             run: Mutex::new(Some(run)),
             chat_meta: Mutex::new(Some(DialogMemoryChatMeta {
                 chat_type: "supergroup".to_owned(),
-                username: "plotva_lab".to_owned(),
-                active_usernames: vec!["plotva_lab".to_owned(), "plotva_alt".to_owned()],
+                username: "example_lab".to_owned(),
+                active_usernames: vec!["example_lab".to_owned(), "example_alt".to_owned()],
             })),
             visible_cards: Mutex::new(vec![memory_card(42, "Alice likes Rust")]),
             messages: Mutex::new(messages),
@@ -5771,10 +5771,10 @@ mod tests {
         let inputs = extractor.inputs.lock().expect("inputs");
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].chat_type, "supergroup");
-        assert_eq!(inputs[0].chat_username, "plotva_lab");
+        assert_eq!(inputs[0].chat_username, "example_lab");
         assert_eq!(
             inputs[0].chat_active_usernames,
-            vec!["plotva_lab".to_owned(), "plotva_alt".to_owned()]
+            vec!["example_lab".to_owned(), "example_alt".to_owned()]
         );
         assert_eq!(inputs[0].messages.len(), 1);
         assert_eq!(inputs[0].existing_cards.len(), 1);

@@ -9636,7 +9636,7 @@ mod tests {
                     ChatAttachment {
                         kind: "image".to_owned(),
                         source: "quoted".to_owned(),
-                        file_unique_id: "AQADnRJrGyADoEt8".to_owned(),
+                        file_unique_id: "AQADexampleImg1".to_owned(),
                         ..ChatAttachment::default()
                     },
                     ChatAttachment {
@@ -9653,7 +9653,7 @@ mod tests {
 
         assert!(body.contains("<file_id>message_11951604_image_1</file_id>"));
         assert!(body.contains("<file_id>message_11951604_video_2</file_id>"));
-        assert!(body.contains("<file_unique_id>AQADnRJrGyADoEt8</file_unique_id>"));
+        assert!(body.contains("<file_unique_id>AQADexampleImg1</file_unique_id>"));
     }
 
     #[test]
@@ -9959,7 +9959,7 @@ mod tests {
                             "type": "function",
                             "function": {
                                 "name": "history_search (retry with shorter query)",
-                                "arguments": "{\"query\": \"CherryCherry123\"}"
+                                "arguments": "{\"query\": \"cherry_example\"}"
                             }
                         }]
                     }
@@ -10171,7 +10171,7 @@ mod tests {
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": "<react_to_message chat_id=\"-1001680667629\" emoji=\"🤣\" message_id=\"316691\" />"
+                        "content": "<react_to_message chat_id=\"-1009876543210\" emoji=\"🤣\" message_id=\"424242\" />"
                     }
                 }]
             }),
@@ -10200,8 +10200,8 @@ mod tests {
         assert!(output.tool_calls[0].salvaged);
         assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
         assert_eq!(output.tool_calls[0].step.emoji, "🤣");
-        assert_eq!(output.tool_calls[0].step.target_chat_id, -1001680667629);
-        assert_eq!(output.tool_calls[0].step.target_message_id, 316691);
+        assert_eq!(output.tool_calls[0].step.target_chat_id, -1009876543210);
+        assert_eq!(output.tool_calls[0].step.target_message_id, 424242);
         assert_eq!(
             output.text, "",
             "salvaged session tool markup must not leak into the chat text"
@@ -10216,7 +10216,7 @@ mod tests {
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": "<react_to_message chat_id=\"-1001680667629\" emoji=\"🤣\" message_id=\"316691\" />\n<send_message text=\"Проверяю.\" />"
+                        "content": "<react_to_message chat_id=\"-1009876543210\" emoji=\"🤣\" message_id=\"424242\" />\n<send_message text=\"Проверяю.\" />"
                     }
                 }]
             }),
@@ -10246,7 +10246,7 @@ mod tests {
         assert!(output.tool_calls.iter().all(|call| call.salvaged));
         assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
         assert_eq!(output.tool_calls[0].step.emoji, "🤣");
-        assert_eq!(output.tool_calls[0].step.target_message_id, 316691);
+        assert_eq!(output.tool_calls[0].step.target_message_id, 424242);
         assert_eq!(output.tool_calls[1].step.step, STEP_SEND_MESSAGE);
         assert_eq!(output.tool_calls[1].step.text, "Проверяю.");
         assert_eq!(

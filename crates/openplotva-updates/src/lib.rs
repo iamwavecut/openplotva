@@ -4318,7 +4318,7 @@ mod tests {
         assert!(!guest_has_other_bot_mention(Some(&own_mention), Some(&bot)));
 
         let not_bot =
-            sample_guest_message_from_value(sample_guest_message_json(514, "hello @PlotvaTeam"))?;
+            sample_guest_message_from_value(sample_guest_message_json(514, "hello @ExampleTeam"))?;
         assert!(!guest_has_other_bot_mention(Some(&not_bot), Some(&bot)));
 
         let bot_suffix =

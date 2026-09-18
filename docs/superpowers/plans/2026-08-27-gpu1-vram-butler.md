@@ -51,7 +51,7 @@ Host: driver 610.43.02, CUDA UMD 13.3. RAM 62 GiB with **swap 8/8 GiB fully used
 - **draw-api: 3239 generations / 72 h** — 3140 `/v1/boogu/turbo/generate` (97 %), 99 `/v1/generate` (flux2, ~1.4/h), 0 `/v1/boogu/edit/generate`.
 - **privacy-filter: 60 470 `/v1/redact` / 24 h (~42/min)** — a hot path (Gradius ad redaction ×2 per eligible dialog reply + memory extraction), not an idle tenant.
 - Restart counts: draw-api **5**, asr-api **7**, privacy-filter 0 — holder death/self-kill is a real recurring event, not a theoretical one.
-- All three services are invoked through Discovery (caller IP = discovery container). Registered budgets: draw endpoints 600 s, asr 600 s + `max_concurrent_jobs: 1`, privacy 30 s. Discovery stores any upstream HTTP response **verbatim** (status + body) in the job result (`/home/wavecut/discovery/app/worker.py:122-140`), and itself refuses over-capacity submits with `429 "service capacity unavailable"` (`app/main.py:179`) — so service-emitted busy bodies survive the gateway unmodified.
+- All three services are invoked through Discovery (caller IP = discovery container). Registered budgets: draw endpoints 600 s, asr 600 s + `max_concurrent_jobs: 1`, privacy 30 s. Discovery stores any upstream HTTP response **verbatim** (status + body) in the job result (`~/discovery/app/worker.py:122-140`), and itself refuses over-capacity submits with `429 "service capacity unavailable"` (`app/main.py:179`) — so service-emitted busy bodies survive the gateway unmodified.
 
 ### 0.3 Corrections to the brief (verified deltas)
 
@@ -82,7 +82,7 @@ Host: driver 610.43.02, CUDA UMD 13.3. RAM 62 GiB with **swap 8/8 GiB fully used
 
 ### 1.2 Deployment
 
-New repo **`aifarm-gpu-butler`**; deployed as `/home/wavecut/services/gpu-butler/` (fourth compose project — no merging of the existing three; see OD1):
+New repo **`aifarm-gpu-butler`**; deployed as `~/services/gpu-butler/` (fourth compose project — no merging of the existing three; see OD1):
 
 ```
 aifarm-gpu-butler/
@@ -339,7 +339,7 @@ Rollback: unset probe env vars (flags off = dead code); revert PRs if desired.
 ### Phase 1 — butler live, flock bridge, ASR migrated
 
 Changes:
-- **Deploy gpu-butler** (`/home/wavecut/services/gpu-butler/compose.yaml`); verify `/health`, `/v1/status`, bridge idle (flock unheld), NVML view matches nvidia-smi.
+- **Deploy gpu-butler** (`~/services/gpu-butler/compose.yaml`); verify `/health`, `/v1/status`, bridge idle (flock unheld), NVML view matches nvidia-smi.
 - **aifarm-asr PR:** vendor `gpu_butler_client.py`; in `api/service_engines.py` route the GigaAM excursion through the client (`wait_ms=0`, profile `asr-gigaam-burst`, ttl 90 s to cover the 40 s max excursion) behind `ASR_GPU_ARBITER_MODE`; add the in-process non-blocking gate (§1.4); on lease refusal raise `RuntimeError("GPU lock is busy: gigaam transcribe")` — byte-identical text (OD4), so the warning remains `primary_failed:gigaam:GPU lock is busy: gigaam transcribe`; keep the `flock` branch intact for rollback. compose: `ASR_GPU_ARBITER_MODE=flock` at merge; flip to `arbiter` via env once the butler is verified healthy.
 - Note: ASR's existing "any exception → Vosk" (`api/runtime.py:91-109`) already covers butler bugs — worst case is today's behavior.
 
@@ -368,7 +368,7 @@ Rollback: per-service `<SVC>_GPU_ARBITER_MODE=flock` env flips (the bridge keeps
 
 ### 3.5 Phase 1-2 deployment record (2026-08-28, night)
 
-Shipped and verified live, in order: butler deployed (`/home/wavecut/services/gpu-butler`, `pid: host` for NVML name resolution — [commits](https://github.com/iamwavecut/aifarm-gpu-butler)); privacy residency seeded in the ledger; ASR migrated ([aifarm-asr#7](https://github.com/iamwavecut/aifarm-asr/pull/7)) — first production lease `L-000001`: 201 → GigaAM (probe 1285 MiB) → 204; draw migrated ([aifarm-draw#7](https://github.com/iamwavecut/aifarm-draw/pull/7), warm-fix [#8](https://github.com/iamwavecut/aifarm-draw/pull/8)) — startup now takes **zero** flock acquisitions; privacy managed residency ([aifarm-privacy-filter#2](https://github.com/iamwavecut/aifarm-privacy-filter/pull/2)).
+Shipped and verified live, in order: butler deployed (`~/services/gpu-butler`, `pid: host` for NVML name resolution — [commits](https://github.com/iamwavecut/aifarm-gpu-butler)); privacy residency seeded in the ledger; ASR migrated ([aifarm-asr#7](https://github.com/iamwavecut/aifarm-asr/pull/7)) — first production lease `L-000001`: 201 → GigaAM (probe 1285 MiB) → 204; draw migrated ([aifarm-draw#7](https://github.com/iamwavecut/aifarm-draw/pull/7), warm-fix [#8](https://github.com/iamwavecut/aifarm-draw/pull/8)) — startup now takes **zero** flock acquisitions; privacy managed residency ([aifarm-privacy-filter#2](https://github.com/iamwavecut/aifarm-privacy-filter/pull/2)).
 
 **The pairing proof:** `PAIRING engine=gigaam fallback=False latency_ms=1365` returned mid-flight of a 31 s boogu generation (butler log shows the ASR lease granted and released inside draw's lease window) — the exact event the flock made impossible and the reason 49.4 % of voice messages degraded to Vosk.
 
@@ -379,7 +379,7 @@ Also exercised live: queue-wait (a held 12 GiB lease parked an organic-style boo
 2. **Vacate frees only ~224 MiB in practice** — `runtime.model.to("cpu")` + `empty_cache` leaves ~2.8 GiB NVML-resident (OPF holds CUDA memory beyond `runtime.model`, or the allocator keeps expandable segments). Harmless under `evictable: false` (the planner never fires), but revocable residency needs deeper OPF surgery before it can back hidream-class exclusives. Redacts under the degraded lease worked (12.6 s first ping-pong; organic redacts back to 13-15 ms after restore).
 3. The transient `unknown_pid (unnamed)` watchdog alarm during a draw redeploy is the watchdog correctly seeing a dying process whose /proc entry vanished mid-lookup — expected noise during container swaps.
 
-**Production DB verification (morning after, `plotva` on geta.moe):** ASR fallback per hour went 45.5 % / 50.0 % / 40.0 % (pre-arbiter hours) → **0.0 % across the 01:00-05:00 UTC morning ramp (165+ transcriptions)**; `asr_status='failed'` = 0 in 8 h (the `unavailable` rows are Telegram's own 20 MB "file is too big" limit — pre-existing product behavior); dialog ledger healthy (2 `terminal_failed` / 8 h); `aifarm-vllm-gpu0` error rate 8.6 % vs 7.0 % 72 h baseline (pre-existing broken-video vision traffic on GPU0 — not this program's doing). Draw served zero 5xx and Discovery zero upstream errors through every deploy and smoke.
+**Production DB verification (morning after, `plotva` on the production host):** ASR fallback per hour went 45.5 % / 50.0 % / 40.0 % (pre-arbiter hours) → **0.0 % across the 01:00-05:00 UTC morning ramp (165+ transcriptions)**; `asr_status='failed'` = 0 in 8 h (the `unavailable` rows are Telegram's own 20 MB "file is too big" limit — pre-existing product behavior); dialog ledger healthy (2 `terminal_failed` / 8 h); `aifarm-vllm-gpu0` error rate 8.6 % vs 7.0 % 72 h baseline (pre-existing broken-video vision traffic on GPU0 — not this program's doing). Draw served zero 5xx and Discovery zero upstream errors through every deploy and smoke.
 
 **Deliberate deferrals (owner follow-up, reasons on record):**
 - **embedder redeploy** — merged and ready, but its deploy contract is bespoke and hand-managed (non-git deploy copy, immutable `EMBEDDER_IMAGE` sha tag, `EMBEDDER_SERVICE_REVISION`, `GPU_LOCK_EXPECTED_DEVICE`/`GPU_LOCK_EXPECTED_INODE` guards from the GPU2-lock era, deterministic `Dockerfile.lock` build). The only benefit is the uvicorn wrapper's ps title (the llama-server engine is already distinct in nvidia-smi), and the build cache was pruned so a rebuild means a full llama.cpp compile on the production host. Risk ≫ benefit for an unattended 6 a.m. change next to production ninfer — needs a 15-minute owner window.
@@ -492,14 +492,14 @@ Options: (a) hard checkpoint — you approve the measured `profiles.yaml` betwee
 ## Appendix — verification commands used for this survey
 
 ```
-ssh aifarm nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used --format=csv
-ssh aifarm docker ps / docker inspect {draw-api,asr-api,privacy-filter}   # env, mounts, restart counts
-ssh aifarm cat /home/wavecut/services/{draw,asr,privacy-filter}/compose.yaml
-ssh aifarm grep -rIl 4060ti.lock /home/wavecut/services                   # lock users: exactly asr, draw, privacy(+tests)
-ssh aifarm docker logs asr-api --since 72h | grep -c fallback_used=True   # 1469 (vs 1504 False)
-ssh aifarm docker logs draw-api --since 72h | grep -c "POST /v1/..."      # 99 / 3140 / 0
-ssh aifarm docker logs privacy-filter --since 24h | grep -c "POST /v1/redact"  # 60470
-ssh aifarm sed -n 100,152p /home/wavecut/discovery/app/worker.py          # verbatim upstream passthrough
+ssh <farm-host> nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used --format=csv
+ssh <farm-host> docker ps / docker inspect {draw-api,asr-api,privacy-filter}   # env, mounts, restart counts
+ssh <farm-host> cat ~/services/{draw,asr,privacy-filter}/compose.yaml
+ssh <farm-host> grep -rIl 4060ti.lock ~/services                   # lock users: exactly asr, draw, privacy(+tests)
+ssh <farm-host> docker logs asr-api --since 72h | grep -c fallback_used=True   # 1469 (vs 1504 False)
+ssh <farm-host> docker logs draw-api --since 72h | grep -c "POST /v1/..."      # 99 / 3140 / 0
+ssh <farm-host> docker logs privacy-filter --since 24h | grep -c "POST /v1/redact"  # 60470
+ssh <farm-host> sed -n 100,152p ~/discovery/app/worker.py          # verbatim upstream passthrough
 ```
 
 Local: `aifarm-asr`, `aifarm-draw`, `aifarm-privacy-filter` working trees and the OpenPlotva workspace, cited inline as `path:line`.

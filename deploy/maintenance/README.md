@@ -2,7 +2,7 @@
 
 This feature implements the incident → OMP diagnosis → issue → isolated repair
 → reviewed PR flow. It is disabled by default. This checkout does not provision
-credentials, create GitHub labels/issues, install services on geta.moe, or enable
+credentials, create GitHub labels/issues, install services on the production host, or enable
 production automation. Merge and deployment remain operator actions.
 
 The runtime captures fresh user-facing terminal routing failures independently
@@ -59,7 +59,7 @@ authorized. The production workflow uploads
 and the deploy script layers it automatically when the protected runtime
 configuration exists. The overlay publishes the dedicated TLS listener only on
 host loopback port 9092. Keep these values in
-`/etc/openplotva-maintenance/runtime.env` on geta.moe:
+`/etc/openplotva-maintenance/runtime.env` on the production host:
 
 - `MAINTENANCE_ENABLED=true` to capture incidents and serve the private API.
 - `MAINTENANCE_TOKEN`: a new, independent 32–256 byte ASCII secret.
@@ -86,7 +86,7 @@ put token values in commands, issue bodies, image layers, or logs.
 
 ## Host installation and credentials
 
-Use a clean checkout at verified `origin/main` on geta.moe. Install Python 3.11+,
+Use a clean checkout at verified `origin/main` on the production host. Install Python 3.11+,
 Git, GitHub CLI, Docker, iptables and the normal Linux filesystem tools (`mount`,
 `umount`, `fallocate`, `mkfs.ext4`, `findmnt`). The installer refuses an unreviewed
 branch or dirty checkout. It does not start or enable services.
@@ -184,7 +184,7 @@ models, the shared five-hour/weekly limits and their credit multipliers.
 ## Restricted Actions ingress
 
 Generate a dedicated SSH key. Store its private half as GitHub Actions secret
-`MAINTENANCE_SSH_KEY`; store a previously verified geta.moe host-key line as
+`MAINTENANCE_SSH_KEY`; store a previously verified production host-key line as
 `MAINTENANCE_SSH_KNOWN_HOSTS`. Do not establish trust with an unchecked
 `ssh-keyscan` result. Install the public key in the root-owned
 `/var/lib/openplotva-maintenance-dispatch/.ssh/authorized_keys` with these options:
@@ -407,7 +407,7 @@ the controller. Older controllers remain compatible with the new runtime.
 2. Verify the private GitHub identity, OMP Coding Plan profile, TLS and exact
    personal Telegram recipient. Run the offline semantic/recovery suite.
 3. Build and test the pinned image, then perform the resource/isolation and
-   controlled test-issue → PR → notification exercise on geta.moe. Keep merge
+   controlled test-issue → PR → notification exercise on the production host. Keep merge
    and deploy manual. Check actual broker quota behavior and Telegram receipt.
 4. Enable new jobs after the complete scenario passes. Observe the first real
    incident and exact PR HEAD; use `disable` or `cancel` if intervention is needed.
