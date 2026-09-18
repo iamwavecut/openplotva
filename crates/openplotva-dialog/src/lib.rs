@@ -2985,8 +2985,13 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         }
         // `<tool_call>` and friends also carry attribute-shaped calls that other parsers
         // own; only an element naming its tool in a child belongs to this one.
-        let Some(raw_name) =
-            xmlish_child_text(body, "tool_name").or_else(|| xmlish_child_text(body, "name"))
+        let attribute_name = xmlish_tool_attr(&remaining[..open_end], "name")
+            .or_else(|| xmlish_tool_attr(&remaining[..open_end], "call"))
+            .or_else(|| xmlish_tool_attr(&remaining[..open_end], "tool"))
+            .filter(|value| canonical_known_step(value.trim()).is_some());
+        let Some(raw_name) = xmlish_child_text(body, "tool_name")
+            .or_else(|| xmlish_child_text(body, "name"))
+            .or(attribute_name)
         else {
             if legacy_call {
                 return Err(ToolParseError::new("XML-ish call has no tool_name"));
@@ -3012,7 +3017,10 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
                 arguments.insert((*key).to_owned(), Value::String(value));
             }
         }
-        steps.push(decode_tool_call_arguments(name, &Value::Object(arguments))?);
+        let mut step = decode_tool_call_arguments(name, &Value::Object(arguments))?;
+        // An element that names its tool in an attribute carries its arguments there too.
+        populate_xmlish_tool_attrs(&remaining[..open_end], &mut step)?;
+        steps.push(normalize_and_validate_step(step)?);
 
         remaining = remaining[body_end + close.len()..].trim_start();
     }
@@ -5742,6 +5750,28 @@ mod tests {
         assert_eq!(
             unterminated_open.tool_steps[0].step,
             STEP_CHAT_HISTORY_SUMMARY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_legacy_call_may_name_its_tool_in_an_attribute() -> Result<(), ToolParseError> {
+        // Production, 2026-09-18: a complete draw_image call was refused because the legacy
+        // element wanted the name in a child, and the user got no picture.
+        let parsed = parse_assistant_content(concat!(
+            "<call name=\"draw_image\" args=\"{&quot;prompt&quot;: &quot;coffee and a croissant&quot;, ",
+            "&quot;aspect_ratio&quot;: &quot;16:9&quot;}\"></call>Лови свой завтрак."
+        ))?;
+
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(parsed.tool_steps[0].prompt, "coffee and a croissant");
+        assert_eq!(parsed.text, "Лови свой завтрак.");
+
+        // An element that names nothing at all is still a loud protocol error.
+        assert!(
+            parse_assistant_content("<call><arguments><prompt>fox</prompt></arguments></call>")
+                .is_err()
         );
         Ok(())
     }
