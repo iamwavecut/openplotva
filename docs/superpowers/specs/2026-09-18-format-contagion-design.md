@@ -118,6 +118,57 @@ calls and no drift in reply length or language. P1/P2 ship if they add ≥5 poin
 The hint ships if it recovers ≥15 points more than a blind re-sample. A2 is a spike: its
 output is an answer, not necessarily code.
 
+## What the measurement said
+
+A rented RTX 3090 ran the farm's stack (vLLM 0.25.1, the pinned checkpoint, prefix caching
+on) and replayed 300 production requests from 2026-09-17 per arm: 150 turns production
+rejected as a wrapped answer, 100 ordinary turns, 50 turns where a tool was expected. Every
+reply was scored by the production code — `finalize_dialog_reply_with_guard` with a guard
+rebuilt from each request's own messages, plus `parse_assistant_content`. Multimodal turns
+were replayed with a neutral placeholder image, because stored images are redacted in
+`raw_request`: the structure is faithful, the content is not.
+
+| arm | wrapped answers | delivered | tool calls executed | false tools | suppressed | median latency |
+|---|---|---|---|---|---|---|
+| A0 baseline | 92/150 | 278/300 | 37/50 | 6/100 | 22 | 2.0s |
+| A1 `bad_words` | 0/150 | 279/300 | 43/50 | 6/100 | 21 | 1.4s |
+| A2 first-token regex | 0/150 | 293/300 | 7/50 | 0/100 | 7 | 1.6s |
+| A3 prompt line | 0/150 | 280/300 | 32/50 | 2/100 | 20 | 1.5s |
+| A4 `bad_words` + prompt line | 0/150 | 285/300 | 30/50 | 3/100 | 15 | 1.7s |
+
+Shipped: **A1** and **D**. A1 clears the envelope completely and buys six tool calls per
+fifty; the ordinary set does not move in length (63 → 61 chars) or language (Cyrillic share
+1.00). It is enabled per model through the routing config, so only the farm's vLLM rows
+carry it.
+
+Not shipped, and why:
+
+- **A2 (guided regex).** The spike's answer: xgrammar accepts the pattern, no engine errors,
+  latency unaffected, and it delivers the most replies — but it costs 30 of 50 tool calls,
+  because the textual call form is how this model calls tools and native calls do not take
+  over. Only worth revisiting for turns that carry no tools.
+- **A3/A4 (prompt line).** The line clears the envelope as well as A1 does, but it costs 11
+  tool calls against A1 and adds nothing on top of it. The acceptance bar (≥5 points over
+  A1) is not met.
+
+**B (the hinted re-sample)** was measured separately: 208 re-samples per arm, drawn from the
+baseline arm's own turns. Blind repeats the request as production did; hinted appends the
+note.
+
+| | blind | hinted |
+|---|---|---|
+| delivered | 160/208 (77%) | 181/208 (87%) |
+| wrapped the answer again | 124 (60%) | 15 (7%) |
+| executed a tool call | 52 | 52 |
+| recovered after a protocol/empty rejection | 6/39 (15%) | 16/39 (41%) |
+
+Honest caveat carried into production: `bad_words` does not reduce the *total* number of
+rejected turns (22 → 21). It removes the transcript envelope, and the model then invents
+other shapes (`<reason_to_be_optimistic>`, repeated `<react_to_message>` blocks). That
+residue is what D's unwrap and B's note exist for, and it is the thing to watch next.
+
+No seed plumbing was needed: dialog requests set no seed, so re-samples already differ.
+
 ## Delivery
 
 1. Pod experiment, report with the table and a recommendation.
