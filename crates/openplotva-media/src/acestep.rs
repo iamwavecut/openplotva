@@ -23,11 +23,11 @@ pub const SONG_MIN_TAGS: usize = 10;
 pub const SONG_MAX_TAGS: usize = 40;
 const SONG_MAX_TAG_CHARS: usize = 80;
 const SONG_MIN_LYRIC_LINES: usize = 8;
-const SONG_MAX_LYRIC_LINES: usize = 80;
+const SONG_MAX_LYRIC_LINES: usize = 60;
 const SONG_MIN_INSTRUMENTAL_SECONDS: u32 = 45;
 const SONG_DEFAULT_INSTRUMENTAL_SECONDS: u32 = 180;
 const SONG_MIN_VOCAL_SECONDS: u32 = 60;
-const SONG_DEFAULT_VOCAL_SECONDS: u32 = 200;
+const SONG_DEFAULT_VOCAL_SECONDS: u32 = 180;
 /// Vocal songs end with their lyrics; the farm cap only guards against runaway takes.
 const SONG_VOCAL_CAP_MARGIN_SECONDS: u32 = 45;
 pub const SONG_VOCALS: [&str; 5] = ["male", "female", "duet", "choir", "instrumental"];
@@ -525,6 +525,8 @@ pub struct SongPromptResult {
     pub vocals: String,
     /// Section-marked lyrics; empty for instrumentals.
     pub lyrics: String,
+    /// Empty section markers for instrumentals, see [`instrumental_skeleton`].
+    pub skeleton: String,
     /// Target length in seconds.
     pub duration_seconds: u32,
     /// The director's brief as returned by the model, kept for tracing.
@@ -818,7 +820,9 @@ pub fn normalize_song_prompt_payload(
                 SONG_LYRICS_STRUCTURE_REJECTION.to_owned(),
             ));
         }
-        if !lyrics_script_matches_language(&lyrics.text, &language) {
+        if !lyrics_script_matches_language(&lyrics.text, &language)
+            || foreign_script_line_share(&lyrics.text, &language) > SONG_MAX_FOREIGN_LINE_SHARE
+        {
             return Err(AceStepError::InvalidResponse(
                 SONG_LYRICS_LANGUAGE_REJECTION.to_owned(),
             ));
@@ -848,8 +852,14 @@ pub fn normalize_song_prompt_payload(
         title.to_owned()
     };
     let raw_style = song_style_summary(&payload, &vocals, instrumental);
+    let skeleton = if instrumental {
+        instrumental_skeleton(&payload.structure)
+    } else {
+        String::new()
+    };
     let brief = serde_json::to_value(&payload).unwrap_or(Value::Null);
     Ok(SongPromptResult {
+        skeleton,
         title,
         topic: topic.to_owned(),
         raw_style,
@@ -953,23 +963,25 @@ pub fn compile_song_tags(
     instrumental: bool,
 ) -> Vec<String> {
     let mut tags = SongTagList::default();
+    if instrumental {
+        tags.push("instrumental");
+    }
     for tag in split_song_tag_field(&payload.genre) {
         tags.push(&tag);
     }
-    if (40..=300).contains(&payload.bpm) {
-        tags.push(&format!("{} BPM", payload.bpm));
-    }
-    tags.push(&payload.key);
-    if instrumental {
-        tags.push("instrumental");
-    } else {
+    if !instrumental {
         tags.push(&vocal_descriptor(&payload.vocal_style, vocals));
     }
+    let references: &[String] = if genre_takes_references(&payload.genre) {
+        &payload.references
+    } else {
+        &[]
+    };
     for field in [
         &payload.sound,
         &payload.character,
         &payload.structure,
-        &payload.references,
+        references,
     ] {
         for raw in field {
             for tag in split_song_tag_field(raw) {
@@ -977,7 +989,59 @@ pub fn compile_song_tags(
             }
         }
     }
+    if (40..=300).contains(&payload.bpm) {
+        tags.push_last(&format!("{} BPM", payload.bpm));
+    }
     tags.into_tags()
+}
+
+/// Genres where artist references were heard to steer the sound; elsewhere
+/// they pulled takes toward the wrong genre, so they are left out.
+const SONG_REFERENCE_GENRES: [&str; 3] = ["dubstep", "brostep", "riddim"];
+
+fn genre_takes_references(genre: &str) -> bool {
+    let genre = genre.to_ascii_lowercase();
+    SONG_REFERENCE_GENRES
+        .iter()
+        .any(|allowed| genre.contains(allowed))
+}
+
+/// Empty section markers that give an instrumental its arrangement: the music
+/// model plans the structure from lyric sections, and words in the lyrics are
+/// what makes it sing.
+#[must_use]
+pub fn instrumental_skeleton(structure: &[String]) -> String {
+    let mut sections = vec!["Intro"];
+    for phrase in structure {
+        let phrase = phrase.to_ascii_lowercase();
+        let section = if phrase.contains("outro") || phrase.contains("fade") {
+            "Outro"
+        } else if phrase.contains("drop") || phrase.contains("chorus") || phrase.contains("hook") {
+            "Chorus"
+        } else if phrase.contains("build") || phrase.contains("riser") || phrase.contains("pre-chorus") {
+            "Pre-Chorus"
+        } else if phrase.contains("breakdown") || phrase.contains("bridge") || phrase.contains("interlude") {
+            "Bridge"
+        } else if phrase.contains("intro") {
+            continue;
+        } else {
+            "Verse"
+        };
+        if sections.last() != Some(&section) {
+            sections.push(section);
+        }
+    }
+    if !sections.contains(&"Chorus") {
+        sections.extend(["Verse", "Chorus"]);
+    }
+    if sections.last() != Some(&"Outro") {
+        sections.push("Outro");
+    }
+    sections
+        .iter()
+        .map(|section| format!("[{section}]"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn vocal_descriptor(vocal_style: &str, vocals: &str) -> String {
@@ -1031,6 +1095,14 @@ impl SongTagList {
         if self.seen.insert(tag.to_ascii_lowercase()) {
             self.tags.push(tag);
         }
+    }
+
+    /// Push a tag that must end the list, dropping the last tag when full.
+    fn push_last(&mut self, raw: &str) {
+        if self.tags.len() >= SONG_MAX_TAGS {
+            self.tags.pop();
+        }
+        self.push(raw);
     }
 
     fn into_tags(self) -> Vec<String> {
@@ -1209,7 +1281,70 @@ fn is_placeholder_lyric_line(line: &str) -> bool {
 
 fn clean_lyric_line(line: &str) -> String {
     let line = strip_list_numbering(line.trim());
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let letters: Vec<char> = line.chars().filter(|ch| ch.is_alphabetic()).collect();
+    if letters.len() >= 4 && letters.iter().all(|ch| ch.is_uppercase()) {
+        sentence_case(&line)
+    } else {
+        line
+    }
+}
+
+/// Capitals change how the music model tokenizes and sings a line, so shouted
+/// lines are written in sentence case.
+fn sentence_case(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut first = true;
+    for ch in line.chars().flat_map(char::to_lowercase) {
+        if first && ch.is_alphabetic() {
+            out.extend(ch.to_uppercase());
+            first = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Share of sung lines written in another script than the language's; a
+/// Russian song with a tenth of its lines in English drifted, not a style choice.
+const SONG_MAX_FOREIGN_LINE_SHARE: f64 = 0.1;
+
+fn foreign_script_line_share(text: &str, language: &str) -> f64 {
+    let cyrillic_language = matches!(language, "ru" | "uk" | "be");
+    if matches!(language, "ja" | "ko" | "zh") {
+        return 0.0;
+    }
+    let mut sung = 0usize;
+    let mut foreign = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || section_marker(line).is_some() {
+            continue;
+        }
+        let cyrillic = line
+            .chars()
+            .filter(|ch| ('\u{0400}'..='\u{04ff}').contains(ch))
+            .count();
+        let latin = line.chars().filter(char::is_ascii_alphabetic).count();
+        if cyrillic + latin == 0 {
+            continue;
+        }
+        sung += 1;
+        let is_foreign = if cyrillic_language {
+            latin > cyrillic
+        } else {
+            cyrillic > latin
+        };
+        if is_foreign {
+            foreign += 1;
+        }
+    }
+    if sung == 0 {
+        0.0
+    } else {
+        foreign as f64 / sung as f64
+    }
 }
 
 /// Cheap sanity check that the lyrics are written in the declared language's script.
@@ -2389,12 +2524,12 @@ mod tests {
 
         assert_eq!(
             result.style,
-            "brostep, dubstep, 140 BPM, F minor, male rap vocals with an aggressive chanted flow, \
+            "brostep, dubstep, male rap vocals with an aggressive chanted flow, \
              distorted mid-range growl bass, wobble bass in call and response, \
              half-time drums with a big clap, laser synths, clean sub, aggressive, energetic, \
              serene melodic synth intro, rap verse over a sparse beat, \
              snare-roll build with a shouted vocal sample, second drop a whole step higher, \
-             in the style of Skrillex"
+             in the style of Skrillex, 140 BPM"
         );
         assert_eq!(
             result.raw_style,
@@ -2437,9 +2572,14 @@ mod tests {
         assert_eq!(result.lyrics, "");
         assert_eq!(result.vocals, "instrumental");
         assert!(
-            result.style.contains(", instrumental, "),
+            result.style.starts_with("instrumental, "),
             "{}",
             result.style
+        );
+        assert!(result.style.ends_with(", 140 BPM"), "{}", result.style);
+        assert_eq!(
+            result.skeleton,
+            "[Intro]\n\n[Verse]\n\n[Pre-Chorus]\n\n[Chorus]\n\n[Outro]"
         );
         assert!(!result.style.contains("rap vocals"));
         assert_eq!(result.duration_seconds, 180);
@@ -2520,6 +2660,75 @@ mod tests {
     }
 
     #[test]
+    fn tags_skip_the_key_and_references_outside_allowlisted_genres() {
+        let payload = rap_payload();
+        let tags = compile_song_tags(&payload, "male", false);
+        assert!(!tags.iter().any(|tag| tag == "F minor"));
+        assert!(tags.contains(&"in the style of Skrillex".to_owned()));
+
+        let mut neurofunk = rap_payload();
+        neurofunk.genre = "neurofunk, drum and bass".to_owned();
+        let tags = compile_song_tags(&neurofunk, "male", false);
+        assert!(!tags.iter().any(|tag| tag.starts_with("in the style of")));
+    }
+
+    #[test]
+    fn instrumental_skeleton_follows_the_structure_and_has_no_words() {
+        assert_eq!(
+            instrumental_skeleton(&[]),
+            "[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]"
+        );
+        let skeleton = instrumental_skeleton(&[
+            "atmospheric intro with filtered drums".to_owned(),
+            "tension build with a snare roll".to_owned(),
+            "drop with switch-ups every eight bars".to_owned(),
+            "short breakdown".to_owned(),
+            "second drop".to_owned(),
+            "outro".to_owned(),
+        ]);
+        assert_eq!(
+            skeleton,
+            "[Intro]\n\n[Pre-Chorus]\n\n[Chorus]\n\n[Bridge]\n\n[Chorus]\n\n[Outro]"
+        );
+        assert!(
+            skeleton
+                .lines()
+                .all(|line| line.is_empty() || section_marker(line).is_some())
+        );
+    }
+
+    #[test]
+    fn shouted_lyric_lines_are_normalized_to_sentence_case() {
+        let canonical = canonicalize_song_lyrics(
+            "[Chorus]\nКОТ-ВОРИШКА, ГДЕ УЛОВ?\nDROP IT NOW\nOK\nПод диваном клад носков",
+        );
+        assert_eq!(
+            canonical.text,
+            "[Chorus]\nКот-воришка, где улов?\nDrop it now\nOK\nПод диваном клад носков"
+        );
+    }
+
+    #[test]
+    fn lyrics_with_many_foreign_script_lines_are_rejected() {
+        let mut payload = rap_payload();
+        payload.vocal_language = "ru".to_owned();
+        let mut lines = vec!["[Verse]".to_owned()];
+        lines.extend((0..9).map(|index| format!("Строка номер {index} про ночной город")));
+        lines.push("[Chorus]".to_owned());
+        lines.extend((0..3).map(|index| format!("English hook line number {index}")));
+        payload.lyrics = lines.join("\n");
+        let error = normalize_song_prompt_payload(payload.clone(), "topic", "ru")
+            .expect_err("a quarter of the lines are English");
+        assert_eq!(error.to_string(), SONG_LYRICS_LANGUAGE_REJECTION);
+
+        payload.lyrics = payload
+            .lyrics
+            .replace("English hook line number 1", "Припев про город номер один")
+            .replace("English hook line number 2", "Припев про город номер два");
+        assert!(normalize_song_prompt_payload(payload, "topic", "ru").is_ok());
+    }
+
+    #[test]
     fn song_tags_are_normalized_deduplicated_and_capped() {
         assert_eq!(
             normalize_song_tag("  1. Dark   sci-fi  atmosphere "),
@@ -2553,7 +2762,12 @@ mod tests {
         assert_eq!(tags.len(), SONG_MAX_TAGS);
         assert_eq!(tags[0], "brostep");
         assert_eq!(tags[1], "dubstep");
-        assert_eq!(tags[2], "140 BPM");
+        assert_eq!(tags[2], "male rap vocals with an aggressive chanted flow");
+        assert_eq!(
+            tags.last().map(String::as_str),
+            Some("140 BPM"),
+            "BPM ends the list even at the cap"
+        );
 
         let mut no_voice_word = rap_payload();
         no_voice_word.vocal_style = "clean pop vocals".to_owned();

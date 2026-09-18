@@ -6684,20 +6684,21 @@ mod tests {
             }
         );
         assert_eq!(material_provider.calls(), vec!["99:neon rain".to_owned()]);
+        let expected_request = crate::music_jobs::MusicGenerationRequest {
+            topic: "neon rain".to_owned(),
+            material: crate::music_jobs::SongMaterial {
+                title: "Neon Rain".to_owned(),
+                lyrics: "[Verse]\nneon rain".to_owned(),
+                style: "synthwave, neon, 100 BPM".to_owned(),
+                raw_style: "Synthwave, Neon, 100 bpm".to_owned(),
+                vocal_language: "en".to_owned(),
+                ..crate::music_jobs::SongMaterial::default()
+            },
+            reference_audio: None,
+        };
         assert_eq!(
             generator.requests(),
-            vec![crate::music_jobs::MusicGenerationRequest {
-                topic: "neon rain".to_owned(),
-                material: crate::music_jobs::SongMaterial {
-                    title: "Neon Rain".to_owned(),
-                    lyrics: "[Verse]\nneon rain".to_owned(),
-                    style: "synthwave, neon, 100 BPM".to_owned(),
-                    raw_style: "Synthwave, Neon, 100 bpm".to_owned(),
-                    vocal_language: "en".to_owned(),
-                    ..crate::music_jobs::SongMaterial::default()
-                },
-                reference_audio: None,
-            }]
+            vec![expected_request; crate::music_jobs::SONG_TAKES_PER_REQUEST]
         );
         assert_eq!(permission_store.loads(), vec![-100]);
         assert!(permission_store.saves().is_empty());
@@ -6713,7 +6714,7 @@ mod tests {
         );
         {
             let sent = music_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
+            assert_eq!(sent.len(), crate::music_jobs::SONG_TAKES_PER_REQUEST);
             assert_eq!(sent[0].chat_id, -100);
             assert_eq!(sent[0].reply_to_message_id, Some(78));
             assert!(sent[0].html.contains(r#"<audio src="#));
