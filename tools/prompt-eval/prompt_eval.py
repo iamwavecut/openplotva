@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import http.client
 import json
 import mimetypes
 import os
@@ -16,8 +17,7 @@ import re
 import statistics
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -182,21 +182,27 @@ def finish_request(data: dict[str, Any], messages: list[dict[str, Any]], args: a
 
 
 def post(endpoint: str, request: dict[str, Any], headers: dict[str, str], timeout: float) -> tuple[int, Any, float]:
+    url = urllib.parse.urlsplit(endpoint)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return 0, {"error": f"unsupported endpoint {endpoint!r}: expected an http(s) URL"}, 0.0
+    connection_class = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    path = url.path or "/"
+    if url.query:
+        path += "?" + url.query
     body = json.dumps(request).encode("utf-8")
-    req = urllib.request.Request(endpoint, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    for key, value in headers.items():
-        req.add_header(key, value)
     started = time.monotonic()
+    connection = connection_class(url.hostname, url.port, timeout=timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return response.status, payload, time.monotonic() - started
-    except urllib.error.HTTPError as error:
-        text = error.read().decode("utf-8", "replace")
-        return error.code, {"error": text[:2000]}, time.monotonic() - started
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        connection.request("POST", path, body=body, headers={"Content-Type": "application/json", **headers})
+        response = connection.getresponse()
+        text = response.read().decode("utf-8", "replace")
+        if response.status != 200:
+            return response.status, {"error": text[:2000]}, time.monotonic() - started
+        return response.status, json.loads(text), time.monotonic() - started
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
         return 0, {"error": str(error)}, time.monotonic() - started
+    finally:
+        connection.close()
 
 
 def response_text(payload: Any) -> str:
