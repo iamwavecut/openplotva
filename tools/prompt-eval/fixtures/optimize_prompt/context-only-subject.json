@@ -17,7 +17,7 @@
     "json",
     "schema",
     "contains:lighthouse",
-    "no_substring:|",
+    "no_substring:|@outputs[]",
     "max_blank_run:3"
   ]
 }

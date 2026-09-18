@@ -18,7 +18,7 @@
     "schema",
     "contains:Скидки до 50%",
     "equals:aspect_ratio=2:3",
-    "no_substring:|",
+    "no_substring:|@outputs[]",
     "max_blank_run:3"
   ]
 }

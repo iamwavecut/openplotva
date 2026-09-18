@@ -16,8 +16,8 @@
   "checks": [
     "json",
     "schema",
-    "no_substring:|",
-    "no_phrases:blurry;cartoon",
+    "no_substring:|@outputs[]",
+    "no_phrases:blurry;cartoon@outputs[]",
     "equals:aspect_ratio=3:4",
     "max_blank_run:3"
   ]

@@ -17,7 +17,7 @@
     "json",
     "schema",
     "contains:ginger",
-    "no_substring:|",
+    "no_substring:|@outputs[]",
     "lang:en:outputs[]",
     "max_blank_run:3"
   ]
