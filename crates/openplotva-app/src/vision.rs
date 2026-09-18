@@ -480,6 +480,21 @@ fn vision_config_for_attempt(
     config.with_defaults()
 }
 
+fn vision_call_trace(is_video: bool) -> openplotva_llm::LlmCallTrace {
+    openplotva_llm::LlmCallTrace {
+        context: openplotva_llm::LlmCallContext::default(),
+        tags: openplotva_llm::LlmCallTags {
+            provider: "aifarm".to_owned(),
+            source: "aifarm_vision".to_owned(),
+            flow: "vision".to_owned(),
+            mode: if is_video { "video" } else { "image" }.to_owned(),
+            request_kind: "openai.chat.completions".to_owned(),
+            iteration: 1,
+            docs_chars: 0,
+        },
+    }
+}
+
 fn vision_retryable_reason(error: &AifarmVisionCaptionerError) -> Option<FailureReason> {
     match error {
         AifarmVisionCaptionerError::Provider(message) => retryable_reason_from_message(message),
@@ -555,6 +570,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                 serde_json::json!({ "enable_thinking": enable_thinking }),
             );
         }
+        completion_request.trace = Some(vision_call_trace(is_video));
         Ok(completion_request)
     }
 
@@ -2559,6 +2575,51 @@ mod tests {
             body["messages"][1]["content"][0]["image_url"]["detail"],
             "auto"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vision_requests_are_traced_as_their_own_flow() -> Result<(), Box<dyn std::error::Error>> {
+        let captioner = AifarmVisionCaptioner::with_transport(
+            AifarmVisionCaptionerConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://vision.example.test/v1/chat/completions".to_owned(),
+                    default_model: "vision-model".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                model: "vision-model".to_owned(),
+                ..AifarmVisionCaptionerConfig::default()
+            },
+            DataUrlStub::default(),
+            AifarmTransportStub::new(Vec::new()),
+        );
+        let photo = captioner.request(
+            "data:image/jpeg;base64,photo",
+            &TelegramVisionCaptionRequest {
+                file_unique_id: "photo-u".to_owned(),
+                latest_file_id: "photo-file".to_owned(),
+                media_kind: "photo".to_owned(),
+                mime_type: None,
+            },
+        )?;
+        let video = captioner.request(
+            "data:video/mp4;base64,video",
+            &TelegramVisionCaptionRequest {
+                file_unique_id: "video-u".to_owned(),
+                latest_file_id: "video-file".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            },
+        )?;
+
+        let photo_tags = photo.trace.map(|trace| trace.tags).unwrap_or_default();
+        assert_eq!(photo_tags.flow, "vision");
+        assert_eq!(photo_tags.source, "aifarm_vision");
+        assert_eq!(photo_tags.mode, "image");
+        assert_eq!(photo_tags.request_kind, "openai.chat.completions");
+        let video_tags = video.trace.map(|trace| trace.tags).unwrap_or_default();
+        assert_eq!(video_tags.flow, "vision");
+        assert_eq!(video_tags.mode, "video");
         Ok(())
     }
 
