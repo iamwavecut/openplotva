@@ -242,6 +242,12 @@ pub struct ChatCompletionRequest {
     /// SGLang backends ignore the unknown key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<Value>,
+    /// Gateway routing preferences (OpenRouter `provider`), see [`GatewayRequestFields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Value>,
+    /// Gateway reasoning control (OpenRouter `reasoning`), see [`GatewayRequestFields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
     /// Trace metadata for low-level call observation. Never serialized to the wire.
     #[serde(skip)]
     pub trace: Option<crate::trace::LlmCallTrace>,
@@ -4009,6 +4015,40 @@ pub struct AifarmClientConfig {
     pub workload: String,
     /// Fail fast on capacity errors.
     pub fail_fast_on_capacity_unavailable: bool,
+    /// Per-model gateway fields added to every request this client sends.
+    pub gateway_fields: GatewayRequestFields,
+}
+
+/// Request fields understood by OpenAI-compatible gateways such as OpenRouter:
+/// `provider` (routing preferences like `require_parameters`, `quantizations`,
+/// `order`) and `reasoning` (unified reasoning control, e.g. `{"enabled":
+/// false}`). Configured per routed model through its config or assignment
+/// overrides, and sent only when configured, so other backends never see them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GatewayRequestFields {
+    pub provider: Option<Value>,
+    pub reasoning: Option<Value>,
+}
+
+impl GatewayRequestFields {
+    /// Read the `provider` and `reasoning` objects from routing overrides.
+    #[must_use]
+    pub fn from_overrides(extra: &Value) -> Self {
+        let object = |key: &str| extra.get(key).filter(|value| value.is_object()).cloned();
+        Self {
+            provider: object("provider"),
+            reasoning: object("reasoning"),
+        }
+    }
+
+    fn apply(&self, request: &mut ChatCompletionRequest) {
+        if request.provider.is_none() {
+            request.provider.clone_from(&self.provider);
+        }
+        if request.reasoning.is_none() {
+            request.reasoning.clone_from(&self.reasoning);
+        }
+    }
 }
 
 impl Default for AifarmClientConfig {
@@ -4030,6 +4070,7 @@ impl Default for AifarmClientConfig {
             priority: 0,
             workload: String::new(),
             fail_fast_on_capacity_unavailable: false,
+            gateway_fields: GatewayRequestFields::default(),
         }
     }
 }
@@ -4539,6 +4580,7 @@ pub fn build_discovery_job_request(
 }
 
 fn normalize_request_for_client(request: &mut ChatCompletionRequest, cfg: &AifarmClientConfig) {
+    cfg.gateway_fields.apply(request);
     normalize_request_for_runtime_hint(request, &cfg.runtime_hint);
     if !cfg.supports_message_name {
         for message in &mut request.messages {
@@ -8719,6 +8761,43 @@ mod tests {
         assert_eq!(value["model"], "model");
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn gateway_fields_reach_the_wire_only_when_configured() {
+        let wire = |cfg: &AifarmClientConfig| {
+            let mut request = ChatCompletionRequest {
+                model: "model".to_owned(),
+                ..ChatCompletionRequest::default()
+            };
+            normalize_request_for_client(&mut request, cfg);
+            let body = direct_chat_completion_body(&request).expect("direct request body");
+            serde_json::from_slice::<Value>(&body).expect("direct request json")
+        };
+
+        let plain = wire(&AifarmClientConfig::default());
+        assert!(plain.get("provider").is_none());
+        assert!(plain.get("reasoning").is_none());
+
+        let configured = wire(&AifarmClientConfig {
+            gateway_fields: GatewayRequestFields::from_overrides(&json!({
+                "provider": {"require_parameters": true},
+                "reasoning": {"enabled": false},
+                "enable_thinking": false
+            })),
+            ..AifarmClientConfig::default()
+        });
+        assert_eq!(configured["provider"], json!({"require_parameters": true}));
+        assert_eq!(configured["reasoning"], json!({"enabled": false}));
+        assert!(configured.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn gateway_fields_ignore_non_object_overrides() {
+        assert_eq!(
+            GatewayRequestFields::from_overrides(&json!({"provider": "fp8", "reasoning": false})),
+            GatewayRequestFields::default()
+        );
     }
 
     #[test]

@@ -438,11 +438,7 @@ async fn build_song_prompt_with_attempt_and_prompt_store(
 ) -> Result<SongPromptResult, MusicGenerationError> {
     if media::routed_attempt_is_genkit(&attempt) {
         let model = media::genkit_model_for_attempt(&attempt);
-        if let Some((cfg, _)) =
-            media::genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
-                config, &model,
-            )
-        {
+        if let Some(cfg) = media::gateway_structured_json_config_for_attempt(config, &attempt) {
             let generator =
                 AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
             return generator.build_song_prompt(request).await;
