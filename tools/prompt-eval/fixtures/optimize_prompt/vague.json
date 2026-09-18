@@ -3,7 +3,16 @@
   "id": "optimize_prompt/vague",
   "prompt": "image/optimizer",
   "vars": {
-    "variant_count": 1
+    "variant_count": 1,
+    "multi": false,
+    "klein": true,
+    "boogu": false,
+    "slots": [
+      {
+        "index": 0,
+        "model": "FLUX.2 [klein]"
+      }
+    ]
   },
   "schema": "optimize_prompt",
   "tool_name": "optimize_prompt",
@@ -16,7 +25,7 @@
   "checks": [
     "json",
     "schema",
-    "word_range:outputs[]:30:220",
+    "word_range:outputs[]:20:150",
     "no_substring:|@outputs[]",
     "lang:en:outputs[]",
     "max_blank_run:3"

@@ -3,7 +3,16 @@
   "id": "optimize_edit_prompt/context-style",
   "prompt": "image/edit_optimizer",
   "vars": {
-    "variant_count": 1
+    "variant_count": 1,
+    "multi": false,
+    "klein": true,
+    "boogu": false,
+    "slots": [
+      {
+        "index": 0,
+        "model": "FLUX.2 [klein]"
+      }
+    ]
   },
   "schema": "optimize_edit_prompt",
   "tool_name": "optimize_edit_prompt",
