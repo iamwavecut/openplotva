@@ -1,0 +1,46 @@
+{
+  "properties": {
+    "aspect_ratio": {
+      "description": "Target aspect ratio for the generated image. Use 1:1 when nothing in the request implies an orientation.",
+      "enum": [
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "9:16",
+        "16:9",
+        "1:2",
+        "2:1"
+      ],
+      "type": "string"
+    },
+    "input": {
+      "type": "string"
+    },
+    "nsfw_result": {
+      "description": "Image safety classification. Use forbidden for minor sexual content only: CSAM, sexual content involving minors, sexualized minors, underage nudity, or facilitation of that content. Use adult for adult-only sexual content, gore, violence, horror, war, generic unsafe themes, or ambiguous non-CSAM content.",
+      "enum": [
+        "safe",
+        "adult",
+        "forbidden"
+      ],
+      "type": "string"
+    },
+    "outputs": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 1,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "input",
+    "outputs",
+    "nsfw_result",
+    "aspect_ratio"
+  ],
+  "type": "object"
+}

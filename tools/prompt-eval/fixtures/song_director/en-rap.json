@@ -1,0 +1,26 @@
+{
+  "flow": "song_director",
+  "id": "song_director/en-rap",
+  "prompt": "music/song_director",
+  "schema": "song_director",
+  "tool_name": "song_director",
+  "request": {
+    "temperature": 0.7,
+    "max_tokens": 6144
+  },
+  "vars": {
+    "request": "!song write an english rap track about debugging at 3am",
+    "topic": "debugging at 3am",
+    "userName": "Kirill",
+    "languageHint": "ru",
+    "maxDuration": 360,
+    "context": ""
+  },
+  "checks": [
+    "json",
+    "schema",
+    "equals:vocal_language=en",
+    "lang:en:lyrics",
+    "max_blank_run:3"
+  ]
+}

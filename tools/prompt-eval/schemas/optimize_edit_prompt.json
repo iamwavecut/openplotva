@@ -1,0 +1,30 @@
+{
+  "properties": {
+    "input": {
+      "type": "string"
+    },
+    "nsfw_result": {
+      "description": "Image safety classification. Use forbidden for minor sexual content only: CSAM, sexual content involving minors, sexualized minors, underage nudity, or facilitation of that content. Use adult for adult-only sexual content, gore, violence, horror, war, generic unsafe themes, or ambiguous non-CSAM content.",
+      "enum": [
+        "safe",
+        "adult",
+        "forbidden"
+      ],
+      "type": "string"
+    },
+    "outputs": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 1,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "input",
+    "outputs",
+    "nsfw_result"
+  ],
+  "type": "object"
+}

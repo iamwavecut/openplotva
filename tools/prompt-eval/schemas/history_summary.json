@@ -1,0 +1,102 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "summary_json": {
+      "additionalProperties": false,
+      "properties": {
+        "actors": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "description"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "event_details": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "actors": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "confidence": {
+                "type": "number"
+              },
+              "description": {
+                "type": "string"
+              },
+              "occurred_at": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "description",
+              "actors",
+              "occurred_at",
+              "confidence"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "events": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "open_questions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "quality_notes": {
+          "type": "string"
+        },
+        "quality_score": {
+          "type": "number"
+        },
+        "recap": {
+          "type": "string"
+        },
+        "source_style": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "events",
+        "event_details",
+        "actors",
+        "recap",
+        "open_questions",
+        "source_style",
+        "quality_score",
+        "quality_notes"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "summary_json"
+  ],
+  "type": "object"
+}

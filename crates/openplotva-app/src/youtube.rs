@@ -1,8 +1,13 @@
 //! App-level YouTube summary runtime for the dialog toolbox.
 
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use openplotva_config::AppConfig;
+use openplotva_dialog::{DialogTraceArtifacts, DialogTraceUsage};
 use openplotva_llm::gemini::{MODEL_GEMINI_FLASH_LITE, cache_contour_model};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use quick_xml::de::from_str as xml_from_str;
@@ -470,17 +475,24 @@ impl GeminiYouTubeSummarizer {
         let request = youtube_summary_gemini_request(&system, transcript);
         let model = cache_contour_model(&self.cfg.model);
         let url = gemini_generate_url(&self.cfg.base_url, &model)?;
-        let response = self
+        let trace = YouTubeCallTrace::begin(
+            YouTubeTraceTags {
+                provider: "genkit",
+                source: "youtube_gemini",
+                request_kind: "gemini.generateContent",
+            },
+            &model,
+            &request,
+        );
+        let sent = self
             .http
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("x-goog-api-key", self.cfg.api_key.trim())
             .json(&request)
             .send()
-            .await
-            .map_err(http_error_text)?;
-        let status = response.status();
-        let body = response.bytes().await.map_err(http_error_text)?;
+            .await;
+        let (status, body) = trace.read_response(sent).await?;
         if !status.is_success() {
             return Err(YouTubeSummaryError::Http(format!(
                 "HTTP {}: {}",
@@ -554,17 +566,24 @@ impl OpenAiCompatibleYouTubeSummarizer {
     async fn generate_summary(&self, transcript: &str) -> Result<String, YouTubeSummaryError> {
         let system = openplotva_prompts::read("youtube/summary_system")?;
         let request = youtube_summary_openai_request(&self.cfg.model, &system, transcript);
-        let response = self
+        let trace = YouTubeCallTrace::begin(
+            YouTubeTraceTags {
+                provider: self.provider,
+                source: "youtube_openai_compatible",
+                request_kind: "openai.chat.completions",
+            },
+            &self.cfg.model,
+            &request,
+        );
+        let sent = self
             .http
             .post(self.cfg.direct_url.trim())
             .bearer_auth(self.cfg.api_key.trim())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&request)
             .send()
-            .await
-            .map_err(http_error_text)?;
-        let status = response.status();
-        let body = response.bytes().await.map_err(http_error_text)?;
+            .await;
+        let (status, body) = trace.read_response(sent).await?;
         if !status.is_success() {
             return Err(YouTubeSummaryError::Http(format!(
                 "HTTP {}: {}",
@@ -630,14 +649,23 @@ async fn generate_youtube_summary_with_attempt(
     {
         builder = builder.header("X-Title", app_title.trim());
     }
-    let response = builder.send().await.map_err(http_error_text)?;
-    let status = response.status();
-    let retry_after = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
+    let trace = YouTubeCallTrace::begin(
+        YouTubeTraceTags {
+            provider: &attempt.provider_name,
+            source: "youtube_routed",
+            request_kind: "openai.chat.completions",
+        },
+        &model,
+        &request,
+    );
+    let sent = builder.send().await;
+    let retry_after = sent
+        .as_ref()
+        .ok()
+        .and_then(|response| response.headers().get(reqwest::header::RETRY_AFTER))
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().await.map_err(http_error_text)?;
+    let (status, body) = trace.read_response(sent).await?;
     if !status.is_success() {
         let mut message = format!(
             "HTTP {}: {}",
@@ -652,6 +680,124 @@ async fn generate_youtube_summary_with_attempt(
         return Err(YouTubeSummaryError::Http(message));
     }
     decode_openai_text(&body)
+}
+
+struct YouTubeTraceTags<'a> {
+    provider: &'a str,
+    source: &'a str,
+    request_kind: &'a str,
+}
+
+struct YouTubeCallTrace {
+    artifact: DialogTraceArtifacts,
+    started: Instant,
+}
+
+impl YouTubeCallTrace {
+    fn begin<T: Serialize>(tags: YouTubeTraceTags<'_>, model: &str, request: &T) -> Self {
+        let raw_request = serde_json::to_value(request).ok();
+        let prompt_chars = raw_request.as_ref().map_or(0, |value| {
+            i32::try_from(value.to_string().len()).unwrap_or(i32::MAX)
+        });
+        Self {
+            artifact: DialogTraceArtifacts {
+                provider: tags.provider.trim().to_owned(),
+                request_kind: tags.request_kind.to_owned(),
+                source: tags.source.to_owned(),
+                mode: "text".to_owned(),
+                flow: "youtube_summary".to_owned(),
+                iteration: 1,
+                model: model.trim().to_owned(),
+                raw_request,
+                inference_params: Some(json!({
+                    "max_tokens": YOUTUBE_SUMMARY_MAX_OUTPUT_TOKENS,
+                    "temperature": YOUTUBE_SUMMARY_TEMPERATURE,
+                })),
+                prompt_chars,
+                prompt_messages: 2,
+                ..DialogTraceArtifacts::default()
+            },
+            started: Instant::now(),
+        }
+    }
+
+    async fn read_response(
+        self,
+        sent: Result<reqwest::Response, reqwest::Error>,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), YouTubeSummaryError> {
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                let error = http_error_text(error);
+                self.finish(None, Some(error.to_string()));
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        match response.bytes().await {
+            Ok(body) => {
+                let error = (!status.is_success()).then(|| format!("HTTP {}", status.as_u16()));
+                self.finish(Some(&body), error);
+                Ok((status, body.to_vec()))
+            }
+            Err(error) => {
+                let error = http_error_text(error);
+                self.finish(None, Some(error.to_string()));
+                Err(error)
+            }
+        }
+    }
+
+    fn finish(self, body: Option<&[u8]>, error: Option<String>) {
+        let duration_ms = i32::try_from(self.started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        openplotva_llm::trace::observe(openplotva_llm::LlmCallRecord {
+            artifact: youtube_trace_artifact(self.artifact, body, error),
+            duration_ms,
+            ..openplotva_llm::LlmCallRecord::default()
+        });
+    }
+}
+
+fn youtube_trace_artifact(
+    mut artifact: DialogTraceArtifacts,
+    body: Option<&[u8]>,
+    error: Option<String>,
+) -> DialogTraceArtifacts {
+    let response = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+    artifact.usage = response.as_ref().and_then(youtube_trace_usage);
+    artifact.raw_response = response;
+    artifact.error = error.unwrap_or_default();
+    artifact
+}
+
+fn youtube_trace_usage(response: &serde_json::Value) -> Option<DialogTraceUsage> {
+    let count = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|count| i32::try_from(count).ok())
+            .unwrap_or_default()
+    };
+    if let Some(usage) = response.get("usage") {
+        return Some(DialogTraceUsage {
+            input_tokens: count(usage, "prompt_tokens"),
+            output_tokens: count(usage, "completion_tokens"),
+            total_tokens: count(usage, "total_tokens"),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .map_or(0, |details| count(details, "cached_tokens")),
+            ..DialogTraceUsage::default()
+        });
+    }
+    let usage = response.get("usageMetadata")?;
+    Some(DialogTraceUsage {
+        input_tokens: count(usage, "promptTokenCount"),
+        output_tokens: count(usage, "candidatesTokenCount"),
+        total_tokens: count(usage, "totalTokenCount"),
+        cached_tokens: count(usage, "cachedContentTokenCount"),
+        thoughts_tokens: count(usage, "thoughtsTokenCount"),
+        ..DialogTraceUsage::default()
+    })
 }
 
 fn youtube_model_for_attempt(attempt: &RoutedAttempt) -> String {
@@ -1442,6 +1588,63 @@ mod tests {
         assert_eq!(summarizer.cfg.api_key, "openrouter-key");
         assert_eq!(summarizer.cfg.direct_url, OPENROUTER_CHAT_COMPLETIONS_URL);
         assert_eq!(summarizer.cfg.request_timeout, Duration::from_secs(333));
+    }
+
+    #[test]
+    fn youtube_trace_artifact_reads_openai_usage_and_http_errors() {
+        let trace = YouTubeCallTrace::begin(
+            YouTubeTraceTags {
+                provider: "openrouter",
+                source: "youtube_routed",
+                request_kind: "openai.chat.completions",
+            },
+            "summary-model",
+            &youtube_summary_openai_request("summary-model", "system", "0.5: hello"),
+        );
+        let artifact = youtube_trace_artifact(
+            trace.artifact,
+            Some(br#"{"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":64}}}"#),
+            Some("HTTP 429".to_owned()),
+        );
+
+        assert_eq!(artifact.flow, "youtube_summary");
+        assert_eq!(artifact.source, "youtube_routed");
+        assert_eq!(artifact.model, "summary-model");
+        assert_eq!(artifact.error, "HTTP 429");
+        assert!(artifact.prompt_chars > 0);
+        assert_eq!(
+            artifact.inference_params,
+            Some(json!({"max_tokens": 8192, "temperature": 0.3}))
+        );
+        let usage = artifact.usage.unwrap_or_default();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_tokens, 64);
+    }
+
+    #[test]
+    fn youtube_trace_artifact_reads_gemini_usage_metadata() {
+        let trace = YouTubeCallTrace::begin(
+            YouTubeTraceTags {
+                provider: "genkit",
+                source: "youtube_gemini",
+                request_kind: "gemini.generateContent",
+            },
+            "gemini-model",
+            &youtube_summary_gemini_request("system", "0.5: hello"),
+        );
+        let artifact = youtube_trace_artifact(
+            trace.artifact,
+            Some(br#"{"usageMetadata":{"promptTokenCount":90,"candidatesTokenCount":10,"totalTokenCount":100,"thoughtsTokenCount":5}}"#),
+            None,
+        );
+
+        assert!(artifact.error.is_empty());
+        assert_eq!(artifact.request_kind, "gemini.generateContent");
+        let usage = artifact.usage.unwrap_or_default();
+        assert_eq!(usage.input_tokens, 90);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.thoughts_tokens, 5);
     }
 
     #[test]

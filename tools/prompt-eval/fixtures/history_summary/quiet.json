@@ -1,0 +1,150 @@
+{
+  "flow": "history_summary",
+  "id": "history_summary/quiet",
+  "prompt": "history/summary",
+  "schema": "history_summary",
+  "tool_name": "chat_history_summary",
+  "request": {
+    "temperature": 0.2,
+    "max_tokens": 1024
+  },
+  "notes": "Nothing happened: events should stay empty or near-empty.",
+  "user": {
+    "chat_id": -1000000000002,
+    "thread_id": 0,
+    "scope": "chat",
+    "range_start_at": [
+      2026,
+      244,
+      18,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "range_end_at": [
+      2026,
+      244,
+      18,
+      4,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "first_message_id": 2001,
+    "last_message_id": 2004,
+    "first_entry_id": "msg:2001",
+    "last_entry_id": "msg:2004",
+    "raw_message_count": 4,
+    "covered_message_count": 4,
+    "reused_summary_count": 0,
+    "omitted_message_count": 0,
+    "source_summary_ids": [],
+    "requested_by_user_id": 7001,
+    "input_hash": "eval",
+    "input_token_estimate": 0,
+    "cascade_depth": 0,
+    "sources": [],
+    "items": [
+      {
+        "kind": "message",
+        "at": [
+          2026,
+          244,
+          18,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "message_id": 2001,
+        "entry_id": "msg:2001",
+        "role": "user",
+        "sender_name": "Лёша",
+        "sender_username": "",
+        "sender_type": "user",
+        "text": "всем привет",
+        "meta_type": ""
+      },
+      {
+        "kind": "message",
+        "at": [
+          2026,
+          244,
+          18,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "message_id": 2002,
+        "entry_id": "msg:2002",
+        "role": "user",
+        "sender_name": "Маша",
+        "sender_username": "",
+        "sender_type": "user",
+        "text": "ку",
+        "meta_type": ""
+      },
+      {
+        "kind": "message",
+        "at": [
+          2026,
+          244,
+          18,
+          2,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "message_id": 2003,
+        "entry_id": "msg:2003",
+        "role": "user",
+        "sender_name": "Лёша",
+        "sender_username": "",
+        "sender_type": "user",
+        "text": "как дела",
+        "meta_type": ""
+      },
+      {
+        "kind": "message",
+        "at": [
+          2026,
+          244,
+          18,
+          3,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "message_id": 2004,
+        "entry_id": "msg:2004",
+        "role": "user",
+        "sender_name": "Маша",
+        "sender_username": "",
+        "sender_type": "user",
+        "text": "норм",
+        "meta_type": ""
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "max_items:summary_json.events:1",
+    "lang:ru:summary_json.recap",
+    "no_phrases:but wait;let me think;let me check;the prompt says"
+  ]
+}

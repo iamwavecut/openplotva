@@ -1,0 +1,17 @@
+{
+  "flow": "youtube_summary",
+  "id": "youtube_summary/very-short",
+  "prompt": "youtube/summary_system",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 8192
+  },
+  "notes": "Three lines only: the summary should be short, not padded.",
+  "user": "Language: Russian\n0.0: Короче, это тест микрофона\n7.5: Раз, два, три\n15.0: Всё, пока\n",
+  "checks": [
+    "lang:ru",
+    "html_tags:b,i,u,s,a,code,pre,blockquote,tg-spoiler",
+    "no_phrases:<ul>;<li>;<h1;<h2;<h3;**;##",
+    "no_repeat_lines:2"
+  ]
+}

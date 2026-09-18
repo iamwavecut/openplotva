@@ -1,0 +1,24 @@
+{
+  "flow": "optimize_prompt",
+  "id": "optimize_prompt/vague",
+  "prompt": "image/optimizer",
+  "vars": {
+    "variant_count": 1
+  },
+  "schema": "optimize_prompt",
+  "tool_name": "optimize_prompt",
+  "request": {
+    "temperature": 0.3,
+    "max_tokens": 2048
+  },
+  "notes": "Vague request: one concrete direction.",
+  "user": "что-нибудь необычное",
+  "checks": [
+    "json",
+    "schema",
+    "word_range:outputs[]:30:220",
+    "no_substring:|",
+    "lang:en:outputs[]",
+    "max_blank_run:3"
+  ]
+}

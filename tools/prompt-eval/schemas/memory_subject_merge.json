@@ -1,0 +1,49 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "clusters": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "absorbed_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "merged_fact_text": {
+            "type": "string"
+          },
+          "survivor_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "survivor_id",
+          "absorbed_ids",
+          "merged_fact_text"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "demote_ids": {
+      "items": {
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "keep_ids": {
+      "items": {
+        "type": "integer"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "clusters",
+    "demote_ids",
+    "keep_ids"
+  ],
+  "type": "object"
+}
