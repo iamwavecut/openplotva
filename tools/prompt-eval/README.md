@@ -30,6 +30,7 @@ fixtures (for example exported production requests) and is never committed.
 | `user_prompt` | optional second template rendered as the user text |
 | `vars` | template variables (`{{name}}` is HTML-escaped like Handlebars, `{{{name}}}` is raw) |
 | `user` | user turn: a string, or JSON that is pretty-printed like the bot does |
+| `user_layout` | `memory_blocks` renders `user` as the memory extraction message (`<run>`, `<existing_cards>`, `<chat_window>`, task line); `--legacy-user-layout` sends the old pretty JSON instead, for the pre-v6 prompt |
 | `image` | optional path (relative to this directory) attached before the text; the fixture is skipped if missing |
 | `schema` | name of `schemas/<name>.json`; sent as `response_format` (`--mode response_format`), as a forced tool (`--mode tools`), or not at all (`--mode prompt_only`) |
 | `tool_name` | schema/tool name for the two structured modes |
@@ -48,7 +49,11 @@ fixtures (for example exported production requests) and is never committed.
 | `no_substring:<s>[@<path>]` | the literal substring is absent, from the raw output or only at the path |
 | `max_items:<path>:<n>` / `min_items:<path>:<n>` | the array at the path has at most / at least n items |
 | `ids_from_input` | every integer under a `*_id` / `*_ids` key occurs in the user payload (0 allowed) |
-| `partition_ids` | subject merge: every input card id appears exactly once across clusters, `demote_ids`, `keep_ids` |
+| `merge_plan_valid` | subject merge: every card index has one known action, folded cards point at kept cards, and every survivor with folded cards has merged text |
+| `separate:<i>,<j>` | subject merge: cards i and j do not end up in the same cluster |
+| `evidence_quoted` | memory extraction: every candidate card's `evidence_quote` occurs in a message it cites |
+| `not_equals:<path>=<value>` | no value at the path equals the given value |
+| `min_count:<path>=<value>:<n>` | at least n values at the path equal the given value |
 | `label:<prefix>` | the first non-empty line starts with the prefix |
 | `equals:<path>=<value>` | every value at the path equals the given value |
 | `contains:<s>` | the raw output contains the substring |

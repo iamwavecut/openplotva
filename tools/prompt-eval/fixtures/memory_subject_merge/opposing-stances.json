@@ -5,7 +5,11 @@
   "schema": "memory_subject_merge",
   "tool_name": "memory_subject_merge",
   "request": {
-    "temperature": 0.2,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
     "max_tokens": 4000
   },
   "notes": "Two people with opposite stances must stay separate; one throwaway card can be demoted.",
@@ -13,7 +17,7 @@
     "subject": "удалёнка",
     "cards": [
       {
-        "id": 21,
+        "index": 0,
         "type": "recurring_topic",
         "predicate": "считает",
         "fact": "Олег считает удалёнку продуктивнее офиса",
@@ -22,7 +26,7 @@
         "age": "1mo"
       },
       {
-        "id": 22,
+        "index": 1,
         "type": "recurring_topic",
         "predicate": "повторяет",
         "fact": "Олег снова говорит, что дома работает лучше",
@@ -31,7 +35,7 @@
         "age": "2w"
       },
       {
-        "id": 23,
+        "index": 2,
         "type": "recurring_topic",
         "predicate": "считает",
         "fact": "Марина уверена, что в офисе команда сильнее",
@@ -40,7 +44,7 @@
         "age": "1mo"
       },
       {
-        "id": 24,
+        "index": 3,
         "type": "recurring_topic",
         "predicate": "считает",
         "fact": "Марина считает, что удалёнка разрушает общение",
@@ -49,7 +53,7 @@
         "age": "2w"
       },
       {
-        "id": 25,
+        "index": 4,
         "type": "event",
         "predicate": "написал",
         "fact": "Кто-то написал «ну такое» про удалёнку",
@@ -62,8 +66,7 @@
   "checks": [
     "json",
     "schema",
-    "partition_ids",
-    "ids_from_input",
+    "merge_plan_valid",
     "no_phrases:but wait;let me think;let me check;the prompt says"
   ]
 }

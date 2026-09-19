@@ -1,0 +1,74 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/junk-events-ru",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 4000
+  },
+  "notes": "Russian: one-off reply events around one real fact; the replies are demoted.",
+  "user": {
+    "subject": "Рома",
+    "cards": [
+      {
+        "index": 0,
+        "type": "identity",
+        "predicate": "работает",
+        "fact": "Рома работает пожарным",
+        "salience": 0.8,
+        "obs": 3,
+        "age": "2mo"
+      },
+      {
+        "index": 1,
+        "type": "event",
+        "predicate": "ответил",
+        "fact": "Рома поздно вечером ответил «ага»",
+        "salience": 0.2,
+        "obs": 1,
+        "age": "1w"
+      },
+      {
+        "index": 2,
+        "type": "event",
+        "predicate": "ответил",
+        "fact": "Рома коротко ответил «лол» в завершение вечера",
+        "salience": 0.2,
+        "obs": 1,
+        "age": "6d"
+      },
+      {
+        "index": 3,
+        "type": "event",
+        "predicate": "ответил",
+        "fact": "Рома подхватил нить разговора коротким «ну да»",
+        "salience": 0.2,
+        "obs": 1,
+        "age": "5d"
+      },
+      {
+        "index": 4,
+        "type": "event",
+        "predicate": "написал",
+        "fact": "Рома написал «+» в ответ на предложение",
+        "salience": 0.1,
+        "obs": 1,
+        "age": "4d"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "merge_plan_valid",
+    "min_count:decisions[].action=demote:3",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

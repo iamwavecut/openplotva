@@ -1,0 +1,87 @@
+{
+  "flow": "memory_extraction",
+  "id": "memory_extraction/relationship-ru",
+  "prompt": "memory/extraction",
+  "schema": "memory_extraction",
+  "tool_name": "memory_extraction",
+  "user_layout": "memory_blocks",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 4000
+  },
+  "notes": "Russian: two members turn out to be siblings; one relationship card bound to the chat.",
+  "user": {
+    "chat_type": "supergroup",
+    "existing_cards": [],
+    "messages": [
+      {
+        "entry_id": "msg:2001",
+        "message_id": 2001,
+        "occurred_at": "2026-09-01T18:00:00Z",
+        "sender_name": "Вероника",
+        "sender_type": "user",
+        "text": "Кстати, Гоша — мой младший брат, если кто не знал",
+        "thread_id": 0,
+        "user_id": 7401
+      },
+      {
+        "entry_id": "msg:2002",
+        "message_id": 2002,
+        "occurred_at": "2026-09-01T18:01:00Z",
+        "sender_name": "Гоша",
+        "sender_type": "user",
+        "text": "Ага, это правда, вечно за мной присматривает 😄",
+        "thread_id": 0,
+        "user_id": 7402
+      },
+      {
+        "entry_id": "msg:2003",
+        "message_id": 2003,
+        "occurred_at": "2026-09-01T18:02:00Z",
+        "sender_name": "Нина",
+        "sender_type": "user",
+        "text": "Ого, а я думала, вы просто однокурсники",
+        "thread_id": 0,
+        "user_id": 7403
+      },
+      {
+        "entry_id": "msg:2004",
+        "message_id": 2004,
+        "occurred_at": "2026-09-01T18:03:00Z",
+        "sender_name": "Вероника",
+        "sender_type": "user",
+        "text": "Не, родные, у нас разница два года",
+        "thread_id": 0,
+        "user_id": 7401
+      }
+    ],
+    "run": {
+      "attempts": 0,
+      "chat_id": -1000000000001,
+      "cursor_after_at": "2026-09-01T00:00:00Z",
+      "cursor_entry_id": "",
+      "cursor_message_id": 0,
+      "id": 1,
+      "message_count": 4,
+      "prompt_version": "eval",
+      "range_end_at": "2026-09-02T00:00:00Z",
+      "range_start_at": "2026-09-01T00:00:00Z"
+    }
+  },
+  "checks": [
+    "json",
+    "schema",
+    "ids_from_input",
+    "evidence_quoted",
+    "min_items:candidate_cards:1",
+    "max_items:candidate_cards:2",
+    "equals:candidate_cards[].scope_type=chat",
+    "lang:ru:candidate_cards[].fact_text",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

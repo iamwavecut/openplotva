@@ -1,0 +1,102 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/many-paraphrases-uk",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 4000
+  },
+  "notes": "Ukrainian: eight cards restating two facts about one person.",
+  "user": {
+    "subject": "Остап",
+    "cards": [
+      {
+        "index": 0,
+        "type": "preference",
+        "predicate": "їсть",
+        "fact": "Остап не їсть солодкого",
+        "salience": 0.8,
+        "obs": 3,
+        "age": "1mo"
+      },
+      {
+        "index": 1,
+        "type": "preference",
+        "predicate": "їсть",
+        "fact": "Остап відмовився від солодкого",
+        "salience": 0.6,
+        "obs": 1,
+        "age": "3w"
+      },
+      {
+        "index": 2,
+        "type": "preference",
+        "predicate": "їсть",
+        "fact": "Остап каже, що не їсть торти",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "index": 3,
+        "type": "preference",
+        "predicate": "їсть",
+        "fact": "Остап знову відмовився від десерту",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "1w"
+      },
+      {
+        "index": 4,
+        "type": "project",
+        "predicate": "біжить",
+        "fact": "Остап готується до марафону",
+        "salience": 0.7,
+        "obs": 2,
+        "age": "1mo"
+      },
+      {
+        "index": 5,
+        "type": "project",
+        "predicate": "біжить",
+        "fact": "Остап тренується до марафону щоранку",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "index": 6,
+        "type": "project",
+        "predicate": "біжить",
+        "fact": "Остап бігає, бо готується до марафону",
+        "salience": 0.4,
+        "obs": 1,
+        "age": "1w"
+      },
+      {
+        "index": 7,
+        "type": "project",
+        "predicate": "біжить",
+        "fact": "Остап записався на марафон",
+        "salience": 0.6,
+        "obs": 1,
+        "age": "5d"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "merge_plan_valid",
+    "min_items:survivors:2",
+    "min_count:decisions[].action=cluster_with:4",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}
