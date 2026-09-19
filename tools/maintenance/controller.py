@@ -137,7 +137,7 @@ class Controller:
     def schedule_incidents(self):
         for incident in self.state.due_incidents():
             with self.state.transaction():
-                active = [j for j in self.state.jobs() if j['signature'] == incident['signature'] and j['status'] in ('queued', 'running', 'result', 'processing', 'waiting_ci')]
+                active = [j for j in self.state.jobs({'queued', 'running', 'result', 'processing', 'waiting_ci'}) if j['signature'] == incident['signature']]
                 if not active: self.state.new_job('initial', incident['signature'], incident['incident_id'])
                 incident['status'] = 'diagnosing'; self.state.put_incident(incident)
 
@@ -151,7 +151,6 @@ class Controller:
         self.reconcile_origins()
         own_marker = '<!-- maintenance:origin:'+job['id']+' -->'
         issues = []
-        jobs = self.state.jobs()
         for origin in self.state.origins_for_signature(job['signature']):
             # The current initial result must finish its own journaled publication.
             if job['stage']=='initial' and origin['marker']==own_marker: continue
@@ -163,8 +162,7 @@ class Controller:
                 raise InvalidResult('known issue provenance changed')
             item = self.github.discussion({**remote,'kind':'issue'})
             linked = set(item.get('linked_prs',[]))
-            linked.update(j['pr_number'] for j in jobs if j['signature']==job['signature']
-                          and j.get('issue_number')==number and j.get('pr_number'))
+            linked.update(j['pr_number'] for j in self.state.issue_jobs(number) if j['signature']==job['signature'] and j.get('pr_number'))
             issues.append({**item,'linked_prs':sorted(linked)})
         return issues
 

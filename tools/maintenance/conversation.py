@@ -17,8 +17,7 @@ class Conversation:
         return job['stage'] != 'triage' and self.state.owner_hold(job.get('issue_number'))
 
     def repair_jobs(self, number):
-        return [job for job in self.state.jobs() if job.get('issue_number') == number
-                and job['stage'] in ('deep', 'revise') and not job['cancelled']]
+        return [job for job in self.state.issue_jobs(number) if job['stage'] in ('deep', 'revise') and not job['cancelled']]
 
     def managed_pr(self, number, include_closed=False):
         candidates = [job for job in self.repair_jobs(number) if job.get('pr_number')]
@@ -35,8 +34,8 @@ class Conversation:
             if pr['state'] == 'open' or include_closed: return job, pr
         return None
 
-    def automated(self, number, comment):
-        for effect in self.state.records('effects'):
+    def automated(self, number, comment, effects):
+        for effect in effects:
             payload = effect.get('payload', {})
             if (effect['kind'] in ('comment', 'reply') and payload.get('number') == number
                     and payload.get('body') == comment.get('body')):
@@ -47,9 +46,11 @@ class Conversation:
     def comments(self, number):
         since = self.state.setting('owner_feedback_since')
         values = []
-        for comment in self.github.comments(number):
+        comments = self.github.comments(number)
+        effects = self.state.records('effects')
+        for comment in comments:
             if (not is_owner(comment.get('user')) or type(comment.get('id')) is not int
-                    or comment['id'] <= 0 or self.automated(number, comment)
+                    or comment['id'] <= 0 or self.automated(number, comment, effects)
                     or comment.get('issue_url') != 'https://api.github.com/repos/'+REPOSITORY+'/issues/'+str(number)):
                 continue
             updated = comment.get('updated_at', '')
@@ -77,7 +78,7 @@ class Conversation:
                 comments = self.comments(number)
                 if managed: comments += self.comments(managed[1]['number'])
                 with self.state.transaction():
-                    previous = [job for job in self.state.jobs() if job['stage'] == 'triage' and job['issue_number'] == number]
+                    previous = [job for job in self.state.issue_jobs(number) if job['stage'] == 'triage']
                     seen = {comment['version'] for job in previous for comment in job['owner_comments']}
                     fresh = sorted((comment for comment in comments if comment['version'] not in seen),
                                    key=lambda comment: (comment['updated_at'], comment['id']))
@@ -112,8 +113,8 @@ class Conversation:
                 continue
 
     def guidance(self, number):
-        decisions = [job for job in self.state.jobs() if job['stage'] == 'triage'
-                     and job['issue_number'] == number and job['status'] == 'done' and job.get('result')]
+        decisions = [job for job in self.state.issue_jobs(number) if job['stage'] == 'triage'
+                     and job['status'] == 'done' and job.get('result')]
         return [{'comments': job['owner_comments'], 'decision': job['result']} for job in decisions[-10:]]
 
     def context(self, job):
@@ -125,8 +126,8 @@ class Conversation:
             target = {key: pr.get(key) for key in ('number', 'state', 'title', 'body')}
             target['head'] = pr['head']['sha']
         prior = [{'action': candidate['result']['action'], 'reply': candidate['result']['reply']}
-                 for candidate in self.state.jobs() if candidate['stage'] == 'triage'
-                 and candidate['issue_number'] == job['issue_number'] and candidate['status'] == 'done'
+                 for candidate in self.state.issue_jobs(job['issue_number']) if candidate['stage'] == 'triage'
+                 and candidate['status'] == 'done'
                  and candidate.get('result') and candidate['id'] != job['id']][-20:]
         return {'owner_comments': job['owner_comments'], 'managed_pr': target,
                 'previous_replies': prior, 'repair_budget': self.state.issue_usage(job['issue_number'])}
@@ -143,14 +144,11 @@ class Conversation:
         if managed: allowed.add(managed[1]['number'])
         current = {c['version'] for number in allowed for c in self.comments(number)}
         # New comments also supersede a decision already being computed.
-        known = {c['version'] for candidate in self.state.jobs() if candidate['stage'] == 'triage'
-                 and candidate['issue_number'] == job['issue_number']
-                 for c in candidate['owner_comments']}
+        triage = [candidate for candidate in self.state.issue_jobs(job['issue_number']) if candidate['stage'] == 'triage']
+        known = {c['version'] for candidate in triage for c in candidate['owner_comments']}
         if not {c['version'] for c in job['owner_comments']} <= current or current - known:
             raise InvalidResult('owner feedback changed during triage')
-        newer = [candidate for candidate in self.state.jobs() if candidate['stage'] == 'triage'
-                 and candidate['issue_number'] == job['issue_number'] and candidate['id'] != job['id']
-                 and candidate['status'] == 'queued']
+        newer = [candidate for candidate in triage if candidate['id'] != job['id'] and candidate['status'] == 'queued']
         if newer and job.get('context'): raise InvalidResult('new owner feedback supersedes this decision')
 
     def process(self, job):
@@ -233,7 +231,7 @@ class Conversation:
         if action != 'continue': controller.notify(job, 'needs_human')
 
     def filter_review(self, snapshot, number):
-        handled = {(str(c['id']), c['body']) for job in self.state.jobs() if job['stage'] == 'triage'
-                   and job['issue_number'] == number for c in job['owner_comments']}
+        handled = {(str(c['id']), c['body']) for job in self.state.issue_jobs(number) if job['stage'] == 'triage'
+                   for c in job['owner_comments']}
         return {**snapshot, 'artifacts': [item for item in snapshot['artifacts']
                 if not (item['kind'] == 'comment' and (str(item['id']), item['body']) in handled)]}

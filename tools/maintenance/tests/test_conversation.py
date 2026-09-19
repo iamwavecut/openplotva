@@ -12,6 +12,7 @@ from tools.maintenance.state import State
 from tools.maintenance import worker
 from tools.maintenance.tests import test_controller as fixtures
 from tools.maintenance.tests.test_github import owner
+from tools.maintenance.tests.test_state import decoded_job_ids
 
 
 BASE = fixtures.BASE
@@ -68,6 +69,18 @@ class ConversationTests(unittest.TestCase):
             'head': {'sha': BASE, 'ref': 'fix/issue-7', 'repo': {'full_name': 'iamwavecut/openplotva'}}}
         self.gh.close_pr = lambda number: self.gh.prs[number].update(state='closed') or copy.deepcopy(self.gh.prs[number])
         return job
+
+    def test_poll_reads_only_its_issue_jobs_and_loads_effects_once(self):
+        for number in range(3):
+            self.state.new_job('initial', 'other-'+str(number), number+50, issue_number=number+20, status='done')
+        for _ in range(3): self.comment()
+        self.gh.acknowledge_comment = lambda number, comment_id: {'id': 900+comment_id}
+        with decoded_job_ids() as decoded, patch.object(self.state, 'records', wraps=self.state.records) as records:
+            self.controller.conversation.poll()
+        self.assertTrue(decoded)
+        self.assertEqual({self.state.job(job_id)['issue_number'] for job_id in decoded}, {7})
+        self.assertEqual([call.args for call in records.call_args_list], [('effects',)])
+        self.assertEqual(len(self.poll()), 1)
 
     def test_only_owner_comments_create_one_durable_triage_and_edits_are_new_feedback(self):
         self.assertTrue(hasattr(self.controller, 'conversation'), 'owner comment triage is absent')

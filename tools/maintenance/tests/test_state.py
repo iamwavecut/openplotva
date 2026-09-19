@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from tools.maintenance.state import State
+from tools.maintenance.state import FINISHED, TERMINAL, State
 from tools.maintenance.contracts import Deferred, DAY
 
 
@@ -66,6 +66,77 @@ class StateTests(unittest.TestCase):
         self.assertEqual([job['id'] for job in jobs],expected)
         self.assertEqual(decoded,expected)
         self.assertEqual(self.state.jobs(set()),[])
+
+    def test_issue_and_unfinished_queries_decode_only_their_jobs_in_save_order(self):
+        first=self.state.new_job('deep','a',1,issue_number=7)
+        self.state.new_job('deep','b',2,issue_number=8,status='done')
+        self.state.new_job('initial','c',3,status='result')
+        second=self.state.new_job('triage','a',1,issue_number=7,status='done')
+        self.state.update_job(first['id'],reason='saved last')
+        self.assertEqual([job['id'] for job in self.state.issue_jobs(7)],[second['id'],first['id']])
+        for number in (7,8,None,9):
+            expected=[job['id'] for job in self.state.jobs() if job.get('issue_number')==number]
+            with decoded_job_ids() as decoded:
+                self.assertEqual([job['id'] for job in self.state.issue_jobs(number)],expected)
+            self.assertEqual(decoded,expected)
+        expected=[job['id'] for job in self.state.jobs() if job['status'] not in TERMINAL]
+        with decoded_job_ids() as decoded:
+            self.assertEqual([job['id'] for job in self.state.unfinished_jobs()],expected)
+        self.assertEqual(len(expected),2)
+        self.assertEqual(decoded,expected)
+
+    def test_repeated_events_for_a_diagnosing_incident_skip_finished_payloads(self):
+        event=lambda n: {'id':n,'signature':'same','first_seen':n,'last_seen':n,'snapshot':{}}
+        self.state.ingest([event(1)],1,0)
+        self.state.put_incident({**self.state.incident('same'),'status':'diagnosing'})
+        for _ in range(3): self.state.new_job('initial','same',1,status='done')
+        running=self.state.new_job('initial','same',1,status='running')
+        with decoded_job_ids() as decoded:
+            self.state.ingest([event(n) for n in range(2,12)],11,0)
+        self.assertEqual(set(decoded),{running['id']})
+        self.assertEqual(self.state.incident('same')['status'],'diagnosing')
+        self.state.update_job(running['id'],status='needs_human')
+        self.state.ingest([event(12)],12,0)
+        self.assertEqual(self.state.incident('same')['status'],'pending')
+
+    def candidate_context(self):
+        item={'kind':'issue','number':7,'title':'Queue timeout','body':'Long report.','state':'open','merged_at':None,
+              'merge_commit_sha':None,'linked_prs':[8],'comments':[{'id':1,'body':'Details.'}]}
+        context={'incident':{'count':3},'evidence':{'queue':1},'deployed':{'revision':'a'*40},
+                 'private':{'identifiers':['worker-7']},'history':[item]}
+        slim={**context,'history':[{key:value for key,value in item.items() if key not in ('body','comments')}]}
+        return context,slim
+
+    def test_finished_jobs_keep_candidate_list_without_bodies_or_threads(self):
+        context,slim=self.candidate_context()
+        for status in ('result','waiting_ci','ready'):
+            job=self.state.new_job('initial','sig',1,context=context)
+            self.state.update_job(job['id'],status=status)
+            self.assertEqual(self.state.job(job['id'])['context'],context)
+        for status in sorted(FINISHED):
+            job=self.state.new_job('initial','sig',1,context=context)
+            self.state.update_job(job['id'],status=status,cancelled=status=='cancelled')
+            self.assertEqual(self.state.job(job['id'])['context'],slim)
+        self.assertEqual(self.state.job(self.state.new_job('triage','sig',1,status='done',context=context)['id'])['context'],slim)
+        self.assertEqual(context['history'][0]['body'],'Long report.')
+
+    def test_reopening_slims_legacy_finished_rows_in_place(self):
+        context,slim=self.candidate_context()
+        jobs=[self.state.new_job('initial',str(n),n+1,context=context) for n in range(4)]
+        for job in jobs[:2]:
+            # Rows saved before retention existed still carry full candidate history.
+            self.state.db.execute('UPDATE jobs SET status=?,data=? WHERE id=?',('done',json.dumps({**job,'status':'done'}),job['id']))
+        order=[tuple(row) for row in self.state.db.execute('SELECT rowid,id FROM jobs ORDER BY rowid')]
+        other=State(self.state.path,clock=lambda:self.now)
+        try:
+            self.assertEqual([tuple(row) for row in other.db.execute('SELECT rowid,id FROM jobs ORDER BY rowid')],order)
+            self.assertEqual([other.job(job['id']) for job in jobs],
+                             [{**job,'status':'done','context':slim} for job in jobs[:2]]+jobs[2:])
+            data=[row[0] for row in other.db.execute('SELECT data FROM jobs ORDER BY rowid')]
+        finally: other.close()
+        again=State(self.state.path,clock=lambda:self.now)
+        try: self.assertEqual([row[0] for row in again.db.execute('SELECT data FROM jobs ORDER BY rowid')],data)
+        finally: again.close()
 
     def test_late_quota_receipt_cannot_let_older_success_clear_newer_limit(self):
         self.state.defer_provider('newer-refusal', 600, at=self.now)
