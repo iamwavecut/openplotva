@@ -65,6 +65,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(expected,[result['id'],queued['id']])
         self.assertEqual([job['id'] for job in jobs],expected)
         self.assertEqual(decoded,expected)
+        self.assertEqual(self.state.jobs(set()),[])
 
     def test_late_quota_receipt_cannot_let_older_success_clear_newer_limit(self):
         self.state.defer_provider('newer-refusal', 600, at=self.now)
