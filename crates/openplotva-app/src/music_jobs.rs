@@ -653,10 +653,16 @@ impl AceStepMusicGenerator {
 const INSTRUMENTAL_VOCAL_LANGUAGE: &str = "instrumental";
 
 /// Lyrics and language the music service gets: instrumentals send their section
-/// skeleton and a non-language value, songs their lyrics and language.
+/// skeleton (the default one when the material came without a director plan)
+/// and a non-language value, songs their lyrics and language.
 fn completion_voice(material: SongMaterial) -> (String, String) {
     if material.is_instrumental() {
-        (material.skeleton, INSTRUMENTAL_VOCAL_LANGUAGE.to_owned())
+        let skeleton = if material.skeleton.trim().is_empty() {
+            openplotva_media::acestep::instrumental_skeleton(&[])
+        } else {
+            material.skeleton
+        };
+        (skeleton, INSTRUMENTAL_VOCAL_LANGUAGE.to_owned())
     } else {
         (material.lyrics, material.vocal_language)
     }
@@ -2610,6 +2616,10 @@ mod tests {
         });
         assert_eq!(lyrics, "[Chorus]\nночной город");
         assert_eq!(language, "ru");
+
+        let (lyrics, language) = completion_voice(SongMaterial::default());
+        assert_eq!(lyrics, "[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]");
+        assert_eq!(language, INSTRUMENTAL_VOCAL_LANGUAGE);
     }
 
     #[tokio::test]
