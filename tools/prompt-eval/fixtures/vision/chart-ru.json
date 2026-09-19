@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/chart-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A bar chart with a Russian title and four labelled bars. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/chart-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:Продажи по кварталам, 2026|120|95|140|160",
+    "lang:ru"
+  ]
+}

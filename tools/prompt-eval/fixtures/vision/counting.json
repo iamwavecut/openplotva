@@ -1,0 +1,18 @@
+{
+  "flow": "vision",
+  "id": "vision/counting",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "Seven red circles and four blue squares; no text. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/counting.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "lang:ru"
+  ]
+}

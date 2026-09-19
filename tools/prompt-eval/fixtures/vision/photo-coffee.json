@@ -1,0 +1,18 @@
+{
+  "flow": "vision",
+  "id": "vision/photo-coffee",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A public-domain photo of a cup of coffee. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/photo-coffee.jpg",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "lang:ru"
+  ]
+}

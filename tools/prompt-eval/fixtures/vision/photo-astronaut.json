@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/photo-astronaut",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A public-domain portrait of an astronaut; the caption must not name the person. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/photo-astronaut.jpg",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "no_phrases:коллинз;collins;eileen;айлин",
+    "lang:ru"
+  ]
+}

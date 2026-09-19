@@ -144,6 +144,13 @@ def data_url(path: Path) -> str:
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
+def local_media(name: str, args: argparse.Namespace) -> Path:
+    """A fixture's image or video: under `--images` when given, else relative to the harness."""
+    if getattr(args, "images", None):
+        return (args.images / Path(name).name).resolve()
+    return (HERE / name).resolve()
+
+
 def escape_prompt_attr(value: str) -> str:
     return value.replace("<", "&lt;").replace('"', "&quot;")
 
@@ -266,15 +273,15 @@ def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) 
             user_text = render_history_items(user_text)
         elif not isinstance(user_text, str):
             user_text = json.dumps(user_text, ensure_ascii=False, indent=2)
-        if data.get("image"):
-            image = (HERE / data["image"]).resolve()
-            if not image.exists():
+        if data.get("image") or data.get("video"):
+            media = local_media(data.get("image") or data.get("video"), args)
+            if not media.exists():
                 return None
-            content = [
-                {"type": "image_url", "image_url": {"url": data_url(image), "detail": "auto"}},
-                {"type": "text", "text": user_text},
-            ]
-            messages.append({"role": "user", "content": content})
+            if data.get("image"):
+                part = {"type": "image_url", "image_url": {"url": data_url(media), "detail": "auto"}}
+            else:
+                part = {"type": "video_url", "video_url": {"url": data_url(media)}}
+            messages.append({"role": "user", "content": [part, {"type": "text", "text": user_text}]})
         else:
             messages.append({"role": "user", "content": user_text})
     return finish_request(data, messages, args)
@@ -561,7 +568,10 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
         return parsed is not None, parse_note or "ok"
     if name == "strict_json":
         return parsed is not None and parse_note == "", parse_note or "ok"
-    if parsed is None and name not in ("label", "lang", "no_phrases", "no_substring", "contains", "html_tags", "max_blank_run", "no_repeat_lines"):
+    if parsed is None and name not in (
+        "label", "labels", "lang", "no_phrases", "no_substring", "contains", "verbatim", "html_tags", "max_blank_run",
+        "no_repeat_lines",
+    ):
         return False, "no json"
     if name == "schema":
         schema = load_schema(fixture.data.get("schema"))
@@ -635,6 +645,13 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
         return first.startswith(arg), first[:40]
     if name == "contains":
         return arg in raw, "ok" if arg in raw else f"missing {arg!r}"
+    if name == "labels":
+        missing = [label for label in arg.split(",") if not re.search(rf"(?m)^\s*{re.escape(label)}\s*:", raw)]
+        return not missing, f"missing {missing}" if missing else "ok"
+    if name == "verbatim":
+        wanted = [part for part in arg.split("|") if part]
+        found = [part for part in wanted if comparable(part) in comparable(raw)]
+        return len(found) == len(wanted), f"{len(found)}/{len(wanted)}"
     if name == "equals":
         path, _, expected = arg.partition("=")
         values = walk(parsed, path)
@@ -765,6 +782,10 @@ SELF_TEST_CASES = [
     ("max_items:candidate_cards:1", '{"candidate_cards": [1, 2]}', False),
     ("label:PROMPT:", "PROMPT: a cat", True),
     ("label:PROMPT:", "PROMTP: a cat", False),
+    ("labels:Тип,Текст", "Тип: фото\nТекст: «ЗАКРЫТО»", True),
+    ("labels:Тип,Текст", "Тип: фото\nОбъекты: кот", False),
+    ("verbatim:ЗАКРЫТО НА РЕМОНТ|до 15.10", "Текст: «Закрыто на  ремонт», «до 15.10»", True),
+    ("verbatim:ЗАКРЫТО НА РЕМОНТ|до 15.10", "Текст: «Закрыто на ремонт»", False),
     ("word_range:outputs[]:2:4", '{"outputs": ["one two three"]}', True),
     ("word_range:outputs[]:2:4", '{"outputs": ["one"]}', False),
     ("equals:nsfw_result=forbidden", '{"nsfw_result": "forbidden"}', True),
@@ -880,8 +901,9 @@ def render_requests(fixtures: list[Fixture], args: argparse.Namespace) -> int:
         for message in request["messages"]:
             if isinstance(message.get("content"), list):
                 for part in message["content"]:
-                    if part.get("type") == "image_url":
-                        part["image_url"]["url"] = part["image_url"]["url"][:48] + "..."
+                    for key in ("image_url", "video_url"):
+                        if part.get("type") == key:
+                            part[key]["url"] = part[key]["url"][:48] + "..."
         print(f"# {fixture.id}")
         print(json.dumps(request, ensure_ascii=False, indent=2))
     return 0
@@ -907,6 +929,7 @@ def main() -> int:
         action="store_true",
         help="send memory fixtures as pretty JSON, the layout the memory prompts used before v6",
     )
+    parser.add_argument("--images", type=Path, help="directory holding the vision fixtures' local images and videos")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1, help="parallel requests")
     parser.add_argument("--timeout", type=float, default=180.0)

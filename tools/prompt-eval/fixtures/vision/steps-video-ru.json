@@ -1,0 +1,22 @@
+{
+  "flow": "vision",
+  "id": "vision/steps-video-ru",
+  "prompt": "vision/video_system",
+  "user_prompt": "vision/video_user",
+  "vars": {
+    "duration": "00:24"
+  },
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 1024
+  },
+  "notes": "A 24-second clip with three on-screen steps, 8 seconds each. Media from make_vision_media.py (not committed); skipped when missing.",
+  "video": "local/vision/steps-ru.mp4",
+  "checks": [
+    "labels:Тип,Хронология,Текст",
+    "verbatim:ШАГ 1: ОТКРОЙТЕ КРЫШКУ|ШАГ 2: НАЛЕЙТЕ ВОДУ|ШАГ 3: НАЖМИТЕ КНОПКУ",
+    "contains:00:",
+    "no_repeat_lines:2",
+    "lang:ru"
+  ]
+}

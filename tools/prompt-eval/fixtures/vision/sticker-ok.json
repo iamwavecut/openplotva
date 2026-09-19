@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/sticker-ok",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A sticker: a smiling face and the word «ОК!». Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/sticker-ok.webp",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ОК",
+    "lang:ru"
+  ]
+}

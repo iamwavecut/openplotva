@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/document-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A contract page in Russian. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/document-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ДОГОВОР АРЕНДЫ № 17/2026|45 000|11 месяцев|ул. Садовая, д. 8",
+    "lang:ru"
+  ]
+}

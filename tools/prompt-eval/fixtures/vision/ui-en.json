@@ -1,0 +1,18 @@
+{
+  "flow": "vision",
+  "id": "vision/ui-en",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "An English settings screen; the text must stay in English. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/ui-en.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:Settings|Bluetooth|42%|Version 18.2 available"
+  ]
+}
