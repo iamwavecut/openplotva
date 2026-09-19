@@ -1046,9 +1046,10 @@ pub struct MemoryConfig {
     pub aifarm_task_timeout_seconds: i32,
     pub aifarm_capacity_wait_seconds: i32,
     pub aifarm_capacity_poll_seconds: i32,
-    pub aifarm_temperature: f64,
-    pub aifarm_frequency_penalty: f64,
-    pub aifarm_presence_penalty: f64,
+    /// Unset lets the memory workers use the model family's sampling.
+    pub aifarm_temperature: Option<f64>,
+    pub aifarm_frequency_penalty: Option<f64>,
+    pub aifarm_presence_penalty: Option<f64>,
     pub aifarm_enable_thinking: bool,
     pub subject_merge_enabled: bool,
     pub subject_merge_min_cards: i32,
@@ -2918,27 +2919,20 @@ impl AppConfig {
                     raw.memory_aifarm_capacity_poll_seconds,
                     1,
                 )?,
-                aifarm_temperature: parse_f64(
+                aifarm_temperature: parse_optional_f64(
                     "MEMORY_AIFARM_TEMPERATURE",
                     raw.memory_aifarm_temperature,
-                    0.2,
                 )?,
-                aifarm_frequency_penalty: clamp_penalty(
-                    parse_f64(
-                        "MEMORY_AIFARM_FREQUENCY_PENALTY",
-                        raw.memory_aifarm_frequency_penalty,
-                        0.3,
-                    )?,
-                    0.3,
-                ),
-                aifarm_presence_penalty: clamp_penalty(
-                    parse_f64(
-                        "MEMORY_AIFARM_PRESENCE_PENALTY",
-                        raw.memory_aifarm_presence_penalty,
-                        0.3,
-                    )?,
-                    0.3,
-                ),
+                aifarm_frequency_penalty: parse_optional_f64(
+                    "MEMORY_AIFARM_FREQUENCY_PENALTY",
+                    raw.memory_aifarm_frequency_penalty,
+                )?
+                .and_then(finite_penalty),
+                aifarm_presence_penalty: parse_optional_f64(
+                    "MEMORY_AIFARM_PRESENCE_PENALTY",
+                    raw.memory_aifarm_presence_penalty,
+                )?
+                .and_then(finite_penalty),
                 aifarm_enable_thinking: parse_bool(
                     "MEMORY_AIFARM_ENABLE_THINKING",
                     raw.memory_aifarm_enable_thinking,
@@ -3484,6 +3478,27 @@ fn parse_f64(name: &'static str, value: Option<String>, default: f64) -> Result<
             value,
             source,
         })
+}
+
+fn parse_optional_f64(
+    name: &'static str,
+    value: Option<String>,
+) -> Result<Option<f64>, ConfigError> {
+    let Some(value) = parse_scalar_value(value) else {
+        return Ok(None);
+    };
+    value
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|source| ConfigError::InvalidFloat {
+            name,
+            value,
+            source,
+        })
+}
+
+fn finite_penalty(value: f64) -> Option<f64> {
+    value.is_finite().then(|| value.clamp(-2.0, 2.0))
 }
 
 // vLLM's OpenAI-compatible layer rejects repetition penalties outside
@@ -4153,7 +4168,8 @@ mod tests {
         assert_eq!(config.memory.aifarm_task_timeout_seconds, 720);
         assert_eq!(config.memory.aifarm_capacity_wait_seconds, 600);
         assert_eq!(config.memory.aifarm_capacity_poll_seconds, 1);
-        assert_eq!(config.memory.aifarm_temperature, 0.2);
+        assert_eq!(config.memory.aifarm_temperature, None);
+        assert_eq!(config.memory.aifarm_presence_penalty, None);
         assert!(!config.memory.aifarm_enable_thinking);
         assert!(config.memory.redaction_enabled);
         assert_eq!(config.memory.redaction_service_name, "privacy-filter");
@@ -4871,7 +4887,7 @@ mod tests {
         assert_eq!(config.memory.aifarm_task_timeout_seconds, 99);
         assert_eq!(config.memory.aifarm_capacity_wait_seconds, 0);
         assert_eq!(config.memory.aifarm_capacity_poll_seconds, 5);
-        assert_eq!(config.memory.aifarm_temperature, 0.4);
+        assert_eq!(config.memory.aifarm_temperature, Some(0.4));
         assert!(config.memory.aifarm_enable_thinking);
         assert!(!config.memory.redaction_enabled);
         assert_eq!(config.memory.redaction_service_name, "redactor");
