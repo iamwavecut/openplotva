@@ -1,6 +1,6 @@
 {
   "flow": "youtube_summary",
-  "id": "youtube_summary/very-short",
+  "id": "youtube_summary/music-only",
   "prompt": "youtube/summary_system",
   "schema": "youtube_summary",
   "tool_name": "youtube_summary",
@@ -10,16 +10,14 @@
     "top_k": 20,
     "max_tokens": 3072
   },
-  "notes": "Three lines only: the summary should be short, not padded.",
-  "user": "<transcript>\n[s1 00:00:00] Короче, это тест микрофона Раз, два, три Всё, пока\n</transcript>\nПо транскрипту выше верни JSON с саммари, как описано в инструкции.",
+  "notes": "Captions hold only music markers; the summary says there is no speech.",
+  "user": "<transcript>\n[s1 00:00:00] [Музыка] [Музыка] [Аплодисменты] [Музыка]\n</transcript>\nПо транскрипту выше верни JSON с саммари, как описано в инструкции.",
   "checks": [
     "json",
     "schema",
     "ids_in_input:sections[].segment_id",
     "lang:ru:overview",
-    "lang:ru:sections[].title",
-    "lang:ru:sections[].points[]",
-    "max_items:sections:12",
+    "max_items:sections:0",
     "no_phrases:but wait;let me think;let me check;the prompt says",
     "max_blank_run:3",
     "no_substring:<@sections[].title",

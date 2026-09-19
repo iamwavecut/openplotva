@@ -620,6 +620,11 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
                 heads[decision["index"]] = decision.get("survivor_index") if folded else decision["index"]
         together = left in heads and right in heads and heads[left] == heads[right]
         return not together, f"{left} and {right} folded together" if together else "ok"
+    if name == "ids_in_input":
+        user = fixture.data.get("user")
+        text = user if isinstance(user, str) else json.dumps(user, ensure_ascii=False)
+        missing = [value for value in strings_in(walk(parsed, arg)) if f"[{value} " not in text]
+        return not missing, f"unknown ids {missing[:5]}" if missing else "ok"
     if name == "not_equals":
         path, _, unwanted = arg.partition("=")
         values = walk(parsed, path)
@@ -776,6 +781,8 @@ SELF_TEST_CASES = [
     ("not_equals:cards[].type=event", '{"cards": [{"type": "decision"}]}', True),
     ("ids_from_input", '{"events": [{"source_ids": ["7"]}]}', True),
     ("ids_from_input", '{"events": [{"source_ids": ["8"]}]}', False),
+    ("ids_in_input:sections[].segment_id", '{"sections": [{"segment_id": "s3"}]}', True),
+    ("ids_in_input:sections[].segment_id", '{"sections": [{"segment_id": "s9"}]}', False),
     ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "demote"}]}', True),
     ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 0}]}', True),
     ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 3}]}', False),
@@ -811,6 +818,7 @@ def self_test() -> int:
                 "existing_cards": [{"id": 7}],
                 "candidates": [{"index": 0, "similar": [{"index": 0}]}],
                 "messages": [{"message_id": 5, "entry_id": "e5", "text": "Я больше не ем   мясо, честно"}],
+                "transcript": "[s3 00:00:10] текст",
             },
         },
     )

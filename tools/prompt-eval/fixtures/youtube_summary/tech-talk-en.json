@@ -2,16 +2,28 @@
   "flow": "youtube_summary",
   "id": "youtube_summary/tech-talk-en",
   "prompt": "youtube/summary_system",
+  "schema": "youtube_summary",
+  "tool_name": "youtube_summary",
   "request": {
-    "temperature": 0.3,
-    "max_tokens": 8192
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 3072
   },
   "notes": "English talk; the summary must be Russian.",
-  "user": "Language: English\n0.0: Hi everyone, today I want to talk about why our database queries got slow\n7.5: It started when the table crossed fifty million rows\n15.0: The planner switched from an index scan to a sequential scan\n22.5: We found the statistics were stale, so we ran analyze\n30.0: That fixed half of the queries but not the reports\n37.5: The reports sorted by a column without an index\n45.0: Adding a composite index cut the report time from forty seconds to two\n52.5: Then we partitioned the table by month\n60.0: Partitioning made vacuum faster and backups smaller\n67.5: The lesson: measure first, then index, then partition\n75.0: Thanks for watching\n",
+  "user": "<transcript>\n[s1 00:00:00] Hi everyone, today I want to talk about why our database queries got slow It started when the table crossed fifty million rows The planner switched from an index scan to a sequential scan We found the statistics were stale, so we ran analyze\n[s2 00:00:30] That fixed half of the queries but not the reports The reports sorted by a column without an index Adding a composite index cut the report time from forty seconds to two Then we partitioned the table by month Partitioning made vacuum faster and backups smaller\n[s3 00:01:07] The lesson: measure first, then index, then partition Thanks for watching\n</transcript>\nПо транскрипту выше верни JSON с саммари, как описано в инструкции.",
   "checks": [
-    "lang:ru",
-    "html_tags:b,i,u,s,a,code,pre,blockquote,tg-spoiler",
-    "no_phrases:<ul>;<li>;<h1;<h2;<h3;**;##",
-    "no_repeat_lines:2"
+    "json",
+    "schema",
+    "ids_in_input:sections[].segment_id",
+    "lang:ru:overview",
+    "lang:ru:sections[].title",
+    "lang:ru:sections[].points[]",
+    "min_items:sections:3",
+    "max_items:sections:12",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3",
+    "no_substring:<@sections[].title",
+    "no_substring:**@sections[].points[]"
   ]
 }
