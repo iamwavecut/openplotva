@@ -12997,6 +12997,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_pools),
             )
             .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+            .with_primary_slot_wait(media::MEDIA_OPTIMIZER_PRIMARY_SLOT_WAIT)
             .with_reporter(routing_event_reporter.clone()),
             config,
             Arc::clone(&prompt_store),
