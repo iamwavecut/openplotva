@@ -12,9 +12,10 @@ use openplotva_history::stages::{
 };
 use openplotva_history::{
     DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_SUMMARY_MAX_INPUT_TOKENS,
-    HistorySummarySinceParseError, MIN_EDGE_RAW_MESSAGES, SUMMARY_PROMPT_VERSION, StoredSummary,
-    SummaryDocument, SummaryInput, SummaryInputItem, SummaryRequest, SummaryScope,
-    build_edge_raw_summary_input, build_ordered_summary_input_assembly, build_summary_input,
+    HistorySummaryDecodeError, HistorySummarySinceParseError, MIN_EDGE_RAW_MESSAGES,
+    SUMMARY_PROMPT_VERSION, StoredSummary, SummaryDocument, SummaryInput, SummaryInputItem,
+    SummaryRequest, SummaryScope, build_edge_raw_summary_input,
+    build_ordered_summary_input_assembly, build_summary_input,
     decode_summary_message_entry_payloads, estimate_summary_tokens,
     filter_summary_entries_with_content, fit_summary_input_to_token_limit, hash_text,
     history_summary_generate_error_retryable, history_summary_model, history_summary_provider,
@@ -406,6 +407,35 @@ where
         fit_summary_input_to_token_limit(input, None, 0, &self.options.system_prompt).0
     }
 
+    /// Decode a stage answer, asking once more when it is unreadable: stage one
+    /// sends no response schema, and some transports send none for either stage.
+    async fn decoded_stage<T>(
+        &self,
+        input: &SummaryInput,
+        stage: HistoryStage,
+        payload: &str,
+        reply: HistoryStageReply,
+        decode: fn(&str) -> Result<T, HistorySummaryDecodeError>,
+    ) -> Result<(T, String), HistorySummaryServiceError> {
+        if let Ok(answer) = decode(&reply.text) {
+            return Ok((answer, reply.model));
+        }
+        let reply = self
+            .generator
+            .generate_history_stage(input, stage, payload)
+            .await?;
+        let answer = decode(&reply.text).map_err(|err| {
+            let what = match stage {
+                HistoryStage::Events => "events",
+                HistoryStage::Recap => "recap",
+            };
+            HistorySummaryServiceError::Generate {
+                message: format!("decode chat history {what}: {err}"),
+            }
+        })?;
+        Ok((answer, reply.model))
+    }
+
     /// Two stages: events from every chunk of the window (at most
     /// `STAGE_ONE_CONCURRENCY` chunks at a time), merged in code, then a recap
     /// written from those events. A window without events gets the quiet recap
@@ -455,25 +485,17 @@ where
         let mut model = String::new();
         let mut per_chunk = Vec::with_capacity(chunks.len());
         for ((chunk, payload), reply) in chunks.iter().zip(&payloads).zip(replies) {
-            let mut reply = reply?;
-            // Stage one has no response schema, so an unreadable answer is
-            // asked for once more.
-            let answer = match decode_stage_events(&reply.text) {
-                Ok(answer) => answer,
-                Err(_) => {
-                    reply = self
-                        .generator
-                        .generate_history_stage(input, HistoryStage::Events, payload)
-                        .await?;
-                    decode_stage_events(&reply.text).map_err(|err| {
-                        HistorySummaryServiceError::Generate {
-                            message: format!("decode chat history events: {err}"),
-                        }
-                    })?
-                }
-            };
+            let (answer, reply_model) = self
+                .decoded_stage(
+                    input,
+                    HistoryStage::Events,
+                    payload,
+                    reply?,
+                    decode_stage_events,
+                )
+                .await?;
             per_chunk.push(validated_events(chunk, answer));
-            model = reply.model;
+            model = reply_model;
         }
         let events = merge_events(per_chunk);
         let recap = if events.is_empty() {
@@ -484,12 +506,17 @@ where
                 .generator
                 .generate_history_stage(input, HistoryStage::Recap, &payload)
                 .await?;
-            model = reply.model;
-            Some(decode_stage_recap(&reply.text).map_err(|err| {
-                HistorySummaryServiceError::Generate {
-                    message: format!("decode chat history recap: {err}"),
-                }
-            })?)
+            let (recap, reply_model) = self
+                .decoded_stage(
+                    input,
+                    HistoryStage::Recap,
+                    &payload,
+                    reply,
+                    decode_stage_recap,
+                )
+                .await?;
+            model = reply_model;
+            Some(recap)
         };
         let content = normalize_generated_summary_content(summary_content(&events, recap));
         Ok(SummaryDocument {
@@ -1377,6 +1404,7 @@ mod tests {
         inputs: Mutex<Vec<SummaryInput>>,
         stages: Mutex<Vec<HistoryStage>>,
         garbled_events_answers: Mutex<usize>,
+        garbled_recap_answers: Mutex<usize>,
     }
 
     impl HistorySummaryGenerator for FakeHistorySummaryGenerator {
@@ -1414,15 +1442,25 @@ mod tests {
                         })
                         .to_string()
                     }
-                    HistoryStage::Recap => serde_json::json!({
-                        "recap": "done",
-                        "actors": [],
-                        "open_questions": [],
-                        "source_style": "хроника",
-                        "quality_score": 0.5,
-                        "quality_notes": ""
-                    })
-                    .to_string(),
+                    HistoryStage::Recap => {
+                        let mut garbled = self.garbled_recap_answers.lock().expect("garbled");
+                        if *garbled > 0 {
+                            *garbled -= 1;
+                            return Ok(HistoryStageReply {
+                                text: "{\"recap\": \"\"}".to_owned(),
+                                model: "test-model".to_owned(),
+                            });
+                        }
+                        serde_json::json!({
+                            "recap": "done",
+                            "actors": [],
+                            "open_questions": [],
+                            "source_style": "хроника",
+                            "quality_score": 0.5,
+                            "quality_notes": ""
+                        })
+                        .to_string()
+                    }
                 };
                 Ok(HistoryStageReply {
                     text,
@@ -1685,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_events_answer_is_asked_once_more() {
+    async fn unreadable_stage_answers_are_asked_once_more() {
         let base = OffsetDateTime::parse("2026-05-20T10:00:00Z", &Rfc3339).expect("base");
         let store = Arc::new(FakeHistorySummaryStore::default());
         *store.payloads.lock().expect("payloads") = (1..=10)
@@ -1699,6 +1737,7 @@ mod tests {
             .collect();
         let generator = Arc::new(FakeHistorySummaryGenerator::default());
         *generator.garbled_events_answers.lock().expect("garbled") = 1;
+        *generator.garbled_recap_answers.lock().expect("garbled") = 1;
         let service = ChatHistorySummaryService::new(store, generator.clone());
 
         let result = service
@@ -1720,10 +1759,12 @@ mod tests {
             vec![
                 HistoryStage::Events,
                 HistoryStage::Events,
+                HistoryStage::Recap,
                 HistoryStage::Recap
             ]
         );
         assert_eq!(result.summary_json.events, vec!["thread recap"]);
+        assert_eq!(result.summary_json.recap, "done");
     }
 
     #[tokio::test]
