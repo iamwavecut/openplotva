@@ -1018,9 +1018,15 @@ pub fn instrumental_skeleton(structure: &[String]) -> String {
             "Outro"
         } else if phrase.contains("drop") || phrase.contains("chorus") || phrase.contains("hook") {
             "Chorus"
-        } else if phrase.contains("build") || phrase.contains("riser") || phrase.contains("pre-chorus") {
+        } else if phrase.contains("build")
+            || phrase.contains("riser")
+            || phrase.contains("pre-chorus")
+        {
             "Pre-Chorus"
-        } else if phrase.contains("breakdown") || phrase.contains("bridge") || phrase.contains("interlude") {
+        } else if phrase.contains("breakdown")
+            || phrase.contains("bridge")
+            || phrase.contains("interlude")
+        {
             "Bridge"
         } else if phrase.contains("intro") {
             continue;
@@ -2002,10 +2008,10 @@ mod tests {
         SONG_STYLE_INVALID_REJECTION, SongPromptPayload, SongPromptRequest, TaskStatus,
         bounded_http_error_body, build_audio_url, build_song_file_name, build_song_release_prompt,
         canonicalize_song_lyrics, compile_song_tags, detect_song_language, extract_files,
-        extract_task_id_list, lenient_number, normalize_song_language, normalize_song_prompt_input,
-        normalize_song_prompt_payload, normalize_song_tag, parse_completion_response,
-        parse_query_items, query_result_items, release_task_id, render_song_director_messages_with,
-        song_max_audio_seconds,
+        extract_task_id_list, instrumental_skeleton, lenient_number, normalize_song_language,
+        normalize_song_prompt_input, normalize_song_prompt_payload, normalize_song_tag,
+        parse_completion_response, parse_query_items, query_result_items, release_task_id,
+        render_song_director_messages_with, section_marker, song_max_audio_seconds,
     };
 
     fn prompt_store_with(files: &[(&str, &str)]) -> openplotva_prompts::PromptStore {

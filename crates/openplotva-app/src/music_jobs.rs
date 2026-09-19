@@ -2118,13 +2118,15 @@ mod tests {
 
     use super::{
         AifarmSongMaterialProvider, FallbackSongPromptGenerator, GeneratedSongAudio,
-        GeneratedSongSendPlan, HeuristicSongMaterialProvider, MusicGenerationError,
-        MusicGenerationFuture, MusicGenerationRequest, MusicGenerator, MusicJobEffectFuture,
-        MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions, MusicQueuePollOutcome,
-        MusicReferenceAudio, NoSongLanguageHintStore, SongLanguageHintFuture,
-        SongLanguageHintStore, SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
-        build_song_caption_with_support, build_song_release_prompt, execute_music_gen_job,
-        music_job_topic, run_music_queue_once, run_music_queue_once_with_max_attempts,
+        GeneratedSongSendPlan, HeuristicSongMaterialProvider, INSTRUMENTAL_VOCAL_LANGUAGE,
+        MusicGenerationError, MusicGenerationFuture, MusicGenerationRequest, MusicGenerator,
+        MusicJobEffectFuture, MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions,
+        MusicQueuePollOutcome, MusicReferenceAudio, NoSongLanguageHintStore,
+        SONG_TAKES_PER_REQUEST, SongLanguageHintFuture, SongLanguageHintStore, SongMaterial,
+        SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
+        build_song_caption_with_support, build_song_release_prompt, completion_voice,
+        execute_music_gen_job, music_job_topic, run_music_queue_once,
+        run_music_queue_once_with_max_attempts,
     };
 
     fn test_walker() -> crate::routed_attempts::RoutedAttemptWalker {
@@ -2479,7 +2481,11 @@ mod tests {
         let sent = effects.sent();
         assert_eq!(sent.len(), SONG_TAKES_PER_REQUEST);
         assert_eq!(sent[0].chat_id, 42);
-        assert!(sent[1].material.title.ends_with(" (2)"), "{}", sent[1].material.title);
+        assert!(
+            sent[1].material.title.ends_with(" (2)"),
+            "{}",
+            sent[1].material.title
+        );
         assert_eq!(sent[0].thread_id, Some(77));
         assert_eq!(generator.requests()[0].topic, "ночной город");
         assert_eq!(
