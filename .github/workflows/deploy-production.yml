@@ -28,6 +28,7 @@ jobs:
     needs: authorize
     runs-on: ubuntu-22.04
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
@@ -82,6 +83,33 @@ jobs:
           push: true
           cache-from: type=gha,scope=openplotva-runtime-prebuilt
           cache-to: type=gha,mode=min,scope=openplotva-runtime-prebuilt
+
+      - name: Wait for green CI on this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          started=$SECONDS
+          while :; do
+            run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&head_sha=${GITHUB_SHA}&per_page=1" \
+              --jq '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "none") \(.html_url)"')"
+            elapsed=$((SECONDS - started))
+            if [[ -z "$run" ]]; then
+              echo "No push CI run for ${GITHUB_SHA} after ${elapsed}s"
+              (( elapsed < 180 )) || { echo "Only commits that CI ran on after a push can be deployed" >&2; exit 1; }
+            else
+              read -r status conclusion url <<<"$run"
+              echo "CI ${status}/${conclusion} after ${elapsed}s: ${url}"
+              if [[ "$status" == completed ]]; then
+                [[ "$conclusion" == success ]] && exit 0
+                echo "CI for ${GITHUB_SHA} concluded ${conclusion}; not deploying" >&2
+                exit 1
+              fi
+              (( elapsed < 1800 )) || { echo "CI for ${GITHUB_SHA} did not finish within 30 minutes" >&2; exit 1; }
+            fi
+            sleep 20
+          done
 
       - name: Configure SSH
         shell: bash
