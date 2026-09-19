@@ -13,7 +13,7 @@ use openplotva_config::AppConfig;
 use openplotva_dialog::{DialogTraceArtifacts, DialogTraceUsage};
 use openplotva_llm::aifarm::{
     AIFARM_WORKLOAD_SUMMARY, AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport,
-    ChatCompletionRequest, ChatMessage, StatusUpdate,
+    ChatCompletionRequest, ChatMessage, GatewayRequestFields, StatusUpdate,
 };
 use openplotva_llm::gemini::{MODEL_GEMINI_FLASH_LITE, cache_contour_model};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
@@ -622,7 +622,10 @@ async fn generate_youtube_summary_with_attempt(
     }
     let system = openplotva_prompts::read(stage.prompt_name())?;
     let model = attempt.model_name.trim().to_owned();
-    let request = youtube_summary_openai_request(&model, &system, payload, stage);
+    let mut request = youtube_summary_openai_request(&model, &system, payload, stage);
+    let gateway = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
+    request.provider = gateway.provider;
+    request.reasoning = gateway.reasoning;
     let endpoint = routed_attempt_endpoint(&attempt).ok_or_else(|| {
         YouTubeSummaryError::Http("routed provider has no chat completions endpoint".to_owned())
     })?;
@@ -1377,6 +1380,8 @@ fn youtube_summary_openai_request(
         temperature,
         top_p,
         top_k,
+        provider: None,
+        reasoning: None,
     }
 }
 
@@ -1419,6 +1424,10 @@ struct OpenAiChatCompletionRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1609,7 +1618,7 @@ impl YouTubeStage {
 
     const fn max_output_tokens(self) -> i32 {
         match self {
-            Self::Summary => 3072,
+            Self::Summary => 4096,
             Self::Merge => 8192,
         }
     }
@@ -2011,7 +2020,7 @@ mod tests {
         assert_eq!(value["systemInstruction"]["parts"][0]["text"], "sys");
         assert_eq!(value["contents"][0]["role"], "user");
         assert_eq!(value["contents"][0]["parts"][0]["text"], "payload");
-        assert_eq!(value["generationConfig"]["maxOutputTokens"], 3072);
+        assert_eq!(value["generationConfig"]["maxOutputTokens"], 4096);
         assert_eq!(value["generationConfig"]["temperature"], 0.3);
         assert_eq!(
             value["generationConfig"]["responseMimeType"],
@@ -2031,10 +2040,11 @@ mod tests {
         assert_eq!(value["model"], "gpt-5-mini");
         assert_eq!(value["messages"][0]["content"], "sys");
         assert_eq!(value["messages"][1]["content"], "payload");
-        assert_eq!(value["max_tokens"], 3072);
+        assert_eq!(value["max_tokens"], 4096);
         assert_eq!(value["temperature"], 0.3);
         assert!(value.get("top_p").is_none());
         assert!(value.get("response_format").is_none(), "{value}");
+        assert!(value.get("reasoning").is_none(), "{value}");
 
         let qwen =
             youtube_summary_openai_request("qwen3.6-27b", "sys", "payload", YouTubeStage::Merge);
@@ -2306,7 +2316,7 @@ mod tests {
         assert!(artifact.prompt_chars > 0);
         assert_eq!(
             artifact.inference_params,
-            Some(json!({"max_tokens": 3072, "temperature": 0.3}))
+            Some(json!({"max_tokens": 4096, "temperature": 0.3}))
         );
         let usage = artifact.usage.unwrap_or_default();
         assert_eq!(usage.input_tokens, 120);
@@ -2434,7 +2444,7 @@ mod tests {
         };
         let request =
             youtube_summary_farm_request(&thinking, "sys", "payload", YouTubeStage::Summary);
-        assert_eq!(request.max_tokens, 3072);
+        assert_eq!(request.max_tokens, 4096);
         assert_eq!(
             request.chat_template_kwargs,
             Some(json!({ "enable_thinking": true }))
@@ -2587,6 +2597,10 @@ mod tests {
             discovery_service_name: None,
             discovery_endpoint_name: None,
             provider_config: json!({}),
+            overrides: openplotva_llm::router::InferenceOverrides {
+                extra: json!({ "reasoning": { "effort": "none" } }),
+                ..openplotva_llm::router::InferenceOverrides::default()
+            },
             ..farm_attempt()
         };
 
@@ -2604,5 +2618,6 @@ mod tests {
         let seen = seen.lock().expect("seen");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["model"], "~openai/gpt-luna-latest");
+        assert_eq!(seen[0]["reasoning"], json!({ "effort": "none" }));
     }
 }

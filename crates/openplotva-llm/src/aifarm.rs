@@ -45,11 +45,10 @@ const DEFAULT_AIFARM_BASE_URL: &str = "http://127.0.0.1:50051";
 const DEFAULT_SERVICE_NAME: &str = "llm-openai";
 const DEFAULT_ENDPOINT_NAME: &str = "chat_completions";
 const DEFAULT_MODEL_NAME: &str = "Gemma 4 26B Heretic";
-const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 1024;
-// 6144, not 4096: the Gemma primary reasons at length before the JSON and was
-// observed truncating Russian lyrics at 1145 final chars; the director payload
-// also carries the analysis and three tag layers before the lyrics.
-const SONG_OPTIMIZER_MAX_TOKENS: i32 = 6144;
+const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 4096;
+// The Gemma primary reasons at length before the JSON, and the director payload
+// carries the analysis and three tag layers before the lyrics.
+const SONG_OPTIMIZER_MAX_TOKENS: i32 = 8192;
 // Lyrics need more variety than prompt optimization; JSON stays well-formed at 0.7.
 const SONG_DIRECTOR_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TEMPERATURE: f64 = 0.7;
@@ -2440,8 +2439,8 @@ fn worker_sampling_for_model(model: &str) -> WorkerSampling {
 #[must_use]
 pub fn aifarm_optimizer_max_tokens(variant_count: usize) -> i32 {
     let normalized = openplotva_media::normalize_variant_count(variant_count);
-    let budget = normalized.saturating_mul(1024);
-    i32::try_from(budget.max(2048)).unwrap_or(i32::MAX)
+    let budget = normalized.saturating_mul(2048);
+    i32::try_from(budget.max(4096)).unwrap_or(i32::MAX)
 }
 
 fn optimizer_messages(system_prompt: &str, text: &str) -> Vec<AifarmStructuredJsonMessage> {
@@ -7843,7 +7842,7 @@ mod tests {
             "custom image variants=2"
         );
         assert_eq!(image_body["messages"][1]["content"], "cat");
-        assert_eq!(image_body["max_tokens"], 2048);
+        assert_eq!(image_body["max_tokens"], 4096);
         assert_eq!(image_body["temperature"], 0.3);
 
         let edit_body: Value = serde_json::from_slice(&requests[1].body)?;
@@ -7860,7 +7859,7 @@ mod tests {
             "custom edit variants=2"
         );
         assert_eq!(edit_body["messages"][1]["content"], "edit it");
-        assert_eq!(edit_body["max_tokens"], 2048);
+        assert_eq!(edit_body["max_tokens"], 4096);
         assert_eq!(edit_body["temperature"], 0.3);
         Ok(())
     }
@@ -7991,7 +7990,7 @@ mod tests {
             body["messages"][1]["content"],
             "custom song user !song night city en"
         );
-        assert_eq!(body["max_tokens"], 6144);
+        assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["temperature"], 0.7);
         Ok(())
     }

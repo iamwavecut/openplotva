@@ -561,7 +561,7 @@ pub fn aifarm_history_summary_config_from_app_config(
             ..AifarmClientConfig::default()
         },
         model,
-        max_output_tokens: 1024,
+        max_output_tokens: 4096,
         temperature: memory.aifarm_temperature,
         top_p: None,
         top_k: None,
@@ -1841,7 +1841,7 @@ mod tests {
             openplotva_llm::aifarm::AIFARM_WORKLOAD_SUMMARY
         );
         assert_eq!(cfg.model, "summary-model");
-        assert_eq!(cfg.max_output_tokens, 1024);
+        assert_eq!(cfg.max_output_tokens, 4096);
         assert_eq!(cfg.temperature, Some(0.35));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));

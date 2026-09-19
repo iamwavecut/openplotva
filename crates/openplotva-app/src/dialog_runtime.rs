@@ -13,8 +13,8 @@ use openplotva_dialog::{
 use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatStepFuture, ChatStepProvider,
     aifarm::{
-        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
-        normalize_chat_completions_url, rejection_verdict_for,
+        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, GatewayRequestFields,
+        ReqwestAifarmTransport, normalize_chat_completions_url, rejection_verdict_for,
     },
     gemini::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
@@ -54,7 +54,7 @@ pub struct ChatClientFactory {
     template: AifarmDialogConfig,
     static_clients: HashMap<String, DialogProviderHandle>,
     default_client: DialogProviderHandle,
-    cache: std::sync::Mutex<HashMap<i64, (u64, DialogProviderHandle)>>,
+    cache: std::sync::Mutex<HashMap<(i64, i64), (u64, DialogProviderHandle)>>,
     prompt_store: Arc<openplotva_prompts::PromptStore>,
 }
 
@@ -95,31 +95,48 @@ impl ChatClientFactory {
             // default keeps legacy behavior for the built-in providers.
             return Ok(Arc::clone(&self.default_client));
         };
-        let fingerprint = provider_row_fingerprint(row);
+        let gateway = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
+        let fingerprint = provider_row_fingerprint(row, &gateway);
+        let key = (row.id, attempt.model_id);
         {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((cached_fingerprint, client)) = cache.get(&row.id)
+            if let Some((cached_fingerprint, client)) = cache.get(&key)
                 && *cached_fingerprint == fingerprint
             {
                 return Ok(Arc::clone(client));
             }
         }
-        let client = self.build_client(row)?;
+        let client = self.build_client(row, gateway)?;
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.insert(row.id, (fingerprint, Arc::clone(&client)));
+        cache.insert(key, (fingerprint, Arc::clone(&client)));
         Ok(client)
     }
 
     fn build_client(
         &self,
         row: &openplotva_llm::router::ProviderRow,
+        gateway: GatewayRequestFields,
     ) -> Result<DialogProviderHandle, openplotva_llm::retry::ProviderError> {
+        let cfg = self.dynamic_dialog_config(row, gateway)?;
+        let provider =
+            AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(&self.prompt_store));
+        Ok(Arc::new(provider))
+    }
+
+    /// Dialog config for a provider row without an env-built client: the shared
+    /// template pointed at the row's endpoint or Discovery service, carrying the
+    /// route's gateway fields (OpenRouter `reasoning` and `provider`).
+    fn dynamic_dialog_config(
+        &self,
+        row: &openplotva_llm::router::ProviderRow,
+        gateway: GatewayRequestFields,
+    ) -> Result<AifarmDialogConfig, openplotva_llm::retry::ProviderError> {
         let protocol = row.protocol.as_deref().unwrap_or(
             // Legacy rows without a protocol: chat-kind non-genkit rows are
             // OpenAI-compatible in this deployment.
@@ -136,6 +153,7 @@ impl ChatClientFactory {
             ));
         }
         let mut cfg = self.template.clone();
+        cfg.client.gateway_fields = gateway;
         cfg.provider_name = row.name.clone();
         cfg.model = String::new();
         cfg.client.default_model = String::new();
@@ -176,9 +194,7 @@ impl ChatClientFactory {
                 ));
             }
         }
-        let provider =
-            AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(&self.prompt_store));
-        Ok(Arc::new(provider))
+        Ok(cfg)
     }
 }
 
@@ -202,8 +218,12 @@ pub(crate) fn resolve_provider_api_key(
     }
 }
 
-/// Change-detection fingerprint over the client-relevant provider row fields.
-fn provider_row_fingerprint(row: &openplotva_llm::router::ProviderRow) -> u64 {
+/// Change-detection fingerprint over the client-relevant provider row fields
+/// and the route's gateway fields.
+fn provider_row_fingerprint(
+    row: &openplotva_llm::router::ProviderRow,
+    gateway: &GatewayRequestFields,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     row.name.hash(&mut hasher);
@@ -215,6 +235,16 @@ fn provider_row_fingerprint(row: &openplotva_llm::router::ProviderRow) -> u64 {
     row.api_key_ref.hash(&mut hasher);
     row.api_key_encrypted.hash(&mut hasher);
     row.config.to_string().hash(&mut hasher);
+    gateway
+        .provider
+        .as_ref()
+        .map(ToString::to_string)
+        .hash(&mut hasher);
+    gateway
+        .reasoning
+        .as_ref()
+        .map(ToString::to_string)
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1707,6 +1737,49 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &third),
             "a runtime-hint-only change must invalidate the cached client"
+        );
+    }
+
+    #[test]
+    fn factory_client_carries_the_route_gateway_fields() {
+        let snapshot = admin_created_provider_snapshot("openai_compat", "https://gateway.local/v1");
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
+        let table = handle.snapshot();
+        let row = table.provider(5).expect("provider row");
+        let overrides = json!({ "reasoning": { "effort": "none" } });
+
+        let cfg = factory
+            .dynamic_dialog_config(row, GatewayRequestFields::from_overrides(&overrides))
+            .expect("dynamic config");
+
+        assert_eq!(
+            cfg.client.gateway_fields.reasoning,
+            Some(json!({ "effort": "none" }))
+        );
+        assert_eq!(
+            cfg.client.direct_url,
+            "https://gateway.local/v1/chat/completions"
+        );
+
+        let plain = factory
+            .resolve(&attempt_for(5, "my-sglang"))
+            .expect("plain");
+        let mut quiet = attempt_for(5, "my-sglang");
+        quiet.overrides.extra = overrides;
+        let quiet_client = factory.resolve(&quiet).expect("reasoning off");
+        assert!(
+            !Arc::ptr_eq(&plain, &quiet_client),
+            "different gateway fields must not share a cached client"
+        );
+        let mut other_model = attempt_for(5, "my-sglang");
+        other_model.model_id = 11;
+        let other_client = factory.resolve(&other_model).expect("second model");
+        assert!(
+            !Arc::ptr_eq(&plain, &other_client),
+            "each model of a provider gets its own cached client"
         );
     }
 
