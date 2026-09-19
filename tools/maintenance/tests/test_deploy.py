@@ -60,12 +60,13 @@ class DeploymentIntegrationTests(unittest.TestCase):
                 """,
             )
             docker_output = test_root / "docker.args"
+            inspect_result = "printf 'true\\n'" if existing_enabled else "exit 1"
             docker_body = f"""
             if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then
               {'exit 0' if existing_enabled else 'exit 1'}
             fi
             if [ "$1" = "inspect" ]; then
-              {'printf \'true\\n\'' if existing_enabled else 'exit 1'}
+              {inspect_result}
             fi
             if [ "$1" = "compose" ]; then
               printf '%s\\n' "$@" > {docker_output}
