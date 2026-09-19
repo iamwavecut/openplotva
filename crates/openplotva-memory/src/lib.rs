@@ -79,6 +79,10 @@ pub const DEFAULT_MEMORY_REDACTION_CATEGORIES: &[&str] = &[
 pub type MemoryExtractorFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<ExtractOutput, E>> + Send + 'a>>;
 
+/// Future returned by candidate resolvers.
+pub type MemoryResolverFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Option<ResolutionPlan>, E>> + Send + 'a>>;
+
 /// Memory extraction boundary.
 pub trait MemoryExtractor {
     /// Extractor error.
@@ -86,6 +90,14 @@ pub trait MemoryExtractor {
 
     /// Extract memory facts from a batch.
     fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error>;
+
+    /// Decide how each extracted candidate relates to the existing cards on its
+    /// shortlist. `None` means this extractor has no resolution call; the caller
+    /// then keeps the candidates and lets the code gates catch known facts.
+    fn resolve<'a>(&'a self, input: &'a ResolutionInput) -> MemoryResolverFuture<'a, Self::Error> {
+        let _ = input;
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Future returned by subject mergers.
@@ -1390,6 +1402,23 @@ where
             }
         })
     }
+
+    fn resolve<'a>(&'a self, input: &'a ResolutionInput) -> MemoryResolverFuture<'a, Self::Error> {
+        Box::pin(async move {
+            match self.primary.resolve(input).await {
+                Ok(plan) => Ok(plan),
+                Err(primary) if !(self.is_retryable)(&primary) => {
+                    Err(FallbackMemoryExtractorError::Primary(primary))
+                }
+                Err(primary) => {
+                    let primary = primary.to_string();
+                    self.fallback.resolve(input).await.map_err(|source| {
+                        FallbackMemoryExtractorError::Fallback { primary, source }
+                    })
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1435,6 +1464,22 @@ where
             {
                 Ok(redacted) => Ok(redacted),
                 Err(_) => Ok(output),
+            }
+        })
+    }
+
+    fn resolve<'a>(&'a self, input: &'a ResolutionInput) -> MemoryResolverFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let Some(plan) = self.next.resolve(input).await? else {
+                return Ok(None);
+            };
+            match redact_resolution_plan_with_async(plan.clone(), |value| {
+                self.redactor.redact_text(value)
+            })
+            .await
+            {
+                Ok(redacted) => Ok(Some(redacted)),
+                Err(_) => Ok(Some(plan)),
             }
         })
     }
@@ -2266,6 +2311,295 @@ pub fn observed_at_from_messages_at(
         .find(|message| message.occurred_at != go_zero_time())
         .map(|message| message.occurred_at)
         .unwrap_or(fallback_observed_at)
+}
+
+/// Existing cards offered to the resolution call for one candidate.
+pub const RESOLUTION_SHORTLIST_LIMIT: usize = 5;
+
+pub const RESOLUTION_ACTION_ADD: &str = "add";
+pub const RESOLUTION_ACTION_REINFORCE: &str = "reinforce";
+pub const RESOLUTION_ACTION_UPDATE: &str = "update";
+pub const RESOLUTION_ACTION_SUPERSEDE: &str = "supersede";
+pub const RESOLUTION_ACTION_COMPETING: &str = "competing";
+
+/// One existing card on a candidate's shortlist, numbered within that list.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolutionCard {
+    pub index: usize,
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub card_type: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub predicate: String,
+    pub fact: String,
+    pub conf: f64,
+    pub age: String,
+}
+
+/// One extracted candidate with the existing cards most similar to it.
+/// `position` points back into the extraction output's `candidate_cards`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolutionCandidate {
+    pub index: usize,
+    #[serde(skip)]
+    pub position: usize,
+    #[serde(rename = "type")]
+    pub card_type: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub predicate: String,
+    pub fact: String,
+    pub similar: Vec<ResolutionCard>,
+}
+
+/// Input of the resolution call: candidates that have at least one similar card.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ResolutionInput {
+    pub candidates: Vec<ResolutionCandidate>,
+}
+
+impl ResolutionInput {
+    /// Pair each candidate with its shortlist; candidates without similar cards
+    /// stay out of the call and are added as they are.
+    #[must_use]
+    pub fn new(
+        candidates: &[CandidateCard],
+        shortlists: &[Vec<Card>],
+        as_of: OffsetDateTime,
+    ) -> Self {
+        let candidates = candidates
+            .iter()
+            .zip(shortlists)
+            .enumerate()
+            .filter(|(_, (_, shortlist))| !shortlist.is_empty())
+            .enumerate()
+            .map(
+                |(index, (position, (candidate, shortlist)))| ResolutionCandidate {
+                    index,
+                    position,
+                    card_type: normalize_card_type(&candidate.card_type),
+                    subject: candidate.subject.trim().to_owned(),
+                    predicate: candidate.predicate.trim().to_owned(),
+                    fact: candidate.fact_text.trim().to_owned(),
+                    similar: shortlist
+                        .iter()
+                        .take(RESOLUTION_SHORTLIST_LIMIT)
+                        .enumerate()
+                        .map(|(index, card)| ResolutionCard {
+                            index,
+                            id: card.id,
+                            card_type: card.card_type.clone(),
+                            subject: card.subject.trim().to_owned(),
+                            predicate: card.predicate.trim().to_owned(),
+                            fact: card.fact_text.trim().to_owned(),
+                            conf: round_two(card.confidence),
+                            age: coarse_card_age(card.created_at.or(card.last_observed_at), as_of),
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        Self { candidates }
+    }
+}
+
+/// The model's decision on one candidate, by candidate and card index.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ResolutionChoice {
+    #[serde(default)]
+    pub candidate_index: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub new_fact_text: String,
+}
+
+/// The model's raw resolution plan (indexes unverified).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ResolutionPlan {
+    #[serde(default)]
+    pub decisions: Vec<ResolutionChoice>,
+    /// Top-level array fields that arrived as JSON strings and were parsed again.
+    #[serde(skip)]
+    pub stringified_fields: Vec<String>,
+}
+
+/// Why a resolution plan was rejected as a whole.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ResolutionPlanError {
+    #[error("candidate index {0} is not in the input")]
+    UnknownCandidate(i64),
+    #[error("candidate index {0} has more than one decision")]
+    RepeatedCandidate(i64),
+    #[error("candidate index {0} has no decision")]
+    MissingCandidate(usize),
+    #[error("candidate index {candidate} has unknown action {action:?}")]
+    UnknownAction { candidate: i64, action: String },
+    #[error("candidate index {candidate} names card {card:?}, which is not on its shortlist")]
+    UnknownCard { candidate: i64, card: Option<i64> },
+}
+
+const RESOLUTION_ARRAY_FIELDS: &[&str] = &["decisions"];
+
+/// Decode the resolution call's response, salvaging truncation and stringified
+/// arrays the same way extraction does.
+pub fn decode_resolution_plan(raw: &str) -> Result<ResolutionPlan, DecodeExtractionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DecodeExtractionError::Empty);
+    }
+    let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) else {
+        return Err(DecodeExtractionError::Decode);
+    };
+    if end <= start {
+        return Err(DecodeExtractionError::Decode);
+    }
+    let object = &trimmed[start..=end];
+    if let Ok(parsed) = serde_json::from_str(object) {
+        return Ok(parsed);
+    }
+    if let Some((mut parsed, fields)) =
+        decode_with_stringified_arrays::<ResolutionPlan>(object, RESOLUTION_ARRAY_FIELDS)
+    {
+        parsed.stringified_fields = fields;
+        return Ok(parsed);
+    }
+    salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
+}
+
+/// Validate a plan against its input and apply it to the extraction output.
+/// Every candidate of the input needs exactly one known action, and every
+/// action other than `add` must name a card on that candidate's own shortlist.
+/// `reinforce` and `update` fold the candidate into the existing card;
+/// `supersede` and `competing` keep it and link it to the existing card; `add`
+/// keeps it as a new card. Nothing is applied when the plan is invalid.
+pub fn apply_resolution_plan(
+    mut output: ExtractOutput,
+    input: &ResolutionInput,
+    plan: &ResolutionPlan,
+) -> Result<ExtractOutput, ResolutionPlanError> {
+    let count = input.candidates.len();
+    let mut chosen: Vec<Option<(&'static str, Option<usize>, &ResolutionChoice)>> =
+        vec![None; count];
+    for choice in &plan.decisions {
+        let index = usize::try_from(choice.candidate_index)
+            .ok()
+            .filter(|index| *index < count)
+            .ok_or(ResolutionPlanError::UnknownCandidate(
+                choice.candidate_index,
+            ))?;
+        if chosen[index].is_some() {
+            return Err(ResolutionPlanError::RepeatedCandidate(
+                choice.candidate_index,
+            ));
+        }
+        let action = choice.action.trim();
+        let action = [
+            RESOLUTION_ACTION_ADD,
+            RESOLUTION_ACTION_REINFORCE,
+            RESOLUTION_ACTION_UPDATE,
+            RESOLUTION_ACTION_SUPERSEDE,
+            RESOLUTION_ACTION_COMPETING,
+        ]
+        .into_iter()
+        .find(|known| action.eq_ignore_ascii_case(known))
+        .ok_or_else(|| ResolutionPlanError::UnknownAction {
+            candidate: choice.candidate_index,
+            action: action.to_owned(),
+        })?;
+        let card = if action == RESOLUTION_ACTION_ADD {
+            None
+        } else {
+            let card = choice
+                .card_index
+                .and_then(|card| usize::try_from(card).ok())
+                .filter(|card| *card < input.candidates[index].similar.len())
+                .ok_or(ResolutionPlanError::UnknownCard {
+                    candidate: choice.candidate_index,
+                    card: choice.card_index,
+                })?;
+            Some(card)
+        };
+        chosen[index] = Some((action, card, choice));
+    }
+    let chosen = chosen
+        .into_iter()
+        .enumerate()
+        .map(|(index, choice)| choice.ok_or(ResolutionPlanError::MissingCandidate(index)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut folded = HashSet::new();
+    for (candidate, (action, card, choice)) in input.candidates.iter().zip(chosen) {
+        let Some(card) = card else {
+            continue;
+        };
+        let Some(fact) = output
+            .candidate_cards
+            .get(candidate.position)
+            .map(|card| card.fact_text.clone())
+        else {
+            continue;
+        };
+        let (decision, new_fact_text) = match action {
+            RESOLUTION_ACTION_REINFORCE => (ResolutionDecision::Reinforce, String::new()),
+            RESOLUTION_ACTION_UPDATE => {
+                let text = choice.new_fact_text.trim();
+                let text = if text.is_empty() {
+                    fact
+                } else {
+                    text.to_owned()
+                };
+                (ResolutionDecision::Update, text)
+            }
+            RESOLUTION_ACTION_SUPERSEDE => (ResolutionDecision::Supersede, fact),
+            _ => (ResolutionDecision::Competing, fact),
+        };
+        if matches!(
+            decision,
+            ResolutionDecision::Reinforce | ResolutionDecision::Update
+        ) {
+            folded.insert(candidate.position);
+        }
+        output.resolutions.push(Resolution {
+            old_card_id: candidate.similar[card].id,
+            new_fact_text,
+            decision,
+            reason: choice.reason.trim().to_owned(),
+            ..Resolution::default()
+        });
+    }
+    output.candidate_cards = output
+        .candidate_cards
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, card)| (!folded.contains(&position)).then_some(card))
+        .collect();
+    Ok(output)
+}
+
+/// Redact the texts a resolution plan writes onto existing cards.
+pub async fn redact_resolution_plan_with_async<F, Fut, E>(
+    mut plan: ResolutionPlan,
+    mut redact: F,
+) -> Result<ResolutionPlan, E>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<String, E>> + Send,
+{
+    for choice in &mut plan.decisions {
+        if !choice.new_fact_text.trim().is_empty() {
+            choice.new_fact_text = redact(std::mem::take(&mut choice.new_fact_text)).await?;
+        }
+    }
+    Ok(plan)
 }
 
 /// Most candidate cards one extraction window may add.
@@ -5473,6 +5807,151 @@ mod tests {
         });
         assert_eq!(gated.resolutions[0].decision, ResolutionDecision::Supersede);
         assert_eq!(report.supersede_downgraded, 0);
+    }
+
+    fn resolution_setup() -> (ExtractOutput, ResolutionInput) {
+        let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
+        let candidate = |subject: &str, fact: &str| CandidateCard {
+            subject: subject.to_owned(),
+            predicate: "p".to_owned(),
+            fact_text: fact.to_owned(),
+            ..CandidateCard::default()
+        };
+        let card = |id: i64, fact: &str| Card {
+            id,
+            subject: "Ann".to_owned(),
+            fact_text: fact.to_owned(),
+            confidence: 0.8,
+            ..Card::default()
+        };
+        let output = ExtractOutput {
+            candidate_cards: vec![
+                candidate("Ann", "Ann likes tea a lot"),
+                candidate("Bob", "Bob plays chess"),
+                candidate("Ann", "Ann lives in Oslo"),
+                candidate("Ann", "Ann now works at a bakery"),
+            ],
+            ..ExtractOutput::default()
+        };
+        let shortlists = vec![
+            vec![card(10, "Ann likes tea")],
+            Vec::new(),
+            vec![
+                card(11, "Ann likes coffee"),
+                card(12, "Ann lives in Bergen"),
+            ],
+            vec![card(13, "Ann works at a bank")],
+        ];
+        let input = ResolutionInput::new(&output.candidate_cards, &shortlists, as_of);
+        (output, input)
+    }
+
+    fn resolution_choice(candidate: i64, action: &str, card: Option<i64>) -> ResolutionChoice {
+        ResolutionChoice {
+            candidate_index: candidate,
+            reason: "r".to_owned(),
+            action: action.to_owned(),
+            card_index: card,
+            new_fact_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolution_input_numbers_candidates_with_shortlists() {
+        let (_, input) = resolution_setup();
+        let positions: Vec<(usize, usize)> = input
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.index, candidate.position))
+            .collect();
+        assert_eq!(positions, vec![(0, 0), (1, 2), (2, 3)]);
+        assert_eq!(input.candidates[1].similar[1].index, 1);
+        assert_eq!(input.candidates[1].similar[1].id, 12);
+        let payload = serde_json::to_string(&input).expect("payload");
+        assert!(!payload.contains("\"id\""), "{payload}");
+        assert!(!payload.contains("position"), "{payload}");
+    }
+
+    #[test]
+    fn resolution_plan_folds_and_links_candidates() {
+        let (output, input) = resolution_setup();
+        let plan = ResolutionPlan {
+            decisions: vec![
+                resolution_choice(0, "reinforce", Some(0)),
+                resolution_choice(1, "supersede", Some(1)),
+                ResolutionChoice {
+                    new_fact_text: "Ann works at a bakery since May".to_owned(),
+                    ..resolution_choice(2, "update", Some(0))
+                },
+            ],
+            ..ResolutionPlan::default()
+        };
+        let resolved = apply_resolution_plan(output, &input, &plan).expect("valid plan");
+        let facts: Vec<&str> = resolved
+            .candidate_cards
+            .iter()
+            .map(|card| card.fact_text.as_str())
+            .collect();
+        assert_eq!(facts, vec!["Bob plays chess", "Ann lives in Oslo"]);
+        let resolutions: Vec<(i64, ResolutionDecision, &str)> = resolved
+            .resolutions
+            .iter()
+            .map(|r| (r.old_card_id, r.decision, r.new_fact_text.as_str()))
+            .collect();
+        assert_eq!(
+            resolutions,
+            vec![
+                (10, ResolutionDecision::Reinforce, ""),
+                (12, ResolutionDecision::Supersede, "Ann lives in Oslo"),
+                (
+                    13,
+                    ResolutionDecision::Update,
+                    "Ann works at a bakery since May"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolution_plan_rejects_cards_off_the_shortlist() {
+        let (output, input) = resolution_setup();
+        let off_list = ResolutionPlan {
+            decisions: vec![
+                resolution_choice(0, "reinforce", Some(1)),
+                resolution_choice(1, "add", None),
+                resolution_choice(2, "add", None),
+            ],
+            ..ResolutionPlan::default()
+        };
+        assert_eq!(
+            apply_resolution_plan(output.clone(), &input, &off_list),
+            Err(ResolutionPlanError::UnknownCard {
+                candidate: 0,
+                card: Some(1)
+            })
+        );
+        let missing = ResolutionPlan {
+            decisions: vec![resolution_choice(0, "add", None)],
+            ..ResolutionPlan::default()
+        };
+        assert_eq!(
+            apply_resolution_plan(output.clone(), &input, &missing),
+            Err(ResolutionPlanError::MissingCandidate(1))
+        );
+        let unknown = ResolutionPlan {
+            decisions: vec![resolution_choice(5, "add", None)],
+            ..ResolutionPlan::default()
+        };
+        assert_eq!(
+            apply_resolution_plan(output, &input, &unknown),
+            Err(ResolutionPlanError::UnknownCandidate(5))
+        );
+        let stringified = decode_resolution_plan(
+            r#"{"decisions":"[{\"candidate_index\":0,\"reason\":\"r\",\"action\":\"add\"}]"}"#,
+        )
+        .expect("decode");
+        assert_eq!(stringified.decisions.len(), 1);
+        assert_eq!(stringified.stringified_fields, vec!["decisions"]);
     }
 
     #[test]

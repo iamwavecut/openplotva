@@ -35,7 +35,8 @@ use openplotva_history::{
 };
 use openplotva_memory::{
     DEFAULT_MEMORY_MAX_OUTPUT_TOKENS, ExtractInput, ExtractOutput, MemoryExtractor,
-    MemoryExtractorFuture, decode_extraction_json, estimate_memory_tokens,
+    MemoryExtractorFuture, MemoryResolverFuture, ResolutionInput, ResolutionPlan,
+    decode_extraction_json, estimate_memory_tokens,
 };
 
 use crate::retry::{FailureReason, ProviderError, retryable_reason};
@@ -2629,6 +2630,36 @@ where
         Ok(openplotva_memory::decode_subject_merge_plan(&content)?)
     }
 
+    /// Second phase of two-phase extraction: decide, per extracted candidate,
+    /// how it relates to the existing cards on its shortlist.
+    pub async fn resolve_candidates(
+        &self,
+        input: &ResolutionInput,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> Result<ResolutionPlan, AifarmMemoryExtractorError> {
+        let system_prompt = openplotva_prompts::read("memory/resolution")?;
+        let payload = serde_json::to_string(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let mut request = self.subject_merge_request(&system_prompt, &payload);
+        request.response_format = Some(candidate_resolution_response_format());
+        request.trace = Some(aux_llm_call_trace(
+            "memory_resolution",
+            "aifarm_memory_extractor",
+        ));
+        let result = self
+            .client
+            .complete(request, on_status)
+            .await
+            .map_err(|source| AifarmMemoryExtractorError::Completion { source })?;
+        let Some(response) = result.response.as_ref() else {
+            return Err(AifarmMemoryExtractorError::Response(
+                "chat completion returned no response".to_owned(),
+            ));
+        };
+        let content = first_choice_structured_content(response)
+            .map_err(|err| AifarmMemoryExtractorError::Response(err.to_string()))?;
+        Ok(openplotva_memory::decode_resolution_plan(&content)?)
+    }
+
     fn subject_merge_request(&self, system_prompt: &str, payload: &str) -> ChatCompletionRequest {
         let mut request = ChatCompletionRequest {
             model: self.cfg.model.trim().to_owned(),
@@ -2675,6 +2706,15 @@ where
         Box::pin(async move {
             let mut on_status = |_status: StatusUpdate| {};
             AifarmMemoryExtractor::extract(self, input, &mut on_status).await
+        })
+    }
+
+    fn resolve<'a>(&'a self, input: &'a ResolutionInput) -> MemoryResolverFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let mut on_status = |_status: StatusUpdate| {};
+            AifarmMemoryExtractor::resolve_candidates(self, input, &mut on_status)
+                .await
+                .map(Some)
         })
     }
 }
@@ -5535,6 +5575,44 @@ fn subject_merge_response_schema() -> Value {
     })
 }
 
+fn candidate_resolution_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "memory_resolution",
+            "schema": candidate_resolution_response_schema(),
+        },
+    })
+}
+
+fn candidate_resolution_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decisions"],
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["candidate_index", "reason", "action"],
+                    "properties": {
+                        "candidate_index": {"type": "integer"},
+                        "reason": {"type": "string"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["add", "reinforce", "update", "supersede", "competing"],
+                        },
+                        "card_index": {"type": "integer"},
+                        "new_fact_text": {"type": "string"},
+                    },
+                },
+            },
+        },
+    })
+}
+
 fn memory_extraction_response_format() -> Value {
     json!({
         "type": "json_schema",
@@ -7546,11 +7624,40 @@ mod tests {
                 memory_extraction_response_schema(),
             ),
             ("memory_subject_merge.json", subject_merge_response_schema()),
+            (
+                "memory_resolution.json",
+                candidate_resolution_response_schema(),
+            ),
         ] {
             let text = std::fs::read_to_string(dir.join(file)).expect("harness schema file");
             let harness: Value = serde_json::from_str(&text).expect("harness schema json");
             assert_eq!(harness, schema, "{file} drifted from the request schema");
         }
+    }
+
+    #[test]
+    fn resolution_request_uses_its_schema_without_penalties() {
+        let extractor = AifarmMemoryExtractor::with_transport(
+            AifarmMemoryExtractorConfig {
+                model: "qwen3.8-27b".to_owned(),
+                ..AifarmMemoryExtractorConfig::default()
+            },
+            FakeTransport::new(vec![]),
+        );
+        let mut request = extractor.subject_merge_request("system", "payload");
+        request.response_format = Some(candidate_resolution_response_format());
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "memory_resolution"
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["decisions"]["items"]["properties"]
+                ["action"]["enum"],
+            json!(["add", "reinforce", "update", "supersede", "competing"])
+        );
+        assert_eq!(body["presence_penalty"], 0.0);
+        assert_eq!(body["temperature"], 0.7);
     }
 
     #[test]
