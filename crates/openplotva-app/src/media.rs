@@ -20,6 +20,10 @@ use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// The farm model's two slots are shared with the dialog and are often both
+/// busy for a few seconds; a prompt rewrite waits this long for one before it
+/// takes a fallback route.
+pub const MEDIA_OPTIMIZER_PRIMARY_SLOT_WAIT: Duration = Duration::from_secs(15);
 
 /// Boxed image-prompt optimizer future.
 pub type ImagePromptOptimizeFuture<'a> =
