@@ -9091,6 +9091,17 @@ fn admin_session_user_ids(headers: &HeaderMap, secret: &str) -> Vec<i64> {
         .collect()
 }
 
+/// Render a fatal error like the report of a `Result` returned from `main`, with
+/// secrets masked. That report goes straight to stderr, past the redacting log
+/// writer, and Telegram client errors carry the bot token in the request URL.
+#[must_use]
+pub fn fatal_error_report(error: &anyhow::Error) -> String {
+    format!(
+        "Error: {}",
+        openplotva_observability::secrets::redact(&format!("{error:?}"))
+    )
+}
+
 /// Run the current OpenPlotva app shell.
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env().context("load configuration")?;
@@ -17252,6 +17263,26 @@ mod tests {
             ]
         );
         let _ = super::router();
+    }
+
+    #[test]
+    fn fatal_error_report_masks_bot_token_in_error_chain() {
+        let error = anyhow::anyhow!(
+            "error sending request for url (https://api.telegram.org/bot123456789:AAFfake_value_1234567890abcdefghij/getMe)"
+        )
+        .context("get Telegram bot identity");
+
+        let report = super::fatal_error_report(&error);
+
+        assert!(
+            report.starts_with("Error: get Telegram bot identity"),
+            "{report}"
+        );
+        assert!(report.contains("bot123456789:<redacted>/getMe"), "{report}");
+        assert!(
+            !report.contains("AAFfake_value_1234567890abcdefghij"),
+            "{report}"
+        );
     }
 
     #[test]
