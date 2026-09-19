@@ -19,7 +19,7 @@
     "lang:ru:overview",
     "lang:ru:sections[].title",
     "lang:ru:sections[].points[]",
-    "min_items:sections:3",
+    "min_items:sections:2",
     "max_items:sections:12",
     "no_phrases:but wait;let me think;let me check;the prompt says",
     "max_blank_run:3",

@@ -1238,6 +1238,9 @@ fn youtube_sampling(model: &str) -> (f64, Option<f64>, Option<i32>) {
     }
 }
 
+/// No `response_format`: the prompt asks for JSON. `json_object` mode garbled
+/// the first key on a vLLM server, and structured modes differ between the
+/// providers a route can reach.
 fn youtube_summary_openai_request(
     model: &str,
     system: &str,
@@ -1261,7 +1264,6 @@ fn youtube_summary_openai_request(
         temperature,
         top_p,
         top_k,
-        response_format: json!({"type": "json_object"}),
     }
 }
 
@@ -1304,7 +1306,6 @@ struct OpenAiChatCompletionRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<i32>,
-    response_format: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1909,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn youtube_summary_openai_request_uses_family_sampling_and_json_mode() {
+    fn youtube_summary_openai_request_uses_family_sampling_without_a_response_format() {
         let request =
             youtube_summary_openai_request("gpt-5-mini", "sys", "payload", YouTubeStage::Summary);
         let value = serde_json::to_value(&request).expect("json");
@@ -1920,7 +1921,7 @@ mod tests {
         assert_eq!(value["max_tokens"], 3072);
         assert_eq!(value["temperature"], 0.3);
         assert!(value.get("top_p").is_none());
-        assert_eq!(value["response_format"]["type"], "json_object");
+        assert!(value.get("response_format").is_none(), "{value}");
 
         let qwen =
             youtube_summary_openai_request("qwen3.6-27b", "sys", "payload", YouTubeStage::Merge);
