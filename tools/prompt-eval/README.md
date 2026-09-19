@@ -54,6 +54,7 @@ fixtures (for example exported production requests) and is never committed.
 | `decision:<i>=<a\|b>[@<card>]` | candidate resolution: candidate i got one of the listed actions (and the given card index) |
 | `separate:<i>,<j>` | subject merge: cards i and j do not end up in the same cluster |
 | `evidence_quoted` | memory extraction: every candidate card's `evidence_quote` occurs in a message it cites |
+| `ids_in_input:<path>` | every string at the path appears in the user text as a `[<id> ` segment label |
 | `not_equals:<path>=<value>` | no value at the path equals the given value |
 | `min_count:<path>=<value>:<n>` | at least n values at the path equal the given value |
 | `label:<prefix>` | the first non-empty line starts with the prefix |

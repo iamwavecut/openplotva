@@ -1,0 +1,29 @@
+{
+  "flow": "youtube_summary",
+  "id": "youtube_summary/noisy-auto-captions",
+  "prompt": "youtube/summary_system",
+  "schema": "youtube_summary",
+  "tool_name": "youtube_summary",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 3072
+  },
+  "notes": "Auto captions without punctuation, cut mid-phrase.",
+  "user": "<transcript>\n[s1 00:00:00] так ну всем привет сегодня мы будем собирать компьютер для монтажа видео ээ значит начнём с процессора берём восьмиядерный потому что рендер любит ядра дальше видеокарта тут важно смотреть на объём памяти минимум двенадцать гигабайт ну и накопитель ставим два ссд один\n[s2 00:02:03] под систему второй под проекты ну и в конце тест рендера десятиминутный ролик собрался за четыре минуты всем пока\n</transcript>\nПо транскрипту выше верни JSON с саммари, как описано в инструкции.",
+  "checks": [
+    "json",
+    "schema",
+    "ids_in_input:sections[].segment_id",
+    "lang:ru:overview",
+    "lang:ru:sections[].title",
+    "lang:ru:sections[].points[]",
+    "min_items:sections:2",
+    "max_items:sections:12",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3",
+    "no_substring:<@sections[].title",
+    "no_substring:**@sections[].points[]"
+  ]
+}

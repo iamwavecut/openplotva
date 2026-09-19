@@ -1,0 +1,29 @@
+{
+  "flow": "youtube_summary",
+  "id": "youtube_summary/mixed-ru-en",
+  "prompt": "youtube/summary_system",
+  "schema": "youtube_summary",
+  "tool_name": "youtube_summary",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 3072
+  },
+  "notes": "Russian talk that switches to English quotes; the summary stays Russian.",
+  "user": "<transcript>\n[s1 00:00:00] Привет! Сегодня говорим про запуск стартапа.\n[s2 00:00:12] Первое правило: talk to your users, as Paul Graham says.\n[s3 00:00:40] Мы опросили сорок клиентов за две недели.\n[s4 00:01:15] Second: launch before you feel ready.\n[s5 00:01:50] Наш первый релиз был страшным, но он принёс первых платящих клиентов.\n[s6 00:02:40] И третье: следите за удержанием, а не за регистрациями.\n[s7 00:03:40] Retention is the only metric that matters early on.\n[s8 00:04:20] Итог: говорите с людьми, запускайтесь рано и считайте удержание.\n</transcript>\nПо транскрипту выше верни JSON с саммари, как описано в инструкции.",
+  "checks": [
+    "json",
+    "schema",
+    "ids_in_input:sections[].segment_id",
+    "lang:ru:overview",
+    "lang:ru:sections[].title",
+    "lang:ru:sections[].points[]",
+    "min_items:sections:3",
+    "max_items:sections:12",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3",
+    "no_substring:<@sections[].title",
+    "no_substring:**@sections[].points[]"
+  ]
+}

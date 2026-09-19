@@ -1,0 +1,44 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "conclusion": {
+      "type": "string"
+    },
+    "overview": {
+      "type": "string"
+    },
+    "sections": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "points": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "segment_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segment_id",
+          "title",
+          "points"
+        ],
+        "type": "object"
+      },
+      "maxItems": 12,
+      "type": "array"
+    }
+  },
+  "required": [
+    "overview",
+    "sections",
+    "conclusion"
+  ],
+  "type": "object"
+}
