@@ -58,9 +58,11 @@ impl HistoryStage {
         }
     }
 
-    /// Whether the request carries the answer schema. Guided decoding over a
-    /// long, mostly idle chunk makes the model close the events list at once,
-    /// so stage one asks for its JSON in the prompt only.
+    /// Whether the request carries the answer schema. Stage one asks for its
+    /// JSON in the prompt only: on a server that decodes schemas without
+    /// whitespace (vLLM's `disable_any_whitespace`), a long, mostly idle chunk
+    /// made the model close the events list at once, and the prompt alone read
+    /// every planted thread with or without that setting.
     #[must_use]
     pub const fn sends_response_schema(self) -> bool {
         matches!(self, Self::Recap)
