@@ -448,7 +448,7 @@ where
         original_prompt: &str,
         fallback_prompt: &str,
         aspect_ratio: &str,
-        variant_count: usize,
+        options: OptimizePromptOptions,
     ) -> MediaPromptOptimization<ImageOptimize> {
         let fallback = ImageOptimize {
             input: original_prompt.to_owned(),
@@ -463,7 +463,7 @@ where
             };
         };
         match optimizer
-            .optimize_image_prompt(original_prompt, OptimizePromptOptions { variant_count })
+            .optimize_image_prompt(original_prompt, options)
             .await
         {
             Ok(mut value) => {
@@ -485,7 +485,7 @@ where
     pub async fn enhance_image_edit_prompt(
         &self,
         original_prompt: &str,
-        variant_count: usize,
+        options: OptimizePromptOptions,
     ) -> MediaPromptOptimization<ImageEditOptimize> {
         let fallback = ImageEditOptimize {
             input: original_prompt.to_owned(),
@@ -499,7 +499,7 @@ where
             };
         };
         match optimizer
-            .optimize_image_edit_prompt(original_prompt, OptimizePromptOptions { variant_count })
+            .optimize_image_edit_prompt(original_prompt, options)
             .await
         {
             Ok(value) => MediaPromptOptimization {
@@ -1167,6 +1167,13 @@ mod tests {
         assert_eq!(plain.client.gateway_fields, GatewayRequestFields::default());
     }
 
+    fn options(variant_count: usize) -> OptimizePromptOptions {
+        OptimizePromptOptions {
+            variant_count,
+            ..OptimizePromptOptions::default()
+        }
+    }
+
     #[tokio::test]
     async fn media_optimizer_service_preserves_go_fallback_and_aspect_behavior() {
         let optimizer = FakeOptimizer::default();
@@ -1177,13 +1184,17 @@ mod tests {
         }));
         let service = MediaPromptOptimizerService::new(Some(optimizer));
 
-        let got = service.enhance_image_prompt("cat", "cat", "16:9", 2).await;
+        let got = service
+            .enhance_image_prompt("cat", "cat", "16:9", options(2))
+            .await;
 
         assert_eq!(got.provider_error, None);
         assert_eq!(got.value.outputs, vec!["cinematic cat"]);
         assert_eq!(got.value.aspect_ratio, "16:9");
 
-        let got = service.enhance_image_prompt("cat", "cat", "1:1", 1).await;
+        let got = service
+            .enhance_image_prompt("cat", "cat", "1:1", options(1))
+            .await;
 
         assert_eq!(got.provider_error.as_deref(), Some("boom"));
         assert_eq!(
@@ -1202,7 +1213,9 @@ mod tests {
         let optimizer = FakeOptimizer::default();
         let service = MediaPromptOptimizerService::new(Some(optimizer));
 
-        let got = service.enhance_image_edit_prompt("make it day", 3).await;
+        let got = service
+            .enhance_image_edit_prompt("make it day", options(3))
+            .await;
 
         assert_eq!(got.provider_error.as_deref(), Some("boom"));
         assert_eq!(
@@ -1239,7 +1252,13 @@ mod tests {
         );
 
         let got = optimizer
-            .optimize_image_prompt("cat", OptimizePromptOptions { variant_count: 1 })
+            .optimize_image_prompt(
+                "cat",
+                OptimizePromptOptions {
+                    variant_count: 1,
+                    ..OptimizePromptOptions::default()
+                },
+            )
             .await
             .expect("secondary result");
 
@@ -1270,7 +1289,13 @@ mod tests {
         );
 
         let got = optimizer
-            .optimize_image_edit_prompt("make it day", OptimizePromptOptions { variant_count: 1 })
+            .optimize_image_edit_prompt(
+                "make it day",
+                OptimizePromptOptions {
+                    variant_count: 1,
+                    ..OptimizePromptOptions::default()
+                },
+            )
             .await
             .expect("secondary edit result");
 

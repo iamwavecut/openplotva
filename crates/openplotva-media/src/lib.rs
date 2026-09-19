@@ -56,6 +56,88 @@ pub struct ImageEditOptimize {
 pub struct OptimizePromptOptions {
     /// Requested prompt variant count.
     pub variant_count: usize,
+    /// Image models the variants are written for, one per slot.
+    pub targets: ImageTargets,
+}
+
+/// Image model a prompt variant is written for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ImageModel {
+    /// FLUX.2 [klein]: short prompts, subject first, a 512-token text encoder.
+    #[default]
+    Klein,
+    /// Boogu-Image (Turbo and Edit-Turbo): concise, style first.
+    Boogu,
+}
+
+impl ImageModel {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Klein => "FLUX.2 [klein]",
+            Self::Boogu => "Boogu-Image",
+        }
+    }
+}
+
+/// Most output slots one optimizer call is written for.
+pub const MAX_IMAGE_SLOTS: usize = 4;
+
+/// Which model each output slot targets, in slot order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageTargets {
+    models: [ImageModel; MAX_IMAGE_SLOTS],
+    len: usize,
+}
+
+impl Default for ImageTargets {
+    fn default() -> Self {
+        Self::KLEIN
+    }
+}
+
+impl ImageTargets {
+    pub const KLEIN: Self = Self::single(ImageModel::Klein);
+    pub const BOOGU: Self = Self::single(ImageModel::Boogu);
+
+    #[must_use]
+    pub const fn single(model: ImageModel) -> Self {
+        Self {
+            models: [model; MAX_IMAGE_SLOTS],
+            len: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn models(&self) -> &[ImageModel] {
+        &self.models[..self.len]
+    }
+
+    /// Model for output slot `index`; slots past the list reuse the last model.
+    #[must_use]
+    pub fn model_for_slot(self, index: usize) -> ImageModel {
+        self.models[index.min(self.len - 1)]
+    }
+
+    /// Targets for two generators rendered side by side: `own_slots` slots
+    /// written for these targets, then `next_slots` slots for `next`.
+    #[must_use]
+    pub fn followed_by(self, own_slots: usize, next: Self, next_slots: usize) -> Self {
+        let own_slots = own_slots.clamp(1, MAX_IMAGE_SLOTS);
+        let mut out = self;
+        for index in 0..own_slots {
+            out.models[index] = self.model_for_slot(index);
+        }
+        out.len = own_slots;
+        for index in 0..next_slots {
+            if out.len == MAX_IMAGE_SLOTS {
+                break;
+            }
+            out.models[out.len] = next.model_for_slot(index);
+            out.len += 1;
+        }
+        out
+    }
 }
 
 /// Parsed image prompt modifiers.
@@ -208,41 +290,73 @@ pub const fn normalize_variant_count(count: usize) -> usize {
 }
 
 pub fn render_image_optimizer_prompt(
-    variant_count: usize,
+    options: OptimizePromptOptions,
 ) -> Result<String, openplotva_prompts::PromptError> {
-    openplotva_prompts::render(
-        IMAGE_OPTIMIZER_PROMPT_NAME,
-        &json!({ "variant_count": normalize_variant_count(variant_count) }),
-    )
+    openplotva_prompts::render(IMAGE_OPTIMIZER_PROMPT_NAME, &optimizer_prompt_data(options))
 }
 
 pub fn render_image_optimizer_prompt_with(
     prompts: &openplotva_prompts::PromptStore,
-    variant_count: usize,
+    options: OptimizePromptOptions,
 ) -> Result<String, openplotva_prompts::PromptError> {
-    prompts.render(
-        IMAGE_OPTIMIZER_PROMPT_NAME,
-        &json!({ "variant_count": normalize_variant_count(variant_count) }),
-    )
+    prompts.render(IMAGE_OPTIMIZER_PROMPT_NAME, &optimizer_prompt_data(options))
 }
 
 pub fn render_image_edit_optimizer_prompt(
-    variant_count: usize,
+    options: OptimizePromptOptions,
 ) -> Result<String, openplotva_prompts::PromptError> {
     openplotva_prompts::render(
         IMAGE_EDIT_OPTIMIZER_PROMPT_NAME,
-        &json!({ "variant_count": normalize_variant_count(variant_count) }),
+        &optimizer_prompt_data(options),
     )
 }
 
 pub fn render_image_edit_optimizer_prompt_with(
     prompts: &openplotva_prompts::PromptStore,
-    variant_count: usize,
+    options: OptimizePromptOptions,
 ) -> Result<String, openplotva_prompts::PromptError> {
     prompts.render(
         IMAGE_EDIT_OPTIMIZER_PROMPT_NAME,
-        &json!({ "variant_count": normalize_variant_count(variant_count) }),
+        &optimizer_prompt_data(options),
     )
+}
+
+/// Upper bound for one optimized image prompt or edit instruction, in
+/// characters. The prompts ask for at most 150 words; the bound only makes a
+/// looping model close its string and the JSON instead of running to the token cap.
+pub const IMAGE_PROMPT_MAX_CHARS: usize = 1200;
+
+/// Add a `maxLength` bound to every string of the schema's `outputs` array.
+#[must_use]
+pub fn with_output_max_chars(mut schema: Value, max_chars: usize) -> Value {
+    if let Some(items) = schema
+        .pointer_mut("/properties/outputs/items")
+        .and_then(Value::as_object_mut)
+    {
+        items.insert("maxLength".to_owned(), json!(max_chars));
+    }
+    schema
+}
+
+/// Template data for the image prompts: the slot count, which model each slot
+/// targets, and flags for the per-model rule blocks.
+fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
+    let variant_count = normalize_variant_count(options.variant_count);
+    let models: Vec<ImageModel> = (0..variant_count)
+        .map(|index| options.targets.model_for_slot(index))
+        .collect();
+    let slots: Vec<Value> = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| json!({ "index": index, "model": model.display_name() }))
+        .collect();
+    json!({
+        "variant_count": variant_count,
+        "slots": slots,
+        "multi": variant_count > 1,
+        "klein": models.contains(&ImageModel::Klein),
+        "boogu": models.contains(&ImageModel::Boogu),
+    })
 }
 
 #[must_use]
@@ -640,13 +754,98 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_prompt_renders_rules_for_each_slot_target() {
+        let pair = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 2,
+            targets: ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1),
+        })
+        .expect("render pair");
+        assert!(pair.contains("`outputs[0]` is rendered by FLUX.2 [klein]"));
+        assert!(pair.contains("`outputs[1]` is rendered by Boogu-Image"));
+        assert!(pair.contains("**FLUX.2 [klein]**"));
+        assert!(pair.contains("**Boogu-Image**"));
+        assert!(pair.contains("All prompts describe the same image idea"));
+        assert!(!pair.contains("{{"));
+
+        let boogu = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::BOOGU,
+        })
+        .expect("render boogu");
+        assert!(boogu.contains("`outputs[0]` is rendered by Boogu-Image"));
+        assert!(boogu.contains("**Boogu-Image**"));
+        assert!(!boogu.contains("**FLUX.2 [klein]**"));
+        assert!(!boogu.contains("All prompts describe the same image idea"));
+
+        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::KLEIN,
+        })
+        .expect("render edit");
+        assert!(edit.contains("`outputs[0]` is carried out by FLUX.2 [klein]"));
+        assert!(edit.contains("**FLUX.2 [klein]**"));
+        assert!(!edit.contains("**Boogu-Image Edit**"));
+    }
+
+    #[test]
+    fn output_strings_get_a_length_bound() {
+        let schema = with_output_max_chars(
+            optimize_prompt_terminator_definition(1).input_schema,
+            IMAGE_PROMPT_MAX_CHARS,
+        );
+        assert_eq!(
+            schema["properties"]["outputs"]["items"]["maxLength"],
+            IMAGE_PROMPT_MAX_CHARS
+        );
+        assert_eq!(schema["properties"]["outputs"]["maxItems"], 1);
+    }
+
+    #[test]
+    fn image_targets_follow_each_side_slot_count() {
+        let pair = ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1);
+        assert_eq!(pair.models(), [ImageModel::Klein, ImageModel::Boogu]);
+
+        let wide_first = ImageTargets::KLEIN.followed_by(2, ImageTargets::BOOGU, 1);
+        assert_eq!(
+            wide_first.models(),
+            [ImageModel::Klein, ImageModel::Klein, ImageModel::Boogu]
+        );
+        assert_eq!(wide_first.model_for_slot(1), ImageModel::Klein);
+        assert_eq!(wide_first.model_for_slot(2), ImageModel::Boogu);
+
+        assert_eq!(ImageTargets::KLEIN.model_for_slot(3), ImageModel::Klein);
+        assert_eq!(ImageTargets::default(), ImageTargets::KLEIN);
+        assert_eq!(
+            ImageTargets::BOOGU
+                .followed_by(3, ImageTargets::KLEIN, 3)
+                .models()
+                .len(),
+            MAX_IMAGE_SLOTS
+        );
+    }
+
+    #[test]
+    fn image_prompts_stay_within_the_word_budget() {
+        for prompt in [
+            include_str!("../../../prompts/image/optimizer.prompt"),
+            include_str!("../../../prompts/image/edit_optimizer.prompt"),
+        ] {
+            assert!(prompt.split_whitespace().count() <= 3_500);
+            assert!(!prompt.contains("random visual style"));
+            assert!(!prompt.contains("90 to 180 words"));
+            assert!(!prompt.contains("Kontext"));
+        }
+    }
+
+    #[test]
     fn optimizer_prompt_rendering_and_tool_schemas_match_contract() {
-        let prompt = render_image_optimizer_prompt(2).expect("render image optimizer prompt");
-        assert!(prompt.contains(
-            "The JSON object has exactly the fields `input`, `outputs`, `nsfw_result`, and `aspect_ratio`."
-        ));
-        assert!(prompt.contains("must contain exactly `2` optimized prompts"));
-        assert!(prompt.contains("Aspect Ratio Selection"));
+        let prompt = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 2,
+            ..OptimizePromptOptions::default()
+        })
+        .expect("render image optimizer prompt");
+        assert!(prompt.contains("`outputs` holds exactly `2` prompts"));
+        assert!(prompt.contains("### ASPECT RATIO"));
         assert!(prompt.contains("`9:16`, `16:9`, `1:2`, `2:1`"));
         assert!(prompt.contains("Closed-gate decision tree"));
         assert!(prompt.contains("Both gates must be present for `forbidden`"));
@@ -654,12 +853,10 @@ mod tests {
         assert!(prompt.contains("non-sexual children"));
         assert!(prompt.contains("minor sexual content"));
 
-        let edit_prompt =
-            render_image_edit_optimizer_prompt(0).expect("render image edit optimizer prompt");
-        assert!(edit_prompt.contains(
-            "The JSON object has exactly the fields `input`, `outputs`, and `nsfw_result`."
-        ));
-        assert!(edit_prompt.contains("must contain exactly `1` final edit instructions"));
+        let edit_prompt = render_image_edit_optimizer_prompt(OptimizePromptOptions::default())
+            .expect("render image edit optimizer prompt");
+        assert!(edit_prompt.contains("`outputs` holds exactly `1` instructions"));
+        assert!(edit_prompt.contains("Preserve the image unchanged"));
         assert!(edit_prompt.contains("Closed-gate decision tree"));
         assert!(edit_prompt.contains("Both gates must be present for `forbidden`"));
         assert!(edit_prompt.contains("adult-only nudity"));
@@ -721,11 +918,19 @@ mod tests {
         ]);
 
         assert_eq!(
-            render_image_optimizer_prompt_with(&store, 0).expect("render image prompt"),
+            render_image_optimizer_prompt_with(&store, OptimizePromptOptions::default())
+                .expect("render image prompt"),
             "custom image variants=1"
         );
         assert_eq!(
-            render_image_edit_optimizer_prompt_with(&store, 3).expect("render edit prompt"),
+            render_image_edit_optimizer_prompt_with(
+                &store,
+                OptimizePromptOptions {
+                    variant_count: 3,
+                    ..OptimizePromptOptions::default()
+                }
+            )
+            .expect("render edit prompt"),
             "custom edit variants=3"
         );
     }

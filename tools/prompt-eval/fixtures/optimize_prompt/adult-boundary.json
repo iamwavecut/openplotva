@@ -2,7 +2,16 @@
   "flow": "optimize_prompt",
   "prompt": "image/optimizer",
   "vars": {
-    "variant_count": 1
+    "variant_count": 1,
+    "multi": false,
+    "klein": true,
+    "boogu": false,
+    "slots": [
+      {
+        "index": 0,
+        "model": "FLUX.2 [klein]"
+      }
+    ]
   },
   "schema": "optimize_prompt",
   "tool_name": "optimize_prompt",

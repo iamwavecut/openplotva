@@ -1261,11 +1261,15 @@ where
         options: openplotva_media::OptimizePromptOptions,
     ) -> Result<openplotva_media::ImageOptimize, GeminiMediaPromptOptimizerError> {
         let (text, variant_count) = optimizer_text_and_count(text, options)?;
+        let render_options = openplotva_media::OptimizePromptOptions {
+            variant_count,
+            ..options
+        };
         let prompt = match self.prompt_store.as_deref() {
             Some(prompts) => {
-                openplotva_media::render_image_optimizer_prompt_with(prompts, variant_count)?
+                openplotva_media::render_image_optimizer_prompt_with(prompts, render_options)?
             }
-            None => openplotva_media::render_image_optimizer_prompt(variant_count)?,
+            None => openplotva_media::render_image_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let payload = self
@@ -1286,11 +1290,15 @@ where
         options: openplotva_media::OptimizePromptOptions,
     ) -> Result<openplotva_media::ImageEditOptimize, GeminiMediaPromptOptimizerError> {
         let (text, variant_count) = optimizer_text_and_count(text, options)?;
+        let render_options = openplotva_media::OptimizePromptOptions {
+            variant_count,
+            ..options
+        };
         let prompt = match self.prompt_store.as_deref() {
             Some(prompts) => {
-                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, variant_count)?
+                openplotva_media::render_image_edit_optimizer_prompt_with(prompts, render_options)?
             }
-            None => openplotva_media::render_image_edit_optimizer_prompt(variant_count)?,
+            None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
         let payload = self
@@ -3755,7 +3763,10 @@ mod tests {
         let got = optimizer
             .optimize_image_prompt(
                 " cat ",
-                openplotva_media::OptimizePromptOptions { variant_count: 2 },
+                openplotva_media::OptimizePromptOptions {
+                    variant_count: 2,
+                    ..Default::default()
+                },
             )
             .await?;
 
