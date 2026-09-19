@@ -1238,9 +1238,10 @@ fn youtube_sampling(model: &str) -> (f64, Option<f64>, Option<i32>) {
     }
 }
 
-/// No `response_format`: the prompt asks for JSON. `json_object` mode garbled
-/// the first key on a vLLM server, and structured modes differ between the
-/// providers a route can reach.
+/// No `response_format`: the prompt asks for JSON, which kept the summary's
+/// shape in every eval run. Structured modes differ between the providers a
+/// route can reach, and `json_object` mode garbled the first key on a vLLM
+/// server that decodes without whitespace (`disable_any_whitespace`).
 fn youtube_summary_openai_request(
     model: &str,
     system: &str,
