@@ -12,6 +12,14 @@ from .contracts import DAY, DEEP_LIMIT, DEEP_SECONDS, INITIAL_LIMIT, INITIAL_SEC
 from .quota import retry_after
 
 TERMINAL = {'done', 'observing', 'needs_human', 'cancelled', 'ready', 'wait_deploy'}
+FINISHED = TERMINAL - {'ready'}
+
+
+def retained_context(context):
+    # A later run rebuilds its own context, so a finished job keeps only which
+    # candidates it was shown; their bodies and threads stay on GitHub.
+    return {**context, 'history': [{key: value for key, value in item.items() if key not in ('body', 'comments')}
+                                   if isinstance(item, dict) else item for item in context['history']]}
 
 
 class State:
@@ -31,6 +39,7 @@ class State:
         CREATE TABLE IF NOT EXISTS incidents(signature TEXT PRIMARY KEY,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,issue_number INTEGER,status TEXT NOT NULL,data TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+        CREATE INDEX IF NOT EXISTS jobs_issue ON jobs(issue_number);
         CREATE TABLE IF NOT EXISTS starts(job_id TEXT PRIMARY KEY,kind TEXT NOT NULL,at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS initial_launches(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL,at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS initial_launches_at ON initial_launches(at);
@@ -44,6 +53,13 @@ class State:
         CREATE TABLE IF NOT EXISTS history(kind TEXT NOT NULL,number INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(kind,number));
         ''')
         self.db.execute("UPDATE jobs SET data=json_set(data,'$.stage','revise') WHERE json_extract(data,'$.stage')='review'")
+        with self.transaction():
+            for rowid, data in self.db.execute(
+                    "SELECT rowid,data FROM jobs WHERE status IN (SELECT value FROM json_each(?)) AND (json_type(data,'$.context.history[0].body') IS NOT NULL OR json_type(data,'$.context.history[0].comments') IS NOT NULL)",
+                    (json.dumps(sorted(FINISHED)),)).fetchall():
+                job = json.loads(data)
+                # Updating in place keeps the rowid, and with it the save order callers rely on.
+                self.db.execute('UPDATE jobs SET data=? WHERE rowid=?', (json.dumps({**job, 'context': retained_context(job['context'])}), rowid))
 
     def close(self): self.db.close()
 
@@ -109,7 +125,7 @@ class State:
                 if previous and (
                     previous['status'] in ('observing','done','wait_deploy','needs_human')
                     or previous['status']=='diagnosing' and not any(
-                        job['signature']==event['signature'] and job['status'] not in TERMINAL for job in self.jobs())
+                        job['signature']==event['signature'] for job in self.unfinished_jobs())
                 ):
                     # A new immutable event can reassess a terminal job; replayed IDs returned above.
                     data.update(status='pending', due=self.clock()+debounce)
@@ -141,6 +157,8 @@ class State:
             # Cancellation cannot be cleared by a stale service result or saved snapshot.
             if job.get('cancelled') or existing and json.loads(existing[0])['cancelled']:
                 job.update(cancelled=True,status='cancelled')
+            if job['status'] in FINISHED and isinstance(job.get('context'), dict) and isinstance(job['context'].get('history'), list):
+                job['context'] = retained_context(job['context'])
             self.db.execute('INSERT OR REPLACE INTO jobs VALUES(?,?,?,?)',
                             (job['id'], job.get('issue_number'), job['status'], json.dumps(job)))
 
@@ -154,6 +172,13 @@ class State:
         # save_job mirrors data['status'] into this column, so the service loop never decodes retained jobs to skip them.
         return [json.loads(r[0]) for r in self.db.execute(
             'SELECT data FROM jobs WHERE status IN (SELECT value FROM json_each(?)) ORDER BY rowid', (json.dumps(list(statuses)),))]
+
+    def issue_jobs(self, issue_number):
+        return [json.loads(r[0]) for r in self.db.execute('SELECT data FROM jobs WHERE issue_number IS ? ORDER BY rowid', (issue_number,))]
+
+    def unfinished_jobs(self):
+        return [json.loads(r[0]) for r in self.db.execute(
+            'SELECT data FROM jobs WHERE status NOT IN (SELECT value FROM json_each(?)) ORDER BY rowid', (json.dumps(sorted(TERMINAL)),))]
 
     def update_job(self, job_id, **fields):
         with self.transaction():
@@ -226,7 +251,7 @@ class State:
             short = job['stage'] in ('initial', 'triage')
             limit = INITIAL_SECONDS if short else DEEP_SECONDS
             if not short and job.get('issue_number'):
-                limit-=sum(j['active_seconds'] for j in self.jobs() if j['id']!=job_id and j['stage'] in ('deep', 'revise') and j.get('issue_number')==job['issue_number'])
+                limit-=sum(j['active_seconds'] for j in self.issue_jobs(job['issue_number']) if j['id']!=job_id and j['stage'] in ('deep', 'revise'))
             if job['active_seconds'] >= limit: raise Deferred('active budget exhausted')
             if self.launch_after(job) > self.clock(): raise Deferred('rolling daily quota exhausted')
             if short and not job.get('quota_resume'):
@@ -237,7 +262,7 @@ class State:
             return self.update_job(job_id, status='running', lease_started=self.clock(), remaining_seconds=limit-job['active_seconds'])
 
     def issue_usage(self, issue_number):
-        jobs=[j for j in self.jobs() if j['stage'] in ('deep', 'revise') and j.get('issue_number')==issue_number]
+        jobs=[j for j in self.issue_jobs(issue_number) if j['stage'] in ('deep', 'revise')]
         started={r[0] for r in self.db.execute('SELECT job_id FROM starts')}
         return {'active_seconds':sum(j['active_seconds'] for j in jobs),
                 'cycles':sum(1+j['rounds'] for j in jobs if j['id'] in started)}
@@ -287,12 +312,11 @@ class State:
                 return self.job(reserved[0])
             manual_resume = str(event_id).isdigit() and self.owner_hold(issue_number)
             if manual_resume:
-                for previous in self.jobs():
-                    if previous['stage'] == 'triage' and previous['issue_number'] == issue_number and previous['status'] not in TERMINAL:
+                for previous in self.issue_jobs(issue_number):
+                    if previous['stage'] == 'triage' and previous['status'] not in TERMINAL:
                         self.cancel(previous['id'])
                 self.set_setting('owner_hold_'+str(issue_number), False)
-            active = [j for j in self.jobs() if j.get('issue_number') == issue_number
-                      and j['stage'] in ('deep', 'revise') and j['status'] not in TERMINAL]
+            active = [j for j in self.issue_jobs(issue_number) if j['stage'] in ('deep', 'revise') and j['status'] not in TERMINAL]
             job = active[0] if active else self.new_job('deep', origin['signature'], origin['incident_id'], issue_number=issue_number)
             if manual_resume and active and job['status'] != 'running':
                 started = self.db.execute('SELECT 1 FROM starts WHERE job_id=?', (job['id'],)).fetchone()
