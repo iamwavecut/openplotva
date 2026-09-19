@@ -30,6 +30,7 @@ class State:
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,signature TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS incidents(signature TEXT PRIMARY KEY,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,issue_number INTEGER,status TEXT NOT NULL,data TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
         CREATE TABLE IF NOT EXISTS starts(job_id TEXT PRIMARY KEY,kind TEXT NOT NULL,at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS initial_launches(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL,at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS initial_launches_at ON initial_launches(at);
@@ -149,8 +150,10 @@ class State:
         return json.loads(row[0])
 
     def jobs(self, statuses=None):
-        rows = [json.loads(r[0]) for r in self.db.execute('SELECT data FROM jobs')]
-        return [j for j in rows if statuses is None or j['status'] in statuses]
+        if statuses is None: return [json.loads(r[0]) for r in self.db.execute('SELECT data FROM jobs ORDER BY rowid')]
+        # save_job mirrors data['status'] into this column, so the service loop never decodes retained jobs to skip them.
+        return [json.loads(r[0]) for r in self.db.execute(
+            'SELECT data FROM jobs WHERE status IN (SELECT value FROM json_each(?)) ORDER BY rowid', (json.dumps(list(statuses)),))]
 
     def update_job(self, job_id, **fields):
         with self.transaction():
