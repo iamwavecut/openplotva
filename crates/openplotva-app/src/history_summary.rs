@@ -2,18 +2,25 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
+use futures_util::StreamExt;
 use openplotva_config::AppConfig;
 use openplotva_dialog::{HistorySummaryRequest, ToolboxError};
+use openplotva_history::stages::{
+    EVENTS_CHUNK_MAX_TOKENS, EVENTS_MIN_SUBSTANTIVE_MESSAGES, HistoryStage, chunk_items,
+    decode_stage_events, decode_stage_recap, events_payload, item_carries_event, merge_events,
+    recap_payload, substantive_message_count, summary_content, validated_events,
+};
 use openplotva_history::{
     DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_SUMMARY_MAX_INPUT_TOKENS,
-    HistorySummarySinceParseError, MIN_EDGE_RAW_MESSAGES, StoredSummary, SummaryDocument,
-    SummaryInput, SummaryRequest, SummaryScope, build_edge_raw_summary_input,
-    build_ordered_summary_input_assembly, build_summary_input,
-    decode_summary_message_entry_payloads, filter_summary_entries_with_content,
-    fit_summary_input_to_token_limit, history_summary_generate_error_retryable,
-    history_summary_model, history_summary_provider, history_summary_scope,
-    history_summary_timeout_seconds, merge_edge_summary_input, normalize_summary_request,
-    normalized_summary_window, parse_history_summary_since, select_reusable_summary_spans,
+    HistorySummarySinceParseError, MIN_EDGE_RAW_MESSAGES, SUMMARY_PROMPT_VERSION, StoredSummary,
+    SummaryDocument, SummaryInput, SummaryInputItem, SummaryRequest, SummaryScope,
+    build_edge_raw_summary_input, build_ordered_summary_input_assembly, build_summary_input,
+    decode_summary_message_entry_payloads, estimate_summary_tokens,
+    filter_summary_entries_with_content, fit_summary_input_to_token_limit, hash_text,
+    history_summary_generate_error_retryable, history_summary_model, history_summary_provider,
+    history_summary_scope, history_summary_timeout_seconds, merge_edge_summary_input,
+    normalize_generated_summary_content, normalize_summary_request, normalized_summary_window,
+    parse_history_summary_since, render_history_summary_html, select_reusable_summary_spans,
     stamp_summary_input_metadata, summary_message_entry_timestamp, summary_requested_range,
     summary_reset_at,
 };
@@ -39,7 +46,8 @@ use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const HISTORY_SUMMARY_TEMPERATURE: f64 = 0.2;
+/// Stage-one chunks summarized at the same time.
+const STAGE_ONE_CONCURRENCY: usize = 3;
 
 /// Concrete app history-summary service used by the dialog toolbox runtime.
 pub type AppHistorySummaryService =
@@ -58,9 +66,17 @@ pub type HistorySummaryPayloadFuture<'a> =
 pub type ReusableHistorySummariesFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<StoredSummary>, HistorySummaryInputError>> + Send + 'a>>;
 
-/// Boxed future returned by history summary generators.
-pub type HistorySummaryGenerateFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<SummaryDocument, HistorySummaryServiceError>> + Send + 'a>>;
+/// Boxed future returned by history summary stage calls.
+pub type HistoryStageFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<HistoryStageReply, HistorySummaryServiceError>> + Send + 'a>,
+>;
+
+/// A stage answer: the model's JSON text and the model that wrote it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HistoryStageReply {
+    pub text: String,
+    pub model: String,
+}
 
 /// Boxed future returned by history summary savers.
 pub type HistorySummarySaveFuture<'a> =
@@ -90,13 +106,15 @@ pub trait HistorySummaryInputStore: Send + Sync {
     ) -> ReusableHistorySummariesFuture<'a>;
 }
 
-/// Provider boundary for generating a summary document from a fully assembled input.
+/// Provider boundary for one model call of the two-stage summary.
 pub trait HistorySummaryGenerator: Send + Sync {
-    /// Generate a summary document.
-    fn generate_history_summary<'a>(
+    /// Run one stage for the summary of `input`; `payload` is the user message.
+    fn generate_history_stage<'a>(
         &'a self,
         input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a>;
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a>;
 }
 
 /// Store boundary for persisting generated history summaries.
@@ -239,11 +257,11 @@ pub struct ChatHistorySummaryService<Store, Generator> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistorySummaryServiceOptions {
-    /// Maximum input tokens before largest-message-first thinning.
+    /// Estimated tokens of one stage-one chunk.
     pub max_input_tokens: i32,
     /// Minimum contiguous raw edge messages before pre-summary cascade.
     pub edge_min_raw_messages: i32,
-    /// Frozen history summary system prompt used for input-size estimation.
+    /// Stage prompts, used for the input-size estimate and the prompt hash.
     pub system_prompt: String,
     pub timeout: Duration,
 }
@@ -253,7 +271,11 @@ impl Default for HistorySummaryServiceOptions {
         Self {
             max_input_tokens: DEFAULT_SUMMARY_MAX_INPUT_TOKENS,
             edge_min_raw_messages: MIN_EDGE_RAW_MESSAGES,
-            system_prompt: include_str!("../../../prompts/history/summary.prompt").to_owned(),
+            system_prompt: [
+                include_str!("../../../prompts/history/events.prompt"),
+                include_str!("../../../prompts/history/recap.prompt"),
+            ]
+            .concat(),
             timeout: Duration::from_secs(DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS as u64),
         }
     }
@@ -339,8 +361,8 @@ where
         let summary_request = summary_request_from_dialog_tool(&request)?;
         let mut input = build_history_summary_input(self.store.as_ref(), summary_request).await?;
         input = self.maybe_pre_summarize_edge_gap(input).await?;
-        input = self.fit_summary_input(input);
-        let doc = self.generator.generate_history_summary(&input).await?;
+        input = self.stamp_summary_input(input);
+        let doc = self.generate_document(&input).await?;
         let stored = self.store.save_history_summary(&input, &doc).await?;
         Ok(ChatHistorySummaryResult::from_stored_summary(
             &stored,
@@ -357,14 +379,12 @@ where
         else {
             return Ok(input);
         };
-        let raw_input = self.fit_summary_input(raw_input);
-        let edge_doc = self
-            .generator
-            .generate_history_summary(&raw_input)
-            .await
-            .map_err(|err| HistorySummaryServiceError::Generate {
+        let raw_input = self.stamp_summary_input(raw_input);
+        let edge_doc = self.generate_document(&raw_input).await.map_err(|err| {
+            HistorySummaryServiceError::Generate {
                 message: format!("generate edge chat history summary: {err}"),
-            })?;
+            }
+        })?;
         let edge_stored = self
             .store
             .save_history_summary(&raw_input, &edge_doc)
@@ -380,14 +400,100 @@ where
         Ok(merge_edge_summary_input(&input, &raw_input, &edge_stored))
     }
 
-    fn fit_summary_input(&self, input: SummaryInput) -> SummaryInput {
-        fit_summary_input_to_token_limit(
-            input,
-            None,
-            self.options.max_input_tokens,
-            &self.options.system_prompt,
-        )
-        .0
+    /// Stamp the input hash and token estimate; every message stays, because
+    /// long windows are split into chunks instead of thinned.
+    fn stamp_summary_input(&self, input: SummaryInput) -> SummaryInput {
+        fit_summary_input_to_token_limit(input, None, 0, &self.options.system_prompt).0
+    }
+
+    /// Two stages: events from every chunk of the window (at most
+    /// `STAGE_ONE_CONCURRENCY` chunks at a time), merged in code, then a recap
+    /// written from those events. A window without events gets the quiet recap
+    /// and no model call.
+    async fn generate_document(
+        &self,
+        input: &SummaryInput,
+    ) -> Result<SummaryDocument, HistorySummaryServiceError> {
+        let items: Vec<SummaryInputItem> = input
+            .items
+            .iter()
+            .filter(|item| item_carries_event(item))
+            .cloned()
+            .collect();
+        let chunk_tokens = self.options.max_input_tokens.min(EVENTS_CHUNK_MAX_TOKENS);
+        let chunks = chunk_items(&items, chunk_tokens);
+        let last = chunks.len().saturating_sub(1);
+        // A middle chunk with only a few substantive messages is noise; the last
+        // chunk holds the newest messages and is kept whenever it has any.
+        let chunks: Vec<Vec<SummaryInputItem>> = chunks
+            .into_iter()
+            .enumerate()
+            .filter(|(index, chunk)| {
+                let substantive = substantive_message_count(chunk);
+                chunk.iter().any(|item| item.kind == "summary")
+                    || (substantive > 0
+                        && (*index == last || substantive >= EVENTS_MIN_SUBSTANTIVE_MESSAGES))
+            })
+            .map(|(_, chunk)| chunk)
+            .collect();
+        let payloads: Vec<String> = chunks
+            .iter()
+            .map(|chunk| events_payload(input, chunk))
+            .collect();
+        let calls: Vec<HistoryStageFuture<'_>> = payloads
+            .iter()
+            .map(|payload| {
+                self.generator
+                    .generate_history_stage(input, HistoryStage::Events, payload)
+            })
+            .collect();
+        let replies: Vec<Result<HistoryStageReply, HistorySummaryServiceError>> =
+            futures_util::stream::iter(calls)
+                .buffered(STAGE_ONE_CONCURRENCY)
+                .collect()
+                .await;
+        let mut model = String::new();
+        let mut per_chunk = Vec::with_capacity(chunks.len());
+        for (chunk, reply) in chunks.iter().zip(replies) {
+            let reply = reply?;
+            let answer = decode_stage_events(&reply.text).map_err(|err| {
+                HistorySummaryServiceError::Generate {
+                    message: format!("decode chat history events: {err}"),
+                }
+            })?;
+            per_chunk.push(validated_events(chunk, answer));
+            model = reply.model;
+        }
+        let events = merge_events(per_chunk);
+        let recap = if events.is_empty() {
+            None
+        } else {
+            let payload = recap_payload(input, &events, OffsetDateTime::now_utc());
+            let reply = self
+                .generator
+                .generate_history_stage(input, HistoryStage::Recap, &payload)
+                .await?;
+            model = reply.model;
+            Some(decode_stage_recap(&reply.text).map_err(|err| {
+                HistorySummaryServiceError::Generate {
+                    message: format!("decode chat history recap: {err}"),
+                }
+            })?)
+        };
+        let content = normalize_generated_summary_content(summary_content(&events, recap));
+        Ok(SummaryDocument {
+            html: render_history_summary_html(&content),
+            output_token_estimate: estimate_summary_tokens(&content),
+            quality_score: content.quality_score,
+            quality_notes: content.quality_notes.clone(),
+            content,
+            model,
+            prompt_version: SUMMARY_PROMPT_VERSION.to_owned(),
+            prompt_hash: hash_text(&self.options.system_prompt),
+            input_hash: input.input_hash.clone(),
+            input_token_estimate: input.input_token_estimate,
+            cascade_depth: input.cascade_depth,
+        })
     }
 }
 
@@ -418,11 +524,9 @@ pub fn aifarm_history_summary_config_from_app_config(
         },
         model,
         max_output_tokens: 1024,
-        temperature: Some(
-            memory
-                .aifarm_temperature
-                .unwrap_or(HISTORY_SUMMARY_TEMPERATURE),
-        ),
+        temperature: memory.aifarm_temperature,
+        top_p: None,
+        top_k: None,
         enable_thinking: Some(false),
         include_reasoning: Some(false),
     }
@@ -809,17 +913,24 @@ impl<T> HistorySummaryGenerator for openplotva_llm::aifarm::AifarmHistorySummary
 where
     T: openplotva_llm::aifarm::AifarmHttpTransport + Clone + 'static,
 {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
-        input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        _input: &'a SummaryInput,
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         Box::pin(async move {
             let mut ignore_status = |_status: openplotva_llm::aifarm::StatusUpdate| {};
-            self.generate_document(input, &mut ignore_status)
+            let text = self
+                .complete_stage(stage, payload, &mut ignore_status)
                 .await
                 .map_err(|err| HistorySummaryServiceError::Generate {
                     message: err.to_string(),
-                })
+                })?;
+            Ok(HistoryStageReply {
+                text,
+                model: self.model().to_owned(),
+            })
         })
     }
 }
@@ -828,15 +939,21 @@ impl<T> HistorySummaryGenerator for openplotva_llm::gemini::GeminiHistorySummary
 where
     T: openplotva_llm::aifarm::AifarmHttpTransport + 'static,
 {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
-        input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        _input: &'a SummaryInput,
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         Box::pin(async move {
-            self.generate_document(input).await.map_err(|err| {
+            let text = self.complete_stage(stage, payload).await.map_err(|err| {
                 HistorySummaryServiceError::Generate {
                     message: err.to_string(),
                 }
+            })?;
+            Ok(HistoryStageReply {
+                text,
+                model: self.model().to_owned(),
             })
         })
     }
@@ -846,30 +963,44 @@ impl<T> HistorySummaryGenerator for GenkitOpenAiCompatibleHistorySummaryGenerato
 where
     T: openplotva_llm::aifarm::AifarmHttpTransport + 'static,
 {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
-        input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        _input: &'a SummaryInput,
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         Box::pin(async move {
-            self.generate_document(input).await.map_err(|err| {
+            let text = self.complete_stage(stage, payload).await.map_err(|err| {
                 HistorySummaryServiceError::Generate {
                     message: err.to_string(),
                 }
+            })?;
+            Ok(HistoryStageReply {
+                text,
+                model: self.model().to_owned(),
             })
         })
     }
 }
 
 impl HistorySummaryGenerator for AppGenkitHistorySummaryGenerator {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
         input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         Box::pin(async move {
             match self {
-                Self::Gemini(generator) => generator.generate_history_summary(input).await,
+                Self::Gemini(generator) => {
+                    generator
+                        .generate_history_stage(input, stage, payload)
+                        .await
+                }
                 Self::OpenAiCompatible(generator) => {
-                    generator.generate_history_summary(input).await
+                    generator
+                        .generate_history_stage(input, stage, payload)
+                        .await
                 }
             }
         })
@@ -877,10 +1008,12 @@ impl HistorySummaryGenerator for AppGenkitHistorySummaryGenerator {
 }
 
 impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
         input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         Box::pin(async move {
             let config = self.config.clone();
             let result = self
@@ -898,14 +1031,17 @@ impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
                     move |attempt| {
                         let config = config.clone();
                         async move {
-                            generate_history_summary_with_attempt(&config, attempt, input).await
+                            generate_history_stage_with_attempt(
+                                &config, attempt, input, stage, payload,
+                            )
+                            .await
                         }
                     },
                     history_summary_service_retryable_reason,
                 )
                 .await;
             match result {
-                Ok(doc) => Ok(doc),
+                Ok(reply) => Ok(reply),
                 Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
                 Err(RoutedAttemptRunError::Routing(error)) => {
                     Err(HistorySummaryServiceError::Generate {
@@ -917,22 +1053,28 @@ impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
     }
 }
 
-async fn generate_history_summary_with_attempt(
+async fn generate_history_stage_with_attempt(
     config: &AppConfig,
     attempt: RoutedAttempt,
     input: &SummaryInput,
-) -> Result<SummaryDocument, HistorySummaryServiceError> {
+    stage: HistoryStage,
+    payload: &str,
+) -> Result<HistoryStageReply, HistorySummaryServiceError> {
     if routed_attempt_is_genkit(&attempt) {
         let model = genkit_model_for_attempt(&attempt);
         let generator = genkit_history_summary_generator_from_app_config(config, Some(&model))
             .map_err(|error| HistorySummaryServiceError::Generate {
                 message: error.to_string(),
             })?;
-        return generator.generate_history_summary(input).await;
+        return generator
+            .generate_history_stage(input, stage, payload)
+            .await;
     }
     let generator =
         AifarmHistorySummaryGenerator::new(aifarm_history_config_for_attempt(config, &attempt));
-    generator.generate_history_summary(input).await
+    generator
+        .generate_history_stage(input, stage, payload)
+        .await
 }
 
 fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
@@ -1030,10 +1172,12 @@ fn history_summary_service_retryable_reason(
 }
 
 impl HistorySummaryGenerator for RuntimeHistorySummaryGenerator {
-    fn generate_history_summary<'a>(
+    fn generate_history_stage<'a>(
         &'a self,
         input: &'a SummaryInput,
-    ) -> HistorySummaryGenerateFuture<'a> {
+        stage: HistoryStage,
+        payload: &'a str,
+    ) -> HistoryStageFuture<'a> {
         match self {
             Self::Aifarm {
                 primary,
@@ -1041,8 +1185,14 @@ impl HistorySummaryGenerator for RuntimeHistorySummaryGenerator {
                 fallback,
             } => Box::pin(async move {
                 let mut ignore_status = |_status: openplotva_llm::aifarm::StatusUpdate| {};
-                match primary.generate_document(input, &mut ignore_status).await {
-                    Ok(doc) => Ok(doc),
+                match primary
+                    .complete_stage(stage, payload, &mut ignore_status)
+                    .await
+                {
+                    Ok(text) => Ok(HistoryStageReply {
+                        text,
+                        model: primary_model.trim().to_owned(),
+                    }),
                     Err(err) => {
                         if !aifarm_history_summary_error_retryable(&err) {
                             return Err(HistorySummaryServiceError::Generate {
@@ -1054,10 +1204,10 @@ impl HistorySummaryGenerator for RuntimeHistorySummaryGenerator {
                                 message: err.to_string(),
                             });
                         };
-                        match fallback.generate_history_summary(input).await {
-                            Ok(mut doc) => {
-                                doc.model = primary_model.trim().to_owned();
-                                Ok(doc)
+                        match fallback.generate_history_stage(input, stage, payload).await {
+                            Ok(mut reply) => {
+                                reply.model = primary_model.trim().to_owned();
+                                Ok(reply)
                             }
                             Err(fallback_err) => Err(HistorySummaryServiceError::Generate {
                                 message: format!(
@@ -1068,7 +1218,7 @@ impl HistorySummaryGenerator for RuntimeHistorySummaryGenerator {
                     }
                 }
             }),
-            Self::Genkit(generator) => generator.generate_history_summary(input),
+            Self::Genkit(generator) => generator.generate_history_stage(input, stage, payload),
         }
     }
 }
@@ -1090,7 +1240,7 @@ mod tests {
 
     use openplotva_dialog::ToolContext;
     use openplotva_history::{
-        StoredSummary, SummaryContent, SummaryMessageEntry, SummaryWindow, prepare_stored_summary,
+        StoredSummary, SummaryMessageEntry, SummaryWindow, prepare_stored_summary,
     };
     use time::format_description::well_known::Rfc3339;
 
@@ -1214,29 +1364,54 @@ mod tests {
     #[derive(Default)]
     struct FakeHistorySummaryGenerator {
         inputs: Mutex<Vec<SummaryInput>>,
+        stages: Mutex<Vec<HistoryStage>>,
     }
 
     impl HistorySummaryGenerator for FakeHistorySummaryGenerator {
-        fn generate_history_summary<'a>(
+        fn generate_history_stage<'a>(
             &'a self,
             input: &'a SummaryInput,
-        ) -> HistorySummaryGenerateFuture<'a> {
+            stage: HistoryStage,
+            _payload: &'a str,
+        ) -> HistoryStageFuture<'a> {
             Box::pin(async move {
-                self.inputs
-                    .lock()
-                    .expect("generator inputs")
-                    .push(input.clone());
-                Ok(SummaryDocument {
-                    content: SummaryContent {
-                        events: vec!["thread recap".to_owned()],
-                        recap: "done".to_owned(),
-                        quality_score: 0.5,
-                        ..SummaryContent::default()
-                    },
-                    html: "• thread recap\n\ndone".to_owned(),
+                self.stages.lock().expect("stages").push(stage);
+                let text = match stage {
+                    HistoryStage::Events => {
+                        self.inputs
+                            .lock()
+                            .expect("generator inputs")
+                            .push(input.clone());
+                        let source = input
+                            .items
+                            .first()
+                            .map(openplotva_history::stages::item_source_id)
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "events": [{
+                                "source_ids": [source],
+                                "title": "thread recap",
+                                "description": "",
+                                "actors": [],
+                                "confidence": 0.9
+                            }],
+                            "nothing_notable": false
+                        })
+                        .to_string()
+                    }
+                    HistoryStage::Recap => serde_json::json!({
+                        "recap": "done",
+                        "actors": [],
+                        "open_questions": [],
+                        "source_style": "хроника",
+                        "quality_score": 0.5,
+                        "quality_notes": ""
+                    })
+                    .to_string(),
+                };
+                Ok(HistoryStageReply {
+                    text,
                     model: "test-model".to_owned(),
-                    prompt_hash: "prompt-hash".to_owned(),
-                    ..SummaryDocument::default()
                 })
             })
         }
@@ -1448,29 +1623,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_history_summary_service_fits_input_before_generation_like_go() {
+    async fn chat_history_summary_keeps_every_message_and_chunks_long_windows() {
         let base = OffsetDateTime::parse("2026-05-20T10:00:00Z", &Rfc3339).expect("base");
         let store = Arc::new(FakeHistorySummaryStore::default());
-        *store.payloads.lock().expect("payloads") = vec![
-            entry_payload(
-                10,
-                base + time::Duration::minutes(1),
-                "large visible message that must be thinned",
-            ),
-            entry_payload(
-                11,
-                base + time::Duration::minutes(2),
-                "another large visible message that must be thinned",
-            ),
-        ];
+        *store.payloads.lock().expect("payloads") = (1..=40)
+            .map(|index| {
+                entry_payload(
+                    index,
+                    base + time::Duration::minutes(i64::from(index)),
+                    "long visible message about plans for the weekend and the new project",
+                )
+            })
+            .collect();
         let generator = Arc::new(FakeHistorySummaryGenerator::default());
         let service = ChatHistorySummaryService::new_with_options(
             store,
             generator.clone(),
-            HistorySummaryServiceOptions::default().with_max_input_tokens(1),
+            HistorySummaryServiceOptions::default().with_max_input_tokens(400),
         );
 
-        service
+        let result = service
+            .summarize(HistorySummaryRequest {
+                context: ToolContext {
+                    chat_id: 100,
+                    user_id: 55,
+                    ..ToolContext::default()
+                },
+                window: "messages".to_owned(),
+                message_count: 40,
+                ..HistorySummaryRequest::default()
+            })
+            .await
+            .expect("summary result");
+
+        let stages = generator.stages.lock().expect("stages");
+        let event_calls = stages
+            .iter()
+            .filter(|stage| **stage == HistoryStage::Events)
+            .count();
+        assert!(event_calls > 1, "the window is split into chunks");
+        assert_eq!(stages.last(), Some(&HistoryStage::Recap));
+        let inputs = generator.inputs.lock().expect("generator inputs");
+        assert!(inputs.iter().all(|input| input.omitted_message_count == 0));
+        assert_eq!(inputs[0].items.len(), 40);
+        assert_eq!(result.raw_message_count, 40);
+    }
+
+    #[tokio::test]
+    async fn quiet_window_is_summarized_without_a_model_call() {
+        let base = OffsetDateTime::parse("2026-05-20T10:00:00Z", &Rfc3339).expect("base");
+        let store = Arc::new(FakeHistorySummaryStore::default());
+        *store.payloads.lock().expect("payloads") = vec![
+            entry_payload(1, base + time::Duration::minutes(1), "ок"),
+            entry_payload(2, base + time::Duration::minutes(2), "+"),
+        ];
+        let generator = Arc::new(FakeHistorySummaryGenerator::default());
+        let service = ChatHistorySummaryService::new(store, generator.clone());
+
+        let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
                     chat_id: 100,
@@ -1484,11 +1694,12 @@ mod tests {
             .await
             .expect("summary result");
 
-        let inputs = generator.inputs.lock().expect("generator inputs");
-        assert_eq!(inputs.len(), 1);
-        assert!(inputs[0].items.is_empty());
-        assert_eq!(inputs[0].omitted_message_count, 2);
-        assert!(inputs[0].input_token_estimate > 0);
+        assert!(generator.stages.lock().expect("stages").is_empty());
+        assert!(result.summary_json.events.is_empty());
+        assert_eq!(
+            result.summary_json.recap,
+            openplotva_history::stages::QUIET_RECAP
+        );
     }
 
     #[test]

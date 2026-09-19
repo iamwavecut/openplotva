@@ -8,10 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub mod stages;
+
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "history";
 
-pub const SUMMARY_PROMPT_VERSION: &str = "chat_history_summary_v1";
+pub const SUMMARY_PROMPT_VERSION: &str = "chat_history_summary_v2";
 pub const MAX_SUMMARY_MESSAGES: i32 = 500;
 pub const MIN_EDGE_RAW_MESSAGES: i32 = 20;
 pub const SUMMARY_WINDOW_TTL_HOURS: i64 = 24;
@@ -2515,7 +2517,7 @@ fn clamp_quality_score(score: f64) -> f64 {
     score.clamp(0.0, 1.0)
 }
 
-fn go_zero_time() -> OffsetDateTime {
+pub(crate) fn go_zero_time() -> OffsetDateTime {
     let date = match time::Date::from_calendar_date(1, time::Month::January, 1) {
         Ok(date) => date,
         Err(_) => unreachable!("year 1 January 1 is representable"),
@@ -2584,7 +2586,7 @@ fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
-fn deserialize_f64_loose<'de, D>(deserializer: D) -> Result<f64, D::Error>
+pub(crate) fn deserialize_f64_loose<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: Deserializer<'de>,
 {
