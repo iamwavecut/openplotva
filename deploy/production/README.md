@@ -8,6 +8,8 @@ Every deploy builds the release binary and runtime image from the exact dispatch
 `main` commit and pushes it to GHCR tagged with that commit SHA. Pull request CI does
 not build images. The release build cache is scoped to `main`, so a deploy with an
 unchanged `Cargo.lock` recompiles only the workspace crates.
+Before touching the host, the deploy waits for the CI run of the same commit after its
+push to `main` and stops unless that run succeeded.
 After a successful deploy, local Docker and GHCR cleanup keep only the current
 main-SHA image; they do not maintain rollback image history.
 

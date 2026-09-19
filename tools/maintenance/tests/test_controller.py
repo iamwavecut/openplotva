@@ -702,6 +702,21 @@ class ControllerTests(unittest.TestCase):
         snapshot['checks']=[{**required,'conclusion':'neutral'},report]
         self.assertFalse(review_ready(snapshot,['Semgrep CE'],handled))
 
+    def test_missing_code_scanning_configuration_notice_does_not_block_readiness(self):
+        required={'id':1,'name':'Rust workspace','head_sha':BASE,'status':'completed','conclusion':'success'}
+        notice={'id':2,'name':'CodeQL','app':{'id':57789,'slug':'github-advanced-security'},'head_sha':BASE,
+                'status':'completed','conclusion':'neutral','output':{'title':'1 configuration not found'}}
+        snapshot={'head':BASE,'checks':[required,notice],'statuses':[],'threads':[],'artifacts':[]}
+        self.assertTrue(review_ready(snapshot,['Rust workspace'],{}))
+        snapshot['checks']=[required,{**notice,'output':{'title':'2 configurations not found'}}]
+        self.assertTrue(review_ready(snapshot,['Rust workspace'],{}))
+        for fields in ({'conclusion':'failure'},{'status':'in_progress'},{'head_sha':'b'*40},
+                       {'app':{'id':123,'slug':'github-advanced-security'}},{'output':{'title':'1 new alert'}},{'output':None}):
+            snapshot['checks']=[required,{**notice,**fields}]
+            self.assertFalse(review_ready(snapshot,['Rust workspace'],{}))
+        snapshot['checks']=[required,notice]
+        self.assertFalse(review_ready(snapshot,['Rust workspace','CodeQL'],{}))
+
     def test_context_failure_after_previous_attempt_is_bounded(self):
         job=self.incident(); self.state.update_job(job['id'],base_sha=BASE)
         def unavailable(): raise Deferred('index unavailable')

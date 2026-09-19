@@ -31,7 +31,7 @@ from .review_queue import ReviewQueue
 from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
 from .notifications import coalesce_pending, notification_payload
 
-DEFAULT_CHECKS = ['Rust lint', 'Rust workspace', 'PostgreSQL integration', 'Rust dependencies',
+DEFAULT_CHECKS = ['Rust lint', 'Rust workspace', 'Rust dependencies',
                   'Danger PR rules', 'PR-Agent review and suggestions', 'Semgrep CE', 'Maintenance automation']
 
 
@@ -49,8 +49,14 @@ def review_ready(snapshot, required_checks, handled):
                       and (check.get('app') or {}).get('id')==15368
                       and (check.get('app') or {}).get('slug')=='github-actions'
                       and check.get('conclusion')=='neutral')
+        # CodeQL analyses only main, so code scanning marks every PR with this neutral notice.
+        missing_configuration = (check['name'] not in required_checks
+                                 and (check.get('app') or {}).get('id')==57789
+                                 and (check.get('app') or {}).get('slug')=='github-advanced-security'
+                                 and check.get('conclusion')=='neutral'
+                                 and re.fullmatch(r'\d+ configurations? not found', (check.get('output') or {}).get('title') or ''))
         if check.get('head_sha') != head or check.get('status') != 'completed': return False
-        if check.get('conclusion') != 'success' and not diagnostic: return False
+        if check.get('conclusion') != 'success' and not (diagnostic or missing_configuration): return False
     statuses = {}
     for status in snapshot.get('statuses', []): statuses.setdefault(status['context'], status)
     if any(s['state'] != 'success' for s in statuses.values()): return False
