@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "21 3 * * 1"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SEMGREP_VERSION: "1.163.0"
 
@@ -21,6 +25,7 @@ permissions:
 jobs:
   codeql-rust:
     name: CodeQL Rust
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -28,14 +28,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cache Rust toolchain
-        uses: actions/cache@v6 # v4
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.rustup/update-hashes
-          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-deep-v1
-
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
