@@ -1,7 +1,10 @@
 //! App-level YouTube summary runtime for the dialog toolbox.
 
 use std::{
+    collections::HashMap,
     error::Error,
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,7 +34,6 @@ const INNERTUBE_CLIENT_VERSION: &str = "20.10.38";
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const YOUTUBE_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 8192;
 const YOUTUBE_SUMMARY_TEMPERATURE: f64 = 0.3;
 const YOUTUBE_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -236,46 +238,41 @@ impl RoutedYouTubeSummarizer {
     }
 
     async fn run(&self, video: &str) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
-        let transcript = self.transcript.transcript_for_video(video).await?;
-        if transcript.is_empty() {
-            return Ok(YouTubeSummaryResult {
-                summary: String::new(),
-                transcript,
-            });
-        }
-        let summary = self.generate_summary(&transcript).await?;
-        Ok(YouTubeSummaryResult {
-            summary: summary.trim().to_owned(),
-            transcript,
-        })
+        let fetched = self.transcript.transcript_for_video(video).await?;
+        summary_result(self, fetched).await
     }
+}
 
-    async fn generate_summary(&self, transcript: &str) -> Result<String, YouTubeSummaryError> {
-        let config = Arc::clone(&self.config);
-        let transcript = transcript.to_owned();
-        self.walker
-            .run(
-                RoutedRequestContext {
-                    workflow_key: "youtube_summary".to_owned(),
-                    vip: false,
-                    ..RoutedRequestContext::default()
-                },
-                move |attempt| {
-                    let config = Arc::clone(&config);
-                    let transcript = transcript.clone();
-                    async move {
-                        generate_youtube_summary_with_attempt(&config, attempt, &transcript).await
+impl YouTubeSummaryModel for RoutedYouTubeSummarizer {
+    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
+        Box::pin(async move {
+            let config = Arc::clone(&self.config);
+            let payload = payload.to_owned();
+            self.walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "youtube_summary".to_owned(),
+                        vip: false,
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let config = Arc::clone(&config);
+                        let payload = payload.clone();
+                        async move {
+                            generate_youtube_summary_with_attempt(&config, attempt, stage, &payload)
+                                .await
+                        }
+                    },
+                    youtube_summary_retryable,
+                )
+                .await
+                .map_err(|error| match error {
+                    RoutedAttemptRunError::Attempt(error) => error,
+                    RoutedAttemptRunError::Routing(error) => {
+                        YouTubeSummaryError::Http(error.to_string())
                     }
-                },
-                youtube_summary_retryable,
-            )
-            .await
-            .map_err(|error| match error {
-                RoutedAttemptRunError::Attempt(error) => error,
-                RoutedAttemptRunError::Routing(error) => {
-                    YouTubeSummaryError::Http(error.to_string())
-                }
-            })
+                })
+        })
     }
 }
 
@@ -325,21 +322,14 @@ impl GeminiYouTubeSummarizer {
     }
 
     async fn run(&self, video: &str) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
-        let transcript = self.transcript_for_video(video).await?;
-        if transcript.is_empty() {
-            return Ok(YouTubeSummaryResult {
-                summary: String::new(),
-                transcript,
-            });
-        }
-        let summary = self.generate_summary(&transcript).await?;
-        Ok(YouTubeSummaryResult {
-            summary: summary.trim().to_owned(),
-            transcript,
-        })
+        let fetched = self.transcript_for_video(video).await?;
+        summary_result(self, fetched).await
     }
 
-    async fn transcript_for_video(&self, video: &str) -> Result<String, YouTubeSummaryError> {
+    async fn transcript_for_video(
+        &self,
+        video: &str,
+    ) -> Result<FetchedTranscript, YouTubeSummaryError> {
         if self.cfg.api_key.trim().is_empty() {
             return Err(YouTubeSummaryError::MissingGoogleAiKey);
         }
@@ -351,13 +341,13 @@ impl GeminiYouTubeSummarizer {
         )
         .await
         .map_err(|_| YouTubeSummaryError::Http("context deadline exceeded".to_owned()))??;
-        Ok(transcript.trim().to_owned())
+        Ok(FetchedTranscript::new(&transcript))
     }
 
     async fn fetch_youtube_transcript(
         &self,
         video_id: &str,
-    ) -> Result<String, YouTubeSummaryError> {
+    ) -> Result<Vec<Transcript>, YouTubeSummaryError> {
         let (watch_html, consent_cookie) = self.fetch_video_page(video_id).await?;
         let api_key = extract_innertube_api_key(&watch_html).ok_or_else(|| {
             YouTubeSummaryError::Transcript("innerTube API key not found".to_owned())
@@ -379,9 +369,7 @@ impl GeminiYouTubeSummarizer {
                 lines,
             });
         }
-        Ok(trim_youtube_transcript_like_go(&format_text_transcripts(
-            &transcripts,
-        )))
+        Ok(transcripts)
     }
 
     async fn fetch_video_page(
@@ -470,9 +458,13 @@ impl GeminiYouTubeSummarizer {
         )))
     }
 
-    async fn generate_summary(&self, transcript: &str) -> Result<String, YouTubeSummaryError> {
-        let system = openplotva_prompts::read("youtube/summary_system")?;
-        let request = youtube_summary_gemini_request(&system, transcript);
+    async fn generate(
+        &self,
+        stage: YouTubeStage,
+        payload: &str,
+    ) -> Result<String, YouTubeSummaryError> {
+        let system = openplotva_prompts::read(stage.prompt_name())?;
+        let request = youtube_summary_gemini_request(&system, payload, stage);
         let model = cache_contour_model(&self.cfg.model);
         let url = gemini_generate_url(&self.cfg.base_url, &model)?;
         let trace = YouTubeCallTrace::begin(
@@ -501,6 +493,12 @@ impl GeminiYouTubeSummarizer {
             )));
         }
         decode_gemini_text(&body)
+    }
+}
+
+impl YouTubeSummaryModel for GeminiYouTubeSummarizer {
+    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
+        Box::pin(self.generate(stage, payload))
     }
 }
 
@@ -549,23 +547,17 @@ impl OpenAiCompatibleYouTubeSummarizer {
     }
 
     async fn run(&self, video: &str) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
-        let transcript = self.transcript.transcript_for_video(video).await?;
-        if transcript.is_empty() {
-            return Ok(YouTubeSummaryResult {
-                summary: String::new(),
-                transcript,
-            });
-        }
-        let summary = self.generate_summary(&transcript).await?;
-        Ok(YouTubeSummaryResult {
-            summary: summary.trim().to_owned(),
-            transcript,
-        })
+        let fetched = self.transcript.transcript_for_video(video).await?;
+        summary_result(self, fetched).await
     }
 
-    async fn generate_summary(&self, transcript: &str) -> Result<String, YouTubeSummaryError> {
-        let system = openplotva_prompts::read("youtube/summary_system")?;
-        let request = youtube_summary_openai_request(&self.cfg.model, &system, transcript);
+    async fn generate(
+        &self,
+        stage: YouTubeStage,
+        payload: &str,
+    ) -> Result<String, YouTubeSummaryError> {
+        let system = openplotva_prompts::read(stage.prompt_name())?;
+        let request = youtube_summary_openai_request(&self.cfg.model, &system, payload, stage);
         let trace = YouTubeCallTrace::begin(
             YouTubeTraceTags {
                 provider: self.provider,
@@ -595,6 +587,12 @@ impl OpenAiCompatibleYouTubeSummarizer {
     }
 }
 
+impl YouTubeSummaryModel for OpenAiCompatibleYouTubeSummarizer {
+    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
+        Box::pin(self.generate(stage, payload))
+    }
+}
+
 impl YouTubeSummarizer for OpenAiCompatibleYouTubeSummarizer {
     fn summarize<'a>(&'a self, video: &'a str) -> YouTubeSummaryFuture<'a> {
         Box::pin(async move {
@@ -608,11 +606,12 @@ impl YouTubeSummarizer for OpenAiCompatibleYouTubeSummarizer {
 async fn generate_youtube_summary_with_attempt(
     config: &AppConfig,
     attempt: RoutedAttempt,
-    transcript: &str,
+    stage: YouTubeStage,
+    payload: &str,
 ) -> Result<String, YouTubeSummaryError> {
-    let system = openplotva_prompts::read("youtube/summary_system")?;
+    let system = openplotva_prompts::read(stage.prompt_name())?;
     let model = youtube_model_for_attempt(&attempt);
-    let request = youtube_summary_openai_request(&model, &system, transcript);
+    let request = youtube_summary_openai_request(&model, &system, payload, stage);
     let endpoint = routed_attempt_endpoint(&attempt).ok_or_else(|| {
         YouTubeSummaryError::Http("routed provider has no chat completions endpoint".to_owned())
     })?;
@@ -699,6 +698,14 @@ impl YouTubeCallTrace {
         let prompt_chars = raw_request.as_ref().map_or(0, |value| {
             i32::try_from(value.to_string().len()).unwrap_or(i32::MAX)
         });
+        let request_param = |openai: &str, gemini: &str| {
+            raw_request
+                .as_ref()
+                .and_then(|value| value.get(openai).or_else(|| value.pointer(gemini)))
+                .cloned()
+        };
+        let max_tokens = request_param("max_tokens", "/generationConfig/maxOutputTokens");
+        let temperature = request_param("temperature", "/generationConfig/temperature");
         Self {
             artifact: DialogTraceArtifacts {
                 provider: tags.provider.trim().to_owned(),
@@ -710,8 +717,8 @@ impl YouTubeCallTrace {
                 model: model.trim().to_owned(),
                 raw_request,
                 inference_params: Some(json!({
-                    "max_tokens": YOUTUBE_SUMMARY_MAX_OUTPUT_TOKENS,
-                    "temperature": YOUTUBE_SUMMARY_TEMPERATURE,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
                 })),
                 prompt_chars,
                 prompt_messages: 2,
@@ -1195,7 +1202,11 @@ fn trim_youtube_transcript_like_go(transcript: &str) -> String {
     trimmed[..end].to_owned()
 }
 
-fn youtube_summary_gemini_request(system: &str, transcript: &str) -> GeminiTextRequest {
+fn youtube_summary_gemini_request(
+    system: &str,
+    payload: &str,
+    stage: YouTubeStage,
+) -> GeminiTextRequest {
     GeminiTextRequest {
         system_instruction: Some(GeminiTextContent {
             role: String::new(),
@@ -1206,21 +1217,34 @@ fn youtube_summary_gemini_request(system: &str, transcript: &str) -> GeminiTextR
         contents: vec![GeminiTextContent {
             role: "user".to_owned(),
             parts: vec![GeminiTextPart {
-                text: transcript.to_owned(),
+                text: payload.to_owned(),
             }],
         }],
         generation_config: GeminiTextGenerationConfig {
-            max_output_tokens: YOUTUBE_SUMMARY_MAX_OUTPUT_TOKENS,
+            max_output_tokens: stage.max_output_tokens(),
             temperature: YOUTUBE_SUMMARY_TEMPERATURE,
+            response_mime_type: "application/json".to_owned(),
         },
+    }
+}
+
+/// Qwen 3.6/3.8 publish temperature 0.7, top_p 0.8 and top_k 20 for
+/// non-thinking use; other models keep the previous 0.3.
+fn youtube_sampling(model: &str) -> (f64, Option<f64>, Option<i32>) {
+    if model.to_ascii_lowercase().contains("qwen") {
+        (0.7, Some(0.8), Some(20))
+    } else {
+        (YOUTUBE_SUMMARY_TEMPERATURE, None, None)
     }
 }
 
 fn youtube_summary_openai_request(
     model: &str,
     system: &str,
-    transcript: &str,
+    payload: &str,
+    stage: YouTubeStage,
 ) -> OpenAiChatCompletionRequest {
+    let (temperature, top_p, top_k) = youtube_sampling(model);
     OpenAiChatCompletionRequest {
         model: model.to_owned(),
         messages: vec![
@@ -1230,11 +1254,14 @@ fn youtube_summary_openai_request(
             },
             OpenAiChatMessage {
                 role: "user".to_owned(),
-                content: transcript.to_owned(),
+                content: payload.to_owned(),
             },
         ],
-        max_tokens: YOUTUBE_SUMMARY_MAX_OUTPUT_TOKENS,
-        temperature: YOUTUBE_SUMMARY_TEMPERATURE,
+        max_tokens: stage.max_output_tokens(),
+        temperature,
+        top_p,
+        top_k,
+        response_format: json!({"type": "json_object"}),
     }
 }
 
@@ -1264,6 +1291,7 @@ struct GeminiTextPart {
 struct GeminiTextGenerationConfig {
     max_output_tokens: i32,
     temperature: f64,
+    response_mime_type: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1272,6 +1300,11 @@ struct OpenAiChatCompletionRequest {
     messages: Vec<OpenAiChatMessage>,
     max_tokens: i32,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<i32>,
+    response_format: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1431,6 +1464,353 @@ fn http_error_text(error: reqwest::Error) -> YouTubeSummaryError {
     YouTubeSummaryError::Http(error.without_url().to_string())
 }
 
+/// Longest segment built from merged caption fragments.
+const SEGMENT_MAX_CHARS: usize = 240;
+/// Transcripts longer than this are summarized in parts and merged.
+const SINGLE_CALL_MAX_CHARS: usize = 40_000;
+/// Characters per part of a long transcript.
+const PART_MAX_CHARS: usize = 30_000;
+/// Most sections a summary shows.
+const MAX_SUMMARY_SECTIONS: usize = 12;
+const SUMMARY_TASK_LINE: &str =
+    "По транскрипту выше верни JSON с саммари, как описано в инструкции.";
+const MERGE_TASK_LINE: &str =
+    "По частям выше верни один JSON с саммари всего видео, как описано в инструкции.";
+
+/// The model calls of a summary: one per transcript (or per part of a long
+/// one), and a merge call over the parts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YouTubeStage {
+    Summary,
+    Merge,
+}
+
+impl YouTubeStage {
+    const fn prompt_name(self) -> &'static str {
+        match self {
+            Self::Summary => "youtube/summary_system",
+            Self::Merge => "youtube/merge",
+        }
+    }
+
+    const fn max_output_tokens(self) -> i32 {
+        match self {
+            Self::Summary => 3072,
+            Self::Merge => 8192,
+        }
+    }
+}
+
+type YouTubeModelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, YouTubeSummaryError>> + Send + 'a>>;
+
+/// One summary model call on a summarizer's transport; returns the JSON text.
+trait YouTubeSummaryModel: Send + Sync {
+    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a>;
+}
+
+/// A merged caption sentence with its id and start time.
+#[derive(Clone, Debug, PartialEq)]
+struct TranscriptSegment {
+    id: String,
+    start: f64,
+    text: String,
+}
+
+/// A fetched transcript: the text handed to the dialog (trimmed as before) and
+/// the numbered segments the summary is built from.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct FetchedTranscript {
+    text: String,
+    segments: Vec<TranscriptSegment>,
+}
+
+impl FetchedTranscript {
+    fn new(transcripts: &[Transcript]) -> Self {
+        Self {
+            text: trim_youtube_transcript_like_go(&format_text_transcripts(transcripts))
+                .trim()
+                .to_owned(),
+            segments: transcript_segments(transcripts),
+        }
+    }
+}
+
+/// Merge the preferred track's caption fragments into sentences: a segment ends
+/// at sentence punctuation or at `SEGMENT_MAX_CHARS`, keeps the start of its
+/// first fragment, and gets the id `s1`, `s2`, …
+fn transcript_segments(transcripts: &[Transcript]) -> Vec<TranscriptSegment> {
+    let Some(track) = transcripts
+        .iter()
+        .find(|track| track.lines.iter().any(|line| !line.text.trim().is_empty()))
+    else {
+        return Vec::new();
+    };
+    let mut segments = Vec::new();
+    let mut text = String::new();
+    let mut start = 0.0;
+    for line in &track.lines {
+        let piece = line.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if piece.is_empty() {
+            continue;
+        }
+        if text.is_empty() {
+            start = line.start;
+        } else {
+            text.push(' ');
+        }
+        text.push_str(&piece);
+        if text.ends_with(['.', '!', '?', '…']) || text.chars().count() >= SEGMENT_MAX_CHARS {
+            segments.push(TranscriptSegment {
+                id: format!("s{}", segments.len() + 1),
+                start,
+                text: std::mem::take(&mut text),
+            });
+        }
+    }
+    if !text.is_empty() {
+        segments.push(TranscriptSegment {
+            id: format!("s{}", segments.len() + 1),
+            start,
+            text,
+        });
+    }
+    segments
+}
+
+fn timecode(seconds: f64) -> String {
+    let total = if seconds.is_finite() && seconds > 0.0 {
+        seconds as u64
+    } else {
+        0
+    };
+    format!(
+        "{:02}:{:02}:{:02}",
+        total / 3600,
+        total / 60 % 60,
+        total % 60
+    )
+}
+
+fn escape_telegram_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn segment_line(segment: &TranscriptSegment) -> String {
+    format!(
+        "[{} {}] {}",
+        segment.id,
+        timecode(segment.start),
+        segment.text.replace('<', "&lt;")
+    )
+}
+
+/// User message of a summary call: the numbered transcript (or one part of it),
+/// then the task.
+fn summary_payload(segments: &[TranscriptSegment], part: Option<(usize, usize)>) -> String {
+    let mut out = String::from("<transcript");
+    if let Some((index, total)) = part {
+        out.push_str(&format!(" part=\"{index}\" of=\"{total}\""));
+    }
+    out.push_str(">\n");
+    for segment in segments {
+        out.push_str(&segment_line(segment));
+        out.push('\n');
+    }
+    out.push_str("</transcript>\n");
+    out.push_str(SUMMARY_TASK_LINE);
+    out
+}
+
+/// The whole transcript when it is short, otherwise parts of at most
+/// `PART_MAX_CHARS` characters on segment boundaries.
+fn transcript_parts(segments: &[TranscriptSegment]) -> Vec<&[TranscriptSegment]> {
+    let sizes: Vec<usize> = segments
+        .iter()
+        .map(|segment| segment_line(segment).chars().count() + 1)
+        .collect();
+    if sizes.iter().sum::<usize>() <= SINGLE_CALL_MAX_CHARS {
+        return vec![segments];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, size) in sizes.iter().enumerate() {
+        if used + size > PART_MAX_CHARS && index > start {
+            parts.push(&segments[start..index]);
+            start = index;
+            used = 0;
+        }
+        used += size;
+    }
+    parts.push(&segments[start..]);
+    parts
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct SummaryJson {
+    #[serde(default)]
+    overview: String,
+    #[serde(default)]
+    sections: Vec<SummarySection>,
+    #[serde(default)]
+    conclusion: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct SummarySection {
+    #[serde(default)]
+    segment_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    points: Vec<String>,
+}
+
+fn decode_summary_json(text: &str) -> Result<SummaryJson, YouTubeSummaryError> {
+    let trimmed = text.trim();
+    let object = match (trimmed.find('{'), trimmed.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &trimmed[start..=end],
+        _ => {
+            return Err(YouTubeSummaryError::Decode(
+                "summary response holds no JSON object".to_owned(),
+            ));
+        }
+    };
+    serde_json::from_str(object)
+        .map_err(|error| YouTubeSummaryError::Decode(format!("summary JSON: {error}")))
+}
+
+/// User message of the merge call: every part's overview, sections with their
+/// segment ids, and conclusion, then the task.
+fn merge_payload(parts: &[SummaryJson], segments: &[TranscriptSegment]) -> String {
+    let starts: HashMap<&str, f64> = segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment.start))
+        .collect();
+    let mut out = String::from("<parts>\n");
+    for (index, part) in parts.iter().enumerate() {
+        out.push_str(&format!("<part index=\"{}\">\n", index + 1));
+        out.push_str(&format!("overview: {}\n", part.overview.trim()));
+        for section in &part.sections {
+            let id = section.segment_id.trim();
+            let Some(start) = starts.get(id) else {
+                continue;
+            };
+            out.push_str(&format!(
+                "[{id} {}] {}: {}\n",
+                timecode(*start),
+                section.title.trim().replace('<', "&lt;"),
+                section.points.join("; ").replace('<', "&lt;")
+            ));
+        }
+        out.push_str(&format!(
+            "conclusion: {}\n</part>\n",
+            part.conclusion.trim()
+        ));
+    }
+    out.push_str("</parts>\n");
+    out.push_str(MERGE_TASK_LINE);
+    out
+}
+
+/// Telegram HTML for a summary. Timecodes come from the segment ids, a section
+/// naming an unknown id is dropped, every text is escaped, and only `<b>` and
+/// `<i>` tags are written.
+fn render_summary_html(summary: &SummaryJson, segments: &[TranscriptSegment]) -> String {
+    let starts: HashMap<&str, f64> = segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment.start))
+        .collect();
+    let mut sections: Vec<(f64, &SummarySection)> = summary
+        .sections
+        .iter()
+        .filter_map(|section| {
+            let start = starts.get(section.segment_id.trim()).copied();
+            if start.is_none() {
+                tracing::warn!(
+                    segment_id = %section.segment_id,
+                    "youtube summary section names an unknown segment; dropped"
+                );
+            }
+            start.map(|start| (start, section))
+        })
+        .collect();
+    sections.sort_by(|left, right| left.0.total_cmp(&right.0));
+    sections.truncate(MAX_SUMMARY_SECTIONS);
+    let mut blocks = Vec::new();
+    let overview = summary.overview.trim();
+    if !overview.is_empty() {
+        blocks.push(escape_telegram_html(overview));
+    }
+    for (start, section) in sections {
+        let mut block = format!(
+            "[{}] <b>{}</b>",
+            timecode(start),
+            escape_telegram_html(section.title.trim())
+        );
+        for point in section.points.iter().map(|point| point.trim()) {
+            if !point.is_empty() {
+                block.push_str("\n• ");
+                block.push_str(&escape_telegram_html(point));
+            }
+        }
+        blocks.push(block);
+    }
+    let conclusion = summary.conclusion.trim();
+    if !conclusion.is_empty() {
+        blocks.push(format!("<i>{}</i>", escape_telegram_html(conclusion)));
+    }
+    blocks.join("\n\n")
+}
+
+/// Summarize the segments: one call for a short transcript; for a long one a
+/// call per part and a merge call that keeps at most `MAX_SUMMARY_SECTIONS`.
+async fn summarize_segments(
+    model: &dyn YouTubeSummaryModel,
+    segments: &[TranscriptSegment],
+) -> Result<String, YouTubeSummaryError> {
+    let parts = transcript_parts(segments);
+    if parts.len() == 1 {
+        let text = model
+            .complete(YouTubeStage::Summary, &summary_payload(segments, None))
+            .await?;
+        return Ok(render_summary_html(&decode_summary_json(&text)?, segments));
+    }
+    let total = parts.len();
+    let mut summaries = Vec::with_capacity(total);
+    for (index, part) in parts.iter().enumerate() {
+        let text = model
+            .complete(
+                YouTubeStage::Summary,
+                &summary_payload(part, Some((index + 1, total))),
+            )
+            .await?;
+        summaries.push(decode_summary_json(&text)?);
+    }
+    let text = model
+        .complete(YouTubeStage::Merge, &merge_payload(&summaries, segments))
+        .await?;
+    Ok(render_summary_html(&decode_summary_json(&text)?, segments))
+}
+
+async fn summary_result(
+    model: &dyn YouTubeSummaryModel,
+    fetched: FetchedTranscript,
+) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
+    let summary = if fetched.segments.is_empty() {
+        String::new()
+    } else {
+        summarize_segments(model, &fetched.segments).await?
+    };
+    Ok(YouTubeSummaryResult {
+        summary,
+        transcript: fetched.text,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1510,34 +1890,227 @@ mod tests {
     }
 
     #[test]
-    fn youtube_summary_gemini_request_matches_go_generation_config() {
-        let request = youtube_summary_gemini_request("sys", "0.000000: transcript");
+    fn youtube_summary_gemini_request_asks_for_json_within_the_stage_budget() {
+        let request = youtube_summary_gemini_request("sys", "payload", YouTubeStage::Summary);
         let value = serde_json::to_value(&request).expect("json");
 
         assert_eq!(value["systemInstruction"]["parts"][0]["text"], "sys");
         assert_eq!(value["contents"][0]["role"], "user");
-        assert_eq!(
-            value["contents"][0]["parts"][0]["text"],
-            "0.000000: transcript"
-        );
-        assert_eq!(value["generationConfig"]["maxOutputTokens"], 8192);
+        assert_eq!(value["contents"][0]["parts"][0]["text"], "payload");
+        assert_eq!(value["generationConfig"]["maxOutputTokens"], 3072);
         assert_eq!(value["generationConfig"]["temperature"], 0.3);
-        assert!(value["generationConfig"].get("topP").is_none());
+        assert_eq!(
+            value["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        let merge = youtube_summary_gemini_request("sys", "payload", YouTubeStage::Merge);
+        let merge = serde_json::to_value(&merge).expect("json");
+        assert_eq!(merge["generationConfig"]["maxOutputTokens"], 8192);
     }
 
     #[test]
-    fn youtube_summary_openai_request_matches_go_genkit_config() {
-        let request = youtube_summary_openai_request("gpt-5-mini", "sys", "0.000000: transcript");
+    fn youtube_summary_openai_request_uses_family_sampling_and_json_mode() {
+        let request =
+            youtube_summary_openai_request("gpt-5-mini", "sys", "payload", YouTubeStage::Summary);
         let value = serde_json::to_value(&request).expect("json");
 
         assert_eq!(value["model"], "gpt-5-mini");
-        assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][0]["content"], "sys");
-        assert_eq!(value["messages"][1]["role"], "user");
-        assert_eq!(value["messages"][1]["content"], "0.000000: transcript");
-        assert_eq!(value["max_tokens"], 8192);
+        assert_eq!(value["messages"][1]["content"], "payload");
+        assert_eq!(value["max_tokens"], 3072);
         assert_eq!(value["temperature"], 0.3);
         assert!(value.get("top_p").is_none());
+        assert_eq!(value["response_format"]["type"], "json_object");
+
+        let qwen =
+            youtube_summary_openai_request("qwen3.6-27b", "sys", "payload", YouTubeStage::Merge);
+        let qwen = serde_json::to_value(&qwen).expect("json");
+        assert_eq!(qwen["max_tokens"], 8192);
+        assert_eq!(qwen["temperature"], 0.7);
+        assert_eq!(qwen["top_p"], 0.8);
+        assert_eq!(qwen["top_k"], 20);
+    }
+
+    fn caption(start: f64, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            text: text.to_owned(),
+            start,
+            duration: 2.0,
+        }
+    }
+
+    fn sample_segments() -> Vec<TranscriptSegment> {
+        transcript_segments(&[Transcript {
+            language: "Russian".to_owned(),
+            language_code: "ru".to_owned(),
+            lines: vec![
+                caption(5.0, "всем привет, сегодня"),
+                caption(7.5, "разбираем сборку ПК."),
+                caption(754.2, "теперь про блок питания"),
+                caption(757.0, "и его мощность!"),
+                caption(3725.0, "итоги"),
+            ],
+        }])
+    }
+
+    #[test]
+    fn caption_fragments_merge_into_numbered_sentences() {
+        let segments = sample_segments();
+        let lines: Vec<String> = segments.iter().map(segment_line).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "[s1 00:00:05] всем привет, сегодня разбираем сборку ПК.",
+                "[s2 00:12:34] теперь про блок питания и его мощность!",
+                "[s3 01:02:05] итоги",
+            ]
+        );
+        let payload = summary_payload(&segments, None);
+        assert!(payload.starts_with("<transcript>\n[s1 00:00:05]"));
+        assert!(payload.ends_with(SUMMARY_TASK_LINE));
+    }
+
+    #[test]
+    fn summary_timestamps_come_from_segment_ids() {
+        let summary = decode_summary_json(
+            r#"```json
+{"overview":"Сборка ПК.","sections":[{"segment_id":"s2","title":"Блок питания","points":["Выбор мощности"]},{"segment_id":"s1","title":"Вступление","points":[]}],"conclusion":"Готово."}
+```"#,
+        )
+        .expect("decode");
+        let html = render_summary_html(&summary, &sample_segments());
+        assert_eq!(
+            html,
+            "Сборка ПК.\n\n[00:00:05] <b>Вступление</b>\n\n[00:12:34] <b>Блок питания</b>\n• Выбор мощности\n\n<i>Готово.</i>"
+        );
+    }
+
+    #[test]
+    fn unknown_segment_id_is_dropped() {
+        let summary = SummaryJson {
+            sections: vec![
+                SummarySection {
+                    segment_id: "s99".to_owned(),
+                    title: "Выдумка".to_owned(),
+                    points: vec!["нет такого места".to_owned()],
+                },
+                SummarySection {
+                    segment_id: "s3".to_owned(),
+                    title: "Итоги".to_owned(),
+                    points: Vec::new(),
+                },
+            ],
+            ..SummaryJson::default()
+        };
+        let html = render_summary_html(&summary, &sample_segments());
+        assert_eq!(html, "[01:02:05] <b>Итоги</b>");
+    }
+
+    #[test]
+    fn rendered_html_uses_only_allowed_tags() {
+        let summary = SummaryJson {
+            overview: "Сравнение <script> & «кавычки»".to_owned(),
+            sections: vec![SummarySection {
+                segment_id: "s1".to_owned(),
+                title: "Цена < 100 & > 50".to_owned(),
+                points: vec!["<b>жирно</b>".to_owned()],
+            }],
+            conclusion: "a & b".to_owned(),
+        };
+        let html = render_summary_html(&summary, &sample_segments());
+        assert!(
+            html.contains("Сравнение &lt;script&gt; &amp; «кавычки»"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<b>Цена &lt; 100 &amp; &gt; 50</b>"),
+            "{html}"
+        );
+        assert!(html.contains("• &lt;b&gt;жирно&lt;/b&gt;"), "{html}");
+        let tags: Vec<&str> = html
+            .match_indices('<')
+            .map(|(index, _)| {
+                &html[index
+                    ..html[index..]
+                        .find('>')
+                        .map_or(html.len(), |end| index + end + 1)]
+            })
+            .collect();
+        assert!(
+            tags.iter()
+                .all(|tag| matches!(*tag, "<b>" | "</b>" | "<i>" | "</i>")),
+            "{tags:?}"
+        );
+    }
+
+    struct ScriptedModel {
+        calls: std::sync::Mutex<Vec<(YouTubeStage, String)>>,
+    }
+
+    impl YouTubeSummaryModel for ScriptedModel {
+        fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().expect("calls");
+                calls.push((stage, payload.to_owned()));
+                let first_id = payload
+                    .split('[')
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .unwrap_or("s1")
+                    .to_owned();
+                Ok(json!({
+                    "overview": format!("часть {}", calls.len()),
+                    "sections": [{"segment_id": first_id, "title": "Раздел", "points": ["пункт"]}],
+                    "conclusion": "итог"
+                })
+                .to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn long_transcript_is_chunked_and_merged() {
+        let lines: Vec<TranscriptLine> = (0..3000)
+            .map(|index| {
+                caption(
+                    f64::from(index) * 3.6,
+                    "длинная фраза о сборке компьютера и выборе деталей для него.",
+                )
+            })
+            .collect();
+        let segments = transcript_segments(&[Transcript {
+            language: String::new(),
+            language_code: "ru".to_owned(),
+            lines,
+        }]);
+        assert!(transcript_parts(&segments).len() > 1);
+        let model = ScriptedModel {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let html = summarize_segments(&model, &segments)
+            .await
+            .expect("summary");
+
+        let calls = model.calls.lock().expect("calls");
+        let parts = calls
+            .iter()
+            .filter(|(stage, _)| *stage == YouTubeStage::Summary)
+            .count();
+        assert_eq!(parts, transcript_parts(&segments).len());
+        assert_eq!(
+            calls.last().map(|(stage, _)| *stage),
+            Some(YouTubeStage::Merge)
+        );
+        assert!(
+            calls
+                .last()
+                .expect("merge")
+                .1
+                .contains("<part index=\"1\">")
+        );
+        assert!(html.starts_with("часть"), "{html}");
+        assert!(html.contains("<b>Раздел</b>"), "{html}");
     }
 
     #[test]
@@ -1599,7 +2172,12 @@ mod tests {
                 request_kind: "openai.chat.completions",
             },
             "summary-model",
-            &youtube_summary_openai_request("summary-model", "system", "0.5: hello"),
+            &youtube_summary_openai_request(
+                "summary-model",
+                "system",
+                "0.5: hello",
+                YouTubeStage::Summary,
+            ),
         );
         let artifact = youtube_trace_artifact(
             trace.artifact,
@@ -1614,7 +2192,7 @@ mod tests {
         assert!(artifact.prompt_chars > 0);
         assert_eq!(
             artifact.inference_params,
-            Some(json!({"max_tokens": 8192, "temperature": 0.3}))
+            Some(json!({"max_tokens": 3072, "temperature": 0.3}))
         );
         let usage = artifact.usage.unwrap_or_default();
         assert_eq!(usage.input_tokens, 120);
@@ -1631,7 +2209,7 @@ mod tests {
                 request_kind: "gemini.generateContent",
             },
             "gemini-model",
-            &youtube_summary_gemini_request("system", "0.5: hello"),
+            &youtube_summary_gemini_request("system", "0.5: hello", YouTubeStage::Summary),
         );
         let artifact = youtube_trace_artifact(
             trace.artifact,
