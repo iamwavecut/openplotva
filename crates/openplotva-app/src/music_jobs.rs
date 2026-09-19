@@ -97,6 +97,8 @@ pub struct SongMaterial {
     pub title: String,
     /// Section-marked lyrics; empty for instrumentals.
     pub lyrics: String,
+    /// Empty section markers sent in place of lyrics for instrumentals.
+    pub skeleton: String,
     /// Compiled tag list sent to the music model.
     pub style: String,
     /// Compact style line shown to users.
@@ -128,6 +130,7 @@ impl From<SongPromptResult> for SongMaterial {
         Self {
             title: value.title,
             lyrics: value.lyrics,
+            skeleton: value.skeleton,
             style: value.style,
             raw_style: value.raw_style,
             vocal_language: value.vocal_language,
@@ -644,18 +647,44 @@ impl AceStepMusicGenerator {
     }
 }
 
+/// The music service prepends language descriptors for known language codes;
+/// instrumentals send a value outside that list so no language words reach the
+/// style, since those words make the model sing.
+const INSTRUMENTAL_VOCAL_LANGUAGE: &str = "instrumental";
+
+/// Lyrics and language the music service gets: instrumentals send their section
+/// skeleton (the default one when the material came without a director plan)
+/// and a non-language value, songs their lyrics and language.
+fn completion_voice(material: SongMaterial) -> (String, String) {
+    if material.is_instrumental() {
+        let skeleton = if material.skeleton.trim().is_empty() {
+            openplotva_media::acestep::instrumental_skeleton(&[])
+        } else {
+            material.skeleton
+        };
+        (skeleton, INSTRUMENTAL_VOCAL_LANGUAGE.to_owned())
+    } else {
+        (material.lyrics, material.vocal_language)
+    }
+}
+
+/// Every song request is answered with this many independent takes of the same
+/// material (the service draws a fresh seed per call), each in its own message.
+pub const SONG_TAKES_PER_REQUEST: usize = 2;
+
 impl MusicGenerator for AceStepMusicGenerator {
     fn generate_song<'a>(&'a self, request: MusicGenerationRequest) -> MusicGenerationFuture<'a> {
         Box::pin(async move {
             let prompt = build_song_release_prompt(&request.material.style);
             if self.client.mode() == AceStepApiMode::Completion {
                 let max_seconds = request.material.max_audio_seconds();
+                let (lyrics, vocal_language) = completion_voice(request.material);
                 let result = self
                     .client
                     .generate_completion(CompletionRequest {
                         prompt,
-                        lyrics: request.material.lyrics,
-                        vocal_language: request.material.vocal_language,
+                        lyrics,
+                        vocal_language,
                         audio_format: self.audio_format.clone(),
                         thinking: true,
                         max_seconds: Some(max_seconds),
@@ -1304,77 +1333,98 @@ where
         }
     };
     let reference_audio = effects.reference_audio(&params).await;
-    let generated = match generator
-        .generate_song(MusicGenerationRequest {
-            topic: topic.clone(),
-            material: material.clone(),
-            reference_audio,
-        })
-        .await
-    {
-        Ok(generated) => generated,
-        Err(error) => {
-            return MusicJobExecutionReport {
-                outcome: MusicJobExecutionOutcome::Failed,
-                topic,
-                error: Some(error.message()),
-                result_message_id: None,
-            };
+    let mut first_message_id = None;
+    for take in 1..=SONG_TAKES_PER_REQUEST {
+        let generated = match generator
+            .generate_song(MusicGenerationRequest {
+                topic: topic.clone(),
+                material: material.clone(),
+                reference_audio: reference_audio.clone(),
+            })
+            .await
+        {
+            Ok(generated) => generated,
+            Err(error) if take == 1 => {
+                return MusicJobExecutionReport {
+                    outcome: MusicJobExecutionOutcome::Failed,
+                    topic,
+                    error: Some(error.message()),
+                    result_message_id: None,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(error = %error.message(), take, "extra song take failed");
+                break;
+            }
+        };
+        let take_material = song_take_material(&material, &topic, take);
+        let song_id = effects
+            .persist_generated_song(new_generated_song(
+                &params,
+                job_id,
+                &topic,
+                &take_material,
+                &generated,
+            ))
+            .await;
+        match effects
+            .send_generated_song(GeneratedSongSendPlan {
+                chat_id: params.chat_id,
+                message_id: params.message_id,
+                user_id: params.user_id,
+                user_full_name: params.user_full_name.clone(),
+                thread_id: params.thread_id,
+                topic: topic.clone(),
+                material: take_material,
+                generated,
+                is_vip: true,
+                song_id,
+            })
+            .await
+        {
+            Ok(Some(audio_message_id)) => {
+                if let Some(song_id) = song_id {
+                    effects
+                        .mark_generated_song_sent(song_id, audio_message_id)
+                        .await;
+                }
+                first_message_id = first_message_id.or(Some(audio_message_id));
+            }
+            Ok(None) => {}
+            Err(error) if take == 1 => {
+                return MusicJobExecutionReport {
+                    outcome: MusicJobExecutionOutcome::Failed,
+                    topic,
+                    error: Some(error),
+                    result_message_id: None,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%error, take, "extra song take was not delivered");
+                break;
+            }
         }
-    };
-    let song_id = effects
-        .persist_generated_song(new_generated_song(
-            &params, job_id, &topic, &material, &generated,
-        ))
+    }
+    effects
+        .clear_song_signal(params.chat_id, params.message_id)
         .await;
-    match effects
-        .send_generated_song(GeneratedSongSendPlan {
-            chat_id: params.chat_id,
-            message_id: params.message_id,
-            user_id: params.user_id,
-            user_full_name: params.user_full_name,
-            thread_id: params.thread_id,
-            topic: topic.clone(),
-            material: material.clone(),
-            generated,
-            is_vip: true,
-            song_id,
-        })
-        .await
-    {
-        Ok(Some(audio_message_id)) => {
-            if let Some(song_id) = song_id {
-                effects
-                    .mark_generated_song_sent(song_id, audio_message_id)
-                    .await;
-            }
-            effects
-                .clear_song_signal(params.chat_id, params.message_id)
-                .await;
-            MusicJobExecutionReport {
-                outcome: MusicJobExecutionOutcome::Completed,
-                topic,
-                error: None,
-                result_message_id: Some(audio_message_id),
-            }
-        }
-        Ok(None) => {
-            effects
-                .clear_song_signal(params.chat_id, params.message_id)
-                .await;
-            MusicJobExecutionReport {
-                outcome: MusicJobExecutionOutcome::Completed,
-                topic,
-                error: None,
-                result_message_id: None,
-            }
-        }
-        Err(error) => MusicJobExecutionReport {
-            outcome: MusicJobExecutionOutcome::Failed,
-            topic,
-            error: Some(error),
-            result_message_id: None,
-        },
+    MusicJobExecutionReport {
+        outcome: MusicJobExecutionOutcome::Completed,
+        topic,
+        error: None,
+        result_message_id: first_message_id,
+    }
+}
+
+/// Later takes carry their number in the title so the two messages and files
+/// are told apart.
+fn song_take_material(material: &SongMaterial, topic: &str, take: usize) -> SongMaterial {
+    if take <= 1 {
+        return material.clone();
+    }
+    SongMaterial {
+        title: format!("{} ({take})", song_file_title(&material.title, topic)),
+        ..material.clone()
     }
 }
 
@@ -2074,13 +2124,15 @@ mod tests {
 
     use super::{
         AifarmSongMaterialProvider, FallbackSongPromptGenerator, GeneratedSongAudio,
-        GeneratedSongSendPlan, HeuristicSongMaterialProvider, MusicGenerationError,
-        MusicGenerationFuture, MusicGenerationRequest, MusicGenerator, MusicJobEffectFuture,
-        MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions, MusicQueuePollOutcome,
-        MusicReferenceAudio, NoSongLanguageHintStore, SongLanguageHintFuture,
-        SongLanguageHintStore, SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
-        build_song_caption_with_support, build_song_release_prompt, execute_music_gen_job,
-        music_job_topic, run_music_queue_once, run_music_queue_once_with_max_attempts,
+        GeneratedSongSendPlan, HeuristicSongMaterialProvider, INSTRUMENTAL_VOCAL_LANGUAGE,
+        MusicGenerationError, MusicGenerationFuture, MusicGenerationRequest, MusicGenerator,
+        MusicJobEffectFuture, MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions,
+        MusicQueuePollOutcome, MusicReferenceAudio, NoSongLanguageHintStore,
+        SONG_TAKES_PER_REQUEST, SongLanguageHintFuture, SongLanguageHintStore, SongMaterial,
+        SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
+        build_song_caption_with_support, build_song_release_prompt, completion_voice,
+        execute_music_gen_job, music_job_topic, run_music_queue_once,
+        run_music_queue_once_with_max_attempts,
     };
 
     fn test_walker() -> crate::routed_attempts::RoutedAttemptWalker {
@@ -2330,7 +2382,7 @@ mod tests {
 
         assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
         let persisted = effects.persisted();
-        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted.len(), SONG_TAKES_PER_REQUEST);
         assert_eq!(persisted[0].job_id, Some(555));
         assert_eq!(persisted[0].chat_id, 42);
         assert_eq!(persisted[0].thread_id, Some(77));
@@ -2433,8 +2485,13 @@ mod tests {
 
         assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
         let sent = effects.sent();
-        assert_eq!(sent.len(), 1);
+        assert_eq!(sent.len(), SONG_TAKES_PER_REQUEST);
         assert_eq!(sent[0].chat_id, 42);
+        assert!(
+            sent[1].material.title.ends_with(" (2)"),
+            "{}",
+            sent[1].material.title
+        );
         assert_eq!(sent[0].thread_id, Some(77));
         assert_eq!(generator.requests()[0].topic, "ночной город");
         assert_eq!(
@@ -2443,6 +2500,126 @@ mod tests {
             "the topic is no longer appended to the tag list"
         );
         Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    struct SequenceGeneratorStub {
+        results: Arc<Mutex<VecDeque<Result<GeneratedSongAudio, MusicGenerationError>>>>,
+    }
+
+    impl MusicGenerator for SequenceGeneratorStub {
+        fn generate_song<'a>(
+            &'a self,
+            _request: MusicGenerationRequest,
+        ) -> MusicGenerationFuture<'a> {
+            Box::pin(async move {
+                lock(&self.results).pop_front().unwrap_or_else(|| {
+                    Err(MusicGenerationError::Provider("no more takes".to_owned()))
+                })
+            })
+        }
+    }
+
+    fn song_params() -> MusicGenJobParams {
+        MusicGenJobParams {
+            chat_id: 42,
+            message_id: 9,
+            user_id: 7,
+            user_full_name: "Alice".to_owned(),
+            topic: "ночной город".to_owned(),
+            ..MusicGenJobParams::default()
+        }
+    }
+
+    fn take(file_name: &str) -> Result<GeneratedSongAudio, MusicGenerationError> {
+        Ok(GeneratedSongAudio {
+            data: b"MP3".to_vec(),
+            file_name: file_name.to_owned(),
+            ..GeneratedSongAudio::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn one_song_request_delivers_two_numbered_takes() {
+        let generator = SequenceGeneratorStub {
+            results: Arc::new(Mutex::new(VecDeque::from([
+                take("first.mp3"),
+                take("second.mp3"),
+            ]))),
+        };
+        let effects = EffectsStub::allowed().with_song_ids(vec![Some(1), Some(2)]);
+
+        let report = execute_music_gen_job(
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            song_params(),
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(100));
+        let sent = effects.sent();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].generated.file_name, "first.mp3");
+        assert_eq!(sent[1].generated.file_name, "second.mp3");
+        assert!(!sent[0].material.title.ends_with(" (2)"));
+        assert!(sent[1].material.title.ends_with(" (2)"));
+        assert_eq!(effects.marked(), vec![(1, 100), (2, 100)]);
+        assert_eq!(
+            effects
+                .reactions()
+                .iter()
+                .filter(|(kind, _, _)| *kind == "clear")
+                .count(),
+            1,
+            "the progress signal is cleared once, after the last take"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_second_take_keeps_the_first_song() {
+        let generator = SequenceGeneratorStub {
+            results: Arc::new(Mutex::new(VecDeque::from([take("first.mp3")]))),
+        };
+        let effects = EffectsStub::allowed();
+
+        let report = execute_music_gen_job(
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            song_params(),
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
+        assert_eq!(effects.sent().len(), 1);
+    }
+
+    #[test]
+    fn instrumentals_send_their_skeleton_without_a_language() {
+        let (lyrics, language) = completion_voice(SongMaterial {
+            skeleton: "[Intro]\n\n[Chorus]\n\n[Outro]".to_owned(),
+            vocal_language: "ru".to_owned(),
+            ..SongMaterial::default()
+        });
+        assert_eq!(lyrics, "[Intro]\n\n[Chorus]\n\n[Outro]");
+        assert_eq!(language, INSTRUMENTAL_VOCAL_LANGUAGE);
+
+        let (lyrics, language) = completion_voice(SongMaterial {
+            lyrics: "[Chorus]\nночной город".to_owned(),
+            skeleton: "[Intro]".to_owned(),
+            vocal_language: "ru".to_owned(),
+            ..SongMaterial::default()
+        });
+        assert_eq!(lyrics, "[Chorus]\nночной город");
+        assert_eq!(language, "ru");
+
+        let (lyrics, language) = completion_voice(SongMaterial::default());
+        assert_eq!(lyrics, "[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]");
+        assert_eq!(language, INSTRUMENTAL_VOCAL_LANGUAGE);
     }
 
     #[tokio::test]
@@ -2679,7 +2856,7 @@ mod tests {
             queue.records()[0].status,
             openplotva_taskman::JobStatus::Completed
         );
-        assert_eq!(generator.requests().len(), 1);
+        assert_eq!(generator.requests().len(), SONG_TAKES_PER_REQUEST);
         Ok(())
     }
 
@@ -2901,6 +3078,7 @@ mod tests {
         audio: GeneratedSongAudio,
         notify: Arc<tokio::sync::Notify>,
         requests: Arc<Mutex<Vec<MusicGenerationRequest>>>,
+        waited: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl WaitingGeneratorStub {
@@ -2909,6 +3087,7 @@ mod tests {
                 audio,
                 notify,
                 requests: Arc::new(Mutex::new(Vec::new())),
+                waited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -2924,7 +3103,9 @@ mod tests {
         ) -> MusicGenerationFuture<'a> {
             Box::pin(async move {
                 lock(&self.requests).push(request);
-                self.notify.notified().await;
+                if !self.waited.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    self.notify.notified().await;
+                }
                 Ok(self.audio.clone())
             })
         }

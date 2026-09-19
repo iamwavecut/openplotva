@@ -3914,12 +3914,12 @@ mod tests {
         assert_eq!(got.vocal_language, "en");
         assert_eq!(got.vocals, "female");
         assert!(
-            got.style.starts_with(
-                "synthwave, 102 BPM, female clean vocals with light reverb, synth bass"
-            ),
+            got.style
+                .starts_with("synthwave, female clean vocals with light reverb, synth bass"),
             "{}",
             got.style
         );
+        assert!(got.style.ends_with(", 102 BPM"), "{}", got.style);
         let state = transport.state();
         assert_eq!(state.requests.len(), 2);
         let cache_body: Value = serde_json::from_slice(&state.requests[0].body)?;
