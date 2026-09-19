@@ -1,0 +1,24 @@
+{
+  "flow": "history_recap",
+  "id": "history_recap/board-games",
+  "prompt": "history/recap",
+  "schema": "history_recap",
+  "tool_name": "chat_history_recap",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 2048
+  },
+  "notes": "Planning a board-game evening with a running joke and an open question.",
+  "user": "<window>\\n{\"items\":3,\"range_end\":\"2026-09-01T12:00:00Z\",\"range_start\":\"2026-09-01T00:00:00Z\",\"scope\":\"chat\"}\\n</window>\\n<events>\\n<event id=\"E1\" at=\"2026-09-01T18:00:00Z\" when=\"вчера\" actors=\"Аня, Дима\">Настолки у Ани в субботу — Аня позвала всех на настолки в субботу, Дима подтвердил.</event>\\n<event id=\"E2\" at=\"2026-09-01T18:20:00Z\" when=\"вчера\" actors=\"Кирилл\">Шутка про вечно проигрывающего Кирилла — Кирилл снова пообещал наконец выиграть в «Каркассон», чат смеётся.</event>\\n<event id=\"E3\" at=\"2026-09-01T18:40:00Z\" when=\"вчера\" actors=\"Аня\">Не решили, кто везёт пиццу — Вопрос с пиццей остался открытым.</event>\\n</events>\\nПо событиям выше верни JSON с пересказом, как описано в инструкции.",
+  "checks": [
+    "json",
+    "schema",
+    "lang:ru:recap",
+    "word_range:recap:15:180",
+    "min_items:open_questions:1",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

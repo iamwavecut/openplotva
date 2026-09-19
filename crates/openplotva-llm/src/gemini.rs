@@ -19,9 +19,7 @@ use openplotva_dialog::{
 };
 use openplotva_history::{
     HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS, HISTORY_SUMMARY_GENERATE_RETRY_DELAY_SECONDS,
-    HistorySummaryDecodeError, HistorySummaryLlmResponse, SummaryDocument, SummaryInput,
-    decode_history_summary_response, hash_text, history_output_token_estimate,
-    history_summary_generate_error_retryable,
+    HistorySummaryDecodeError, history_summary_generate_error_retryable, stages::HistoryStage,
 };
 use openplotva_memory::{
     ExtractInput, ExtractOutput, MemoryExtractor, MemoryExtractorFuture, decode_extraction_json,
@@ -1889,13 +1887,19 @@ where
         self
     }
 
-    pub fn request_for_input(
+    /// Model this generator calls.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.cfg.model.trim()
+    }
+
+    pub fn request_for_stage(
         &self,
-        input: &SummaryInput,
+        stage: HistoryStage,
+        payload: &str,
     ) -> Result<GeminiGenerateContentRequest, GeminiHistorySummaryError> {
-        let system_prompt = openplotva_prompts::read("history/summary")?;
-        let payload =
-            serde_json::to_string_pretty(input).map_err(GeminiHistorySummaryError::Input)?;
+        let system_prompt = openplotva_prompts::read(stage.prompt_name())?;
+        let payload = payload.to_owned();
         Ok(GeminiGenerateContentRequest {
             cached_content: None,
             system_instruction: Some(GeminiContent {
@@ -1913,7 +1917,7 @@ where
                 }],
             }],
             generation_config: GeminiGenerationConfig {
-                max_output_tokens: self.cfg.max_output_tokens,
+                max_output_tokens: stage.max_output_tokens(),
                 temperature: self.cfg.temperature,
                 top_p: self.cfg.top_p,
                 top_k: None,
@@ -1925,17 +1929,18 @@ where
         })
     }
 
-    pub async fn generate_document(
+    /// One call of the two-stage summary. Returns the model's JSON text.
+    pub async fn complete_stage(
         &self,
-        input: &SummaryInput,
-    ) -> Result<SummaryDocument, GeminiHistorySummaryError> {
+        stage: HistoryStage,
+        payload: &str,
+    ) -> Result<String, GeminiHistorySummaryError> {
         if self.cfg.api_key.trim().is_empty() {
             return Err(GeminiHistorySummaryError::Generate(
                 "google ai key is required".to_owned(),
             ));
         }
-        let system_prompt = openplotva_prompts::read("history/summary")?;
-        let request = self.request_for_input(input)?;
+        let request = self.request_for_stage(stage, payload)?;
         let mut last_error = None;
         for attempt in 1..=HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS {
             let started = std::time::Instant::now();
@@ -1986,13 +1991,7 @@ where
                     continue;
                 }
             };
-            let decoded = decode_history_summary_response(&text)?;
-            return Ok(summary_document_from_history_llm(
-                self.cfg.model.trim(),
-                input,
-                &decoded,
-                &system_prompt,
-            ));
+            return Ok(text);
         }
         Err(GeminiHistorySummaryError::Generate(
             last_error.unwrap_or_else(|| "empty model response".to_owned()),
@@ -2989,27 +2988,6 @@ fn shrink_repeated_runes(raw: &str) -> String {
         }
     }
     out
-}
-
-fn summary_document_from_history_llm(
-    model: &str,
-    input: &SummaryInput,
-    llm: &HistorySummaryLlmResponse,
-    system_prompt: &str,
-) -> SummaryDocument {
-    SummaryDocument {
-        content: llm.summary_json.clone(),
-        html: llm.summary_html.clone(),
-        model: model.trim().to_owned(),
-        prompt_version: openplotva_history::SUMMARY_PROMPT_VERSION.to_owned(),
-        prompt_hash: hash_text(system_prompt),
-        input_hash: input.input_hash.clone(),
-        input_token_estimate: input.input_token_estimate,
-        output_token_estimate: history_output_token_estimate(llm),
-        cascade_depth: input.cascade_depth,
-        quality_score: llm.summary_json.quality_score,
-        quality_notes: llm.summary_json.quality_notes.clone(),
-    }
 }
 
 fn history_summary_gemini_error_retryable(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -4032,22 +4010,14 @@ mod tests {
             },
             transport.clone(),
         );
-        let input = SummaryInput {
-            input_hash: "input-hash".to_owned(),
-            input_token_estimate: 321,
-            cascade_depth: 2,
-            ..SummaryInput::default()
-        };
+        let text = generator
+            .complete_stage(
+                HistoryStage::Recap,
+                "<window>\n{}\n</window>\npayload-marker",
+            )
+            .await?;
 
-        let doc = generator.generate_document(&input).await?;
-
-        assert_eq!(doc.model, MODEL_GEMINI_FLASH_LITE_PINNED);
-        assert_eq!(doc.input_hash, "input-hash");
-        assert_eq!(doc.input_token_estimate, 321);
-        assert_eq!(doc.cascade_depth, 2);
-        assert_eq!(doc.content.recap, "Запуск готов");
-        assert!(doc.html.contains("Запуск"));
-        assert_eq!(doc.quality_score, 0.75);
+        assert!(text.contains("Запуск готов"), "{text}");
         let state = transport.state();
         assert_eq!(state.requests.len(), 1);
         let request = &state.requests[0];
@@ -4061,15 +4031,18 @@ mod tests {
             body["systemInstruction"]["parts"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("суммаризатор живого группового чата")
+                .contains("Ты пишешь сводку живого группового чата")
         );
         assert!(
             body["contents"][0]["parts"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("\"input_hash\": \"input-hash\"")
+                .contains("payload-marker")
         );
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"],
+            HistoryStage::Recap.max_output_tokens()
+        );
         assert_eq!(body["generationConfig"]["temperature"], 0.45);
         assert_eq!(body["generationConfig"]["topP"], 0.9);
         assert!(body["generationConfig"].get("topK").is_none());

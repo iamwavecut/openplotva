@@ -30,8 +30,7 @@ use openplotva_dialog::{
     select_llm_history_messages_for_context, tool_telemetry,
 };
 use openplotva_history::{
-    AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
-    decode_history_summary_response, hash_text, history_output_token_estimate,
+    AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, stages::HistoryStage,
 };
 use openplotva_memory::{
     DEFAULT_MEMORY_MAX_OUTPUT_TOKENS, ExtractInput, ExtractOutput, MemoryExtractor,
@@ -1714,8 +1713,12 @@ pub struct AifarmHistorySummaryConfig {
     pub model: String,
     /// Maximum output tokens.
     pub max_output_tokens: i32,
-    /// Temperature.
+    /// Temperature; unset takes the model family's default.
     pub temperature: Option<f64>,
+    /// Top-p; unset takes the model family's default.
+    pub top_p: Option<f64>,
+    /// Top-k; unset takes the model family's default.
+    pub top_k: Option<f64>,
     /// Whether model thinking is enabled.
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
@@ -1893,6 +1896,10 @@ impl AifarmHistorySummaryConfig {
         } else {
             self.max_output_tokens
         };
+        let family = worker_sampling_for_model(&self.model);
+        self.temperature = Some(self.temperature.unwrap_or(family.temperature));
+        self.top_p = self.top_p.or(family.top_p);
+        self.top_k = self.top_k.or(family.top_k);
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -1937,7 +1944,7 @@ impl AifarmMemoryExtractorConfig {
         // family, then clamp penalties to the [-2.0, 2.0] range the
         // OpenAI-compatible backend enforces so an out-of-range or non-finite
         // operator override cannot 400 every extraction request.
-        let family = memory_worker_sampling(&self.model);
+        let family = worker_sampling_for_model(&self.model);
         self.temperature = Some(self.temperature.unwrap_or(family.temperature));
         self.top_p = self.top_p.or(family.top_p);
         self.top_k = self.top_k.or(family.top_k);
@@ -2398,9 +2405,9 @@ fn worker_nucleus_for_model(model: &str) -> (Option<f64>, Option<f64>) {
     }
 }
 
-/// Sampling the memory workers use when neither the deployment nor the route
-/// sets it.
-struct MemoryWorkerSampling {
+/// Sampling the JSON workers (memory, history) use when neither the deployment
+/// nor the route sets it.
+struct WorkerSampling {
     temperature: f64,
     top_p: Option<f64>,
     top_k: Option<f64>,
@@ -2411,9 +2418,9 @@ struct MemoryWorkerSampling {
 /// non-thinking use, and loop on long outputs at low temperature; penalties stay
 /// off because the output repeats names and ids from the input. Other models
 /// keep the previous 0.2 with light penalties, plus the Gemma nucleus.
-fn memory_worker_sampling(model: &str) -> MemoryWorkerSampling {
+fn worker_sampling_for_model(model: &str) -> WorkerSampling {
     if model.to_ascii_lowercase().contains("qwen") {
-        MemoryWorkerSampling {
+        WorkerSampling {
             temperature: 0.7,
             top_p: Some(0.8),
             top_k: Some(20.0),
@@ -2421,7 +2428,7 @@ fn memory_worker_sampling(model: &str) -> MemoryWorkerSampling {
         }
     } else {
         let (top_p, top_k) = worker_nucleus_for_model(model);
-        MemoryWorkerSampling {
+        WorkerSampling {
             temperature: 0.2,
             top_p,
             top_k,
@@ -2462,15 +2469,32 @@ where
         Self { cfg, client }
     }
 
-    pub async fn generate_document(
+    /// Model this generator calls.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.cfg.model.trim()
+    }
+
+    /// One call of the two-stage summary: the stage picks the prompt, the schema
+    /// and the output budget. Returns the model's JSON text.
+    pub async fn complete_stage(
         &self,
-        input: &SummaryInput,
+        stage: HistoryStage,
+        payload: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<SummaryDocument, AifarmHistorySummaryError> {
-        let system_prompt = openplotva_prompts::read("history/summary")?;
-        let payload =
-            serde_json::to_string_pretty(input).map_err(AifarmHistorySummaryError::Input)?;
-        let mut request = self.request(&system_prompt, &payload);
+    ) -> Result<String, AifarmHistorySummaryError> {
+        let system_prompt = openplotva_prompts::read(stage.prompt_name())?;
+        let mut request = self.request(&system_prompt, payload);
+        request.response_format = stage.sends_response_schema().then(|| {
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": stage.schema_name(),
+                    "schema": stage.response_schema(),
+                },
+            })
+        });
+        request.max_tokens = stage.max_output_tokens();
         request.trace = Some(aux_llm_call_trace(
             "history_summary",
             "aifarm_history_summary",
@@ -2485,15 +2509,8 @@ where
                 "chat completion returned no response".to_owned(),
             ));
         };
-        let content = first_choice_structured_content(response)
-            .map_err(|err| AifarmHistorySummaryError::Response(err.to_string()))?;
-        let decoded = decode_history_summary_response(&content)?;
-        Ok(summary_document_from_llm(
-            self.cfg.model.trim(),
-            input,
-            &decoded,
-            &system_prompt,
-        ))
+        first_choice_structured_content(response)
+            .map_err(|err| AifarmHistorySummaryError::Response(err.to_string()))
     }
 
     fn request(&self, system_prompt: &str, payload: &str) -> ChatCompletionRequest {
@@ -2514,9 +2531,10 @@ where
                 },
             ],
             stream: false,
-            response_format: Some(history_summary_response_format()),
             max_tokens: self.cfg.max_output_tokens,
             temperature: self.cfg.temperature,
+            top_p: self.cfg.top_p,
+            top_k: self.cfg.top_k,
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
@@ -2897,13 +2915,18 @@ where
         Self { cfg, client }
     }
 
-    pub fn request_for_input(
+    /// Model this generator calls.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.cfg.model.trim()
+    }
+
+    pub fn request_for_stage(
         &self,
-        input: &SummaryInput,
+        stage: HistoryStage,
+        payload: &str,
     ) -> Result<ChatCompletionRequest, GenkitOpenAiCompatibleHistorySummaryError> {
-        let system_prompt = openplotva_prompts::read("history/summary")?;
-        let payload = serde_json::to_string_pretty(input)
-            .map_err(GenkitOpenAiCompatibleHistorySummaryError::Input)?;
+        let system_prompt = openplotva_prompts::read(stage.prompt_name())?;
         Ok(ChatCompletionRequest {
             model: self.cfg.model.trim().to_owned(),
             messages: vec![
@@ -2915,53 +2938,29 @@ where
                 },
                 ChatMessage {
                     role: "user".to_owned(),
-                    content: payload,
+                    content: payload.to_owned(),
                     content_parts: Vec::new(),
                     ..ChatMessage::default()
                 },
             ],
             stream: false,
-            max_tokens: self.cfg.max_output_tokens,
+            max_tokens: stage.max_output_tokens(),
             temperature: Some(self.cfg.temperature),
             top_p: Some(self.cfg.top_p),
             ..ChatCompletionRequest::default()
         })
     }
 
-    pub async fn generate_document(
+    /// One call of the two-stage summary. Returns the model's JSON text.
+    pub async fn complete_stage(
         &self,
-        input: &SummaryInput,
-    ) -> Result<SummaryDocument, GenkitOpenAiCompatibleHistorySummaryError> {
-        let system_prompt = openplotva_prompts::read("history/summary")?;
-        let payload = serde_json::to_string_pretty(input)
-            .map_err(GenkitOpenAiCompatibleHistorySummaryError::Input)?;
+        stage: HistoryStage,
+        payload: &str,
+    ) -> Result<String, GenkitOpenAiCompatibleHistorySummaryError> {
+        let request = self.request_for_stage(stage, payload)?;
         let result = self
             .client
-            .complete(
-                ChatCompletionRequest {
-                    model: self.cfg.model.trim().to_owned(),
-                    messages: vec![
-                        ChatMessage {
-                            role: "system".to_owned(),
-                            content: system_prompt.clone(),
-                            content_parts: Vec::new(),
-                            ..ChatMessage::default()
-                        },
-                        ChatMessage {
-                            role: "user".to_owned(),
-                            content: payload,
-                            content_parts: Vec::new(),
-                            ..ChatMessage::default()
-                        },
-                    ],
-                    stream: false,
-                    max_tokens: self.cfg.max_output_tokens,
-                    temperature: Some(self.cfg.temperature),
-                    top_p: Some(self.cfg.top_p),
-                    ..ChatCompletionRequest::default()
-                },
-                &mut |_| {},
-            )
+            .complete(request, &mut |_| {})
             .await
             .map_err(|source| GenkitOpenAiCompatibleHistorySummaryError::Completion { source })?;
         let Some(response) = result.response.as_ref() else {
@@ -2969,16 +2968,8 @@ where
                 "chat completion returned no response".to_owned(),
             ));
         };
-        let content = first_choice_content(response).map_err(|error| {
-            GenkitOpenAiCompatibleHistorySummaryError::Response(error.to_string())
-        })?;
-        let decoded = decode_history_summary_response(&content)?;
-        Ok(summary_document_from_llm(
-            &self.cfg.model,
-            input,
-            &decoded,
-            &system_prompt,
-        ))
+        first_choice_content(response)
+            .map_err(|error| GenkitOpenAiCompatibleHistorySummaryError::Response(error.to_string()))
     }
 }
 
@@ -5455,27 +5446,6 @@ fn first_choice_message_value(response: &Value) -> Result<&Value, AifarmDialogEr
     })
 }
 
-fn summary_document_from_llm(
-    model: &str,
-    input: &SummaryInput,
-    llm: &openplotva_history::HistorySummaryLlmResponse,
-    system_prompt: &str,
-) -> SummaryDocument {
-    SummaryDocument {
-        content: llm.summary_json.clone(),
-        html: llm.summary_html.clone(),
-        model: model.trim().to_owned(),
-        prompt_version: openplotva_history::SUMMARY_PROMPT_VERSION.to_owned(),
-        prompt_hash: hash_text(system_prompt),
-        input_hash: input.input_hash.clone(),
-        input_token_estimate: input.input_token_estimate,
-        output_token_estimate: history_output_token_estimate(llm),
-        cascade_depth: input.cascade_depth,
-        quality_score: llm.summary_json.quality_score,
-        quality_notes: llm.summary_json.quality_notes.clone(),
-    }
-}
-
 fn decode_memory_extraction_output(
     response: &Value,
     payload: &str,
@@ -5506,27 +5476,6 @@ fn decode_memory_extraction_output(
         out.output_tokens = estimate_memory_tokens(&content);
     }
     Ok(out)
-}
-
-fn history_summary_response_format() -> Value {
-    json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "chat_history_summary",
-            "schema": history_summary_response_schema(),
-        },
-    })
-}
-
-fn history_summary_response_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["summary_json"],
-        "properties": {
-            "summary_json": history_summary_content_schema(),
-        },
-    })
 }
 
 fn subject_merge_response_format() -> Value {
@@ -5749,75 +5698,6 @@ fn memory_link_schema() -> Value {
             "to_fact_text": {"type": "string"},
             "relation": {"type": "string"},
             "confidence": {"type": "number"},
-        },
-    })
-}
-
-fn history_summary_content_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "events",
-            "event_details",
-            "actors",
-            "recap",
-            "open_questions",
-            "source_style",
-            "quality_score",
-            "quality_notes",
-        ],
-        "properties": {
-            "events": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "event_details": {
-                "type": "array",
-                "items": history_summary_event_schema(),
-            },
-            "actors": {
-                "type": "array",
-                "items": history_summary_actor_schema(),
-            },
-            "recap": {"type": "string"},
-            "open_questions": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "source_style": {"type": "string"},
-            "quality_score": {"type": "number"},
-            "quality_notes": {"type": "string"},
-        },
-    })
-}
-
-fn history_summary_event_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["title", "description", "actors", "occurred_at", "confidence"],
-        "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "actors": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "occurred_at": {"type": "string"},
-            "confidence": {"type": "number"},
-        },
-    })
-}
-
-fn history_summary_actor_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["name", "description"],
-        "properties": {
-            "name": {"type": "string"},
-            "description": {"type": "string"},
         },
     })
 }
@@ -7185,36 +7065,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aifarm_history_summary_generator_matches_go_request_and_document_shape()
+    async fn aifarm_history_stages_send_the_prompt_budget_and_recap_schema()
     -> Result<(), Box<dyn Error>> {
-        let content = serde_json::to_string(&json!({
-            "summary_json": {
-                "events": [" shipped "],
-                "event_details": [{
-                    "title": " shipped ",
-                    "description": "done",
-                    "actors": ["Alice"],
-                    "occurred_at": "2026-05-20T10:00:00Z",
-                    "confidence": 0.8
-                }],
-                "actors": [{"name": " Alice ", "description": " drove "}],
-                "recap": " ok ",
-                "open_questions": [],
-                "source_style": "log",
-                "quality_score": 0.7,
-                "quality_notes": "solid"
-            }
-        }))?;
+        let answer = r#"{"events":[],"nothing_notable":true}"#;
         let response = json!({
-            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "choices": [{"message": {"role": "assistant", "content": answer}}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 20}
         });
-        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
-            status_code: 200,
-            status_text: "OK".to_owned(),
-            body: serde_json::to_vec(&response)?,
-            ..AifarmHttpResponse::default()
-        })]);
+        let reply = || -> Result<AifarmHttpResponse, serde_json::Error> {
+            Ok(AifarmHttpResponse {
+                status_code: 200,
+                status_text: "OK".to_owned(),
+                body: serde_json::to_vec(&response)?,
+                ..AifarmHttpResponse::default()
+            })
+        };
+        let transport = FakeTransport::new(vec![Ok(reply()?), Ok(reply()?)]);
         let generator = AifarmHistorySummaryGenerator::with_transport(
             AifarmHistorySummaryConfig {
                 client: AifarmClientConfig {
@@ -7222,117 +7088,55 @@ mod tests {
                     api_key: " token ".to_owned(),
                     ..AifarmClientConfig::default()
                 },
-                model: "summary-model".to_owned(),
-                temperature: Some(0.2),
+                model: "qwen3.8-27b".to_owned(),
                 ..AifarmHistorySummaryConfig::default()
             },
             transport.clone(),
         );
-        let input = openplotva_history::SummaryInput {
-            chat_id: 100,
-            thread_id: 7,
-            scope: openplotva_history::SummaryScope::Thread,
-            range_start_at: at(10, 0),
-            range_end_at: at(11, 0),
-            first_message_id: 1,
-            last_message_id: 2,
-            first_entry_id: "msg:1".to_owned(),
-            last_entry_id: "msg:2".to_owned(),
-            raw_message_count: 2,
-            covered_message_count: 2,
-            requested_by_user_id: 42,
-            input_hash: "input-hash".to_owned(),
-            input_token_estimate: 321,
-            cascade_depth: 3,
-            items: vec![openplotva_history::SummaryInputItem {
-                kind: "message".to_owned(),
-                at: at(10, 0),
-                message_id: 1,
-                text: "hello".to_owned(),
-                ..openplotva_history::SummaryInputItem::default()
-            }],
-            ..openplotva_history::SummaryInput::default()
-        };
 
         let mut statuses = Vec::new();
-        let doc = generator
-            .generate_document(&input, &mut |status| statuses.push(status))
+        let text = generator
+            .complete_stage(HistoryStage::Events, "payload-marker", &mut |status| {
+                statuses.push(status)
+            })
             .await?;
 
-        assert_eq!(doc.model, "summary-model");
-        assert_eq!(
-            doc.prompt_version,
-            openplotva_history::SUMMARY_PROMPT_VERSION
-        );
-        assert_eq!(
-            doc.prompt_hash,
-            openplotva_history::hash_text(&openplotva_prompts::read("history/summary")?)
-        );
-        assert_eq!(doc.input_hash, "input-hash");
-        assert_eq!(doc.input_token_estimate, 321);
-        assert_eq!(doc.cascade_depth, 3);
-        assert_eq!(doc.quality_score, 0.7);
-        assert_eq!(doc.quality_notes, "solid");
-        assert_eq!(doc.content.events, vec!["shipped"]);
-        assert_eq!(doc.html, "• shipped\n\nok");
-        assert!(doc.output_token_estimate > 0);
+        assert_eq!(text, answer);
         assert_eq!(statuses.last().expect("status").status, STATUS_SUCCEEDED);
-
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://llm.example/v1/chat/completions");
         assert_eq!(
             requests[0].headers.get("Authorization").map(String::as_str),
             Some("Bearer token")
         );
         let body: Value = serde_json::from_slice(&requests[0].body)?;
-        assert_eq!(body["model"], "summary-model");
-        assert_eq!(
-            body["max_tokens"],
-            DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS
-        );
-        assert_eq!(body["temperature"], 0.2);
-        assert_eq!(body["include_reasoning"], false);
+        assert_eq!(body["model"], "qwen3.8-27b");
+        assert_eq!(body["max_tokens"], HistoryStage::Events.max_output_tokens());
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.8);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-        assert_eq!(
-            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
-            false
-        );
-        assert_eq!(body["messages"][0]["role"], "system");
         assert!(
             body["messages"][0]["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Ты суммаризатор живого группового чата")
+                .contains("Ты выделяешь события")
         );
-        assert_eq!(body["messages"][1]["role"], "user");
-        assert!(
-            body["messages"][1]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("\"chat_id\": 100")
-        );
-        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["messages"][1]["content"], "payload-marker");
+        assert!(body.get("response_format").is_none(), "{body}");
+
+        generator
+            .complete_stage(HistoryStage::Recap, "recap-marker", &mut |_| {})
+            .await?;
+        let requests = transport.requests();
+        let body: Value = serde_json::from_slice(&requests[1].body)?;
+        assert_eq!(body["max_tokens"], HistoryStage::Recap.max_output_tokens());
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
-            "chat_history_summary"
+            "chat_history_recap"
         );
         assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["required"],
-            json!(["summary_json"])
-        );
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["properties"]["summary_json"]["required"],
-            json!([
-                "events",
-                "event_details",
-                "actors",
-                "recap",
-                "open_questions",
-                "source_style",
-                "quality_score",
-                "quality_notes"
-            ])
+            body["response_format"]["json_schema"]["schema"],
+            HistoryStage::Recap.response_schema()
         );
         Ok(())
     }
@@ -7372,17 +7176,11 @@ mod tests {
             },
             transport.clone(),
         );
-        let input = openplotva_history::SummaryInput {
-            chat_id: 100,
-            input_hash: "input-hash".to_owned(),
-            input_token_estimate: 77,
-            ..openplotva_history::SummaryInput::default()
-        };
+        let text = generator
+            .complete_stage(HistoryStage::Recap, "payload-marker")
+            .await?;
 
-        let doc = generator.generate_document(&input).await?;
-
-        assert_eq!(doc.model, "summary-plugin");
-        assert_eq!(doc.content.recap, "fallback recap");
+        assert!(text.contains("fallback recap"), "{text}");
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
@@ -7395,10 +7193,7 @@ mod tests {
         );
         let body: Value = serde_json::from_slice(&requests[0].body)?;
         assert_eq!(body["model"], "summary-plugin");
-        assert_eq!(
-            body["max_tokens"],
-            DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS
-        );
+        assert_eq!(body["max_tokens"], HistoryStage::Recap.max_output_tokens());
         assert_eq!(body["temperature"], 0.45);
         assert_eq!(body["top_p"], 0.9);
         assert!(body.get("response_format").is_none());

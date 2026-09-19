@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ CYRILLIC = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґЎў]")
 LATIN = re.compile(r"[A-Za-z]")
 TAG_RE = re.compile(r"</?\s*([a-zA-Z][a-zA-Z0-9-]*)")
 MEMORY_TASK_LINE = "Based on the window above, return the JSON object described in the system prompt."
+HISTORY_EVENTS_TASK_LINE = "По окну выше верни JSON с событиями, как описано в инструкции."
 QUOTE_EDGES = " \t\n\"'«»“”„.,!?;:"
 
 
@@ -183,6 +185,66 @@ def render_memory_blocks(user: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def history_item_text(item: dict[str, Any]) -> str:
+    if item.get("kind") == "summary":
+        summary = item.get("summary_json") or {}
+        return (summary.get("recap") or "").strip() or "; ".join(summary.get("events") or [])
+    text = (item.get("text") or "").strip() or (item.get("original_text") or "").strip()
+    vision = (item.get("vision_description") or "").strip()
+    if vision:
+        return f"{text} [изображение: {vision}]" if text else f"[изображение: {vision}]"
+    return text
+
+
+def history_item_carries_event(item: dict[str, Any]) -> bool:
+    """Mirror of `stages::item_carries_event`."""
+    if item.get("kind") == "summary":
+        return True
+    text = history_item_text(item).strip()
+    if len(text) > 1 and text[0] == "/" and text[1].isascii() and text[1].isalpha():
+        return False
+    if not any(ch.isalnum() for ch in text):
+        return False
+    return len(text) >= 12 or len(text.split()) >= 2
+
+
+def utc_day_and_clock(at: str) -> tuple[str, str] | None:
+    try:
+        moment = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    return moment.date().isoformat(), moment.strftime("%H:%M")
+
+
+def render_history_items(user: dict[str, Any]) -> str:
+    """The stage-one message for one chunk, as `stages::events_payload` renders it:
+    items numbered from 1, messages at the UTC time of day under a `<day>` line."""
+    items = [item for item in user.get("items", []) if history_item_carries_event(item)]
+    header = {"scope": user.get("scope") or "", "items": len(items)}
+    if user.get("range_start_at"):
+        header["range_start"] = user["range_start_at"]
+    if user.get("range_end_at"):
+        header["range_end"] = user["range_end_at"]
+    lines = ["<window>", json.dumps(header, ensure_ascii=False, separators=(",", ":"), sort_keys=True), "</window>", "<items>"]
+    day = None
+    for index, item in enumerate(items, 1):
+        text = " ".join(history_item_text(item).split()).replace("<", "&lt;")
+        if item.get("kind") == "summary":
+            lines.append(f'<summary id="{index}" from="{item.get("range_start_at", "")}" to="{item.get("range_end_at", "")}">{text}</summary>')
+            continue
+        moment = utc_day_and_clock(item.get("at") or "")
+        if moment and moment[0] != day:
+            day = moment[0]
+            lines.append(f'<day date="{day}"/>')
+        author = (item.get("sender_name") or "").strip()
+        if not author and (item.get("sender_username") or "").strip():
+            author = "@" + item["sender_username"].strip().lstrip("@")
+        author = author or (item.get("role") or "").strip()
+        lines.append(f'<msg id="{index}" at="{moment[1] if moment else ""}" from="{escape_prompt_attr(author)}">{text}</msg>')
+    lines += ["</items>", HISTORY_EVENTS_TASK_LINE]
+    return "\n".join(lines)
+
+
 def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) -> dict[str, Any] | None:
     data = fixture.data
     if "messages" in data:
@@ -200,6 +262,8 @@ def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) 
     if user_text is not None:
         if data.get("user_layout") == "memory_blocks" and not args.legacy_user_layout:
             user_text = render_memory_blocks(user_text)
+        elif data.get("user_layout") == "history_items":
+            user_text = render_history_items(user_text)
         elif not isinstance(user_text, str):
             user_text = json.dumps(user_text, ensure_ascii=False, indent=2)
         if data.get("image"):
@@ -382,6 +446,7 @@ def id_values(value: Any) -> list[int]:
                 found.append(item)
             elif key.endswith("_ids") and isinstance(item, list):
                 found.extend(x for x in item if isinstance(x, int) and not isinstance(x, bool))
+                found.extend(int(x) for x in item if isinstance(x, str) and x.strip().isdigit())
             else:
                 found.extend(id_values(item))
     elif isinstance(value, list):
@@ -391,6 +456,9 @@ def id_values(value: Any) -> list[int]:
 
 
 def input_ints(fixture: Fixture) -> set[int]:
+    if fixture.data.get("user_layout") == "history_items":
+        items = (fixture.data.get("user") or {}).get("items", [])
+        return set(range(1, sum(1 for item in items if history_item_carries_event(item)) + 1))
     source = fixture.data.get("user")
     if source is None:
         source = [m.get("content") for m in fixture.data.get("messages", []) if m.get("role") == "user"]
@@ -706,6 +774,8 @@ SELF_TEST_CASES = [
     ("no_repeat_lines:2", "line number one\nline number two", True),
     ("no_repeat_lines:2", "same line here\nsame line here\nsame line here", False),
     ("not_equals:cards[].type=event", '{"cards": [{"type": "decision"}]}', True),
+    ("ids_from_input", '{"events": [{"source_ids": ["7"]}]}', True),
+    ("ids_from_input", '{"events": [{"source_ids": ["8"]}]}', False),
     ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "demote"}]}', True),
     ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 0}]}', True),
     ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 3}]}', False),

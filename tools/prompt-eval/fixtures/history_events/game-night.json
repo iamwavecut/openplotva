@@ -1,40 +1,23 @@
 {
-  "flow": "history_summary",
-  "id": "history_summary/game-night",
-  "prompt": "history/summary",
-  "schema": "history_summary",
-  "tool_name": "chat_history_summary",
+  "flow": "history_events",
+  "id": "history_events/game-night",
+  "prompt": "history/events",
+  "schema": "history_events",
+  "tool_name": "chat_history_events",
+  "user_layout": "history_items",
   "request": {
-    "temperature": 0.2,
-    "max_tokens": 1024
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 1536
   },
   "notes": "Planning, a running joke and one open question.",
   "user": {
     "chat_id": -1000000000002,
     "thread_id": 0,
     "scope": "chat",
-    "range_start_at": [
-      2026,
-      244,
-      18,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-    ],
-    "range_end_at": [
-      2026,
-      244,
-      18,
-      12,
-      0,
-      0,
-      0,
-      0,
-      0
-    ],
+    "range_start_at": "2026-09-01T18:00:00Z",
+    "range_end_at": "2026-09-01T18:12:00Z",
     "first_message_id": 2001,
     "last_message_id": 2012,
     "first_entry_id": "msg:2001",
@@ -52,17 +35,7 @@
     "items": [
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          0,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:00:00Z",
         "message_id": 2001,
         "entry_id": "msg:2001",
         "role": "user",
@@ -74,17 +47,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          1,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:01:00Z",
         "message_id": 2002,
         "entry_id": "msg:2002",
         "role": "user",
@@ -96,17 +59,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          2,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:02:00Z",
         "message_id": 2003,
         "entry_id": "msg:2003",
         "role": "user",
@@ -118,17 +71,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          3,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:03:00Z",
         "message_id": 2004,
         "entry_id": "msg:2004",
         "role": "user",
@@ -140,17 +83,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          4,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:04:00Z",
         "message_id": 2005,
         "entry_id": "msg:2005",
         "role": "user",
@@ -162,17 +95,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          5,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:05:00Z",
         "message_id": 2006,
         "entry_id": "msg:2006",
         "role": "user",
@@ -184,17 +107,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          6,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:06:00Z",
         "message_id": 2007,
         "entry_id": "msg:2007",
         "role": "user",
@@ -206,17 +119,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          7,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:07:00Z",
         "message_id": 2008,
         "entry_id": "msg:2008",
         "role": "user",
@@ -228,17 +131,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          8,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:08:00Z",
         "message_id": 2009,
         "entry_id": "msg:2009",
         "role": "user",
@@ -250,17 +143,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          9,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:09:00Z",
         "message_id": 2010,
         "entry_id": "msg:2010",
         "role": "user",
@@ -272,17 +155,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          10,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:10:00Z",
         "message_id": 2011,
         "entry_id": "msg:2011",
         "role": "user",
@@ -294,17 +167,7 @@
       },
       {
         "kind": "message",
-        "at": [
-          2026,
-          244,
-          18,
-          11,
-          0,
-          0,
-          0,
-          0,
-          0
-        ],
+        "at": "2026-09-01T18:11:00Z",
         "message_id": 2012,
         "entry_id": "msg:2012",
         "role": "user",
@@ -319,9 +182,10 @@
   "checks": [
     "json",
     "schema",
-    "min_items:summary_json.events:2",
-    "max_items:summary_json.events:6",
-    "lang:ru:summary_json.recap",
-    "no_phrases:but wait;let me think;let me check;the prompt says"
+    "ids_from_input",
+    "lang:ru:events[].description",
+    "min_items:events:1",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
   ]
 }
