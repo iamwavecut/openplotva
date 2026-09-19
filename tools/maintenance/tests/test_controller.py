@@ -11,6 +11,7 @@ from tools.maintenance.controller import Controller, issue_body, review_ready, m
 from tools.maintenance.state import State
 from tools.maintenance.contracts import Deferred, InvalidResult, QuotaUnavailable, fingerprint
 from tools.maintenance.tests.test_github import issue, dispatch, ReviewGitHub
+from tools.maintenance.tests.test_state import decoded_job_ids
 
 BASE = 'a'*40
 
@@ -146,6 +147,14 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.state.job(waiting['id'])['next_at'], 0)
         self.assertEqual(other.reset_initial_quota('concurrent-owner-request'), receipt)
         self.assertEqual(self.state.status()['starts']['initial'], 0)
+
+    def test_idle_service_iteration_leaves_terminal_job_payloads_undecoded(self):
+        for number, status in enumerate(('done', 'wait_deploy', 'needs_human')*3):
+            self.state.new_job('initial', 'terminal-'+str(number), number+1, status=status)
+        with decoded_job_ids() as decoded:
+            self.controller.process_results(); self.controller.poll_reviews(); self.controller.poll_notifications()
+            self.assertIsNone(self.controller.prepare_run())
+        self.assertEqual(decoded, [])
 
     def known_ready_incident(self):
         self.incident(); self.controller.run_next()

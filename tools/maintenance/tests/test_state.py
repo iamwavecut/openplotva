@@ -1,9 +1,24 @@
 import concurrent.futures
+import contextlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from tools.maintenance.state import State
 from tools.maintenance.contracts import Deferred, DAY
+
+
+@contextlib.contextmanager
+def decoded_job_ids():
+    decoded = []
+    def loads(value):
+        item = json.loads(value)
+        if isinstance(item, dict) and 'stage' in item: decoded.append(item['id'])
+        return item
+    with patch('tools.maintenance.state.json', SimpleNamespace(loads=loads, dumps=json.dumps)):
+        yield decoded
 
 
 class StateTests(unittest.TestCase):
@@ -38,6 +53,18 @@ class StateTests(unittest.TestCase):
         finally:
             self.state.job=original
             other.close()
+
+    def test_status_query_decodes_only_matching_jobs_in_save_order(self):
+        queued=self.state.new_job('initial','queued',1)
+        for number in range(3): self.state.new_job('initial',str(number),number+2,status='done')
+        result=self.state.new_job('deep','result',9,status='result')
+        self.state.update_job(queued['id'],reason='saved last')
+        expected=[job['id'] for job in self.state.jobs() if job['status'] in ('queued','result')]
+        with decoded_job_ids() as decoded:
+            jobs=self.state.jobs({'queued','result'})
+        self.assertEqual(expected,[result['id'],queued['id']])
+        self.assertEqual([job['id'] for job in jobs],expected)
+        self.assertEqual(decoded,expected)
 
     def test_late_quota_receipt_cannot_let_older_success_clear_newer_limit(self):
         self.state.defer_provider('newer-refusal', 600, at=self.now)
