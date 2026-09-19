@@ -7888,12 +7888,13 @@ mod tests {
         assert_eq!(result.vocals, "female");
         assert_eq!(result.duration_seconds, 180);
         assert!(
-            result.style.starts_with(
-                "synthwave, 102 BPM, female clean vocals with light reverb, synth bass"
-            ),
+            result
+                .style
+                .starts_with("synthwave, female clean vocals with light reverb, synth bass"),
             "{}",
             result.style
         );
+        assert!(result.style.ends_with(", 102 BPM"), "{}", result.style);
         assert!(result.lyrics.starts_with("[Verse 1]\nNeon rain"));
 
         let requests = transport.requests();
