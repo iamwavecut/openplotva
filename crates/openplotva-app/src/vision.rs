@@ -1913,7 +1913,9 @@ fn data_url_payload(data_url: &str) -> Option<Vec<u8>> {
     BASE64_STANDARD.decode(payload).ok()
 }
 
-/// Whole seconds from the `mvhd` box of an MP4 or MOV file.
+/// Whole seconds from the header of an MP4 or MOV file. In a fragmented file
+/// (`moov` has `mvex`) `mvhd` covers only the samples before the first
+/// fragment, so the length comes from `mvex/mehd` or stays unknown.
 fn mp4_duration_seconds(data: &[u8]) -> Option<u64> {
     let moov = mp4_child(data, b"moov")?;
     let mvhd = mp4_child(moov, b"mvhd")?;
@@ -1932,7 +1934,25 @@ fn mp4_duration_seconds(data: &[u8]) -> Option<u64> {
     } else {
         (be_u32(11)?, be_u32(15)?)
     };
-    (timescale > 0).then(|| duration / timescale)
+    let duration = match mp4_child(moov, b"mvex") {
+        Some(mvex) => mp4_fragment_duration(mvex)?,
+        None => duration,
+    };
+    (timescale > 0 && duration > 0).then(|| duration / timescale)
+}
+
+/// `fragment_duration` of `mvex/mehd`, in the `mvhd` timescale.
+fn mp4_fragment_duration(mvex: &[u8]) -> Option<u64> {
+    let (&version, fields) = mp4_child(mvex, b"mehd")?.split_first()?;
+    // After the version byte: 3 bytes of flags, then the duration (8 bytes in
+    // version 1, 4 in version 0).
+    if version == 1 {
+        Some(u64::from_be_bytes(fields.get(3..11)?.try_into().ok()?))
+    } else {
+        Some(u64::from(u32::from_be_bytes(
+            fields.get(3..7)?.try_into().ok()?,
+        )))
+    }
 }
 
 /// Whether a track of an MP4 or MOV file stores AV1 video. `stsd` holds its
@@ -2694,7 +2714,7 @@ mod tests {
     fn h264_video_is_sent_with_its_duration() -> Result<(), Box<dyn std::error::Error>> {
         let data_url = format!(
             "data:video/mp4;base64,{}",
-            BASE64_STANDARD.encode(mp4_clip(&[b"avc1", b"mp4a"], 7))
+            BASE64_STANDARD.encode(mp4_clip(&[b"avc1", b"mp4a"], 7_000, None))
         );
         let captioner = AifarmVisionCaptioner::with_transport(
             AifarmVisionCaptionerConfig {
@@ -2730,6 +2750,74 @@ mod tests {
             "{}",
             parts[1].text
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fragmented_clip_duration_comes_from_mehd_or_is_unknown() {
+        let trex = mp4_full_box(b"trex", 0, &[0_u8; 20]);
+        let mehd_v0 = mp4_full_box(b"mehd", 0, &6_500_u32.to_be_bytes());
+        let mehd_v1 = mp4_full_box(b"mehd", 1, &7_000_u64.to_be_bytes());
+        let fragmented = |mvhd_ticks: u32, mvex: &[&[u8]]| {
+            mp4_clip(&[b"avc1"], mvhd_ticks, Some(mvex.concat().as_slice()))
+        };
+
+        assert_eq!(
+            mp4_duration_seconds(&fragmented(0, &[&mehd_v0, &trex])),
+            Some(6)
+        );
+        assert_eq!(
+            mp4_duration_seconds(&fragmented(0, &[&mehd_v1, &trex])),
+            Some(7)
+        );
+        assert_eq!(mp4_duration_seconds(&fragmented(0, &[&trex])), None);
+        // `mvhd` of a fragmented file covers only the samples before the first `moof`.
+        assert_eq!(mp4_duration_seconds(&fragmented(1_000, &[&trex])), None);
+    }
+
+    #[test]
+    fn zero_mvhd_duration_is_unknown_but_a_short_clip_lasts_zero_seconds() {
+        assert_eq!(mp4_duration_seconds(&mp4_clip(&[b"avc1"], 0, None)), None);
+        assert_eq!(
+            mp4_duration_seconds(&mp4_clip(&[b"avc1"], 400, None)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn fragmented_video_prompt_omits_an_unknown_duration() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let trex = mp4_full_box(b"trex", 0, &[0_u8; 20]);
+        let data_url = format!(
+            "data:video/mp4;base64,{}",
+            BASE64_STANDARD.encode(mp4_clip(&[b"avc1", b"mp4a"], 0, Some(&trex)))
+        );
+        let captioner = AifarmVisionCaptioner::with_transport(
+            AifarmVisionCaptionerConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://vision.example.test/v1/chat/completions".to_owned(),
+                    default_model: "vision-model".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                model: "vision-model".to_owned(),
+                ..AifarmVisionCaptionerConfig::default()
+            },
+            DataUrlStub::default(),
+            AifarmTransportStub::new(Vec::new()),
+        );
+
+        let request = captioner.request(
+            &data_url,
+            &TelegramVisionCaptionRequest {
+                file_unique_id: "video-u".to_owned(),
+                latest_file_id: "video-file".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            },
+        )?;
+
+        let text = &request.messages[1].content_parts[1].text;
+        assert!(text.starts_with("Опиши видео"), "{text}");
         Ok(())
     }
 
@@ -3014,7 +3102,7 @@ mod tests {
     #[tokio::test]
     async fn av1_video_is_skipped_before_the_provider_call()
     -> Result<(), Box<dyn std::error::Error>> {
-        let clip = mp4_clip(&[b"mp4a", b"av01"], 6);
+        let clip = mp4_clip(&[b"mp4a", b"av01"], 6_000, None);
         let transport = AifarmTransportStub::new(Vec::new());
         let probe = transport.clone();
         let captioner = AifarmVisionCaptioner::with_transport(
@@ -3611,12 +3699,20 @@ mod tests {
         out
     }
 
-    /// `ftyp`, `moov` and `mdat` of a clip lasting `seconds`, with one track
-    /// per sample entry type laid out as an encoder writes it.
-    fn mp4_clip(sample_entries: &[&[u8; 4]], seconds: u32) -> Vec<u8> {
+    fn mp4_full_box(box_type: &[u8; 4], version: u8, fields: &[u8]) -> Vec<u8> {
+        let mut payload = vec![version, 0, 0, 0];
+        payload.extend_from_slice(fields);
+        mp4_box(box_type, &payload)
+    }
+
+    /// `ftyp`, `moov` and `mdat` of a clip whose `mvhd` holds `ticks` at
+    /// 1 kHz, with one track per sample entry type laid out as an encoder
+    /// writes it. `mvex` children make it fragmented: `moov` ends with
+    /// `mvex` and a `moof` comes before the media data.
+    fn mp4_clip(sample_entries: &[&[u8; 4]], ticks: u32, mvex: Option<&[u8]>) -> Vec<u8> {
         let mut mvhd = vec![0_u8; 100];
         mvhd[12..16].copy_from_slice(&1_000_u32.to_be_bytes());
-        mvhd[16..20].copy_from_slice(&(seconds * 1_000).to_be_bytes());
+        mvhd[16..20].copy_from_slice(&ticks.to_be_bytes());
         let mut moov = mp4_box(b"mvhd", &mvhd);
         for sample_entry in sample_entries {
             let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
@@ -3632,8 +3728,14 @@ mod tests {
             trak.extend_from_slice(&mp4_box(b"mdia", &mdia));
             moov.extend_from_slice(&mp4_box(b"trak", &trak));
         }
+        if let Some(children) = mvex {
+            moov.extend_from_slice(&mp4_box(b"mvex", children));
+        }
         let mut clip = mp4_box(b"ftyp", b"isom\0\0\0\0");
         clip.extend_from_slice(&mp4_box(b"moov", &moov));
+        if mvex.is_some() {
+            clip.extend_from_slice(&mp4_box(b"moof", &[0_u8; 16]));
+        }
         clip.extend_from_slice(&mp4_box(b"mdat", &[0_u8; 32]));
         clip
     }
