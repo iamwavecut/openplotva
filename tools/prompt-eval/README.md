@@ -30,7 +30,7 @@ fixtures (for example exported production requests) and is never committed.
 | `user_prompt` | optional second template rendered as the user text |
 | `vars` | template variables (`{{name}}` is HTML-escaped like Handlebars, `{{{name}}}` is raw) |
 | `user` | user turn: a string, or JSON that is pretty-printed like the bot does |
-| `user_layout` | `memory_blocks` renders `user` as the memory extraction message (`<run>`, `<existing_cards>`, `<chat_window>`, task line); `--legacy-user-layout` sends the old pretty JSON instead, for the pre-v6 prompt |
+| `user_layout` | `history_items` renders `user` as the stage-one history message (`<window>`, one `<msg>`/`<summary>` line per item that can carry an event, task line); `memory_blocks` renders `user` as the memory extraction message (`<run>`, `<existing_cards>`, `<chat_window>`, task line); `--legacy-user-layout` sends the old pretty JSON instead, for the pre-v6 prompt |
 | `image` | optional path (relative to this directory) attached before the text; the fixture is skipped if missing |
 | `schema` | name of `schemas/<name>.json`; sent as `response_format` (`--mode response_format`), as a forced tool (`--mode tools`), or not at all (`--mode prompt_only`) |
 | `tool_name` | schema/tool name for the two structured modes |

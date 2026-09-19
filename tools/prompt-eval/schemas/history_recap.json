@@ -1,0 +1,51 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "actors": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "quality_notes": {
+      "type": "string"
+    },
+    "quality_score": {
+      "type": "number"
+    },
+    "recap": {
+      "type": "string"
+    },
+    "source_style": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "recap",
+    "actors",
+    "open_questions",
+    "source_style",
+    "quality_score",
+    "quality_notes"
+  ],
+  "type": "object"
+}

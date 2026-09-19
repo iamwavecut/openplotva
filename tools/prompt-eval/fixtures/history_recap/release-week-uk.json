@@ -1,0 +1,23 @@
+{
+  "flow": "history_recap",
+  "id": "history_recap/release-week-uk",
+  "prompt": "history/recap",
+  "schema": "history_recap",
+  "tool_name": "chat_history_recap",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "max_tokens": 2048
+  },
+  "notes": "Ukrainian team chat: a release moved and a bug hunt; the recap must stay in the chat's language.",
+  "user": "<window>\\n{\"items\":2,\"range_end\":\"2026-09-02T20:00:00Z\",\"range_start\":\"2026-09-02T08:00:00Z\",\"scope\":\"chat\"}\\n</window>\\n<events>\\n<event id=\"E1\" at=\"2026-09-02T09:00:00Z\" when=\"11 годин назад\" actors=\"Остап\">Реліз перенесли на п'ятницю — Остап сказав, що тести червоні, тому реліз у п'ятницю.</event>\\n<event id=\"E2\" at=\"2026-09-02T15:00:00Z\" when=\"5 годин назад\" actors=\"Леся, Остап\">Знайшли баг у кеші — Леся знайшла причину червоних тестів у кеші, Остап взявся за виправлення.</event>\\n</events>\\nПо событиям выше верни JSON с пересказом, как описано в инструкции.",
+  "checks": [
+    "json",
+    "schema",
+    "lang:ru:recap",
+    "word_range:recap:15:180",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}
