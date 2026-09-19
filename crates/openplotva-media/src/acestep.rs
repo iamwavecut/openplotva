@@ -1040,7 +1040,10 @@ pub fn instrumental_skeleton(structure: &[String]) -> String {
         }
     }
     if !sections.contains(&"Chorus") {
-        sections.extend(["Verse", "Chorus"]);
+        if sections.last() != Some(&"Verse") {
+            sections.push("Verse");
+        }
+        sections.push("Chorus");
     }
     if sections.last() != Some(&"Outro") {
         sections.push("Outro");
@@ -2710,6 +2713,10 @@ mod tests {
                 "chorus".to_owned(),
             ]),
             "[Intro]\n\n[Verse]\n\n[Pre-Chorus]\n\n[Chorus]\n\n[Outro]"
+        );
+        assert_eq!(
+            instrumental_skeleton(&["slow verse with a lonely piano".to_owned()]),
+            "[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]"
         );
     }
 
