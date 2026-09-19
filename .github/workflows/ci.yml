@@ -171,13 +171,19 @@ jobs:
           set -euo pipefail
           # Per-package cargo test would resolve different dependency features and rebuild most of
           # the graph, so run the test binaries the workspace build already produced.
-          binaries="$(cargo test --workspace --tests --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.kind == ["lib"]) | "\(.target.name) \(.executable)"')"
-          storage="$(awk '$1 == "openplotva_storage" {print $2}' <<<"$binaries")"
-          app="$(awk '$1 == "openplotva_app" {print $2}' <<<"$binaries")"
-          [[ -x "$storage" && -x "$app" ]] || { echo "storage or app test binary not found" >&2; exit 1; }
-          (cd crates/openplotva-storage && "$storage" --test-threads=1 outbox_roundtrip_is_idempotent_ordered_and_fenced live_)
-          (cd crates/openplotva-app && "$app" --test-threads=1 maintenance)
+          artifacts="$(cargo test --workspace --tests --no-run --message-format=json \
+            | jq -c 'select(.reason == "compiler-artifact" and .profile.test and .executable)')"
+          run_serially() {
+            local crate="$1"; shift
+            local executables
+            executables="$(jq -r --arg manifest "$PWD/crates/$crate/Cargo.toml" 'select(.manifest_path == $manifest) | .executable' <<<"$artifacts")"
+            [[ -n "$executables" ]] || { echo "no test binaries for $crate" >&2; exit 1; }
+            while read -r executable; do
+              (cd "crates/$crate" && "$executable" --test-threads=1 "$@" </dev/null)
+            done <<<"$executables"
+          }
+          run_serially openplotva-storage outbox_roundtrip_is_idempotent_ordered_and_fenced live_
+          run_serially openplotva-app maintenance
 
   rust-dependencies:
     name: Rust dependencies
