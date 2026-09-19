@@ -50,6 +50,8 @@ fixtures (for example exported production requests) and is never committed.
 | `max_items:<path>:<n>` / `min_items:<path>:<n>` | the array at the path has at most / at least n items |
 | `ids_from_input` | every integer under a `*_id` / `*_ids` key occurs in the user payload (0 allowed) |
 | `merge_plan_valid` | subject merge: every card index has one known action, folded cards point at kept cards, and every survivor with folded cards has merged text |
+| `resolution_plan_valid` | candidate resolution: every candidate index has one known action, and every action other than `add` names a card on that candidate's own shortlist |
+| `decision:<i>=<a\|b>[@<card>]` | candidate resolution: candidate i got one of the listed actions (and the given card index) |
 | `separate:<i>,<j>` | subject merge: cards i and j do not end up in the same cluster |
 | `evidence_quoted` | memory extraction: every candidate card's `evidence_quote` occurs in a message it cites |
 | `not_equals:<path>=<value>` | no value at the path equals the given value |

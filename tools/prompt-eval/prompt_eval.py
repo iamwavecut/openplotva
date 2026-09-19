@@ -464,6 +464,29 @@ def merge_plan_errors(fixture: Fixture, parsed: Any) -> list[str]:
     return [f"survivors without text {lacking}"] if lacking else []
 
 
+def resolution_choices(fixture: Fixture, parsed: Any) -> tuple[dict[int, dict[str, Any]], list[str]]:
+    """Candidate resolution: the rules `apply_resolution_plan` enforces, plus the choice per candidate."""
+    candidates = (fixture.data.get("user") or {}).get("candidates", [])
+    if not isinstance(parsed, dict):
+        return {}, ["no object"]
+    choices: dict[int, dict[str, Any]] = {}
+    for choice in parsed.get("decisions") or []:
+        index = choice.get("candidate_index") if isinstance(choice, dict) else None
+        if not isinstance(index, int) or not 0 <= index < len(candidates):
+            return choices, [f"unknown candidate {index}"]
+        if index in choices:
+            return choices, [f"repeated candidate {index}"]
+        action = str(choice.get("action") or "").strip().lower()
+        if action not in ("add", "reinforce", "update", "supersede", "competing"):
+            return choices, [f"unknown action {action!r}"]
+        card = choice.get("card_index")
+        if action != "add" and (not isinstance(card, int) or not 0 <= card < len(candidates[index].get("similar", []))):
+            return choices, [f"candidate {index} names card {card}"]
+        choices[index] = {"action": action, "card": card}
+    missing = [index for index in range(len(candidates)) if index not in choices]
+    return choices, [f"missing candidates {missing}"] if missing else []
+
+
 def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: str) -> tuple[bool, str]:
     name, _, arg = check.partition(":")
     if name == "json":
@@ -500,6 +523,15 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
         allowed = input_ints(fixture) | {0}
         bad = sorted({i for i in id_values(parsed) if i not in allowed})
         return not bad, f"unknown ids {bad[:5]}" if bad else "ok"
+    if name == "resolution_plan_valid":
+        _, errors = resolution_choices(fixture, parsed)
+        return not errors, "; ".join(errors) or "ok"
+    if name == "decision":
+        target, _, expected = arg.partition("=")
+        actions, _, card = expected.partition("@")
+        choice = resolution_choices(fixture, parsed)[0].get(int(target))
+        ok = bool(choice) and choice["action"] in actions.split("|") and (not card or choice["card"] == int(card))
+        return ok, f"{choice}" if choice else "no decision"
     if name == "merge_plan_valid":
         errors = merge_plan_errors(fixture, parsed)
         return not errors, "; ".join(errors) or "ok"
@@ -675,6 +707,10 @@ SELF_TEST_CASES = [
     ("no_repeat_lines:2", "same line here\nsame line here\nsame line here", False),
     ("not_equals:cards[].type=event", '{"cards": [{"type": "decision"}]}', True),
     ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "demote"}]}', True),
+    ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 0}]}', True),
+    ("resolution_plan_valid", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 3}]}', False),
+    ("decision:0=update|reinforce@0", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 0}]}', True),
+    ("decision:0=add", '{"decisions": [{"candidate_index": 0, "action": "reinforce", "card_index": 0}]}', False),
     ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "keep"}]}', False),
     ("separate:0,1", '{"decisions": [{"index": 0, "action": "keep"}, {"index": 1, "action": "keep"}]}', True),
     ("separate:0,1", '{"decisions": [{"index": 0, "action": "keep"}, {"index": 1, "action": "cluster_with", "survivor_index": 0}]}', False),
@@ -703,6 +739,7 @@ def self_test() -> int:
             "user": {
                 "cards": [{"index": 0}, {"index": 1}],
                 "existing_cards": [{"id": 7}],
+                "candidates": [{"index": 0, "similar": [{"index": 0}]}],
                 "messages": [{"message_id": 5, "entry_id": "e5", "text": "Я больше не ем   мясо, честно"}],
             },
         },
