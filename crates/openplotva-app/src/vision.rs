@@ -523,12 +523,20 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
         request: &TelegramVisionCaptionRequest,
     ) -> Result<ChatCompletionRequest, AifarmVisionCaptionerError> {
         let is_video = vision_request_is_video(request);
+        let video = if is_video {
+            data_url_payload(data_url)
+        } else {
+            None
+        };
+        if video.as_deref().is_some_and(mp4_has_av1_track) {
+            return Err(AifarmVisionCaptionerError::Av1VideoUnsupported);
+        }
         let (system_prompt, user_prompt) = if is_video {
             (
                 openplotva_prompts::read("vision/video_system")?,
                 openplotva_prompts::render(
                     "vision/video_user",
-                    &video_prompt_data(video_duration_seconds(data_url)),
+                    &video_prompt_data(video.as_deref().and_then(mp4_duration_seconds)),
                 )?,
             )
         } else {
@@ -629,6 +637,9 @@ pub enum AifarmVisionCaptionerError {
     EmptyCaption,
     #[error("legacy vision API does not support video input")]
     LegacyVideoUnsupported,
+    /// AV1 video, from which the vision model's frame decoder reads no frames.
+    #[error("AV1 video is not supported for captions")]
+    Av1VideoUnsupported,
     /// The caption kept repeating one line.
     #[error("vision caption repeats a line {VISION_RUNAWAY_LINE_REPEATS} times")]
     Runaway,
@@ -1897,11 +1908,9 @@ fn still_max_side(media_kind: &str, max_side: u32) -> u32 {
     }
 }
 
-/// Clip length for the video prompt, from the data URL's MP4 header.
-fn video_duration_seconds(data_url: &str) -> Option<u64> {
+fn data_url_payload(data_url: &str) -> Option<Vec<u8>> {
     let (_, payload) = split_vision_data_url(data_url)?;
-    let bytes = BASE64_STANDARD.decode(payload).ok()?;
-    mp4_duration_seconds(&bytes)
+    BASE64_STANDARD.decode(payload).ok()
 }
 
 /// Whole seconds from the `mvhd` box of an MP4 or MOV file.
@@ -1926,9 +1935,38 @@ fn mp4_duration_seconds(data: &[u8]) -> Option<u64> {
     (timescale > 0).then(|| duration / timescale)
 }
 
+/// Whether a track of an MP4 or MOV file stores AV1 video. `stsd` holds its
+/// version, flags and entry count, then the first sample entry: a box whose
+/// type follows its 4-byte size.
+fn mp4_has_av1_track(data: &[u8]) -> bool {
+    let Some(moov) = mp4_child(data, b"moov") else {
+        return false;
+    };
+    mp4_boxes(moov)
+        .filter(|(box_type, _)| *box_type == b"trak")
+        .filter_map(|(_, trak)| {
+            let mdia = mp4_child(trak, b"mdia")?;
+            let minf = mp4_child(mdia, b"minf")?;
+            let stbl = mp4_child(minf, b"stbl")?;
+            mp4_child(stbl, b"stsd")
+        })
+        .any(|stsd| {
+            stsd.get(12..16)
+                .is_some_and(|sample_entry| sample_entry == b"av01")
+        })
+}
+
 /// Payload of the first box called `name` among the boxes in `data`.
-fn mp4_child<'a>(mut data: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
-    while data.len() >= 8 {
+fn mp4_child<'a>(data: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
+    mp4_boxes(data).find_map(|(box_type, payload)| (box_type == name).then_some(payload))
+}
+
+/// Type and payload of each box laid out one after another in `data`.
+fn mp4_boxes(mut data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    std::iter::from_fn(move || {
+        if data.len() < 8 {
+            return None;
+        }
         let declared = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?);
         let (header, size) = match declared {
             0 => (8, data.len()),
@@ -1941,12 +1979,10 @@ fn mp4_child<'a>(mut data: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
         if size < header || size > data.len() {
             return None;
         }
-        if data.get(4..8)? == name {
-            return data.get(header..size);
-        }
-        data = &data[size..];
-    }
-    None
+        let (current, rest) = data.split_at(size);
+        data = rest;
+        Some((current.get(4..8)?, current.get(header..)?))
+    })
 }
 
 fn video_prompt_data(duration_seconds: Option<u64>) -> serde_json::Value {
@@ -2637,8 +2673,7 @@ mod tests {
         clip.extend_from_slice(&(8 + mvhd_box.len() as u32).to_be_bytes());
         clip.extend_from_slice(b"moov");
         clip.extend_from_slice(&mvhd_box);
-        let data_url = format!("data:video/mp4;base64,{}", BASE64_STANDARD.encode(&clip));
-        assert_eq!(video_duration_seconds(&data_url), Some(95));
+        assert_eq!(mp4_duration_seconds(&clip), Some(95));
 
         let prompt = openplotva_prompts::render("vision/video_user", &video_prompt_data(Some(95)))?;
         assert!(prompt.contains("Длительность ролика: 01:35."), "{prompt}");
@@ -2651,7 +2686,50 @@ mod tests {
         );
         let unknown = openplotva_prompts::render("vision/video_user", &video_prompt_data(None))?;
         assert!(unknown.starts_with("Опиши видео"), "{unknown}");
-        assert_eq!(video_duration_seconds("data:video/mp4;base64,AAAA"), None);
+        assert_eq!(mp4_duration_seconds(&[0, 0, 0]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn h264_video_is_sent_with_its_duration() -> Result<(), Box<dyn std::error::Error>> {
+        let data_url = format!(
+            "data:video/mp4;base64,{}",
+            BASE64_STANDARD.encode(mp4_clip(&[b"avc1", b"mp4a"], 7))
+        );
+        let captioner = AifarmVisionCaptioner::with_transport(
+            AifarmVisionCaptionerConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://vision.example.test/v1/chat/completions".to_owned(),
+                    default_model: "vision-model".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                model: "vision-model".to_owned(),
+                ..AifarmVisionCaptionerConfig::default()
+            },
+            DataUrlStub::default(),
+            AifarmTransportStub::new(Vec::new()),
+        );
+
+        let request = captioner.request(
+            &data_url,
+            &TelegramVisionCaptionRequest {
+                file_unique_id: "video-u".to_owned(),
+                latest_file_id: "video-file".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            },
+        )?;
+
+        let parts = &request.messages[1].content_parts;
+        assert_eq!(
+            parts[0].video_url.as_ref().map(|video| video.url.as_str()),
+            Some(data_url.as_str())
+        );
+        assert!(
+            parts[1].text.starts_with("Длительность ролика: 00:07."),
+            "{}",
+            parts[1].text
+        );
         Ok(())
     }
 
@@ -2930,6 +3008,47 @@ mod tests {
             body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
             false
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn av1_video_is_skipped_before_the_provider_call()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clip = mp4_clip(&[b"mp4a", b"av01"], 6);
+        let transport = AifarmTransportStub::new(Vec::new());
+        let probe = transport.clone();
+        let captioner = AifarmVisionCaptioner::with_transport(
+            AifarmVisionCaptionerConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://vision.example.test/v1/chat/completions".to_owned(),
+                    default_model: "vision-model".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                model: "vision-model".to_owned(),
+                ..AifarmVisionCaptionerConfig::default()
+            },
+            FixedDataUrl(format!(
+                "data:video/mp4;base64,{}",
+                BASE64_STANDARD.encode(&clip)
+            )),
+            transport,
+        );
+
+        let error = captioner
+            .caption_telegram_file(TelegramVisionCaptionRequest {
+                file_unique_id: "video-u".to_owned(),
+                latest_file_id: "video-file".to_owned(),
+                media_kind: "video".to_owned(),
+                mime_type: Some("video/mp4".to_owned()),
+            })
+            .await
+            .expect_err("an AV1 clip is not sent for a caption");
+
+        assert!(
+            matches!(error, AifarmVisionCaptionerError::Av1VideoUnsupported),
+            "{error}"
+        );
+        assert!(probe.requests().is_empty());
         Ok(())
     }
 
@@ -3284,6 +3403,22 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedDataUrl(String);
+
+    impl TelegramVisionDataUrlProvider for FixedDataUrl {
+        type Error = StubError;
+
+        fn telegram_file_data_url<'a>(
+            &'a self,
+            _latest_file_id: &'a str,
+            _media_kind: &'a str,
+            _mime_type: Option<&'a str>,
+        ) -> TelegramVisionDataUrlFuture<'a, Self::Error> {
+            Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct AifarmTransportStub {
         state: Arc<Mutex<AifarmTransportState>>,
@@ -3466,6 +3601,41 @@ mod tests {
             }
         }
         Ok(out)
+    }
+
+    fn mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + payload.len()).expect("test box size fits u32");
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `ftyp`, `moov` and `mdat` of a clip lasting `seconds`, with one track
+    /// per sample entry type laid out as an encoder writes it.
+    fn mp4_clip(sample_entries: &[&[u8; 4]], seconds: u32) -> Vec<u8> {
+        let mut mvhd = vec![0_u8; 100];
+        mvhd[12..16].copy_from_slice(&1_000_u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&(seconds * 1_000).to_be_bytes());
+        let mut moov = mp4_box(b"mvhd", &mvhd);
+        for sample_entry in sample_entries {
+            let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+            stsd.extend_from_slice(&mp4_box(sample_entry, &[0_u8; 78]));
+            let mut stbl = mp4_box(b"stsd", &stsd);
+            stbl.extend_from_slice(&mp4_box(b"stts", &[0_u8; 8]));
+            let mut minf = mp4_box(b"dinf", &[0_u8; 28]);
+            minf.extend_from_slice(&mp4_box(b"stbl", &stbl));
+            let mut mdia = mp4_box(b"mdhd", &[0_u8; 24]);
+            mdia.extend_from_slice(&mp4_box(b"hdlr", &[0_u8; 25]));
+            mdia.extend_from_slice(&mp4_box(b"minf", &minf));
+            let mut trak = mp4_box(b"tkhd", &[0_u8; 84]);
+            trak.extend_from_slice(&mp4_box(b"mdia", &mdia));
+            moov.extend_from_slice(&mp4_box(b"trak", &trak));
+        }
+        let mut clip = mp4_box(b"ftyp", b"isom\0\0\0\0");
+        clip.extend_from_slice(&mp4_box(b"moov", &moov));
+        clip.extend_from_slice(&mp4_box(b"mdat", &[0_u8; 32]));
+        clip
     }
 
     fn decode_data_url_payload(data_url: &str) -> Result<Vec<u8>, base64::DecodeError> {
