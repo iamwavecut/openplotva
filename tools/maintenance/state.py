@@ -151,10 +151,9 @@ class State:
 
     def jobs(self, statuses=None):
         if statuses is None: return [json.loads(r[0]) for r in self.db.execute('SELECT data FROM jobs ORDER BY rowid')]
-        statuses = tuple(statuses)
         # save_job mirrors data['status'] into this column, so the service loop never decodes retained jobs to skip them.
         return [json.loads(r[0]) for r in self.db.execute(
-            'SELECT data FROM jobs WHERE status IN ('+','.join('?'*len(statuses))+') ORDER BY rowid', statuses)]
+            'SELECT data FROM jobs WHERE status IN (SELECT value FROM json_each(?)) ORDER BY rowid', (json.dumps(list(statuses)),))]
 
     def update_job(self, job_id, **fields):
         with self.transaction():
