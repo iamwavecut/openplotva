@@ -1,0 +1,102 @@
+{
+  "flow": "memory_resolution",
+  "id": "memory_resolution/mixed-window-ru",
+  "prompt": "memory/resolution",
+  "schema": "memory_resolution",
+  "tool_name": "memory_resolution",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 2000
+  },
+  "notes": "Three candidates from one window: a restatement, a new fact and a relocation.",
+  "user": {
+    "candidates": [
+      {
+        "index": 0,
+        "type": "preference",
+        "subject": "Лена",
+        "predicate": "likes",
+        "fact": "Лена обожает джаз",
+        "similar": [
+          {
+            "index": 0,
+            "type": "preference",
+            "subject": "Лена",
+            "predicate": "likes",
+            "fact": "Лена любит джаз",
+            "conf": 0.8,
+            "age": "3w"
+          },
+          {
+            "index": 1,
+            "type": "preference",
+            "subject": "Петя",
+            "predicate": "likes",
+            "fact": "Петя не любит джаз",
+            "conf": 0.6,
+            "age": "3w"
+          }
+        ]
+      },
+      {
+        "index": 1,
+        "type": "project",
+        "subject": "Лена",
+        "predicate": "learns",
+        "fact": "Лена учится играть на саксофоне",
+        "similar": [
+          {
+            "index": 0,
+            "type": "preference",
+            "subject": "Лена",
+            "predicate": "likes",
+            "fact": "Лена любит джаз",
+            "conf": 0.8,
+            "age": "3w"
+          }
+        ]
+      },
+      {
+        "index": 2,
+        "type": "identity",
+        "subject": "Гоша",
+        "predicate": "lives_in",
+        "fact": "Гоша переехал в Тбилиси",
+        "similar": [
+          {
+            "index": 0,
+            "type": "identity",
+            "subject": "Гоша",
+            "predicate": "lives_in",
+            "fact": "Гоша живёт в Москве",
+            "conf": 0.8,
+            "age": "4mo"
+          },
+          {
+            "index": 1,
+            "type": "relationship",
+            "subject": "Вероника",
+            "predicate": "sibling",
+            "fact": "Гоша — младший брат Вероники",
+            "conf": 0.8,
+            "age": "3w"
+          }
+        ]
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "resolution_plan_valid",
+    "decision:0=reinforce|update@0",
+    "decision:1=add",
+    "decision:2=supersede@0",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

@@ -1051,6 +1051,9 @@ pub struct MemoryConfig {
     pub aifarm_frequency_penalty: Option<f64>,
     pub aifarm_presence_penalty: Option<f64>,
     pub aifarm_enable_thinking: bool,
+    /// Extract candidates without existing cards, then resolve each candidate
+    /// against a shortlist of similar cards in a second call.
+    pub two_phase_enabled: bool,
     pub subject_merge_enabled: bool,
     pub subject_merge_min_cards: i32,
     pub subject_merge_cooldown_hours: f64,
@@ -1587,6 +1590,8 @@ pub struct RawConfig {
     pub memory_aifarm_presence_penalty: Option<String>,
     /// `MEMORY_AIFARM_ENABLE_THINKING`.
     pub memory_aifarm_enable_thinking: Option<String>,
+    /// `MEMORY_TWO_PHASE_ENABLED`.
+    pub memory_two_phase_enabled: Option<String>,
     /// `MEMORY_SUBJECT_MERGE_ENABLED`.
     pub memory_subject_merge_enabled: Option<String>,
     /// `MEMORY_SUBJECT_MERGE_MIN_CARDS`.
@@ -2938,6 +2943,11 @@ impl AppConfig {
                     raw.memory_aifarm_enable_thinking,
                     false,
                 )?,
+                two_phase_enabled: parse_bool(
+                    "MEMORY_TWO_PHASE_ENABLED",
+                    raw.memory_two_phase_enabled,
+                    true,
+                )?,
                 subject_merge_enabled: parse_bool(
                     "MEMORY_SUBJECT_MERGE_ENABLED",
                     raw.memory_subject_merge_enabled,
@@ -3353,6 +3363,7 @@ impl RawConfig {
             memory_aifarm_frequency_penalty: env("MEMORY_AIFARM_FREQUENCY_PENALTY"),
             memory_aifarm_presence_penalty: env("MEMORY_AIFARM_PRESENCE_PENALTY"),
             memory_aifarm_enable_thinking: env("MEMORY_AIFARM_ENABLE_THINKING"),
+            memory_two_phase_enabled: env("MEMORY_TWO_PHASE_ENABLED"),
             memory_subject_merge_enabled: env("MEMORY_SUBJECT_MERGE_ENABLED"),
             memory_subject_merge_min_cards: env("MEMORY_SUBJECT_MERGE_MIN_CARDS"),
             memory_subject_merge_cooldown_hours: env("MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS"),
@@ -4169,6 +4180,7 @@ mod tests {
         assert_eq!(config.memory.aifarm_capacity_wait_seconds, 600);
         assert_eq!(config.memory.aifarm_capacity_poll_seconds, 1);
         assert_eq!(config.memory.aifarm_temperature, None);
+        assert!(config.memory.two_phase_enabled);
         assert_eq!(config.memory.aifarm_presence_penalty, None);
         assert!(!config.memory.aifarm_enable_thinking);
         assert!(config.memory.redaction_enabled);

@@ -681,6 +681,9 @@ pub struct MemoryRunProcessConfig {
     pub embedding_dimension: i32,
     /// Episode model stored with `memory_episodes`.
     pub episode_model: String,
+    /// Extract candidates without existing cards, then resolve each against a
+    /// shortlist of similar cards in a second call.
+    pub two_phase: bool,
 }
 
 /// Config for the app-level memory service worker.
@@ -857,6 +860,7 @@ impl Default for MemoryRunProcessConfig {
             max_input_tokens: MEMORY_MAX_EXTRACTION_BATCH_INPUT_TOKENS,
             embedding_dimension: 512,
             episode_model: openplotva_memory::DEFAULT_MEMORY_CONSOLIDATION_MODEL.to_owned(),
+            two_phase: false,
         }
     }
 }
@@ -890,6 +894,7 @@ impl MemoryRunProcessConfig {
             } else {
                 self.episode_model.trim().to_owned()
             },
+            two_phase: self.two_phase,
         }
     }
 }
@@ -988,6 +993,184 @@ where
         .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
     let output = gated_extraction_output(input, output);
     write_memory_extraction_batch_inner(store, embedder, input, output, cfg).await
+}
+
+/// Model calls allowed for one window's resolution plan.
+const RESOLUTION_PLAN_ATTEMPTS: usize = 2;
+/// Related cards fetched per candidate before the worth-showing filter.
+const RESOLUTION_SHORTLIST_FETCH: i32 = 10;
+
+/// Two-phase extraction: the model first extracts candidates from the window
+/// without seeing existing cards (so their wording cannot prime it), then one
+/// resolution call decides for every candidate with similar cards whether it
+/// is new, restates, rewords, replaces or contradicts one of them. A failed or
+/// invalid resolution keeps the candidates as new cards; the final gate pass
+/// against the shortlisted cards still turns restated facts into
+/// reinforcements.
+async fn extract_in_two_phases<Extractor, Store, Embedder>(
+    extractor: &Extractor,
+    store: &Store,
+    embedder: Option<&Embedder>,
+    run: &openplotva_memory::Run,
+    chat: &DialogMemoryChatMeta,
+    input: &ExtractInput,
+    embedding_dimension: i32,
+) -> Result<ExtractOutput, MemoryExtractionWriteError<Extractor::Error, Store::Error>>
+where
+    Extractor: MemoryExtractor + Send + Sync,
+    Extractor::Error: StdError + Send + Sync + 'static,
+    Store: MemoryRunStore,
+    Embedder: EmbeddingProvider,
+{
+    let candidates_input = ExtractInput {
+        existing_cards: Vec::new(),
+        ..input.clone()
+    };
+    let output = extractor
+        .extract(&candidates_input)
+        .await
+        .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+    let output = gated_extraction_output(&candidates_input, output);
+    if output.candidate_cards.is_empty() {
+        return Ok(output);
+    }
+    let as_of = if openplotva_memory::is_memory_zero_time(run.range_end_at) {
+        OffsetDateTime::now_utc()
+    } else {
+        run.range_end_at
+    };
+    let shortlists = candidate_shortlists(
+        store,
+        run,
+        chat,
+        &output.candidate_cards,
+        embedder,
+        embedding_dimension,
+        as_of,
+    )
+    .await;
+    let mut shown: Vec<Card> = Vec::new();
+    for card in shortlists.iter().flatten() {
+        if !shown.iter().any(|seen| seen.id == card.id) {
+            shown.push(card.clone());
+        }
+    }
+    let resolution =
+        openplotva_memory::ResolutionInput::new(&output.candidate_cards, &shortlists, as_of);
+    let output = if resolution.candidates.is_empty() {
+        output
+    } else {
+        resolve_candidates(extractor, &resolution, output, run.id).await
+    };
+    let final_input = ExtractInput {
+        existing_cards: shown,
+        ..candidates_input
+    };
+    Ok(gated_extraction_output(&final_input, output))
+}
+
+/// Similar existing cards for every candidate, retrieved like the window's
+/// related cards: in the candidate's scope, lexical plus vector when the
+/// embedder answers, filtered by `worth_showing_as_existing`.
+async fn candidate_shortlists<Store, Embedder>(
+    store: &Store,
+    run: &openplotva_memory::Run,
+    chat: &DialogMemoryChatMeta,
+    candidates: &[openplotva_memory::CandidateCard],
+    embedder: Option<&Embedder>,
+    embedding_dimension: i32,
+    as_of: OffsetDateTime,
+) -> Vec<Vec<Card>>
+where
+    Store: MemoryRunStore,
+    Embedder: EmbeddingProvider,
+{
+    let texts: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.fact_text.trim().to_owned())
+        .collect();
+    let mut embeddings = match embedder {
+        Some(provider) => provider
+            .embed_batch(&texts, embedding_dimension, MEMORY_RETRIEVAL_QUERY_TASK)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    embeddings.resize(texts.len(), None);
+    let mut shortlists = Vec::with_capacity(candidates.len());
+    for ((candidate, text), embedding) in candidates.iter().zip(&texts).zip(&embeddings) {
+        let user_id = if openplotva_memory::normalize_card_kind(&candidate.scope_type)
+            == openplotva_memory::CARD_KIND_USER
+        {
+            candidate.user_id
+        } else {
+            0
+        };
+        let request = openplotva_memory::RetrievalRequest {
+            scope: retrieval_scope_for_run(run, chat, user_id),
+            query: text.clone(),
+            card_limit: RESOLUTION_SHORTLIST_FETCH,
+            episode_limit: 0,
+        };
+        let cards = store
+            .retrieve_related_cards(&request, embedding.as_ref())
+            .await
+            .unwrap_or_default();
+        shortlists.push(
+            cards
+                .into_iter()
+                .filter(|card| openplotva_memory::worth_showing_as_existing(card, as_of))
+                .take(openplotva_memory::RESOLUTION_SHORTLIST_LIMIT)
+                .collect(),
+        );
+    }
+    shortlists
+}
+
+/// Ask for a resolution plan and apply it. An invalid plan gets one more call;
+/// a second invalid plan, a failed call or an extractor without a resolution
+/// call keeps the candidates as they are.
+async fn resolve_candidates<Extractor>(
+    extractor: &Extractor,
+    input: &openplotva_memory::ResolutionInput,
+    output: ExtractOutput,
+    run_id: i64,
+) -> ExtractOutput
+where
+    Extractor: MemoryExtractor + Send + Sync,
+{
+    for attempt in 1..=RESOLUTION_PLAN_ATTEMPTS {
+        let plan = match extractor.resolve(input).await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return output,
+            Err(error) => {
+                tracing::warn!(run_id, %error, "memory resolution call failed; keeping the candidates as new cards");
+                return output;
+            }
+        };
+        if !plan.stringified_fields.is_empty() {
+            tracing::warn!(
+                run_id,
+                fields = ?plan.stringified_fields,
+                "memory resolution returned array fields as JSON strings"
+            );
+        }
+        match openplotva_memory::apply_resolution_plan(output.clone(), input, &plan) {
+            Ok(resolved) => return resolved,
+            Err(error) if attempt < RESOLUTION_PLAN_ATTEMPTS => {
+                tracing::warn!(run_id, %error, "memory resolution plan invalid; asking again");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id,
+                    %error,
+                    event = "resolution_plan_invalid",
+                    "memory resolution plan invalid twice; keeping the candidates as new cards"
+                );
+            }
+        }
+    }
+    output
 }
 
 /// Enforce the extraction contract on a fresh model answer and log what each
@@ -1653,11 +1836,24 @@ where
     let fallback_observed_at = OffsetDateTime::now_utc();
     for batch in &batches {
         let input = extraction_input_for_batch(run, &chat, batch);
-        let output = extractor
-            .extract(&input)
-            .await
-            .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
-        let output = gated_extraction_output(&input, output);
+        let output = if cfg.two_phase {
+            extract_in_two_phases(
+                extractor,
+                store,
+                embedder,
+                run,
+                &chat,
+                &input,
+                cfg.embedding_dimension,
+            )
+            .await?
+        } else {
+            let output = extractor
+                .extract(&input)
+                .await
+                .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+            gated_extraction_output(&input, output)
+        };
         state.add_extraction_metadata(batch, &output);
         let card_report = write_memory_extraction_cards(
             store,
@@ -3857,6 +4053,55 @@ impl MemoryExtractor for RoutedMemoryExtractor {
             }
         })
     }
+
+    fn resolve<'a>(
+        &'a self,
+        input: &'a openplotva_memory::ResolutionInput,
+    ) -> openplotva_memory::MemoryResolverFuture<'a, Self::Error> {
+        Box::pin(async move { self.resolve_routed(input).await })
+    }
+}
+
+impl RoutedMemoryExtractor {
+    async fn resolve_routed(
+        &self,
+        input: &openplotva_memory::ResolutionInput,
+    ) -> Result<Option<openplotva_memory::ResolutionPlan>, RoutedMemoryExtractorError> {
+        let config = self.config.clone();
+        let result =
+            self.walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: MEMORY_EXTRACTION_WORKFLOW_KEY.to_owned(),
+                        queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let config = config.clone();
+                        async move {
+                            resolve_candidates_with_routed_attempt(&config, attempt, input).await
+                        }
+                    },
+                    |error| retryable_reason(error),
+                )
+                .await;
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(RoutedAttemptRunError::Attempt(error)) => return Err(error),
+            Err(RoutedAttemptRunError::Routing(error)) => return Err(error.into()),
+        };
+        let (Some(plan), Some(redactor)) = (plan.clone(), &self.redactor) else {
+            return Ok(plan);
+        };
+        match openplotva_memory::redact_resolution_plan_with_async(plan.clone(), |value| {
+            redactor.redact_text(value)
+        })
+        .await
+        {
+            Ok(redacted) => Ok(Some(redacted)),
+            Err(_) => Ok(Some(plan)),
+        }
+    }
 }
 
 impl openplotva_memory::SubjectMerger for RoutedSubjectMerger {
@@ -3940,6 +4185,20 @@ async fn extract_memory_with_routed_attempt(
 
     let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
     MemoryExtractor::extract(&extractor, input)
+        .await
+        .map_err(Into::into)
+}
+
+async fn resolve_candidates_with_routed_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    input: &openplotva_memory::ResolutionInput,
+) -> Result<Option<openplotva_memory::ResolutionPlan>, RoutedMemoryExtractorError> {
+    if routed_attempt_is_genkit(&attempt) {
+        return Ok(None);
+    }
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    MemoryExtractor::resolve(&extractor, input)
         .await
         .map_err(Into::into)
 }
@@ -4339,6 +4598,7 @@ pub fn memory_service_worker_config_from_memory_config(
             max_input_tokens: config.max_input_tokens,
             embedding_dimension: config.embedding_dim,
             episode_model: config.consolidation_model.clone(),
+            two_phase: config.two_phase_enabled,
             ..MemoryRunProcessConfig::default()
         },
     }
@@ -4624,6 +4884,7 @@ mod tests {
         chat_meta: Mutex<Option<DialogMemoryChatMeta>>,
         messages: Mutex<Vec<openplotva_memory::Message>>,
         visible_cards: Mutex<Vec<Card>>,
+        related_cards: Mutex<Vec<Card>>,
         visible_card_scopes: Mutex<Vec<openplotva_memory::RetrievalScope>>,
         continuations: Mutex<Vec<(i32, i32)>>,
         completed: Mutex<Vec<(i64, RunStats)>>,
@@ -4865,6 +5126,14 @@ mod tests {
             })
         }
 
+        fn retrieve_related_cards<'a>(
+            &'a self,
+            _req: &'a openplotva_memory::RetrievalRequest,
+            _query_embedding: Option<&'a PgEmbeddingVector>,
+        ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
+            Box::pin(async move { Ok(self.related_cards.lock().expect("related cards").clone()) })
+        }
+
         fn enqueue_run_continuation<'a>(
             &'a self,
             _run: &'a openplotva_memory::Run,
@@ -4992,6 +5261,169 @@ mod tests {
                 Ok(self.output.clone())
             })
         }
+    }
+
+    struct ResolvingExtractor {
+        output: ExtractOutput,
+        plan: openplotva_memory::ResolutionPlan,
+        inputs: Mutex<Vec<ExtractInput>>,
+        resolutions: Mutex<Vec<openplotva_memory::ResolutionInput>>,
+    }
+
+    impl MemoryExtractor for ResolvingExtractor {
+        type Error = TestExtractorError;
+
+        fn extract<'a>(
+            &'a self,
+            input: &'a ExtractInput,
+        ) -> MemoryExtractorFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.inputs.lock().expect("inputs").push(input.clone());
+                Ok(self.output.clone())
+            })
+        }
+
+        fn resolve<'a>(
+            &'a self,
+            input: &'a openplotva_memory::ResolutionInput,
+        ) -> openplotva_memory::MemoryResolverFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.resolutions
+                    .lock()
+                    .expect("resolutions")
+                    .push(input.clone());
+                Ok(Some(self.plan.clone()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn two_phase_extraction_resolves_candidates_against_their_shortlists() {
+        let at = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let run = openplotva_memory::Run {
+            id: 31,
+            chat_id: -100,
+            range_start_at: at - time::Duration::hours(1),
+            range_end_at: at,
+            prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+            message_count: 2,
+            ..openplotva_memory::Run::default()
+        };
+        let message = |id: i32, text: &str| openplotva_memory::Message {
+            entry_id: format!("msg:{id}"),
+            message_id: id,
+            text: text.to_owned(),
+            occurred_at: at - time::Duration::minutes(10),
+            ..openplotva_memory::Message::default()
+        };
+        let known = |id: i64, subject: &str, predicate: &str, fact: &str| Card {
+            subject: subject.to_owned(),
+            predicate: predicate.to_owned(),
+            observation_count: 3,
+            ..memory_card(id, fact)
+        };
+        let store = FakeMemoryWriteStore {
+            ids: vec![501],
+            run: Mutex::new(Some(run)),
+            messages: Mutex::new(vec![
+                message(1, "Alice likes Rust a lot, as always"),
+                message(2, "Bob moved to Berlin last week for good"),
+            ]),
+            visible_cards: Mutex::new(vec![memory_card(99, "Carol likes Go")]),
+            related_cards: Mutex::new(vec![
+                known(42, "Alice", "likes", "Alice likes Rust"),
+                known(43, "Bob", "lives_in", "Bob lives in Paris"),
+            ]),
+            ..FakeMemoryWriteStore::default()
+        };
+        let candidate = |subject: &str, predicate: &str, fact: &str, quote: &str, entry: &str| {
+            openplotva_memory::CandidateCard {
+                scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
+                card_type: openplotva_memory::CARD_TYPE_PREFERENCE.to_owned(),
+                subject: subject.to_owned(),
+                predicate: predicate.to_owned(),
+                fact_text: fact.to_owned(),
+                evidence_quote: quote.to_owned(),
+                source_entry_ids: vec![entry.to_owned()],
+                confidence: 0.9,
+                salience: 0.8,
+                ..openplotva_memory::CandidateCard::default()
+            }
+        };
+        let choice =
+            |candidate: i64, action: &str, card: i64| openplotva_memory::ResolutionChoice {
+                candidate_index: candidate,
+                reason: "same subject and attribute".to_owned(),
+                action: action.to_owned(),
+                card_index: Some(card),
+                new_fact_text: String::new(),
+            };
+        let extractor = ResolvingExtractor {
+            output: ExtractOutput {
+                episode_summary: "Summary".to_owned(),
+                candidate_cards: vec![
+                    candidate(
+                        "Alice",
+                        "likes",
+                        "Alice likes Rust a lot",
+                        "likes Rust a lot",
+                        "msg:1",
+                    ),
+                    candidate(
+                        "Bob",
+                        "lives_in",
+                        "Bob lives in Berlin",
+                        "moved to Berlin",
+                        "msg:2",
+                    ),
+                ],
+                ..ExtractOutput::default()
+            },
+            plan: openplotva_memory::ResolutionPlan {
+                decisions: vec![choice(0, "reinforce", 0), choice(1, "supersede", 1)],
+                ..openplotva_memory::ResolutionPlan::default()
+            },
+            inputs: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
+        };
+
+        process_next_memory_run(
+            &extractor,
+            &store,
+            Option::<&FakeEmbedder>::None,
+            MemoryRunProcessConfig {
+                two_phase: true,
+                ..MemoryRunProcessConfig::default()
+            },
+        )
+        .await
+        .expect("processed");
+
+        let inputs = extractor.inputs.lock().expect("inputs");
+        assert_eq!(inputs.len(), 1);
+        assert!(
+            inputs[0].existing_cards.is_empty(),
+            "phase one sees no cards"
+        );
+        let resolutions = extractor.resolutions.lock().expect("resolutions");
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].candidates.len(), 2);
+        assert_eq!(resolutions[0].candidates[1].similar[1].id, 43);
+
+        let cards = store.cards.lock().expect("cards");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].fact_text, "Bob lives in Berlin");
+        assert_eq!(
+            store.superseded.lock().expect("superseded").as_slice(),
+            &[(43, 501)]
+        );
+        assert!(
+            store
+                .resolution_ops
+                .lock()
+                .expect("resolution ops")
+                .contains(&"reinforce:42".to_owned())
+        );
     }
 
     #[test]

@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "decisions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "reinforce",
+              "update",
+              "supersede",
+              "competing"
+            ],
+            "type": "string"
+          },
+          "candidate_index": {
+            "type": "integer"
+          },
+          "card_index": {
+            "type": "integer"
+          },
+          "new_fact_text": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_index",
+          "reason",
+          "action"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "decisions"
+  ],
+  "type": "object"
+}
