@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/dense-invoice-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "An invoice page in 20 px type: unreadable at 512 px, readable at 1024. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/dense-invoice-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:4471-Б|6312045578|128 450,00|24.10.2026|Северный ветер",
+    "lang:ru"
+  ]
+}

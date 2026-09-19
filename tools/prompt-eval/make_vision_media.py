@@ -229,6 +229,43 @@ def small_text(out: Path) -> None:
     img.save(out / "notice-small-text-ru.jpg", quality=92)
 
 
+def dense_invoice(out: Path) -> None:
+    img = Image.new("RGB", (1240, 1754), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    face = font(20)
+    lines = [
+        "ООО «Северный ветер», ИНН 6312045578, КПП 631201001",
+        "Счёт на оплату № 4471-Б от 19 сентября 2026 г.",
+        "Получатель: ООО «Северный ветер», р/с 40702810900000012345",
+        "Плательщик: ИП Корнеева А. В., г. Тольятти, ул. Мира, д. 12",
+    ]
+    lines += [f"{n}. Позиция каталога {1000 + n * 17}, кол-во {n % 4 + 1} шт., цена {n * 350},00 руб." for n in range(1, 25)]
+    lines += ["Итого к оплате: 128 450,00 руб. (сто двадцать восемь тысяч четыреста пятьдесят рублей)",
+              "Срок оплаты: до 24.10.2026. Назначение платежа: оплата по счёту № 4471-Б."]
+    y = 80
+    for line in lines:
+        draw.text((80, y), line, font=face, fill=(0, 0, 0))
+        y += 34
+    img.save(out / "dense-invoice-ru.png")
+
+
+def dense_settings(out: Path) -> None:
+    img = Image.new("RGB", (1080, 2400), (248, 248, 250))
+    draw = ImageDraw.Draw(img)
+    draw.text((50, 60), "Настройки экрана", font=font(40, True), fill=(0, 0, 0))
+    rows = [("Яркость", "64%"), ("Автоблокировка", "30 сек"), ("Тёмная тема", "с 21:30 до 07:00"),
+            ("Размер шрифта", "Средний"), ("Частота обновления", "120 Гц"), ("Ночной режим", "выключен"),
+            ("Заставка", "Часы"), ("Масштаб интерфейса", "110%"), ("Поворот экрана", "Авто"),
+            ("Всегда на экране", "только уведомления"), ("Разрешение", "2400 × 1080"), ("Цветовой профиль", "Яркий")]
+    y = 160
+    for name, value in rows:
+        draw.rounded_rectangle((30, y, 1050, y + 150), radius=18, fill=(255, 255, 255))
+        draw.text((60, y + 30), name, font=font(26), fill=(0, 0, 0))
+        draw.text((60, y + 80), value, font=font(22), fill=(110, 110, 110))
+        y += 180
+    img.save(out / "dense-settings-ru.png")
+
+
 def sticker(out: Path) -> None:
     img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -236,8 +273,9 @@ def sticker(out: Path) -> None:
     draw.ellipse((170, 180, 220, 240), fill=(40, 40, 40, 255))
     draw.ellipse((292, 180, 342, 240), fill=(40, 40, 40, 255))
     draw.arc((160, 250, 352, 380), start=15, end=165, fill=(40, 40, 40, 255), width=12)
-    draw.text((330, 390), "ОК!", font=font(64, True), fill=(220, 40, 40, 255), stroke_width=4, stroke_fill=(255, 255, 255, 255))
-    img.save(out / "sticker-ok.webp")
+    draw.text((150, 400), "ПРИВЕТ!", font=font(56, True), fill=(220, 40, 40, 255), stroke_width=4,
+              stroke_fill=(255, 255, 255, 255))
+    img.save(out / "sticker-hello.webp")
 
 
 def sample_photos(out: Path) -> None:
@@ -301,7 +339,7 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     for draw_one in (sign, chat_screenshot, document, meme, receipt, counting, chart, drawing, ui_english, small_text,
-                     sticker, sample_photos, video):
+                     dense_invoice, dense_settings, sticker, sample_photos, video):
         draw_one(args.out)
     for size in (int(part) for part in args.sizes.split(",") if part):
         dest = args.out.parent / f"{args.out.name}-{size}"
