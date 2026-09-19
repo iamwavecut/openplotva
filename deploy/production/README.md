@@ -4,10 +4,10 @@ Production deployment and backup are independent operations. The deployment
 workflow never starts, waits for, or checks a backup. It pulls the selected image,
 recreates the application, and succeeds after `/api/health` and `/api/ready` pass.
 
-The normal fast path reuses the release image built by the successful same-repository
-PR CI run when the merged `main` Git tree exactly matches that PR head. A missing or
-non-matching candidate falls back to building exact `main`, so artifact reuse cannot
-silently deploy different source content.
+Every deploy builds the release binary and runtime image from the exact dispatched
+`main` commit and pushes it to GHCR tagged with that commit SHA. Pull request CI does
+not build images. The release build cache is scoped to `main`, so a deploy with an
+unchanged `Cargo.lock` recompiles only the workspace crates.
 After a successful deploy, local Docker and GHCR cleanup keep only the current
 main-SHA image; they do not maintain rollback image history.
 

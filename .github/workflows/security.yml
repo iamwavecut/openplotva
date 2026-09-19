@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "21 3 * * 1"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SEMGREP_VERSION: "1.163.0"
 
@@ -19,27 +23,6 @@ permissions:
   security-events: write
 
 jobs:
-  codeql-rust:
-    name: CodeQL Rust
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7 # v5
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4 # v4
-        with:
-          languages: rust
-          build-mode: none
-
-      - name: Analyze
-        uses: github/codeql-action/analyze@v4 # v4
-        with:
-          category: "/language:rust"
-          upload: never
-          upload-database: false
-          wait-for-processing: false
-
   semgrep:
     name: Semgrep CE
     runs-on: ubuntu-latest

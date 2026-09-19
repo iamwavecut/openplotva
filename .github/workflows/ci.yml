@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_VERSION: "1.95.0"
   CARGO_DENY_VERSION: "0.19.7"
@@ -51,8 +55,8 @@ jobs:
             pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
             -m unittest discover -s /tmp/pr-agent-scripts/tests -p test_glm_coding_plan.py -v
 
-  rust-workspace:
-    name: Rust workspace
+  rust-lint:
+    name: Rust lint
     runs-on: ubuntu-22.04
     permissions:
       checks: write
@@ -61,14 +65,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v5
-
-      - name: Cache Rust toolchain
-        uses: actions/cache@v6 # v4
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.rustup/update-hashes
-          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-workspace-v1
 
       - name: Install Rust
         run: |
@@ -84,7 +80,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2 # v2
         with:
-          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-workspace
+          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-lint
 
       - name: Review Rust formatting
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
@@ -128,84 +124,31 @@ jobs:
             -level=warning || echo "reviewdog cargo clippy report failed" >&2
           exit "$clippy_status"
 
-      - name: Run fast Rust quality gate
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.head.repo.full_name }}" == "${{ github.repository }}" ]]; then
-            tools/rust-fast-gate.sh --skip-clippy
-          else
-            tools/rust-fast-gate.sh
-          fi
+      - name: Run clippy
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  release-candidate:
-    name: Release candidate image
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+  rust-workspace:
+    name: Rust workspace
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      packages: write
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - name: Checkout exact PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
-      - name: Cache Rust toolchain
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.rustup/update-hashes
-          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-deploy-v1
+      - name: Checkout
+        uses: actions/checkout@v7 # v5
 
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
           rustup default "$RUST_VERSION"
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@v2 # v2
         with:
-          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-deploy
+          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-workspace
 
-      - name: Build release binary
-        run: cargo build --locked --release -p openplotva-app
-
-      - name: Select candidate image
-        env:
-          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY}:candidate-${CANDIDATE_SHA}"
-          image="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
-          echo "OPENPLOTVA_CANDIDATE_IMAGE=$image" >> "$GITHUB_ENV"
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-
-      - name: Build and push candidate image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        env:
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
-        with:
-          context: .
-          target: runtime-prebuilt
-          build-args: RUST_VERSION=${{ env.RUST_VERSION }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          tags: ${{ env.OPENPLOTVA_CANDIDATE_IMAGE }}
-          push: true
-          cache-from: type=gha,scope=openplotva-runtime-prebuilt
-          cache-to: type=gha,mode=min,scope=openplotva-runtime-prebuilt
+      - name: Run fast Rust quality gate
+        run: tools/rust-fast-gate.sh --skip-clippy
 
   postgres-integration:
     name: PostgreSQL integration
@@ -226,6 +169,7 @@ jobs:
           --health-retries 12
     env:
       OPENPLOTVA_TEST_POSTGRES_DSN: postgres://openplotva_test:openplotva_test@127.0.0.1:5432/openplotva_test
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v5
@@ -256,14 +200,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v5
-
-      - name: Cache Rust toolchain
-        uses: actions/cache@v6 # v4
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.rustup/update-hashes
-          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-dependencies-v1
 
       - name: Install Rust
         run: |

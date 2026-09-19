@@ -13,7 +13,7 @@ Runs the fast blocking Rust quality gate used by CI and local development:
   - cargo test --workspace
 
 Options:
-  --skip-clippy  Skip clippy when an earlier CI step already ran the same command.
+  --skip-clippy  Skip clippy when CI runs the same command in a separate job.
 USAGE
 }
 

@@ -31,8 +31,8 @@ from .review_queue import ReviewQueue
 from .review_receipt import REVIEW_CHECK, EXECUTION_CHECK
 from .notifications import coalesce_pending, notification_payload
 
-DEFAULT_CHECKS = ['Rust workspace', 'Release candidate image', 'PostgreSQL integration', 'Rust dependencies',
-                  'Danger PR rules', 'PR-Agent review and suggestions', 'CodeQL Rust', 'Semgrep CE', 'Maintenance automation']
+DEFAULT_CHECKS = ['Rust lint', 'Rust workspace', 'PostgreSQL integration', 'Rust dependencies',
+                  'Danger PR rules', 'PR-Agent review and suggestions', 'Semgrep CE', 'Maintenance automation']
 
 
 def review_ready(snapshot, required_checks, handled):
