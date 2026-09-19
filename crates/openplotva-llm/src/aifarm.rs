@@ -2485,13 +2485,15 @@ where
     ) -> Result<String, AifarmHistorySummaryError> {
         let system_prompt = openplotva_prompts::read(stage.prompt_name())?;
         let mut request = self.request(&system_prompt, payload);
-        request.response_format = Some(json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": stage.schema_name(),
-                "schema": stage.response_schema(),
-            },
-        }));
+        request.response_format = stage.sends_response_schema().then(|| {
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": stage.schema_name(),
+                    "schema": stage.response_schema(),
+                },
+            })
+        });
         request.max_tokens = stage.max_output_tokens();
         request.trace = Some(aux_llm_call_trace(
             "history_summary",
@@ -7063,19 +7065,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aifarm_history_stage_sends_the_stage_prompt_schema_and_budget()
+    async fn aifarm_history_stages_send_the_prompt_budget_and_recap_schema()
     -> Result<(), Box<dyn Error>> {
         let answer = r#"{"events":[],"nothing_notable":true}"#;
         let response = json!({
             "choices": [{"message": {"role": "assistant", "content": answer}}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 20}
         });
-        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
-            status_code: 200,
-            status_text: "OK".to_owned(),
-            body: serde_json::to_vec(&response)?,
-            ..AifarmHttpResponse::default()
-        })]);
+        let reply = || -> Result<AifarmHttpResponse, serde_json::Error> {
+            Ok(AifarmHttpResponse {
+                status_code: 200,
+                status_text: "OK".to_owned(),
+                body: serde_json::to_vec(&response)?,
+                ..AifarmHttpResponse::default()
+            })
+        };
+        let transport = FakeTransport::new(vec![Ok(reply()?), Ok(reply()?)]);
         let generator = AifarmHistorySummaryGenerator::with_transport(
             AifarmHistorySummaryConfig {
                 client: AifarmClientConfig {
@@ -7117,13 +7122,21 @@ mod tests {
                 .contains("Ты выделяешь события")
         );
         assert_eq!(body["messages"][1]["content"], "payload-marker");
+        assert!(body.get("response_format").is_none(), "{body}");
+
+        generator
+            .complete_stage(HistoryStage::Recap, "recap-marker", &mut |_| {})
+            .await?;
+        let requests = transport.requests();
+        let body: Value = serde_json::from_slice(&requests[1].body)?;
+        assert_eq!(body["max_tokens"], HistoryStage::Recap.max_output_tokens());
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
-            "chat_history_events"
+            "chat_history_recap"
         );
         assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["required"],
-            json!(["events", "nothing_notable"])
+            body["response_format"]["json_schema"]["schema"],
+            HistoryStage::Recap.response_schema()
         );
         Ok(())
     }

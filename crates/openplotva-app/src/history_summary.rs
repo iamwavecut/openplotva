@@ -454,13 +454,24 @@ where
                 .await;
         let mut model = String::new();
         let mut per_chunk = Vec::with_capacity(chunks.len());
-        for (chunk, reply) in chunks.iter().zip(replies) {
-            let reply = reply?;
-            let answer = decode_stage_events(&reply.text).map_err(|err| {
-                HistorySummaryServiceError::Generate {
-                    message: format!("decode chat history events: {err}"),
+        for ((chunk, payload), reply) in chunks.iter().zip(&payloads).zip(replies) {
+            let mut reply = reply?;
+            // Stage one has no response schema, so an unreadable answer is
+            // asked for once more.
+            let answer = match decode_stage_events(&reply.text) {
+                Ok(answer) => answer,
+                Err(_) => {
+                    reply = self
+                        .generator
+                        .generate_history_stage(input, HistoryStage::Events, payload)
+                        .await?;
+                    decode_stage_events(&reply.text).map_err(|err| {
+                        HistorySummaryServiceError::Generate {
+                            message: format!("decode chat history events: {err}"),
+                        }
+                    })?
                 }
-            })?;
+            };
             per_chunk.push(validated_events(chunk, answer));
             model = reply.model;
         }
@@ -1365,6 +1376,7 @@ mod tests {
     struct FakeHistorySummaryGenerator {
         inputs: Mutex<Vec<SummaryInput>>,
         stages: Mutex<Vec<HistoryStage>>,
+        garbled_events_answers: Mutex<usize>,
     }
 
     impl HistorySummaryGenerator for FakeHistorySummaryGenerator {
@@ -1382,14 +1394,17 @@ mod tests {
                             .lock()
                             .expect("generator inputs")
                             .push(input.clone());
-                        let source = input
-                            .items
-                            .first()
-                            .map(openplotva_history::stages::item_source_id)
-                            .unwrap_or_default();
+                        let mut garbled = self.garbled_events_answers.lock().expect("garbled");
+                        if *garbled > 0 {
+                            *garbled -= 1;
+                            return Ok(HistoryStageReply {
+                                text: "Событий нет".to_owned(),
+                                model: "test-model".to_owned(),
+                            });
+                        }
                         serde_json::json!({
                             "events": [{
-                                "source_ids": [source],
+                                "source_ids": ["1"],
                                 "title": "thread recap",
                                 "description": "",
                                 "actors": [],
@@ -1667,6 +1682,48 @@ mod tests {
         assert!(inputs.iter().all(|input| input.omitted_message_count == 0));
         assert_eq!(inputs[0].items.len(), 40);
         assert_eq!(result.raw_message_count, 40);
+    }
+
+    #[tokio::test]
+    async fn unreadable_events_answer_is_asked_once_more() {
+        let base = OffsetDateTime::parse("2026-05-20T10:00:00Z", &Rfc3339).expect("base");
+        let store = Arc::new(FakeHistorySummaryStore::default());
+        *store.payloads.lock().expect("payloads") = (1..=10)
+            .map(|index| {
+                entry_payload(
+                    index,
+                    base + time::Duration::minutes(i64::from(index)),
+                    "обсуждаем переезд офиса на следующей неделе",
+                )
+            })
+            .collect();
+        let generator = Arc::new(FakeHistorySummaryGenerator::default());
+        *generator.garbled_events_answers.lock().expect("garbled") = 1;
+        let service = ChatHistorySummaryService::new(store, generator.clone());
+
+        let result = service
+            .summarize(HistorySummaryRequest {
+                context: ToolContext {
+                    chat_id: 100,
+                    user_id: 55,
+                    ..ToolContext::default()
+                },
+                window: "messages".to_owned(),
+                message_count: 10,
+                ..HistorySummaryRequest::default()
+            })
+            .await
+            .expect("summary result");
+
+        assert_eq!(
+            *generator.stages.lock().expect("stages"),
+            vec![
+                HistoryStage::Events,
+                HistoryStage::Events,
+                HistoryStage::Recap
+            ]
+        );
+        assert_eq!(result.summary_json.events, vec!["thread recap"]);
     }
 
     #[tokio::test]

@@ -5,15 +5,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
     HistorySummaryDecodeError, SummaryActor, SummaryContent, SummaryEvent, SummaryInput,
     SummaryInputItem, deserialize_f64_loose, estimate_summary_text_tokens, go_zero_time,
 };
 
-/// Estimated tokens of one stage-one chunk.
-pub const EVENTS_CHUNK_MAX_TOKENS: i32 = 8_000;
+/// Estimated tokens (a quarter of the characters) of one stage-one chunk.
+/// Cyrillic chats run about twice that in real tokens; chunks twice this size
+/// lost a quarter of the planted threads in the eval.
+pub const EVENTS_CHUNK_MAX_TOKENS: i32 = 3_000;
 /// Share of a chunk's trailing items repeated at the start of the next chunk.
 pub const EVENTS_CHUNK_OVERLAP_PERCENT: usize = 10;
 /// A chunk with fewer substantive messages is quiet without a model call.
@@ -54,6 +56,14 @@ impl HistoryStage {
             Self::Events => 1536,
             Self::Recap => 2048,
         }
+    }
+
+    /// Whether the request carries the answer schema. Guided decoding over a
+    /// long, mostly idle chunk makes the model close the events list at once,
+    /// so stage one asks for its JSON in the prompt only.
+    #[must_use]
+    pub const fn sends_response_schema(self) -> bool {
+        matches!(self, Self::Recap)
     }
 
     #[must_use]
@@ -125,6 +135,10 @@ fn iso(value: OffsetDateTime) -> Option<String> {
         .flatten()
 }
 
+fn utc(value: OffsetDateTime) -> Option<OffsetDateTime> {
+    (value != go_zero_time()).then(|| value.to_offset(UtcOffset::UTC))
+}
+
 fn escape_text(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -164,9 +178,9 @@ fn item_text(item: &SummaryInputItem) -> String {
     }
 }
 
-/// The id a stage-one event cites for an item.
-#[must_use]
-pub fn item_source_id(item: &SummaryInputItem) -> String {
+/// The id merging and dating use for an item; the model sees a short
+/// position instead.
+fn item_source_id(item: &SummaryInputItem) -> String {
     if is_summary_item(item) {
         format!("s{}", item.summary_id)
     } else if item.message_id != 0 {
@@ -199,17 +213,22 @@ fn item_author(item: &SummaryInputItem) -> String {
 
 /// One prompt line per item.
 #[must_use]
-pub fn render_item(item: &SummaryInputItem) -> String {
-    let id = escape_attr(&item_source_id(item));
+fn render_item(item: &SummaryInputItem, id: usize) -> String {
     let text = escape_text(&item_text(item));
     if is_summary_item(item) {
         let from = iso(item.range_start_at).unwrap_or_default();
         let to = iso(item.range_end_at).unwrap_or_default();
         return format!("<summary id=\"{id}\" from=\"{from}\" to=\"{to}\">{text}</summary>");
     }
-    let at = iso(item.at).unwrap_or_default();
+    let at = utc(item.at)
+        .map(|at| format!("{:02}:{:02}", at.hour(), at.minute()))
+        .unwrap_or_default();
     let from = escape_attr(&item_author(item));
     format!("<msg id=\"{id}\" at=\"{at}\" from=\"{from}\">{text}</msg>")
+}
+
+fn item_cost(item: &SummaryInputItem) -> i32 {
+    estimate_summary_text_tokens(&render_item(item, 100)) + 1
 }
 
 /// Whether an item can carry an event: summaries always; messages need a letter
@@ -246,15 +265,24 @@ fn window_header(input: &SummaryInput, items: usize) -> String {
 }
 
 /// Stage-one user message for one chunk: the window header, one line per item,
-/// then the task.
+/// then the task. Items are numbered from 1 within the chunk and messages show
+/// the UTC time of day under a `<day>` line for every new date: short ids and
+/// times cost a third fewer tokens than message ids and full timestamps.
 #[must_use]
 pub fn events_payload(input: &SummaryInput, chunk: &[SummaryInputItem]) -> String {
     let mut out = format!(
         "<window>\n{}\n</window>\n<items>\n",
         window_header(input, chunk.len())
     );
-    for item in chunk {
-        out.push_str(&render_item(item));
+    let mut day = None;
+    for (index, item) in chunk.iter().enumerate() {
+        if let Some(at) = utc(item.at).filter(|_| !is_summary_item(item))
+            && day != Some(at.date())
+        {
+            day = Some(at.date());
+            out.push_str(&format!("<day date=\"{}\"/>\n", at.date()));
+        }
+        out.push_str(&render_item(item, index + 1));
         out.push('\n');
     }
     out.push_str("</items>\n");
@@ -267,10 +295,7 @@ pub fn events_payload(input: &SummaryInput, chunk: &[SummaryInputItem]) -> Strin
 /// one so an event on a boundary is seen whole at least once.
 #[must_use]
 pub fn chunk_items(items: &[SummaryInputItem], max_tokens: i32) -> Vec<Vec<SummaryInputItem>> {
-    let costs: Vec<i32> = items
-        .iter()
-        .map(|item| estimate_summary_text_tokens(&render_item(item)) + 1)
-        .collect();
+    let costs: Vec<i32> = items.iter().map(item_cost).collect();
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < items.len() {
@@ -285,8 +310,11 @@ pub fn chunk_items(items: &[SummaryInputItem], max_tokens: i32) -> Vec<Vec<Summa
             break;
         }
         let taken = end - start;
-        let overlap = (taken * EVENTS_CHUNK_OVERLAP_PERCENT / 100).clamp(1, taken - 1);
-        start = if taken > 1 { end - overlap } else { end };
+        start = if taken > 1 {
+            end - (taken * EVENTS_CHUNK_OVERLAP_PERCENT / 100).clamp(1, taken - 1)
+        } else {
+            end
+        };
     }
     chunks
 }
@@ -386,34 +414,41 @@ fn source_id_text(value: &Value) -> Option<String> {
     .filter(|id| !id.is_empty())
 }
 
-/// Keep the events whose sources exist in the chunk, at most
-/// `EVENTS_MAX_PER_CHUNK`, each dated by its earliest source.
+/// Keep the events whose sources are positions in the chunk, at most
+/// `EVENTS_MAX_PER_CHUNK`, each citing the items' own ids and dated by its
+/// earliest source.
 #[must_use]
 pub fn validated_events(chunk: &[SummaryInputItem], answer: StageEvents) -> Vec<HistoryEvent> {
-    let times: HashMap<String, OffsetDateTime> = chunk
+    let positions: HashMap<String, &SummaryInputItem> = chunk
         .iter()
-        .map(|item| (item_source_id(item), item_time(item)))
+        .enumerate()
+        .map(|(index, item)| ((index + 1).to_string(), item))
         .collect();
     answer
         .events
         .into_iter()
         .filter_map(|event| {
-            let mut source_ids: Vec<String> = event
+            let mut sources: Vec<&SummaryInputItem> = Vec::new();
+            for item in event
                 .source_ids
                 .iter()
                 .filter_map(source_id_text)
-                .filter(|id| times.contains_key(id))
-                .collect();
-            source_ids.dedup();
+                .filter_map(|id| positions.get(&id).copied())
+            {
+                if !sources.iter().any(|kept| std::ptr::eq(*kept, item)) {
+                    sources.push(item);
+                }
+            }
             let title = event.title.trim().to_owned();
-            if source_ids.is_empty() || title.is_empty() {
+            if sources.is_empty() || title.is_empty() {
                 return None;
             }
-            let occurred_at = source_ids
+            let occurred_at = sources
                 .iter()
-                .filter_map(|id| times.get(id).copied())
+                .map(|item| item_time(item))
                 .filter(|at| *at != go_zero_time())
                 .min();
+            let source_ids = sources.iter().map(|item| item_source_id(item)).collect();
             Some(HistoryEvent {
                 source_ids,
                 occurred_at,
@@ -589,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_prompt_payload_is_line_per_message_with_iso_times() {
+    fn summary_prompt_payload_numbers_items_under_day_lines() {
         let items = vec![
             message(
                 10,
@@ -597,6 +632,7 @@ mod tests {
                 "Решили:\nвстречаемся по пятницам <в 19:00>",
                 5,
             ),
+            message(11, "Дима", "Поддерживаю", 1200),
             SummaryInputItem {
                 kind: "summary".to_owned(),
                 summary_id: 45,
@@ -611,11 +647,14 @@ mod tests {
         ];
         let payload = events_payload(&window(), &items);
         assert!(
-            payload.contains(r#"<msg id="10" at="2025-09-16T05:25:00Z" from="Аня &quot;А&quot;">Решили: встречаемся по пятницам &lt;в 19:00></msg>"#),
-            "{payload}"
-        );
-        assert!(
-            payload.contains(r#"<summary id="s45" from="2025-09-15T19:20:00Z" to="2025-09-16T05:10:00Z">Вчера обсуждали поход</summary>"#),
+            payload.contains(concat!(
+                "<items>\n<day date=\"2025-09-16\"/>\n",
+                r#"<msg id="1" at="05:25" from="Аня &quot;А&quot;">Решили: встречаемся по пятницам &lt;в 19:00></msg>"#,
+                "\n<day date=\"2025-09-17\"/>\n",
+                r#"<msg id="2" at="01:20" from="Дима">Поддерживаю</msg>"#,
+                "\n",
+                r#"<summary id="3" from="2025-09-15T19:20:00Z" to="2025-09-16T05:10:00Z">Вчера обсуждали поход</summary>"#,
+            )),
             "{payload}"
         );
         assert!(payload.ends_with(EVENTS_TASK_LINE));
@@ -651,12 +690,23 @@ mod tests {
             );
         }
         for chunk in &chunks {
-            let tokens: i32 = chunk
-                .iter()
-                .map(|item| estimate_summary_text_tokens(&render_item(item)) + 1)
-                .sum();
+            let tokens: i32 = chunk.iter().map(item_cost).sum();
             assert!(tokens <= EVENTS_CHUNK_MAX_TOKENS);
         }
+    }
+
+    #[test]
+    fn oversized_items_get_a_chunk_each() {
+        let long = "длинное сообщение ".repeat(400);
+        let items: Vec<SummaryInputItem> = (0..3)
+            .map(|index| message(index, "A", &long, i64::from(index)))
+            .collect();
+        let chunks = chunk_items(&items, 100);
+        let ids: Vec<Vec<i32>> = chunks
+            .iter()
+            .map(|chunk| chunk.iter().map(|item| item.message_id).collect())
+            .collect();
+        assert_eq!(ids, vec![vec![0], vec![1], vec![2]]);
     }
 
     #[test]
@@ -676,13 +726,15 @@ mod tests {
     }
 
     #[test]
-    fn stage_one_events_carry_source_ids() {
+    fn stage_one_positions_map_back_to_message_ids() {
         let chunk = vec![
             message(10, "Аня", "Решили встречаться по пятницам", 5),
             message(11, "Дима", "Поддерживаю, в 19:00", 7),
         ];
         let answer = decode_stage_events(
-            r#"{"events":[{"source_ids":["11",10],"title":"Встречи по пятницам","description":"Решили встречаться по пятницам в 19:00","actors":["Аня","Дима"],"confidence":0.9},{"source_ids":["999"],"title":"Выдумка","confidence":0.9},{"source_ids":["10"],"title":"  "}],"nothing_notable":false}"#,
+            r#"```json
+{"events":[{"source_ids":["2",1,"2"],"title":"Встречи по пятницам","description":"Решили встречаться по пятницам в 19:00","actors":["Аня","Дима"],"confidence":0.9},{"source_ids":["3","10"],"title":"Выдумка","confidence":0.9},{"source_ids":["1"],"title":"  "}],"nothing_notable":false}
+```"#,
         )
         .expect("decode");
         let events = validated_events(&chunk, answer);

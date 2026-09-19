@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -207,8 +208,17 @@ def history_item_carries_event(item: dict[str, Any]) -> bool:
     return len(text) >= 12 or len(text.split()) >= 2
 
 
+def utc_day_and_clock(at: str) -> tuple[str, str] | None:
+    try:
+        moment = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    return moment.date().isoformat(), moment.strftime("%H:%M")
+
+
 def render_history_items(user: dict[str, Any]) -> str:
-    """The stage-one message for one chunk, as `stages::events_payload` renders it."""
+    """The stage-one message for one chunk, as `stages::events_payload` renders it:
+    items numbered from 1, messages at the UTC time of day under a `<day>` line."""
     items = [item for item in user.get("items", []) if history_item_carries_event(item)]
     header = {"scope": user.get("scope") or "", "items": len(items)}
     if user.get("range_start_at"):
@@ -216,17 +226,21 @@ def render_history_items(user: dict[str, Any]) -> str:
     if user.get("range_end_at"):
         header["range_end"] = user["range_end_at"]
     lines = ["<window>", json.dumps(header, ensure_ascii=False, separators=(",", ":"), sort_keys=True), "</window>", "<items>"]
-    for item in items:
+    day = None
+    for index, item in enumerate(items, 1):
         text = " ".join(history_item_text(item).split()).replace("<", "&lt;")
         if item.get("kind") == "summary":
-            lines.append(f'<summary id="s{item.get("summary_id", 0)}" from="{item.get("range_start_at", "")}" to="{item.get("range_end_at", "")}">{text}</summary>')
+            lines.append(f'<summary id="{index}" from="{item.get("range_start_at", "")}" to="{item.get("range_end_at", "")}">{text}</summary>')
             continue
-        item_id = str(item["message_id"]) if item.get("message_id") else (item.get("entry_id") or "").strip()
+        moment = utc_day_and_clock(item.get("at") or "")
+        if moment and moment[0] != day:
+            day = moment[0]
+            lines.append(f'<day date="{day}"/>')
         author = (item.get("sender_name") or "").strip()
         if not author and (item.get("sender_username") or "").strip():
             author = "@" + item["sender_username"].strip().lstrip("@")
         author = author or (item.get("role") or "").strip()
-        lines.append(f'<msg id="{escape_prompt_attr(item_id)}" at="{item.get("at", "")}" from="{escape_prompt_attr(author)}">{text}</msg>')
+        lines.append(f'<msg id="{index}" at="{moment[1] if moment else ""}" from="{escape_prompt_attr(author)}">{text}</msg>')
     lines += ["</items>", HISTORY_EVENTS_TASK_LINE]
     return "\n".join(lines)
 
@@ -442,6 +456,9 @@ def id_values(value: Any) -> list[int]:
 
 
 def input_ints(fixture: Fixture) -> set[int]:
+    if fixture.data.get("user_layout") == "history_items":
+        items = (fixture.data.get("user") or {}).get("items", [])
+        return set(range(1, sum(1 for item in items if history_item_carries_event(item)) + 1))
     source = fixture.data.get("user")
     if source is None:
         source = [m.get("content") for m in fixture.data.get("messages", []) if m.get("role") == "user"]
