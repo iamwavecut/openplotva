@@ -52,6 +52,8 @@ const MEMORY_EPISODE_EMBEDDING_TASK: &str =
     "Daily chat episode for scoped conversational retrieval";
 const MEMORY_MAX_EXTRACTION_BATCH_INPUT_TOKENS: i32 = 10_000;
 const EXISTING_CARDS_LIMIT: i32 = 80;
+/// Existing cards shown to the extractor in one window.
+const EXISTING_CARDS_PROMPT_LIMIT: usize = 40;
 const EXISTING_USER_CARDS_LIMIT: i32 = 20;
 const EXISTING_PARTICIPANT_CARDS_MAX_USER: usize = 20;
 const RELATED_CARDS_LIMIT: i32 = 24;
@@ -984,7 +986,36 @@ where
         .extract(input)
         .await
         .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+    let output = gated_extraction_output(input, output);
     write_memory_extraction_batch_inner(store, embedder, input, output, cfg).await
+}
+
+/// Enforce the extraction contract on a fresh model answer and log what each
+/// rule removed, so a prompt or model change that starts tripping a rule shows.
+fn gated_extraction_output(input: &ExtractInput, output: ExtractOutput) -> ExtractOutput {
+    if !output.stringified_fields.is_empty() {
+        tracing::warn!(
+            run_id = input.run.id,
+            fields = ?output.stringified_fields,
+            "memory extraction returned array fields as JSON strings"
+        );
+    }
+    let (output, report) = openplotva_memory::gate_extraction_output(input, output);
+    if !report.is_clean() {
+        tracing::warn!(
+            run_id = input.run.id,
+            unsourced = report.unsourced,
+            unquoted_evidence = report.unquoted_evidence,
+            short_single_message_events = report.short_single_message_events,
+            foreign_script = report.foreign_script,
+            known_facts = report.known_facts,
+            over_cap = report.over_cap,
+            unknown_card_ids = report.unknown_card_ids,
+            supersede_downgraded = report.supersede_downgraded,
+            "memory extraction gates adjusted the model output"
+        );
+    }
+    output
 }
 
 /// Claim and process one queued memory run.
@@ -1626,6 +1657,7 @@ where
             .extract(&input)
             .await
             .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+        let output = gated_extraction_output(&input, output);
         state.add_extraction_metadata(batch, &output);
         let card_report = write_memory_extraction_cards(
             store,
@@ -2075,21 +2107,23 @@ async fn existing_cards_for_run<Store>(
 where
     Store: MemoryRunStore,
 {
+    let as_of = if openplotva_memory::is_memory_zero_time(run.range_end_at) {
+        OffsetDateTime::now_utc()
+    } else {
+        run.range_end_at
+    };
+    let limit = EXISTING_CARDS_LIMIT as usize;
     let mut out = Vec::new();
     let mut seen = Vec::new();
     // Cards related to what this window is about come first, so the model merges
     // into existing facts instead of inserting duplicates the recency window
     // would hide (finding A). Retrieved once per run in `related_cards_for_window`
     // and passed in, because this runs many times per run during batch sizing.
-    add_existing_cards(
-        &mut out,
-        &mut seen,
-        related.to_vec(),
-        EXISTING_CARDS_LIMIT as usize,
-    );
+    add_existing_cards(&mut out, &mut seen, related.to_vec(), limit, as_of);
+    let related_count = out.len();
     let scope = retrieval_scope_for_run(run, chat, 0);
     if let Ok(cards) = store.list_visible_cards(&scope, EXISTING_CARDS_LIMIT).await {
-        add_existing_cards(&mut out, &mut seen, cards, EXISTING_CARDS_LIMIT as usize);
+        add_existing_cards(&mut out, &mut seen, cards, limit, as_of);
     }
     for user_id in participant_user_ids(messages, EXISTING_PARTICIPANT_CARDS_MAX_USER) {
         let scope = retrieval_scope_for_run(run, chat, user_id);
@@ -2097,12 +2131,14 @@ where
             .list_visible_cards(&scope, EXISTING_USER_CARDS_LIMIT)
             .await
         {
-            add_existing_cards(&mut out, &mut seen, cards, EXISTING_CARDS_LIMIT as usize);
+            add_existing_cards(&mut out, &mut seen, cards, limit, as_of);
         }
-        if out.len() >= EXISTING_CARDS_LIMIT as usize {
+        if out.len() >= limit {
             break;
         }
     }
+    out[related_count..].sort_by(|left, right| right.salience.total_cmp(&left.salience));
+    out.truncate(EXISTING_CARDS_PROMPT_LIMIT);
     out
 }
 
@@ -2172,10 +2208,19 @@ fn consolidation_retrieval_query(messages: &[openplotva_memory::Message]) -> Opt
     if query.is_empty() { None } else { Some(query) }
 }
 
-fn add_existing_cards(out: &mut Vec<Card>, seen: &mut Vec<i64>, cards: Vec<Card>, limit: usize) {
+fn add_existing_cards(
+    out: &mut Vec<Card>,
+    seen: &mut Vec<i64>,
+    cards: Vec<Card>,
+    limit: usize,
+    as_of: OffsetDateTime,
+) {
     for card in cards {
         if out.len() >= limit {
             break;
+        }
+        if !openplotva_memory::worth_showing_as_existing(&card, as_of) {
+            continue;
         }
         if card.id != 0 {
             if seen.contains(&card.id) {
@@ -2614,13 +2659,12 @@ pub struct MemorySubjectMergeReport {
     pub errors: u64,
 }
 
-/// Build the storage apply plan from the model's raw plan: validate every id
-/// against the real group, then carry the summed observation_count (survivor +
-/// absorbed) onto each survivor. Pure so the id-safety and count math are unit
-/// tested without a transport.
+/// Build the storage apply plan from a validated plan, carrying the summed
+/// observation_count (survivor + absorbed) onto each survivor. Pure so the
+/// count math is unit tested without a transport.
 #[must_use]
 fn plan_to_subject_merge_apply(
-    plan: &openplotva_memory::SubjectMergePlan,
+    validated: openplotva_memory::ValidatedSubjectMerge,
     cards: &[openplotva_memory::Card],
     group_ids: &[i64],
     demote_confidence_delta: f64,
@@ -2629,7 +2673,6 @@ fn plan_to_subject_merge_apply(
         .iter()
         .map(|card| (card.id, i64::from(card.observation_count).max(0)))
         .collect();
-    let validated = openplotva_memory::validate_subject_merge_plan(plan, group_ids);
     let clusters = validated
         .clusters
         .into_iter()
@@ -2703,6 +2746,49 @@ async fn embed_merge_survivors<Embedder>(
     }
 }
 
+/// Model calls allowed for one subject group's merge plan.
+const SUBJECT_MERGE_PLAN_ATTEMPTS: usize = 2;
+
+/// Ask for a merge plan and validate it against the group. An invalid plan gets
+/// one more call; a second invalid plan skips the group (`merge_plan_invalid`)
+/// rather than applying an answer that was only partly understood.
+async fn plan_subject_merge<Merger>(
+    merger: &Merger,
+    input: &openplotva_memory::SubjectMergeInput,
+) -> Result<Option<openplotva_memory::ValidatedSubjectMerge>, Box<dyn StdError + Send + Sync>>
+where
+    Merger: openplotva_memory::SubjectMerger + Send + Sync,
+{
+    let card_ids = input.card_ids();
+    for attempt in 1..=SUBJECT_MERGE_PLAN_ATTEMPTS {
+        let plan = merger
+            .merge_subject(input)
+            .await
+            .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
+        if !plan.stringified_fields.is_empty() {
+            tracing::warn!(
+                fields = ?plan.stringified_fields,
+                "subject merge returned array fields as JSON strings"
+            );
+        }
+        match openplotva_memory::validate_subject_merge_plan(&plan, &card_ids) {
+            Ok(validated) => return Ok(Some(validated)),
+            Err(error) if attempt < SUBJECT_MERGE_PLAN_ATTEMPTS => {
+                tracing::warn!(%error, cards = card_ids.len(), "subject merge plan invalid; asking again");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    cards = card_ids.len(),
+                    event = "merge_plan_invalid",
+                    "subject merge plan invalid twice; skipping the group"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
 async fn process_one_merge_group<Merger, Embedder>(
     merger: &Merger,
     store: &PostgresMemoryStore,
@@ -2726,12 +2812,13 @@ where
         subject: group.subject.clone(),
         cards: openplotva_memory::subject_merge_cards(&cards, now),
     };
-    let plan = merger
-        .merge_subject(&input)
-        .await
-        .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
+    // A group whose plan stayed invalid is still marked reviewed (empty apply),
+    // so it waits out the cooldown instead of costing a model call every tick.
+    let validated = plan_subject_merge(merger, &input)
+        .await?
+        .unwrap_or_default();
     let mut apply =
-        plan_to_subject_merge_apply(&plan, &cards, &group_ids, cfg.demote_confidence_delta);
+        plan_to_subject_merge_apply(validated, &cards, &group_ids, cfg.demote_confidence_delta);
     embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
     Ok(Some(store.apply_subject_merge(&apply).await?))
 }
@@ -3397,9 +3484,11 @@ pub fn aifarm_memory_extractor_config_from_app_config_with_model(
         },
         model,
         max_output_tokens: memory.aifarm_max_output_tokens,
-        temperature: Some(memory.aifarm_temperature),
-        frequency_penalty: Some(memory.aifarm_frequency_penalty),
-        presence_penalty: Some(memory.aifarm_presence_penalty),
+        temperature: memory.aifarm_temperature,
+        top_p: None,
+        top_k: None,
+        frequency_penalty: memory.aifarm_frequency_penalty,
+        presence_penalty: memory.aifarm_presence_penalty,
         enable_thinking: Some(memory.aifarm_enable_thinking),
         include_reasoning: Some(false),
     }
@@ -3943,6 +4032,18 @@ fn aifarm_memory_config_for_attempt(
     if let Some(temperature) = attempt.overrides.temperature {
         cfg.temperature = Some(temperature);
     }
+    if let Some(penalty) = attempt.overrides.frequency_penalty {
+        cfg.frequency_penalty = Some(penalty);
+    }
+    if let Some(penalty) = attempt.overrides.presence_penalty {
+        cfg.presence_penalty = Some(penalty);
+    }
+    if let Some(top_p) = routed_f64_override(attempt, "top_p") {
+        cfg.top_p = Some(top_p);
+    }
+    if let Some(top_k) = routed_f64_override(attempt, "top_k") {
+        cfg.top_k = Some(top_k);
+    }
     if let Some(enable_thinking) = routed_bool_override(attempt, "enable_thinking") {
         cfg.enable_thinking = Some(enable_thinking);
     }
@@ -3964,6 +4065,10 @@ fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
 
 fn routed_bool_override(attempt: &RoutedAttempt, key: &str) -> Option<bool> {
     attempt.overrides.extra.get(key).and_then(Value::as_bool)
+}
+
+fn routed_f64_override(attempt: &RoutedAttempt, key: &str) -> Option<f64> {
+    attempt.overrides.extra.get(key).and_then(Value::as_f64)
 }
 
 /// App memory extractor build error.
@@ -4365,7 +4470,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_to_subject_merge_apply_sums_observations_and_validates_ids() {
+    fn plan_to_subject_merge_apply_sums_observations() {
         let cards = vec![
             openplotva_memory::Card {
                 id: 1,
@@ -4383,26 +4488,116 @@ mod tests {
                 ..openplotva_memory::Card::default()
             },
         ];
-        let plan = openplotva_memory::SubjectMergePlan {
-            clusters: vec![openplotva_memory::SubjectMergeCluster {
+        let validated = openplotva_memory::ValidatedSubjectMerge {
+            clusters: vec![openplotva_memory::ValidatedMergeCluster {
                 survivor_id: 1,
-                // 99 is not in the group -> dropped by validation before apply.
-                absorbed_ids: vec![2, 99],
+                absorbed_ids: vec![2],
                 merged_fact_text: "merged".to_owned(),
             }],
             demote_ids: vec![3],
-            keep_ids: vec![],
         };
-        let apply = plan_to_subject_merge_apply(&plan, &cards, &[1, 2, 3], 0.2);
+        let apply = plan_to_subject_merge_apply(validated, &cards, &[1, 2, 3], 0.2);
         assert_eq!(apply.clusters.len(), 1);
         assert_eq!(apply.clusters[0].survivor_id, 1);
         assert_eq!(apply.clusters[0].absorbed_ids, vec![2]);
-        // observation_count carries survivor(3) + absorbed(5); the dropped 99 adds nothing.
+        // observation_count carries survivor(3) + absorbed(5).
         assert_eq!(apply.clusters[0].observation_count, 8);
         assert_eq!(apply.demote_ids, vec![3]);
         assert_eq!(apply.group_ids, vec![1, 2, 3]);
         assert_eq!(apply.demote_confidence_delta, 0.2);
     }
+    struct ScriptedMerger {
+        plans: std::sync::Mutex<std::collections::VecDeque<openplotva_memory::SubjectMergePlan>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedMerger {
+        fn new(plans: Vec<openplotva_memory::SubjectMergePlan>) -> Self {
+            Self {
+                plans: std::sync::Mutex::new(plans.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl openplotva_memory::SubjectMerger for ScriptedMerger {
+        type Error = std::io::Error;
+
+        fn merge_subject<'a>(
+            &'a self,
+            _input: &'a openplotva_memory::SubjectMergeInput,
+        ) -> openplotva_memory::SubjectMergerFuture<'a, Self::Error> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let plan = self
+                .plans
+                .lock()
+                .expect("plans")
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(plan) })
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_plan_retries_once() {
+        let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
+        let cards = vec![
+            openplotva_memory::Card {
+                id: 7,
+                salience: 0.9,
+                ..openplotva_memory::Card::default()
+            },
+            openplotva_memory::Card {
+                id: 8,
+                salience: 0.5,
+                ..openplotva_memory::Card::default()
+            },
+        ];
+        let input = openplotva_memory::SubjectMergeInput {
+            subject: "Ann".to_owned(),
+            cards: openplotva_memory::subject_merge_cards(&cards, as_of),
+        };
+        let decision = |index: i64, action: &str, survivor: Option<i64>| {
+            openplotva_memory::SubjectMergeDecision {
+                index,
+                reason: "same fact".to_owned(),
+                action: action.to_owned(),
+                survivor_index: survivor,
+            }
+        };
+        let invalid = openplotva_memory::SubjectMergePlan {
+            decisions: vec![decision(0, "keep", None)],
+            ..openplotva_memory::SubjectMergePlan::default()
+        };
+        let valid = openplotva_memory::SubjectMergePlan {
+            decisions: vec![
+                decision(0, "keep", None),
+                decision(1, "cluster_with", Some(0)),
+            ],
+            survivors: vec![openplotva_memory::SubjectMergeSurvivor {
+                survivor_index: 0,
+                merged_fact_text: "merged".to_owned(),
+            }],
+            ..openplotva_memory::SubjectMergePlan::default()
+        };
+
+        let merger = ScriptedMerger::new(vec![invalid.clone(), valid]);
+        let validated = plan_subject_merge(&merger, &input)
+            .await
+            .expect("merge call")
+            .expect("second plan is valid");
+        assert_eq!(merger.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(validated.clusters[0].survivor_id, 7);
+        assert_eq!(validated.clusters[0].absorbed_ids, vec![8]);
+
+        let merger = ScriptedMerger::new(vec![invalid.clone(), invalid]);
+        let skipped = plan_subject_merge(&merger, &input)
+            .await
+            .expect("merge call");
+        assert_eq!(skipped, None);
+        assert_eq!(merger.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     use openplotva_storage::pg_embedding_vector;
     use std::sync::Mutex;
 
@@ -5380,6 +5575,7 @@ mod tests {
             }],
             input_tokens: 11,
             output_tokens: 12,
+            stringified_fields: Vec::new(),
         };
         let store = FakeMemoryWriteStore {
             ids: vec![101, 102],
@@ -5544,6 +5740,7 @@ mod tests {
                 candidate_cards: vec![openplotva_memory::CandidateCard {
                     scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
                     fact_text: "Alice likes Rust".to_owned(),
+                    evidence_quote: "likes Rust".to_owned(),
                     source_entry_ids: vec!["msg:1".to_owned()],
                     confidence: 0.8,
                     salience: 0.9,
@@ -5662,6 +5859,7 @@ mod tests {
                 candidate_cards: vec![openplotva_memory::CandidateCard {
                     scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
                     fact_text: "Alice likes Rust".to_owned(),
+                    evidence_quote: "likes Rust".to_owned(),
                     source_entry_ids: vec!["msg:1".to_owned()],
                     confidence: 0.8,
                     salience: 0.9,
@@ -5809,6 +6007,7 @@ mod tests {
                 candidate_cards: vec![openplotva_memory::CandidateCard {
                     scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
                     fact_text: "Alice talks about Rust".to_owned(),
+                    evidence_quote: "wide words".to_owned(),
                     source_entry_ids: vec!["msg:1".to_owned()],
                     confidence: 0.8,
                     salience: 0.8,

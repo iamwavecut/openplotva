@@ -1,0 +1,96 @@
+{
+  "flow": "memory_extraction",
+  "id": "memory_extraction/preference-be",
+  "prompt": "memory/extraction",
+  "schema": "memory_extraction",
+  "tool_name": "memory_extraction",
+  "user_layout": "memory_blocks",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 4000
+  },
+  "notes": "Belarusian: one lasting preference among small talk.",
+  "user": {
+    "chat_type": "supergroup",
+    "existing_cards": [],
+    "messages": [
+      {
+        "entry_id": "msg:2001",
+        "message_id": 2001,
+        "occurred_at": "2026-09-01T18:00:00Z",
+        "sender_name": "Алеся",
+        "sender_type": "user",
+        "text": "Добры вечар усім",
+        "thread_id": 0,
+        "user_id": 7201
+      },
+      {
+        "entry_id": "msg:2002",
+        "message_id": 2002,
+        "occurred_at": "2026-09-01T18:01:00Z",
+        "sender_name": "Ясь",
+        "sender_type": "user",
+        "text": "Хто заўтра на каву?",
+        "thread_id": 0,
+        "user_id": 7202
+      },
+      {
+        "entry_id": "msg:2003",
+        "message_id": 2003,
+        "occurred_at": "2026-09-01T18:02:00Z",
+        "sender_name": "Алеся",
+        "sender_type": "user",
+        "text": "Я ўжо тры гады не п'ю каву, толькі зялёную гарбату, так што мне гарбату",
+        "thread_id": 0,
+        "user_id": 7201
+      },
+      {
+        "entry_id": "msg:2004",
+        "message_id": 2004,
+        "occurred_at": "2026-09-01T18:03:00Z",
+        "sender_name": "Ясь",
+        "sender_type": "user",
+        "text": "Добра, запомніў",
+        "thread_id": 0,
+        "user_id": 7202
+      },
+      {
+        "entry_id": "msg:2005",
+        "message_id": 2005,
+        "occurred_at": "2026-09-01T18:04:00Z",
+        "sender_name": "Віктар",
+        "sender_type": "user",
+        "text": "ха-ха, я з вамі",
+        "thread_id": 0,
+        "user_id": 7203
+      }
+    ],
+    "run": {
+      "attempts": 0,
+      "chat_id": -1000000000001,
+      "cursor_after_at": "2026-09-01T00:00:00Z",
+      "cursor_entry_id": "",
+      "cursor_message_id": 0,
+      "id": 1,
+      "message_count": 5,
+      "prompt_version": "eval",
+      "range_end_at": "2026-09-02T00:00:00Z",
+      "range_start_at": "2026-09-01T00:00:00Z"
+    }
+  },
+  "checks": [
+    "json",
+    "schema",
+    "ids_from_input",
+    "evidence_quoted",
+    "min_items:candidate_cards:1",
+    "max_items:candidate_cards:2",
+    "lang:be:candidate_cards[].fact_text",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

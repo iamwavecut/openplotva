@@ -6,12 +6,34 @@
         "additionalProperties": false,
         "properties": {
           "card_type": {
+            "enum": [
+              "preference",
+              "identity",
+              "project",
+              "decision",
+              "relationship",
+              "recurring_topic",
+              "joke",
+              "warning",
+              "technical_fact",
+              "event"
+            ],
             "type": "string"
           },
           "confidence": {
             "type": "number"
           },
           "durability": {
+            "enum": [
+              "permanent",
+              "long",
+              "short",
+              "ephemeral"
+            ],
+            "type": "string"
+          },
+          "evidence_quote": {
+            "maxLength": 200,
             "type": "string"
           },
           "fact_text": {
@@ -54,11 +76,17 @@
           },
           "user_id": {
             "type": "integer"
+          },
+          "why_durable": {
+            "type": "string"
           }
         },
         "required": [
+          "evidence_quote",
+          "why_durable",
           "scope_type",
           "card_type",
+          "durability",
           "subject",
           "predicate",
           "object",
@@ -117,11 +145,11 @@
           },
           "decision": {
             "enum": [
-              "supersede",
-              "competing",
+              "reinforce",
               "update",
               "merge",
-              "reinforce",
+              "supersede",
+              "competing",
               "demote"
             ],
             "type": "string"
@@ -141,30 +169,8 @@
         },
         "required": [
           "old_card_id",
+          "reason",
           "decision"
-        ],
-        "type": "object"
-      },
-      "type": "array"
-    },
-    "supersessions": {
-      "items": {
-        "additionalProperties": false,
-        "properties": {
-          "new_fact_text": {
-            "type": "string"
-          },
-          "old_card_id": {
-            "type": "integer"
-          },
-          "reason": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "old_card_id",
-          "new_fact_text",
-          "reason"
         ],
         "type": "object"
       },
@@ -182,7 +188,7 @@
     "topics",
     "participants",
     "candidate_cards",
-    "supersessions",
+    "resolutions",
     "links"
   ],
   "type": "object"

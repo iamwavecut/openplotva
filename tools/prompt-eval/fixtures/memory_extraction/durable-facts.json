@@ -5,7 +5,11 @@
   "schema": "memory_extraction",
   "tool_name": "memory_extraction",
   "request": {
-    "temperature": 0.2,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
     "max_tokens": 4000
   },
   "notes": "One reinforce of an existing preference, one standing decision, one relocation fact; the rest is chatter.",
@@ -113,7 +117,9 @@
     "max_items:candidate_cards:4",
     "lang:ru:candidate_cards[].fact_text",
     "ids_from_input",
+    "evidence_quoted",
     "no_phrases:but wait;let me think;let me check;the prompt says",
     "max_blank_run:3"
-  ]
+  ],
+  "user_layout": "memory_blocks"
 }

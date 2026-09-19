@@ -1,0 +1,68 @@
+{
+  "flow": "memory_subject_merge",
+  "id": "memory_subject_merge/different-people-ru",
+  "prompt": "memory/subject_merge",
+  "schema": "memory_subject_merge",
+  "tool_name": "memory_subject_merge",
+  "request": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": 4000
+  },
+  "notes": "Russian: similar wording about two different people must stay apart.",
+  "user": {
+    "subject": "кофе",
+    "cards": [
+      {
+        "index": 0,
+        "type": "preference",
+        "predicate": "пьёт",
+        "fact": "Лена пьёт кофе без сахара",
+        "salience": 0.7,
+        "obs": 2,
+        "age": "1mo"
+      },
+      {
+        "index": 1,
+        "type": "preference",
+        "predicate": "пьёт",
+        "fact": "Лена всегда берёт кофе без сахара",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      },
+      {
+        "index": 2,
+        "type": "preference",
+        "predicate": "пьёт",
+        "fact": "Петя пьёт кофе с тремя ложками сахара",
+        "salience": 0.7,
+        "obs": 2,
+        "age": "1mo"
+      },
+      {
+        "index": 3,
+        "type": "preference",
+        "predicate": "пьёт",
+        "fact": "Петя кладёт в кофе много сахара",
+        "salience": 0.5,
+        "obs": 1,
+        "age": "2w"
+      }
+    ]
+  },
+  "checks": [
+    "json",
+    "schema",
+    "merge_plan_valid",
+    "separate:0,2",
+    "separate:1,3",
+    "separate:0,3",
+    "separate:1,2",
+    "no_phrases:but wait;let me think;let me check;the prompt says",
+    "max_blank_run:3"
+  ]
+}

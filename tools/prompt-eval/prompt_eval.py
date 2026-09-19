@@ -43,6 +43,8 @@ FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 CYRILLIC = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґЎў]")
 LATIN = re.compile(r"[A-Za-z]")
 TAG_RE = re.compile(r"</?\s*([a-zA-Z][a-zA-Z0-9-]*)")
+MEMORY_TASK_LINE = "Based on the window above, return the JSON object described in the system prompt."
+QUOTE_EDGES = " \t\n\"'«»“”„.,!?;:"
 
 
 def handlebars_escape(value: str) -> str:
@@ -140,6 +142,47 @@ def data_url(path: Path) -> str:
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
+def escape_prompt_attr(value: str) -> str:
+    return value.replace("<", "&lt;").replace('"', "&quot;")
+
+
+def render_memory_blocks(user: dict[str, Any]) -> str:
+    """The memory extraction user message, as `ExtractInput::to_prompt_payload` renders it."""
+    run = user.get("run", {})
+    facts = {"chat_type": (user.get("chat_type") or "").strip()}
+    for key, name in (("range_start_at", "window_start"), ("range_end_at", "window_end")):
+        value = run.get(key) or ""
+        if value and not value.startswith("0001-"):
+            facts[name] = value
+    facts = {key: value for key, value in facts.items() if value}
+    lines = ["<run>", json.dumps(facts, ensure_ascii=False, separators=(",", ":")), "</run>", "<existing_cards>"]
+    cards = sorted(user.get("existing_cards", []), key=lambda card: ((card.get("subject") or "").strip().lower(), card.get("id", 0)))
+    lines.extend(json.dumps(card, ensure_ascii=False, separators=(",", ":")) for card in cards)
+    lines += ["</existing_cards>", "<chat_window>"]
+    for message in user.get("messages", []):
+        attrs = []
+        if message.get("message_id"):
+            attrs.append(f'id="{message["message_id"]}"')
+        if (message.get("entry_id") or "").strip():
+            attrs.append(f'entry="{escape_prompt_attr(message["entry_id"].strip())}"')
+        if message.get("user_id"):
+            attrs.append(f'user="{message["user_id"]}"')
+        author = (message.get("sender_name") or "").strip()
+        if not author and (message.get("sender_username") or "").strip():
+            author = "@" + message["sender_username"].strip().lstrip("@")
+        if author:
+            attrs.append(f'author="{escape_prompt_attr(author)}"')
+        if message.get("occurred_at"):
+            attrs.append(f'at="{message["occurred_at"]}"')
+        if message.get("is_forwarded"):
+            attrs.append('forwarded="true"')
+        text = " ".join((message.get("text") or "").split()).replace("<", "&lt;")
+        opening = "<msg " + " ".join(attrs) + ">" if attrs else "<msg>"
+        lines.append(f"{opening}{text}</msg>")
+    lines += ["</chat_window>", MEMORY_TASK_LINE]
+    return "\n".join(lines)
+
+
 def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) -> dict[str, Any] | None:
     data = fixture.data
     if "messages" in data:
@@ -155,7 +198,9 @@ def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) 
     else:
         user_text = data.get("user")
     if user_text is not None:
-        if not isinstance(user_text, str):
+        if data.get("user_layout") == "memory_blocks" and not args.legacy_user_layout:
+            user_text = render_memory_blocks(user_text)
+        elif not isinstance(user_text, str):
             user_text = json.dumps(user_text, ensure_ascii=False, indent=2)
         if data.get("image"):
             image = (HERE / data["image"]).resolve()
@@ -353,6 +398,72 @@ def input_ints(fixture: Fixture) -> set[int]:
     return {int(x) for x in re.findall(r"-?\d+", text)}
 
 
+def comparable(text: str) -> str:
+    folded = text.replace("ё", "е").replace("Ё", "е")
+    for chars, target in (("«»“”„", '"'), ("’‘", "'"), ("—–", "-")):
+        for char in chars:
+            folded = folded.replace(char, target)
+    return " ".join(folded.lower().split())
+
+
+def quote_fragments(quote: str) -> list[str]:
+    unescaped = quote.replace("&lt;", "<").replace("&quot;", '"')
+    parts = [piece for part in unescaped.split("…") for piece in part.split("...")]
+    return [fragment for fragment in (comparable(part.strip(QUOTE_EDGES)) for part in parts) if fragment]
+
+
+def evidence_failures(fixture: Fixture, parsed: Any) -> list[str]:
+    """Candidate cards whose evidence quote is not in a message they cite (the extraction gate rule)."""
+    messages = (fixture.data.get("user") or {}).get("messages", [])
+    failures = []
+    for card in parsed.get("candidate_cards") or [] if isinstance(parsed, dict) else []:
+        if not isinstance(card, dict):
+            failures.append("non-object card")
+            continue
+        entries = {str(entry).strip() for entry in card.get("source_entry_ids") or []}
+        ids = {value for value in card.get("source_message_ids") or [] if isinstance(value, int) and value}
+        cited = [m for m in messages if (m.get("entry_id") or "").strip() in entries or m.get("message_id") in ids]
+        fragments = quote_fragments(str(card.get("evidence_quote") or ""))
+        if not cited or not fragments or not any(all(f in comparable(m.get("text") or "") for f in fragments) for m in cited):
+            failures.append(str(card.get("fact_text") or "")[:40])
+    return failures
+
+
+def merge_plan_errors(fixture: Fixture, parsed: Any) -> list[str]:
+    """Subject merge by index: the rules `validate_subject_merge_plan` enforces."""
+    count = len((fixture.data.get("user") or {}).get("cards", []))
+    if not isinstance(parsed, dict):
+        return ["no object"]
+    actions: dict[int, tuple[str, Any]] = {}
+    for decision in parsed.get("decisions") or []:
+        index = decision.get("index") if isinstance(decision, dict) else None
+        if not isinstance(index, int) or not 0 <= index < count:
+            return [f"unknown index {index}"]
+        if index in actions:
+            return [f"repeated index {index}"]
+        action = str(decision.get("action") or "").strip().lower()
+        if action not in ("keep", "cluster_with", "demote"):
+            return [f"unknown action {action!r}"]
+        actions[index] = (action, decision.get("survivor_index"))
+    missing = [index for index in range(count) if index not in actions]
+    if missing:
+        return [f"missing indexes {missing[:5]}"]
+    heads = set()
+    for index, (action, survivor) in actions.items():
+        if action != "cluster_with":
+            continue
+        if not isinstance(survivor, int) or survivor == index or actions.get(survivor, ("",))[0] != "keep":
+            return [f"index {index} folds into {survivor}"]
+        heads.add(survivor)
+    texts = {
+        entry.get("survivor_index")
+        for entry in parsed.get("survivors") or []
+        if isinstance(entry, dict) and str(entry.get("merged_fact_text") or "").strip()
+    }
+    lacking = sorted(heads - texts)
+    return [f"survivors without text {lacking}"] if lacking else []
+
+
 def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: str) -> tuple[bool, str]:
     name, _, arg = check.partition(":")
     if name == "json":
@@ -389,17 +500,31 @@ def run_check(check: str, fixture: Fixture, raw: str, parsed: Any, parse_note: s
         allowed = input_ints(fixture) | {0}
         bad = sorted({i for i in id_values(parsed) if i not in allowed})
         return not bad, f"unknown ids {bad[:5]}" if bad else "ok"
-    if name == "partition_ids":
-        expected = sorted(card["id"] for card in fixture.data["user"]["cards"])
-        seen = []
-        for cluster in parsed.get("clusters", []) if isinstance(parsed, dict) else []:
-            if isinstance(cluster, dict):
-                seen.append(cluster.get("survivor_id"))
-                seen.extend(cluster.get("absorbed_ids") or [])
-        seen.extend(parsed.get("demote_ids") or [])
-        seen.extend(parsed.get("keep_ids") or [])
-        ok = sorted(x for x in seen if isinstance(x, int)) == expected
-        return ok, "ok" if ok else f"got {sorted(x for x in seen if isinstance(x, int))[:12]}"
+    if name == "merge_plan_valid":
+        errors = merge_plan_errors(fixture, parsed)
+        return not errors, "; ".join(errors) or "ok"
+    if name == "evidence_quoted":
+        failures = evidence_failures(fixture, parsed)
+        return not failures, f"unquoted {failures[:3]}" if failures else "ok"
+    if name == "min_count":
+        target, _, limit = arg.rpartition(":")
+        path, _, wanted = target.partition("=")
+        count = sum(1 for value in walk(parsed, path) if str(value) == wanted)
+        return count >= int(limit), f"{count} of {wanted}"
+    if name == "separate":
+        left, right = (int(part) for part in arg.split(","))
+        heads = {}
+        for decision in parsed.get("decisions") or [] if isinstance(parsed, dict) else []:
+            if isinstance(decision, dict) and isinstance(decision.get("index"), int):
+                folded = decision.get("action") == "cluster_with"
+                heads[decision["index"]] = decision.get("survivor_index") if folded else decision["index"]
+        together = left in heads and right in heads and heads[left] == heads[right]
+        return not together, f"{left} and {right} folded together" if together else "ok"
+    if name == "not_equals":
+        path, _, unwanted = arg.partition("=")
+        values = walk(parsed, path)
+        hits = sum(1 for value in values if str(value) == unwanted)
+        return hits == 0, f"{hits} of {len(values)}"
     if name == "label":
         first = next((line.strip() for line in raw.splitlines() if line.strip()), "")
         return first.startswith(arg), first[:40]
@@ -548,6 +673,18 @@ SELF_TEST_CASES = [
     ("max_blank_run:2", '{\n\n\n\n\n"a": 1}', False),
     ("no_repeat_lines:2", "line number one\nline number two", True),
     ("no_repeat_lines:2", "same line here\nsame line here\nsame line here", False),
+    ("not_equals:cards[].type=event", '{"cards": [{"type": "decision"}]}', True),
+    ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "demote"}]}', True),
+    ("min_count:decisions[].action=demote:2", '{"decisions": [{"action": "demote"}, {"action": "keep"}]}', False),
+    ("separate:0,1", '{"decisions": [{"index": 0, "action": "keep"}, {"index": 1, "action": "keep"}]}', True),
+    ("separate:0,1", '{"decisions": [{"index": 0, "action": "keep"}, {"index": 1, "action": "cluster_with", "survivor_index": 0}]}', False),
+    ("not_equals:cards[].type=event", '{"cards": [{"type": "event"}]}', False),
+    ("evidence_quoted", '{"candidate_cards": [{"fact_text": "x", "evidence_quote": "«НЕ ЕМ мясо…»", "source_message_ids": [5]}]}', True),
+    ("evidence_quoted", '{"candidate_cards": [{"fact_text": "x", "evidence_quote": "люблю стейки", "source_message_ids": [5]}]}', False),
+    ("evidence_quoted", '{"candidate_cards": [{"fact_text": "x", "evidence_quote": "не ем мясо", "source_message_ids": [6]}]}', False),
+    ("merge_plan_valid", '{"decisions": [{"index": 0, "action": "keep"}, {"index": 1, "action": "cluster_with", "survivor_index": 0}], "survivors": [{"survivor_index": 0, "merged_fact_text": "m"}]}', True),
+    ("merge_plan_valid", '{"decisions": [{"index": 0, "action": "keep"}], "survivors": []}', False),
+    ("merge_plan_valid", '{"decisions": [{"index": 0, "action": "cluster_with", "survivor_index": 1}, {"index": 1, "action": "cluster_with", "survivor_index": 0}], "survivors": []}', False),
     ("ids_from_input", '{"old_card_id": 7}', True),
     ("ids_from_input", '{"old_card_id": 99}', False),
 ]
@@ -559,7 +696,17 @@ def self_test() -> int:
         {"slots": [{"index": 0, "model": "A"}, {"index": 1, "model": "B"}], "klein": True},
     )
     assert rendered == "- slot 0: A\n- slot 1: B\nK", rendered
-    fixture = Fixture(Path("self-test.json"), {"flow": "self_test", "user": {"cards": [{"id": 7}]}})
+    fixture = Fixture(
+        Path("self-test.json"),
+        {
+            "flow": "self_test",
+            "user": {
+                "cards": [{"index": 0}, {"index": 1}],
+                "existing_cards": [{"id": 7}],
+                "messages": [{"message_id": 5, "entry_id": "e5", "text": "Я больше не ем   мясо, честно"}],
+            },
+        },
+    )
     failures = 0
     for check, raw, expected in SELF_TEST_CASES:
         parsed, note = parse_json_output(raw)
@@ -576,6 +723,32 @@ def self_test() -> int:
     if schema_errors({"a": ["x"]}, schema) or not schema_errors({"a": ["y", "x"]}, schema):
         failures += 1
         print("FAIL schema subset")
+    blocks = render_memory_blocks(
+        {
+            "chat_type": "supergroup",
+            "run": {"range_start_at": "0001-01-01T00:00:00Z", "range_end_at": "2023-11-14T22:13:20Z"},
+            "existing_cards": [{"id": 42, "type": "event", "subject": "Bob", "fact": "b"}, {"id": 7, "type": "preference", "subject": "Ada", "fact": "a"}],
+            "messages": [{"message_id": 10, "entry_id": "e1", "user_id": 42, "sender_name": 'Ann "A"', "occurred_at": "2023-11-14T22:13:20Z", "text": "line one\nline <two>"}],
+        }
+    )
+    expected_blocks = "\n".join(
+        [
+            "<run>",
+            '{"chat_type":"supergroup","window_end":"2023-11-14T22:13:20Z"}',
+            "</run>",
+            "<existing_cards>",
+            '{"id":7,"type":"preference","subject":"Ada","fact":"a"}',
+            '{"id":42,"type":"event","subject":"Bob","fact":"b"}',
+            "</existing_cards>",
+            "<chat_window>",
+            '<msg id="10" entry="e1" user="42" author="Ann &quot;A&quot;" at="2023-11-14T22:13:20Z">line one line &lt;two></msg>',
+            "</chat_window>",
+            MEMORY_TASK_LINE,
+        ]
+    )
+    if blocks != expected_blocks:
+        failures += 1
+        print(f"FAIL memory blocks:\n{blocks}")
     if failures:
         print(f"self-test failed: {failures}")
         return 1
@@ -614,6 +787,11 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="second prompt tree to run on the same fixtures")
     parser.add_argument("--mode", choices=["response_format", "tools", "prompt_only"], default="response_format")
     parser.add_argument("--set", action="append", help="override a request field, e.g. temperature=0.7")
+    parser.add_argument(
+        "--legacy-user-layout",
+        action="store_true",
+        help="send memory fixtures as pretty JSON, the layout the memory prompts used before v6",
+    )
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1, help="parallel requests")
     parser.add_argument("--timeout", type=float, default=180.0)

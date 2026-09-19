@@ -1,49 +1,60 @@
 {
   "additionalProperties": false,
   "properties": {
-    "clusters": {
+    "decisions": {
       "items": {
         "additionalProperties": false,
         "properties": {
-          "absorbed_ids": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array"
-          },
-          "merged_fact_text": {
+          "action": {
+            "enum": [
+              "keep",
+              "cluster_with",
+              "demote"
+            ],
             "type": "string"
           },
-          "survivor_id": {
+          "index": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "survivor_index": {
             "type": "integer"
           }
         },
         "required": [
-          "survivor_id",
-          "absorbed_ids",
-          "merged_fact_text"
+          "index",
+          "reason",
+          "action"
         ],
         "type": "object"
       },
       "type": "array"
     },
-    "demote_ids": {
+    "survivors": {
       "items": {
-        "type": "integer"
-      },
-      "type": "array"
-    },
-    "keep_ids": {
-      "items": {
-        "type": "integer"
+        "additionalProperties": false,
+        "properties": {
+          "merged_fact_text": {
+            "type": "string"
+          },
+          "survivor_index": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "survivor_index",
+          "merged_fact_text"
+        ],
+        "type": "object"
       },
       "type": "array"
     }
   },
   "required": [
-    "clusters",
-    "demote_ids",
-    "keep_ids"
+    "decisions",
+    "survivors"
   ],
   "type": "object"
 }

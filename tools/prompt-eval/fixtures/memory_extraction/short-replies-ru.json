@@ -1,9 +1,10 @@
 {
   "flow": "memory_extraction",
-  "id": "memory_extraction/noise-only",
+  "id": "memory_extraction/short-replies-ru",
   "prompt": "memory/extraction",
   "schema": "memory_extraction",
   "tool_name": "memory_extraction",
+  "user_layout": "memory_blocks",
   "request": {
     "temperature": 0.7,
     "top_p": 0.8,
@@ -12,80 +13,80 @@
     "frequency_penalty": 0.0,
     "max_tokens": 4000
   },
-  "notes": "Greetings, spam and reactions only: the right answer is no cards.",
+  "notes": "Russian: a chain of short reactions and one-word replies — no event per reply.",
   "user": {
     "chat_type": "supergroup",
     "existing_cards": [],
     "messages": [
       {
-        "entry_id": "msg:1001",
-        "message_id": 1001,
+        "entry_id": "msg:2001",
+        "message_id": 2001,
         "occurred_at": "2026-09-01T18:00:00Z",
-        "sender_name": "Лёша",
+        "sender_name": "Рома",
         "sender_type": "user",
-        "text": "всем привет",
+        "text": "ахах",
         "thread_id": 0,
-        "user_id": 7001
+        "user_id": 7601
       },
       {
-        "entry_id": "msg:1002",
-        "message_id": 1002,
+        "entry_id": "msg:2002",
+        "message_id": 2002,
         "occurred_at": "2026-09-01T18:01:00Z",
-        "sender_name": "Маша",
+        "sender_name": "Света",
+        "sender_type": "user",
+        "text": "ну да",
+        "thread_id": 0,
+        "user_id": 7602
+      },
+      {
+        "entry_id": "msg:2003",
+        "message_id": 2003,
+        "occurred_at": "2026-09-01T18:02:00Z",
+        "sender_name": "Рома",
+        "sender_type": "user",
+        "text": "ага",
+        "thread_id": 0,
+        "user_id": 7601
+      },
+      {
+        "entry_id": "msg:2004",
+        "message_id": 2004,
+        "occurred_at": "2026-09-01T18:03:00Z",
+        "sender_name": "Кира",
+        "sender_type": "user",
+        "text": "лол",
+        "thread_id": 0,
+        "user_id": 7603
+      },
+      {
+        "entry_id": "msg:2005",
+        "message_id": 2005,
+        "occurred_at": "2026-09-01T18:04:00Z",
+        "sender_name": "Света",
+        "sender_type": "user",
+        "text": "спокойной ночи всем",
+        "thread_id": 0,
+        "user_id": 7602
+      },
+      {
+        "entry_id": "msg:2006",
+        "message_id": 2006,
+        "occurred_at": "2026-09-01T18:05:00Z",
+        "sender_name": "Рома",
+        "sender_type": "user",
+        "text": "+",
+        "thread_id": 0,
+        "user_id": 7601
+      },
+      {
+        "entry_id": "msg:2007",
+        "message_id": 2007,
+        "occurred_at": "2026-09-01T18:06:00Z",
+        "sender_name": "Кира",
         "sender_type": "user",
         "text": "👍",
         "thread_id": 0,
-        "user_id": 7002
-      },
-      {
-        "entry_id": "msg:1003",
-        "message_id": 1003,
-        "occurred_at": "2026-09-01T18:02:00Z",
-        "sender_name": "ServiceBot",
-        "sender_type": "bot",
-        "text": "Новый участник вступил в чат",
-        "thread_id": 0,
-        "user_id": 7003
-      },
-      {
-        "entry_id": "msg:1004",
-        "message_id": 1004,
-        "occurred_at": "2026-09-01T18:03:00Z",
-        "sender_name": "Незнакомец",
-        "sender_type": "user",
-        "text": "Работа на дому, от 5000 в день! Пиши в личку, всё расскажу",
-        "thread_id": 0,
-        "user_id": 7004
-      },
-      {
-        "entry_id": "msg:1005",
-        "message_id": 1005,
-        "occurred_at": "2026-09-01T18:04:00Z",
-        "sender_name": "Лёша",
-        "sender_type": "user",
-        "text": "ок",
-        "thread_id": 0,
-        "user_id": 7001
-      },
-      {
-        "entry_id": "msg:1006",
-        "message_id": 1006,
-        "occurred_at": "2026-09-01T18:05:00Z",
-        "sender_name": "Маша",
-        "sender_type": "user",
-        "text": "[стикер]",
-        "thread_id": 0,
-        "user_id": 7002
-      },
-      {
-        "entry_id": "msg:1007",
-        "message_id": 1007,
-        "occurred_at": "2026-09-01T18:06:00Z",
-        "sender_name": "Лёша",
-        "sender_type": "user",
-        "text": "спокойной ночи",
-        "thread_id": 0,
-        "user_id": 7001
+        "user_id": 7603
       }
     ],
     "run": {
@@ -104,12 +105,11 @@
   "checks": [
     "json",
     "schema",
-    "max_items:candidate_cards:0",
     "ids_from_input",
     "evidence_quoted",
+    "max_items:candidate_cards:0",
+    "not_equals:candidate_cards[].card_type=event",
     "no_phrases:but wait;let me think;let me check;the prompt says",
-    "max_blank_run:3",
-    "not_equals:candidate_cards[].card_type=event"
-  ],
-  "user_layout": "memory_blocks"
+    "max_blank_run:3"
+  ]
 }

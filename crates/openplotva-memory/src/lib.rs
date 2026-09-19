@@ -1,6 +1,6 @@
 //! Long-term memory extraction, redaction, and retrieval.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
@@ -22,7 +22,7 @@ pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
-pub const PROMPT_VERSION: &str = "chat_memory_daily_v5";
+pub const PROMPT_VERSION: &str = "chat_memory_daily_v6";
 pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const DEFAULT_MEMORY_REDACTION_SERVICE_NAME: &str = "privacy-filter";
 pub const DEFAULT_MEMORY_REDACTION_ENDPOINT_NAME: &str = "redact";
@@ -283,24 +283,109 @@ pub struct ExtractInput {
     pub existing_cards: Vec<Card>,
 }
 
+/// Closing line of the extraction user message: the task follows the data.
+pub const EXTRACTION_TASK_LINE: &str =
+    "Based on the window above, return the JSON object described in the system prompt.";
+
 impl ExtractInput {
-    /// Serialize this extraction input for the LLM prompt, projecting
-    /// `existing_cards` to their compact reasoning payload (id, type, subject,
-    /// fact, confidence, coarse age, disputed) instead of the full DB rows.
-    /// This keeps the prompt small and lets more cards fit the token budget; the
-    /// `id` is preserved so the model can still cite `old_card_id` in
-    /// resolutions. All other fields serialize exactly as before.
+    /// Render the extraction user message as delimited data blocks followed by
+    /// the task: `<run>` facts, the compact `<existing_cards>` (one JSON object
+    /// per line, ids kept so resolutions can cite them) and the `<chat_window>`
+    /// with one `<msg>` line per message carrying the ids a card must cite.
     pub fn to_prompt_payload(&self) -> Result<String, serde_json::Error> {
-        let mut value = serde_json::to_value(self)?;
-        if !self.existing_cards.is_empty() {
-            let compact = compact_existing_cards(&self.existing_cards, self.run.range_end_at);
-            let compact = serde_json::to_value(&compact)?;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("existing_cards".to_owned(), compact);
-            }
+        let mut out = String::from("<run>\n");
+        out.push_str(&serde_json::to_string(&PromptRunFacts::new(self))?);
+        out.push_str("\n</run>\n<existing_cards>\n");
+        for card in compact_existing_cards(&self.existing_cards, self.run.range_end_at) {
+            out.push_str(&serde_json::to_string(&card)?);
+            out.push('\n');
         }
-        serde_json::to_string_pretty(&value)
+        out.push_str("</existing_cards>\n<chat_window>\n");
+        for message in &self.messages {
+            push_prompt_message(&mut out, message);
+        }
+        out.push_str("</chat_window>\n");
+        out.push_str(EXTRACTION_TASK_LINE);
+        Ok(out)
     }
+}
+
+#[derive(Serialize)]
+struct PromptRunFacts<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    chat_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_end: Option<String>,
+}
+
+impl<'a> PromptRunFacts<'a> {
+    fn new(input: &'a ExtractInput) -> Self {
+        Self {
+            chat_type: input.chat_type.trim(),
+            window_start: prompt_timestamp(input.run.range_start_at),
+            window_end: prompt_timestamp(input.run.range_end_at),
+        }
+    }
+}
+
+fn prompt_timestamp(value: OffsetDateTime) -> Option<String> {
+    if value == go_zero_time() {
+        return None;
+    }
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+fn push_prompt_message(out: &mut String, message: &Message) {
+    out.push_str("<msg");
+    if message.message_id != 0 {
+        out.push_str(&format!(" id=\"{}\"", message.message_id));
+    }
+    let entry_id = message.entry_id.trim();
+    if !entry_id.is_empty() {
+        out.push_str(&format!(" entry=\"{}\"", escape_prompt_attr(entry_id)));
+    }
+    if message.user_id != 0 {
+        out.push_str(&format!(" user=\"{}\"", message.user_id));
+    }
+    let author = prompt_author(message);
+    if !author.is_empty() {
+        out.push_str(&format!(" author=\"{}\"", escape_prompt_attr(&author)));
+    }
+    if let Some(at) = prompt_timestamp(message.occurred_at) {
+        out.push_str(&format!(" at=\"{at}\""));
+    }
+    if message.is_forwarded {
+        out.push_str(" forwarded=\"true\"");
+    }
+    out.push('>');
+    out.push_str(&escape_prompt_text(&normalized_space(&message.text)));
+    out.push_str("</msg>\n");
+}
+
+fn prompt_author(message: &Message) -> String {
+    let name = message.sender_name.trim();
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    let username = message.sender_username.trim().trim_start_matches('@');
+    if username.is_empty() {
+        String::new()
+    } else {
+        format!("@{username}")
+    }
+}
+
+/// Message text cannot open or close a data block once `<` is escaped.
+fn escape_prompt_text(text: &str) -> String {
+    text.replace('<', "&lt;")
+}
+
+fn escape_prompt_attr(text: &str) -> String {
+    escape_prompt_text(text).replace('"', "&quot;")
 }
 
 /// Compact projection of an existing card for the extraction/consolidation
@@ -408,6 +493,9 @@ pub struct ExtractOutput {
     /// Completion token count.
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub output_tokens: i32,
+    /// Top-level array fields that arrived as JSON strings and were parsed again.
+    #[serde(skip)]
+    pub stringified_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -453,6 +541,13 @@ pub struct CandidateCard {
     /// Empty means "derive from card_type". Drives the card's expiry (forgetting).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub durability: String,
+    /// Verbatim fragment of a cited message that supports the fact. Checked
+    /// against the window by `gate_extraction_output`; never stored on a card.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence_quote: String,
+    /// One clause on why the fact will still matter in two weeks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why_durable: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1631,13 +1726,62 @@ pub fn decode_extraction_json(raw: &str) -> Result<ExtractOutput, DecodeExtracti
     if end <= start {
         return Err(DecodeExtractionError::Decode);
     }
-    if let Ok(parsed) = serde_json::from_str(&trimmed[start..=end]) {
+    let object = &trimmed[start..=end];
+    if let Ok(parsed) = serde_json::from_str(object) {
+        return Ok(parsed);
+    }
+    if let Some((mut parsed, fields)) =
+        decode_with_stringified_arrays::<ExtractOutput>(object, EXTRACTION_ARRAY_FIELDS)
+    {
+        parsed.stringified_fields = fields;
         return Ok(parsed);
     }
     // A response truncated at the model's output cap ends mid-structure. Keep the
     // longest prefix that closes cleanly (dropping the incomplete trailing element)
     // rather than losing the whole batch; fall back to Decode if nothing parses.
     salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
+}
+
+const EXTRACTION_ARRAY_FIELDS: &[&str] = &[
+    "topics",
+    "participants",
+    "candidate_cards",
+    "supersessions",
+    "resolutions",
+    "links",
+];
+
+/// Tool-call transports sometimes return an array argument as a JSON string.
+/// Parse such top-level fields once (a blank string counts as an empty array)
+/// and decode the object again, reporting which fields needed it.
+fn decode_with_stringified_arrays<T: serde::de::DeserializeOwned>(
+    object: &str,
+    fields: &[&str],
+) -> Option<(T, Vec<String>)> {
+    let mut value: Value = serde_json::from_str(object).ok()?;
+    let map = value.as_object_mut()?;
+    let mut parsed_fields = Vec::new();
+    for field in fields {
+        let Some(Value::String(text)) = map.get(*field) else {
+            continue;
+        };
+        let parsed = if text.trim().is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            match serde_json::from_str::<Value>(text) {
+                Ok(array @ Value::Array(_)) => array,
+                _ => continue,
+            }
+        };
+        map.insert((*field).to_owned(), parsed);
+        parsed_fields.push((*field).to_owned());
+    }
+    if parsed_fields.is_empty() {
+        return None;
+    }
+    serde_json::from_value(value)
+        .ok()
+        .map(|parsed| (parsed, parsed_fields))
 }
 
 fn salvage_truncated_json<T: serde::de::DeserializeOwned>(fragment: &str) -> Option<T> {
@@ -1678,10 +1822,12 @@ fn salvage_truncated_json<T: serde::de::DeserializeOwned>(fragment: &str) -> Opt
     serde_json::from_str(&repaired).ok()
 }
 
-/// One card projected for the subject merge-pass prompt: the payload the model
-/// folds over, plus salience/observation weight so it can pick the survivor.
+/// One card projected for the subject merge-pass prompt. The model refers to
+/// cards by `index`; the id stays on our side.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SubjectMergeCard {
+    pub index: usize,
+    #[serde(skip)]
     pub id: i64,
     #[serde(rename = "type")]
     pub card_type: String,
@@ -1701,30 +1847,71 @@ pub struct SubjectMergeInput {
     pub cards: Vec<SubjectMergeCard>,
 }
 
-/// One consolidation cluster from the model: fold `absorbed_ids` into
-/// `survivor_id`, rewriting the survivor to `merged_fact_text`.
+impl SubjectMergeInput {
+    /// Card ids in prompt index order.
+    #[must_use]
+    pub fn card_ids(&self) -> Vec<i64> {
+        self.cards.iter().map(|card| card.id).collect()
+    }
+}
+
+pub const SUBJECT_MERGE_ACTION_KEEP: &str = "keep";
+pub const SUBJECT_MERGE_ACTION_CLUSTER_WITH: &str = "cluster_with";
+pub const SUBJECT_MERGE_ACTION_DEMOTE: &str = "demote";
+
+/// The model's verdict on one input card, by prompt index.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct SubjectMergeCluster {
-    pub survivor_id: i64,
+pub struct SubjectMergeDecision {
     #[serde(default)]
-    pub absorbed_ids: Vec<i64>,
+    pub index: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub survivor_index: Option<i64>,
+}
+
+/// The consolidated wording of one survivor, written once per survivor.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SubjectMergeSurvivor {
+    #[serde(default)]
+    pub survivor_index: i64,
     #[serde(default)]
     pub merged_fact_text: String,
 }
 
-/// The model's raw plan for one subject group (ids unverified).
+/// The model's raw plan for one subject group (indexes unverified).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SubjectMergePlan {
     #[serde(default)]
-    pub clusters: Vec<SubjectMergeCluster>,
+    pub decisions: Vec<SubjectMergeDecision>,
     #[serde(default)]
-    pub demote_ids: Vec<i64>,
-    #[serde(default)]
-    pub keep_ids: Vec<i64>,
+    pub survivors: Vec<SubjectMergeSurvivor>,
+    /// Top-level array fields that arrived as JSON strings and were parsed again.
+    #[serde(skip)]
+    pub stringified_fields: Vec<String>,
 }
 
-/// A cluster whose ids are all confirmed present in the group, with a non-empty
-/// absorbed set disjoint from every other cluster/demote id.
+/// Why a merge plan was rejected as a whole.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SubjectMergePlanError {
+    #[error("card index {0} is outside the group")]
+    UnknownIndex(i64),
+    #[error("card index {0} has more than one decision")]
+    RepeatedIndex(i64),
+    #[error("card index {0} has no decision")]
+    MissingIndex(usize),
+    #[error("card index {index} has unknown action {action:?}")]
+    UnknownAction { index: i64, action: String },
+    #[error("card index {index} folds into {survivor:?}, which is not a kept card")]
+    InvalidSurvivor { index: usize, survivor: Option<i64> },
+    #[error("survivor index {0} has no merged text")]
+    MissingMergedText(usize),
+}
+
+/// One cluster of the validated plan: fold `absorbed_ids` into `survivor_id`
+/// and rewrite the survivor to `merged_fact_text`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedMergeCluster {
     pub survivor_id: i64,
@@ -1732,9 +1919,8 @@ pub struct ValidatedMergeCluster {
     pub merged_fact_text: String,
 }
 
-/// The plan after checking every id against real group membership: ids the model
-/// invented or referenced twice are dropped, so apply only ever touches real
-/// cards in this group exactly once.
+/// A plan whose every decision was mapped from a prompt index to a real card
+/// of the group.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ValidatedSubjectMerge {
     pub clusters: Vec<ValidatedMergeCluster>,
@@ -1742,12 +1928,21 @@ pub struct ValidatedSubjectMerge {
 }
 
 /// Project a group's cards for the merge prompt, strongest-salience first so the
-/// model sees the likeliest survivors at the top.
+/// model sees the likeliest survivors at the top, and number them in that order.
 #[must_use]
 pub fn subject_merge_cards(cards: &[Card], as_of: OffsetDateTime) -> Vec<SubjectMergeCard> {
-    let mut out: Vec<SubjectMergeCard> = cards
-        .iter()
-        .map(|card| SubjectMergeCard {
+    let mut ordered: Vec<&Card> = cards.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .salience
+            .total_cmp(&left.salience)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, card)| SubjectMergeCard {
+            index,
             id: card.id,
             card_type: card.card_type.clone(),
             predicate: card.predicate.trim().to_owned(),
@@ -1756,15 +1951,10 @@ pub fn subject_merge_cards(cards: &[Card], as_of: OffsetDateTime) -> Vec<Subject
             obs: card.observation_count,
             age: coarse_card_age(card.created_at.or(card.last_observed_at), as_of),
         })
-        .collect();
-    out.sort_by(|left, right| {
-        right
-            .salience
-            .total_cmp(&left.salience)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    out
+        .collect()
 }
+
+const SUBJECT_MERGE_ARRAY_FIELDS: &[&str] = &["decisions", "survivors"];
 
 /// Decode the merge-pass model response, salvaging a response truncated at the
 /// output cap the same way extraction does.
@@ -1782,62 +1972,103 @@ pub fn decode_subject_merge_plan(raw: &str) -> Result<SubjectMergePlan, DecodeEx
     if end <= start {
         return Err(DecodeExtractionError::Decode);
     }
-    if let Ok(parsed) = serde_json::from_str(&trimmed[start..=end]) {
+    let object = &trimmed[start..=end];
+    if let Ok(parsed) = serde_json::from_str(object) {
+        return Ok(parsed);
+    }
+    if let Some((mut parsed, fields)) =
+        decode_with_stringified_arrays::<SubjectMergePlan>(object, SUBJECT_MERGE_ARRAY_FIELDS)
+    {
+        parsed.stringified_fields = fields;
         return Ok(parsed);
     }
     salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
 }
 
-/// Validate a raw plan against the group's real card ids. Every id must be a
-/// real group member used at most once; a cluster keeps only its valid absorbed
-/// ids and is dropped if none survive or the survivor/text is invalid. This is
-/// the guard that makes apply safe against hallucinated or repeated ids.
-#[must_use]
+/// Check a plan against the group, whose ids are given in prompt index order:
+/// every index gets exactly one known action, a folded card points at a card
+/// that is kept, and every survivor that absorbs cards has merged text. Any
+/// violation rejects the whole plan, so apply never acts on an answer that was
+/// only partly understood.
 pub fn validate_subject_merge_plan(
     plan: &SubjectMergePlan,
-    group_ids: &[i64],
-) -> ValidatedSubjectMerge {
-    let group: std::collections::HashSet<i64> =
-        group_ids.iter().copied().filter(|id| *id != 0).collect();
-    let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut clusters = Vec::new();
-    for cluster in &plan.clusters {
-        let survivor = cluster.survivor_id;
-        let text = cluster.merged_fact_text.trim();
-        if !group.contains(&survivor) || used.contains(&survivor) || text.is_empty() {
-            continue;
+    card_ids: &[i64],
+) -> Result<ValidatedSubjectMerge, SubjectMergePlanError> {
+    let count = card_ids.len();
+    let mut decided: Vec<Option<(&'static str, Option<i64>)>> = vec![None; count];
+    for decision in &plan.decisions {
+        let index = usize::try_from(decision.index)
+            .ok()
+            .filter(|index| *index < count)
+            .ok_or(SubjectMergePlanError::UnknownIndex(decision.index))?;
+        if decided[index].is_some() {
+            return Err(SubjectMergePlanError::RepeatedIndex(decision.index));
         }
-        let mut absorbed = Vec::new();
-        for id in &cluster.absorbed_ids {
-            if *id != survivor && group.contains(id) && !used.contains(id) && !absorbed.contains(id)
-            {
-                absorbed.push(*id);
+        let action = decision.action.trim();
+        let action = [
+            SUBJECT_MERGE_ACTION_KEEP,
+            SUBJECT_MERGE_ACTION_CLUSTER_WITH,
+            SUBJECT_MERGE_ACTION_DEMOTE,
+        ]
+        .into_iter()
+        .find(|known| action.eq_ignore_ascii_case(known))
+        .ok_or_else(|| SubjectMergePlanError::UnknownAction {
+            index: decision.index,
+            action: action.to_owned(),
+        })?;
+        decided[index] = Some((action, decision.survivor_index));
+    }
+    let decided = decided
+        .into_iter()
+        .enumerate()
+        .map(|(index, decision)| decision.ok_or(SubjectMergePlanError::MissingIndex(index)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut absorbed: Vec<Vec<i64>> = vec![Vec::new(); count];
+    let mut demote_ids = Vec::new();
+    for (index, (action, survivor)) in decided.iter().enumerate() {
+        match *action {
+            SUBJECT_MERGE_ACTION_CLUSTER_WITH => {
+                let head = survivor
+                    .and_then(|survivor| usize::try_from(survivor).ok())
+                    .filter(|head| {
+                        *head < count
+                            && *head != index
+                            && decided[*head].0 == SUBJECT_MERGE_ACTION_KEEP
+                    })
+                    .ok_or(SubjectMergePlanError::InvalidSurvivor {
+                        index,
+                        survivor: *survivor,
+                    })?;
+                absorbed[head].push(card_ids[index]);
             }
+            SUBJECT_MERGE_ACTION_DEMOTE => demote_ids.push(card_ids[index]),
+            _ => {}
         }
-        if absorbed.is_empty() {
+    }
+
+    let mut clusters = Vec::new();
+    for (head, absorbed_ids) in absorbed.into_iter().enumerate() {
+        if absorbed_ids.is_empty() {
             continue;
         }
-        used.insert(survivor);
-        for id in &absorbed {
-            used.insert(*id);
-        }
+        let merged_fact_text = plan
+            .survivors
+            .iter()
+            .filter(|survivor| usize::try_from(survivor.survivor_index).ok() == Some(head))
+            .map(|survivor| survivor.merged_fact_text.trim())
+            .find(|text| !text.is_empty())
+            .ok_or(SubjectMergePlanError::MissingMergedText(head))?;
         clusters.push(ValidatedMergeCluster {
-            survivor_id: survivor,
-            absorbed_ids: absorbed,
-            merged_fact_text: text.to_owned(),
+            survivor_id: card_ids[head],
+            absorbed_ids,
+            merged_fact_text: merged_fact_text.to_owned(),
         });
     }
-    let mut demote_ids = Vec::new();
-    for id in &plan.demote_ids {
-        if group.contains(id) && !used.contains(id) && !demote_ids.contains(id) {
-            demote_ids.push(*id);
-            used.insert(*id);
-        }
-    }
-    ValidatedSubjectMerge {
+    Ok(ValidatedSubjectMerge {
         clusters,
         demote_ids,
-    }
+    })
 }
 
 #[must_use]
@@ -1860,7 +2091,7 @@ pub fn estimate_extraction_input_with<F>(
 where
     F: FnMut(&str) -> i32,
 {
-    let payload = match serde_json::to_string_pretty(input) {
+    let payload = match input.to_prompt_payload() {
         Ok(payload) => payload,
         Err(_) => return EXTRACTION_PROMPT_OVERHEAD_TOKENS,
     };
@@ -2035,6 +2266,372 @@ pub fn observed_at_from_messages_at(
         .find(|message| message.occurred_at != go_zero_time())
         .map(|message| message.occurred_at)
         .unwrap_or(fallback_observed_at)
+}
+
+/// Most candidate cards one extraction window may add.
+pub const MAX_CANDIDATE_CARDS_PER_WINDOW: usize = 8;
+/// Most candidate cards one window may add about the same subject.
+pub const MAX_CANDIDATE_CARDS_PER_SUBJECT: usize = 2;
+/// An event resting on a single message needs at least this much text.
+pub const MIN_SINGLE_MESSAGE_EVENT_CHARS: usize = 40;
+/// Word overlap at which a candidate restates an existing card.
+const KNOWN_FACT_WORD_OVERLAP: f64 = 0.8;
+
+/// What `gate_extraction_output` removed or rewrote, one counter per rule.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExtractionGateReport {
+    /// Cards citing no message of the window.
+    pub unsourced: usize,
+    /// Cards whose evidence quote is missing or not found in a cited message.
+    pub unquoted_evidence: usize,
+    /// Event cards resting on one short message.
+    pub short_single_message_events: usize,
+    /// Cards written in another script than the messages they cite.
+    pub foreign_script: usize,
+    /// Cards restating an existing card; recorded as a reinforcement instead.
+    pub known_facts: usize,
+    /// Cards over the per-subject or per-window cap, lowest salience first.
+    pub over_cap: usize,
+    /// Resolutions naming a card the model was not shown.
+    pub unknown_card_ids: usize,
+    /// Supersessions across subjects or predicates, kept as competing instead.
+    pub supersede_downgraded: usize,
+}
+
+impl ExtractionGateReport {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Enforce the extraction contract in code, whatever the model wrote: a card
+/// must quote a message it cites, an event needs more than one short reply, a
+/// fact keeps its sources' script, a restated existing fact becomes a
+/// reinforcement, a window adds at most `MAX_CANDIDATE_CARDS_PER_WINDOW` cards
+/// and `MAX_CANDIDATE_CARDS_PER_SUBJECT` per subject, resolutions may only name
+/// cards the model was shown, and a supersession must keep subject and
+/// predicate (anything else is kept as competing). Legacy `supersessions` are
+/// folded into `resolutions` first.
+#[must_use]
+pub fn gate_extraction_output(
+    input: &ExtractInput,
+    mut output: ExtractOutput,
+) -> (ExtractOutput, ExtractionGateReport) {
+    let mut report = ExtractionGateReport::default();
+    for legacy in std::mem::take(&mut output.supersessions) {
+        output.resolutions.push(Resolution {
+            old_card_id: legacy.old_card_id,
+            new_fact_text: legacy.new_fact_text,
+            decision: ResolutionDecision::Supersede,
+            reason: legacy.reason,
+            ..Resolution::default()
+        });
+    }
+    let shown: HashSet<i64> = input
+        .existing_cards
+        .iter()
+        .map(|card| card.id)
+        .filter(|id| *id != 0)
+        .collect();
+    let before = output.resolutions.len();
+    output.resolutions.retain(|resolution| {
+        shown.contains(&resolution.old_card_id)
+            && (resolution.decision != ResolutionDecision::Merge
+                || shown.contains(&resolution.into_card_id))
+    });
+    report.unknown_card_ids = before - output.resolutions.len();
+
+    let mut kept = Vec::with_capacity(output.candidate_cards.len());
+    for candidate in std::mem::take(&mut output.candidate_cards) {
+        let sources: Vec<&Message> = input
+            .messages
+            .iter()
+            .filter(|message| message_matches_candidate_source(message, &candidate))
+            .collect();
+        if sources.is_empty() {
+            report.unsourced += 1;
+            continue;
+        }
+        if !evidence_is_quoted(&candidate.evidence_quote, &sources) {
+            report.unquoted_evidence += 1;
+            continue;
+        }
+        if is_short_single_message_event(&candidate, &sources) {
+            report.short_single_message_events += 1;
+            continue;
+        }
+        if script_differs(&candidate.fact_text, &sources) {
+            report.foreign_script += 1;
+            continue;
+        }
+        if let Some(existing_id) = known_fact_id(&candidate, &input.existing_cards) {
+            report.known_facts += 1;
+            if !output
+                .resolutions
+                .iter()
+                .any(|resolution| resolution.old_card_id == existing_id)
+            {
+                output.resolutions.push(Resolution {
+                    old_card_id: existing_id,
+                    decision: ResolutionDecision::Reinforce,
+                    reason: "restated in the window".to_owned(),
+                    ..Resolution::default()
+                });
+            }
+            continue;
+        }
+        kept.push(candidate);
+    }
+    let (kept, over_cap) = cap_candidate_cards(kept);
+    report.over_cap = over_cap;
+    output.candidate_cards = kept;
+
+    for resolution in &mut output.resolutions {
+        if resolution.decision == ResolutionDecision::Supersede
+            && !supersession_keeps_attribute(
+                resolution,
+                &input.existing_cards,
+                &output.candidate_cards,
+            )
+        {
+            resolution.decision = ResolutionDecision::Competing;
+            report.supersede_downgraded += 1;
+        }
+    }
+    (output, report)
+}
+
+fn evidence_is_quoted(quote: &str, sources: &[&Message]) -> bool {
+    let fragments = quote_fragments(quote);
+    !fragments.is_empty()
+        && sources.iter().any(|message| {
+            let text = comparable_text(&message.text);
+            fragments
+                .iter()
+                .all(|fragment| text.contains(fragment.as_str()))
+        })
+}
+
+/// A quote split at elisions, with wrapping quote marks and edge punctuation
+/// trimmed and prompt escapes undone.
+fn quote_fragments(quote: &str) -> Vec<String> {
+    let unescaped = quote.replace("&lt;", "<").replace("&quot;", "\"");
+    unescaped
+        .split('…')
+        .flat_map(|part| part.split("..."))
+        .map(|part| {
+            comparable_text(part.trim_matches(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '"' | '\''
+                            | '«'
+                            | '»'
+                            | '“'
+                            | '”'
+                            | '„'
+                            | '.'
+                            | ','
+                            | '!'
+                            | '?'
+                            | ';'
+                            | ':'
+                    )
+            }))
+        })
+        .filter(|fragment| !fragment.is_empty())
+        .collect()
+}
+
+/// Lowercase, `ё` folded into `е`, typographic quotes and dashes unified and
+/// whitespace collapsed, so a faithful quote matches its message.
+fn comparable_text(value: &str) -> String {
+    let folded: String = value
+        .chars()
+        .map(|ch| match ch {
+            'ё' | 'Ё' => 'е',
+            '«' | '»' | '“' | '”' | '„' => '"',
+            '’' | '‘' => '\'',
+            '—' | '–' => '-',
+            other => other,
+        })
+        .collect();
+    normalized_lower_space(&folded)
+}
+
+fn is_short_single_message_event(candidate: &CandidateCard, sources: &[&Message]) -> bool {
+    normalize_card_type(&candidate.card_type) == CARD_TYPE_EVENT
+        && sources.len() == 1
+        && sources[0].text.trim().chars().count() < MIN_SINGLE_MESSAGE_EVENT_CHARS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LetterScript {
+    Cyrillic,
+    Latin,
+}
+
+/// The script holding at least two thirds of the letters, ignoring
+/// `[PLACEHOLDER]` redactions; `None` for short or mixed text.
+fn dominant_script(text: &str) -> Option<LetterScript> {
+    let mut cyrillic = 0usize;
+    let mut latin = 0usize;
+    let mut in_placeholder = false;
+    for ch in text.chars() {
+        match ch {
+            '[' => in_placeholder = true,
+            ']' => in_placeholder = false,
+            _ if in_placeholder => {}
+            '\u{0400}'..='\u{04FF}' => cyrillic += 1,
+            _ if ch.is_ascii_alphabetic() => latin += 1,
+            _ => {}
+        }
+    }
+    let letters = cyrillic + latin;
+    if letters < 8 {
+        None
+    } else if cyrillic * 3 >= letters * 2 {
+        Some(LetterScript::Cyrillic)
+    } else if latin * 3 >= letters * 2 {
+        Some(LetterScript::Latin)
+    } else {
+        None
+    }
+}
+
+fn script_differs(fact_text: &str, sources: &[&Message]) -> bool {
+    let source_text = sources
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(
+        (dominant_script(fact_text), dominant_script(&source_text)),
+        (Some(fact), Some(source)) if fact != source
+    )
+}
+
+fn fact_words(text: &str) -> HashSet<String> {
+    comparable_text(text)
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 2)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn word_overlap(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    let union = left.union(right).count();
+    if union == 0 {
+        return 0.0;
+    }
+    left.intersection(right).count() as f64 / union as f64
+}
+
+/// The existing card a candidate restates: same text, or the same subject with
+/// nearly the same words.
+fn known_fact_id(candidate: &CandidateCard, existing: &[Card]) -> Option<i64> {
+    let key = normalized_fact_text_key(&candidate.fact_text);
+    let words = fact_words(&candidate.fact_text);
+    let subject = normalize_subject(&candidate.subject);
+    existing
+        .iter()
+        .find(|card| {
+            card.id != 0
+                && (normalized_fact_text_key(&card.fact_text) == key
+                    || (normalize_subject(&card.subject) == subject
+                        && word_overlap(&words, &fact_words(&card.fact_text))
+                            >= KNOWN_FACT_WORD_OVERLAP))
+        })
+        .map(|card| card.id)
+}
+
+/// Keep the most salient cards, at most `MAX_CANDIDATE_CARDS_PER_SUBJECT` per
+/// subject and `MAX_CANDIDATE_CARDS_PER_WINDOW` overall, in the model's order.
+fn cap_candidate_cards(cards: Vec<CandidateCard>) -> (Vec<CandidateCard>, usize) {
+    let mut ranked: Vec<usize> = (0..cards.len()).collect();
+    ranked.sort_by(|left, right| cards[*right].salience.total_cmp(&cards[*left].salience));
+    let mut per_subject: HashMap<String, usize> = HashMap::new();
+    let mut keep = vec![false; cards.len()];
+    let mut kept = 0usize;
+    for index in ranked {
+        if kept == MAX_CANDIDATE_CARDS_PER_WINDOW {
+            break;
+        }
+        let count = per_subject
+            .entry(normalize_subject(&cards[index].subject))
+            .or_default();
+        if *count == MAX_CANDIDATE_CARDS_PER_SUBJECT {
+            continue;
+        }
+        *count += 1;
+        keep[index] = true;
+        kept += 1;
+    }
+    let dropped = cards.len() - kept;
+    let cards = cards
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(card, keep)| keep.then_some(card))
+        .collect();
+    (cards, dropped)
+}
+
+fn normalize_predicate(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .split(|ch: char| ch.is_whitespace() || ch == '-' || ch == '_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// A supersession replaces one attribute of one entity: the old card and its
+/// replacement must share subject and predicate. Without a replacement in
+/// this window the pairing step drops the supersession anyway.
+fn supersession_keeps_attribute(
+    resolution: &Resolution,
+    existing: &[Card],
+    candidates: &[CandidateCard],
+) -> bool {
+    let Some(old) = existing
+        .iter()
+        .find(|card| card.id == resolution.old_card_id)
+    else {
+        return false;
+    };
+    let key = normalized_fact_text_key(&resolution.new_fact_text);
+    let replacement = candidates
+        .iter()
+        .find(|candidate| !key.is_empty() && normalized_fact_text_key(&candidate.fact_text) == key)
+        .or_else(|| (candidates.len() == 1).then(|| &candidates[0]));
+    let Some(new) = replacement else {
+        return true;
+    };
+    normalize_subject(&old.subject) == normalize_subject(&new.subject)
+        && normalize_predicate(&old.predicate) == normalize_predicate(&new.predicate)
+}
+
+/// Days an event card stays useful as an example for the extractor.
+pub const EXISTING_EVENT_CARD_MAX_AGE_DAYS: i64 = 3;
+/// Salience a card seen only once needs to be shown to the extractor.
+pub const EXISTING_SINGLE_OBSERVATION_MIN_SALIENCE: f64 = 0.6;
+
+/// Whether an existing card is worth showing to the extractor. Shown cards
+/// double as examples of what to write, so stale events and weak cards seen
+/// only once stay out of the prompt.
+#[must_use]
+pub fn worth_showing_as_existing(card: &Card, as_of: OffsetDateTime) -> bool {
+    if card.card_type == CARD_TYPE_EVENT {
+        let seen = card.created_at.or(card.last_observed_at);
+        if seen.is_none_or(|seen| {
+            as_of - seen > time::Duration::days(EXISTING_EVENT_CARD_MAX_AGE_DAYS)
+        }) {
+            return false;
+        }
+    }
+    !(card.observation_count == 1 && card.salience < EXISTING_SINGLE_OBSERVATION_MIN_SALIENCE)
 }
 
 pub fn redact_extract_output_with<F, E>(
@@ -2408,7 +3005,27 @@ pub fn is_memory_noise_message(message: &Message) -> bool {
     if is_noisy_memory_forward_origin(&message.forward_origin_type) {
         return true;
     }
-    looks_like_memory_spam(&message.text)
+    looks_like_memory_spam(&message.text) || cannot_carry_memory_fact(&message.text)
+}
+
+/// Shortest one-word message that still reaches the extractor.
+pub const MIN_ONE_WORD_MEMORY_MESSAGE_CHARS: usize = 12;
+
+/// Messages no fact can come from: bot commands, reactions without a letter or
+/// digit, and one-word replies shorter than `MIN_ONE_WORD_MEMORY_MESSAGE_CHARS`.
+/// Two-word replies stay because short statements ("мне 30", "я веган") do
+/// carry facts.
+#[must_use]
+pub fn cannot_carry_memory_fact(text: &str) -> bool {
+    let text = text.trim();
+    let mut chars = text.chars();
+    if chars.next() == Some('/') && chars.next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        return true;
+    }
+    if !text.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    text.chars().count() < MIN_ONE_WORD_MEMORY_MESSAGE_CHARS && text.split_whitespace().count() < 2
 }
 
 #[must_use]
@@ -3167,85 +3784,217 @@ mod tests {
     use std::fmt;
     use std::sync::{Arc, Mutex as StdMutex};
 
-    #[test]
-    fn validate_subject_merge_plan_drops_hallucinated_and_repeated_ids() {
-        let plan = SubjectMergePlan {
-            clusters: vec![
-                SubjectMergeCluster {
-                    survivor_id: 1,
-                    // 99 is hallucinated; 1 is the survivor itself; both dropped.
-                    absorbed_ids: vec![2, 3, 99, 1],
-                    merged_fact_text: "merged".to_owned(),
-                },
-                SubjectMergeCluster {
-                    // survivor already consumed as an absorbed id above -> whole cluster dropped.
-                    survivor_id: 2,
-                    absorbed_ids: vec![4],
-                    merged_fact_text: "x".to_owned(),
-                },
-                SubjectMergeCluster {
-                    // only self as absorbed -> empty -> dropped, and survivor 4 stays free.
-                    survivor_id: 4,
-                    absorbed_ids: vec![4],
-                    merged_fact_text: "y".to_owned(),
-                },
-            ],
-            demote_ids: vec![4, 2, 88],
-            keep_ids: vec![5],
-        };
-        let validated = validate_subject_merge_plan(&plan, &[1, 2, 3, 4, 5]);
-        assert_eq!(
-            validated.clusters,
-            vec![ValidatedMergeCluster {
-                survivor_id: 1,
-                absorbed_ids: vec![2, 3],
-                merged_fact_text: "merged".to_owned(),
-            }]
-        );
-        // 4 is the only demote id in-group and not already used; 2 used, 88 hallucinated.
-        assert_eq!(validated.demote_ids, vec![4]);
+    fn merge_decision(index: i64, action: &str, survivor: Option<i64>) -> SubjectMergeDecision {
+        SubjectMergeDecision {
+            index,
+            reason: "same fact".to_owned(),
+            action: action.to_owned(),
+            survivor_index: survivor,
+        }
+    }
+
+    fn merge_plan(
+        decisions: Vec<SubjectMergeDecision>,
+        survivors: &[(i64, &str)],
+    ) -> SubjectMergePlan {
+        SubjectMergePlan {
+            decisions,
+            survivors: survivors
+                .iter()
+                .map(|(index, text)| SubjectMergeSurvivor {
+                    survivor_index: *index,
+                    merged_fact_text: (*text).to_owned(),
+                })
+                .collect(),
+            ..SubjectMergePlan::default()
+        }
     }
 
     #[test]
-    fn validate_subject_merge_plan_requires_nonempty_absorbed_and_text() {
-        let plan = SubjectMergePlan {
-            clusters: vec![
-                SubjectMergeCluster {
-                    survivor_id: 1,
-                    absorbed_ids: vec![2],
-                    merged_fact_text: "   ".to_owned(),
-                },
-                SubjectMergeCluster {
-                    survivor_id: 3,
-                    absorbed_ids: vec![],
-                    merged_fact_text: "kept but nothing to fold".to_owned(),
-                },
+    fn merge_plan_folds_cards_into_kept_survivors() {
+        let plan = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(1, "cluster_with", Some(0)),
+                merge_decision(2, "CLUSTER_WITH", Some(0)),
+                merge_decision(3, "demote", None),
+                merge_decision(4, "keep", None),
             ],
-            demote_ids: vec![],
-            keep_ids: vec![],
+            &[(0, "  merged  "), (4, "ignored: nothing folds into it")],
+        );
+        let validated =
+            validate_subject_merge_plan(&plan, &[10, 11, 12, 13, 14]).expect("valid plan");
+        assert_eq!(
+            validated.clusters,
+            vec![ValidatedMergeCluster {
+                survivor_id: 10,
+                absorbed_ids: vec![11, 12],
+                merged_fact_text: "merged".to_owned(),
+            }]
+        );
+        assert_eq!(validated.demote_ids, vec![13]);
+    }
+
+    #[test]
+    fn merge_plan_requires_every_index_once() {
+        let ids = [10, 11, 12];
+        let missing = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(1, "keep", None),
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_subject_merge_plan(&missing, &ids),
+            Err(SubjectMergePlanError::MissingIndex(2))
+        );
+        let repeated = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(1, "keep", None),
+                merge_decision(1, "demote", None),
+                merge_decision(2, "keep", None),
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_subject_merge_plan(&repeated, &ids),
+            Err(SubjectMergePlanError::RepeatedIndex(1))
+        );
+        let unknown = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(7, "keep", None),
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_subject_merge_plan(&unknown, &ids),
+            Err(SubjectMergePlanError::UnknownIndex(7))
+        );
+        let bad_action = merge_plan(vec![merge_decision(0, "merge", Some(1))], &[]);
+        assert_eq!(
+            validate_subject_merge_plan(&bad_action, &ids),
+            Err(SubjectMergePlanError::UnknownAction {
+                index: 0,
+                action: "merge".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn merge_plan_rejects_unknown_survivor() {
+        let ids = [10, 11, 12];
+        let chained = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(1, "cluster_with", Some(2)),
+                merge_decision(2, "cluster_with", Some(0)),
+            ],
+            &[(0, "merged")],
+        );
+        assert_eq!(
+            validate_subject_merge_plan(&chained, &ids),
+            Err(SubjectMergePlanError::InvalidSurvivor {
+                index: 1,
+                survivor: Some(2)
+            })
+        );
+        for survivor in [None, Some(1), Some(9), Some(-1)] {
+            let plan = merge_plan(
+                vec![
+                    merge_decision(0, "keep", None),
+                    merge_decision(1, "cluster_with", survivor),
+                    merge_decision(2, "keep", None),
+                ],
+                &[(0, "merged")],
+            );
+            assert_eq!(
+                validate_subject_merge_plan(&plan, &ids),
+                Err(SubjectMergePlanError::InvalidSurvivor { index: 1, survivor })
+            );
+        }
+        let no_text = merge_plan(
+            vec![
+                merge_decision(0, "keep", None),
+                merge_decision(1, "cluster_with", Some(0)),
+                merge_decision(2, "keep", None),
+            ],
+            &[(0, "   ")],
+        );
+        assert_eq!(
+            validate_subject_merge_plan(&no_text, &ids),
+            Err(SubjectMergePlanError::MissingMergedText(0))
+        );
+    }
+
+    #[test]
+    fn subject_merge_cards_number_cards_by_salience_and_hide_ids() {
+        let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
+        let cards = vec![
+            Card {
+                id: 5,
+                fact_text: "weak".to_owned(),
+                salience: 0.2,
+                ..Card::default()
+            },
+            Card {
+                id: 9,
+                fact_text: "strong".to_owned(),
+                salience: 0.9,
+                ..Card::default()
+            },
+        ];
+        let input = SubjectMergeInput {
+            subject: "Ann".to_owned(),
+            cards: subject_merge_cards(&cards, as_of),
         };
-        let validated = validate_subject_merge_plan(&plan, &[1, 2, 3]);
-        assert!(validated.clusters.is_empty());
-        assert!(validated.demote_ids.is_empty());
+        assert_eq!(input.card_ids(), vec![9, 5]);
+        let payload = serde_json::to_string(&input).expect("payload");
+        assert!(payload.contains("\"index\":0"), "{payload}");
+        assert!(!payload.contains("\"id\""), "{payload}");
     }
 
     #[test]
     fn decode_subject_merge_plan_parses_and_salvages() {
-        let full = r#"{"clusters":[{"survivor_id":1,"absorbed_ids":[2,3],"merged_fact_text":"m"}],"demote_ids":[4],"keep_ids":[5]}"#;
+        let full = r#"{"decisions":[{"index":0,"reason":"r","action":"keep"},{"index":1,"reason":"r","action":"cluster_with","survivor_index":0}],"survivors":[{"survivor_index":0,"merged_fact_text":"m"}]}"#;
         let parsed = decode_subject_merge_plan(full).expect("parse");
-        assert_eq!(parsed.clusters.len(), 1);
-        assert_eq!(parsed.demote_ids, vec![4]);
+        assert_eq!(parsed.decisions.len(), 2);
+        assert_eq!(parsed.survivors[0].merged_fact_text, "m");
+        assert!(parsed.stringified_fields.is_empty());
 
-        // Truncated at the output cap mid-"demote_ids": salvage keeps the clusters.
-        let truncated = r#"{"clusters":[{"survivor_id":1,"absorbed_ids":[2,3],"merged_fact_text":"m"}],"demote_i"#;
+        let truncated = r#"{"decisions":[{"index":0,"reason":"r","action":"keep"}],"survi"#;
         let salvaged = decode_subject_merge_plan(truncated).expect("salvage");
-        assert_eq!(salvaged.clusters.len(), 1);
-        assert_eq!(salvaged.clusters[0].survivor_id, 1);
+        assert_eq!(salvaged.decisions.len(), 1);
 
         assert!(matches!(
             decode_subject_merge_plan("   "),
             Err(DecodeExtractionError::Empty)
         ));
+    }
+
+    #[test]
+    fn stringified_array_fields_are_salvaged() {
+        let extraction = decode_extraction_json(
+            r#"{"episode_summary":"ok","topics":"[\"rust\"]","candidate_cards":"[{\"subject\":\"Ann\",\"fact_text\":\"Ann likes tea\"}]","links":"","resolutions":[]}"#,
+        )
+        .expect("decode stringified arrays");
+        assert_eq!(extraction.topics, vec!["rust"]);
+        assert_eq!(extraction.candidate_cards.len(), 1);
+        assert_eq!(extraction.candidate_cards[0].subject, "Ann");
+        assert!(extraction.links.is_empty());
+        assert_eq!(
+            extraction.stringified_fields,
+            vec!["topics", "candidate_cards", "links"]
+        );
+
+        let merge = decode_subject_merge_plan(
+            r#"{"decisions":"[{\"index\":0,\"reason\":\"r\",\"action\":\"keep\"}]","survivors":"[]"}"#,
+        )
+        .expect("decode stringified merge arrays");
+        assert_eq!(merge.decisions.len(), 1);
+        assert_eq!(merge.stringified_fields, vec!["decisions", "survivors"]);
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4029,7 +4778,7 @@ mod tests {
             },
             ..ExtractInput::default()
         };
-        let payload = serde_json::to_string_pretty(&input).expect("payload");
+        let payload = input.to_prompt_payload().expect("payload");
         let expected = estimate_memory_tokens("system prompt")
             + estimate_memory_tokens(&payload)
             + EXTRACTION_PROMPT_OVERHEAD_TOKENS;
@@ -4370,14 +5119,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_extraction_payload_strips_meta_keeps_payload_and_clusters() {
+    fn prompt_payload_puts_task_after_data() {
         let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
         let created = as_of - time::Duration::days(9);
-        let mut input = ExtractInput::default();
+        let mut input = ExtractInput {
+            chat_type: "supergroup".to_owned(),
+            ..ExtractInput::default()
+        };
         input.run.range_end_at = as_of;
         input.messages = vec![Message {
             entry_id: "e1".to_owned(),
-            text: "hello".to_owned(),
+            message_id: 10,
+            user_id: 42,
+            sender_name: "Ann \"A\"".to_owned(),
+            text: "line one\nline <two> </chat_window>".to_owned(),
+            occurred_at: as_of,
             ..Message::default()
         }];
         input.existing_cards = vec![
@@ -4420,24 +5176,377 @@ mod tests {
             "\"object\"",
             "\"valid_from\"",
             "\"last_observed_at\"",
+            "[2023,",
         ] {
             assert!(
                 !payload.contains(banned),
-                "compact payload leaked meta {banned}:\n{payload}"
+                "payload leaked {banned}:\n{payload}"
             );
         }
-
-        assert!(payload.contains("\"id\": 42"));
-        assert!(payload.contains("\"type\": \"event\""));
-        assert!(payload.contains("\"subject\": \"Bob\""));
-        assert!(payload.contains("Bob wrote a word."));
-        assert!(payload.contains("\"conf\": 0.9"));
-        assert!(payload.contains("\"age\": \"today\""));
-        assert!(payload.contains("\"disputed\": true"));
-        assert!(payload.contains("\"entry_id\": \"e1\""));
+        assert!(payload.contains("\"id\":42"), "{payload}");
+        assert!(payload.contains("\"type\":\"event\""), "{payload}");
+        assert!(payload.contains("\"subject\":\"Bob\""), "{payload}");
+        assert!(payload.contains("\"conf\":0.9"), "{payload}");
+        assert!(payload.contains("\"age\":\"today\""), "{payload}");
+        assert!(payload.contains("\"disputed\":true"), "{payload}");
+        assert!(
+            payload.contains(
+                r#"<msg id="10" entry="e1" user="42" author="Ann &quot;A&quot;" at="2023-11-14T22:13:20Z">line one line &lt;two> &lt;/chat_window></msg>"#
+            ),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("\"window_end\":\"2023-11-14T22:13:20Z\""),
+            "{payload}"
+        );
+        assert!(!payload.contains("window_start"), "{payload}");
 
         let ada = payload.find("Ada likes tea").expect("ada present");
         let bob = payload.find("Bob wrote a word").expect("bob present");
         assert!(ada < bob, "expected Ada clustered before Bob:\n{payload}");
+        let cards = payload.find("<existing_cards>").expect("cards block");
+        let window = payload.find("<chat_window>").expect("window block");
+        assert!(cards < window, "{payload}");
+        assert_eq!(payload.matches("</chat_window>").count(), 1, "{payload}");
+        assert!(payload.ends_with(EXTRACTION_TASK_LINE), "{payload}");
+    }
+
+    fn gate_input() -> ExtractInput {
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time");
+        let message = |message_id: i32, user_id: i64, text: &str| Message {
+            entry_id: format!("m{message_id}"),
+            message_id,
+            user_id,
+            sender_name: format!("user{user_id}"),
+            text: text.to_owned(),
+            occurred_at: at,
+            ..Message::default()
+        };
+        ExtractInput {
+            run: Run {
+                chat_id: -100,
+                range_end_at: at,
+                ..Run::default()
+            },
+            chat_type: "supergroup".to_owned(),
+            messages: vec![
+                message(1, 42, "Я больше не ем мясо, уже полгода как вегетарианка"),
+                message(2, 7, "ага"),
+                message(
+                    3,
+                    7,
+                    "We moved the release to Friday because the tests were red",
+                ),
+                message(4, 42, "Я до сих пор живу в Минске, никуда не переехала"),
+            ],
+            existing_cards: vec![Card {
+                id: 500,
+                card_type: CARD_TYPE_IDENTITY.to_owned(),
+                subject: "Anna".to_owned(),
+                predicate: "lives in".to_owned(),
+                fact_text: "Анна живёт в Минске".to_owned(),
+                observation_count: 3,
+                salience: 0.8,
+                ..Card::default()
+            }],
+            ..ExtractInput::default()
+        }
+    }
+
+    fn gate_card(message_id: i32, subject: &str, fact: &str, quote: &str) -> CandidateCard {
+        CandidateCard {
+            scope_type: "user".to_owned(),
+            user_id: 42,
+            card_type: CARD_TYPE_PREFERENCE.to_owned(),
+            subject: subject.to_owned(),
+            predicate: "diet".to_owned(),
+            fact_text: fact.to_owned(),
+            evidence_quote: quote.to_owned(),
+            confidence: 0.9,
+            salience: 0.8,
+            source_message_ids: vec![message_id],
+            ..CandidateCard::default()
+        }
+    }
+
+    fn gate(output: ExtractOutput) -> (ExtractOutput, ExtractionGateReport) {
+        gate_extraction_output(&gate_input(), output)
+    }
+
+    #[test]
+    fn gates_drop_cards_whose_quote_is_not_in_a_cited_message() {
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![
+                gate_card(1, "Anna", "Анна не ест мясо", "НЕ ЕМ мясо"),
+                gate_card(
+                    1,
+                    "Anna",
+                    "Анна вегетарианка",
+                    "«…уже полгода как вегетарианка»",
+                ),
+                gate_card(1, "Anna B", "Анна любит стейки", "люблю стейки"),
+                gate_card(1, "Anna C", "Анна давно не ест мясо", ""),
+                gate_card(99, "Anna D", "Анна ест рыбу", "ем рыбу"),
+            ],
+            ..ExtractOutput::default()
+        });
+        let facts: Vec<&str> = gated
+            .candidate_cards
+            .iter()
+            .map(|card| card.fact_text.as_str())
+            .collect();
+        assert_eq!(facts, vec!["Анна не ест мясо", "Анна вегетарианка"]);
+        assert_eq!(report.unquoted_evidence, 2);
+        assert_eq!(report.unsourced, 1);
+    }
+
+    #[test]
+    fn gates_drop_events_resting_on_one_short_reply() {
+        let mut short = gate_card(2, "Boris", "Борис ответил коротко", "ага");
+        short.card_type = CARD_TYPE_EVENT.to_owned();
+        let mut long = gate_card(
+            3,
+            "Release",
+            "The release moved to Friday because the tests were red",
+            "moved the release to Friday",
+        );
+        long.card_type = CARD_TYPE_EVENT.to_owned();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![short, long],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.candidate_cards.len(), 1);
+        assert_eq!(gated.candidate_cards[0].subject, "Release");
+        assert_eq!(report.short_single_message_events, 1);
+    }
+
+    #[test]
+    fn gates_drop_cards_written_in_another_script() {
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![
+                gate_card(
+                    3,
+                    "Release",
+                    "Релиз перенесли на пятницу",
+                    "moved the release",
+                ),
+                gate_card(
+                    3,
+                    "Tests",
+                    "The tests were red before the release",
+                    "tests were red",
+                ),
+            ],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.candidate_cards.len(), 1);
+        assert_eq!(gated.candidate_cards[0].subject, "Tests");
+        assert_eq!(report.foreign_script, 1);
+    }
+
+    #[test]
+    fn gates_cap_cards_per_subject_and_per_window() {
+        let mut cards = Vec::new();
+        for (salience, fact) in [
+            (0.9, "Анна не ест мясо"),
+            (0.5, "Анна ест овощи"),
+            (0.7, "Анна вегетарианка"),
+        ] {
+            let mut card = gate_card(1, "Anna", fact, "не ем мясо");
+            card.salience = salience;
+            cards.push(card);
+        }
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: cards,
+            ..ExtractOutput::default()
+        });
+        let facts: Vec<&str> = gated
+            .candidate_cards
+            .iter()
+            .map(|card| card.fact_text.as_str())
+            .collect();
+        assert_eq!(facts, vec!["Анна не ест мясо", "Анна вегетарианка"]);
+        assert_eq!(report.over_cap, 1);
+
+        let many = (0..10)
+            .map(|index| {
+                let mut card = gate_card(1, &format!("S{index}"), "Анна не ест мясо", "не ем мясо");
+                card.salience = f64::from(index) / 10.0;
+                card
+            })
+            .collect();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: many,
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.candidate_cards.len(), MAX_CANDIDATE_CARDS_PER_WINDOW);
+        assert!(
+            gated
+                .candidate_cards
+                .iter()
+                .all(|card| card.subject != "S0" && card.subject != "S1")
+        );
+        assert_eq!(report.over_cap, 2);
+    }
+
+    #[test]
+    fn gates_keep_resolutions_to_shown_cards_only() {
+        let (gated, report) = gate(ExtractOutput {
+            resolutions: vec![
+                Resolution {
+                    old_card_id: 500,
+                    decision: ResolutionDecision::Reinforce,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 999,
+                    decision: ResolutionDecision::Demote,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 500,
+                    into_card_id: 998,
+                    decision: ResolutionDecision::Merge,
+                    ..Resolution::default()
+                },
+            ],
+            supersessions: vec![Supersession {
+                old_card_id: 997,
+                new_fact_text: "x".to_owned(),
+                reason: "legacy".to_owned(),
+            }],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.resolutions.len(), 1);
+        assert_eq!(gated.resolutions[0].old_card_id, 500);
+        assert!(gated.supersessions.is_empty());
+        assert_eq!(report.unknown_card_ids, 3);
+    }
+
+    #[test]
+    fn gates_turn_a_restated_card_into_a_reinforcement() {
+        let mut restated = gate_card(4, "Anna", "Анна живет в Минске.", "живу в Минске");
+        restated.card_type = CARD_TYPE_IDENTITY.to_owned();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![restated],
+            ..ExtractOutput::default()
+        });
+        assert!(gated.candidate_cards.is_empty());
+        assert_eq!(report.known_facts, 1);
+        assert_eq!(
+            gated.resolutions,
+            vec![Resolution {
+                old_card_id: 500,
+                decision: ResolutionDecision::Reinforce,
+                reason: "restated in the window".to_owned(),
+                ..Resolution::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn gates_keep_supersession_only_for_the_same_attribute() {
+        let supersede = |fact: &str| Resolution {
+            old_card_id: 500,
+            new_fact_text: fact.to_owned(),
+            decision: ResolutionDecision::Supersede,
+            ..Resolution::default()
+        };
+        let mut other_attribute =
+            gate_card(4, "Anna", "Анна никуда не переехала", "никуда не переехала");
+        other_attribute.predicate = "moved".to_owned();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![other_attribute],
+            resolutions: vec![supersede("Анна никуда не переехала")],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.resolutions[0].decision, ResolutionDecision::Competing);
+        assert_eq!(report.supersede_downgraded, 1);
+
+        let mut same_attribute =
+            gate_card(4, "anna", "Анна по-прежнему в Минске", "до сих пор живу");
+        same_attribute.predicate = "Lives-In".to_owned();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![same_attribute],
+            resolutions: vec![supersede("Анна по-прежнему в Минске")],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.resolutions[0].decision, ResolutionDecision::Supersede);
+        assert_eq!(report.supersede_downgraded, 0);
+    }
+
+    #[test]
+    fn existing_cards_skip_stale_events_and_weak_single_observations() {
+        let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
+        let card = |card_type: &str, age_days: i64, observations: i32, salience: f64| Card {
+            card_type: card_type.to_owned(),
+            created_at: Some(as_of - time::Duration::days(age_days)),
+            observation_count: observations,
+            salience,
+            ..Card::default()
+        };
+        assert!(worth_showing_as_existing(
+            &card(CARD_TYPE_EVENT, 2, 3, 0.9),
+            as_of
+        ));
+        assert!(!worth_showing_as_existing(
+            &card(CARD_TYPE_EVENT, 5, 3, 0.9),
+            as_of
+        ));
+        assert!(!worth_showing_as_existing(
+            &card(CARD_TYPE_PREFERENCE, 30, 1, 0.5),
+            as_of
+        ));
+        assert!(worth_showing_as_existing(
+            &card(CARD_TYPE_PREFERENCE, 30, 1, 0.7),
+            as_of
+        ));
+        assert!(worth_showing_as_existing(
+            &card(CARD_TYPE_PREFERENCE, 30, 2, 0.1),
+            as_of
+        ));
+        let undated_event = Card {
+            card_type: CARD_TYPE_EVENT.to_owned(),
+            observation_count: 3,
+            ..Card::default()
+        };
+        assert!(!worth_showing_as_existing(&undated_event, as_of));
+    }
+
+    #[test]
+    fn filter_consolidation_messages_drops_commands_reactions_and_one_word_replies() {
+        let message = |text: &str| Message {
+            sender_type: "user".to_owned(),
+            text: text.to_owned(),
+            ..Message::default()
+        };
+        let texts = [
+            "/start",
+            "/draw кот в шляпе",
+            "😂😂😂",
+            "+++ !!!",
+            "ок",
+            "Спасибо!",
+            "мне 30",
+            "я веган",
+            "Переезжаю в Варшаву",
+            "https://example.invalid/какой-то-очень-длинный-путь",
+            "/ну и что",
+        ];
+        let messages: Vec<Message> = texts.iter().map(|text| message(text)).collect();
+        let kept: Vec<String> = filter_consolidation_messages(&messages)
+            .into_iter()
+            .map(|message| message.text)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "мне 30",
+                "я веган",
+                "Переезжаю в Варшаву",
+                "https://example.invalid/какой-то-очень-длинный-путь",
+                "/ну и что",
+            ]
+        );
     }
 }

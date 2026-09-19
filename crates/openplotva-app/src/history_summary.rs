@@ -39,6 +39,7 @@ use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const HISTORY_SUMMARY_TEMPERATURE: f64 = 0.2;
 
 /// Concrete app history-summary service used by the dialog toolbox runtime.
 pub type AppHistorySummaryService =
@@ -417,7 +418,11 @@ pub fn aifarm_history_summary_config_from_app_config(
         },
         model,
         max_output_tokens: 1024,
-        temperature: Some(memory.aifarm_temperature),
+        temperature: Some(
+            memory
+                .aifarm_temperature
+                .unwrap_or(HISTORY_SUMMARY_TEMPERATURE),
+        ),
         enable_thinking: Some(false),
         include_reasoning: Some(false),
     }

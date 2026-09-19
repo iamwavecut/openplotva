@@ -1730,11 +1730,15 @@ pub struct AifarmMemoryExtractorConfig {
     pub model: String,
     /// Maximum output tokens.
     pub max_output_tokens: i32,
-    /// Temperature.
+    /// Temperature; unset takes the model family's default.
     pub temperature: Option<f64>,
-    /// Frequency penalty (breaks self-questioning repetition loops); 0 disables.
+    /// Top-p; unset takes the model family's default.
+    pub top_p: Option<f64>,
+    /// Top-k; unset takes the model family's default.
+    pub top_k: Option<f64>,
+    /// Frequency penalty; unset takes the model family's default.
     pub frequency_penalty: Option<f64>,
-    /// Presence penalty; 0 disables.
+    /// Presence penalty; unset takes the model family's default.
     pub presence_penalty: Option<f64>,
     /// Whether model thinking is enabled.
     pub enable_thinking: Option<bool>,
@@ -1928,11 +1932,22 @@ impl AifarmMemoryExtractorConfig {
         } else {
             self.max_output_tokens
         };
-        // Apply the anti-repetition default, then clamp to the [-2.0, 2.0] range
-        // the OpenAI-compatible backend enforces so an out-of-range or non-finite
+        // Fill what the deployment and the route left unset from the model
+        // family, then clamp penalties to the [-2.0, 2.0] range the
+        // OpenAI-compatible backend enforces so an out-of-range or non-finite
         // operator override cannot 400 every extraction request.
-        self.frequency_penalty = Some(clamp_penalty(self.frequency_penalty.unwrap_or(0.3), 0.3));
-        self.presence_penalty = Some(clamp_penalty(self.presence_penalty.unwrap_or(0.3), 0.3));
+        let family = memory_worker_sampling(&self.model);
+        self.temperature = Some(self.temperature.unwrap_or(family.temperature));
+        self.top_p = self.top_p.or(family.top_p);
+        self.top_k = self.top_k.or(family.top_k);
+        self.frequency_penalty = Some(clamp_penalty(
+            self.frequency_penalty.unwrap_or(family.penalty),
+            family.penalty,
+        ));
+        self.presence_penalty = Some(clamp_penalty(
+            self.presence_penalty.unwrap_or(family.penalty),
+            family.penalty,
+        ));
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -2382,6 +2397,38 @@ fn worker_nucleus_for_model(model: &str) -> (Option<f64>, Option<f64>) {
     }
 }
 
+/// Sampling the memory workers use when neither the deployment nor the route
+/// sets it.
+struct MemoryWorkerSampling {
+    temperature: f64,
+    top_p: Option<f64>,
+    top_k: Option<f64>,
+    penalty: f64,
+}
+
+/// Qwen 3.6/3.8 publish temperature 0.7, top_p 0.8 and top_k 20 for
+/// non-thinking use, and loop on long outputs at low temperature; penalties stay
+/// off because the output repeats names and ids from the input. Other models
+/// keep the previous 0.2 with light penalties, plus the Gemma nucleus.
+fn memory_worker_sampling(model: &str) -> MemoryWorkerSampling {
+    if model.to_ascii_lowercase().contains("qwen") {
+        MemoryWorkerSampling {
+            temperature: 0.7,
+            top_p: Some(0.8),
+            top_k: Some(20.0),
+            penalty: 0.0,
+        }
+    } else {
+        let (top_p, top_k) = worker_nucleus_for_model(model);
+        MemoryWorkerSampling {
+            temperature: 0.2,
+            top_p,
+            top_k,
+            penalty: 0.3,
+        }
+    }
+}
+
 #[must_use]
 pub fn aifarm_optimizer_max_tokens(variant_count: usize) -> i32 {
     let normalized = openplotva_media::normalize_variant_count(variant_count);
@@ -2539,8 +2586,8 @@ where
             response_format: Some(memory_extraction_response_format()),
             max_tokens: self.cfg.max_output_tokens,
             temperature: self.cfg.temperature,
-            // Break the self-questioning loops the extractor otherwise falls into
-            // inside the JSON (repeating "but wait…" until it hits the output cap).
+            top_p: self.cfg.top_p,
+            top_k: self.cfg.top_k,
             frequency_penalty: self.cfg.frequency_penalty,
             presence_penalty: self.cfg.presence_penalty,
             include_reasoning: self.cfg.include_reasoning,
@@ -2603,8 +2650,11 @@ where
             response_format: Some(subject_merge_response_format()),
             max_tokens: self.cfg.max_output_tokens,
             temperature: self.cfg.temperature,
-            frequency_penalty: self.cfg.frequency_penalty,
-            presence_penalty: self.cfg.presence_penalty,
+            top_p: self.cfg.top_p,
+            top_k: self.cfg.top_k,
+            // Merged text reuses the cards' own words, which penalties push away from.
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
@@ -5453,23 +5503,34 @@ fn subject_merge_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["clusters", "demote_ids", "keep_ids"],
+        "required": ["decisions", "survivors"],
         "properties": {
-            "clusters": {
+            "decisions": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["survivor_id", "absorbed_ids", "merged_fact_text"],
+                    "required": ["index", "reason", "action"],
                     "properties": {
-                        "survivor_id": {"type": "integer"},
-                        "absorbed_ids": {"type": "array", "items": {"type": "integer"}},
+                        "index": {"type": "integer"},
+                        "reason": {"type": "string"},
+                        "action": {"type": "string", "enum": ["keep", "cluster_with", "demote"]},
+                        "survivor_index": {"type": "integer"},
+                    },
+                },
+            },
+            "survivors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["survivor_index", "merged_fact_text"],
+                    "properties": {
+                        "survivor_index": {"type": "integer"},
                         "merged_fact_text": {"type": "string"},
                     },
                 },
             },
-            "demote_ids": {"type": "array", "items": {"type": "integer"}},
-            "keep_ids": {"type": "array", "items": {"type": "integer"}},
         },
     })
 }
@@ -5493,7 +5554,7 @@ fn memory_extraction_response_schema() -> Value {
             "topics",
             "participants",
             "candidate_cards",
-            "supersessions",
+            "resolutions",
             "links",
         ],
         "properties": {
@@ -5509,10 +5570,6 @@ fn memory_extraction_response_schema() -> Value {
             "candidate_cards": {
                 "type": "array",
                 "items": memory_candidate_card_schema(),
-            },
-            "supersessions": {
-                "type": "array",
-                "items": memory_supersession_schema(),
             },
             "resolutions": {
                 "type": "array",
@@ -5531,8 +5588,11 @@ fn memory_candidate_card_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
+            "evidence_quote",
+            "why_durable",
             "scope_type",
             "card_type",
+            "durability",
             "subject",
             "predicate",
             "object",
@@ -5543,16 +5603,32 @@ fn memory_candidate_card_schema() -> Value {
             "source_message_ids",
         ],
         "properties": {
+            "evidence_quote": {"type": "string", "maxLength": 200},
+            "why_durable": {"type": "string"},
             "scope_type": {"type": "string", "enum": ["chat", "thread", "user"]},
             "user_id": {"type": "integer"},
-            "card_type": {"type": "string"},
+            "card_type": {
+                "type": "string",
+                "enum": [
+                    "preference",
+                    "identity",
+                    "project",
+                    "decision",
+                    "relationship",
+                    "recurring_topic",
+                    "joke",
+                    "warning",
+                    "technical_fact",
+                    "event",
+                ],
+            },
+            "durability": {"type": "string", "enum": ["permanent", "long", "short", "ephemeral"]},
             "subject": {"type": "string"},
             "predicate": {"type": "string"},
             "object": {"type": "string"},
             "fact_text": {"type": "string"},
             "confidence": {"type": "number"},
             "salience": {"type": "number"},
-            "durability": {"type": "string"},
             "portable": {"type": "boolean"},
             "source_entry_ids": {
                 "type": "array",
@@ -5566,34 +5642,21 @@ fn memory_candidate_card_schema() -> Value {
     })
 }
 
-fn memory_supersession_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["old_card_id", "new_fact_text", "reason"],
-        "properties": {
-            "old_card_id": {"type": "integer"},
-            "new_fact_text": {"type": "string"},
-            "reason": {"type": "string"},
-        },
-    })
-}
-
 fn memory_resolution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["old_card_id", "decision"],
+        "required": ["old_card_id", "reason", "decision"],
         "properties": {
             "old_card_id": {"type": "integer"},
-            "into_card_id": {"type": "integer"},
-            "new_fact_text": {"type": "string"},
+            "reason": {"type": "string"},
             "decision": {
                 "type": "string",
-                "enum": ["supersede", "competing", "update", "merge", "reinforce", "demote"],
+                "enum": ["reinforce", "update", "merge", "supersede", "competing", "demote"],
             },
+            "into_card_id": {"type": "integer"},
+            "new_fact_text": {"type": "string"},
             "conflict_score": {"type": "number"},
-            "reason": {"type": "string"},
         },
     })
 }
@@ -7283,8 +7346,14 @@ mod tests {
             body["response_format"]["json_schema"]["name"],
             "memory_subject_merge"
         );
-        assert_eq!(body["frequency_penalty"], 0.3);
-        assert_eq!(body["presence_penalty"], 0.3);
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["required"], json!(["decisions", "survivors"]));
+        assert_eq!(
+            schema["properties"]["decisions"]["items"]["properties"]["action"]["enum"],
+            json!(["keep", "cluster_with", "demote"])
+        );
+        assert_eq!(body["frequency_penalty"], 0.0);
+        assert_eq!(body["presence_penalty"], 0.0);
         assert_eq!(body["stream"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
@@ -7441,14 +7510,14 @@ mod tests {
                 "topics",
                 "participants",
                 "candidate_cards",
-                "supersessions",
+                "resolutions",
                 "links"
             ])
         );
         assert_eq!(
             body["response_format"]["json_schema"]["schema"]["properties"]["resolutions"]["items"]
                 ["required"],
-            json!(["old_card_id", "decision"])
+            json!(["old_card_id", "reason", "decision"])
         );
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(
@@ -7462,9 +7531,96 @@ mod tests {
             body["messages"][1]["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("\"id\": 10")
+                .contains(r#"<msg id="1" entry="m1">remember this</msg>"#)
         );
         Ok(())
+    }
+
+    #[test]
+    fn eval_harness_memory_schemas_match_the_requests() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/prompt-eval/schemas");
+        for (file, schema) in [
+            (
+                "memory_extraction.json",
+                memory_extraction_response_schema(),
+            ),
+            ("memory_subject_merge.json", subject_merge_response_schema()),
+        ] {
+            let text = std::fs::read_to_string(dir.join(file)).expect("harness schema file");
+            let harness: Value = serde_json::from_str(&text).expect("harness schema json");
+            assert_eq!(harness, schema, "{file} drifted from the request schema");
+        }
+    }
+
+    #[test]
+    fn memory_schema_requires_evidence_and_closed_vocabularies() {
+        let schema = memory_extraction_response_schema();
+        let required = schema["required"].as_array().expect("required list");
+        assert!(!required.contains(&json!("supersessions")));
+        assert!(schema["properties"].get("supersessions").is_none());
+        let card = &schema["properties"]["candidate_cards"]["items"];
+        for field in ["evidence_quote", "why_durable", "durability", "card_type"] {
+            assert!(
+                card["required"]
+                    .as_array()
+                    .expect("card required")
+                    .contains(&json!(field)),
+                "{field} must be required"
+            );
+        }
+        assert_eq!(
+            card["properties"]["card_type"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(
+            card["properties"]["durability"]["enum"],
+            json!(["permanent", "long", "short", "ephemeral"])
+        );
+        assert_eq!(card["properties"]["evidence_quote"]["maxLength"], 200);
+    }
+
+    #[test]
+    fn extraction_request_uses_qwen_instruct_sampling() {
+        let qwen = AifarmMemoryExtractorConfig {
+            model: "qwen3.8-27b".to_owned(),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(qwen.temperature, Some(0.7));
+        assert_eq!(qwen.top_p, Some(0.8));
+        assert_eq!(qwen.top_k, Some(20.0));
+        assert_eq!(qwen.frequency_penalty, Some(0.0));
+        assert_eq!(qwen.presence_penalty, Some(0.0));
+
+        let overridden = AifarmMemoryExtractorConfig {
+            model: "Qwen3.6-27B".to_owned(),
+            temperature: Some(0.5),
+            presence_penalty: Some(1.5),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(overridden.temperature, Some(0.5));
+        assert_eq!(overridden.presence_penalty, Some(1.5));
+        assert_eq!(overridden.frequency_penalty, Some(0.0));
+
+        let other = AifarmMemoryExtractorConfig {
+            model: "some-other-model".to_owned(),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(other.temperature, Some(0.2));
+        assert_eq!(other.top_p, None);
+        assert_eq!(other.presence_penalty, Some(0.3));
+
+        let extractor = AifarmMemoryExtractor::with_transport(qwen, FakeTransport::new(vec![]));
+        let body = serde_json::to_value(extractor.request("system", "payload")).expect("serialize");
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["top_k"], 20.0);
+        assert_eq!(body["presence_penalty"], 0.0);
     }
 
     #[test]
