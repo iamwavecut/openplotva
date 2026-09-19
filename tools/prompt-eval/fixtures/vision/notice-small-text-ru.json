@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/notice-small-text-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A wide notice with small Russian text. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/notice-small-text-ru.jpg",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ОБЪЯВЛЕНИЕ ДЛЯ ЖИЛЬЦОВ|22 сентября|до 9 этажа|30 сентября в 19:00|123-45-67",
+    "lang:ru"
+  ]
+}

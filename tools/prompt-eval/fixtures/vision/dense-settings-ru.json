@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/dense-settings-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A tall settings screenshot in 22–26 px type. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/dense-settings-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:Автоблокировка|30 сек|120 Гц|с 21:30 до 07:00|2400 × 1080",
+    "lang:ru"
+  ]
+}

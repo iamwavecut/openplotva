@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/chat-screenshot-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A phone screenshot of a Russian group chat; the text is small. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/chat-screenshot-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:Кто завтра едет на дачу|Возьми мангал из гаража|Мы с детьми к 15:00|СНТ Рассвет, участок 42",
+    "lang:ru"
+  ]
+}

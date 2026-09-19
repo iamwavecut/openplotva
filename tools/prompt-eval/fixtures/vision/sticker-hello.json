@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/sticker-hello",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A sticker: a smiling face and the word «ПРИВЕТ!». Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/sticker-hello.webp",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ПРИВЕТ",
+    "lang:ru"
+  ]
+}

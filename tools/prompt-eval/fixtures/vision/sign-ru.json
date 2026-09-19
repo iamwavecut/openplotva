@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/sign-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A door sign in Russian. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/sign-ru.jpg",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ЗАКРЫТО НА РЕМОНТ|до 15 октября|Приносим извинения|за неудобства",
+    "lang:ru"
+  ]
+}

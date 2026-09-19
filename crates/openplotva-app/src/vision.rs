@@ -46,8 +46,20 @@ pub const AIFARM_VISION_WORKLOAD: &str = "vision";
 pub const LEGACY_VISION_SERVICE_NAME: &str = "vision-api";
 pub const LEGACY_VISION_ENDPOINT_NAME: &str = "generate";
 pub const VISION_MAX_SIDE: u32 = 512;
-pub const VISION_MAX_PIXELS: u64 = VISION_MAX_SIDE as u64 * VISION_MAX_SIDE as u64;
+/// Longest side of a photo, screenshot or document sent for a caption: small
+/// text is unreadable at `VISION_MAX_SIDE`. Stickers keep `VISION_MAX_SIDE`.
+pub const DEFAULT_VISION_CAPTION_MAX_SIDE: u32 = 1024;
+const VISION_CAPTION_MAX_SIDE_LIMIT: u32 = 2048;
 pub const VISION_MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
+/// Completion floor for a video caption, which walks the clip segment by segment.
+const VISION_VIDEO_MIN_MAX_TOKENS: i32 = 1024;
+/// Caption stored when the model declines to describe the media.
+pub const VISION_UNAVAILABLE_CAPTION: &str = "Описание недоступно.";
+/// A caption that repeats one line this many times is a decoding loop.
+const VISION_RUNAWAY_LINE_REPEATS: usize = 5;
+const VISION_REFUSAL_MAX_CHARS: usize = 120;
+const VISION_REFUSAL_MARKERS: [&str; 5] =
+    ["не могу", "не буду", "i can't", "i cannot", "i'm unable"];
 const VISION_MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const VISION_MAX_SOURCE_SIDE: u32 = 16_384;
 const VISION_MAX_SOURCE_PIXELS: u64 = 64 * 1024 * 1024;
@@ -347,6 +359,7 @@ where
             .map_err(|error| AifarmVisionCaptionerError::Provider(error.to_string()))?;
             let caption = extract_aifarm_vision_caption(completion.response.as_ref())
                 .ok_or(AifarmVisionCaptionerError::EmptyCaption)?;
+            let caption = checked_caption(caption)?;
             Ok(TelegramVisionCaptionResult {
                 caption,
                 processing_time_seconds: started.elapsed().as_secs_f64(),
@@ -498,6 +511,7 @@ fn vision_call_trace(is_video: bool) -> openplotva_llm::LlmCallTrace {
 fn vision_retryable_reason(error: &AifarmVisionCaptionerError) -> Option<FailureReason> {
     match error {
         AifarmVisionCaptionerError::Provider(message) => retryable_reason_from_message(message),
+        AifarmVisionCaptionerError::Runaway => Some(FailureReason::ModelOutputRejected),
         _ => None,
     }
 }
@@ -509,13 +523,20 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
         request: &TelegramVisionCaptionRequest,
     ) -> Result<ChatCompletionRequest, AifarmVisionCaptionerError> {
         let is_video = vision_request_is_video(request);
-        let prompt_prefix = if is_video {
-            "vision/video"
+        let (system_prompt, user_prompt) = if is_video {
+            (
+                openplotva_prompts::read("vision/video_system")?,
+                openplotva_prompts::render(
+                    "vision/video_user",
+                    &video_prompt_data(video_duration_seconds(data_url)),
+                )?,
+            )
         } else {
-            "vision/caption"
+            (
+                openplotva_prompts::read("vision/caption_system")?,
+                openplotva_prompts::read("vision/caption_user")?,
+            )
         };
-        let system_prompt = openplotva_prompts::read(&format!("{prompt_prefix}_system"))?;
-        let user_prompt = openplotva_prompts::read(&format!("{prompt_prefix}_user"))?;
         let media_part = if is_video {
             ChatContentPart {
                 part_type: "video_url".to_owned(),
@@ -561,7 +582,11 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                 },
             ],
             stream: false,
-            max_tokens: self.cfg.max_tokens,
+            max_tokens: if is_video {
+                self.cfg.max_tokens.max(VISION_VIDEO_MIN_MAX_TOKENS)
+            } else {
+                self.cfg.max_tokens
+            },
             temperature: Some(self.cfg.temperature),
             ..ChatCompletionRequest::default()
         };
@@ -604,6 +629,9 @@ pub enum AifarmVisionCaptionerError {
     EmptyCaption,
     #[error("legacy vision API does not support video input")]
     LegacyVideoUnsupported,
+    /// The caption kept repeating one line.
+    #[error("vision caption repeats a line {VISION_RUNAWAY_LINE_REPEATS} times")]
+    Runaway,
 }
 
 pub trait TelegramVisionDataUrlProvider {
@@ -622,13 +650,25 @@ pub trait TelegramVisionDataUrlProvider {
 #[derive(Clone)]
 pub struct TelegramClientVisionDataUrlProvider {
     client: TelegramClient,
+    max_side: u32,
 }
 
 impl TelegramClientVisionDataUrlProvider {
     /// Build a direct image provider around the runtime Telegram client.
     #[must_use]
     pub fn new(client: TelegramClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            max_side: VISION_MAX_SIDE,
+        }
+    }
+
+    /// Send photos, screenshots and documents at up to `max_side` pixels on the
+    /// longest side; stickers stay at `VISION_MAX_SIDE`.
+    #[must_use]
+    pub fn with_max_side(mut self, max_side: u32) -> Self {
+        self.max_side = max_side.clamp(VISION_MAX_SIDE, VISION_CAPTION_MAX_SIDE_LIMIT);
+        self
     }
 }
 
@@ -682,8 +722,11 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
                 telegram_vision_video_data_url_from_bytes(&data, mime_type)
                     .map_err(TelegramVisionDataUrlError::Build)
             } else {
-                telegram_vision_data_url_from_bytes(&data)
-                    .map_err(TelegramVisionDataUrlError::Build)
+                telegram_vision_data_url_from_bytes_with_max_side(
+                    &data,
+                    still_max_side(media_kind, self.max_side),
+                )
+                .map_err(TelegramVisionDataUrlError::Build)
             }
         })
     }
@@ -1666,10 +1709,17 @@ fn asr_unavailable_note(record: &TelegramFileRecord) -> String {
 pub fn telegram_vision_data_url_from_bytes(
     data: &[u8],
 ) -> Result<String, TelegramVisionDataUrlBuildError> {
+    telegram_vision_data_url_from_bytes_with_max_side(data, VISION_MAX_SIDE)
+}
+
+pub fn telegram_vision_data_url_from_bytes_with_max_side(
+    data: &[u8],
+    max_side: u32,
+) -> Result<String, TelegramVisionDataUrlBuildError> {
     if data.is_empty() {
         return Err(TelegramVisionDataUrlBuildError::EmptyImageData);
     }
-    let data = normalize_understand_media(data)?;
+    let data = normalize_understand_media(data, max_side)?;
     let mime = telegram_understand_media_mime(&data).unwrap_or("image/jpeg");
     Ok(format!(
         "data:{mime};base64,{}",
@@ -1726,7 +1776,10 @@ fn telegram_understand_media_mime(data: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
+fn normalize_understand_media(
+    data: &[u8],
+    max_side: u32,
+) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
     if data.len() > VISION_MAX_IMAGE_BYTES {
         return Err(TelegramVisionDataUrlBuildError::UnsupportedImageData);
     }
@@ -1765,7 +1818,7 @@ fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionData
     if width == 0 || height == 0 {
         return Err(TelegramVisionDataUrlBuildError::UnsupportedImageData);
     }
-    let (new_width, new_height) = normalized_vision_dimensions(width, height);
+    let (new_width, new_height) = normalized_vision_dimensions(width, height, max_side);
     if new_width == width && new_height == height {
         return Ok(data.to_vec());
     }
@@ -1781,33 +1834,27 @@ fn vision_source_dimensions_allowed(width: u32, height: u32) -> bool {
         && u64::from(width) * u64::from(height) <= VISION_MAX_SOURCE_PIXELS
 }
 
-fn normalized_vision_dimensions(width: u32, height: u32) -> (u32, u32) {
+fn normalized_vision_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     let width = width.max(1);
     let height = height.max(1);
-    if understand_media_fits(width, height) {
+    if width <= max_side && height <= max_side {
         return (width, height);
     }
-    let scale = (f64::from(VISION_MAX_SIDE) / f64::from(width))
-        .min(f64::from(VISION_MAX_SIDE) / f64::from(height))
+    let scale = (f64::from(max_side) / f64::from(width))
+        .min(f64::from(max_side) / f64::from(height))
         .min(1.0);
     (
-        clamp_vision_dimension(f64::from(width) * scale),
-        clamp_vision_dimension(f64::from(height) * scale),
+        clamp_vision_dimension(f64::from(width) * scale, max_side),
+        clamp_vision_dimension(f64::from(height) * scale, max_side),
     )
 }
 
-fn understand_media_fits(width: u32, height: u32) -> bool {
-    width <= VISION_MAX_SIDE
-        && height <= VISION_MAX_SIDE
-        && u64::from(width) * u64::from(height) <= VISION_MAX_PIXELS
-}
-
-fn clamp_vision_dimension(value: f64) -> u32 {
+fn clamp_vision_dimension(value: f64, max_side: u32) -> u32 {
     let dimension = value.round();
     if dimension < 1.0 {
         1
-    } else if dimension > f64::from(VISION_MAX_SIDE) {
-        VISION_MAX_SIDE
+    } else if dimension > f64::from(max_side) {
+        max_side
     } else {
         dimension as u32
     }
@@ -1840,6 +1887,111 @@ fn split_vision_data_url(data_url: &str) -> Option<(&str, &str)> {
     let (mime, body) = rest.split_once(";base64,")?;
     let b64 = body.trim();
     (!b64.is_empty()).then_some((mime.trim(), b64))
+}
+
+fn still_max_side(media_kind: &str, max_side: u32) -> u32 {
+    if media_kind.trim().eq_ignore_ascii_case("sticker") {
+        VISION_MAX_SIDE
+    } else {
+        max_side
+    }
+}
+
+/// Clip length for the video prompt, from the data URL's MP4 header.
+fn video_duration_seconds(data_url: &str) -> Option<u64> {
+    let (_, payload) = split_vision_data_url(data_url)?;
+    let bytes = BASE64_STANDARD.decode(payload).ok()?;
+    mp4_duration_seconds(&bytes)
+}
+
+/// Whole seconds from the `mvhd` box of an MP4 or MOV file.
+fn mp4_duration_seconds(data: &[u8]) -> Option<u64> {
+    let moov = mp4_child(data, b"moov")?;
+    let mvhd = mp4_child(moov, b"mvhd")?;
+    let (&version, fields) = mvhd.split_first()?;
+    let be_u32 = |at: usize| -> Option<u64> {
+        Some(u64::from(u32::from_be_bytes(
+            fields.get(at..at + 4)?.try_into().ok()?,
+        )))
+    };
+    // After the version byte: 3 bytes of flags, then creation and modification
+    // times (4 bytes each in version 0, 8 in version 1), the timescale and the
+    // duration (as wide as the times).
+    let (timescale, duration) = if version == 1 {
+        let duration = u64::from_be_bytes(fields.get(23..31)?.try_into().ok()?);
+        (be_u32(19)?, duration)
+    } else {
+        (be_u32(11)?, be_u32(15)?)
+    };
+    (timescale > 0).then(|| duration / timescale)
+}
+
+/// Payload of the first box called `name` among the boxes in `data`.
+fn mp4_child<'a>(mut data: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
+    while data.len() >= 8 {
+        let declared = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?);
+        let (header, size) = match declared {
+            0 => (8, data.len()),
+            1 => (
+                16,
+                usize::try_from(u64::from_be_bytes(data.get(8..16)?.try_into().ok()?)).ok()?,
+            ),
+            size => (8, usize::try_from(size).ok()?),
+        };
+        if size < header || size > data.len() {
+            return None;
+        }
+        if data.get(4..8)? == name {
+            return data.get(header..size);
+        }
+        data = &data[size..];
+    }
+    None
+}
+
+fn video_prompt_data(duration_seconds: Option<u64>) -> serde_json::Value {
+    match duration_seconds {
+        Some(seconds) => serde_json::json!({
+            "duration": format!("{:02}:{:02}", seconds / 60, seconds % 60),
+            "long_clip": seconds > 60,
+        }),
+        None => serde_json::json!({}),
+    }
+}
+
+/// The caption to store: a decoding loop is rejected so the route samples
+/// again or falls back, and a refusal becomes `VISION_UNAVAILABLE_CAPTION`.
+fn checked_caption(caption: String) -> Result<String, AifarmVisionCaptionerError> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let runaway = caption
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().count() > 8)
+        .any(|line| {
+            let count = seen.entry(line).or_default();
+            *count += 1;
+            *count >= VISION_RUNAWAY_LINE_REPEATS
+        });
+    if runaway {
+        return Err(AifarmVisionCaptionerError::Runaway);
+    }
+    let bare = caption
+        .trim()
+        .trim_matches(|ch| matches!(ch, '«' | '»' | '"'));
+    let lowered = bare.to_lowercase();
+    let refused = bare == VISION_UNAVAILABLE_CAPTION
+        || (bare.chars().count() <= VISION_REFUSAL_MAX_CHARS
+            && !bare.contains("Тип:")
+            && VISION_REFUSAL_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker)));
+    if refused {
+        if bare != VISION_UNAVAILABLE_CAPTION {
+            tracing::warn!(caption = %bare, "vision model declined to describe the media");
+        }
+        return Ok(VISION_UNAVAILABLE_CAPTION.to_owned());
+    }
+    Ok(caption)
 }
 
 fn extract_aifarm_vision_caption(response: Option<&serde_json::Value>) -> Option<String> {
@@ -2431,10 +2583,110 @@ mod tests {
 
     #[test]
     fn normalized_vision_dimensions_match_go_boundaries() {
-        assert_eq!(normalized_vision_dimensions(1, 1), (1, 1));
-        assert_eq!(normalized_vision_dimensions(512, 512), (512, 512));
-        assert_eq!(normalized_vision_dimensions(1024, 768), (512, 384));
-        assert_eq!(normalized_vision_dimensions(2000, 100), (512, 26));
+        assert_eq!(normalized_vision_dimensions(1, 1, VISION_MAX_SIDE), (1, 1));
+        assert_eq!(
+            normalized_vision_dimensions(512, 512, VISION_MAX_SIDE),
+            (512, 512)
+        );
+        assert_eq!(
+            normalized_vision_dimensions(1024, 768, VISION_MAX_SIDE),
+            (512, 384)
+        );
+        assert_eq!(
+            normalized_vision_dimensions(2000, 100, VISION_MAX_SIDE),
+            (512, 26)
+        );
+    }
+
+    #[test]
+    fn screenshots_are_sent_at_1024px() -> Result<(), Box<dyn std::error::Error>> {
+        let screenshot = encode_rgb_test_image(ImageFormat::Png, 1080, 1920)?;
+        let data_url = telegram_vision_data_url_from_bytes_with_max_side(
+            &screenshot,
+            DEFAULT_VISION_CAPTION_MAX_SIDE,
+        )?;
+        let decoded = image::load_from_memory(&decode_data_url_payload(&data_url)?)?;
+        assert_eq!(decoded.dimensions(), (576, 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn stickers_stay_at_512px() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            still_max_side("photo", DEFAULT_VISION_CAPTION_MAX_SIDE),
+            DEFAULT_VISION_CAPTION_MAX_SIDE
+        );
+        let side = still_max_side("sticker", DEFAULT_VISION_CAPTION_MAX_SIDE);
+        let sticker = encode_rgb_test_image(ImageFormat::Png, 1024, 1024)?;
+        let data_url = telegram_vision_data_url_from_bytes_with_max_side(&sticker, side)?;
+        let decoded = image::load_from_memory(&decode_data_url_payload(&data_url)?)?;
+        assert_eq!(decoded.dimensions(), (512, 512));
+        Ok(())
+    }
+
+    #[test]
+    fn video_prompt_contains_duration_and_mmss_format() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mvhd = vec![0_u8; 100];
+        mvhd[12..16].copy_from_slice(&1_000_u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&95_000_u32.to_be_bytes());
+        let mut mvhd_box = (8 + mvhd.len() as u32).to_be_bytes().to_vec();
+        mvhd_box.extend_from_slice(b"mvhd");
+        mvhd_box.extend_from_slice(&mvhd);
+        let mut clip = 16_u32.to_be_bytes().to_vec();
+        clip.extend_from_slice(b"ftypisom\0\0\0\0");
+        clip.extend_from_slice(&(8 + mvhd_box.len() as u32).to_be_bytes());
+        clip.extend_from_slice(b"moov");
+        clip.extend_from_slice(&mvhd_box);
+        let data_url = format!("data:video/mp4;base64,{}", BASE64_STANDARD.encode(&clip));
+        assert_eq!(video_duration_seconds(&data_url), Some(95));
+
+        let prompt = openplotva_prompts::render("vision/video_user", &video_prompt_data(Some(95)))?;
+        assert!(prompt.contains("Длительность ролика: 01:35."), "{prompt}");
+        assert!(prompt.contains("первая минута"), "{prompt}");
+        assert!(prompt.contains("ММ:СС–ММ:СС"), "{prompt}");
+        let short = openplotva_prompts::render("vision/video_user", &video_prompt_data(Some(24)))?;
+        assert!(
+            short.starts_with("Длительность ролика: 00:24.\nОпиши видео"),
+            "{short}"
+        );
+        let unknown = openplotva_prompts::render("vision/video_user", &video_prompt_data(None))?;
+        assert!(unknown.starts_with("Опиши видео"), "{unknown}");
+        assert_eq!(video_duration_seconds("data:video/mp4;base64,AAAA"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn refusal_is_replaced_by_placeholder() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            checked_caption("I'm sorry, but I can't help with that.".to_owned())?,
+            VISION_UNAVAILABLE_CAPTION
+        );
+        assert_eq!(
+            checked_caption("Извините, я не могу описать это изображение.".to_owned())?,
+            VISION_UNAVAILABLE_CAPTION
+        );
+        assert_eq!(
+            checked_caption("«Описание недоступно.»".to_owned())?,
+            VISION_UNAVAILABLE_CAPTION
+        );
+        let quoted = "Тип: стикер — котик.\nТекст: «не могу»";
+        assert_eq!(checked_caption(quoted.to_owned())?, quoted);
+        Ok(())
+    }
+
+    #[test]
+    fn caption_that_repeats_a_line_is_rejected_for_another_sample() {
+        let looping = format!(
+            "Тип: скриншот.\n{}",
+            "Текст: | 1 | 2 | 3 | 4 |\n".repeat(VISION_RUNAWAY_LINE_REPEATS)
+        );
+        let error = checked_caption(looping).expect_err("a loop is rejected");
+        assert!(matches!(error, AifarmVisionCaptionerError::Runaway));
+        assert_eq!(
+            vision_retryable_reason(&error),
+            Some(FailureReason::ModelOutputRejected)
+        );
+        assert!(checked_caption("Тип: фото.\nТекст: нет".to_owned()).is_ok());
     }
 
     #[test]
@@ -2669,9 +2921,10 @@ mod tests {
         assert!(
             body["messages"][1]["content"][1]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("хронологическом порядке"))
+                .is_some_and(|text| text.contains("ММ:СС–ММ:СС"))
         );
-        assert!(body.to_string().contains("только визуальные данные"));
+        assert!(body.to_string().contains("звук расшифровывают отдельно"));
+        assert_eq!(body["max_tokens"], VISION_VIDEO_MIN_MAX_TOKENS);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(
             body["extra_body"]["chat_template_kwargs"]["enable_thinking"],

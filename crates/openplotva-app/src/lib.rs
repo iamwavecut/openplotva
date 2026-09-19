@@ -12366,6 +12366,9 @@ async fn start_runtime_workers(
         ));
     }
     let vision_data_urls = vision::TelegramClientVisionDataUrlProvider::new(telegram.clone());
+    let vision_caption_data_urls = vision_data_urls
+        .clone()
+        .with_max_side(u32::try_from(config.vision.caption_max_side).unwrap_or_default());
     let dialog_tool_vision = Arc::new(
         vision::TelegramVisionDescriber::new(
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
@@ -12379,7 +12382,7 @@ async fn start_runtime_workers(
                 .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
-                vision_data_urls.clone(),
+                vision_caption_data_urls.clone(),
             ),
         )
         .with_model_name(config.vision.model.clone())
@@ -12398,7 +12401,7 @@ async fn start_runtime_workers(
                 .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
-                vision_data_urls.clone(),
+                vision_caption_data_urls,
             ),
         )
         .with_model_name(config.vision.model.clone())

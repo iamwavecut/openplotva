@@ -1,0 +1,19 @@
+{
+  "flow": "vision",
+  "id": "vision/receipt-ru",
+  "prompt": "vision/caption_system",
+  "user_prompt": "vision/caption_user",
+  "request": {
+    "temperature": 0.1,
+    "max_tokens": 768
+  },
+  "notes": "A shop receipt in Russian. Media from make_vision_media.py (not committed); skipped when missing.",
+  "image": "local/vision/receipt-ru.png",
+  "checks": [
+    "labels:Тип,Текст",
+    "no_repeat_lines:2",
+    "max_blank_run:2",
+    "verbatim:ПРОДУКТЫ 24|Молоко 3,2%|ИТОГО|399,59",
+    "lang:ru"
+  ]
+}
