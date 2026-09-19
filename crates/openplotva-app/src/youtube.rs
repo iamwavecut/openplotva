@@ -11,6 +11,10 @@ use std::{
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{DialogTraceArtifacts, DialogTraceUsage};
+use openplotva_llm::aifarm::{
+    AIFARM_WORKLOAD_SUMMARY, AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport,
+    ChatCompletionRequest, ChatMessage, StatusUpdate,
+};
 use openplotva_llm::gemini::{MODEL_GEMINI_FLASH_LITE, cache_contour_model};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use quick_xml::de::from_str as xml_from_str;
@@ -36,6 +40,9 @@ const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const YOUTUBE_SUMMARY_TEMPERATURE: f64 = 0.3;
 const YOUTUBE_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(45);
+/// The farm route shares a one-slot GPU pool with background memory work, so a
+/// summary waits this long for the slot before it takes a fallback route.
+pub const YOUTUBE_PRIMARY_SLOT_WAIT: Duration = Duration::from_secs(60);
 
 type BoxedError = Box<dyn Error + Send + Sync>;
 
@@ -609,8 +616,12 @@ async fn generate_youtube_summary_with_attempt(
     stage: YouTubeStage,
     payload: &str,
 ) -> Result<String, YouTubeSummaryError> {
+    if routed_attempt_uses_discovery(&attempt) {
+        let client = AifarmHttpClient::new(youtube_farm_client_config(config, &attempt));
+        return complete_youtube_stage_through_discovery(&client, &attempt, stage, payload).await;
+    }
     let system = openplotva_prompts::read(stage.prompt_name())?;
-    let model = youtube_model_for_attempt(&attempt);
+    let model = attempt.model_name.trim().to_owned();
     let request = youtube_summary_openai_request(&model, &system, payload, stage);
     let endpoint = routed_attempt_endpoint(&attempt).ok_or_else(|| {
         YouTubeSummaryError::Http("routed provider has no chat completions endpoint".to_owned())
@@ -679,6 +690,120 @@ async fn generate_youtube_summary_with_attempt(
         return Err(YouTubeSummaryError::Http(message));
     }
     decode_openai_text(&body)
+}
+
+fn routed_attempt_uses_discovery(attempt: &RoutedAttempt) -> bool {
+    attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some()
+}
+
+/// Farm models answer through Discovery jobs, not a chat completions URL.
+async fn complete_youtube_stage_through_discovery<T: AifarmHttpTransport>(
+    client: &AifarmHttpClient<T>,
+    attempt: &RoutedAttempt,
+    stage: YouTubeStage,
+    payload: &str,
+) -> Result<String, YouTubeSummaryError> {
+    let system = openplotva_prompts::read(stage.prompt_name())?;
+    let request = youtube_summary_farm_request(attempt, &system, payload, stage);
+    let mut ignore_status = |_status: StatusUpdate| {};
+    let result = client
+        .complete(request, &mut ignore_status)
+        .await
+        .map_err(|error| YouTubeSummaryError::Http(error.to_string()))?;
+    let body = match result.response {
+        Some(response) => serde_json::to_vec(&response)
+            .map_err(|error| YouTubeSummaryError::Decode(error.to_string()))?,
+        None => result.raw_body.into_bytes(),
+    };
+    decode_openai_text(&body)
+}
+
+fn youtube_farm_client_config(config: &AppConfig, attempt: &RoutedAttempt) -> AifarmClientConfig {
+    let dialog = &config.llm.dialog;
+    let seconds = |value: i32| Duration::from_secs(u64::try_from(value).unwrap_or(0));
+    AifarmClientConfig {
+        base_url: attempt
+            .model_base_url
+            .as_deref()
+            .or(attempt.provider_endpoint.as_deref())
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map_or_else(|| config.llm.discovery.base_url.clone(), str::to_owned),
+        service_name: attempt
+            .discovery_service_name
+            .clone()
+            .unwrap_or_else(|| dialog.discovery_service_name.clone()),
+        endpoint_name: attempt
+            .discovery_endpoint_name
+            .clone()
+            .unwrap_or_else(|| dialog.discovery_endpoint_name.clone()),
+        api_key: routed_attempt_api_key(config, attempt).unwrap_or_default(),
+        request_timeout: seconds(dialog.request_timeout_seconds),
+        poll_interval: seconds(dialog.poll_interval_seconds),
+        task_timeout: seconds(dialog.task_timeout_seconds),
+        capacity_wait: seconds(dialog.aifarm_capacity_wait_seconds),
+        capacity_poll_interval: seconds(dialog.aifarm_capacity_poll_seconds),
+        default_model: attempt.model_name.trim().to_owned(),
+        runtime_hint: attempt.provider_runtime_hint.clone().unwrap_or_default(),
+        supports_message_name: attempt.supports_message_name(),
+        workload: AIFARM_WORKLOAD_SUMMARY.to_owned(),
+        ..AifarmClientConfig::default()
+    }
+}
+
+fn youtube_summary_farm_request(
+    attempt: &RoutedAttempt,
+    system: &str,
+    payload: &str,
+    stage: YouTubeStage,
+) -> ChatCompletionRequest {
+    let model = attempt.model_name.trim();
+    let (temperature, top_p, top_k) = youtube_sampling(model);
+    let mut request = ChatCompletionRequest {
+        model: model.to_owned(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_owned(),
+                content: system.to_owned(),
+                ..ChatMessage::default()
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: payload.to_owned(),
+                ..ChatMessage::default()
+            },
+        ],
+        max_tokens: stage.max_output_tokens(),
+        temperature: Some(temperature),
+        top_p,
+        top_k: top_k.map(f64::from),
+        include_reasoning: Some(false),
+        trace: Some(youtube_farm_call_trace(&attempt.provider_name)),
+        ..ChatCompletionRequest::default()
+    };
+    let enable_thinking = attempt
+        .overrides
+        .extra
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
+    request
+}
+
+fn youtube_farm_call_trace(provider: &str) -> openplotva_llm::LlmCallTrace {
+    openplotva_llm::LlmCallTrace {
+        context: openplotva_llm::LlmCallContext::default(),
+        tags: openplotva_llm::LlmCallTags {
+            provider: provider.to_owned(),
+            source: "youtube_routed".to_owned(),
+            flow: "youtube_summary".to_owned(),
+            mode: "text".to_owned(),
+            request_kind: "openai.chat.completions".to_owned(),
+            iteration: 1,
+            docs_chars: 0,
+        },
+    }
 }
 
 struct YouTubeTraceTags<'a> {
@@ -805,19 +930,6 @@ fn youtube_trace_usage(response: &serde_json::Value) -> Option<DialogTraceUsage>
         thoughts_tokens: count(usage, "thoughtsTokenCount"),
         ..DialogTraceUsage::default()
     })
-}
-
-fn youtube_model_for_attempt(attempt: &RoutedAttempt) -> String {
-    if routed_attempt_is_openrouter(attempt)
-        && !attempt
-            .model_name
-            .get(..OPENROUTER_MODEL_PREFIX.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
-    {
-        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
-    } else {
-        attempt.model_name.clone()
-    }
 }
 
 fn routed_attempt_is_openrouter(attempt: &RoutedAttempt) -> bool {
@@ -2245,5 +2357,252 @@ mod tests {
         .expect("text");
 
         assert_eq!(text, "<b>summary</b>");
+    }
+
+    fn farm_attempt() -> RoutedAttempt {
+        RoutedAttempt {
+            provider_id: 17,
+            model_id: 502,
+            provider_name: "farm-qwen".to_owned(),
+            model_name: "qwen3.8-27b".to_owned(),
+            provider_runtime_hint: Some("ninfer".to_owned()),
+            provider_endpoint: None,
+            discovery_service_name: Some("llm-qwen".to_owned()),
+            discovery_endpoint_name: Some("chat_completions".to_owned()),
+            provider_api_key_ref: None,
+            provider_api_key_encrypted: None,
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: json!({ "supports_message_name": false }),
+            model_config: json!({}),
+            overrides: openplotva_llm::router::InferenceOverrides::default(),
+            variant: None,
+        }
+    }
+
+    #[test]
+    fn farm_route_uses_its_discovery_service_and_the_summary_workload() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+        let attempt = farm_attempt();
+        assert!(routed_attempt_uses_discovery(&attempt));
+
+        let client = youtube_farm_client_config(&config, &attempt);
+
+        assert_eq!(client.base_url, config.llm.discovery.base_url);
+        assert_eq!(client.service_name, "llm-qwen");
+        assert_eq!(client.endpoint_name, "chat_completions");
+        assert_eq!(client.runtime_hint, "ninfer");
+        assert!(!client.supports_message_name);
+        assert_eq!(client.workload, AIFARM_WORKLOAD_SUMMARY);
+        assert_eq!(client.default_model, "qwen3.8-27b");
+
+        let with_endpoint = RoutedAttempt {
+            provider_endpoint: Some(" https://discovery.example.test ".to_owned()),
+            ..farm_attempt()
+        };
+        assert_eq!(
+            youtube_farm_client_config(&config, &with_endpoint).base_url,
+            "https://discovery.example.test"
+        );
+    }
+
+    #[test]
+    fn farm_request_keeps_thinking_off_unless_the_route_asks() {
+        let request =
+            youtube_summary_farm_request(&farm_attempt(), "sys", "payload", YouTubeStage::Merge);
+
+        assert_eq!(request.model, "qwen3.8-27b");
+        assert_eq!(request.max_tokens, 8192);
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(0.8));
+        assert_eq!(request.top_k, Some(20.0));
+        assert_eq!(
+            request.chat_template_kwargs,
+            Some(json!({ "enable_thinking": false }))
+        );
+        assert_eq!(
+            request.trace.as_ref().map(|trace| trace.tags.flow.as_str()),
+            Some("youtube_summary")
+        );
+
+        let thinking = RoutedAttempt {
+            overrides: openplotva_llm::router::InferenceOverrides {
+                extra: json!({ "enable_thinking": true }),
+                ..openplotva_llm::router::InferenceOverrides::default()
+            },
+            ..farm_attempt()
+        };
+        let request =
+            youtube_summary_farm_request(&thinking, "sys", "payload", YouTubeStage::Summary);
+        assert_eq!(request.max_tokens, 3072);
+        assert_eq!(
+            request.chat_template_kwargs,
+            Some(json!({ "enable_thinking": true }))
+        );
+    }
+
+    #[derive(Default)]
+    struct FarmTransportState {
+        requests: Vec<openplotva_llm::aifarm::AifarmHttpRequest>,
+        bodies: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FarmTransportStub {
+        state: Arc<std::sync::Mutex<FarmTransportState>>,
+    }
+
+    impl FarmTransportStub {
+        fn new(bodies: Vec<Vec<u8>>) -> Self {
+            Self {
+                state: Arc::new(std::sync::Mutex::new(FarmTransportState {
+                    requests: Vec::new(),
+                    bodies: bodies.into(),
+                })),
+            }
+        }
+
+        fn requests(&self) -> Vec<openplotva_llm::aifarm::AifarmHttpRequest> {
+            self.state.lock().expect("transport state").requests.clone()
+        }
+    }
+
+    impl AifarmHttpTransport for FarmTransportStub {
+        fn send<'a>(
+            &'a self,
+            request: openplotva_llm::aifarm::AifarmHttpRequest,
+        ) -> openplotva_llm::aifarm::AifarmHttpFuture<'a> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("transport state");
+                state.requests.push(request);
+                let body = state.bodies.pop_front().unwrap_or_default();
+                Ok(openplotva_llm::aifarm::AifarmHttpResponse {
+                    status_code: 200,
+                    body,
+                    ..openplotva_llm::aifarm::AifarmHttpResponse::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn farm_stage_is_submitted_as_a_discovery_job() {
+        use base64::Engine as _;
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let answer = base64.encode(
+            json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "{\"summary\":\"ok\"}"},
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        );
+        let transport = FarmTransportStub::new(vec![
+            br#"{"job_id":"yt-job","state":"JOB_STATE_QUEUED"}"#.to_vec(),
+            format!(
+                r#"{{"job":{{"job_id":"yt-job","state":"JOB_STATE_SUCCEEDED","result":{{"response":{{"status_code":200,"body":"{answer}","content_type":"application/json"}}}}}}}}"#
+            )
+            .into_bytes(),
+        ]);
+        let probe = transport.clone();
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+        let attempt = farm_attempt();
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                base_url: "https://discovery.example.test".to_owned(),
+                poll_interval: Duration::from_millis(1),
+                ..youtube_farm_client_config(&config, &attempt)
+            },
+            transport,
+        );
+
+        let text = complete_youtube_stage_through_discovery(
+            &client,
+            &attempt,
+            YouTubeStage::Summary,
+            "0.5: hello",
+        )
+        .await
+        .expect("summary");
+
+        assert_eq!(text, "{\"summary\":\"ok\"}");
+        let requests = probe.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://discovery.example.test/v1/jobs/blocking"
+        );
+        let job: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("job json");
+        assert_eq!(job["invocation"]["service_name"], "llm-qwen");
+        assert_eq!(job["invocation"]["headers"]["X-AIFarm-Workload"], "summary");
+        let sent = base64
+            .decode(job["invocation"]["body"].as_str().expect("body"))
+            .expect("base64 body");
+        let sent: serde_json::Value = serde_json::from_slice(&sent).expect("request json");
+        assert_eq!(sent["model"], "qwen3.8-27b");
+        assert_eq!(sent["enable_thinking"], false);
+        assert!(sent.get("chat_template_kwargs").is_none(), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn openrouter_route_sends_the_model_id_as_stored() {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/api/v1/chat/completions",
+                post(
+                    |State(seen): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        seen.lock().expect("seen").push(body);
+                        Json(json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "{\"summary\":\"ok\"}"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            openrouter_key: Some("openrouter-key".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+        let attempt = RoutedAttempt {
+            provider_name: "openrouter".to_owned(),
+            model_name: "~openai/gpt-luna-latest".to_owned(),
+            provider_runtime_hint: None,
+            provider_endpoint: Some(format!("http://{address}/api/v1/chat/completions")),
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            provider_config: json!({}),
+            ..farm_attempt()
+        };
+
+        let text = generate_youtube_summary_with_attempt(
+            &config,
+            attempt,
+            YouTubeStage::Summary,
+            "0.5: hello",
+        )
+        .await
+        .expect("summary");
+
+        server.abort();
+        assert_eq!(text, "{\"summary\":\"ok\"}");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["model"], "~openai/gpt-luna-latest");
     }
 }
