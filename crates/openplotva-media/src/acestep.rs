@@ -1016,13 +1016,15 @@ pub fn instrumental_skeleton(structure: &[String]) -> String {
         let phrase = phrase.to_ascii_lowercase();
         let section = if phrase.contains("outro") || phrase.contains("fade") {
             "Outro"
-        } else if phrase.contains("drop") || phrase.contains("chorus") || phrase.contains("hook") {
-            "Chorus"
-        } else if phrase.contains("build")
+        } else if phrase.contains("pre-chorus")
+            || phrase.contains("pre chorus")
+            || phrase.contains("prechorus")
+            || phrase.contains("build")
             || phrase.contains("riser")
-            || phrase.contains("pre-chorus")
         {
             "Pre-Chorus"
+        } else if phrase.contains("drop") || phrase.contains("chorus") || phrase.contains("hook") {
+            "Chorus"
         } else if phrase.contains("breakdown")
             || phrase.contains("bridge")
             || phrase.contains("interlude")
@@ -2700,6 +2702,14 @@ mod tests {
             skeleton
                 .lines()
                 .all(|line| line.is_empty() || section_marker(line).is_some())
+        );
+        assert_eq!(
+            instrumental_skeleton(&[
+                "verse".to_owned(),
+                "pre-chorus lift".to_owned(),
+                "chorus".to_owned(),
+            ]),
+            "[Intro]\n\n[Verse]\n\n[Pre-Chorus]\n\n[Chorus]\n\n[Outro]"
         );
     }
 
