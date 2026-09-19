@@ -302,7 +302,7 @@ pub const DEFAULT_VISION_DISCOVERY_ENDPOINT_NAME: &str = DEFAULT_DIALOG_DISCOVER
 
 pub const DEFAULT_VISION_MODEL: &str = DEFAULT_DIALOG_MODEL;
 
-pub const DEFAULT_VISION_MAX_TOKENS: i32 = 768;
+pub const DEFAULT_VISION_MAX_TOKENS: i32 = 1536;
 
 pub const DEFAULT_VISION_TEMPERATURE: f64 = 0.1;
 
@@ -2514,22 +2514,22 @@ impl AppConfig {
                     aifarm_max_tokens: parse_i32(
                         "DIALOG_AIFARM_MAX_TOKENS",
                         raw.dialog_aifarm_max_tokens,
-                        1024,
+                        6144,
                     )?,
                     aifarm_random_max_tokens: parse_i32(
                         "DIALOG_AIFARM_RANDOM_MAX_TOKENS",
                         raw.dialog_aifarm_random_max_tokens,
-                        768,
+                        1024,
                     )?,
                     aifarm_default_max_tokens: parse_i32(
                         "DIALOG_AIFARM_DEFAULT_MAX_TOKENS",
                         raw.dialog_aifarm_default_max_tokens,
-                        1024,
+                        2048,
                     )?,
                     aifarm_long_max_tokens: parse_i32(
                         "DIALOG_AIFARM_LONG_MAX_TOKENS",
                         raw.dialog_aifarm_long_max_tokens,
-                        1024,
+                        4096,
                     )?,
                     aifarm_temperature: parse_f64(
                         "DIALOG_AIFARM_TEMPERATURE",
@@ -2909,7 +2909,7 @@ impl AppConfig {
                 aifarm_max_output_tokens: parse_i32(
                     "MEMORY_AIFARM_MAX_OUTPUT_TOKENS",
                     raw.memory_aifarm_max_output_tokens,
-                    4000,
+                    8192,
                 )?,
                 aifarm_request_timeout_seconds: parse_i32(
                     "MEMORY_AIFARM_REQUEST_TIMEOUT_SECONDS",
@@ -4055,8 +4055,10 @@ mod tests {
             config.llm.dialog.discovery_endpoint_name,
             "chat_completions"
         );
-        assert_eq!(config.llm.dialog.aifarm_max_tokens, 1024);
-        assert_eq!(config.llm.dialog.aifarm_random_max_tokens, 768);
+        assert_eq!(config.llm.dialog.aifarm_max_tokens, 6144);
+        assert_eq!(config.llm.dialog.aifarm_random_max_tokens, 1024);
+        assert_eq!(config.llm.dialog.aifarm_default_max_tokens, 2048);
+        assert_eq!(config.llm.dialog.aifarm_long_max_tokens, 4096);
         assert_eq!(config.llm.dialog.aifarm_temperature, 0.2);
         assert_eq!(config.llm.dialog.aifarm_repeat_penalty, 1.1);
         // Anti-loop sampling defaults (DRY + moderate frequency/presence penalties).
@@ -4190,7 +4192,7 @@ mod tests {
         assert_eq!(config.memory.embedding_dim, 512);
         assert_eq!(config.memory.aifarm_service_name, "llm-openai");
         assert_eq!(config.memory.aifarm_endpoint_name, "chat_completions");
-        assert_eq!(config.memory.aifarm_max_output_tokens, 4000);
+        assert_eq!(config.memory.aifarm_max_output_tokens, 8192);
         assert_eq!(config.memory.aifarm_request_timeout_seconds, 660);
         assert_eq!(config.memory.aifarm_poll_interval_seconds, 1);
         assert_eq!(config.memory.aifarm_task_timeout_seconds, 720);

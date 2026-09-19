@@ -53,8 +53,8 @@ impl HistoryStage {
     #[must_use]
     pub const fn max_output_tokens(self) -> i32 {
         match self {
-            Self::Events => 1536,
-            Self::Recap => 2048,
+            Self::Events => 3072,
+            Self::Recap => 4096,
         }
     }
 

@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub const DEFAULT_VISION_MODEL_NAME: &str = "Gemma 4 26B Heretic";
-pub const DEFAULT_VISION_MAX_TOKENS: i32 = 768;
+pub const DEFAULT_VISION_MAX_TOKENS: i32 = 1536;
 pub const DEFAULT_VISION_TEMPERATURE: f64 = 0.1;
 pub const AIFARM_VISION_WORKLOAD: &str = "vision";
 pub const LEGACY_VISION_SERVICE_NAME: &str = "vision-api";
@@ -52,7 +52,7 @@ pub const DEFAULT_VISION_CAPTION_MAX_SIDE: u32 = 1024;
 const VISION_CAPTION_MAX_SIDE_LIMIT: u32 = 2048;
 pub const VISION_MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
 /// Completion floor for a video caption, which walks the clip segment by segment.
-const VISION_VIDEO_MIN_MAX_TOKENS: i32 = 1024;
+const VISION_VIDEO_MIN_MAX_TOKENS: i32 = 2048;
 /// Caption stored when the model declines to describe the media.
 pub const VISION_UNAVAILABLE_CAPTION: &str = "Описание недоступно.";
 /// A caption that repeats one line this many times is a decoding loop.

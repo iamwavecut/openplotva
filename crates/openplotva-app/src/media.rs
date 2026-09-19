@@ -655,7 +655,7 @@ pub fn aifarm_structured_json_config_from_app_config(
     AifarmStructuredJsonConfig {
         client: discovery_client_config_from_app_config(config, &model),
         model,
-        max_tokens: 1024,
+        max_tokens: 4096,
     }
     .with_defaults()
 }
@@ -746,7 +746,7 @@ pub(crate) fn genkit_openai_compatible_media_prompt_optimizer_config_from_app_co
         AifarmStructuredJsonConfig {
             client,
             model,
-            max_tokens: 1024,
+            max_tokens: 4096,
         }
         .with_defaults(),
         provider,
@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(cfg.client.direct_url, "");
         assert_eq!(cfg.client.api_key, "");
         assert_eq!(cfg.model, "model-x");
-        assert_eq!(cfg.max_tokens, 1024);
+        assert_eq!(cfg.max_tokens, 4096);
         assert_eq!(cfg.client.request_timeout, Duration::from_secs(125));
         assert_eq!(cfg.client.task_timeout, Duration::from_secs(120));
         assert_eq!(cfg.client.capacity_wait, Duration::from_secs(11));
