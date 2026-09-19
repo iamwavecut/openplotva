@@ -1935,8 +1935,9 @@ fn mp4_duration_seconds(data: &[u8]) -> Option<u64> {
     (timescale > 0).then(|| duration / timescale)
 }
 
-/// Whether a track of an MP4 or MOV file stores AV1 video. The first sample
-/// entry of `stsd` follows its version, flags and entry count.
+/// Whether a track of an MP4 or MOV file stores AV1 video. `stsd` holds its
+/// version, flags and entry count, then the first sample entry: a box whose
+/// type follows its 4-byte size.
 fn mp4_has_av1_track(data: &[u8]) -> bool {
     let Some(moov) = mp4_child(data, b"moov") else {
         return false;
