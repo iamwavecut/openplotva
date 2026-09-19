@@ -309,6 +309,8 @@ pub const DEFAULT_VISION_TEMPERATURE: f64 = 0.1;
 pub const DEFAULT_VISION_DIRECT_IMAGE_LIMIT: i32 = 2;
 
 pub const DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS: i32 = 120;
+/// Longest side, in pixels, of a still image sent for a caption.
+pub const DEFAULT_VISION_CAPTION_MAX_SIDE: i32 = 1024;
 
 pub const DEFAULT_BOOGU_IMAGE_TURBO_ENABLED: bool = false;
 
@@ -964,6 +966,9 @@ pub struct VisionConfig {
     pub temperature: f64,
     pub direct_image_limit: i32,
     pub request_timeout_seconds: i32,
+    /// Longest side of a photo, screenshot or document sent for a caption,
+    /// from `VISION_CAPTION_MAX_SIDE`; stickers and dialog images stay at 512.
+    pub caption_max_side: i32,
     /// telegram_files media-cache retention in days by `last_seen_at`, from
     /// `TELEGRAM_FILES_RETENTION_DAYS` (0 disables).
     pub telegram_files_retention_days: i32,
@@ -1480,6 +1485,8 @@ pub struct RawConfig {
     pub vision_direct_image_limit: Option<String>,
     /// `VISION_REQUEST_TIMEOUT_SECONDS`.
     pub vision_request_timeout_seconds: Option<String>,
+    /// `VISION_CAPTION_MAX_SIDE`.
+    pub vision_caption_max_side: Option<String>,
     /// `TELEGRAM_FILES_RETENTION_DAYS`.
     pub telegram_files_retention_days: Option<String>,
     /// `BOOGU_IMAGE_TURBO_ENABLED`.
@@ -2770,6 +2777,11 @@ impl AppConfig {
                     raw.vision_request_timeout_seconds,
                     DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
                 )?,
+                caption_max_side: parse_i32(
+                    "VISION_CAPTION_MAX_SIDE",
+                    raw.vision_caption_max_side,
+                    DEFAULT_VISION_CAPTION_MAX_SIDE,
+                )?,
             },
             image_providers,
             music: MusicConfig {
@@ -3303,6 +3315,7 @@ impl RawConfig {
             vision_discovery_endpoint_name: env("VISION_DISCOVERY_ENDPOINT_NAME"),
             vision_model: env("VISION_MODEL"),
             vision_max_tokens: env("VISION_MAX_TOKENS"),
+            vision_caption_max_side: env("VISION_CAPTION_MAX_SIDE"),
             vision_temperature: env("VISION_TEMPERATURE"),
             vision_direct_image_limit: env("VISION_DIRECT_IMAGE_LIMIT"),
             vision_request_timeout_seconds: env("VISION_REQUEST_TIMEOUT_SECONDS"),
@@ -3825,10 +3838,10 @@ mod tests {
         DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS, DEFAULT_UPDATE_PROJECTION_FLUSH_INTERVAL_MS,
         DEFAULT_UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS,
         DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS, DEFAULT_UPDATE_QUEUE_BACKEND,
-        DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS,
-        DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT,
-        DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, RawConfig,
-        parse_string_list_or_default,
+        DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_CAPTION_MAX_SIDE, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
+        DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS,
+        RawConfig, parse_string_list_or_default,
     };
 
     #[test]
@@ -4096,6 +4109,10 @@ mod tests {
         assert_eq!(config.vision.model, DEFAULT_VISION_MODEL);
         assert_eq!(config.vision.max_tokens, DEFAULT_VISION_MAX_TOKENS);
         assert_eq!(config.vision.temperature, 0.1);
+        assert_eq!(
+            config.vision.caption_max_side,
+            DEFAULT_VISION_CAPTION_MAX_SIDE
+        );
         assert_eq!(
             config.vision.direct_image_limit,
             DEFAULT_VISION_DIRECT_IMAGE_LIMIT
@@ -5004,6 +5021,7 @@ mod tests {
             vision_temperature: Some("0.25".to_owned()),
             vision_direct_image_limit: Some("4".to_owned()),
             vision_request_timeout_seconds: Some("90".to_owned()),
+            vision_caption_max_side: Some("768".to_owned()),
             ..RawConfig::default()
         })?;
 
@@ -5011,6 +5029,7 @@ mod tests {
         assert_eq!(config.vision.discovery_endpoint_name, "vlm-endpoint");
         assert_eq!(config.vision.model, "vision-model");
         assert_eq!(config.vision.max_tokens, 321);
+        assert_eq!(config.vision.caption_max_side, 768);
         assert_eq!(config.vision.temperature, 0.25);
         assert_eq!(config.vision.direct_image_limit, 4);
         assert_eq!(config.vision.request_timeout_seconds, 90);
