@@ -175,7 +175,7 @@ jobs:
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.kind == ["lib"]) | "\(.target.name) \(.executable)"')"
           storage="$(awk '$1 == "openplotva_storage" {print $2}' <<<"$binaries")"
           app="$(awk '$1 == "openplotva_app" {print $2}' <<<"$binaries")"
-          test -x "$storage" && test -x "$app"
+          [[ -x "$storage" && -x "$app" ]] || { echo "storage or app test binary not found" >&2; exit 1; }
           (cd crates/openplotva-storage && "$storage" --test-threads=1 outbox_roundtrip_is_idempotent_ordered_and_fenced live_)
           (cd crates/openplotva-app && "$app" --test-threads=1 maintenance)
 
