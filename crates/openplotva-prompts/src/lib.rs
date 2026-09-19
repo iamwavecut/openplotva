@@ -532,9 +532,9 @@ mod tests {
 
     use super::{
         PromptError, PromptMessage, PromptStore, RoleRenderMode, load_registry,
-        parse_role_messages, prompt_entries, prompt_entry_name, prompt_metadata, prompt_name,
-        prompt_root, read, register_prompt_tree, registry_with_role, render, render_messages,
-        render_text_parts,
+        parse_role_messages, prompt_entries, prompt_entry_name, prompt_name, prompt_root, read,
+        register_prompt_tree, registry_with_role, render, render_messages, render_text_parts,
+        split_front_matter,
     };
 
     struct TestPromptRoot(PathBuf);
@@ -670,24 +670,18 @@ mod tests {
     }
 
     #[test]
-    fn render_strips_dotprompt_front_matter() -> Result<(), Box<dyn std::error::Error>> {
-        let rendered = render("youtube/summary", &serde_json::json!({}))?;
-
-        assert!(!rendered.starts_with("---"));
-        assert!(!rendered.contains("model: googleai/gemini-2.5-flash-lite"));
-        assert!(rendered.starts_with("Ты AI-ассистент"));
-        Ok(())
-    }
-
-    #[test]
-    fn prompt_metadata_exposes_front_matter_model() -> Result<(), Box<dyn std::error::Error>> {
-        let metadata = prompt_metadata("youtube/summary")?;
+    fn front_matter_is_split_from_the_prompt_body() {
+        let (metadata, body) =
+            split_front_matter("---\nmodel: googleai/gemini-2.5-flash-lite\n---\nТело промпта\n");
 
         assert_eq!(
             metadata.get("model").map(String::as_str),
             Some("googleai/gemini-2.5-flash-lite")
         );
-        Ok(())
+        assert_eq!(body, "Тело промпта\n");
+        let (metadata, body) = split_front_matter("Без метаданных");
+        assert!(metadata.is_empty());
+        assert_eq!(body, "Без метаданных");
     }
 
     #[test]
