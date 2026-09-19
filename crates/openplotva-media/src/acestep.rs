@@ -1108,12 +1108,23 @@ impl SongTagList {
         }
     }
 
-    /// Push a tag that must end the list, dropping the last tag when full.
+    /// Push a tag that must end the list, dropping the last tag when full. A tag
+    /// that is invalid or already listed leaves the list unchanged.
     fn push_last(&mut self, raw: &str) {
-        if self.tags.len() >= SONG_MAX_TAGS {
-            self.tags.pop();
+        let Some(tag) = normalize_song_tag(raw) else {
+            return;
+        };
+        let key = tag.to_ascii_lowercase();
+        if self.seen.contains(&key) {
+            return;
         }
-        self.push(raw);
+        if self.tags.len() >= SONG_MAX_TAGS
+            && let Some(dropped) = self.tags.pop()
+        {
+            self.seen.remove(&dropped.to_ascii_lowercase());
+        }
+        self.seen.insert(key);
+        self.tags.push(tag);
     }
 
     fn into_tags(self) -> Vec<String> {
@@ -2010,13 +2021,14 @@ mod tests {
         AceStepApiMode, AceStepClient, AceStepConfig, CompletionRequest,
         MAX_LOGGED_ERROR_BODY_BYTES, ReleaseTaskRequest, SONG_LANGUAGE_INVALID_REJECTION,
         SONG_LYRICS_LANGUAGE_REJECTION, SONG_LYRICS_STRUCTURE_REJECTION, SONG_MAX_TAGS,
-        SONG_STYLE_INVALID_REJECTION, SongPromptPayload, SongPromptRequest, TaskStatus,
-        bounded_http_error_body, build_audio_url, build_song_file_name, build_song_release_prompt,
-        canonicalize_song_lyrics, compile_song_tags, detect_song_language, extract_files,
-        extract_task_id_list, instrumental_skeleton, lenient_number, normalize_song_language,
-        normalize_song_prompt_input, normalize_song_prompt_payload, normalize_song_tag,
-        parse_completion_response, parse_query_items, query_result_items, release_task_id,
-        render_song_director_messages_with, section_marker, song_max_audio_seconds,
+        SONG_STYLE_INVALID_REJECTION, SongPromptPayload, SongPromptRequest, SongTagList,
+        TaskStatus, bounded_http_error_body, build_audio_url, build_song_file_name,
+        build_song_release_prompt, canonicalize_song_lyrics, compile_song_tags,
+        detect_song_language, extract_files, extract_task_id_list, instrumental_skeleton,
+        lenient_number, normalize_song_language, normalize_song_prompt_input,
+        normalize_song_prompt_payload, normalize_song_tag, parse_completion_response,
+        parse_query_items, query_result_items, release_task_id, render_song_director_messages_with,
+        section_marker, song_max_audio_seconds,
     };
 
     fn prompt_store_with(files: &[(&str, &str)]) -> openplotva_prompts::PromptStore {
@@ -2681,6 +2693,24 @@ mod tests {
         neurofunk.genre = "neurofunk, drum and bass".to_owned();
         let tags = compile_song_tags(&neurofunk, "male", false);
         assert!(!tags.iter().any(|tag| tag.starts_with("in the style of")));
+    }
+
+    #[test]
+    fn a_rejected_last_tag_leaves_a_full_list_unchanged() {
+        let mut list = SongTagList::default();
+        for index in 0..SONG_MAX_TAGS {
+            list.push(&format!("layer {index}"));
+        }
+        let full = list.tags.clone();
+        list.push_last("!!!");
+        list.push_last("Layer 3");
+        assert_eq!(list.tags, full);
+
+        list.push_last("120 BPM");
+        assert_eq!(list.tags.len(), SONG_MAX_TAGS);
+        assert_eq!(list.tags.last().map(String::as_str), Some("120 BPM"));
+        list.push(&full[SONG_MAX_TAGS - 1]);
+        assert_eq!(list.tags.len(), SONG_MAX_TAGS);
     }
 
     #[test]
