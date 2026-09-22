@@ -833,8 +833,26 @@ fn utility_endpoint(
 }
 
 fn decode_utility_ad(body: &[u8]) -> Result<Option<GradiusPlacement>, GradiusClientError> {
-    let entries = serde_json::from_slice::<Vec<serde_json::Value>>(body)
-        .map_err(GradiusClientError::Decode)?;
+    let response =
+        serde_json::from_slice::<serde_json::Value>(body).map_err(GradiusClientError::Decode)?;
+    let entries = match response {
+        serde_json::Value::Array(entries) => entries,
+        // The live utility endpoint also returns a single untyped have_ads object.
+        // Normalize only the decoder input; the audit retains the untouched wire body.
+        serde_json::Value::Object(mut entry) => {
+            match entry.get("have_ads").and_then(serde_json::Value::as_bool) {
+                Some(false) => return Ok(None),
+                Some(true) => {
+                    entry
+                        .entry("type")
+                        .or_insert_with(|| serde_json::json!("native-text-ad"));
+                    vec![serde_json::Value::Object(entry)]
+                }
+                None => return Err(GradiusClientError::InvalidUtilityPlacement),
+            }
+        }
+        _ => return Err(GradiusClientError::InvalidUtilityPlacement),
+    };
     let mut malformed = None;
     let mut empty_content = false;
     for (source_index, entry) in entries.into_iter().enumerate() {
@@ -1142,6 +1160,54 @@ mod tests {
             user_metadata: serde_json::json!({"tool": "image_generation"}),
             user_text_request: Some("[PERSON]".to_owned()),
             model_text_answer: Some("Image generated".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_client_accepts_live_object_response_and_preserves_raw_audit() {
+        let body = r#"{"have_ads":true,"content":"Try [this](https://ads.example/r/1)","ad_context":{"campaign_id":42},"price":{"show_price":0.36,"click_price":0},"cta_text":"Try","cta_link":"https://ads.example/r/1"}"#;
+        let transport = FakeGradiusTransport::default();
+        transport
+            .responses
+            .lock()
+            .expect("responses")
+            .push_back(Ok(GradiusHttpResponse {
+                status: 200,
+                body: body.as_bytes().to_vec(),
+            }));
+        let result = enabled_test_client(transport)
+            .utility(test_utility_request())
+            .await
+            .expect("live utility object");
+        assert!(matches!(
+            result.placement,
+            Some(GradiusPlacement::Standalone {
+                source_index: 0,
+                show_price: Some(0.36),
+                ..
+            })
+        ));
+        assert_eq!(result.exchange.outcome, GradiusCallOutcome::Ad);
+        assert_eq!(result.exchange.response_body.as_deref(), Some(body));
+        assert_eq!(
+            result.exchange.response_json,
+            Some(serde_json::from_str(body).expect("raw object"))
+        );
+    }
+
+    #[test]
+    fn utility_object_requires_explicit_boolean_ad_signal() {
+        assert_eq!(
+            decode_utility_ad(br#"{"have_ads":false}"#).expect("no ad"),
+            None
+        );
+        for body in [
+            br#"{"have_ads":true,"content":" "}"#.as_slice(),
+            br#"{"content":"Offer"}"#,
+            br#"{"have_ads":"true","content":"Offer"}"#,
+            br#"null"#,
+        ] {
+            assert!(decode_utility_ad(body).is_err());
         }
     }
 
