@@ -1745,6 +1745,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_rates_ads_keep_rich_table_and_separator_in_durable_outbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::rates::{RatesEffects, RatesTextPlan, RatesUtilityEffects};
+        use openplotva_storage::{
+            PostgresTelegramOutboxStore, gradius_ads::PostgresGradiusAdStore,
+        };
+        use openplotva_telegram::{ChatRef, ReplyMessageRef, TextMessageRequest};
+
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let client = UtilityStub::default();
+        let ads = Arc::new(GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(PostgresGradiusAdStore::new(pool.clone())),
+            Arc::new(VipStub(false)),
+        ));
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let effects = RatesUtilityEffects::new(rich.clone()).with_utility_ads(
+            ads,
+            Arc::new(crate::gradius_utility_outbox::GradiusUtilityOutbox::new(
+                PostgresTelegramOutboxStore::new(pool.clone()),
+                7,
+            )),
+        );
+        for chat_id in [9_820_826_970_i64, -9_820_826_971] {
+            let batch_id = format!("gradius-utility:v1:7:rates-command:{chat_id}:77");
+            sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&batch_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM gradius_ad_opportunities WHERE chat_id = $1")
+                .bind(chat_id)
+                .execute(&pool)
+                .await?;
+            let chat = ChatRef {
+                id: chat_id,
+                is_forum: false,
+            };
+            effects
+                .send_rates_text(RatesTextPlan {
+                    message: TextMessageRequest {
+                        chat: Some(chat),
+                        message_thread_id: 0,
+                        disable_notification: false,
+                        allow_sending_without_reply: None,
+                        text: "<table><tr><td>USD</td><td>90 ₽</td></tr></table>".to_owned(),
+                        render_as: "HTML".to_owned(),
+                        reply_markup: None,
+                    },
+                    reply_to: ReplyMessageRef {
+                        chat,
+                        message_id: 77,
+                        is_topic_message: false,
+                        message_thread_id: 0,
+                    },
+                    plain_html: Some("USD: 90 ₽".to_owned()),
+                    initiator_id: Some(chat_id.abs()),
+                })
+                .await?;
+            let (kind, payload): (String, serde_json::Value) = sqlx::query_as(
+                "SELECT method_kind, payload FROM telegram_outbox WHERE batch_id = $1",
+            )
+            .bind(&batch_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(kind, "sendRichMessage");
+            let html = payload["html"].as_str().expect("rich content");
+            assert!(html.contains("<table>"));
+            assert!(html.contains("<hr/>"));
+            assert!(html.find("</table>") < html.find("<hr/>"));
+            assert!(html.find("<hr/>") < html.find("📢"));
+            assert!(payload.get("link_preview_options").is_none());
+            assert_eq!(payload["options"]["reply_to_message_id"], 77);
+            sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&batch_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM gradius_ad_opportunities WHERE chat_id = $1")
+                .bind(chat_id)
+                .execute(&pool)
+                .await?;
+        }
+        assert_eq!(client.calls.lock().expect("provider calls").len(), 2);
+        assert!(rich.sent.lock().expect("fallback calls").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn utility_image_redacts_prompt_and_audits_only_selected_placement() {
         let client = UtilityStub::default();
         let ledger = LedgerStub::default();

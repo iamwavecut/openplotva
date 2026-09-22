@@ -1415,10 +1415,8 @@ where
             .await;
         match prepared {
             Ok(Some(ad)) => {
-                let base = openplotva_telegram::sanitize_telegram_html(
-                    &text.replace("</h2>", "\n").replace("</p>", "\n"),
-                );
-                let html = format!("{base}\n\n{}", ad.html);
+                let html =
+                    crate::gradius_utility_outbox::compose_rich_utility_html(&text, &ad.html);
                 match utility
                     .outbox
                     .queue_final_edit(

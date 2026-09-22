@@ -57,6 +57,15 @@ pub struct SendRichMessage {
     pub options: RichSendOptions,
 }
 
+/// Replayable rich-content variant of Telegram `editMessageText`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct EditRichMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub html: String,
+    pub reply_markup: Option<Value>,
+}
+
 /// Errors raised while calling the rich-message Bot API.
 #[derive(Debug, thiserror::Error)]
 pub enum RichApiError {
@@ -171,6 +180,22 @@ impl RichApiClient {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn edit_rich_message_request(
+        &self,
+        request: &EditRichMessage,
+    ) -> Result<carapax::types::EditMessageResult, RichApiError> {
+        self.call(
+            "editMessageText",
+            build_edit_body(
+                request.chat_id,
+                request.message_id,
+                &request.html,
+                request.reply_markup.clone(),
+            ),
+        )
+        .await
     }
 
     async fn call<T: DeserializeOwned>(

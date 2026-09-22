@@ -99,7 +99,9 @@ pub use persistence::{
     snapshot_outbound_method,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
-pub use rich_api::{RichApiClient, RichApiError, RichMessage, RichSendOptions, SendRichMessage};
+pub use rich_api::{
+    EditRichMessage, RichApiClient, RichApiError, RichMessage, RichSendOptions, SendRichMessage,
+};
 pub use rich_html::{
     RICH_MEDIA_MAX, RICH_MESSAGE_MAX_CHARS, format_rich_html, is_valid_rich_html,
     rich_message_within_char_limit, sanitize_rich_html,
