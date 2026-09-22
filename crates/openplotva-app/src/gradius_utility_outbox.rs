@@ -2,17 +2,16 @@
 
 use std::sync::Arc;
 
-use carapax::types::LinkPreviewOptions;
 use openplotva_storage::gradius_ads::PostgresGradiusAdStore;
 use openplotva_storage::{
     PostgresTelegramOutboxStore, TelegramDeliveryPolicy, TelegramOutboxBatchInput,
     TelegramOutboxPartInput,
 };
 use openplotva_telegram::{
-    ChatRef, EditTextMessageRequest, OutboundCommand, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
-    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TextMessageRequest,
-    build_edit_text_message_method, build_text_message_method_without_link_preview,
-    is_valid_telegram_html,
+    ChatRef, EditRichMessage, OutboundCommand, ReplyMessageRef, RichSendOptions, SendRichMessage,
+    TELEGRAM_PARSE_MODE_HTML, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TextMessageRequest,
+    build_text_message_method_without_link_preview, format_rich_html, is_valid_telegram_html,
+    rich_message_within_char_limit,
 };
 use time::OffsetDateTime;
 
@@ -154,6 +153,40 @@ impl GradiusUtilityOutbox {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn queue_rich_message(
+        &self,
+        ads: &GradiusUtilityAdService,
+        source_key: &str,
+        opportunity_id: i64,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        reply_to_message_id: i64,
+        html: String,
+    ) -> Result<String, String> {
+        let method = utility_rich_send(chat_id, thread_id, reply_to_message_id, &html);
+        let method = match method {
+            Ok(method) => method,
+            Err(error) => {
+                let _ = ads
+                    .mark_delivery_failed(opportunity_id, "final_rich_html_invalid_or_too_long")
+                    .await;
+                return Err(error);
+            }
+        };
+        self.queue(
+            ads,
+            source_key,
+            opportunity_id,
+            chat_id,
+            thread_id,
+            reply_to_message_id,
+            TelegramDeliveryPolicy::Create,
+            method,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn queue_final_edit(
         &self,
         ads: &GradiusUtilityAdService,
@@ -164,27 +197,15 @@ impl GradiusUtilityOutbox {
         message_id: i64,
         html: String,
     ) -> Result<String, String> {
-        validate_final_html(ads, opportunity_id, &html).await?;
-        let request = EditTextMessageRequest {
-            chat: ChatRef {
-                id: chat_id,
-                is_forum: thread_id.is_some(),
-            },
-            message_id,
-            text: html,
-            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-            reply_markup: None,
-        };
-        let method = match build_edit_text_message_method(&request) {
+        let method = match utility_rich_edit(chat_id, message_id, &html) {
             Ok(method) => method,
             Err(error) => {
                 let _ = ads
-                    .mark_delivery_failed(opportunity_id, "outbox_build_failed")
+                    .mark_delivery_failed(opportunity_id, "final_rich_html_invalid_or_too_long")
                     .await;
-                return Err(error.to_string());
+                return Err(error);
             }
-        }
-        .with_link_preview_options(LinkPreviewOptions::default().with_is_disabled(true));
+        };
         self.queue(
             ads,
             source_key,
@@ -193,7 +214,7 @@ impl GradiusUtilityOutbox {
             thread_id,
             message_id,
             TelegramDeliveryPolicy::TargetIdempotent,
-            TelegramOutboundMethod::from(method),
+            method,
         )
         .await
     }
@@ -282,10 +303,105 @@ fn final_html_fits_telegram(html: &str) -> bool {
     html.len() <= TELEGRAM_TEXT_MAX_BYTES && is_valid_telegram_html(html)
 }
 
+pub(crate) fn compose_rich_utility_html(content: &str, ad: &str) -> String {
+    format_rich_html(&format!("{content}<hr/>{ad}"))
+}
+
+fn utility_rich_html(html: &str) -> Result<String, String> {
+    let html = format_rich_html(html);
+    if html.is_empty() || !rich_message_within_char_limit(&html) {
+        return Err("Gradius utility message exceeds Telegram Rich HTML limits".to_owned());
+    }
+    Ok(html)
+}
+
+fn utility_rich_send(
+    chat_id: i64,
+    thread_id: Option<i32>,
+    reply_to: i64,
+    html: &str,
+) -> Result<TelegramOutboundMethod, String> {
+    Ok(SendRichMessage {
+        chat_id,
+        html: utility_rich_html(html)?,
+        options: RichSendOptions {
+            message_thread_id: thread_id.map(i64::from),
+            reply_to_message_id: Some(reply_to),
+            ..Default::default()
+        },
+    }
+    .into())
+}
+
+fn utility_rich_edit(
+    chat_id: i64,
+    message_id: i64,
+    html: &str,
+) -> Result<TelegramOutboundMethod, String> {
+    Ok(EditRichMessage {
+        chat_id,
+        message_id,
+        html: utility_rich_html(html)?,
+        reply_markup: None,
+    }
+    .into())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::final_html_fits_telegram;
-    use openplotva_telegram::TELEGRAM_TEXT_MAX_BYTES;
+    use super::*;
+
+    #[test]
+    fn rich_utility_send_and_edit_preserve_content_and_ad_separator_on_replay() {
+        for content in [
+            "<table><tr><td>USD</td><td>90 ₽</td></tr></table>",
+            "<h2>Winner</h2><p>Game completed</p>",
+        ] {
+            let html = compose_rich_utility_html(
+                content,
+                "📢 <a href=\"https://example.com\">Offer</a><tg-spoiler>VIP</tg-spoiler>",
+            );
+            assert!(html.starts_with(format_rich_html(content).trim()));
+            assert!(html.contains("<hr/>"));
+            assert!(html.find("<hr/>").expect("separator") < html.find("📢").expect("ad"));
+            for method in [
+                utility_rich_send(42, Some(7), 9, &html).expect("rich send"),
+                utility_rich_edit(42, 9, &html).expect("rich edit"),
+            ] {
+                let (kind, version, payload) = OutboundCommand::try_from_method(method)
+                    .expect("command")
+                    .into_storage_parts()
+                    .expect("stored command");
+                let replay = OutboundCommand::decode(
+                    version,
+                    kind,
+                    &serde_json::to_vec(&payload).expect("encoded payload"),
+                )
+                .expect("replayed command");
+                let (_, _, replayed) = replay.into_storage_parts().expect("replayed payload");
+                assert_eq!(replayed["html"], html);
+                assert!(replayed.get("text").is_none());
+                assert!(replayed.get("link_preview_options").is_none());
+                if kind == "sendRichMessage" {
+                    assert_eq!(replayed["options"]["reply_to_message_id"], 9);
+                    assert_eq!(replayed["options"]["message_thread_id"], 7);
+                } else {
+                    assert_eq!(kind, "editMessageText");
+                    assert_eq!(replayed["message_id"], 9);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rich_utility_uses_rich_limit_without_plain_html_downgrade() {
+        let html = compose_rich_utility_html(&"x".repeat(5000), "📢 Offer");
+        assert!(utility_rich_send(42, None, 9, &html).is_ok());
+        assert!(utility_rich_edit(42, 9, &html).is_ok());
+        let oversized = "x".repeat(32769);
+        assert!(utility_rich_send(42, None, 9, &oversized).is_err());
+        assert!(utility_rich_edit(42, 9, &oversized).is_err());
+    }
 
     #[test]
     fn final_utility_message_must_fit_with_result_and_ad_together() {

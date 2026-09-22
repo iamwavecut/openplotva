@@ -13,10 +13,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     AudioMessagePlan, AudioSource, DispatcherDrain, DispatcherPersistencePayload, DispatcherQueue,
-    DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EnqueueOutcome,
-    MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PhotoMessagePlan, PhotoSource,
-    ReplyParametersPlan, SendRichMessage, StickerMessagePlan, TelegramOutboundMethod,
-    TelegramOutboundMethodKind, hash_content,
+    DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EditRichMessage,
+    EnqueueOutcome, MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
+    PhotoMessagePlan, PhotoSource, ReplyParametersPlan, SendRichMessage, StickerMessagePlan,
+    TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
     outbound::{MESSAGE_TYPE_REACTION, reaction_fingerprint_content},
     parse_mode_from_go,
 };
@@ -670,6 +670,11 @@ fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
 }
 
 fn replay_edit_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
+    if value.get("html").is_some() {
+        return serde_json::from_value::<EditRichMessage>(value.clone())
+            .ok()
+            .map(TelegramOutboundMethod::from);
+    }
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let message_id = field_i64(value, &["MessageID", "message_id"])?;
     let text = field_string(value, &["Text", "text"])?;
@@ -1044,6 +1049,9 @@ fn serialize_outbound_method(
             serde_json::to_vec(method.as_ref()).map(Some)
         }
         TelegramOutboundMethod::EditMessageText(method) => {
+            serde_json::to_vec(method.as_ref()).map(Some)
+        }
+        TelegramOutboundMethod::EditRichMessage(method) => {
             serde_json::to_vec(method.as_ref()).map(Some)
         }
         TelegramOutboundMethod::SetMessageReaction(method) => {
@@ -1514,6 +1522,23 @@ mod tests {
 
         assert!(snapshot_outbound_method(&sticker_method(42, "sticker-file-id")).is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rich_edit_replays_without_downgrading_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{"chat_id":42,"message_id":9,"html":"<h2>Winner</h2><hr/>Offer","reply_markup":null}"#;
+        let command = OutboundCommand::decode(1, "editMessageText", payload)?;
+        assert_eq!(command.method_name(), "editMessageText");
+        assert!(matches!(
+            OutboundCommand::decode(1, "editMessageText", payload)?.into_method(),
+            TelegramOutboundMethod::EditRichMessage(_)
+        ));
+        let (_, _, replayed) = command.into_storage_parts()?;
+        assert_eq!(replayed["html"], "<h2>Winner</h2><hr/>Offer");
+        assert!(replayed.get("text").is_none());
+        assert!(replayed.get("link_preview_options").is_none());
         Ok(())
     }
 

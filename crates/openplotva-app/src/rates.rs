@@ -1232,9 +1232,12 @@ impl RatesEffects for RatesUtilityEffects {
                 .await;
             match prepared {
                 Ok(Some(ad)) => {
-                    let final_html = format!("{plain_html}\n\n{}", ad.html);
+                    let final_html = crate::gradius_utility_outbox::compose_rich_utility_html(
+                        &plan.message.text,
+                        &ad.html,
+                    );
                     let queued = outbox
-                        .queue_message(
+                        .queue_rich_message(
                             ads,
                             &format!("rates-command:{source_id}"),
                             ad.opportunity_id,

@@ -1912,10 +1912,12 @@ mod tests {
                 .await?;
             let preview = carapax::types::LinkPreviewOptions::default().with_is_disabled(true);
             let method = if already_edited {
-                TelegramOutboundMethod::from(
-                    carapax::types::EditMessageText::for_chat_message(chat_id, 77, "📢 Offer")
-                        .with_link_preview_options(preview),
-                )
+                TelegramOutboundMethod::from(openplotva_telegram::EditRichMessage {
+                    chat_id,
+                    message_id: 77,
+                    html: "<h2>Winner</h2><hr/>📢 Offer".to_owned(),
+                    reply_markup: None,
+                })
             } else {
                 TelegramOutboundMethod::from(
                     carapax::types::SendMessage::new(chat_id, "📢 Offer")
@@ -1987,8 +1989,12 @@ mod tests {
             assert_eq!(report.errors, 0, "{:?}", report.last_error);
             let sent = transport.sent.lock().expect("sent commands").clone();
             assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0]["link_preview_options"]["is_disabled"], true);
-            if !already_edited {
+            if already_edited {
+                assert_eq!(sent[0]["html"], "<h2>Winner</h2><hr/>📢 Offer");
+                assert!(sent[0].get("link_preview_options").is_none());
+                assert!(sent[0].get("text").is_none());
+            } else {
+                assert_eq!(sent[0]["link_preview_options"]["is_disabled"], true);
                 assert_eq!(sent[0]["reply_parameters"]["message_id"], 77);
             }
             let shown: Option<OffsetDateTime> =

@@ -12,8 +12,8 @@ use carapax::{
 };
 
 use crate::{
-    DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage, format_rich_html,
-    replay_outbound_method, snapshot_outbound_method,
+    DispatcherSendStatus, EditRichMessage, RichApiClient, RichApiError, SendRichMessage,
+    format_rich_html, replay_outbound_method, snapshot_outbound_method,
 };
 
 /// Maximum attempts (including the first) made by [`send_outbound_method_with_bounded_retry`].
@@ -55,6 +55,8 @@ pub enum TelegramOutboundMethod {
     EditUserStarSubscription(Box<EditUserStarSubscription>),
     /// Telegram `editMessageText`.
     EditMessageText(Box<EditMessageText>),
+    /// Telegram `editMessageText` with rich content instead of plain text.
+    EditRichMessage(Box<EditRichMessage>),
     /// Telegram `editMessageCaption`.
     EditMessageCaption(Box<EditMessageCaption>),
     /// Telegram `editMessageReplyMarkup`.
@@ -436,7 +438,9 @@ impl TelegramOutboundMethod {
             Self::EditUserStarSubscription(_) => {
                 TelegramOutboundMethodKind::EditUserStarSubscription
             }
-            Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
+            Self::EditMessageText(_) | Self::EditRichMessage(_) => {
+                TelegramOutboundMethodKind::EditMessageText
+            }
             Self::EditMessageCaption(_) => TelegramOutboundMethodKind::EditMessageCaption,
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
             Self::EditMessageMedia(_) => TelegramOutboundMethodKind::EditMessageMedia,
@@ -468,6 +472,7 @@ impl TelegramOutboundMethod {
             Self::CreateInvoiceLink(_) => TelegramOutboundResponseKind::String,
             Self::AnswerGuestQuery(_) => TelegramOutboundResponseKind::SentGuestMessage,
             Self::EditMessageText(_)
+            | Self::EditRichMessage(_)
             | Self::EditMessageCaption(_)
             | Self::EditMessageReplyMarkup(_)
             | Self::EditMessageMedia(_) => TelegramOutboundResponseKind::EditMessage,
@@ -496,8 +501,8 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(|message| TelegramOutboundResponse::Message(Box::new(message))),
-        TelegramOutboundMethod::SendRichMessage(_) => {
-            panic!("sendRichMessage requires execute_telegram_method_with_rich")
+        TelegramOutboundMethod::SendRichMessage(_) | TelegramOutboundMethod::EditRichMessage(_) => {
+            panic!("rich methods require execute_telegram_method_with_rich")
         }
         TelegramOutboundMethod::SendSticker(method) => client
             .execute(*method)
@@ -585,6 +590,13 @@ pub async fn execute_telegram_method_with_rich(
             rich.send_rich_message_request(&method)
                 .await
                 .map(|message| TelegramOutboundResponse::Message(Box::new(message)))
+                .map_err(TelegramOutboundExecuteError::from)
+        }
+        TelegramOutboundMethod::EditRichMessage(mut method) => {
+            method.html = format_rich_html(&method.html);
+            rich.edit_rich_message_request(&method)
+                .await
+                .map(TelegramOutboundResponse::EditMessage)
                 .map_err(TelegramOutboundExecuteError::from)
         }
         method => execute_telegram_method(client, method)
@@ -778,6 +790,12 @@ impl From<SendMessage> for TelegramOutboundMethod {
 impl From<SendRichMessage> for TelegramOutboundMethod {
     fn from(value: SendRichMessage) -> Self {
         Self::SendRichMessage(Box::new(value))
+    }
+}
+
+impl From<EditRichMessage> for TelegramOutboundMethod {
+    fn from(value: EditRichMessage) -> Self {
+        Self::EditRichMessage(Box::new(value))
     }
 }
 
