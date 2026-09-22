@@ -2228,6 +2228,23 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
 }
 
 pub trait ImageJobEffects {
+    #[allow(clippy::too_many_arguments)]
+    fn offer_utility_ad<'a>(
+        &'a self,
+        _job_id: i64,
+        _attempt_key: String,
+        _chat_id: i64,
+        _user_id: i64,
+        _thread_id: Option<i32>,
+        _prompt: String,
+        _first_photo_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()>
+    where
+        Self: Sync,
+    {
+        Box::pin(async {})
+    }
+
     /// Best-effort: mark the trigger message with the "drawing" reaction.
     fn signal_draw_progress<'a>(
         &'a self,
@@ -2337,6 +2354,7 @@ pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     reactions: Option<crate::reactions::GenerationReactions>,
     last_generations: Option<Arc<dyn ImageJobLastGenerationWriter>>,
+    utility_ads: Option<Arc<crate::gradius_utility_outbox::GradiusUtilityImageAds>>,
 }
 
 impl<Sender> TelegramImageJobEffects<Sender> {
@@ -2347,6 +2365,7 @@ impl<Sender> TelegramImageJobEffects<Sender> {
             telegram,
             reactions: None,
             last_generations: None,
+            utility_ads: None,
         }
     }
 
@@ -2366,12 +2385,56 @@ impl<Sender> TelegramImageJobEffects<Sender> {
         self.last_generations = Some(writer);
         self
     }
+
+    #[must_use]
+    pub fn with_utility_ads(
+        mut self,
+        ads: Arc<crate::gradius_utility_outbox::GradiusUtilityImageAds>,
+    ) -> Self {
+        self.utility_ads = Some(ads);
+        self
+    }
 }
 
 impl<Sender> ImageJobEffects for TelegramImageJobEffects<Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
+    fn offer_utility_ad<'a>(
+        &'a self,
+        job_id: i64,
+        attempt_key: String,
+        chat_id: i64,
+        user_id: i64,
+        thread_id: Option<i32>,
+        prompt: String,
+        first_photo_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(ads) = self.utility_ads.as_ref() else {
+                return;
+            };
+            if let Err(_error) = ads
+                .offer(
+                    job_id,
+                    attempt_key,
+                    chat_id,
+                    user_id,
+                    thread_id,
+                    prompt,
+                    first_photo_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    job_id,
+                    integration_kind = "native_utility",
+                    source = "image",
+                    "Gradius image ad skipped"
+                );
+            }
+        })
+    }
     fn signal_draw_progress<'a>(
         &'a self,
         chat_id: i64,
@@ -3585,6 +3648,9 @@ where
             TelegramActivityAction::UploadPhoto,
         )
     });
+    let ad_chat_id = params.chat_id;
+    let ad_user_id = params.user_id;
+    let ad_thread_id = params.thread_id;
     let execution = execute_image_gen_job_with_cancel(
         generator,
         effects,
@@ -3626,6 +3692,26 @@ where
                 activity,
                 options.now,
             );
+            if execution.error.is_none()
+                && report.error.is_none()
+                && let Some(first_photo_id) = execution.result_message_id
+            {
+                effects
+                    .offer_utility_ad(
+                        work.id,
+                        format!(
+                            "image-claim:{}:{}",
+                            work.id,
+                            work.claim_started_at.unix_timestamp_nanos()
+                        ),
+                        ad_chat_id,
+                        ad_user_id,
+                        ad_thread_id,
+                        execution.prompt,
+                        first_photo_id,
+                    )
+                    .await;
+            }
             report.error = report.error.or(execution.error);
             report
         }
@@ -6582,6 +6668,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn image_utility_offer_runs_only_after_complete_delivery() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let params = ImageGenJobParams {
+            chat_id: 100,
+            message_id: 20,
+            user_id: 30,
+            prompt: "castle".to_owned(),
+            ..ImageGenJobParams::default()
+        };
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(params.clone(), now),
+        );
+        let effects = EffectsStub::new().recording_ads();
+        let report = run_regular_image_gen_queue_once(
+            &queue,
+            &GeneratorStub::success("https://img.test/1.png"),
+            &effects,
+            "image-worker-1",
+            now,
+        )
+        .await;
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+        assert!(
+            effects
+                .calls()
+                .iter()
+                .any(|call| { call == &format!("utility-ad:{job_id}:100:30:castle:888") })
+        );
+
+        let partial_queue = InMemoryTaskQueue::new();
+        partial_queue.assign(IMAGE_REGULAR_QUEUE_NAME, new_image_gen_job_at(params, now));
+        let partial_effects =
+            EffectsStub::with_replace_error("photo delivery failed").recording_ads();
+        let _ = run_regular_image_gen_queue_once(
+            &partial_queue,
+            &GeneratorStub::success("https://img.test/1.png"),
+            &partial_effects,
+            "image-worker-2",
+            now,
+        )
+        .await;
+        assert!(
+            !partial_effects
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("utility-ad:"))
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn image_gen_queue_once_pulses_upload_photo_during_active_job() {
         let queue = InMemoryTaskQueue::new();
@@ -9297,6 +9435,7 @@ mod tests {
         placeholder_ids: Vec<i32>,
         replace_error: Option<String>,
         replace_notify: Option<Arc<tokio::sync::Notify>>,
+        record_ads: bool,
     }
 
     impl EffectsStub {
@@ -9306,6 +9445,7 @@ mod tests {
                 placeholder_ids: vec![888],
                 replace_error: None,
                 replace_notify: None,
+                record_ads: false,
             }
         }
 
@@ -9326,6 +9466,11 @@ mod tests {
             self
         }
 
+        fn recording_ads(mut self) -> Self {
+            self.record_ads = true;
+            self
+        }
+
         fn calls(&self) -> Vec<String> {
             self.call_log().clone()
         }
@@ -9336,6 +9481,24 @@ mod tests {
     }
 
     impl ImageJobEffects for EffectsStub {
+        fn offer_utility_ad<'a>(
+            &'a self,
+            job_id: i64,
+            _attempt_key: String,
+            chat_id: i64,
+            user_id: i64,
+            _thread_id: Option<i32>,
+            prompt: String,
+            first_photo_id: i32,
+        ) -> ImageJobEffectFuture<'a, ()> {
+            if self.record_ads {
+                self.call_log().push(format!(
+                    "utility-ad:{job_id}:{chat_id}:{user_id}:{prompt}:{first_photo_id}"
+                ));
+            }
+            Box::pin(async {})
+        }
+
         fn signal_draw_progress<'a>(
             &'a self,
             chat_id: i64,

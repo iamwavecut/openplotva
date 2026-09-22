@@ -57,6 +57,7 @@ impl PostgresRuntimeGradiusAuditReader {
             query.push(" AND o.completed_at >= ").push_bind(cutoff);
         }
         push_text_filter(&mut query, "o.integration_kind", &filter.integration_kind);
+        push_text_filter(&mut query, "o.source_kind", &filter.source);
         push_text_filter(&mut query, "o.outcome", &filter.outcome);
         push_text_filter(&mut query, "o.delivery_state", &filter.delivery_state);
         push_text_filter(&mut query, "o.model_version", &filter.model);
@@ -83,6 +84,8 @@ impl PostgresRuntimeGradiusAuditReader {
                 .push(" OR COALESCE(o.dialog_job_id::text, '') ILIKE ")
                 .push_bind(q.clone())
                 .push(" OR COALESCE(o.ad_markdown, '') ILIKE ")
+                .push_bind(q.clone())
+                .push(" OR COALESCE(o.source_context::text, '') ILIKE ")
                 .push_bind(q.clone())
                 .push(" OR EXISTS (SELECT 1 FROM gradius_api_calls qc WHERE qc.opportunity_id = o.id AND (qc.request_body::text ILIKE ")
                 .push_bind(q.clone())
@@ -129,13 +132,41 @@ impl PostgresRuntimeGradiusAuditReader {
                    COUNT(*) FILTER (WHERE outcome IN ('provider_error', 'privacy_error', 'render_error'))::BIGINT AS errors,
                    COUNT(*) FILTER (WHERE provider_outcome = 'ad' AND delivery_state IS DISTINCT FROM 'delivered')::BIGINT AS returned_not_delivered,
                    COALESCE(SUM(show_price) FILTER (WHERE delivery_state = 'delivered'), 0)::DOUBLE PRECISION AS confirmed_show_price
-               FROM gradius_ad_opportunities
+               FROM gradius_ad_opportunities o
                WHERE TRUE"#,
         );
         if let Some(cutoff) = cutoff {
-            query.push(" AND completed_at >= ").push_bind(cutoff);
+            query.push(" AND o.completed_at >= ").push_bind(cutoff);
         }
-        push_text_filter(&mut query, "integration_kind", &filter.integration_kind);
+        push_text_filter(&mut query, "o.integration_kind", &filter.integration_kind);
+        push_text_filter(&mut query, "o.source_kind", &filter.source);
+        push_text_filter(&mut query, "o.outcome", &filter.outcome);
+        push_text_filter(&mut query, "o.delivery_state", &filter.delivery_state);
+        push_text_filter(&mut query, "o.model_version", &filter.model);
+        if let Some(user_id) = filter.user_id {
+            query.push(" AND o.user_id = ").push_bind(user_id);
+        }
+        if let Some(chat_id) = filter.chat_id {
+            query.push(" AND o.chat_id = ").push_bind(chat_id);
+        }
+        if let Some(dialog_job_id) = filter.dialog_job_id {
+            query
+                .push(" AND o.dialog_job_id = ")
+                .push_bind(dialog_job_id);
+        }
+        if !filter.q.trim().is_empty() {
+            let q = format!("%{}%", filter.q.trim());
+            query.push(" AND (o.opportunity_key ILIKE ").push_bind(q.clone())
+                .push(" OR o.user_id::text ILIKE ").push_bind(q.clone())
+                .push(" OR o.chat_id::text ILIKE ").push_bind(q.clone())
+                .push(" OR COALESCE(o.dialog_job_id::text, '') ILIKE ").push_bind(q.clone())
+                .push(" OR COALESCE(o.ad_markdown, '') ILIKE ").push_bind(q.clone())
+                .push(" OR COALESCE(o.source_context::text, '') ILIKE ").push_bind(q.clone())
+                .push(" OR EXISTS (SELECT 1 FROM gradius_api_calls qc WHERE qc.opportunity_id = o.id AND (qc.request_body::text ILIKE ")
+                .push_bind(q.clone())
+                .push(" OR COALESCE(qc.response_body, '') ILIKE ").push_bind(q)
+                .push(")))");
+        }
         let row = query
             .build()
             .fetch_one(&self.pool)
@@ -151,6 +182,7 @@ impl PostgresRuntimeGradiusAuditReader {
         Ok(json!({
             "range": normalized_range(&filter.range)?,
             "integration_kind": optional_text(&filter.integration_kind),
+            "source": optional_text(&filter.source),
             "attempts": attempts,
             "fill_rate": fill_rate,
             "returned": returned,
@@ -201,6 +233,7 @@ fn opportunity_json(row: &sqlx::postgres::PgRow) -> Result<Value, String> {
         "id": row.get::<i64, _>("id"),
         "opportunity_key": row.get::<String, _>("opportunity_key"),
         "source": row.get::<String, _>("source_kind"),
+        "source_context": row.get::<Option<sqlx::types::Json<Value>>, _>("source_context").map(|value| value.0),
         "dialog_job_id": row.get::<Option<i64>, _>("dialog_job_id"),
         "integration_kind": row.get::<String, _>("integration_kind"),
         "user_id": row.get::<i64, _>("user_id"),
@@ -414,6 +447,12 @@ mod tests {
             .gradius_ad_summary(RuntimeGradiusSummaryFilter {
                 range: "all".to_owned(),
                 integration_kind: "native_dialogue".to_owned(),
+                source: "dialog-job".to_owned(),
+                outcome: "ad".to_owned(),
+                delivery_state: "delivered".to_owned(),
+                user_id: Some(user_id),
+                q: "private_email".to_owned(),
+                ..RuntimeGradiusSummaryFilter::default()
             })
             .await?;
         assert_eq!(summary["attempts"], 1);

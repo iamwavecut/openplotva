@@ -4,7 +4,7 @@ use openplotva_llm::gradius::vip_hint_for_impression;
 use openplotva_llm::gradius::{
     GradiusApiExchange, GradiusClient, GradiusDialogueRole, GradiusDialogueTurn,
     GradiusIntegrationKind, GradiusPlacement, GradiusPrivacyRedactor, GradiusSyntheticIds,
-    ReqwestGradiusTransport,
+    GradiusUtilityRequest, ReqwestGradiusTransport,
 };
 use openplotva_storage::gradius_ads::{
     GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
@@ -14,6 +14,7 @@ use openplotva_telegram::{
     TELEGRAM_TEXT_MAX_BYTES, escape_telegram_html_text, is_valid_telegram_html,
     telegram_html_from_markdown,
 };
+use serde_json::Value;
 use serde_json::json;
 use time::OffsetDateTime;
 
@@ -33,6 +34,38 @@ pub trait GradiusDialogueClient: Send + Sync {
         &'a self,
         turn: GradiusDialogueTurn,
     ) -> Pin<Box<dyn Future<Output = GradiusDialogueCall> + Send + 'a>>;
+}
+
+pub struct GradiusUtilityCall {
+    pub result: Result<Option<GradiusPlacement>, String>,
+    pub exchange: Option<GradiusApiExchange>,
+}
+
+pub trait GradiusUtilityClient: Send + Sync {
+    fn utility<'a>(
+        &'a self,
+        request: GradiusUtilityRequest,
+    ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>>;
+}
+
+impl GradiusUtilityClient for GradiusClient<ReqwestGradiusTransport> {
+    fn utility<'a>(
+        &'a self,
+        request: GradiusUtilityRequest,
+    ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>> {
+        Box::pin(async move {
+            match GradiusClient::utility(self, request).await {
+                Ok(result) => GradiusUtilityCall {
+                    result: Ok(result.placement),
+                    exchange: Some(result.exchange),
+                },
+                Err(failure) => GradiusUtilityCall {
+                    result: Err(failure.to_string()),
+                    exchange: failure.exchange.map(|exchange| *exchange),
+                },
+            }
+        })
+    }
 }
 
 impl GradiusDialogueClient for GradiusClient<ReqwestGradiusTransport> {
@@ -76,6 +109,12 @@ pub trait GradiusAdLedger: Send + Sync {
     ) -> GradiusServiceFuture<'a, GradiusAdReservation>;
 
     fn record_api_call<'a>(&'a self, call: GradiusApiCallRecord) -> GradiusServiceFuture<'a, ()>;
+
+    fn set_source_context<'a>(
+        &'a self,
+        opportunity_id: i64,
+        context: Value,
+    ) -> GradiusServiceFuture<'a, ()>;
 
     fn finish_ad<'a>(
         &'a self,
@@ -133,12 +172,6 @@ pub trait GradiusAdLedger: Send + Sync {
         batch_id: &'a str,
     ) -> GradiusServiceFuture<'a, ()>;
 
-    fn mark_delivery_failed_by_batch<'a>(
-        &'a self,
-        batch_id: &'a str,
-        error: &'a str,
-    ) -> GradiusServiceFuture<'a, ()>;
-
     fn mark_delivery_failed<'a>(
         &'a self,
         opportunity_id: i64,
@@ -161,6 +194,18 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
     fn record_api_call<'a>(&'a self, call: GradiusApiCallRecord) -> GradiusServiceFuture<'a, ()> {
         Box::pin(async move {
             PostgresGradiusAdStore::record_api_call(self, call)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn set_source_context<'a>(
+        &'a self,
+        opportunity_id: i64,
+        context: Value,
+    ) -> GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            PostgresGradiusAdStore::set_source_context(self, opportunity_id, context)
                 .await
                 .map_err(|error| error.to_string())
         })
@@ -318,24 +363,6 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
         })
     }
 
-    fn mark_delivery_failed_by_batch<'a>(
-        &'a self,
-        batch_id: &'a str,
-        error: &'a str,
-    ) -> GradiusServiceFuture<'a, ()> {
-        Box::pin(async move {
-            PostgresGradiusAdStore::mark_delivery_failed_by_batch(
-                self,
-                batch_id,
-                error,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|store_error| store_error.to_string())
-        })
-    }
-
     fn mark_delivery_failed<'a>(
         &'a self,
         opportunity_id: i64,
@@ -396,6 +423,357 @@ pub struct GradiusAdAppendRequest {
 pub struct GradiusAdTail {
     pub opportunity_id: i64,
     pub html: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GradiusUtilitySurface {
+    Image,
+    Rates,
+    Checkin,
+}
+
+impl GradiusUtilitySurface {
+    const fn source_kind(self) -> &'static str {
+        match self {
+            Self::Image => "image-job",
+            Self::Rates => "rates-command",
+            Self::Checkin => "checkin-final",
+        }
+    }
+
+    const fn service_label(self) -> &'static str {
+        match self {
+            Self::Image => "image_generation",
+            Self::Rates => "currency_rates",
+            Self::Checkin => "checkin_game",
+        }
+    }
+}
+
+pub struct GradiusUtilityAdRequest {
+    pub surface: GradiusUtilitySurface,
+    pub source_id: String,
+    pub attempt_key: String,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub prompt: Option<String>,
+    pub result_context: Option<String>,
+    pub completed_at: OffsetDateTime,
+}
+
+#[derive(Clone)]
+pub struct GradiusUtilityAdService {
+    client: Arc<dyn GradiusUtilityClient>,
+    redactor: Arc<dyn GradiusTextRedactor>,
+    ledger: Arc<dyn GradiusAdLedger>,
+    vip: Arc<dyn GradiusVipChecker>,
+}
+
+impl GradiusUtilityAdService {
+    #[must_use]
+    pub fn new(
+        client: Arc<dyn GradiusUtilityClient>,
+        redactor: Arc<dyn GradiusTextRedactor>,
+        ledger: Arc<dyn GradiusAdLedger>,
+        vip: Arc<dyn GradiusVipChecker>,
+    ) -> Self {
+        Self {
+            client,
+            redactor,
+            ledger,
+            vip,
+        }
+    }
+
+    pub async fn prepare(
+        &self,
+        request: GradiusUtilityAdRequest,
+    ) -> Result<Option<GradiusAdTail>, String> {
+        if request.user_id <= 0
+            || request.source_id.is_empty()
+            || request.source_id.len() > 128
+            || !request
+                .source_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
+            || (request.surface == GradiusUtilitySurface::Image && request.chat_id <= 0)
+            || (request.surface != GradiusUtilitySurface::Image && request.chat_id == 0)
+        {
+            return Ok(None);
+        }
+        if self
+            .vip
+            .verified_is_vip(request.user_id, request.completed_at)
+            .await?
+        {
+            return Ok(None);
+        }
+        let Some(ids) =
+            GradiusSyntheticIds::derive(request.chat_id, request.thread_id, request.user_id)
+        else {
+            return Ok(None);
+        };
+        let reservation = self
+            .ledger
+            .reserve(GradiusAdOpportunityInput {
+                opportunity_key: format!("{}:{}", request.surface.source_kind(), request.source_id),
+                attempt_key: request.attempt_key.clone(),
+                dialog_job_id: None,
+                integration_kind: GradiusIntegrationKind::NativeUtility.as_str().to_owned(),
+                user_id: request.user_id,
+                chat_id: request.chat_id,
+                thread_id: request.thread_id.unwrap_or_default(),
+                model_version: None,
+                completed_at: request.completed_at,
+            })
+            .await?;
+        let opportunity_id = reservation.opportunity_id();
+        let attempt_generation = match reservation {
+            GradiusAdReservation::Replay { ad, .. } => {
+                return Ok(Some(GradiusAdTail {
+                    opportunity_id,
+                    html: ad.rendered_html,
+                }));
+            }
+            GradiusAdReservation::Reserved {
+                attempt_generation, ..
+            } => attempt_generation,
+            _ => return Ok(None),
+        };
+
+        let redacted = async {
+            let prompt = match request.prompt.as_deref() {
+                Some(text) => Some(self.redactor.redact(text).await?),
+                None => None,
+            };
+            let result_context = match request.result_context.as_deref() {
+                Some(text) => Some(self.redactor.redact(text).await?),
+                None => None,
+            };
+            Ok::<_, String>((prompt, result_context))
+        }
+        .await;
+        let (prompt, result_context) = match redacted {
+            Ok(redacted) => redacted,
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .finish_privacy_error(opportunity_id, attempt_generation)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.ledger
+            .set_source_context(
+                opportunity_id,
+                json!({
+                    "source": request.surface.source_kind(),
+                    "source_id": request.source_id,
+                    "prompt": prompt,
+                    "result": result_context,
+                }),
+            )
+            .await?;
+        let provider_request = GradiusUtilityRequest {
+            chat_id: ids.chat_id.clone(),
+            user_id: ids.user_id.clone(),
+            user_metadata: json!({"service": request.surface.service_label()}),
+            user_text_request: if request.surface == GradiusUtilitySurface::Image {
+                prompt
+            } else {
+                None
+            },
+            model_text_answer: if request.surface == GradiusUtilitySurface::Image {
+                Some("Image generation completed successfully".to_owned())
+            } else {
+                None
+            },
+        };
+        let call = self.client.utility(provider_request).await;
+        let provider_error = call.result.as_ref().err().cloned();
+        let response_json = call
+            .exchange
+            .as_ref()
+            .and_then(|exchange| exchange.response_json.clone());
+        if let Some(exchange) = call.exchange {
+            let status = exchange.status.map(i32::from);
+            let duration_ms = exchange.duration_ms;
+            let outcome = exchange.outcome.as_str().to_owned();
+            self.ledger
+                .record_api_call(GradiusApiCallRecord {
+                    opportunity_id,
+                    attempt_generation,
+                    sequence: 1,
+                    role: None,
+                    synthetic_chat_id: ids.chat_id,
+                    synthetic_user_id: ids.user_id,
+                    endpoint: exchange.endpoint,
+                    request_body: exchange.request_body,
+                    response_status: status,
+                    response_body: exchange.response_body,
+                    response_json: exchange.response_json,
+                    response_truncated: exchange.response_truncated,
+                    duration_ms,
+                    outcome: outcome.clone(),
+                    error: provider_error.clone(),
+                    created_at: request.completed_at,
+                })
+                .await?;
+            tracing::info!(
+                opportunity_id,
+                integration_kind = "native_utility",
+                status,
+                duration_ms,
+                outcome,
+                "Gradius utility exchange audited"
+            );
+        }
+        let placement = match call.result {
+            Ok(Some(GradiusPlacement::Standalone {
+                source_index,
+                markdown,
+                show_price,
+                click_price,
+                ad_context,
+                cta_text,
+                cta_link,
+            })) => (
+                source_index,
+                markdown,
+                show_price,
+                click_price,
+                ad_context,
+                cta_text,
+                cta_link,
+            ),
+            Ok(Some(_)) => {
+                let error = "Gradius returned an unsupported utility placement";
+                let _ = self
+                    .ledger
+                    .finish_render_error(opportunity_id, attempt_generation, error)
+                    .await;
+                return Err(error.to_owned());
+            }
+            Ok(None) => {
+                self.ledger
+                    .finish_no_ad(opportunity_id, attempt_generation)
+                    .await?;
+                return Ok(None);
+            }
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .finish_provider_error(opportunity_id, attempt_generation)
+                    .await;
+                return Err(error);
+            }
+        };
+        let (source_index, markdown, show_price, click_price, ad_context, cta_text, cta_link) =
+            placement;
+        let html = match render_utility_ad_html(
+            &request,
+            &markdown,
+            cta_text.as_deref(),
+            cta_link.as_deref(),
+        ) {
+            Ok(html) => html,
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .finish_render_error(opportunity_id, attempt_generation, &error)
+                    .await;
+                return Err(error);
+            }
+        };
+        let selected_index = Some(source_index);
+        let other_placements = response_json
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != selected_index)
+                    .map(|(index, _)| json!({"index": index, "display_status": "not_shown"}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.ledger
+            .finish_ad(
+                opportunity_id,
+                attempt_generation,
+                GradiusStoredAd {
+                    markdown,
+                    rendered_html: html.clone(),
+                    selected_placement: json!({
+                        "type": "native-text-ad", "selected_index": selected_index,
+                        "ad_context": ad_context, "cta_text": cta_text, "cta_link": cta_link,
+                        "other_placements": other_placements,
+                    }),
+                    insert_index: None,
+                    show_price,
+                    click_price,
+                    prepared_at: request.completed_at,
+                    shown_at: None,
+                },
+            )
+            .await?;
+        tracing::info!(
+            opportunity_id,
+            integration_kind = "native_utility",
+            source = request.surface.source_kind(),
+            delivery_state = "prepared",
+            "Gradius utility ad prepared"
+        );
+        Ok(Some(GradiusAdTail {
+            opportunity_id,
+            html,
+        }))
+    }
+
+    pub async fn mark_delivery_failed(
+        &self,
+        opportunity_id: i64,
+        error: &str,
+    ) -> Result<(), String> {
+        self.ledger
+            .mark_delivery_failed(opportunity_id, error)
+            .await
+    }
+}
+
+fn render_utility_ad_html(
+    request: &GradiusUtilityAdRequest,
+    markdown: &str,
+    cta_text: Option<&str>,
+    cta_link: Option<&str>,
+) -> Result<String, String> {
+    let mut ad_html = telegram_html_from_markdown(markdown).map_err(|error| error.to_string())?;
+    if let (Some(text), Some(link)) = (cta_text.filter(|text| !text.trim().is_empty()), cta_link)
+        && !markdown.contains(link)
+    {
+        let url = reqwest::Url::parse(link).map_err(|_| "Gradius CTA URL is invalid".to_owned())?;
+        if url.scheme() != "https" {
+            return Err("Gradius CTA URL is not HTTPS".to_owned());
+        }
+        ad_html.push_str("\n<a href=\"");
+        ad_html.push_str(&escape_telegram_html_text(link).replace('"', "&quot;"));
+        ad_html.push_str("\">");
+        ad_html.push_str(&escape_telegram_html_text(text));
+        ad_html.push_str("</a>");
+    }
+    let mut html = format!("{GRADIUS_AD_LABEL}{ad_html}");
+    if request.surface == GradiusUtilitySurface::Image {
+        let appendix = render_gradius_vip_appendix(&format!("image-job-{}", request.source_id))
+            .ok_or_else(|| "Gradius VIP appendix catalog is empty".to_owned())?;
+        html.push_str("\n\n");
+        html.push_str(&appendix);
+    }
+    if html.len() > TELEGRAM_TEXT_MAX_BYTES || !is_valid_telegram_html(&html) {
+        return Err("Gradius utility ad is not valid Telegram HTML".to_owned());
+    }
+    Ok(html)
 }
 
 pub trait GradiusAdAppender: Send + Sync {
@@ -941,18 +1319,19 @@ mod tests {
 
     use openplotva_llm::gradius::{
         GradiusApiExchange, GradiusCallOutcome, GradiusDialogueAd, GradiusDialogueRole,
-        GradiusDialogueTurn, GradiusIntegrationKind, GradiusPlacement,
+        GradiusDialogueTurn, GradiusIntegrationKind, GradiusPlacement, GradiusUtilityRequest,
     };
     use openplotva_storage::gradius_ads::{
         GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::OffsetDateTime;
 
     use super::{
         GradiusAdAppendRequest, GradiusAdLedger, GradiusAdService, GradiusDialogueCall,
-        GradiusDialogueClient, GradiusTextRedactor, GradiusVipChecker, gradius_privacy_config,
-        render_vip_hint_html,
+        GradiusDialogueClient, GradiusTextRedactor, GradiusUtilityAdRequest,
+        GradiusUtilityAdService, GradiusUtilityCall, GradiusUtilityClient, GradiusUtilitySurface,
+        GradiusVipChecker, gradius_privacy_config, render_vip_hint_html,
     };
 
     type TestFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -1005,6 +1384,58 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct UtilityStub {
+        calls: Arc<Mutex<Vec<GradiusUtilityRequest>>>,
+    }
+
+    impl GradiusUtilityClient for UtilityStub {
+        fn utility<'a>(
+            &'a self,
+            request: GradiusUtilityRequest,
+        ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("utility calls")
+                    .push(request.clone());
+                GradiusUtilityCall {
+                    result: Ok(Some(GradiusPlacement::Standalone {
+                        source_index: 0,
+                        markdown: "**Ad** [here](https://ads.example/1)".to_owned(),
+                        show_price: Some(1.5),
+                        click_price: Some(3.0),
+                        ad_context: None,
+                        cta_text: None,
+                        cta_link: None,
+                    })),
+                    exchange: Some(GradiusApiExchange {
+                        integration_kind: GradiusIntegrationKind::NativeUtility,
+                        role: None,
+                        endpoint: format!(
+                            "https://ads.example/utility?chat_id={}",
+                            request.chat_id
+                        ),
+                        request_body: json!({
+                            "user_metadata": request.user_metadata,
+                            "user_text_request": request.user_text_request,
+                            "model_text_answer": request.model_text_answer,
+                        }),
+                        status: Some(200),
+                        response_body: Some("[]".to_owned()),
+                        response_json: Some(json!([
+                            {"type":"native-text-ad","content":"**Ad** [here](https://ads.example/1)"},
+                            {"type":"native-text-ad","content":"not shown"},
+                        ])),
+                        response_truncated: false,
+                        duration_ms: 8,
+                        outcome: GradiusCallOutcome::Ad,
+                    }),
+                }
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
     struct RedactorStub {
         calls: Arc<Mutex<Vec<String>>>,
     }
@@ -1028,6 +1459,7 @@ mod tests {
         reservation: Arc<Mutex<Option<GradiusAdReservation>>>,
         reserved_inputs: Arc<Mutex<Vec<GradiusAdOpportunityInput>>>,
         api_calls: Arc<Mutex<Vec<GradiusApiCallRecord>>>,
+        source_contexts: Arc<Mutex<Vec<Value>>>,
         finished_ads: Arc<Mutex<Vec<(i64, GradiusStoredAd)>>>,
         finished_no_ads: Arc<Mutex<Vec<i64>>>,
         finished_provider_errors: Arc<Mutex<Vec<i64>>>,
@@ -1036,7 +1468,6 @@ mod tests {
         render_errors: Arc<Mutex<Vec<(i64, String)>>>,
         queued: Arc<Mutex<Vec<(i64, String)>>>,
         delivered_batches: Arc<Mutex<Vec<String>>>,
-        failed_delivery_batches: Arc<Mutex<Vec<(String, String)>>>,
         failed_delivery_opportunities: Arc<Mutex<Vec<(i64, String)>>>,
     }
 
@@ -1075,6 +1506,20 @@ mod tests {
         fn record_api_call<'a>(&'a self, call: GradiusApiCallRecord) -> TestFuture<'a, ()> {
             Box::pin(async move {
                 self.api_calls.lock().expect("api calls").push(call);
+                Ok(())
+            })
+        }
+
+        fn set_source_context<'a>(
+            &'a self,
+            _opportunity_id: i64,
+            context: Value,
+        ) -> TestFuture<'a, ()> {
+            Box::pin(async move {
+                self.source_contexts
+                    .lock()
+                    .expect("source contexts")
+                    .push(context);
                 Ok(())
             })
         }
@@ -1203,20 +1648,6 @@ mod tests {
             })
         }
 
-        fn mark_delivery_failed_by_batch<'a>(
-            &'a self,
-            batch_id: &'a str,
-            error: &'a str,
-        ) -> TestFuture<'a, ()> {
-            Box::pin(async move {
-                self.failed_delivery_batches
-                    .lock()
-                    .expect("failed delivery batches")
-                    .push((batch_id.to_owned(), error.to_owned()));
-                Ok(())
-            })
-        }
-
         fn mark_delivery_failed<'a>(
             &'a self,
             opportunity_id: i64,
@@ -1311,6 +1742,111 @@ mod tests {
             render_vip_hint_html("VIP и не-VIP: 2 < 3 & SVIPX"),
             "<tg-spoiler><a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a> и не-<a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a>: 2 &lt; 3 &amp; SVIPX</tg-spoiler>"
         );
+    }
+
+    #[tokio::test]
+    async fn utility_image_redacts_prompt_and_audits_only_selected_placement() {
+        let client = UtilityStub::default();
+        let ledger = LedgerStub::default();
+        let service = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        let ad = service
+            .prepare(GradiusUtilityAdRequest {
+                surface: GradiusUtilitySurface::Image,
+                source_id: "42".to_owned(),
+                attempt_key: "claim-1".to_owned(),
+                user_id: 100,
+                chat_id: 100,
+                thread_id: None,
+                prompt: Some("Portrait of Alice@example.com".to_owned()),
+                result_context: Some("Image generated".to_owned()),
+                completed_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .await
+            .expect("prepared")
+            .expect("ad");
+        let request = client.calls.lock().expect("utility calls")[0].clone();
+        assert_eq!(request.user_text_request.as_deref(), Some("user-safe"));
+        assert_eq!(
+            request.model_text_answer.as_deref(),
+            Some("Image generation completed successfully")
+        );
+        assert!(ad.html.starts_with("📢 <b>Ad</b>"));
+        assert!(ad.html.contains("<tg-spoiler>"));
+        let context = ledger.source_contexts.lock().expect("contexts")[0].clone();
+        assert_eq!(context["prompt"], "user-safe");
+        let calls = ledger.api_calls.lock().expect("api calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].role, None);
+        assert!(
+            !calls[0]
+                .request_body
+                .to_string()
+                .contains("Alice@example.com")
+        );
+        assert!(!calls[0].request_body.to_string().contains("Auth"));
+        let ads = ledger.finished_ads.lock().expect("finished ads");
+        assert_eq!(ads[0].1.show_price, Some(1.5));
+        assert_eq!(ads[0].1.selected_placement["selected_index"], 0);
+        assert_eq!(
+            ads[0].1.selected_placement["other_placements"][0]["display_status"],
+            "not_shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn utility_service_uses_empty_texts_and_skips_vip_or_unknown_initiator() {
+        let client = UtilityStub::default();
+        let ledger = LedgerStub::default();
+        let service = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        let request = |user_id| GradiusUtilityAdRequest {
+            surface: GradiusUtilitySurface::Rates,
+            source_id: format!("-100:{user_id}"),
+            attempt_key: "rates-claim".to_owned(),
+            user_id,
+            chat_id: -100,
+            thread_id: None,
+            prompt: None,
+            result_context: Some("Alice's rate table".to_owned()),
+            completed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert!(
+            service
+                .prepare(request(0))
+                .await
+                .expect("unknown user")
+                .is_none()
+        );
+        let ad = service
+            .prepare(request(100))
+            .await
+            .expect("prepared")
+            .expect("ad");
+        assert!(ad.html.starts_with("📢 "));
+        assert!(!ad.html.contains("<tg-spoiler>"));
+        {
+            let sent = client.calls.lock().expect("calls");
+            assert_eq!(sent[0].user_text_request, None);
+            assert_eq!(sent[0].model_text_answer, None);
+            assert_eq!(sent[0].user_metadata, json!({"service":"currency_rates"}));
+        }
+        let vip = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger),
+            Arc::new(VipStub(true)),
+        );
+        assert!(vip.prepare(request(101)).await.expect("vip").is_none());
+        assert_eq!(client.calls.lock().expect("calls").len(), 1);
     }
 
     #[tokio::test]

@@ -2,8 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    DeleteMessage, EditMessageText, ReactionType, ReplyMarkup, ReplyParameters, SendMessage,
-    SetMessageReaction,
+    DeleteMessage, EditMessageText, LinkPreviewOptions, ReactionType, ReplyMarkup, ReplyParameters,
+    SendMessage, SetMessageReaction,
 };
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
@@ -663,6 +663,9 @@ fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
     if let Some(markup) = reply_markup(value) {
         method = method.with_reply_markup(markup);
     }
+    if let Some(options) = link_preview_options(value) {
+        method = method.with_link_preview_options(options);
+    }
     Some(TelegramOutboundMethod::from(method))
 }
 
@@ -677,7 +680,15 @@ fn replay_edit_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
     {
         method = method.with_parse_mode(parse_mode);
     }
+    if let Some(options) = link_preview_options(value) {
+        method = method.with_link_preview_options(options);
+    }
     Some(TelegramOutboundMethod::from(method))
+}
+
+fn link_preview_options(value: &Value) -> Option<LinkPreviewOptions> {
+    let options = field_value(value, &["LinkPreviewOptions", "link_preview_options"])?;
+    serde_json::from_value(options.clone()).ok()
 }
 
 fn replay_delete_method(value: &Value) -> Option<TelegramOutboundMethod> {
@@ -1503,6 +1514,30 @@ mod tests {
 
         assert!(snapshot_outbound_method(&sticker_method(42, "sticker-file-id")).is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn durable_text_send_and_edit_preserve_disabled_link_previews()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use carapax::types::{EditMessageText, LinkPreviewOptions, SendMessage};
+
+        let preview = LinkPreviewOptions::default().with_is_disabled(true);
+        let methods = [
+            TelegramOutboundMethod::from(
+                SendMessage::new(42, "ad").with_link_preview_options(preview.clone()),
+            ),
+            TelegramOutboundMethod::from(
+                EditMessageText::for_chat_message(42, 9, "ad").with_link_preview_options(preview),
+            ),
+        ];
+        for method in methods {
+            let (kind, payload) = snapshot_outbound_method(&method).expect("replayable");
+            let replayed = replay_outbound_method(kind, &payload).expect("replayed");
+            let (_, replayed_payload) = snapshot_outbound_method(&replayed).expect("replayable");
+            let value: Value = serde_json::from_slice(&replayed_payload)?;
+            assert_eq!(value["link_preview_options"]["is_disabled"], json!(true));
+        }
         Ok(())
     }
 

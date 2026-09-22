@@ -332,6 +332,16 @@ pub async fn enqueue_telegram_outbox_batch(
     pool: &PgPool,
     batch: &TelegramOutboxBatchInput,
 ) -> Result<QueuedTelegramOutboxBatch, StorageError> {
+    let mut tx = pool.begin().await?;
+    let queued = enqueue_telegram_outbox_batch_in_transaction(&mut tx, batch).await?;
+    tx.commit().await?;
+    Ok(queued)
+}
+
+pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    batch: &TelegramOutboxBatchInput,
+) -> Result<QueuedTelegramOutboxBatch, StorageError> {
     if batch.parts.is_empty() {
         return Err(StorageError::TelegramOutboxEmptyBatch);
     }
@@ -351,11 +361,10 @@ pub async fn enqueue_telegram_outbox_batch(
         });
     }
 
-    let mut tx = pool.begin().await?;
     let mut blob_ids = HashMap::with_capacity(blobs.len());
     if !blobs.is_empty() {
         let mut builder = outbox_blob_insert_builder(&blobs);
-        let rows = builder.build().fetch_all(&mut *tx).await?;
+        let rows = builder.build().fetch_all(&mut **tx).await?;
         if rows.len() != blobs.len() {
             return Err(StorageError::TelegramOutboxBlobConflict);
         }
@@ -369,7 +378,7 @@ pub async fn enqueue_telegram_outbox_batch(
 
     let parts = prepare_parts(batch, &blob_ids)?;
     let mut builder = outbox_operation_insert_builder(batch, &parts);
-    let rows = builder.build().fetch_all(&mut *tx).await?;
+    let rows = builder.build().fetch_all(&mut **tx).await?;
     if rows.len() != parts.len() {
         return Err(StorageError::TelegramOutboxIdempotencyConflict {
             batch_id: batch.batch_id.clone(),
@@ -388,7 +397,6 @@ pub async fn enqueue_telegram_outbox_batch(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
     queued.sort_by_key(|part| part.part_index);
-    tx.commit().await?;
     Ok(QueuedTelegramOutboxBatch {
         batch_id: batch.batch_id.clone(),
         parts: queued,

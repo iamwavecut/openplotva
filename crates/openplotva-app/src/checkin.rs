@@ -564,6 +564,8 @@ pub struct CheckinGameRuntimeEffects<Store, Sender> {
     permissions: Arc<ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>>,
     bot_id: i64,
     pick_index: Arc<dyn Fn(usize) -> usize + Send + Sync>,
+    utility_ads: Option<Arc<crate::gradius_ads::GradiusUtilityAdService>>,
+    utility_outbox: Option<Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>>,
 }
 
 #[derive(Clone)]
@@ -981,6 +983,8 @@ impl<Store, Sender> CheckinGameRuntimeEffects<Store, Sender> {
             permissions,
             bot_id,
             pick_index: Arc::new(default_checkin_index),
+            utility_ads: None,
+            utility_outbox: None,
         }
     }
 
@@ -988,6 +992,17 @@ impl<Store, Sender> CheckinGameRuntimeEffects<Store, Sender> {
     #[must_use]
     pub fn with_picker(mut self, pick_index: Arc<dyn Fn(usize) -> usize + Send + Sync>) -> Self {
         self.pick_index = pick_index;
+        self
+    }
+
+    #[must_use]
+    pub fn with_utility_ads(
+        mut self,
+        ads: Arc<crate::gradius_ads::GradiusUtilityAdService>,
+        outbox: Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>,
+    ) -> Self {
+        self.utility_ads = Some(ads);
+        self.utility_outbox = Some(outbox);
         self
     }
 }
@@ -1033,6 +1048,14 @@ where
                 },
                 &*self.pick_index,
                 true,
+                self.utility_ads
+                    .as_deref()
+                    .zip(self.utility_outbox.as_deref())
+                    .map(|(ads, outbox)| CheckinUtilityAds {
+                        ads,
+                        outbox,
+                        initiator_id: params.user_id,
+                    }),
             )
             .await
             .map(|_| ())
@@ -1051,7 +1074,14 @@ where
     Sender: CheckinGameSender + Sync,
     Pick: Fn(usize) -> usize + Sync,
 {
-    run_checkin_game_inner(store, sender, request, &pick_index, false).await
+    run_checkin_game_inner(store, sender, request, &pick_index, false, None).await
+}
+
+#[derive(Clone, Copy)]
+struct CheckinUtilityAds<'a> {
+    ads: &'a crate::gradius_ads::GradiusUtilityAdService,
+    outbox: &'a crate::gradius_utility_outbox::GradiusUtilityOutbox,
+    initiator_id: i64,
 }
 
 async fn run_checkin_game_inner<Store, Sender, Pick>(
@@ -1060,6 +1090,7 @@ async fn run_checkin_game_inner<Store, Sender, Pick>(
     request: CheckinGameRunRequest,
     pick_index: &Pick,
     sleep_between_steps: bool,
+    utility_ads: Option<CheckinUtilityAds<'_>>,
 ) -> Result<CheckinGameRunOutcome, CheckinGameRunError>
 where
     Store: CheckinGameStore + Sync,
@@ -1132,6 +1163,8 @@ where
                 winner_id,
                 pick_index,
                 sleep_between_steps,
+                utility_ads,
+                request.now,
             )
             .await?;
             Ok(CheckinGameRunOutcome::WinnerRecorded {
@@ -1298,6 +1331,7 @@ fn daily_game_disabled(settings: &openplotva_core::ChatSettings) -> bool {
     settings.enable_daily_game == Some(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_checkin_animation<Store, Sender, Pick>(
     store: &Store,
     sender: &Sender,
@@ -1306,6 +1340,8 @@ async fn run_checkin_animation<Store, Sender, Pick>(
     winner_id: i64,
     pick_index: &Pick,
     sleep_between_steps: bool,
+    utility_ads: Option<CheckinUtilityAds<'_>>,
+    game_at: OffsetDateTime,
 ) -> Result<(), CheckinGameRunError>
 where
     Store: CheckinGameStore + Sync,
@@ -1347,6 +1383,77 @@ where
     let linked_name = winner_link(store, winner_id).await;
     text.push_str("\n\n");
     text.push_str(&theme.winner_text(&linked_name));
+    if let Some(utility) = utility_ads {
+        if let Err(_error) = sender
+            .edit_checkin_html(message, message_id, text.clone())
+            .await
+        {
+            tracing::warn!(
+                chat_id = message.chat_id,
+                message_id,
+                "failed to edit check-in winner message before optional ad"
+            );
+        }
+        let source_id = format!("{}:{}", message.chat_id, game_at.date());
+        let result_context = openplotva_telegram::strip_telegram_html(&text);
+        let prepared = utility
+            .ads
+            .prepare(crate::gradius_ads::GradiusUtilityAdRequest {
+                surface: crate::gradius_ads::GradiusUtilitySurface::Checkin,
+                source_id: source_id.clone(),
+                attempt_key: format!(
+                    "checkin-final:{source_id}:{}",
+                    OffsetDateTime::now_utc().unix_timestamp_nanos()
+                ),
+                user_id: utility.initiator_id,
+                chat_id: message.chat_id,
+                thread_id: message.thread_id,
+                prompt: None,
+                result_context: Some(result_context),
+                completed_at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        match prepared {
+            Ok(Some(ad)) => {
+                let base = openplotva_telegram::sanitize_telegram_html(
+                    &text.replace("</h2>", "\n").replace("</p>", "\n"),
+                );
+                let html = format!("{base}\n\n{}", ad.html);
+                match utility
+                    .outbox
+                    .queue_final_edit(
+                        utility.ads,
+                        &format!("checkin-final:{source_id}"),
+                        ad.opportunity_id,
+                        message.chat_id,
+                        message.thread_id,
+                        i64::from(message_id),
+                        html,
+                    )
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(_error) => {
+                        tracing::warn!(
+                            opportunity_id = ad.opportunity_id,
+                            integration_kind = "native_utility",
+                            source = "checkin",
+                            "Gradius Check-in final edit not queued"
+                        )
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_error) => {
+                tracing::warn!(
+                    integration_kind = "native_utility",
+                    source = "checkin",
+                    "Gradius Check-in ad skipped"
+                )
+            }
+        }
+        return Ok(());
+    }
     if let Err(error) = sender.edit_checkin_html(message, message_id, text).await {
         tracing::warn!(
             message = %error,

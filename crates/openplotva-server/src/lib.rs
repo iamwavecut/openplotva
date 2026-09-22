@@ -2358,7 +2358,8 @@ mod tests {
                     filter,
                     RuntimeGradiusOpportunitiesFilter {
                         range: "7d".to_owned(),
-                        integration_kind: "native_dialogue".to_owned(),
+                        integration_kind: "native_utility".to_owned(),
+                        source: "image-job".to_owned(),
                         outcome: "ad".to_owned(),
                         delivery_state: "delivered".to_owned(),
                         user_id: Some(7),
@@ -2386,7 +2387,15 @@ mod tests {
                     filter,
                     RuntimeGradiusSummaryFilter {
                         range: "24h".to_owned(),
-                        integration_kind: "native_dialogue".to_owned(),
+                        integration_kind: "native_utility".to_owned(),
+                        source: "image-job".to_owned(),
+                        outcome: "ad".to_owned(),
+                        delivery_state: "delivered".to_owned(),
+                        user_id: Some(7),
+                        chat_id: Some(8),
+                        dialog_job_id: Some(9),
+                        model: "qwen".to_owned(),
+                        q: "sale".to_owned(),
                     }
                 );
                 Box::pin(async {
@@ -2412,7 +2421,8 @@ mod tests {
                 query {
                     gradiusAdOpportunities(filter: {
                         range: "7d",
-                        integrationKind: "native_dialogue",
+                        integrationKind: "native_utility",
+                        source: "image-job",
                         outcome: "ad",
                         deliveryState: "delivered",
                         userID: "7",
@@ -2423,7 +2433,11 @@ mod tests {
                         offset: -2,
                         limit: 900
                     })
-                    gradiusAdSummary(filter: { range: "24h", integrationKind: "native_dialogue" })
+                    gradiusAdSummary(filter: {
+                        range: "24h", integrationKind: "native_utility", source: "image-job",
+                        outcome: "ad", deliveryState: "delivered", userID: "7", chatID: "8",
+                        dialogJobID: "9", model: "qwen", q: "sale"
+                    })
                 }
                 "#,
             )
@@ -2444,6 +2458,11 @@ mod tests {
             .await;
         assert_eq!(invalid.errors.len(), 1);
         assert!(invalid.errors[0].message.contains("invalid userID"));
+        let invalid_summary = schema
+            .execute(r#"query { gradiusAdSummary(filter: { chatID: "bad" }) }"#)
+            .await;
+        assert_eq!(invalid_summary.errors.len(), 1);
+        assert!(invalid_summary.errors[0].message.contains("invalid chatID"));
     }
 
     #[tokio::test]

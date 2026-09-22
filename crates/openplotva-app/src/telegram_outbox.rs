@@ -106,6 +106,21 @@ pub trait TelegramOutboxJobResolver: Send + Sync {
         batch_id: &'a str,
         error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error>;
+
+    fn complete_unlinked_batch<'a>(
+        &'a self,
+        _batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn fail_unlinked_batch<'a>(
+        &'a self,
+        _batch_id: &'a str,
+        _error: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl TelegramOutboxJobResolver for SharedTaskQueueRuntime {
@@ -223,6 +238,39 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
                 );
             }
             Ok(())
+        })
+    }
+
+    fn complete_unlinked_batch<'a>(
+        &'a self,
+        batch_id: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        Box::pin(async move {
+            if !batch_id.starts_with("gradius-utility:v1:") {
+                return Ok(());
+            }
+            self.gradius
+                .mark_delivered_by_batch(batch_id, OffsetDateTime::now_utc())
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn fail_unlinked_batch<'a>(
+        &'a self,
+        batch_id: &'a str,
+        error: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        Box::pin(async move {
+            if !batch_id.starts_with("gradius-utility:v1:") {
+                return Ok(());
+            }
+            self.gradius
+                .mark_delivery_failed_by_batch(batch_id, error, OffsetDateTime::now_utc())
+                .await
+                .map(|_| ())
+                .map_err(|store_error| store_error.to_string())
         })
     }
 }
@@ -786,7 +834,43 @@ async fn handle_send_error<Jobs>(
     let http_status = telegram_error_status(&error);
     let error_text = error.diagnostic_message();
 
+    if operation.batch_id.starts_with("gradius-utility:v1:")
+        && operation.method_kind == "editMessageText"
+        && operation.delivery_policy == "target_idempotent"
+        && error_text
+            .to_ascii_lowercase()
+            .contains("message is not modified")
+    {
+        let receipt = telegram_response_receipt(TelegramOutboundResponse::EditMessage(
+            EditMessageResult::Bool(true),
+        ));
+        match store
+            .mark_delivered_with_history(
+                operation.id,
+                operation.lease_token,
+                "edit_message",
+                &receipt.message_ids,
+                &receipt.value,
+                &[],
+            )
+            .await
+        {
+            Ok(true) => {
+                report.delivered = report.delivered.saturating_add(1);
+                resolve_batch(store, jobs, &operation.batch_id, report).await;
+            }
+            Ok(false) => report.lease_lost = report.lease_lost.saturating_add(1),
+            Err(store_error) => record_worker_error(
+                report,
+                format!("confirm idempotent Gradius edit: {store_error}"),
+            ),
+        }
+        return;
+    }
+
     if error.is_reply_missing()
+        && !(operation.batch_id.starts_with("gradius-utility:v1:")
+            && operation.batch_id.split(':').nth(3) == Some("image-job"))
         && let Some(replacement) = reply_missing_replacement
     {
         let transitioned = store
@@ -1527,6 +1611,35 @@ async fn reconcile_resolved_taskman_batches<Jobs>(
     for batch_id in batch_ids {
         resolve_batch(store, jobs, &batch_id, report).await;
     }
+    let utility_batch_ids = match sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT opportunity.outbox_batch_id \
+         FROM gradius_ad_opportunities AS opportunity \
+         JOIN telegram_outbox AS operation ON operation.batch_id = opportunity.outbox_batch_id \
+         WHERE opportunity.integration_kind = 'native_utility' \
+           AND opportunity.delivery_state = 'queued' \
+           AND opportunity.outbox_batch_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM telegram_outbox AS unresolved \
+               WHERE unresolved.batch_id = operation.batch_id \
+                 AND (unresolved.state IN ('pending', 'leased', 'retry_wait') \
+                      OR unresolved.last_error_class = 'history_pending')) \
+         ORDER BY opportunity.outbox_batch_id LIMIT $1",
+    )
+    .bind(i64::try_from(OUTBOX_MAINTENANCE_LIMIT).unwrap_or(1_000))
+    .fetch_all(store.pool())
+    .await
+    {
+        Ok(batch_ids) => batch_ids,
+        Err(error) => {
+            record_worker_error(
+                report,
+                format!("scan resolved Gradius utility batches: {error}"),
+            );
+            return;
+        }
+    };
+    for batch_id in utility_batch_ids {
+        resolve_batch(store, jobs, &batch_id, report).await;
+    }
 }
 
 enum BatchResolution {
@@ -1580,8 +1693,19 @@ async fn resolve_batch<Jobs>(
 {
     match batch_resolution(store, batch_id).await {
         Ok(BatchResolution::Pending) => {}
-        Ok(BatchResolution::Delivered { job_id: None })
-        | Ok(BatchResolution::Terminal { job_id: None, .. }) => {}
+        Ok(BatchResolution::Delivered { job_id: None }) => {
+            if let Err(error) = jobs.complete_unlinked_batch(batch_id).await {
+                record_worker_error(report, format!("confirm unlinked Telegram batch: {error}"));
+            }
+        }
+        Ok(BatchResolution::Terminal {
+            job_id: None,
+            error,
+        }) => {
+            if let Err(failure) = jobs.fail_unlinked_batch(batch_id, &error).await {
+                record_worker_error(report, format!("fail unlinked Telegram batch: {failure}"));
+            }
+        }
         Ok(BatchResolution::Delivered {
             job_id: Some(job_id),
         }) => match jobs.complete_job(job_id, batch_id).await {
@@ -1669,6 +1793,254 @@ fn merge_worker_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UtilityReceiptTransport {
+        already_edited: bool,
+        reply_missing: bool,
+        chat_id: i64,
+        sent: Mutex<Vec<Value>>,
+    }
+
+    impl TelegramOutboxTransport for UtilityReceiptTransport {
+        fn execute<'a>(&'a self, command: OutboundCommand) -> TelegramOutboxTransportFuture<'a> {
+            Box::pin(async move {
+                let (_, _, payload) = command
+                    .into_storage_parts()
+                    .expect("persisted text command");
+                self.sent.lock().expect("sent commands").push(payload);
+                if self.reply_missing {
+                    return Err(TelegramOutboundExecuteError::Rich(RichApiError::Api {
+                        code: 400,
+                        description: "Bad Request: message to be replied not found".to_owned(),
+                        retry_after: None,
+                    }));
+                }
+                if self.already_edited {
+                    return Err(TelegramOutboundExecuteError::Rich(RichApiError::Api {
+                        code: 400,
+                        description: "Bad Request: message is not modified".to_owned(),
+                        retry_after: None,
+                    }));
+                }
+                let message = serde_json::from_value(json!({
+                    "message_id": 982,
+                    "date": 1,
+                    "chat": {"id": self.chat_id, "type": "private", "first_name": "Test"}
+                }))
+                .expect("Telegram receipt");
+                Ok(TelegramOutboundResponse::Message(Box::new(message)))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_utility_receipts_confirm_delivery_and_recover_missed_callbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use openplotva_storage::gradius_ads::{GradiusAdOpportunityInput, GradiusStoredAd};
+
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let ledger = PostgresGradiusAdStore::new(pool.clone());
+        let store = PostgresTelegramOutboxStore::new(pool.clone());
+        let history = PostgresHistoryStore::new(pool.clone());
+        let (queue, _) = SharedTaskQueueRuntime::load_from_postgres_with_id_allocator(
+            openplotva_storage::PostgresTaskQueueStore::new(pool.clone()),
+            openplotva_taskman::TaskQueueIdAllocator::default(),
+        )
+        .await?;
+        let resolver = RunAwareTelegramOutboxJobResolver::new(
+            queue,
+            crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(4),
+            ledger.clone(),
+        );
+        for (already_edited, reply_missing) in [(false, false), (true, false), (false, true)] {
+            let chat_id = if already_edited {
+                -9_820_825_960_i64
+            } else {
+                9_820_825_960
+            };
+            let source = if already_edited {
+                "checkin-final"
+            } else {
+                "image-job"
+            };
+            let batch_id = format!("gradius-utility:v1:7:{source}:receipt-test");
+            sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&batch_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM gradius_ad_opportunities WHERE chat_id = $1")
+                .bind(chat_id)
+                .execute(&pool)
+                .await?;
+            let now = OffsetDateTime::now_utc();
+            let reservation = ledger
+                .reserve_opportunity(GradiusAdOpportunityInput {
+                    opportunity_key: format!("{source}:receipt-test"),
+                    attempt_key: "attempt-1".to_owned(),
+                    dialog_job_id: None,
+                    integration_kind: "native_utility".to_owned(),
+                    user_id: 9_820_825_960,
+                    chat_id,
+                    thread_id: 0,
+                    model_version: None,
+                    completed_at: now,
+                })
+                .await?;
+            let opportunity_id = reservation.opportunity_id();
+            ledger
+                .finish_ad(
+                    opportunity_id,
+                    1,
+                    GradiusStoredAd {
+                        markdown: "Offer".to_owned(),
+                        rendered_html: "📢 Offer".to_owned(),
+                        selected_placement: json!({"type": "native-text-ad"}),
+                        insert_index: None,
+                        show_price: Some(0.25),
+                        click_price: None,
+                        prepared_at: now,
+                        shown_at: None,
+                    },
+                )
+                .await?;
+            let preview = carapax::types::LinkPreviewOptions::default().with_is_disabled(true);
+            let method = if already_edited {
+                TelegramOutboundMethod::from(
+                    carapax::types::EditMessageText::for_chat_message(chat_id, 77, "📢 Offer")
+                        .with_link_preview_options(preview),
+                )
+            } else {
+                TelegramOutboundMethod::from(
+                    carapax::types::SendMessage::new(chat_id, "📢 Offer")
+                        .with_reply_parameters(carapax::types::ReplyParameters::new(77))
+                        .with_link_preview_options(preview),
+                )
+            };
+            let (method_kind, payload_version, payload) =
+                OutboundCommand::try_from_method(method)?.into_storage_parts()?;
+            ledger
+                .enqueue_utility_ad(
+                    opportunity_id,
+                    &TelegramOutboxBatchInput {
+                        batch_id: batch_id.clone(),
+                        bot_id: 7,
+                        chat_id: Some(chat_id),
+                        thread_id: None,
+                        ordering_key: batch_id.clone(),
+                        causation_update_id: None,
+                        dialog_job_id: None,
+                        trigger_message_id: Some(77),
+                        delivery_policy: if already_edited {
+                            TelegramDeliveryPolicy::TargetIdempotent
+                        } else {
+                            TelegramDeliveryPolicy::Create
+                        },
+                        protected: true,
+                        priority: 999,
+                        parts: vec![TelegramOutboxPartInput {
+                            method_kind: method_kind.to_owned(),
+                            payload_version,
+                            payload,
+                            blob: None,
+                            available_at: now,
+                            expires_at: None,
+                        }],
+                    },
+                )
+                .await?;
+            let transport = UtilityReceiptTransport {
+                already_edited,
+                reply_missing,
+                chat_id,
+                sent: Mutex::new(vec![]),
+            };
+            let operation = store
+                .claim_operations("utility-receipt-test", 1)
+                .await?
+                .remove(0);
+            assert_eq!(operation.batch_id, batch_id);
+            let mut report = TelegramOutboxWorkerReport::default();
+            process_claimed_operation(
+                &store,
+                &history,
+                &transport,
+                &resolver,
+                operation,
+                &TelegramOutboxWorkerConfig::default(),
+                &mut report,
+            )
+            .await;
+            assert_eq!(
+                report.delivered,
+                u64::from(!reply_missing),
+                "{:?}",
+                report.last_error
+            );
+            assert_eq!(report.retried, 0);
+            assert_eq!(report.errors, 0, "{:?}", report.last_error);
+            let sent = transport.sent.lock().expect("sent commands").clone();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["link_preview_options"]["is_disabled"], true);
+            if !already_edited {
+                assert_eq!(sent[0]["reply_parameters"]["message_id"], 77);
+            }
+            let shown: Option<OffsetDateTime> =
+                sqlx::query_scalar("SELECT shown_at FROM gradius_ad_opportunities WHERE id = $1")
+                    .bind(opportunity_id)
+                    .fetch_one(&pool)
+                    .await?;
+            if reply_missing {
+                assert!(shown.is_none());
+                assert_eq!(report.dead_lettered, 1);
+                let state: String = sqlx::query_scalar(
+                    "SELECT delivery_state FROM gradius_ad_opportunities WHERE id = $1",
+                )
+                .bind(opportunity_id)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(state, "failed");
+                sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+                    .bind(&batch_id)
+                    .execute(&pool)
+                    .await?;
+                sqlx::query("DELETE FROM gradius_ad_opportunities WHERE chat_id = $1")
+                    .bind(chat_id)
+                    .execute(&pool)
+                    .await?;
+                continue;
+            }
+            assert!(shown.is_some());
+            resolver.complete_unlinked_batch(&batch_id).await?;
+            let repeated: Option<OffsetDateTime> =
+                sqlx::query_scalar("SELECT shown_at FROM gradius_ad_opportunities WHERE id = $1")
+                    .bind(opportunity_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(shown, repeated);
+            sqlx::query("UPDATE gradius_ad_opportunities SET delivery_state = 'queued', delivered_at = NULL, shown_at = NULL WHERE id = $1")
+                .bind(opportunity_id).execute(&pool).await?;
+            reconcile_resolved_taskman_batches(&store, &resolver, &mut report).await;
+            let recovered: bool = sqlx::query_scalar("SELECT delivery_state = 'delivered' AND shown_at IS NOT NULL FROM gradius_ad_opportunities WHERE id = $1")
+                .bind(opportunity_id).fetch_one(&pool).await?;
+            assert!(recovered);
+            sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&batch_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM gradius_ad_opportunities WHERE chat_id = $1")
+                .bind(chat_id)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn worker_metrics_publish_liveness_and_recent_errors() {

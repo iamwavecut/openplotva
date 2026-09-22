@@ -1161,6 +1161,115 @@ pub struct RatesRichEffects {
     rich: Arc<dyn crate::rich::RichSender>,
 }
 
+#[derive(Clone)]
+pub struct RatesUtilityEffects {
+    rich: RatesRichEffects,
+    ads: Option<Arc<crate::gradius_ads::GradiusUtilityAdService>>,
+    outbox: Option<Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>>,
+}
+
+impl RatesUtilityEffects {
+    #[must_use]
+    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        Self {
+            rich: RatesRichEffects::new(rich),
+            ads: None,
+            outbox: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_utility_ads(
+        mut self,
+        ads: Arc<crate::gradius_ads::GradiusUtilityAdService>,
+        outbox: Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>,
+    ) -> Self {
+        self.ads = Some(ads);
+        self.outbox = Some(outbox);
+        self
+    }
+}
+
+impl RatesEffects for RatesUtilityEffects {
+    type Error = RatesRichEffectError;
+
+    fn send_rates_text<'a>(&'a self, plan: RatesTextPlan) -> RatesEffectFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let chat_id = plan.reply_to.chat.id;
+            let (Some(user_id), Some(plain_html), Some(ads), Some(outbox)) = (
+                plan.initiator_id,
+                plan.plain_html.as_deref(),
+                self.ads.as_ref(),
+                self.outbox.as_ref(),
+            ) else {
+                return self.rich.send_rates_text(plan).await;
+            };
+            let thread_id = if plan.reply_to.is_topic_message {
+                match i32::try_from(plan.reply_to.message_thread_id) {
+                    Ok(thread_id) => Some(thread_id),
+                    Err(_) => return self.rich.send_rates_text(plan).await,
+                }
+            } else {
+                None
+            };
+            let source_id = format!("{chat_id}:{}", plan.reply_to.message_id);
+            let redacted_context = openplotva_telegram::strip_telegram_html(plain_html);
+            let prepared = ads
+                .prepare(crate::gradius_ads::GradiusUtilityAdRequest {
+                    surface: crate::gradius_ads::GradiusUtilitySurface::Rates,
+                    source_id: source_id.clone(),
+                    attempt_key: format!(
+                        "rates-command:{source_id}:{}",
+                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                    ),
+                    user_id,
+                    chat_id,
+                    thread_id,
+                    prompt: None,
+                    result_context: Some(redacted_context),
+                    completed_at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+            match prepared {
+                Ok(Some(ad)) => {
+                    let final_html = format!("{plain_html}\n\n{}", ad.html);
+                    let queued = outbox
+                        .queue_message(
+                            ads,
+                            &format!("rates-command:{source_id}"),
+                            ad.opportunity_id,
+                            chat_id,
+                            thread_id,
+                            plan.reply_to.message_id,
+                            final_html,
+                        )
+                        .await;
+                    match queued {
+                        Ok(_) => return Ok(()),
+                        Err(_error) => {
+                            tracing::warn!(
+                                opportunity_id = ad.opportunity_id,
+                                integration_kind = "native_utility",
+                                source = "rates",
+                                "Gradius rates delivery not queued"
+                            )
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_error) => {
+                    tracing::warn!(
+                        integration_kind = "native_utility",
+                        source = "rates",
+                        "Gradius rates ad skipped"
+                    )
+                }
+            }
+            self.rich.send_rates_text(plan).await
+        })
+    }
+}
+
 impl RatesRichEffects {
     /// Build rates effects that reply with a rich message.
     #[must_use]
@@ -1412,6 +1521,8 @@ pub struct RatesBotIdentity {
 pub struct RatesTextPlan {
     pub message: TextMessageRequest,
     pub reply_to: ReplyMessageRef,
+    pub plain_html: Option<String>,
+    pub initiator_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1619,18 +1730,24 @@ where
         );
     }
 
-    let text = format_rates_command_message(
-        &header.rates_header(&message_user_full_name(message)),
-        &snapshot,
+    let heading = header.rates_header(&message_user_full_name(message));
+    let text = format_rates_command_message(&heading, &snapshot);
+    let plain_html = format!(
+        "{}\n{}\n{}",
+        openplotva_telegram::escape_telegram_html_text(&heading),
+        openplotva_telegram::escape_telegram_html_text(&format_dialog_rates_message(&snapshot)),
+        openplotva_telegram::escape_telegram_html_text(&format_rates_footer(&snapshot)),
     );
-    Ok(send_rates_plan(effects, rates_text_plan(message, text))
-        .await
-        .map_or_else(
-            |error| RatesCommandOutcome::SendError {
-                message: error.to_string(),
-            },
-            |()| RatesCommandOutcome::Sent,
-        ))
+    let mut plan = rates_text_plan(message, text);
+    if errors.is_empty() {
+        plan.plain_html = Some(plain_html);
+    }
+    Ok(send_rates_plan(effects, plan).await.map_or_else(
+        |error| RatesCommandOutcome::SendError {
+            message: error.to_string(),
+        },
+        |()| RatesCommandOutcome::Sent,
+    ))
 }
 
 #[must_use]
@@ -1922,6 +2039,8 @@ fn rates_text_plan(message: &TelegramMessage, text: String) -> RatesTextPlan {
             is_topic_message: message.message_thread_id.is_some(),
             message_thread_id: message.message_thread_id.unwrap_or_default(),
         },
+        plain_html: None,
+        initiator_id: message.sender.get_user().map(|user| user.id.into()),
     }
 }
 
