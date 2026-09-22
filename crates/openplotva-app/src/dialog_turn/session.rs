@@ -23,7 +23,7 @@ use openplotva_core::ToolCall;
 use openplotva_dialog::{
     ChatStepRequest, ChatStepToolCall, DialogInput, DialogToolbox, HistoryMessage,
     SESSION_REACT_TO_MESSAGE_SPEC, SESSION_REACTION_ALLOWED_EMOJI, SESSION_SEND_MESSAGE_SPEC,
-    STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
+    STEP_CRAWL_URL, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
     STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, SessionMessage, SessionToolCall, ToolContext,
     ToolContinuation, ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs,
     dialog_tool_context, dialog_tool_continuation, dispatch_dialog_tool,
@@ -42,14 +42,14 @@ use super::budget::{
     TurnBudget,
 };
 use super::engine::{ANSWER_QUEUED_STAGE, ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
+use super::links::DialogLinks;
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use crate::dialog_jobs::{
     DialogAnswerSendOptions, DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport,
     DialogToolCallHistoryStore, PROVIDER_EMPTY_RETRY_CODES, PROVIDER_ERROR_RETRY_CODES,
     RetryableDialogProviderFailure, SANITIZED_EMPTY_RETRY_CODES, UNDELIVERABLE_RETRY_CODES,
     handle_retryable_dialog_provider_error, persist_dialog_tool_calls,
-    prepare_dialog_chat_response, should_suppress_duplicate_bot_reply,
-    validate_dialog_answer_deliverable,
+    should_suppress_duplicate_bot_reply, validate_dialog_answer_deliverable,
 };
 
 /// Job event stage appended after the FIRST outbound send of a session; on
@@ -73,6 +73,8 @@ const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 /// A searched answer gets two focused rewrites before the best available final
 /// answer is sent, even if the model still omitted a citation.
 const MAX_SEARCH_CITATION_REPAIRS: i32 = 2;
+
+const SEARCH_CITATION_HINT: &str = include_str!("../../../../prompts/chat/search_citations.prompt");
 
 const SEARCH_CITATION_REPAIR_HINT: &str = "ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ИСТОЧНИКОВ: предыдущий черновик финального ответа не содержит требуемой inline-ссылки на реально найденный источник. Перепиши финальный ответ без нового поиска и без упоминания этой проверки. Если ты используешь сведения из web_search/crawl_url, ответ ОБЯЗАН содержать хотя бы одну семантическую inline HTML-ссылку вида <a href=\"URL\">подтверждаемая фраза</a>, где href в точности совпадает с одним из URL в уже имеющихся результатах. Размещай ссылку прямо на подтверждаемом утверждении; не печатай raw URL или отдельную библиографию.";
 
@@ -387,6 +389,7 @@ where
     let mut media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
     let mut successful_web_search = false;
     let mut web_source_urls = BTreeSet::new();
+    let mut links = DialogLinks::from_input(&base_input);
     let mut search_citation_repairs: i32 = 0;
     let max_iterations = cfg.max_iterations.max(1);
 
@@ -406,6 +409,7 @@ where
                         crate::dialog_jobs::dialog_job_params_from_input(&injected_params, &input);
                     meta = dialog_tool_context(&input);
                     duplicate_guard_history.clone_from(&input.history);
+                    links = DialogLinks::from_input(&input);
                     base_input = input;
                     transcript.clear();
                     tool_result_cache.clear();
@@ -456,6 +460,11 @@ where
         let mut input = base_input.clone();
         if anti_loop {
             input.reference_context.push(ANTI_LOOP_HINT.to_owned());
+        }
+        if !web_source_urls.is_empty() {
+            input
+                .reference_context
+                .push(SEARCH_CITATION_HINT.trim().to_owned());
         }
         if search_citation_repairs > 0 {
             input
@@ -558,7 +567,7 @@ where
             // markup was already stripped by the step provider, so its text
             // stands on its own.
             let raw_answer = step.text.clone();
-            let sanitized = prepare_dialog_chat_response(&raw_answer);
+            let sanitized = links.prepare_response(&raw_answer);
             if sanitized.trim().is_empty() {
                 if !side_effect_tickets.is_empty() {
                     // Silent side-effect finish (should have terminated at
@@ -964,7 +973,7 @@ where
                 })
                 .collect(),
         });
-        let announcement = prepare_dialog_chat_response(&step.text);
+        let announcement = links.prepare_response(&step.text);
         let step_text_accounted_for = if announcement.trim().is_empty() {
             false
         } else {
@@ -1049,6 +1058,7 @@ where
                         causation_update_id: ctx.item.latest_update_id,
                         budget: &mut budget,
                         sent: &mut sent,
+                        links: &links,
                         draws_scheduled: &mut draws_scheduled,
                         songs_scheduled: &mut songs_scheduled,
                         reacted_message_ids: &mut reacted_message_ids,
@@ -1077,12 +1087,13 @@ where
             if let Some(effect) = queued_generation_side_effect(&result) {
                 batch_side_effects.push(effect);
             }
-            if call.step.step == STEP_WEB_SEARCH
+            links.record_tool_result(&result);
+            if matches!(call.step.step.as_str(), STEP_WEB_SEARCH | STEP_CRAWL_URL)
                 && result
                     .status
                     .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
             {
-                successful_web_search = true;
+                successful_web_search |= call.step.step == STEP_WEB_SEARCH;
                 collect_web_source_urls(&result, &mut web_source_urls);
             }
             append_session_tool_event(
@@ -1529,6 +1540,7 @@ struct SessionToolExecution<'a, 'b> {
     causation_update_id: Option<i64>,
     budget: &'a mut SessionBudget,
     sent: &'a mut SentLog,
+    links: &'a DialogLinks,
     draws_scheduled: &'a mut i32,
     songs_scheduled: &'a mut i32,
     reacted_message_ids: &'a mut BTreeSet<i64>,
@@ -1550,7 +1562,7 @@ where
     let step = &exec.call.step;
     match step.step.as_str() {
         STEP_SEND_MESSAGE => {
-            let sanitized = prepare_dialog_chat_response(&step.text);
+            let sanitized = exec.links.prepare_response(&step.text);
             if sanitized.trim().is_empty() {
                 return ToolResult::failed("empty_text", "message text is empty after sanitizing");
             }
@@ -1943,6 +1955,7 @@ pub async fn run_captured_session(
     let mut recorded: Vec<ToolCall> = Vec::new();
     let mut provider = String::new();
     let mut web_source_urls = BTreeSet::new();
+    let mut links = DialogLinks::from_input(&base_input);
     let mut search_citation_repairs: i32 = 0;
     let max_iterations = max_iterations.max(1);
 
@@ -1956,6 +1969,11 @@ pub async fn run_captured_session(
             ToolsMode::Native(native_tools.clone())
         };
         let mut input = base_input.clone();
+        if !web_source_urls.is_empty() {
+            input
+                .reference_context
+                .push(SEARCH_CITATION_HINT.trim().to_owned());
+        }
         if search_citation_repairs > 0 {
             input
                 .reference_context
@@ -1973,7 +1991,7 @@ pub async fn run_captured_session(
         provider = step.provider.clone();
 
         if step.tool_calls.is_empty() || force_final || search_citation_repairs > 0 {
-            let sanitized = prepare_dialog_chat_response(&step.text);
+            let sanitized = links.prepare_response(&step.text);
             if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)
             {
                 if search_citation_repairs < MAX_SEARCH_CITATION_REPAIRS
@@ -2011,7 +2029,7 @@ pub async fn run_captured_session(
                 })
                 .collect(),
         });
-        let announcement = prepare_dialog_chat_response(&step.text);
+        let announcement = links.prepare_response(&step.text);
         let step_text_accounted_for = if announcement.trim().is_empty() {
             false
         } else if sent.matches_delivery(&announcement) {
@@ -2027,7 +2045,7 @@ pub async fn run_captured_session(
             let step_def = &call.step;
             let result = match step_def.step.as_str() {
                 STEP_SEND_MESSAGE => {
-                    let sanitized = prepare_dialog_chat_response(&step_def.text);
+                    let sanitized = links.prepare_response(&step_def.text);
                     if sanitized.trim().is_empty() {
                         ToolResult::failed("empty_text", "message text is empty after sanitizing")
                     } else if sent.matches_delivery(&sanitized) {
@@ -2055,7 +2073,8 @@ pub async fn run_captured_session(
                     Err(error) => ToolResult::failed("tool_error", error.to_string()),
                 },
             };
-            if step_def.step == STEP_WEB_SEARCH
+            links.record_tool_result(&result);
+            if matches!(step_def.step.as_str(), STEP_WEB_SEARCH | STEP_CRAWL_URL)
                 && result
                     .status
                     .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)

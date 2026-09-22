@@ -3351,6 +3351,187 @@ fn record_status(queue: &InMemoryTaskQueue, job_id: i64) -> JobStatus {
 
 // ---- Dialog session engine ----
 
+#[tokio::test]
+async fn session_link_policy_filters_every_visible_message() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("See https://source.test/page?a=1&b=2"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            r#"An <a href="https://invented.test">ordinary</a> remark"#,
+            vec![(
+                "message",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                    text: r#"<p>Another <a href="https://invented.test"><b>remark</b></a></p>"#
+                        .to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text(
+            r#"The <a href="https://source.test/page?a=1&amp;b=2">provided page</a>, <a href="https://source.test/page?a=1&amp;b=2&amp;extra=1">invented variant</a> and <a href="https://example.com">decoration</a>"#,
+        )),
+    ]);
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(effects.intermediates().len(), 2);
+    assert_eq!(effects.intermediates()[0].0, "An ordinary remark");
+    assert_eq!(effects.intermediates()[1].0, "<p>Another <b>remark</b></p>");
+    assert_eq!(
+        effects.sent()[0].1,
+        r#"The <a href="https://source.test/page?a=1&amp;b=2">provided page</a>, invented variant and decoration"#
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_link_policy_uses_search_results_before_answering()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "search",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "facts".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text(
+            r#"<a href="https://source.test/fact">Fact</a> and <a href="https://invented.test">decoration</a>"#,
+        )),
+    ]);
+    let toolbox = SessionToolboxStub::with_web_search_result(successful_web_search_result(
+        "https://source.test/fact",
+    ));
+    let input = dialog_input_from_job_params_at(&dialog_params("search facts"), now);
+    let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
+    assert_eq!(
+        output.messages,
+        vec![r#"<a href="https://source.test/fact">Fact</a> and decoration"#]
+    );
+    let requests = provider.requests();
+    assert!(requests[0].input.reference_context.is_empty());
+    assert!(
+        requests[1]
+            .input
+            .reference_context
+            .iter()
+            .any(|item| item.contains("<search_citations>"))
+    );
+    assert_eq!(provider.calls(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_link_policy_filters_intermediates_without_search()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            r#"An <a href="https://invented.test">ordinary</a> remark"#,
+            vec![("message", openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                text: r#"A <a href="https://user.test">user link</a> and <a href="https://invented.test">fake</a>"#.to_owned(),
+                ..openplotva_dialog::ToolStep::default()
+            })],
+        )),
+        Ok(step_text("Done")),
+    ]);
+    let input = dialog_input_from_job_params_at(&dialog_params("https://user.test"), now);
+    let output = crate::dialog_turn::run_captured_session(
+        &provider,
+        &SessionToolboxStub::default(),
+        input,
+        8,
+    )
+    .await?;
+    assert_eq!(
+        output.messages,
+        vec![
+            "An ordinary remark",
+            r#"A <a href="https://user.test">user link</a> and fake"#,
+            "Done",
+        ]
+    );
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|request| request.input.reference_context.is_empty())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_session_link_policy_accepts_crawled_sources() -> Result<(), Box<dyn Error>> {
+    struct CrawlToolbox;
+    impl openplotva_dialog::DialogToolbox for CrawlToolbox {
+        fn crawl_url<'a>(&'a self, url: String) -> openplotva_dialog::ToolboxFuture<'a> {
+            Box::pin(async move {
+                Ok(openplotva_dialog::ToolResult {
+                    status: "ok".to_owned(),
+                    data: Some(serde_json::json!({"url":url,"content":"Page content"})),
+                    ..openplotva_dialog::ToolResult::default()
+                })
+            })
+        }
+    }
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "crawl",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_CRAWL_URL.to_owned(),
+                    url: "https://source.test/page".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text(
+            r#"<a href="https://source.test/page">Source</a> and <a href="https://fake.test">fake</a>"#,
+        )),
+    ]);
+    let input = dialog_input_from_job_params_at(&dialog_params("check the page"), now);
+    let output =
+        crate::dialog_turn::run_captured_session(&provider, &CrawlToolbox, input, 8).await?;
+    assert_eq!(
+        output.messages,
+        vec![r#"<a href="https://source.test/page">Source</a> and fake"#]
+    );
+    assert!(
+        provider.requests()[1]
+            .input
+            .reference_context
+            .iter()
+            .any(|item| item.contains("<search_citations>"))
+    );
+    Ok(())
+}
+
 type StepHook = Box<dyn FnMut(usize) + Send>;
 
 struct StepProviderStub {
@@ -4127,7 +4308,13 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert!(requests[1].input.reference_context.is_empty());
+    assert!(
+        requests[1]
+            .input
+            .reference_context
+            .iter()
+            .any(|item| item.contains("<search_citations>"))
+    );
     assert!(matches!(
         &requests[2].tools,
         openplotva_dialog::ToolsMode::FinalOnly
@@ -5929,7 +6116,9 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
                 },
             )],
         )),
-        Ok(step_text("готово: 4")),
+        Ok(step_text(
+            r#"готово: <a href="https://example.com/old-turn">4</a>"#,
+        )),
     ])
     .with_on_call(Box::new(move |call_index| {
         let text = if call_index == 1 {
@@ -5962,6 +6151,8 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
     .await;
 
     assert!(report.sent_answer, "{report:?}");
+    assert_eq!(effects.sent()[0].1, "готово: 4");
+    assert!(provider.requests()[1].input.reference_context.is_empty());
     // The first injected message is the rematerialized current input and is
     // not repeated in the session transcript.
     let requests = provider.requests();

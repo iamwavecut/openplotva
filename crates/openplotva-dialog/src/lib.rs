@@ -676,7 +676,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_WEB_SEARCH,
         summary: "Search the web for current, changeable, or uncertain external facts.",
         when_to_use: "MUST use before answering when accuracy depends on facts that may have changed since model knowledge, including news, prices, weather, schedules, availability, laws, versions, current roles, sports, or economic indicators, or when an external fact is uncertain. An explicit request to search is not required. Prefer a specialized live tool when it fully answers the request; do not search for stable common knowledge, opinions, creative work, or facts supplied by the user.",
-        result: "Returns search results with source titles, snippets, and links. HARD REQUIREMENT: when you use these results in the final answer, include at least one semantic inline HTML link directly on the supported claim; its href MUST exactly match a URL returned by web_search or crawl_url. Verify the href against the available results before finishing. Ground the answer only in supporting results, never print raw URLs or a separate bibliography, and never invent a source when search fails. Follow promising links with crawl_url when snippets are not enough.",
+        result: "Returns search results with source titles, snippets, and links. Follow promising links with crawl_url when snippets are not enough.",
         continuation: ToolContinuation::RequiresFollowup,
         args: WEB_SEARCH_ARGS,
     },
@@ -5094,20 +5094,9 @@ mod tests {
             search
                 .function
                 .description
-                .contains("semantic inline HTML link")
+                .contains("source titles, snippets, and links")
         );
-        assert!(
-            search
-                .function
-                .description
-                .contains("href MUST exactly match")
-        );
-        assert!(
-            search
-                .function
-                .description
-                .contains("never invent a source")
-        );
+        assert!(!search.function.description.contains("inline HTML link"));
         assert!(
             tools
                 .iter()
