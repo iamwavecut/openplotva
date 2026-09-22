@@ -8585,12 +8585,9 @@ mod tests {
         assert!(prompt.contains("не выдумывай источники"));
         assert!(prompt.contains("MUST use before answering"));
         assert!(prompt.contains("Prefer a specialized live tool"));
-        assert!(prompt.contains(
-            "&lt;a href=\"u1\"&gt;слово1&lt;/a&gt; &lt;a href=\"u2\"&gt;слово2&lt;/a&gt;"
-        ));
-        assert!(prompt.contains(
-            "&lt;a href=\"u1\"&gt;слово&lt;/a&gt; (&lt;a href=\"u2\"&gt;2&lt;/a&gt;, &lt;a href=\"u3\"&gt;3&lt;/a&gt;)"
-        ));
+        assert!(!prompt.contains("<search_citations>"));
+        assert!(!prompt.contains("&lt;a href="));
+        assert!(!prompt.contains("semantic inline HTML link"));
         let names = alternative_dialog_tool_names();
         for spec in alternative_dialog_tools()
             .into_iter()

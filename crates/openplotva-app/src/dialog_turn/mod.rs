@@ -36,6 +36,7 @@ mod budget;
 mod engine;
 mod inbox;
 mod ledger;
+mod links;
 mod obligations;
 mod outcome;
 mod session;
