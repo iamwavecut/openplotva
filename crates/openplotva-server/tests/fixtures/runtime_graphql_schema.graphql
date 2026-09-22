@@ -171,6 +171,7 @@ type GeminiExplicitCachePurgeResult {
 input GradiusAdOpportunitiesFilterInput {
 	range: String
 	integrationKind: String
+	source: String
 	outcome: String
 	deliveryState: String
 	userID: ID
@@ -185,6 +186,14 @@ input GradiusAdOpportunitiesFilterInput {
 input GradiusAdSummaryFilterInput {
 	range: String
 	integrationKind: String
+	source: String
+	outcome: String
+	deliveryState: String
+	userID: ID
+	chatID: ID
+	dialogJobID: ID
+	model: String
+	q: String
 }
 
 type HealthSnapshot {

@@ -190,12 +190,21 @@ pub trait RuntimeGradiusAuditReader: Send + Sync {
 pub struct RuntimeGradiusSummaryFilter {
     pub range: String,
     pub integration_kind: String,
+    pub source: String,
+    pub outcome: String,
+    pub delivery_state: String,
+    pub user_id: Option<i64>,
+    pub chat_id: Option<i64>,
+    pub dialog_job_id: Option<i64>,
+    pub model: String,
+    pub q: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeGradiusOpportunitiesFilter {
     pub range: String,
     pub integration_kind: String,
+    pub source: String,
     pub outcome: String,
     pub delivery_state: String,
     pub user_id: Option<i64>,
@@ -2232,7 +2241,7 @@ impl RuntimeQuery {
             return Err("runtime Gradius audit reader is not configured".into());
         };
         reader
-            .gradius_ad_summary(gradius_summary_filter_from_input(filter))
+            .gradius_ad_summary(gradius_summary_filter_from_input(filter)?)
             .await
             .map(Json)
             .map_err(async_graphql::Error::new)
@@ -2628,6 +2637,7 @@ fn gradius_opportunities_filter_from_input(
     Ok(RuntimeGradiusOpportunitiesFilter {
         range: trim_optional(input.range),
         integration_kind: trim_optional(input.integration_kind),
+        source: trim_optional(input.source),
         outcome: trim_optional(input.outcome),
         delivery_state: trim_optional(input.delivery_state),
         user_id: parse_optional_id(input.user_id, "userID")?,
@@ -2642,12 +2652,20 @@ fn gradius_opportunities_filter_from_input(
 
 fn gradius_summary_filter_from_input(
     input: Option<GradiusAdSummaryFilterInput>,
-) -> RuntimeGradiusSummaryFilter {
+) -> async_graphql::Result<RuntimeGradiusSummaryFilter> {
     let input = input.unwrap_or_default();
-    RuntimeGradiusSummaryFilter {
+    Ok(RuntimeGradiusSummaryFilter {
         range: trim_optional(input.range),
         integration_kind: trim_optional(input.integration_kind),
-    }
+        source: trim_optional(input.source),
+        outcome: trim_optional(input.outcome),
+        delivery_state: trim_optional(input.delivery_state),
+        user_id: parse_optional_id(input.user_id, "userID")?,
+        chat_id: parse_optional_id(input.chat_id, "chatID")?,
+        dialog_job_id: parse_optional_id(input.dialog_job_id, "dialogJobID")?,
+        model: trim_optional(input.model),
+        q: trim_optional(input.q),
+    })
 }
 
 fn llm_requests_filter_from_input(
@@ -3076,6 +3094,17 @@ struct LlmRunsFilterInput {
 struct GradiusAdSummaryFilterInput {
     range: Option<String>,
     integration_kind: Option<String>,
+    source: Option<String>,
+    outcome: Option<String>,
+    delivery_state: Option<String>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "dialogJobID")]
+    dialog_job_id: Option<ID>,
+    model: Option<String>,
+    q: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -3083,6 +3112,7 @@ struct GradiusAdSummaryFilterInput {
 struct GradiusAdOpportunitiesFilterInput {
     range: Option<String>,
     integration_kind: Option<String>,
+    source: Option<String>,
     outcome: Option<String>,
     delivery_state: Option<String>,
     #[graphql(name = "userID")]

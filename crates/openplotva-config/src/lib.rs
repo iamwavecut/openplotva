@@ -782,6 +782,12 @@ pub struct WhiteCircleConfig {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GradiusConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub utility_image_enabled: bool,
+    #[serde(default)]
+    pub utility_rates_enabled: bool,
+    #[serde(default)]
+    pub utility_checkin_enabled: bool,
     pub api_key: String,
     pub base_url: String,
     pub request_timeout_seconds: i32,
@@ -792,6 +798,9 @@ impl fmt::Debug for GradiusConfig {
         formatter
             .debug_struct("GradiusConfig")
             .field("enabled", &self.enabled)
+            .field("utility_image_enabled", &self.utility_image_enabled)
+            .field("utility_rates_enabled", &self.utility_rates_enabled)
+            .field("utility_checkin_enabled", &self.utility_checkin_enabled)
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
@@ -1314,6 +1323,12 @@ pub struct RawConfig {
     pub whitecircle_checks_retention_days: Option<String>,
     /// `GRADIUS_ENABLED`.
     pub gradius_enabled: Option<String>,
+    /// `GRADIUS_UTILITY_IMAGE_ENABLED`.
+    pub gradius_utility_image_enabled: Option<String>,
+    /// `GRADIUS_UTILITY_RATES_ENABLED`.
+    pub gradius_utility_rates_enabled: Option<String>,
+    /// `GRADIUS_UTILITY_CHECKIN_ENABLED`.
+    pub gradius_utility_checkin_enabled: Option<String>,
     /// `GRADIUS_API_KEY`.
     pub gradius_api_key: Option<String>,
     /// `GRADIUS_BASE_URL`.
@@ -2467,6 +2482,21 @@ impl AppConfig {
             },
             gradius: GradiusConfig {
                 enabled: parse_bool("GRADIUS_ENABLED", raw.gradius_enabled, false)?,
+                utility_image_enabled: parse_bool(
+                    "GRADIUS_UTILITY_IMAGE_ENABLED",
+                    raw.gradius_utility_image_enabled,
+                    false,
+                )?,
+                utility_rates_enabled: parse_bool(
+                    "GRADIUS_UTILITY_RATES_ENABLED",
+                    raw.gradius_utility_rates_enabled,
+                    false,
+                )?,
+                utility_checkin_enabled: parse_bool(
+                    "GRADIUS_UTILITY_CHECKIN_ENABLED",
+                    raw.gradius_utility_checkin_enabled,
+                    false,
+                )?,
                 api_key: raw.gradius_api_key.unwrap_or_default(),
                 base_url: raw
                     .gradius_base_url
@@ -3232,6 +3262,9 @@ impl RawConfig {
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),
             whitecircle_checks_retention_days: env("WHITECIRCLE_CHECKS_RETENTION_DAYS"),
             gradius_enabled: env("GRADIUS_ENABLED"),
+            gradius_utility_image_enabled: env("GRADIUS_UTILITY_IMAGE_ENABLED"),
+            gradius_utility_rates_enabled: env("GRADIUS_UTILITY_RATES_ENABLED"),
+            gradius_utility_checkin_enabled: env("GRADIUS_UTILITY_CHECKIN_ENABLED"),
             gradius_api_key: env("GRADIUS_API_KEY"),
             gradius_base_url: env("GRADIUS_BASE_URL"),
             gradius_request_timeout_seconds: env("GRADIUS_REQUEST_TIMEOUT_SECONDS"),
@@ -3840,8 +3873,8 @@ mod tests {
         DEFAULT_UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS, DEFAULT_UPDATE_QUEUE_BACKEND,
         DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_CAPTION_MAX_SIDE, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
         DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
-        DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS,
-        RawConfig, parse_string_list_or_default,
+        DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, GradiusConfig,
+        MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, RawConfig, parse_string_list_or_default,
     };
 
     #[test]
@@ -4255,22 +4288,42 @@ mod tests {
     fn gradius_is_disabled_by_default_and_maps_server_settings() -> Result<(), super::ConfigError> {
         let defaults = AppConfig::from_raw(RawConfig::default())?;
         assert!(!defaults.gradius.enabled);
+        assert!(!defaults.gradius.utility_image_enabled);
+        assert!(!defaults.gradius.utility_rates_enabled);
+        assert!(!defaults.gradius.utility_checkin_enabled);
         assert_eq!(defaults.gradius.api_key, "");
         assert_eq!(defaults.gradius.base_url, "https://api.adlean.pro");
         assert_eq!(defaults.gradius.request_timeout_seconds, 5);
 
         let configured = AppConfig::from_raw(RawConfig {
             gradius_enabled: Some("true".to_owned()),
+            gradius_utility_image_enabled: Some("true".to_owned()),
+            gradius_utility_rates_enabled: Some("true".to_owned()),
+            gradius_utility_checkin_enabled: Some("true".to_owned()),
             gradius_api_key: Some("secret".to_owned()),
             gradius_base_url: Some("https://gradius.internal".to_owned()),
             gradius_request_timeout_seconds: Some("7".to_owned()),
             ..RawConfig::default()
         })?;
         assert!(configured.gradius.enabled);
+        assert!(configured.gradius.utility_image_enabled);
+        assert!(configured.gradius.utility_rates_enabled);
+        assert!(configured.gradius.utility_checkin_enabled);
         assert_eq!(configured.gradius.api_key, "secret");
         assert_eq!(configured.gradius.base_url, "https://gradius.internal");
         assert_eq!(configured.gradius.request_timeout_seconds, 7);
         assert!(!format!("{:?}", configured.gradius).contains("secret"));
+        let mut serialized =
+            serde_json::to_value(&configured.gradius).expect("Gradius config JSON");
+        let object = serialized.as_object_mut().expect("Gradius config object");
+        object.remove("utility_image_enabled");
+        object.remove("utility_rates_enabled");
+        object.remove("utility_checkin_enabled");
+        let previous: GradiusConfig =
+            serde_json::from_value(serialized).expect("older config JSON");
+        assert!(!previous.utility_image_enabled);
+        assert!(!previous.utility_rates_enabled);
+        assert!(!previous.utility_checkin_enabled);
         Ok(())
     }
 

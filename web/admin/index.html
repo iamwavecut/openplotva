@@ -895,7 +895,7 @@
                             <div class="gradius-topbar">
                                 <div>
                                     <div class="gradius-title">Delivery ledger</div>
-                                    <div class="text-muted">Privacy-filtered dialogue → provider response → Telegram receipt</div>
+                                    <div class="text-muted">Privacy-filtered context → provider response → Telegram receipt</div>
                                 </div>
                                 <pl-button variant="outline" size="sm" data-action="loadGradiusForced">Refresh</pl-button>
                             </div>
@@ -921,6 +921,15 @@
                                                 <option value="native_generation">Native generation</option>
                                                 <option value="native_utility">Native utility</option>
                                                 <option value="dialogue_thinking">Dialogue thinking</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Surface">
+                                            <pl-select id="gradius-source">
+                                                <option value="">All surfaces</option>
+                                                <option value="dialog-job">Dialogue</option>
+                                                <option value="image-job">Image</option>
+                                                <option value="rates-command">Currency rates</option>
+                                                <option value="checkin-final">Check-in final</option>
                                             </pl-select>
                                         </pl-field-group>
                                         <pl-field-group label="Outcome">
@@ -6037,6 +6046,7 @@
             const mappings = [
                 ['range', 'gradius-range'],
                 ['integration_kind', 'gradius-kind'],
+                ['source', 'gradius-source'],
                 ['outcome', 'gradius-outcome'],
                 ['delivery_state', 'gradius-delivery'],
                 ['user_id', 'gradius-user'],
@@ -6131,6 +6141,7 @@
                 top.append(
                     PL.el('span', { class: 'mono gradius-row-id' }, `#${item.id}`),
                     PL.badge(item.integration_kind || 'unknown', 'neutral'),
+                    PL.badge(item.source || 'unknown source', 'info'),
                     PL.badge(item.outcome || 'unknown', gradiusOutcomeTone(item.outcome)),
                 );
                 if (item.delivery_state) top.append(PL.badge(item.delivery_state, gradiusOutcomeTone(item.delivery_state)));
@@ -6204,17 +6215,17 @@
         function gradiusDialogueContext(item) {
             const section = PL.el('section', {
                 class: 'card card-inset gradius-conversation',
-                'aria-label': 'Dialogue sent to Gradius',
+                'aria-label': 'Context sent to Gradius',
             });
             const header = PL.el('div', { class: 'card-header gradius-conversation-head' });
             header.append(
-                PL.el('div', { class: 'gradius-conversation-title' }, 'Dialogue sent to Gradius'),
-                PL.el('div', { class: 'gradius-conversation-note' }, 'Privacy-filtered messages in the exact order sent to the provider.'),
+                PL.el('div', { class: 'gradius-conversation-title' }, item.integration_kind === 'native_utility' ? 'Utility request sent to Gradius' : 'Dialogue sent to Gradius'),
+                PL.el('div', { class: 'gradius-conversation-note' }, 'Privacy-filtered payloads in the exact order sent to the provider.'),
             );
             const turns = PL.el('div', { class: 'card-body gradius-conversation-turns' });
             const calls = Array.isArray(item.api_calls) ? item.api_calls : [];
             if (!calls.length) {
-                turns.append(PL.el('div', { class: 'text-muted' }, 'No dialogue payload was sent for this opportunity.'));
+                turns.append(PL.el('div', { class: 'text-muted' }, 'No provider payload was sent for this opportunity.'));
             }
             for (const call of calls) {
                 const role = call.role || 'call';
@@ -6250,7 +6261,7 @@
             if (title) title.textContent = `Opportunity #${item.id}`;
             const meta = PL.el('div', { class: 'llmd-meta' });
             const fields = [
-                ['integration', item.integration_kind], ['attempt', item.attempt_generation], ['outcome', item.outcome], ['delivery', item.delivery_state],
+                ['integration', item.integration_kind], ['source', item.source], ['attempt', item.attempt_generation], ['outcome', item.outcome], ['delivery', item.delivery_state],
                 ['user', item.user_id], ['chat', item.chat_id], ['thread', item.thread_id],
                 ['job', item.dialog_job_id], ['model', item.model_version], ['show price', item.show_price],
                 ['click price', item.click_price], ['synthetic chat', item.api_calls?.[0]?.synthetic_chat_id],
@@ -6276,6 +6287,7 @@
                 actions,
                 meta,
                 gradiusDialogueContext(item),
+                gradiusTextCard('Trigger and result context (privacy-filtered)', item.source_context ? JSON.stringify(item.source_context, null, 2) : ''),
                 gradiusTimeline(item),
                 gradiusTextCard('Provider markdown', item.provider_markdown),
                 gradiusTextCard('Telegram HTML', item.telegram_html),
@@ -6366,7 +6378,6 @@
             if (kpis) PL.skeleton(kpis, { rows: 2 });
             const listParams = gradiusParams(true);
             const summaryParams = gradiusParams(false);
-            for (const key of ['outcome', 'delivery_state', 'user_id', 'chat_id', 'dialog_job_id', 'model', 'q']) summaryParams.delete(key);
             const [opportunities, summary] = await Promise.all([
                 apiCall(`/gradius/opportunities?${listParams.toString()}`),
                 apiCall(`/gradius/summary?${summaryParams.toString()}`),

@@ -24,6 +24,7 @@ const VIP_HINT_SCOPE: &str = "gradius:v1:vip-hint";
 const GRADIUS_BASE_URL_DEFAULT: &str = "https://api.adlean.pro";
 const GRADIUS_REQUEST_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
 const GRADIUS_DIALOGUE_PATH: &str = "/v1/native/dialogue_model/chat";
+const GRADIUS_UTILITY_PATH: &str = "/v1/native/utility_service/chat";
 pub const GRADIUS_RAW_BODY_MAX_BYTES: usize = 65_536;
 const GRADIUS_REDACTION_CATEGORIES: [&str; 8] = [
     "account_number",
@@ -131,6 +132,34 @@ pub struct GradiusDialogueTurn {
     pub text: String,
 }
 
+#[derive(Clone, PartialEq)]
+pub struct GradiusUtilityRequest {
+    pub chat_id: String,
+    pub user_id: String,
+    pub user_metadata: serde_json::Value,
+    pub user_text_request: Option<String>,
+    pub model_text_answer: Option<String>,
+}
+
+impl fmt::Debug for GradiusUtilityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GradiusUtilityRequest")
+            .field("chat_id", &self.chat_id)
+            .field("user_id", &self.user_id)
+            .field("user_metadata", &"[redacted]")
+            .field(
+                "user_text_request",
+                &self.user_text_request.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "model_text_answer",
+                &self.model_text_answer.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradiusDialogueAd {
     pub insert_index: usize,
@@ -144,6 +173,7 @@ pub struct GradiusDialogueAd {
 pub enum GradiusPlacement {
     NativeDialogue(GradiusDialogueAd),
     Standalone {
+        source_index: usize,
         markdown: String,
         show_price: Option<f64>,
         click_price: Option<f64>,
@@ -341,6 +371,8 @@ pub enum GradiusClientError {
     Disabled,
     #[error("invalid Gradius dialogue turn field: {0}")]
     InvalidTurn(&'static str),
+    #[error("invalid Gradius utility request field: {0}")]
+    InvalidUtilityRequest(&'static str),
     #[error("invalid Gradius base URL: {0}")]
     InvalidBaseUrl(#[from] url::ParseError),
     #[error("failed to encode Gradius request: {0}")]
@@ -351,6 +383,8 @@ pub enum GradiusClientError {
     Status { status: u16 },
     #[error("failed to decode Gradius response: {0}")]
     Decode(serde_json::Error),
+    #[error("Gradius utility response contains no valid placement")]
+    InvalidUtilityPlacement,
     #[error("Gradius response is too large: {bytes} bytes exceeds {max_bytes}")]
     ResponseTooLarge { bytes: usize, max_bytes: usize },
 }
@@ -521,6 +555,171 @@ where
             ),
         })
     }
+
+    pub async fn utility(
+        &self,
+        request: GradiusUtilityRequest,
+    ) -> Result<GradiusApiResult, GradiusClientFailure> {
+        if !self.config.effective_enabled() {
+            return Err(failure(GradiusClientError::Disabled, None));
+        }
+        for (field, value) in [
+            ("chat_id", request.chat_id.as_str()),
+            ("user_id", request.user_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(failure(
+                    GradiusClientError::InvalidUtilityRequest(field),
+                    None,
+                ));
+            }
+        }
+        if !request.user_metadata.is_object() {
+            return Err(failure(
+                GradiusClientError::InvalidUtilityRequest("user_metadata"),
+                None,
+            ));
+        }
+        let endpoint = utility_endpoint(&self.config.base_url, &request)
+            .map_err(|error| failure(error.into(), None))?;
+        let request_body = serde_json::json!({
+            "user_metadata": request.user_metadata,
+            "user_text_request": request.user_text_request,
+            "model_text_answer": request.model_text_answer,
+        });
+        let body =
+            serde_json::to_vec(&request_body).map_err(|error| failure(error.into(), None))?;
+        let started_at = Instant::now();
+        let response = match self
+            .transport
+            .post_json(GradiusHttpRequest {
+                endpoint: endpoint.clone(),
+                api_key: self.config.api_key.clone(),
+                body,
+                timeout: self.config.request_timeout,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(failure(
+                    error.into(),
+                    Some(utility_exchange(
+                        endpoint,
+                        request_body,
+                        None,
+                        None,
+                        None,
+                        false,
+                        started_at,
+                        GradiusCallOutcome::TransportError,
+                    )),
+                ));
+            }
+        };
+        let response_truncated = response.body.len() > GRADIUS_RAW_BODY_MAX_BYTES;
+        let captured = &response.body[..response.body.len().min(GRADIUS_RAW_BODY_MAX_BYTES)];
+        let response_body = String::from_utf8_lossy(captured).into_owned();
+        let response_json = (!response_truncated)
+            .then(|| serde_json::from_slice::<serde_json::Value>(&response.body).ok())
+            .flatten();
+        if response_truncated {
+            return Err(failure(
+                GradiusClientError::ResponseTooLarge {
+                    bytes: response.body.len(),
+                    max_bytes: GRADIUS_RAW_BODY_MAX_BYTES,
+                },
+                Some(utility_exchange(
+                    endpoint,
+                    request_body,
+                    Some(response.status),
+                    Some(response_body),
+                    None,
+                    true,
+                    started_at,
+                    GradiusCallOutcome::ResponseTooLarge,
+                )),
+            ));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(failure(
+                GradiusClientError::Status {
+                    status: response.status,
+                },
+                Some(utility_exchange(
+                    endpoint,
+                    request_body,
+                    Some(response.status),
+                    Some(response_body),
+                    response_json,
+                    false,
+                    started_at,
+                    GradiusCallOutcome::HttpError,
+                )),
+            ));
+        }
+        let placement = match decode_utility_ad(&response.body) {
+            Ok(placement) => placement,
+            Err(error) => {
+                return Err(failure(
+                    error,
+                    Some(utility_exchange(
+                        endpoint,
+                        request_body,
+                        Some(response.status),
+                        Some(response_body),
+                        response_json,
+                        false,
+                        started_at,
+                        GradiusCallOutcome::DecodeError,
+                    )),
+                ));
+            }
+        };
+        let outcome = if placement.is_some() {
+            GradiusCallOutcome::Ad
+        } else {
+            GradiusCallOutcome::NoAd
+        };
+        Ok(GradiusApiResult {
+            placement,
+            exchange: utility_exchange(
+                endpoint,
+                request_body,
+                Some(response.status),
+                Some(response_body),
+                response_json,
+                false,
+                started_at,
+                outcome,
+            ),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn utility_exchange(
+    endpoint: String,
+    request_body: serde_json::Value,
+    status: Option<u16>,
+    response_body: Option<String>,
+    response_json: Option<serde_json::Value>,
+    response_truncated: bool,
+    started_at: Instant,
+    outcome: GradiusCallOutcome,
+) -> GradiusApiExchange {
+    GradiusApiExchange {
+        integration_kind: GradiusIntegrationKind::NativeUtility,
+        role: None,
+        endpoint,
+        request_body,
+        status,
+        response_body,
+        response_json,
+        response_truncated,
+        duration_ms: started_at.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        outcome,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,6 +795,75 @@ struct GradiusNativeTextAd {
 struct GradiusNativeTextAdContent {
     insert_index: usize,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct GradiusUtilityAd {
+    content: String,
+    #[serde(default)]
+    ad_context: Option<serde_json::Value>,
+    #[serde(default)]
+    price: Option<GradiusUtilityPrice>,
+    #[serde(default)]
+    cta_text: Option<String>,
+    #[serde(default)]
+    cta_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GradiusUtilityPrice {
+    show_price: Option<f64>,
+    click_price: Option<f64>,
+}
+
+fn utility_endpoint(
+    base_url: &str,
+    request: &GradiusUtilityRequest,
+) -> Result<String, url::ParseError> {
+    let mut endpoint = Url::parse(&format!(
+        "{}{}",
+        base_url.trim().trim_end_matches('/'),
+        GRADIUS_UTILITY_PATH
+    ))?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("chat_id", &request.chat_id)
+        .append_pair("user_id", &request.user_id);
+    Ok(endpoint.into())
+}
+
+fn decode_utility_ad(body: &[u8]) -> Result<Option<GradiusPlacement>, GradiusClientError> {
+    let entries = serde_json::from_slice::<Vec<serde_json::Value>>(body)
+        .map_err(GradiusClientError::Decode)?;
+    let mut malformed = None;
+    let mut empty_content = false;
+    for (source_index, entry) in entries.into_iter().enumerate() {
+        if entry.get("type").and_then(serde_json::Value::as_str) != Some("native-text-ad") {
+            continue;
+        }
+        match serde_json::from_value::<GradiusUtilityAd>(entry) {
+            Ok(ad) if !ad.content.trim().is_empty() => {
+                return Ok(Some(GradiusPlacement::Standalone {
+                    source_index,
+                    markdown: ad.content,
+                    show_price: ad.price.as_ref().and_then(|price| price.show_price),
+                    click_price: ad.price.as_ref().and_then(|price| price.click_price),
+                    ad_context: ad.ad_context,
+                    cta_text: ad.cta_text,
+                    cta_link: ad.cta_link,
+                }));
+            }
+            Ok(_) => empty_content = true,
+            Err(error) => malformed = Some(error),
+        }
+    }
+    if let Some(error) = malformed {
+        return Err(GradiusClientError::Decode(error));
+    }
+    if empty_content {
+        return Err(GradiusClientError::InvalidUtilityPlacement);
+    }
+    Ok(None)
 }
 
 fn dialogue_endpoint(
@@ -865,6 +1133,153 @@ mod tests {
             model_version: None,
             text: "Очищенный текст".to_owned(),
         }
+    }
+
+    fn test_utility_request() -> GradiusUtilityRequest {
+        GradiusUtilityRequest {
+            chat_id: "chat_synthetic".to_owned(),
+            user_id: "user_synthetic".to_owned(),
+            user_metadata: serde_json::json!({"tool": "image_generation"}),
+            user_text_request: Some("[PERSON]".to_owned()),
+            model_text_answer: Some("Image generated".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_empty_array_is_no_ad_and_malformed_only_is_decode_error() {
+        let transport = FakeGradiusTransport::default();
+        for body in [r#"[]"#, r#"[{"type":"native-text-ad","content":" "}]"#] {
+            transport
+                .responses
+                .lock()
+                .expect("responses")
+                .push_back(Ok(GradiusHttpResponse {
+                    status: 200,
+                    body: body.as_bytes().to_vec(),
+                }));
+        }
+        let client = enabled_test_client(transport);
+        let no_ad = client
+            .utility(test_utility_request())
+            .await
+            .expect("empty response");
+        assert!(no_ad.placement.is_none());
+        assert_eq!(no_ad.exchange.outcome, GradiusCallOutcome::NoAd);
+        let error = client
+            .utility(test_utility_request())
+            .await
+            .expect_err("invalid placement");
+        assert_eq!(
+            error.exchange.expect("exchange").outcome,
+            GradiusCallOutcome::DecodeError
+        );
+    }
+
+    #[tokio::test]
+    async fn utility_errors_keep_bounded_audit_without_auth_or_original_pii() {
+        let transport = FakeGradiusTransport::default();
+        for (status, body) in [
+            (503, b"provider unavailable".to_vec()),
+            (200, b"not json".to_vec()),
+            (200, vec![b'x'; GRADIUS_RAW_BODY_MAX_BYTES + 1]),
+        ] {
+            transport
+                .responses
+                .lock()
+                .expect("responses")
+                .push_back(Ok(GradiusHttpResponse { status, body }));
+        }
+        let client = enabled_test_client(transport);
+        for outcome in [
+            GradiusCallOutcome::HttpError,
+            GradiusCallOutcome::DecodeError,
+            GradiusCallOutcome::ResponseTooLarge,
+        ] {
+            let error = client
+                .utility(test_utility_request())
+                .await
+                .expect_err("provider error");
+            let exchange = error.exchange.expect("auditable exchange");
+            assert_eq!(exchange.outcome, outcome);
+            assert!(
+                !exchange
+                    .request_body
+                    .to_string()
+                    .contains("Alice@example.com")
+            );
+            assert!(!exchange.request_body.to_string().contains("server-secret"));
+            assert!(!format!("{exchange:?}").contains("server-secret"));
+            assert!(
+                exchange
+                    .response_body
+                    .as_ref()
+                    .is_none_or(|body| body.len() <= GRADIUS_RAW_BODY_MAX_BYTES)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_client_sends_documented_request_and_selects_first_valid_ad() {
+        let transport = FakeGradiusTransport::default();
+        transport.responses.lock().expect("response lock").push_back(Ok(
+            GradiusHttpResponse {
+                status: 200,
+                body: br#"[{"type":"native-text-ad","content":""},{"type":"native-text-ad","content":"Try [this](https://ads.example/r/1)","price":{"show_price":1.25,"click_price":30},"cta_text":"Try","cta_link":"https://ads.example/r/1"},{"type":"native-text-ad","content":"second"}]"#.to_vec(),
+            },
+        ));
+        let client = enabled_test_client(transport.clone());
+
+        let result = client
+            .utility(GradiusUtilityRequest {
+                chat_id: "chat_synthetic".to_owned(),
+                user_id: "user_synthetic".to_owned(),
+                user_metadata: serde_json::json!({"tool": "image_generation"}),
+                user_text_request: Some("A redacted portrait".to_owned()),
+                model_text_answer: Some("Image generated".to_owned()),
+            })
+            .await
+            .expect("utility response");
+        let Some(GradiusPlacement::Standalone {
+            source_index,
+            markdown,
+            show_price,
+            click_price,
+            ..
+        }) = result.placement
+        else {
+            panic!("standalone placement expected");
+        };
+        assert_eq!(markdown, "Try [this](https://ads.example/r/1)");
+        assert_eq!(source_index, 1);
+        assert_eq!(show_price, Some(1.25));
+        assert_eq!(click_price, Some(30.0));
+        assert_eq!(
+            result.exchange.integration_kind,
+            GradiusIntegrationKind::NativeUtility
+        );
+        assert_eq!(result.exchange.role, None);
+        assert_eq!(result.exchange.outcome, GradiusCallOutcome::Ad);
+        assert_eq!(
+            result
+                .exchange
+                .response_json
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].endpoint,
+            "https://api.adlean.pro/v1/native/utility_service/chat?chat_id=chat_synthetic&user_id=user_synthetic"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0].body).expect("JSON"),
+            serde_json::json!({"user_metadata":{"tool":"image_generation"},"user_text_request":"A redacted portrait","model_text_answer":"Image generated"})
+        );
+        assert!(!format!("{:?}", result.exchange).contains("A redacted portrait"));
+        assert!(!format!("{:?}", result.exchange).contains("server-secret"));
     }
 
     #[tokio::test]

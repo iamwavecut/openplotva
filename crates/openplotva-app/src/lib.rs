@@ -21,6 +21,7 @@ pub mod dialog_workers;
 pub mod edited;
 pub mod embedder;
 pub mod gradius_ads;
+pub mod gradius_utility_outbox;
 pub mod guest;
 pub mod help;
 pub mod history_summary;
@@ -1291,9 +1292,21 @@ async fn admin_gradius_summary(
         return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "Gradius audit unavailable");
     };
     let values = admin_auth_query_values(raw_query.as_deref());
+    let list_filter = match admin_gradius_opportunities_filter(&values) {
+        Ok(filter) => filter,
+        Err(error) => return admin_error_response(StatusCode::BAD_REQUEST, &error),
+    };
     let filter = openplotva_server::RuntimeGradiusSummaryFilter {
-        range: values.get("range").cloned().unwrap_or_default(),
-        integration_kind: values.get("integration_kind").cloned().unwrap_or_default(),
+        range: list_filter.range,
+        integration_kind: list_filter.integration_kind,
+        source: list_filter.source,
+        outcome: list_filter.outcome,
+        delivery_state: list_filter.delivery_state,
+        user_id: list_filter.user_id,
+        chat_id: list_filter.chat_id,
+        dialog_job_id: list_filter.dialog_job_id,
+        model: list_filter.model,
+        q: list_filter.q,
     };
     match reader.gradius_ad_summary(filter).await {
         Ok(payload) => admin_json_response(StatusCode::OK, payload),
@@ -1333,6 +1346,7 @@ fn admin_gradius_opportunities_filter(
     Ok(openplotva_server::RuntimeGradiusOpportunitiesFilter {
         range: values.get("range").cloned().unwrap_or_default(),
         integration_kind: values.get("integration_kind").cloned().unwrap_or_default(),
+        source: values.get("source").cloned().unwrap_or_default(),
         outcome: values.get("outcome").cloned().unwrap_or_default(),
         delivery_state: values.get("delivery_state").cloned().unwrap_or_default(),
         user_id: parse_id("user_id")?,
@@ -11914,7 +11928,73 @@ async fn start_runtime_workers(
         chat_settings_store.clone(),
         chat_member_store.clone(),
     );
-    let checkin_effects = checkin::CheckinGameRuntimeEffects::new(
+    let utility_requested = config.gradius.utility_image_enabled
+        || config.gradius.utility_rates_enabled
+        || config.gradius.utility_checkin_enabled;
+    let gradius_utility = if !utility_requested {
+        None
+    } else if !config.gradius.enabled || config.gradius.api_key.trim().is_empty() {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "gradius_utility",
+            "Utility surfaces are enabled but Gradius master switch or API key is missing",
+        ));
+        None
+    } else {
+        match openplotva_llm::gradius::GradiusPrivacyRedactor::new(
+            gradius_ads::gradius_privacy_config(config),
+        ) {
+            Ok(redactor) => {
+                let client: Arc<dyn gradius_ads::GradiusUtilityClient> =
+                    Arc::new(openplotva_llm::gradius::GradiusClient::new(
+                        openplotva_llm::gradius::GradiusClientConfig {
+                            enabled: true,
+                            api_key: config.gradius.api_key.clone(),
+                            base_url: config.gradius.base_url.clone(),
+                            request_timeout: Duration::from_secs(
+                                u64::try_from(config.gradius.request_timeout_seconds.max(1))
+                                    .unwrap_or(5),
+                            ),
+                        },
+                    ));
+                let vip: Arc<dyn gradius_ads::GradiusVipChecker> =
+                    Arc::new(payments::VipStatusWithExternalMembership::new(
+                        payment_store.clone(),
+                        payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
+                        config.vip.chat_id,
+                    ));
+                let ads = Arc::new(gradius_ads::GradiusUtilityAdService::new(
+                    client,
+                    Arc::new(redactor),
+                    Arc::new(
+                        openplotva_storage::gradius_ads::PostgresGradiusAdStore::new(
+                            service_clients.postgres.clone(),
+                        ),
+                    ),
+                    vip,
+                ));
+                let outbox = Arc::new(gradius_utility_outbox::GradiusUtilityOutbox::new(
+                    openplotva_storage::PostgresTelegramOutboxStore::new(
+                        service_clients.postgres.clone(),
+                    ),
+                    bot_identity.id,
+                ));
+                readiness_checks.push(ReadinessCheck::ok(
+                    "gradius_utility",
+                    "Gradius utility surfaces initialized with fail-closed privacy redaction",
+                ));
+                Some((ads, outbox))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Gradius utility privacy redactor unavailable");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "gradius_utility",
+                    "Gradius utility privacy redactor unavailable",
+                ));
+                None
+            }
+        }
+    };
+    let mut checkin_effects = checkin::CheckinGameRuntimeEffects::new(
         checkin_game_store.clone(),
         checkin::TelegramCheckinGameSender::new(
             ephemeral_store.clone(),
@@ -11924,6 +12004,11 @@ async fn start_runtime_workers(
         Arc::clone(&permission_policy),
         bot_identity.id,
     );
+    if config.gradius.utility_checkin_enabled
+        && let Some((ads, outbox)) = &gradius_utility
+    {
+        checkin_effects = checkin_effects.with_utility_ads(Arc::clone(ads), Arc::clone(outbox));
+    }
     let bot_username = bot_identity.username.clone();
     let telegram_effects = Arc::new(telegram.clone());
     let payment_rich_effects = Arc::new(payments::RichPaymentEffects::new(
@@ -13138,6 +13223,16 @@ async fn start_runtime_workers(
     .with_context_provider(chat_context.clone());
     let mut regular_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
+    if config.gradius.utility_image_enabled
+        && let Some((ads, outbox)) = &gradius_utility
+    {
+        regular_image_effects = regular_image_effects.with_utility_ads(Arc::new(
+            gradius_utility_outbox::GradiusUtilityImageAds {
+                ads: Arc::clone(ads),
+                outbox: Arc::clone(outbox),
+            },
+        ));
+    }
     {
         let reactions = &generation_reactions;
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
@@ -13650,6 +13745,12 @@ async fn start_runtime_workers(
             ))),
             delete_drawing_command,
         ));
+        let mut rates_effects = rates::RatesUtilityEffects::new(Arc::clone(&rich_sender));
+        if config.gradius.utility_rates_enabled
+            && let Some((ads, outbox)) = &gradius_utility
+        {
+            rates_effects = rates_effects.with_utility_ads(Arc::clone(ads), Arc::clone(outbox));
+        }
         let rates_handler = Arc::new(rates::RatesCommandUpdateHandler::new(
             rates::RatesBotIdentity {
                 user: bot_user_from_get_me(&bot_identity),
@@ -13657,7 +13758,7 @@ async fn start_runtime_workers(
             Arc::new(MessageGateCheckedRatesPermission),
             Some(Arc::clone(&rates_fetcher)),
             Arc::new(RuntimeRatesHeaderProvider),
-            Arc::new(rates::RatesRichEffects::new(Arc::clone(&rich_sender))),
+            Arc::new(rates_effects),
             translate_handler,
         ));
         let checkin_command = Arc::new(checkin::CheckinCommandUpdateHandler::new(
@@ -16803,11 +16904,12 @@ mod tests {
     #[test]
     fn admin_gradius_filters_preserve_supported_dimensions_and_reject_bad_ids() {
         let values = admin_auth_query_values(Some(
-            "range=7d&integration_kind=native_dialogue&outcome=ad&delivery_state=delivered&user_id=7&chat_id=8&dialog_job_id=9&model=qwen&q=discount&offset=4&limit=999",
+            "range=7d&integration_kind=native_utility&source=rates-command&outcome=ad&delivery_state=delivered&user_id=7&chat_id=8&dialog_job_id=9&model=qwen&q=discount&offset=4&limit=999",
         ));
         let filter = admin_gradius_opportunities_filter(&values).expect("Gradius filter");
         assert_eq!(filter.range, "7d");
-        assert_eq!(filter.integration_kind, "native_dialogue");
+        assert_eq!(filter.integration_kind, "native_utility");
+        assert_eq!(filter.source, "rates-command");
         assert_eq!(filter.outcome, "ad");
         assert_eq!(filter.delivery_state, "delivered");
         assert_eq!(filter.user_id, Some(7));
