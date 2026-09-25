@@ -6696,10 +6696,7 @@ mod tests {
             },
             reference_audio: None,
         };
-        assert_eq!(
-            generator.requests(),
-            vec![expected_request; crate::music_jobs::SONG_TAKES_PER_REQUEST]
-        );
+        assert_eq!(generator.requests(), vec![expected_request]);
         assert_eq!(permission_store.loads(), vec![-100]);
         assert!(permission_store.saves().is_empty());
         assert_eq!(music_files.lookups(), vec![String::new()]);
@@ -6714,7 +6711,7 @@ mod tests {
         );
         {
             let sent = music_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), crate::music_jobs::SONG_TAKES_PER_REQUEST);
+            assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].chat_id, -100);
             assert_eq!(sent[0].reply_to_message_id, Some(78));
             assert!(sent[0].html.contains(r#"<audio src="#));

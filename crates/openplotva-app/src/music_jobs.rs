@@ -670,7 +670,7 @@ fn completion_voice(material: SongMaterial) -> (String, String) {
 
 /// Every song request is answered with this many independent takes of the same
 /// material (the service draws a fresh seed per call), each in its own message.
-pub const SONG_TAKES_PER_REQUEST: usize = 2;
+pub const SONG_TAKES_PER_REQUEST: usize = 1;
 
 impl MusicGenerator for AceStepMusicGenerator {
     fn generate_song<'a>(&'a self, request: MusicGenerationRequest) -> MusicGenerationFuture<'a> {
@@ -2128,11 +2128,10 @@ mod tests {
         MusicGenerationError, MusicGenerationFuture, MusicGenerationRequest, MusicGenerator,
         MusicJobEffectFuture, MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions,
         MusicQueuePollOutcome, MusicReferenceAudio, NoSongLanguageHintStore,
-        SONG_TAKES_PER_REQUEST, SongLanguageHintFuture, SongLanguageHintStore, SongMaterial,
-        SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
-        build_song_caption_with_support, build_song_release_prompt, completion_voice,
-        execute_music_gen_job, music_job_topic, run_music_queue_once,
-        run_music_queue_once_with_max_attempts,
+        SongLanguageHintFuture, SongLanguageHintStore, SongMaterial, SongMaterialProvider,
+        SongPromptFuture, SongPromptGenerator, build_song_caption_with_support,
+        build_song_release_prompt, completion_voice, execute_music_gen_job, music_job_topic,
+        run_music_queue_once, run_music_queue_once_with_max_attempts,
     };
 
     fn test_walker() -> crate::routed_attempts::RoutedAttemptWalker {
@@ -2382,7 +2381,7 @@ mod tests {
 
         assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
         let persisted = effects.persisted();
-        assert_eq!(persisted.len(), SONG_TAKES_PER_REQUEST);
+        assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].job_id, Some(555));
         assert_eq!(persisted[0].chat_id, 42);
         assert_eq!(persisted[0].thread_id, Some(77));
@@ -2485,14 +2484,10 @@ mod tests {
 
         assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
         let sent = effects.sent();
-        assert_eq!(sent.len(), SONG_TAKES_PER_REQUEST);
+        assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, 42);
-        assert!(
-            sent[1].material.title.ends_with(" (2)"),
-            "{}",
-            sent[1].material.title
-        );
         assert_eq!(sent[0].thread_id, Some(77));
+        assert_eq!(generator.requests().len(), 1);
         assert_eq!(generator.requests()[0].topic, "ночной город");
         assert_eq!(
             build_song_release_prompt(&generator.requests()[0].material.style),
@@ -2500,102 +2495,6 @@ mod tests {
             "the topic is no longer appended to the tag list"
         );
         Ok(())
-    }
-
-    #[derive(Clone, Debug)]
-    struct SequenceGeneratorStub {
-        results: Arc<Mutex<VecDeque<Result<GeneratedSongAudio, MusicGenerationError>>>>,
-    }
-
-    impl MusicGenerator for SequenceGeneratorStub {
-        fn generate_song<'a>(
-            &'a self,
-            _request: MusicGenerationRequest,
-        ) -> MusicGenerationFuture<'a> {
-            Box::pin(async move {
-                lock(&self.results).pop_front().unwrap_or_else(|| {
-                    Err(MusicGenerationError::Provider("no more takes".to_owned()))
-                })
-            })
-        }
-    }
-
-    fn song_params() -> MusicGenJobParams {
-        MusicGenJobParams {
-            chat_id: 42,
-            message_id: 9,
-            user_id: 7,
-            user_full_name: "Alice".to_owned(),
-            topic: "ночной город".to_owned(),
-            ..MusicGenJobParams::default()
-        }
-    }
-
-    fn take(file_name: &str) -> Result<GeneratedSongAudio, MusicGenerationError> {
-        Ok(GeneratedSongAudio {
-            data: b"MP3".to_vec(),
-            file_name: file_name.to_owned(),
-            ..GeneratedSongAudio::default()
-        })
-    }
-
-    #[tokio::test]
-    async fn one_song_request_delivers_two_numbered_takes() {
-        let generator = SequenceGeneratorStub {
-            results: Arc::new(Mutex::new(VecDeque::from([
-                take("first.mp3"),
-                take("second.mp3"),
-            ]))),
-        };
-        let effects = EffectsStub::allowed().with_song_ids(vec![Some(1), Some(2)]);
-
-        let report = execute_music_gen_job(
-            &HeuristicSongMaterialProvider,
-            &generator,
-            &effects,
-            song_params(),
-            None,
-        )
-        .await;
-
-        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
-        assert_eq!(report.result_message_id, Some(100));
-        let sent = effects.sent();
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0].generated.file_name, "first.mp3");
-        assert_eq!(sent[1].generated.file_name, "second.mp3");
-        assert!(!sent[0].material.title.ends_with(" (2)"));
-        assert!(sent[1].material.title.ends_with(" (2)"));
-        assert_eq!(effects.marked(), vec![(1, 100), (2, 100)]);
-        assert_eq!(
-            effects
-                .reactions()
-                .iter()
-                .filter(|(kind, _, _)| *kind == "clear")
-                .count(),
-            1,
-            "the progress signal is cleared once, after the last take"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_second_take_keeps_the_first_song() {
-        let generator = SequenceGeneratorStub {
-            results: Arc::new(Mutex::new(VecDeque::from([take("first.mp3")]))),
-        };
-        let effects = EffectsStub::allowed();
-
-        let report = execute_music_gen_job(
-            &HeuristicSongMaterialProvider,
-            &generator,
-            &effects,
-            song_params(),
-            None,
-        )
-        .await;
-
-        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
-        assert_eq!(effects.sent().len(), 1);
     }
 
     #[test]
@@ -2856,7 +2755,7 @@ mod tests {
             queue.records()[0].status,
             openplotva_taskman::JobStatus::Completed
         );
-        assert_eq!(generator.requests().len(), SONG_TAKES_PER_REQUEST);
+        assert_eq!(generator.requests().len(), 1);
         Ok(())
     }
 
