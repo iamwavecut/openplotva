@@ -1678,7 +1678,9 @@ fn image_generation_context(
 
 /// Prompts follow the model routing serves the workflow with: its primary
 /// model's `prompt_target` config names the model, so switching the model in
-/// the database switches the prompt style with it.
+/// the database switches the prompt style with it. The prompt is written once,
+/// before the walk, for the heaviest primary; a lighter primary or a fallback
+/// hop renders that same prompt.
 fn routed_image_targets(
     walker: &RoutedAttemptWalker,
     workflow_key: &str,
