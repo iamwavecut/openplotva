@@ -2247,7 +2247,7 @@ where
                     messages: optimizer_messages(&prompt, text),
                     schema: openplotva_media::with_output_max_chars(
                         tool.input_schema,
-                        openplotva_media::IMAGE_PROMPT_MAX_CHARS,
+                        render_options.targets.prompt_max_chars(),
                     ),
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
@@ -2293,7 +2293,7 @@ where
                     messages: optimizer_messages(&prompt, text),
                     schema: openplotva_media::with_output_max_chars(
                         tool.input_schema,
-                        openplotva_media::IMAGE_PROMPT_MAX_CHARS,
+                        render_options.targets.prompt_max_chars(),
                     ),
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,

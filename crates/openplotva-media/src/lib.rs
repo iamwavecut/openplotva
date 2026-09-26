@@ -68,6 +68,8 @@ pub enum ImageModel {
     Klein,
     /// Boogu-Image (Turbo and Edit-Turbo): concise, style first.
     Boogu,
+    /// Qwen-Image 2.1: long observational descriptions read by a Qwen3-VL encoder.
+    QwenImage,
 }
 
 impl ImageModel {
@@ -76,6 +78,27 @@ impl ImageModel {
         match self {
             Self::Klein => "FLUX.2 [klein]",
             Self::Boogu => "Boogu-Image",
+            Self::QwenImage => "Qwen-Image 2.1",
+        }
+    }
+
+    /// Model named by the `prompt_target` value of a routed provider model.
+    #[must_use]
+    pub fn from_prompt_target(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "klein" => Some(Self::Klein),
+            "boogu" => Some(Self::Boogu),
+            "qwen_image" => Some(Self::QwenImage),
+            _ => None,
+        }
+    }
+
+    /// Upper bound for one prompt written for this model, in characters.
+    #[must_use]
+    pub const fn prompt_max_chars(self) -> usize {
+        match self {
+            Self::Klein | Self::Boogu => IMAGE_PROMPT_MAX_CHARS,
+            Self::QwenImage => QWEN_IMAGE_PROMPT_MAX_CHARS,
         }
     }
 }
@@ -99,6 +122,7 @@ impl Default for ImageTargets {
 impl ImageTargets {
     pub const KLEIN: Self = Self::single(ImageModel::Klein);
     pub const BOOGU: Self = Self::single(ImageModel::Boogu);
+    pub const QWEN_IMAGE: Self = Self::single(ImageModel::QwenImage);
 
     #[must_use]
     pub const fn single(model: ImageModel) -> Self {
@@ -117,6 +141,16 @@ impl ImageTargets {
     #[must_use]
     pub fn model_for_slot(self, index: usize) -> ImageModel {
         self.models[index.min(self.len - 1)]
+    }
+
+    /// Length bound for every optimized string: the most any slot's model allows.
+    #[must_use]
+    pub fn prompt_max_chars(&self) -> usize {
+        self.models()
+            .iter()
+            .map(|model| model.prompt_max_chars())
+            .max()
+            .unwrap_or(IMAGE_PROMPT_MAX_CHARS)
     }
 
     /// Targets for two generators rendered side by side: `own_slots` slots
@@ -326,6 +360,9 @@ pub fn render_image_edit_optimizer_prompt_with(
 /// looping model close its string and the JSON instead of running to the token cap.
 pub const IMAGE_PROMPT_MAX_CHARS: usize = 1200;
 
+/// Qwen-Image rules ask for up to 300 words of description.
+pub const QWEN_IMAGE_PROMPT_MAX_CHARS: usize = 2800;
+
 /// Add a `maxLength` bound to every string of the schema's `outputs` array.
 #[must_use]
 pub fn with_output_max_chars(mut schema: Value, max_chars: usize) -> Value {
@@ -356,6 +393,7 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "multi": variant_count > 1,
         "klein": models.contains(&ImageModel::Klein),
         "boogu": models.contains(&ImageModel::Boogu),
+        "qwen_image": models.contains(&ImageModel::QwenImage),
     })
 }
 
@@ -785,6 +823,65 @@ mod tests {
         assert!(edit.contains("`outputs[0]` is carried out by FLUX.2 [klein]"));
         assert!(edit.contains("**FLUX.2 [klein]**"));
         assert!(!edit.contains("**Boogu-Image Edit**"));
+    }
+
+    #[test]
+    fn qwen_image_slots_get_their_own_rules_and_examples() {
+        let vip_pair = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 2,
+            targets: ImageTargets::QWEN_IMAGE.followed_by(1, ImageTargets::BOOGU, 1),
+        })
+        .expect("render qwen pair");
+        assert!(vip_pair.contains("`outputs[0]` is rendered by Qwen-Image 2.1"));
+        assert!(vip_pair.contains("`outputs[1]` is rendered by Boogu-Image"));
+        assert!(vip_pair.contains("**Qwen-Image 2.1**"));
+        assert!(vip_pair.contains("150 to 300 words"));
+        assert!(vip_pair.contains("single Qwen-Image 2.1 slot"));
+        assert!(!vip_pair.contains("**FLUX.2 [klein]**"));
+        assert!(!vip_pair.contains("{{"));
+
+        let klein =
+            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render klein");
+        assert!(!klein.contains("Qwen-Image"));
+
+        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::QWEN_IMAGE,
+        })
+        .expect("render qwen edit");
+        assert!(edit.contains("`outputs[0]` is carried out by Qwen-Image 2.1"));
+        assert!(edit.contains("Call the picture being edited <image1>"));
+        assert!(edit.contains("<image2>"));
+        assert!(!edit.contains("**FLUX.2 [klein]**"));
+        assert!(!edit.contains("{{"));
+    }
+
+    #[test]
+    fn prompt_targets_and_length_bounds_follow_the_model() {
+        assert_eq!(
+            ImageModel::from_prompt_target(" Qwen_Image "),
+            Some(ImageModel::QwenImage)
+        );
+        assert_eq!(
+            ImageModel::from_prompt_target("klein"),
+            Some(ImageModel::Klein)
+        );
+        assert_eq!(
+            ImageModel::from_prompt_target("boogu"),
+            Some(ImageModel::Boogu)
+        );
+        assert_eq!(ImageModel::from_prompt_target("dall-e"), None);
+
+        assert_eq!(
+            ImageTargets::KLEIN.prompt_max_chars(),
+            IMAGE_PROMPT_MAX_CHARS
+        );
+        assert_eq!(
+            ImageTargets::QWEN_IMAGE
+                .followed_by(1, ImageTargets::BOOGU, 1)
+                .prompt_max_chars(),
+            QWEN_IMAGE_PROMPT_MAX_CHARS
+        );
     }
 
     #[test]

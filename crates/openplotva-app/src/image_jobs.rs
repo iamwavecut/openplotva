@@ -777,8 +777,14 @@ where
         if prompt.trim().is_empty() {
             return Ok(ImageGenerationResult::default());
         }
-        let payload = draw_api_payload(&prompt, &[], draw_api_dimensions(&request.aspect_ratio))
-            .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
+        let aspect_ratio = draw_api_aspect_ratio(&request.aspect_ratio);
+        let payload = draw_api_payload(
+            &prompt,
+            &[],
+            draw_api_dimensions(&request.aspect_ratio),
+            aspect_ratio.as_deref(),
+        )
+        .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let job_id = self
             .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
             .await?;
@@ -825,7 +831,7 @@ where
                 "image edit requires image input".to_owned(),
             ));
         }
-        let payload = draw_api_payload(&prompt, &image_inputs, None)
+        let payload = draw_api_payload(&prompt, &image_inputs, None, None)
             .map_err(|err| ImageEditError::Provider(err.to_string()))?;
         let job_id = self
             .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
@@ -1547,7 +1553,7 @@ impl ImageGenerator for RoutedImageGenerator {
     }
 
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        image_targets_for_workflow(&self.workflow_key)
+        routed_image_targets(&self.walker, &self.workflow_key)
     }
 
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
@@ -1616,7 +1622,7 @@ where
     DataUrl::Error: fmt::Display,
 {
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        image_targets_for_workflow(&self.workflow_key)
+        routed_image_targets(&self.walker, &self.workflow_key)
     }
 
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
@@ -1670,8 +1676,35 @@ fn image_generation_context(
     }
 }
 
-/// Boogu slots get Boogu-Image prompts; FLUX slots and the generic workflows,
-/// whose backend is chosen by routing, get the stricter FLUX.2 [klein] ones.
+/// Prompts follow the model routing serves the workflow with: its primary
+/// model's `prompt_target` config names the model, so switching the model in
+/// the database switches the prompt style with it. The prompt is written once,
+/// before the walk, for the heaviest primary; a lighter primary or a fallback
+/// hop renders that same prompt.
+fn routed_image_targets(
+    walker: &RoutedAttemptWalker,
+    workflow_key: &str,
+) -> openplotva_media::ImageTargets {
+    walker
+        .primary_model_config(workflow_key)
+        .as_ref()
+        .and_then(prompt_target_model)
+        .map_or_else(
+            || image_targets_for_workflow(workflow_key),
+            openplotva_media::ImageTargets::single,
+        )
+}
+
+fn prompt_target_model(config: &serde_json::Value) -> Option<openplotva_media::ImageModel> {
+    config
+        .get("prompt_target")
+        .and_then(serde_json::Value::as_str)
+        .and_then(openplotva_media::ImageModel::from_prompt_target)
+}
+
+/// Without a `prompt_target` on the routed model: Boogu slots get Boogu-Image
+/// prompts; FLUX slots and the generic workflows get the stricter FLUX.2
+/// [klein] ones.
 fn image_targets_for_workflow(workflow_key: &str) -> openplotva_media::ImageTargets {
     match workflow_key {
         IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY | IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY => {
@@ -4730,6 +4763,8 @@ struct DrawApiGenerateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     height: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<OneOrManyStrings<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_b64: Option<OneOrManyStrings<'a>>,
@@ -4788,6 +4823,7 @@ fn draw_api_payload(
     prompt: &str,
     image_inputs: &[String],
     dimensions: Option<(i32, i32)>,
+    aspect_ratio: Option<&str>,
 ) -> serde_json::Result<Vec<u8>> {
     let (image_urls, image_b64) = split_draw_api_image_inputs(image_inputs);
     let image_url = one_or_many_strings(&image_urls);
@@ -4800,6 +4836,7 @@ fn draw_api_payload(
         prompt,
         width: dimensions.map(|(width, _)| width),
         height: dimensions.map(|(_, height)| height),
+        aspect_ratio,
         image_url,
         image_b64,
     })
@@ -4807,9 +4844,8 @@ fn draw_api_payload(
 
 const DRAW_API_BASE_RESOLUTION: i32 = 1024;
 
-/// Width/height for an explicit `N:M` aspect ratio, clamped to [1:2, 2:1] and
-/// scaled around `DRAW_API_BASE_RESOLUTION` in 64px steps.
-fn draw_api_dimensions(aspect_ratio: &str) -> Option<(i32, i32)> {
+/// An explicit `N:M` aspect ratio clamped to [1:2, 2:1] and reduced.
+fn draw_api_aspect(aspect_ratio: &str) -> Option<(i32, i32)> {
     let (hor_text, ver_text) = aspect_ratio.trim().split_once(':')?;
     let mut hor = hor_text.parse::<i32>().ok().filter(|value| *value > 0)?;
     let mut ver = ver_text.parse::<i32>().ok().filter(|value| *value > 0)?;
@@ -4820,8 +4856,19 @@ fn draw_api_dimensions(aspect_ratio: &str) -> Option<(i32, i32)> {
         (hor, ver) = (1, 2);
     }
     let divisor = gcd(hor, ver);
-    hor /= divisor;
-    ver /= divisor;
+    Some((hor / divisor, ver / divisor))
+}
+
+/// The ratio as the farm reads it: `draw_api_dimensions` rounds each side down
+/// to 64 px (16:9 becomes 1280x704), so models sized by ratio get it verbatim.
+fn draw_api_aspect_ratio(aspect_ratio: &str) -> Option<String> {
+    draw_api_aspect(aspect_ratio).map(|(hor, ver)| format!("{hor}:{ver}"))
+}
+
+/// Width/height for an explicit `N:M` aspect ratio, clamped to [1:2, 2:1] and
+/// scaled around `DRAW_API_BASE_RESOLUTION` in 64px steps.
+fn draw_api_dimensions(aspect_ratio: &str) -> Option<(i32, i32)> {
+    let (hor, ver) = draw_api_aspect(aspect_ratio)?;
     let part = f64::from(DRAW_API_BASE_RESOLUTION * 2) / f64::from(hor + ver);
     let width = 64 * (part * f64::from(hor) / 64.0).floor() as i32;
     let height = 64 * (part * f64::from(ver) / 64.0).floor() as i32;
@@ -7440,6 +7487,132 @@ mod tests {
     }
 
     #[test]
+    fn draw_api_aspect_ratio_is_reduced_and_clamped_like_the_dimensions() {
+        assert_eq!(draw_api_aspect_ratio("16:9").as_deref(), Some("16:9"));
+        assert_eq!(draw_api_aspect_ratio("32:18").as_deref(), Some("16:9"));
+        assert_eq!(draw_api_aspect_ratio("3:1").as_deref(), Some("2:1"));
+        assert_eq!(draw_api_aspect_ratio("1:3").as_deref(), Some("1:2"));
+        assert_eq!(draw_api_aspect_ratio(""), None);
+        assert_eq!(draw_api_aspect_ratio("0:3"), None);
+    }
+
+    #[test]
+    fn generation_payload_carries_the_aspect_ratio_and_edits_do_not() {
+        let generation: serde_json::Value = serde_json::from_slice(
+            &draw_api_payload(
+                "cat",
+                &[],
+                draw_api_dimensions("16:9"),
+                draw_api_aspect_ratio("16:9").as_deref(),
+            )
+            .expect("generation payload"),
+        )
+        .expect("generation json");
+        assert_eq!(generation["aspect_ratio"], "16:9");
+        assert_eq!(generation["width"], 1280);
+        assert_eq!(generation["height"], 704);
+
+        let edit: serde_json::Value = serde_json::from_slice(
+            &draw_api_payload("night", &["https://img.test/a.png".to_owned()], None, None)
+                .expect("edit payload"),
+        )
+        .expect("edit json");
+        assert!(edit.get("aspect_ratio").is_none());
+        assert!(edit.get("width").is_none());
+    }
+
+    fn image_route_walker(model_config: serde_json::Value) -> RoutedAttemptWalker {
+        use openplotva_storage::llm_routing::{
+            AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, WorkflowRecord,
+        };
+
+        let snapshot = RoutingSnapshot {
+            providers: vec![ProviderRecord {
+                id: 1,
+                name: "aifarm-draw".to_owned(),
+                kind: "image".to_owned(),
+                protocol: Some("discovery_draw".to_owned()),
+                runtime_hint: None,
+                endpoint: None,
+                discovery_service_name: Some(AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
+                discovery_endpoint_name: Some(AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
+                api_key_ref: None,
+                api_key_encrypted: None,
+                enabled: true,
+                config: json!({}),
+            }],
+            models: vec![ModelRecord {
+                id: 10,
+                provider_id: 1,
+                model_name: "image/model".to_owned(),
+                display_name: None,
+                base_url: None,
+                capabilities: vec!["image".to_owned()],
+                embedding_dim: None,
+                pool_id: None,
+                enabled: true,
+                config: model_config,
+            }],
+            workflows: vec![WorkflowRecord {
+                key: IMAGE_GENERATION_FLUX_WORKFLOW_KEY.to_owned(),
+                kind: "image".to_owned(),
+                full_routing: true,
+                retry_max_hops: 3,
+                retry_wall_ms: 60_000,
+                enabled: true,
+            }],
+            assignments: vec![AssignmentRecord {
+                id: 100,
+                workflow_key: IMAGE_GENERATION_FLUX_WORKFLOW_KEY.to_owned(),
+                scope: "global".to_owned(),
+                role: "primary".to_owned(),
+                provider_model_id: 10,
+                weight: Some(100),
+                fallback_order: None,
+                canary_percent: None,
+                enabled: true,
+                inference_overrides: json!({}),
+                cb_failure_threshold: 5,
+                cb_cooldown_ms: 30_000,
+            }],
+            triggers: vec![],
+            pools: vec![],
+        };
+        RoutedAttemptWalker::new(
+            RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
+            Arc::new(BreakerSet::new()),
+            Arc::new(TriggerState::new()),
+            Arc::new(PoolRegistry::new()),
+        )
+    }
+
+    #[test]
+    fn image_prompt_targets_follow_the_routed_primary_model() {
+        let qwen = image_route_walker(json!({
+            "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": "qwen_image_generate",
+            "prompt_target": "qwen_image",
+        }));
+        assert_eq!(
+            routed_image_targets(&qwen, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
+            openplotva_media::ImageTargets::QWEN_IMAGE
+        );
+
+        let untagged = image_route_walker(json!({"endpoint_name": "generate"}));
+        assert_eq!(
+            routed_image_targets(&untagged, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
+            openplotva_media::ImageTargets::KLEIN
+        );
+        assert_eq!(
+            routed_image_targets(
+                &empty_routed_attempt_walker(),
+                IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
+            ),
+            openplotva_media::ImageTargets::BOOGU
+        );
+    }
+
+    #[test]
     fn flux_watermark_blends_only_the_three_corner_pixels_at_twenty_percent() {
         let source = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 200]));
 
@@ -7634,7 +7807,7 @@ mod tests {
         let draw_request: Value = serde_json::from_slice(&draw_body).expect("draw request");
         assert_eq!(
             draw_request,
-            json!({"prompt": "variant one", "width": 1280, "height": 704})
+            json!({"prompt": "variant one", "width": 1280, "height": 704, "aspect_ratio": "16:9"})
         );
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
         assert_eq!(requests[1].url, "https://draw.example.test/v1/jobs/job-1");

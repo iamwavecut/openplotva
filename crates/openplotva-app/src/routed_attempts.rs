@@ -115,6 +115,21 @@ impl RoutedAttemptWalker {
         self
     }
 
+    /// Config of the workflow's heaviest global primary, for callers that shape
+    /// the request to the model before the walk starts.
+    #[must_use]
+    pub fn primary_model_config(&self, workflow_key: &str) -> Option<Value> {
+        let table = self.handle.load();
+        let route = table.resolve(workflow_key, false)?;
+        let candidate = route
+            .primary
+            .iter()
+            .max_by_key(|candidate| candidate.weight)?;
+        table
+            .model(candidate.model)
+            .map(|model| model.config.clone())
+    }
+
     // The fallback tail serves the request without the primary's tools or
     // quality, so a bounded queue on a busy primary beats an instant downgrade.
     // Slot time is charged to the caller's deadline, not to the retry wall.
