@@ -70,6 +70,8 @@ pub enum ImageModel {
     Boogu,
     /// Qwen-Image 2.1: long observational descriptions read by a Qwen3-VL encoder.
     QwenImage,
+    /// Krea 2 Turbo: one natural-prose paragraph, medium and style first.
+    Krea2,
 }
 
 impl ImageModel {
@@ -79,6 +81,7 @@ impl ImageModel {
             Self::Klein => "FLUX.2 [klein]",
             Self::Boogu => "Boogu-Image",
             Self::QwenImage => "Qwen-Image 2.1",
+            Self::Krea2 => "Krea 2 Turbo",
         }
     }
 
@@ -89,6 +92,7 @@ impl ImageModel {
             "klein" => Some(Self::Klein),
             "boogu" => Some(Self::Boogu),
             "qwen_image" => Some(Self::QwenImage),
+            "krea2" => Some(Self::Krea2),
             _ => None,
         }
     }
@@ -99,6 +103,7 @@ impl ImageModel {
         match self {
             Self::Klein | Self::Boogu => IMAGE_PROMPT_MAX_CHARS,
             Self::QwenImage => QWEN_IMAGE_PROMPT_MAX_CHARS,
+            Self::Krea2 => KREA2_PROMPT_MAX_CHARS,
         }
     }
 }
@@ -123,6 +128,7 @@ impl ImageTargets {
     pub const KLEIN: Self = Self::single(ImageModel::Klein);
     pub const BOOGU: Self = Self::single(ImageModel::Boogu);
     pub const QWEN_IMAGE: Self = Self::single(ImageModel::QwenImage);
+    pub const KREA2: Self = Self::single(ImageModel::Krea2);
 
     #[must_use]
     pub const fn single(model: ImageModel) -> Self {
@@ -363,6 +369,9 @@ pub const IMAGE_PROMPT_MAX_CHARS: usize = 1200;
 /// Qwen-Image rules ask for up to 300 words of description.
 pub const QWEN_IMAGE_PROMPT_MAX_CHARS: usize = 2800;
 
+/// Krea 2 rules ask for up to 200 words.
+pub const KREA2_PROMPT_MAX_CHARS: usize = 1600;
+
 /// Add a `maxLength` bound to every string of the schema's `outputs` array.
 #[must_use]
 pub fn with_output_max_chars(mut schema: Value, max_chars: usize) -> Value {
@@ -394,6 +403,7 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "klein": models.contains(&ImageModel::Klein),
         "boogu": models.contains(&ImageModel::Boogu),
         "qwen_image": models.contains(&ImageModel::QwenImage),
+        "krea2": models.contains(&ImageModel::Krea2),
     })
 }
 
@@ -857,6 +867,29 @@ mod tests {
     }
 
     #[test]
+    fn krea2_slots_get_their_own_rules_and_example() {
+        let krea2 = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::KREA2,
+        })
+        .expect("render krea2");
+        assert!(krea2.contains("`outputs[0]` is rendered by Krea 2 Turbo"));
+        assert!(krea2.contains("**Krea 2 Turbo**"));
+        assert!(krea2.contains("60 to 200 words"));
+        assert!(krea2.contains("single Krea 2 Turbo slot"));
+        assert!(!krea2.contains("**Qwen-Image 2.1**"));
+        assert!(!krea2.contains("**FLUX.2 [klein]**"));
+        assert!(!krea2.contains("{{"));
+
+        let qwen = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::QWEN_IMAGE,
+        })
+        .expect("render qwen");
+        assert!(!qwen.contains("Krea 2"));
+    }
+
+    #[test]
     fn prompt_targets_and_length_bounds_follow_the_model() {
         assert_eq!(
             ImageModel::from_prompt_target(" Qwen_Image "),
@@ -870,6 +903,10 @@ mod tests {
             ImageModel::from_prompt_target("boogu"),
             Some(ImageModel::Boogu)
         );
+        assert_eq!(
+            ImageModel::from_prompt_target("krea2"),
+            Some(ImageModel::Krea2)
+        );
         assert_eq!(ImageModel::from_prompt_target("dall-e"), None);
 
         assert_eq!(
@@ -881,6 +918,10 @@ mod tests {
                 .followed_by(1, ImageTargets::BOOGU, 1)
                 .prompt_max_chars(),
             QWEN_IMAGE_PROMPT_MAX_CHARS
+        );
+        assert_eq!(
+            ImageTargets::KREA2.prompt_max_chars(),
+            KREA2_PROMPT_MAX_CHARS
         );
     }
 
