@@ -34,14 +34,35 @@ WEBAPP_HOST=127.0.0.1 WEBAPP_PORT=8080 cargo run -p openplotva-app
 Useful local checks:
 
 ```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+tools/rust-fast-gate.sh
+# Disposable verification: remove this run's build and temporary files on exit.
+tools/rust-fast-gate.sh --ephemeral
 tools/local-smoke.sh
 tools/service-smoke.sh
 tools/provider-smoke.sh
 tools/update-queue-smoke.sh
 ```
+
+The fast gate runs formatting, Clippy, and the full workspace test suite (including
+doctests), using the lockfile. Normal runs reuse `target/` or `CARGO_TARGET_DIR`;
+`--ephemeral` builds in a new temporary directory and removes it on success,
+failure, or a handled interrupt. Both modes isolate and remove test temporary
+files. Neither mode cleans an existing build cache. SIGKILL or a host crash cannot
+run cleanup handlers.
+
+Development and test builds retain file/line backtraces with reduced debug data.
+For variable inspection in a debugger, use `CARGO_PROFILE_DEV_DEBUG=2 cargo test`.
+CI and disposable runs omit debug data (`CARGO_PROFILE_DEV_DEBUG=0`) to reduce
+compiler/linker work and cached artifacts; runtime backtraces there lack source lines, while assertion
+failures still include their source location. Debug assertions and overflow checks
+remain enabled.
+Disposable runs respect explicit `CARGO_PROFILE_DEV_DEBUG` and `CARGO_INCREMENTAL`
+overrides.
+Release builds keep their existing profile. Run a focused test with
+`cargo test --locked -p <crate> <filter>`; changing package selections can change
+dependency features and require rebuilding dependencies.
+See [test build measurements and cleanup behavior](docs/test-builds.md) for the
+comparison, limitations, and reproduction commands.
 
 Build the runtime image:
 

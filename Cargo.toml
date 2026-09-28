@@ -83,3 +83,8 @@ unused_must_use = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
+
+# Keep file/line backtraces without the type/variable debug data of full DWARF.
+# The test profile inherits these settings for local builds too.
+[profile.dev]
+debug = "line-tables-only"
