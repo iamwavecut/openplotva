@@ -45,6 +45,11 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 -m unittest discover -s .github/scripts/tests -p test_review_workflow.py -v
 
+      - name: Test Rust gate cleanup and failure handling
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tools/tests -v
+
       - name: Test GLM review transport in the pinned PR-Agent runtime
         run: |
           docker run --rm --network none --entrypoint python \
@@ -58,6 +63,8 @@ jobs:
   rust-lint:
     name: Rust lint
     runs-on: ubuntu-22.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
     permissions:
       checks: write
       contents: read
@@ -111,7 +118,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          cargo clippy --workspace --all-targets --all-features --message-format=json -- -D warnings > cargo-clippy.jsonl
+          cargo clippy --locked --workspace --all-targets --all-features --message-format=json -- -D warnings > cargo-clippy.jsonl
           clippy_status=$?
           set -e
           jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo-clippy.jsonl
@@ -126,11 +133,13 @@ jobs:
 
       - name: Run clippy
         if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   rust-workspace:
     name: Rust workspace
     runs-on: ubuntu-22.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -145,8 +154,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v5
@@ -171,7 +178,7 @@ jobs:
           set -euo pipefail
           # Per-package cargo test would resolve different dependency features and rebuild most of
           # the graph, so run the test binaries the workspace build already produced.
-          artifacts="$(cargo test --workspace --tests --no-run --message-format=json \
+          artifacts="$(cargo test --locked --workspace --tests --no-run --message-format=json \
             | jq -c 'select(.reason == "compiler-artifact" and .profile.test and .executable)')"
           run_serially() {
             local crate="$1"; shift
