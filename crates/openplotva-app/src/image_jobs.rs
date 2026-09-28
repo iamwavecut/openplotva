@@ -7598,6 +7598,16 @@ mod tests {
             openplotva_media::ImageTargets::QWEN_IMAGE
         );
 
+        let krea2 = image_route_walker(json!({
+            "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": "krea2_generate",
+            "prompt_target": "krea2",
+        }));
+        assert_eq!(
+            routed_image_targets(&krea2, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
+            openplotva_media::ImageTargets::KREA2
+        );
+
         let untagged = image_route_walker(json!({"endpoint_name": "generate"}));
         assert_eq!(
             routed_image_targets(&untagged, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
