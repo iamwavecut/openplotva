@@ -891,13 +891,36 @@ mod tests {
     }
 
     fn deleting_admin(user_id: i64) -> TelegramChatMember {
-        ChatMember::Administrator(
-            ChatMemberAdministrator::new(User::new(user_id, "Ada", false))
-                .with_can_delete_messages(true),
-        )
+        ChatMember::Administrator(ChatMemberAdministrator {
+            user: User::new(user_id, "Ada", false),
+            can_be_edited: false,
+            can_change_info: false,
+            can_delete_messages: true,
+            can_delete_stories: None,
+            can_edit_messages: None,
+            can_edit_stories: None,
+            can_invite_users: false,
+            can_manage_chat: false,
+            can_manage_direct_messages: None,
+            can_manage_tags: None,
+            can_manage_topics: None,
+            can_manage_video_chats: false,
+            can_pin_messages: None,
+            can_post_messages: None,
+            can_post_stories: None,
+            can_promote_members: false,
+            can_restrict_members: false,
+            can_send_welcome_messages: false,
+            custom_title: None,
+            is_anonymous: false,
+        })
     }
 
     fn creator(user_id: i64) -> TelegramChatMember {
-        ChatMember::Creator(ChatMemberCreator::new(User::new(user_id, "Ada", false)))
+        ChatMember::Creator(ChatMemberCreator {
+            user: User::new(user_id, "Ada", false),
+            is_anonymous: false,
+            custom_title: None,
+        })
     }
 }

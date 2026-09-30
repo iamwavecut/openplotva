@@ -2,8 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    DeleteMessage, EditMessageText, LinkPreviewOptions, ReactionType, ReplyMarkup, ReplyParameters,
-    SendMessage, SetMessageReaction,
+    DeleteMessage, LinkPreviewOptions, ReactionType, ReplyMarkup, ReplyParameters, SendMessage,
+    SetMessageReaction,
 };
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     AudioMessagePlan, AudioSource, DispatcherDrain, DispatcherPersistencePayload, DispatcherQueue,
     DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EditRichMessage,
-    EnqueueOutcome, MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
-    PhotoMessagePlan, PhotoSource, ReplyParametersPlan, SendRichMessage, StickerMessagePlan,
-    TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
+    EditTextMessagePlan, EnqueueOutcome, MediaGroupMessagePlan, MediaGroupPhotoItem,
+    MessageFingerprint, PhotoMessagePlan, PhotoSource, ReplyParametersPlan, SendRichMessage,
+    StickerMessagePlan, TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
     outbound::{MESSAGE_TYPE_REACTION, reaction_fingerprint_content},
     parse_mode_from_go,
 };
@@ -642,6 +642,13 @@ fn replay_rich_method(value: &Value) -> Option<TelegramOutboundMethod> {
 fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let text = field_string(value, &["Text", "text"])?;
+    let mut text = carapax::types::InputText::from(text);
+    if let Some(mode) = field_string(value, &["ParseMode", "parse_mode"])
+        .and_then(|mode| parse_mode_from_go(&mode).ok())
+        .flatten()
+    {
+        text = text.with_format(mode);
+    }
     let mut method = SendMessage::new(chat_id, text);
     if field_bool(value, &["DisableNotification", "disable_notification"]).unwrap_or(false) {
         method = method.with_disable_notification(true);
@@ -651,14 +658,26 @@ fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
     {
         method = method.with_message_thread_id(thread_id);
     }
-    if let Some(parse_mode) = field_string(value, &["ParseMode", "parse_mode"])
-        .and_then(|mode| parse_mode_from_go(&mode).ok())
-        .flatten()
-    {
-        method = method.with_parse_mode(parse_mode);
-    }
     if let Some(reply) = reply_parameters_plan(value, chat_id) {
         method = method.with_reply_parameters(reply_parameters(reply));
+    }
+    if let Some(parameters) = value.get("ephemeral_message_parameters") {
+        let receiver = parameters.get("receiver_user_id")?.as_i64()?;
+        if chat_id >= 0 || receiver <= 0 {
+            return None;
+        }
+        let parameters = serde_json::from_value::<carapax::types::EphemeralMessageParameters>(
+            parameters.clone(),
+        )
+        .ok()?;
+        method = method.with_ephemeral_message_parameters(parameters);
+        if let Some(reply) = value.get("reply_parameters") {
+            if reply.get("chat_id").is_some() {
+                return None;
+            }
+            let reply = serde_json::from_value::<ReplyParameters>(reply.clone()).ok()?;
+            method = method.with_reply_parameters(reply.with_allow_sending_without_reply(false));
+        }
     }
     if let Some(markup) = reply_markup(value) {
         method = method.with_reply_markup(markup);
@@ -678,7 +697,7 @@ fn replay_edit_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let message_id = field_i64(value, &["MessageID", "message_id"])?;
     let text = field_string(value, &["Text", "text"])?;
-    let mut method = EditMessageText::for_chat_message(chat_id, message_id, text);
+    let mut method = EditTextMessagePlan::for_chat_message(chat_id, message_id, text);
     if let Some(parse_mode) = field_string(value, &["ParseMode", "parse_mode"])
         .and_then(|mode| parse_mode_from_go(&mode).ok())
         .flatten()
@@ -1147,8 +1166,8 @@ mod tests {
         AudioMessagePlan, AudioSource, DEFAULT_DISPATCHER_QUEUE_KEY,
         DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DebouncerConfig, DispatcherConfig, DispatcherMessage,
         DispatcherPersistenceError, DispatcherQueue, DispatcherRestoredMessage,
-        EditMediaMessagePlan, EnqueueOutcome, MESSAGE_TYPE_RICH, MESSAGE_TYPE_TEXT,
-        MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
+        EditMediaMessagePlan, EditTextMessagePlan, EnqueueOutcome, MESSAGE_TYPE_RICH,
+        MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
         OUTBOUND_COMMAND_PAYLOAD_VERSION, OutboundCommand, OutboundCommandCodecError,
         PersistentDispatcherItem, PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource,
         ReplyParametersPlan, RichSendOptions, SendRichMessage, StickerMessagePlan,
@@ -1175,6 +1194,43 @@ mod tests {
 
     fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
         TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    #[test]
+    fn ephemeral_replay_keeps_receiver_and_rejects_invalid_parameters() {
+        let payload = serde_json::json!({"chat_id":-100,"text":"Offer",
+            "ephemeral_message_parameters":{"receiver_user_id":42,"callback_query_id":"callback","replace_callback_query_message":true}});
+        let command = OutboundCommand::decode(
+            1,
+            "sendMessage",
+            &serde_json::to_vec(&payload).expect("JSON"),
+        )
+        .expect("replay");
+        let TelegramOutboundMethod::SendMessage(method) = command.into_method() else {
+            panic!("text");
+        };
+        let replayed = serde_json::to_value(method).expect("request");
+        assert_eq!(
+            replayed["ephemeral_message_parameters"],
+            payload["ephemeral_message_parameters"]
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"receiver_user_id":0}),
+            serde_json::json!({"receiver_user_id":"42"}),
+            serde_json::Value::Null,
+        ] {
+            let mut payload = payload.clone();
+            payload["ephemeral_message_parameters"] = invalid;
+            assert!(
+                OutboundCommand::decode(
+                    1,
+                    "sendMessage",
+                    &serde_json::to_vec(&payload).expect("JSON")
+                )
+                .is_err()
+            );
+        }
     }
 
     fn rich_message(chat_id: i64, html: &str, virtual_id: &str) -> DispatcherMessage {
@@ -1545,15 +1601,16 @@ mod tests {
     #[test]
     fn durable_text_send_and_edit_preserve_disabled_link_previews()
     -> Result<(), Box<dyn std::error::Error>> {
-        use carapax::types::{EditMessageText, LinkPreviewOptions, SendMessage};
+        use carapax::types::{LinkPreviewOptions, SendMessage};
 
-        let preview = LinkPreviewOptions::default().with_is_disabled(true);
+        let preview = LinkPreviewOptions::disabled();
         let methods = [
             TelegramOutboundMethod::from(
                 SendMessage::new(42, "ad").with_link_preview_options(preview.clone()),
             ),
             TelegramOutboundMethod::from(
-                EditMessageText::for_chat_message(42, 9, "ad").with_link_preview_options(preview),
+                EditTextMessagePlan::for_chat_message(42, 9, "ad")
+                    .with_link_preview_options(preview),
             ),
         ];
         for method in methods {

@@ -1,10 +1,7 @@
 //! Raw Bot API client for **Rich Messages** (Bot API 10.1).
 //!
-//! `carapax`/`tgbot` (0.46) do not know `sendRichMessage`/`sendRichMessageDraft`/the
-//! `rich_message` parameter of `editMessageText`, and `tgbot::Payload` cannot be built
-//! downstream (its constructors are `pub(crate)`), so the `Method` trait is not usable
-//! for rich calls. This module issues the calls as raw JSON POSTs through `reqwest` and
-//! parses the Telegram response envelope itself, surfacing `retry_after` for the
+//! This adapter preserves the persisted rich HTML envelope used by the dispatcher.
+//! It posts JSON through `reqwest` and exposes Telegram's `retry_after` to the
 //! streaming throttle.
 
 use std::fmt;
@@ -20,7 +17,7 @@ pub type RichMessage = carapax::types::Message;
 
 const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
-/// Client for the rich-message Bot API methods that `carapax` does not expose.
+/// Client for the runtime's persisted rich HTML requests.
 #[derive(Clone)]
 pub struct RichApiClient {
     http: reqwest::Client,

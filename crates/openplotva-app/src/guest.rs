@@ -1920,13 +1920,19 @@ mod tests {
             request: openplotva_telegram::GuestHtmlAnswerRequest,
         ) -> GuestMessageFuture<'a, (), Self::Error> {
             Box::pin(async move {
+                let payload = match openplotva_telegram::build_guest_html_answer_method(&request) {
+                    Some(method) => Some(
+                        crate::test_bot_api::bot_api_payload(method)
+                            .await
+                            .map_err(|error| io::Error::other(error.to_string()))?,
+                    ),
+                    None => None,
+                };
                 let mut state = self.state.lock().expect("state");
-                if let Some(method) = openplotva_telegram::build_guest_html_answer_method(&request)
-                {
-                    state.answer_methods.push((
-                        TelegramOutboundMethodKind::AnswerGuestQuery,
-                        serde_json::to_value(method).map_err(io::Error::other)?,
-                    ));
+                if let Some(payload) = payload {
+                    state
+                        .answer_methods
+                        .push((TelegramOutboundMethodKind::AnswerGuestQuery, payload));
                 }
                 state.answers.push(request);
                 if state.fail_answers {

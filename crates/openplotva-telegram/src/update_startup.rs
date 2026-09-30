@@ -746,11 +746,12 @@ mod tests {
         assert_eq!(payload.get("drop_pending_updates"), Some(&Value::Null));
     }
 
-    #[test]
-    fn set_webhook_method_requests_only_product_updates() {
+    #[tokio::test]
+    async fn set_webhook_method_requests_only_product_updates() {
         let setup = WebhookSetup::new("https://plotva.example/tg", Some("secret-token".to_owned()));
-        let payload =
-            serde_json::to_value(build_set_webhook_method(&setup)).expect("setWebhook JSON");
+        let payload = crate::test_api::bot_api_payload(build_set_webhook_method(&setup))
+            .await
+            .expect("setWebhook payload");
 
         assert_eq!(
             payload.get("url"),
@@ -764,11 +765,12 @@ mod tests {
         assert_eq!(TELEGRAM_WEBHOOK_PATH, "/telegram/webhook");
     }
 
-    #[test]
-    fn set_webhook_method_omits_empty_secret_like_go_add_non_empty() {
+    #[tokio::test]
+    async fn set_webhook_method_omits_empty_secret_like_go_add_non_empty() {
         let setup = WebhookSetup::new("https://plotva.example/tg", Some(String::new()));
-        let payload =
-            serde_json::to_value(build_set_webhook_method(&setup)).expect("setWebhook JSON");
+        let payload = crate::test_api::bot_api_payload(build_set_webhook_method(&setup))
+            .await
+            .expect("setWebhook payload");
 
         assert!(payload.get("secret_token").is_none());
     }

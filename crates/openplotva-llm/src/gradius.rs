@@ -24,6 +24,7 @@ const VIP_HINT_SCOPE: &str = "gradius:v1:vip-hint";
 const GRADIUS_BASE_URL_DEFAULT: &str = "https://api.adlean.pro";
 const GRADIUS_REQUEST_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
 const GRADIUS_DIALOGUE_PATH: &str = "/v1/native/dialogue_model/chat";
+const GRADIUS_GENERATION_PATH: &str = "/v1/native/generation_model/chat";
 const GRADIUS_UTILITY_PATH: &str = "/v1/native/utility_service/chat";
 pub const GRADIUS_RAW_BODY_MAX_BYTES: usize = 65_536;
 const GRADIUS_REDACTION_CATEGORIES: [&str; 8] = [
@@ -130,6 +131,26 @@ pub struct GradiusDialogueTurn {
     pub language: String,
     pub model_version: Option<String>,
     pub text: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct GradiusGenerationRequest {
+    pub chat_id: String,
+    pub user_id: String,
+    pub text: String,
+    pub user_metadata: serde_json::Value,
+}
+
+impl fmt::Debug for GradiusGenerationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GradiusGenerationRequest")
+            .field("chat_id", &self.chat_id)
+            .field("user_id", &self.user_id)
+            .field("text", &"[redacted]")
+            .field("user_metadata", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -371,6 +392,8 @@ pub enum GradiusClientError {
     Disabled,
     #[error("invalid Gradius dialogue turn field: {0}")]
     InvalidTurn(&'static str),
+    #[error("invalid Gradius generation request field: {0}")]
+    InvalidGenerationRequest(&'static str),
     #[error("invalid Gradius utility request field: {0}")]
     InvalidUtilityRequest(&'static str),
     #[error("invalid Gradius base URL: {0}")]
@@ -587,6 +610,67 @@ where
             "user_text_request": request.user_text_request,
             "model_text_answer": request.model_text_answer,
         });
+        self.standalone(
+            endpoint,
+            request_body,
+            GradiusIntegrationKind::NativeUtility,
+        )
+        .await
+    }
+
+    pub async fn generation(
+        &self,
+        request: GradiusGenerationRequest,
+    ) -> Result<GradiusApiResult, GradiusClientFailure> {
+        if !self.config.effective_enabled() {
+            return Err(failure(GradiusClientError::Disabled, None));
+        }
+        for (field, value) in [
+            ("chat_id", request.chat_id.as_str()),
+            ("user_id", request.user_id.as_str()),
+            ("text", request.text.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(failure(
+                    GradiusClientError::InvalidGenerationRequest(field),
+                    None,
+                ));
+            }
+        }
+        if !request.user_metadata.is_object() {
+            return Err(failure(
+                GradiusClientError::InvalidGenerationRequest("user_metadata"),
+                None,
+            ));
+        }
+        let mut endpoint = Url::parse(&format!(
+            "{}{}",
+            self.config.base_url.trim().trim_end_matches('/'),
+            GRADIUS_GENERATION_PATH
+        ))
+        .map_err(|error| failure(error.into(), None))?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("chat_id", &request.chat_id)
+            .append_pair("user_id", &request.user_id)
+            .append_pair("lang", "ru");
+        self.standalone(
+            endpoint.into(),
+            serde_json::json!({
+                "text": request.text,
+                "user_metadata": request.user_metadata,
+            }),
+            GradiusIntegrationKind::NativeGeneration,
+        )
+        .await
+    }
+
+    async fn standalone(
+        &self,
+        endpoint: String,
+        request_body: serde_json::Value,
+        integration_kind: GradiusIntegrationKind,
+    ) -> Result<GradiusApiResult, GradiusClientFailure> {
         let body =
             serde_json::to_vec(&request_body).map_err(|error| failure(error.into(), None))?;
         let started_at = Instant::now();
@@ -605,6 +689,7 @@ where
                 return Err(failure(
                     error.into(),
                     Some(utility_exchange(
+                        integration_kind,
                         endpoint,
                         request_body,
                         None,
@@ -630,6 +715,7 @@ where
                     max_bytes: GRADIUS_RAW_BODY_MAX_BYTES,
                 },
                 Some(utility_exchange(
+                    integration_kind,
                     endpoint,
                     request_body,
                     Some(response.status),
@@ -647,6 +733,7 @@ where
                     status: response.status,
                 },
                 Some(utility_exchange(
+                    integration_kind,
                     endpoint,
                     request_body,
                     Some(response.status),
@@ -664,6 +751,7 @@ where
                 return Err(failure(
                     error,
                     Some(utility_exchange(
+                        integration_kind,
                         endpoint,
                         request_body,
                         Some(response.status),
@@ -684,6 +772,7 @@ where
         Ok(GradiusApiResult {
             placement,
             exchange: utility_exchange(
+                integration_kind,
                 endpoint,
                 request_body,
                 Some(response.status),
@@ -699,6 +788,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn utility_exchange(
+    integration_kind: GradiusIntegrationKind,
     endpoint: String,
     request_body: serde_json::Value,
     status: Option<u16>,
@@ -709,7 +799,7 @@ fn utility_exchange(
     outcome: GradiusCallOutcome,
 ) -> GradiusApiExchange {
     GradiusApiExchange {
-        integration_kind: GradiusIntegrationKind::NativeUtility,
+        integration_kind,
         role: None,
         endpoint,
         request_body,
@@ -1161,6 +1251,49 @@ mod tests {
             user_text_request: Some("[PERSON]".to_owned()),
             model_text_answer: Some("Image generated".to_owned()),
         }
+    }
+
+    #[tokio::test]
+    async fn generation_client_uses_generation_contract_and_keeps_no_ad_quiet() {
+        let transport = FakeGradiusTransport::default();
+        transport
+            .responses
+            .lock()
+            .expect("responses")
+            .push_back(Ok(GradiusHttpResponse {
+                status: 200,
+                body: br#"[]"#.to_vec(),
+            }));
+        let client = enabled_test_client(transport.clone());
+        let mut request = GradiusGenerationRequest {
+            chat_id: "chat_synthetic".to_owned(),
+            user_id: "user_synthetic".to_owned(),
+            text: "[PERSON] portrait".to_owned(),
+            user_metadata: serde_json::json!({"surface":"result_caption"}),
+        };
+        let result = client
+            .generation(request.clone())
+            .await
+            .expect("generation no-ad");
+        assert!(result.placement.is_none());
+        assert_eq!(
+            result.exchange.integration_kind,
+            GradiusIntegrationKind::NativeGeneration
+        );
+        {
+            let requests = transport.requests.lock().expect("requests");
+            assert_eq!(
+                requests[0].endpoint,
+                "https://api.adlean.pro/v1/native/generation_model/chat?chat_id=chat_synthetic&user_id=user_synthetic&lang=ru"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[0].body).expect("body"),
+                serde_json::json!({"text":"[PERSON] portrait","user_metadata":{"surface":"result_caption"}})
+            );
+        }
+        request.text.clear();
+        assert!(client.generation(request).await.is_err());
+        assert_eq!(transport.requests.lock().expect("requests").len(), 1);
     }
 
     #[tokio::test]

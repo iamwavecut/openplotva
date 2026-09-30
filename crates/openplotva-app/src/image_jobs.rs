@@ -2461,7 +2461,7 @@ where
             {
                 tracing::warn!(
                     job_id,
-                    integration_kind = "native_utility",
+                    integration_kind = "native_generation",
                     source = "image",
                     "Gradius image ad skipped"
                 );

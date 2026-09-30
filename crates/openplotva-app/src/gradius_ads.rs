@@ -3,8 +3,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use openplotva_llm::gradius::vip_hint_for_impression;
 use openplotva_llm::gradius::{
     GradiusApiExchange, GradiusClient, GradiusDialogueRole, GradiusDialogueTurn,
-    GradiusIntegrationKind, GradiusPlacement, GradiusPrivacyRedactor, GradiusSyntheticIds,
-    GradiusUtilityRequest, ReqwestGradiusTransport,
+    GradiusGenerationRequest, GradiusIntegrationKind, GradiusPlacement, GradiusPrivacyRedactor,
+    GradiusSyntheticIds, GradiusUtilityRequest, ReqwestGradiusTransport,
 };
 use openplotva_storage::gradius_ads::{
     GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
@@ -42,6 +42,11 @@ pub struct GradiusUtilityCall {
 }
 
 pub trait GradiusUtilityClient: Send + Sync {
+    fn generation<'a>(
+        &'a self,
+        request: GradiusGenerationRequest,
+    ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>>;
+
     fn utility<'a>(
         &'a self,
         request: GradiusUtilityRequest,
@@ -49,6 +54,24 @@ pub trait GradiusUtilityClient: Send + Sync {
 }
 
 impl GradiusUtilityClient for GradiusClient<ReqwestGradiusTransport> {
+    fn generation<'a>(
+        &'a self,
+        request: GradiusGenerationRequest,
+    ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>> {
+        Box::pin(async move {
+            match GradiusClient::generation(self, request).await {
+                Ok(result) => GradiusUtilityCall {
+                    result: Ok(result.placement),
+                    exchange: Some(result.exchange),
+                },
+                Err(failure) => GradiusUtilityCall {
+                    result: Err(failure.to_string()),
+                    exchange: failure.exchange.map(|exchange| *exchange),
+                },
+            }
+        })
+    }
+
     fn utility<'a>(
         &'a self,
         request: GradiusUtilityRequest,
@@ -441,6 +464,13 @@ impl GradiusUtilitySurface {
         }
     }
 
+    const fn integration_kind(self) -> GradiusIntegrationKind {
+        match self {
+            Self::Image => GradiusIntegrationKind::NativeGeneration,
+            Self::Rates | Self::Checkin => GradiusIntegrationKind::NativeUtility,
+        }
+    }
+
     const fn service_label(self) -> &'static str {
         match self {
             Self::Image => "image_generation",
@@ -460,6 +490,31 @@ pub struct GradiusUtilityAdRequest {
     pub prompt: Option<String>,
     pub result_context: Option<String>,
     pub completed_at: OffsetDateTime,
+}
+
+pub(crate) fn initialize_placement_service(
+    config: &openplotva_config::AppConfig,
+    api_key: &str,
+    pool: sqlx::PgPool,
+    vip: Arc<dyn GradiusVipChecker>,
+) -> Result<GradiusUtilityAdService, String> {
+    let redactor = GradiusPrivacyRedactor::new(gradius_privacy_config(config))
+        .map_err(|error| error.to_string())?;
+    Ok(GradiusUtilityAdService::new(
+        Arc::new(GradiusClient::new(
+            openplotva_llm::gradius::GradiusClientConfig {
+                enabled: true,
+                api_key: api_key.to_owned(),
+                base_url: config.gradius.base_url.clone(),
+                request_timeout: std::time::Duration::from_secs(
+                    u64::try_from(config.gradius.request_timeout_seconds.max(1)).unwrap_or(5),
+                ),
+            },
+        )),
+        Arc::new(redactor),
+        Arc::new(PostgresGradiusAdStore::new(pool)),
+        vip,
+    ))
 }
 
 #[derive(Clone)]
@@ -497,8 +552,15 @@ impl GradiusUtilityAdService {
                 .source_id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
-            || (request.surface == GradiusUtilitySurface::Image && request.chat_id <= 0)
-            || (request.surface != GradiusUtilitySurface::Image && request.chat_id == 0)
+            || request.chat_id == 0
+            || (request.surface == GradiusUtilitySurface::Image
+                && request.chat_id > 0
+                && request.chat_id != request.user_id)
+            || (request.surface == GradiusUtilitySurface::Image
+                && request
+                    .prompt
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty()))
         {
             return Ok(None);
         }
@@ -520,7 +582,7 @@ impl GradiusUtilityAdService {
                 opportunity_key: format!("{}:{}", request.surface.source_kind(), request.source_id),
                 attempt_key: request.attempt_key.clone(),
                 dialog_job_id: None,
-                integration_kind: GradiusIntegrationKind::NativeUtility.as_str().to_owned(),
+                integration_kind: request.surface.integration_kind().as_str().to_owned(),
                 user_id: request.user_id,
                 chat_id: request.chat_id,
                 thread_id: request.thread_id.unwrap_or_default(),
@@ -575,22 +637,28 @@ impl GradiusUtilityAdService {
                 }),
             )
             .await?;
-        let provider_request = GradiusUtilityRequest {
-            chat_id: ids.chat_id.clone(),
-            user_id: ids.user_id.clone(),
-            user_metadata: json!({"service": request.surface.service_label()}),
-            user_text_request: if request.surface == GradiusUtilitySurface::Image {
-                prompt
-            } else {
-                None
-            },
-            model_text_answer: if request.surface == GradiusUtilitySurface::Image {
-                Some("Image generation completed successfully".to_owned())
-            } else {
-                None
-            },
+        let call = if request.surface == GradiusUtilitySurface::Image {
+            let Some(text) = prompt.filter(|text| !text.trim().is_empty()) else {
+                self.ledger
+                    .finish_privacy_error(opportunity_id, attempt_generation)
+                    .await?;
+                return Err("Gradius generation prompt is empty after redaction".to_owned());
+            };
+            self.client.generation(GradiusGenerationRequest {
+                chat_id: ids.chat_id.clone(), user_id: ids.user_id.clone(), text,
+                user_metadata: json!({"service": "image_generation", "surface": "result_caption"}),
+            }).await
+        } else {
+            self.client
+                .utility(GradiusUtilityRequest {
+                    chat_id: ids.chat_id.clone(),
+                    user_id: ids.user_id.clone(),
+                    user_metadata: json!({"service": request.surface.service_label()}),
+                    user_text_request: None,
+                    model_text_answer: None,
+                })
+                .await
         };
-        let call = self.client.utility(provider_request).await;
         let provider_error = call.result.as_ref().err().cloned();
         let response_json = call
             .exchange
@@ -622,7 +690,7 @@ impl GradiusUtilityAdService {
                 .await?;
             tracing::info!(
                 opportunity_id,
-                integration_kind = "native_utility",
+                integration_kind = request.surface.integration_kind().as_str(),
                 status,
                 duration_ms,
                 outcome,
@@ -721,7 +789,7 @@ impl GradiusUtilityAdService {
             .await?;
         tracing::info!(
             opportunity_id,
-            integration_kind = "native_utility",
+            integration_kind = request.surface.integration_kind().as_str(),
             source = request.surface.source_kind(),
             delivery_state = "prepared",
             "Gradius utility ad prepared"
@@ -750,7 +818,9 @@ fn render_utility_ad_html(
     cta_link: Option<&str>,
 ) -> Result<String, String> {
     let mut ad_html = telegram_html_from_markdown(markdown).map_err(|error| error.to_string())?;
-    if let (Some(text), Some(link)) = (cta_text.filter(|text| !text.trim().is_empty()), cta_link)
+    if request.surface != GradiusUtilitySurface::Image
+        && let (Some(text), Some(link)) =
+            (cta_text.filter(|text| !text.trim().is_empty()), cta_link)
         && !markdown.contains(link)
     {
         let url = reqwest::Url::parse(link).map_err(|_| "Gradius CTA URL is invalid".to_owned())?;
@@ -1319,7 +1389,8 @@ mod tests {
 
     use openplotva_llm::gradius::{
         GradiusApiExchange, GradiusCallOutcome, GradiusDialogueAd, GradiusDialogueRole,
-        GradiusDialogueTurn, GradiusIntegrationKind, GradiusPlacement, GradiusUtilityRequest,
+        GradiusDialogueTurn, GradiusGenerationRequest, GradiusIntegrationKind, GradiusPlacement,
+        GradiusUtilityRequest,
     };
     use openplotva_storage::gradius_ads::{
         GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
@@ -1386,9 +1457,38 @@ mod tests {
     #[derive(Clone, Default)]
     struct UtilityStub {
         calls: Arc<Mutex<Vec<GradiusUtilityRequest>>>,
+        generation_calls: Arc<Mutex<Vec<GradiusGenerationRequest>>>,
     }
 
     impl GradiusUtilityClient for UtilityStub {
+        fn generation<'a>(
+            &'a self,
+            request: GradiusGenerationRequest,
+        ) -> Pin<Box<dyn Future<Output = GradiusUtilityCall> + Send + 'a>> {
+            Box::pin(async move {
+                self.generation_calls
+                    .lock()
+                    .expect("generation calls")
+                    .push(request.clone());
+                let mut call = self
+                    .utility(GradiusUtilityRequest {
+                        chat_id: request.chat_id,
+                        user_id: request.user_id,
+                        user_metadata: request.user_metadata.clone(),
+                        user_text_request: None,
+                        model_text_answer: None,
+                    })
+                    .await;
+                if let Some(exchange) = call.exchange.as_mut() {
+                    exchange.integration_kind = GradiusIntegrationKind::NativeGeneration;
+                    exchange.endpoint = "https://ads.example/generation".to_owned();
+                    exchange.request_body =
+                        json!({"text":request.text,"user_metadata":request.user_metadata});
+                }
+                call
+            })
+        }
+
         fn utility<'a>(
             &'a self,
             request: GradiusUtilityRequest,
@@ -1864,12 +1964,8 @@ mod tests {
             .await
             .expect("prepared")
             .expect("ad");
-        let request = client.calls.lock().expect("utility calls")[0].clone();
-        assert_eq!(request.user_text_request.as_deref(), Some("user-safe"));
-        assert_eq!(
-            request.model_text_answer.as_deref(),
-            Some("Image generation completed successfully")
-        );
+        let request = client.generation_calls.lock().expect("generation calls")[0].clone();
+        assert_eq!(request.text, "user-safe");
         assert!(ad.html.starts_with("📢 <b>Ad</b>"));
         assert!(ad.html.contains("<tg-spoiler>"));
         let context = ledger.source_contexts.lock().expect("contexts")[0].clone();
@@ -1890,6 +1986,131 @@ mod tests {
         assert_eq!(
             ads[0].1.selected_placement["other_placements"][0]["display_status"],
             "not_shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_group_ads_use_initiator_and_skip_vip_or_unknown_users() {
+        let client = UtilityStub::default();
+        let ledger = LedgerStub::default();
+        let request = |user_id| GradiusUtilityAdRequest {
+            surface: GradiusUtilitySurface::Image,
+            source_id: format!("group-{user_id}"),
+            attempt_key: "claim-1".to_owned(),
+            user_id,
+            chat_id: -100,
+            thread_id: Some(12),
+            prompt: Some("Portrait".to_owned()),
+            result_context: None,
+            completed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let service = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        assert!(
+            service
+                .prepare(request(0))
+                .await
+                .expect("unknown user")
+                .is_none()
+        );
+        assert!(
+            service
+                .prepare(request(100))
+                .await
+                .expect("free group user")
+                .is_some()
+        );
+        assert!(
+            service
+                .prepare(request(101))
+                .await
+                .expect("another free group user")
+                .is_some()
+        );
+        let vip = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(true)),
+        );
+        assert!(
+            vip.prepare(request(102))
+                .await
+                .expect("VIP excluded")
+                .is_none()
+        );
+        let calls = client.generation_calls.lock().expect("generation calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].chat_id, calls[1].chat_id);
+        assert_ne!(calls[0].user_id, calls[1].user_id);
+        let opportunities = ledger.reserved_inputs.lock().expect("opportunities");
+        assert_eq!(opportunities[0].integration_kind, "native_generation");
+        assert_eq!(opportunities[0].user_id, 100);
+        assert_eq!(opportunities[0].chat_id, -100);
+        assert_eq!(opportunities[0].thread_id, 12);
+    }
+
+    #[tokio::test]
+    async fn generation_ads_fail_closed_on_vip_and_privacy_errors() {
+        let client = UtilityStub::default();
+        let ledger = LedgerStub::default();
+        let request = || GradiusUtilityAdRequest {
+            surface: GradiusUtilitySurface::Image,
+            source_id: "privacy-test".to_owned(),
+            attempt_key: "claim-1".to_owned(),
+            user_id: 100,
+            chat_id: -100,
+            thread_id: None,
+            prompt: Some("Portrait of Alice@example.com".to_owned()),
+            result_context: None,
+            completed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let vip_error = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(FailingVipStub),
+        );
+        assert!(vip_error.prepare(request()).await.is_err());
+        assert!(
+            ledger
+                .reserved_inputs
+                .lock()
+                .expect("reservations")
+                .is_empty()
+        );
+        let privacy_error = GradiusUtilityAdService::new(
+            Arc::new(client.clone()),
+            Arc::new(FailingRedactor),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        assert!(privacy_error.prepare(request()).await.is_err());
+        assert_eq!(
+            ledger
+                .finished_privacy_errors
+                .lock()
+                .expect("privacy errors")
+                .len(),
+            1
+        );
+        assert!(
+            client
+                .generation_calls
+                .lock()
+                .expect("generation calls")
+                .is_empty()
+        );
+        assert!(
+            ledger
+                .source_contexts
+                .lock()
+                .expect("source contexts")
+                .is_empty()
         );
     }
 
