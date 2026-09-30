@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use openplotva_storage::gradius_ads::PostgresGradiusAdStore;
+use openplotva_storage::gradius_ads::{GradiusUtilityAdEnqueue, PostgresGradiusAdStore};
 use openplotva_storage::{
     PostgresTelegramOutboxStore, TelegramDeliveryPolicy, TelegramOutboxBatchInput,
     TelegramOutboxPartInput,
@@ -21,6 +21,8 @@ use crate::gradius_ads::{GradiusUtilityAdRequest, GradiusUtilityAdService, Gradi
 pub struct GradiusUtilityImageAds {
     pub ads: Arc<GradiusUtilityAdService>,
     pub outbox: Arc<GradiusUtilityOutbox>,
+    pub telegram: openplotva_telegram::TelegramClient,
+    pub bot_id: i64,
 }
 
 impl std::fmt::Debug for GradiusUtilityImageAds {
@@ -43,6 +45,18 @@ impl GradiusUtilityImageAds {
         prompt: String,
         first_photo_id: i32,
     ) -> Result<(), String> {
+        let delivery = image_ad_delivery(&self.telegram, self.bot_id, chat_id).await?;
+        if delivery == ImageAdDelivery::Persistent
+            && chat_id < 0
+            && !self
+                .outbox
+                .store
+                .public_image_group_available(chat_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
         let source_id = job_id.to_string();
         let Some(ad) = self
             .ads
@@ -67,6 +81,8 @@ impl GradiusUtilityImageAds {
                 &format!("image-job:{source_id}"),
                 ad.opportunity_id,
                 chat_id,
+                user_id,
+                delivery,
                 thread_id,
                 i64::from(first_photo_id),
                 ad.html,
@@ -74,6 +90,35 @@ impl GradiusUtilityImageAds {
             .await?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageAdDelivery {
+    Persistent,
+    Ephemeral,
+}
+
+async fn image_ad_delivery<Api: crate::settings::GroupSettingsMemberApi>(
+    api: &Api,
+    bot_id: i64,
+    chat_id: i64,
+) -> Result<ImageAdDelivery, String> {
+    if chat_id > 0 {
+        return Ok(ImageAdDelivery::Persistent);
+    }
+    let member = api
+        .get_chat_member(chat_id, bot_id)
+        .await
+        .map_err(|_| "Failed to resolve bot membership for image advertising".to_owned())?;
+    if member.get_user().id != bot_id || !member.get_user().is_bot || !member.is_member() {
+        return Err("Image advertising requires active bot membership".to_owned());
+    }
+    Ok(match member {
+        carapax::types::ChatMember::Administrator(_) | carapax::types::ChatMember::Creator(_) => {
+            ImageAdDelivery::Ephemeral
+        }
+        _ => ImageAdDelivery::Persistent,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -98,38 +143,21 @@ impl GradiusUtilityOutbox {
         source_key: &str,
         opportunity_id: i64,
         chat_id: i64,
+        user_id: i64,
+        delivery: ImageAdDelivery,
         thread_id: Option<i32>,
         reply_to_message_id: i64,
         html: String,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         validate_final_html(ads, opportunity_id, &html).await?;
-        let chat = ChatRef {
-            id: chat_id,
-            is_forum: thread_id.is_some(),
-        };
-        let request = TextMessageRequest {
-            chat: Some(chat),
-            message_thread_id: i64::from(thread_id.unwrap_or_default()),
-            disable_notification: false,
-            allow_sending_without_reply: None,
-            text: html.clone(),
-            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-            reply_markup: None,
-        };
-        let reply = ReplyMessageRef {
-            message_id: reply_to_message_id,
-            chat,
-            is_topic_message: thread_id.is_some(),
-            message_thread_id: i64::from(thread_id.unwrap_or_default()),
-        };
-        let method = build_text_message_method_without_link_preview(
-            &request,
-            chat,
-            Some(&reply),
-            html,
-            true,
-        )
-        .map_err(|error| error.to_string());
+        let method = image_ad_message(
+            chat_id,
+            user_id,
+            delivery,
+            thread_id,
+            reply_to_message_id,
+            &html,
+        );
         let method = match method {
             Ok(method) => method,
             Err(error) => {
@@ -162,7 +190,7 @@ impl GradiusUtilityOutbox {
         thread_id: Option<i32>,
         reply_to_message_id: i64,
         html: String,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let method = utility_rich_send(chat_id, thread_id, reply_to_message_id, &html);
         let method = match method {
             Ok(method) => method,
@@ -196,7 +224,7 @@ impl GradiusUtilityOutbox {
         thread_id: Option<i32>,
         message_id: i64,
         html: String,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let method = match utility_rich_edit(chat_id, message_id, &html) {
             Ok(method) => method,
             Err(error) => {
@@ -230,7 +258,7 @@ impl GradiusUtilityOutbox {
         trigger_message_id: i64,
         policy: TelegramDeliveryPolicy,
         method: TelegramOutboundMethod,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let command = match OutboundCommand::try_from_method(method) {
             Ok(command) => command,
             Err(error) => {
@@ -276,13 +304,23 @@ impl GradiusUtilityOutbox {
                 expires_at: None,
             }],
         };
-        if let Err(error) = self.store.enqueue_utility_ad(opportunity_id, &batch).await {
-            let _ = ads
-                .mark_delivery_failed(opportunity_id, "outbox_enqueue_failed")
-                .await;
-            return Err(error.to_string());
+        match self.store.enqueue_utility_ad(opportunity_id, &batch).await {
+            Ok(GradiusUtilityAdEnqueue::Queued) => Ok(Some(batch_id)),
+            Ok(GradiusUtilityAdEnqueue::PublicGroupRateLimited) => {
+                tracing::info!(
+                    opportunity_id,
+                    chat_id,
+                    "public image ad skipped by group limit"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = ads
+                    .mark_delivery_failed(opportunity_id, "outbox_enqueue_failed")
+                    .await;
+                Err(error.to_string())
+            }
         }
-        Ok(batch_id)
     }
 }
 
@@ -297,6 +335,54 @@ async fn validate_final_html(
     ads.mark_delivery_failed(opportunity_id, "final_html_invalid_or_too_long")
         .await?;
     Err("Gradius utility message exceeds Telegram HTML limits".to_owned())
+}
+
+pub(crate) fn image_ad_message(
+    chat_id: i64,
+    user_id: i64,
+    delivery: ImageAdDelivery,
+    thread_id: Option<i32>,
+    reply_to_message_id: i64,
+    html: &str,
+) -> Result<carapax::types::SendMessage, String> {
+    if user_id <= 0 || chat_id == 0 || (chat_id > 0 && chat_id != user_id) {
+        return Err("Image advertising requires an identified initiator".to_owned());
+    }
+    if delivery == ImageAdDelivery::Ephemeral && chat_id > 0 {
+        return Err("Ephemeral image advertising requires a group chat".to_owned());
+    }
+    let chat = ChatRef {
+        id: chat_id,
+        is_forum: thread_id.is_some(),
+    };
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: i64::from(thread_id.unwrap_or_default()),
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: html.to_owned(),
+        render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+        reply_markup: None,
+    };
+    let reply = ReplyMessageRef {
+        message_id: reply_to_message_id,
+        chat,
+        is_topic_message: thread_id.is_some(),
+        message_thread_id: i64::from(thread_id.unwrap_or_default()),
+    };
+    let method =
+        build_text_message_method_without_link_preview(&request, chat, Some(&reply), html, true)
+            .map_err(|error| error.to_string())?;
+    Ok(if delivery == ImageAdDelivery::Ephemeral {
+        method
+            .with_reply_parameters(
+                carapax::types::ReplyParameters::new(reply_to_message_id)
+                    .with_allow_sending_without_reply(false),
+            )
+            .with_ephemeral_message_parameters(user_id)
+    } else {
+        method
+    })
 }
 
 fn final_html_fits_telegram(html: &str) -> bool {
@@ -350,6 +436,145 @@ fn utility_rich_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_ads_preserve_the_selected_visibility_on_replay() {
+        for (chat, user, delivery, thread) in [
+            (-100, 42, ImageAdDelivery::Ephemeral, Some(12)),
+            (-100, 42, ImageAdDelivery::Persistent, Some(12)),
+            (42, 42, ImageAdDelivery::Persistent, None),
+        ] {
+            let method = image_ad_message(chat, user, delivery, thread, 77, "📢 <b>Offer</b>")
+                .expect("image ad");
+            let command = OutboundCommand::try_from_method(method.into()).expect("persistable ad");
+            let (kind, version, payload) = command.into_storage_parts().expect("payload");
+            let replay = OutboundCommand::decode(
+                version,
+                kind,
+                &serde_json::to_vec(&payload).expect("JSON"),
+            )
+            .expect("replay");
+            let TelegramOutboundMethod::SendMessage(replayed) = replay.into_method() else {
+                panic!("text ad");
+            };
+            let replayed = serde_json::to_value(replayed).expect("request");
+            assert_eq!(replayed["chat_id"], chat);
+            assert_eq!(replayed["reply_parameters"]["message_id"], 77);
+            assert_eq!(replayed["parse_mode"], "HTML");
+            assert_eq!(replayed["link_preview_options"]["is_disabled"], true);
+            if let Some(thread) = thread {
+                assert_eq!(replayed["message_thread_id"], thread);
+            }
+            if delivery == ImageAdDelivery::Ephemeral {
+                assert_eq!(
+                    replayed["ephemeral_message_parameters"]["receiver_user_id"],
+                    user
+                );
+                assert_eq!(
+                    replayed["reply_parameters"]["allow_sending_without_reply"],
+                    false
+                );
+                assert!(replayed["reply_parameters"].get("chat_id").is_none());
+            } else {
+                assert!(replayed.get("ephemeral_message_parameters").is_none());
+            }
+        }
+        for (chat, user, delivery) in [
+            (-100, 0, ImageAdDelivery::Ephemeral),
+            (-100, 0, ImageAdDelivery::Persistent),
+            (42, 43, ImageAdDelivery::Persistent),
+            (42, 42, ImageAdDelivery::Ephemeral),
+        ] {
+            assert!(image_ad_message(chat, user, delivery, None, 77, "Offer").is_err());
+        }
+    }
+
+    struct MemberApi {
+        result: Result<carapax::types::ChatMember, &'static str>,
+        calls: std::sync::Mutex<Vec<(i64, i64)>>,
+    }
+
+    impl crate::settings::GroupSettingsMemberApi for MemberApi {
+        type Error = &'static str;
+
+        fn get_chat_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> crate::settings::GroupSettingsMemberFuture<'a, carapax::types::ChatMember, Self::Error>
+        {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("member calls")
+                    .push((chat_id, user_id));
+                self.result.clone()
+            })
+        }
+    }
+
+    fn member_api(status: &str, user_id: i64, is_bot: bool) -> MemberApi {
+        let member = serde_json::from_value(serde_json::json!({
+            "status":status,"user":{"id":user_id,"is_bot":is_bot,"first_name":"Bot"},
+            "is_anonymous":false,"can_be_edited":false,"can_change_info":false,
+            "can_delete_messages":false,"can_invite_users":false,"can_manage_chat":true,
+            "can_manage_video_chats":false,"can_promote_members":false,
+            "can_restrict_members":false,"can_send_welcome_messages":false
+        }))
+        .expect("member fixture");
+        MemberApi {
+            result: Ok(member),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_ad_visibility_uses_current_bot_membership_and_private_needs_no_lookup() {
+        for (status, expected) in [
+            ("administrator", ImageAdDelivery::Ephemeral),
+            ("creator", ImageAdDelivery::Ephemeral),
+            ("member", ImageAdDelivery::Persistent),
+        ] {
+            let api = member_api(status, 7, true);
+            assert_eq!(image_ad_delivery(&api, 7, -100).await, Ok(expected));
+            assert_eq!(*api.calls.lock().expect("member calls"), vec![(-100, 7)]);
+        }
+        let api = MemberApi {
+            result: Err("unavailable"),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            image_ad_delivery(&api, 7, 42).await,
+            Ok(ImageAdDelivery::Persistent)
+        );
+        assert!(api.calls.lock().expect("member calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_ad_visibility_does_not_publish_on_unknown_or_invalid_bot_membership() {
+        for api in [
+            MemberApi {
+                result: Err("unavailable"),
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+            member_api("administrator", 42, true),
+            member_api("administrator", 7, false),
+            member_api("left", 7, true),
+        ] {
+            assert!(image_ad_delivery(&api, 7, -100).await.is_err());
+        }
+        let mut api = member_api("administrator", 7, true);
+        assert_eq!(
+            image_ad_delivery(&api, 7, -100).await,
+            Ok(ImageAdDelivery::Ephemeral)
+        );
+        api.result = member_api("member", 7, true).result;
+        assert_eq!(
+            image_ad_delivery(&api, 7, -100).await,
+            Ok(ImageAdDelivery::Persistent)
+        );
+        assert_eq!(api.calls.lock().expect("member calls").len(), 2);
+    }
 
     #[test]
     fn rich_utility_send_and_edit_preserve_content_and_ad_separator_on_replay() {

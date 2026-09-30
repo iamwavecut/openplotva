@@ -11928,50 +11928,30 @@ async fn start_runtime_workers(
         chat_settings_store.clone(),
         chat_member_store.clone(),
     );
-    let utility_requested = config.gradius.utility_image_enabled
-        || config.gradius.utility_rates_enabled
-        || config.gradius.utility_checkin_enabled;
-    let gradius_utility = if !utility_requested {
-        None
-    } else if !config.gradius.enabled || config.gradius.api_key.trim().is_empty() {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "gradius_utility",
-            "Utility surfaces are enabled but Gradius master switch or API key is missing",
+    let vip_for_ads: Arc<dyn gradius_ads::GradiusVipChecker> =
+        Arc::new(payments::VipStatusWithExternalMembership::new(
+            payment_store.clone(),
+            payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
+            config.vip.chat_id,
         ));
-        None
-    } else {
-        match openplotva_llm::gradius::GradiusPrivacyRedactor::new(
-            gradius_ads::gradius_privacy_config(config),
+    let mut initialize_placement = |requested: bool, api_key: &str, check: &str| {
+        if !requested {
+            return None;
+        }
+        if !config.gradius.enabled || api_key.trim().is_empty() {
+            readiness_checks.push(ReadinessCheck::skipped(
+                check,
+                "Gradius master switch or placement API key is missing",
+            ));
+            return None;
+        }
+        match gradius_ads::initialize_placement_service(
+            config,
+            api_key,
+            service_clients.postgres.clone(),
+            Arc::clone(&vip_for_ads),
         ) {
-            Ok(redactor) => {
-                let client: Arc<dyn gradius_ads::GradiusUtilityClient> =
-                    Arc::new(openplotva_llm::gradius::GradiusClient::new(
-                        openplotva_llm::gradius::GradiusClientConfig {
-                            enabled: true,
-                            api_key: config.gradius.api_key.clone(),
-                            base_url: config.gradius.base_url.clone(),
-                            request_timeout: Duration::from_secs(
-                                u64::try_from(config.gradius.request_timeout_seconds.max(1))
-                                    .unwrap_or(5),
-                            ),
-                        },
-                    ));
-                let vip: Arc<dyn gradius_ads::GradiusVipChecker> =
-                    Arc::new(payments::VipStatusWithExternalMembership::new(
-                        payment_store.clone(),
-                        payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
-                        config.vip.chat_id,
-                    ));
-                let ads = Arc::new(gradius_ads::GradiusUtilityAdService::new(
-                    client,
-                    Arc::new(redactor),
-                    Arc::new(
-                        openplotva_storage::gradius_ads::PostgresGradiusAdStore::new(
-                            service_clients.postgres.clone(),
-                        ),
-                    ),
-                    vip,
-                ));
+            Ok(ads) => {
                 let outbox = Arc::new(gradius_utility_outbox::GradiusUtilityOutbox::new(
                     openplotva_storage::PostgresTelegramOutboxStore::new(
                         service_clients.postgres.clone(),
@@ -11979,21 +11959,31 @@ async fn start_runtime_workers(
                     bot_identity.id,
                 ));
                 readiness_checks.push(ReadinessCheck::ok(
-                    "gradius_utility",
-                    "Gradius utility surfaces initialized with fail-closed privacy redaction",
+                    check,
+                    "Gradius placement initialized with fail-closed privacy redaction",
                 ));
-                Some((ads, outbox))
+                Some((Arc::new(ads), outbox))
             }
             Err(error) => {
-                tracing::warn!(%error, "Gradius utility privacy redactor unavailable");
+                tracing::warn!(%error, "Gradius placement privacy redactor unavailable");
                 readiness_checks.push(ReadinessCheck::skipped(
-                    "gradius_utility",
-                    "Gradius utility privacy redactor unavailable",
+                    check,
+                    "Gradius placement privacy redactor unavailable",
                 ));
                 None
             }
         }
     };
+    let gradius_utility = initialize_placement(
+        config.gradius.utility_rates_enabled || config.gradius.utility_checkin_enabled,
+        &config.gradius.api_key,
+        "gradius_utility",
+    );
+    let gradius_generation = initialize_placement(
+        config.gradius.utility_image_enabled,
+        &config.gradius.generation_api_key,
+        "gradius_generation",
+    );
     let mut checkin_effects = checkin::CheckinGameRuntimeEffects::new(
         checkin_game_store.clone(),
         checkin::TelegramCheckinGameSender::new(
@@ -13224,12 +13214,14 @@ async fn start_runtime_workers(
     let mut regular_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     if config.gradius.utility_image_enabled
-        && let Some((ads, outbox)) = &gradius_utility
+        && let Some((ads, outbox)) = &gradius_generation
     {
         regular_image_effects = regular_image_effects.with_utility_ads(Arc::new(
             gradius_utility_outbox::GradiusUtilityImageAds {
                 ads: Arc::clone(ads),
                 outbox: Arc::clone(outbox),
+                telegram: telegram.clone(),
+                bot_id: bot_identity.id,
             },
         ));
     }
@@ -14795,6 +14787,9 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
+#[cfg(test)]
+#[path = "../../openplotva-telegram/src/test_api.rs"]
+mod test_bot_api;
 #[cfg(test)]
 mod tests {
     use std::{

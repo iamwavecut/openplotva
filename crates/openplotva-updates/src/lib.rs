@@ -258,7 +258,26 @@ pub fn decode_telegram_update_value(
     mut value: serde_json::Value,
 ) -> Result<TelegramUpdate, serde_json::Error> {
     normalize_poll_answer_voter_chat(&mut value);
+    normalize_legacy_chat_member_rights(&mut value);
     serde_json::from_value(value)
+}
+
+fn normalize_legacy_chat_member_rights(value: &mut serde_json::Value) {
+    for event in ["chat_member", "my_chat_member"] {
+        for member in ["old_chat_member", "new_chat_member"] {
+            if let Some(member) = value
+                .get_mut(event)
+                .and_then(|event| event.get_mut(member))
+                .and_then(serde_json::Value::as_object_mut)
+                && member.get("status").and_then(serde_json::Value::as_str) == Some("administrator")
+            {
+                // Persisted pre-10.3 updates must not gain new administrator rights.
+                member
+                    .entry("can_send_welcome_messages")
+                    .or_insert(serde_json::Value::Bool(false));
+            }
+        }
+    }
 }
 
 fn normalize_poll_answer_voter_chat(value: &mut serde_json::Value) {
@@ -1664,6 +1683,8 @@ impl ParsedUpdateKind {
             | TelegramUpdateType::PollAnswer(_)
             | TelegramUpdateType::PurchasedPaidMedia(_)
             | TelegramUpdateType::ShippingQuery(_)
+            | TelegramUpdateType::StoppedMessageGeneration(_)
+            | TelegramUpdateType::Subscription(_)
             | TelegramUpdateType::Unknown(_) => Self::Skipped,
         }
     }
@@ -3683,6 +3704,33 @@ mod tests {
         Message as TelegramMessage, MessageData as TelegramMessageData, Update as TelegramUpdate,
         UpdateType as TelegramUpdateType,
     };
+
+    #[test]
+    fn legacy_administrator_updates_default_new_right_to_false_and_preserve_explicit_true() {
+        let legacy = serde_json::json!({"update_id":51,"my_chat_member":{
+            "chat":{"id":-100,"type":"supergroup","title":"Group"},
+            "from":{"id":42,"is_bot":false,"first_name":"Admin"},"date":1,
+            "old_chat_member":{"status":"member","user":{"id":7,"is_bot":true,"first_name":"Bot"}},
+            "new_chat_member":{"status":"administrator","user":{"id":7,"is_bot":true,"first_name":"Bot"},
+            "can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":true,
+            "can_manage_video_chats":true,"can_restrict_members":true,"can_promote_members":true,
+            "can_change_info":true,"can_invite_users":true}}});
+        for explicit in [None, Some(true)] {
+            let mut value = legacy.clone();
+            if let Some(flag) = explicit {
+                value["my_chat_member"]["new_chat_member"]["can_send_welcome_messages"] =
+                    serde_json::json!(flag);
+            }
+            let update = super::decode_telegram_update_value(value).expect("legacy update");
+            let TelegramUpdateType::BotStatus(status) = update.update_type else {
+                panic!("membership update");
+            };
+            let carapax::types::ChatMember::Administrator(admin) = status.new_chat_member else {
+                panic!("administrator");
+            };
+            assert_eq!(admin.can_send_welcome_messages, explicit.unwrap_or(false));
+        }
+    }
 
     #[test]
     fn update_claim_timing_uses_one_minute_base() {

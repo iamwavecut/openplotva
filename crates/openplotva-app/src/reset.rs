@@ -900,9 +900,29 @@ mod tests {
         fn default() -> Self {
             Self {
                 member: TelegramChatMember::Administrator(
-                    carapax::types::ChatMemberAdministrator::new(carapax::types::User::new(
-                        5, "Ada", false,
-                    )),
+                    carapax::types::ChatMemberAdministrator {
+                        user: carapax::types::User::new(5, "Ada", false),
+                        can_be_edited: false,
+                        can_change_info: false,
+                        can_delete_messages: false,
+                        can_delete_stories: None,
+                        can_edit_messages: None,
+                        can_edit_stories: None,
+                        can_invite_users: false,
+                        can_manage_chat: false,
+                        can_manage_direct_messages: None,
+                        can_manage_tags: None,
+                        can_manage_topics: None,
+                        can_manage_video_chats: false,
+                        can_pin_messages: None,
+                        can_post_messages: None,
+                        can_post_stories: None,
+                        can_promote_members: false,
+                        can_restrict_members: false,
+                        can_send_welcome_messages: false,
+                        custom_title: None,
+                        is_anonymous: false,
+                    },
                 ),
                 error: None,
                 calls: Arc::new(Mutex::new(Vec::new())),

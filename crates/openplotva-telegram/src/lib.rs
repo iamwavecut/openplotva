@@ -44,6 +44,11 @@ pub use html::{
     split_telegram_text_with_atomic_tail, strip_telegram_html,
 };
 pub use markdown::{MarkdownToTelegramHtmlError, telegram_html_from_markdown};
+mod edit_text;
+#[cfg(test)]
+mod test_api;
+pub use edit_text::EditTextMessagePlan;
+
 pub use outbound::{
     AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest,
     ChatRef, DEFAULT_GUEST_BOT_USERNAME, DONATION_DESCRIPTION, DONATION_TITLE,

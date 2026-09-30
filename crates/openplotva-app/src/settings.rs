@@ -5447,7 +5447,11 @@ mod tests {
         let creator = chat_member_upsert_from_telegram(
             -10042,
             42,
-            &ChatMember::Creator(ChatMemberCreator::new(User::new(42, "Ada", false))),
+            &ChatMember::Creator(ChatMemberCreator {
+                user: User::new(42, "Ada", false),
+                is_anonymous: false,
+                custom_title: None,
+            }),
         );
         assert_eq!(creator.can_promote_members, Some(true));
         assert_eq!(creator.can_delete_messages, Some(true));
@@ -7215,39 +7219,61 @@ mod tests {
     }
 
     fn promoting_admin_member(user_id: i64) -> ChatMember {
-        ChatMember::Administrator(
-            ChatMemberAdministrator::new(User::new(user_id, "Ada", false))
-                .with_can_be_edited(true)
-                .with_can_delete_messages(true)
-                .with_can_manage_video_chats(true)
-                .with_can_restrict_members(true)
-                .with_can_promote_members(true)
-                .with_can_change_info(true)
-                .with_can_invite_users(true)
-                .with_can_post_messages(true)
-                .with_can_edit_messages(true)
-                .with_can_pin_messages(true)
-                .with_can_manage_topics(true),
-        )
+        ChatMember::Administrator(ChatMemberAdministrator {
+            user: User::new(user_id, "Ada", false),
+            can_be_edited: true,
+            can_change_info: true,
+            can_delete_messages: true,
+            can_delete_stories: None,
+            can_edit_messages: Some(true),
+            can_edit_stories: None,
+            can_invite_users: true,
+            can_manage_chat: false,
+            can_manage_direct_messages: None,
+            can_manage_tags: None,
+            can_manage_topics: Some(true),
+            can_manage_video_chats: true,
+            can_pin_messages: Some(true),
+            can_post_messages: Some(true),
+            can_post_stories: None,
+            can_promote_members: true,
+            can_restrict_members: true,
+            can_send_welcome_messages: false,
+            custom_title: None,
+            is_anonymous: false,
+        })
     }
 
     fn creator_member(user_id: i64) -> ChatMember {
-        ChatMember::Creator(ChatMemberCreator::new(User::new(user_id, "Grace", false)))
+        ChatMember::Creator(ChatMemberCreator {
+            user: User::new(user_id, "Grace", false),
+            is_anonymous: false,
+            custom_title: None,
+        })
     }
 
     fn restricted_member_with_send_permissions(user_id: i64) -> ChatMember {
-        ChatMember::Restricted(
-            carapax::types::ChatMemberRestricted::new(User::new(user_id, "Ada", false), 0)
-                .with_can_send_messages(true)
-                .with_can_send_audios(true)
-                .with_can_send_documents(true)
-                .with_can_send_photos(true)
-                .with_can_send_videos(true)
-                .with_can_send_video_notes(true)
-                .with_can_send_voice_notes(true)
-                .with_can_send_polls(true)
-                .with_can_send_other_messages(true)
-                .with_can_add_web_page_previews(true),
-        )
+        ChatMember::Restricted(carapax::types::ChatMemberRestricted {
+            user: User::new(user_id, "Ada", false),
+            can_add_web_page_previews: true,
+            can_change_info: false,
+            can_edit_tag: false,
+            can_invite_users: false,
+            can_manage_topics: false,
+            can_pin_messages: false,
+            can_react_to_messages: false,
+            can_send_audios: true,
+            can_send_documents: true,
+            can_send_messages: true,
+            can_send_other_messages: true,
+            can_send_photos: true,
+            can_send_polls: true,
+            can_send_video_notes: true,
+            can_send_videos: true,
+            can_send_voice_notes: true,
+            is_member: false,
+            until_date: 0,
+            tag: None,
+        })
     }
 }

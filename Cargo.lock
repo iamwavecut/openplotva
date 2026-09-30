@@ -555,9 +555,9 @@ dependencies = [
 
 [[package]]
 name = "carapax"
-version = "0.38.0"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a10975ea02fe2e55b80e80bbb700d9ce19226d642b6f2beb9b8cbb5161b94a0"
+checksum = "201da174f89c4b017f4d4c539e78a7af9ce05d80d741b88deafa7c31c9645466"
 dependencies = [
  "futures-util",
  "log",
@@ -3628,14 +3628,15 @@ dependencies = [
 
 [[package]]
 name = "tgbot"
-version = "0.46.0"
+version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc05e21aac7632767ffd5ef7d9573473ede11f77d7f68aa06b64cee747171433"
+checksum = "c0b411ddc08a9a4cb4844a32a7fc286efa1dbf5055a575eb6167d5ba1153d60f"
 dependencies = [
  "async-stream",
  "bytes",
  "derive_more",
  "futures-util",
+ "itoa",
  "log",
  "mime",
  "mime_guess",
@@ -3646,6 +3647,7 @@ dependencies = [
  "shellwords",
  "tokio",
  "tokio-util",
+ "zmij",
 ]
 
 [[package]]

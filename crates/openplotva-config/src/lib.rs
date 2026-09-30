@@ -781,6 +781,8 @@ pub struct WhiteCircleConfig {
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GradiusConfig {
+    #[serde(default)]
+    pub generation_api_key: String,
     pub enabled: bool,
     #[serde(default)]
     pub utility_image_enabled: bool,
@@ -797,6 +799,7 @@ impl fmt::Debug for GradiusConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GradiusConfig")
+            .field("generation_api_key", &"[redacted]")
             .field("enabled", &self.enabled)
             .field("utility_image_enabled", &self.utility_image_enabled)
             .field("utility_rates_enabled", &self.utility_rates_enabled)
@@ -1329,6 +1332,8 @@ pub struct RawConfig {
     pub gradius_utility_rates_enabled: Option<String>,
     /// `GRADIUS_UTILITY_CHECKIN_ENABLED`.
     pub gradius_utility_checkin_enabled: Option<String>,
+    /// `GRADIUS_GENERATION_API_KEY`.
+    pub gradius_generation_api_key: Option<String>,
     /// `GRADIUS_API_KEY`.
     pub gradius_api_key: Option<String>,
     /// `GRADIUS_BASE_URL`.
@@ -2481,6 +2486,7 @@ impl AppConfig {
                 )?,
             },
             gradius: GradiusConfig {
+                generation_api_key: raw.gradius_generation_api_key.unwrap_or_default(),
                 enabled: parse_bool("GRADIUS_ENABLED", raw.gradius_enabled, false)?,
                 utility_image_enabled: parse_bool(
                     "GRADIUS_UTILITY_IMAGE_ENABLED",
@@ -3265,6 +3271,7 @@ impl RawConfig {
             gradius_utility_image_enabled: env("GRADIUS_UTILITY_IMAGE_ENABLED"),
             gradius_utility_rates_enabled: env("GRADIUS_UTILITY_RATES_ENABLED"),
             gradius_utility_checkin_enabled: env("GRADIUS_UTILITY_CHECKIN_ENABLED"),
+            gradius_generation_api_key: env("GRADIUS_GENERATION_API_KEY"),
             gradius_api_key: env("GRADIUS_API_KEY"),
             gradius_base_url: env("GRADIUS_BASE_URL"),
             gradius_request_timeout_seconds: env("GRADIUS_REQUEST_TIMEOUT_SECONDS"),
@@ -4292,6 +4299,7 @@ mod tests {
         assert!(!defaults.gradius.utility_rates_enabled);
         assert!(!defaults.gradius.utility_checkin_enabled);
         assert_eq!(defaults.gradius.api_key, "");
+        assert_eq!(defaults.gradius.generation_api_key, "");
         assert_eq!(defaults.gradius.base_url, "https://api.adlean.pro");
         assert_eq!(defaults.gradius.request_timeout_seconds, 5);
 
@@ -4301,6 +4309,7 @@ mod tests {
             gradius_utility_rates_enabled: Some("true".to_owned()),
             gradius_utility_checkin_enabled: Some("true".to_owned()),
             gradius_api_key: Some("secret".to_owned()),
+            gradius_generation_api_key: Some("generation-secret".to_owned()),
             gradius_base_url: Some("https://gradius.internal".to_owned()),
             gradius_request_timeout_seconds: Some("7".to_owned()),
             ..RawConfig::default()
@@ -4310,17 +4319,20 @@ mod tests {
         assert!(configured.gradius.utility_rates_enabled);
         assert!(configured.gradius.utility_checkin_enabled);
         assert_eq!(configured.gradius.api_key, "secret");
+        assert_eq!(configured.gradius.generation_api_key, "generation-secret");
         assert_eq!(configured.gradius.base_url, "https://gradius.internal");
         assert_eq!(configured.gradius.request_timeout_seconds, 7);
         assert!(!format!("{:?}", configured.gradius).contains("secret"));
         let mut serialized =
             serde_json::to_value(&configured.gradius).expect("Gradius config JSON");
         let object = serialized.as_object_mut().expect("Gradius config object");
+        object.remove("generation_api_key");
         object.remove("utility_image_enabled");
         object.remove("utility_rates_enabled");
         object.remove("utility_checkin_enabled");
         let previous: GradiusConfig =
             serde_json::from_value(serialized).expect("older config JSON");
+        assert!(previous.generation_api_key.is_empty());
         assert!(!previous.utility_image_enabled);
         assert!(!previous.utility_rates_enabled);
         assert!(!previous.utility_checkin_enabled);

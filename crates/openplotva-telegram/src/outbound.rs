@@ -4,14 +4,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery, ChatAction,
     ChatMember, CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
-    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChat,
-    GetChatAdministrators, GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
-    InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
-    LinkPreviewOptions, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType,
-    RefundStarPayment, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio,
-    SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker, SetMessageReaction,
-    WebAppInfo,
+    EditMessageReplyMarkup, EditUserStarSubscription, GetChat, GetChatAdministrators,
+    GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
+    InlineQueryResultArticle, InputFile, InputFileReader, InputMedia, InputMediaPhoto,
+    InputMessageContentText, InputText, InvoiceParameters, LabeledPrice, LinkPreviewOptions,
+    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType, RefundStarPayment,
+    ReplyMarkup, ReplyParameters, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+    SendPhoto, SendSticker, SetMessageReaction, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -19,8 +18,8 @@ use sha1::{Digest, Sha1};
 use thiserror::Error;
 
 use crate::{
-    DispatcherPersistencePayload, RICH_MESSAGE_MAX_CHARS, RichSendOptions, SendRichMessage,
-    TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, escape_telegram_html_text,
+    DispatcherPersistencePayload, EditTextMessagePlan, RICH_MESSAGE_MAX_CHARS, RichSendOptions,
+    SendRichMessage, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, escape_telegram_html_text,
     extract_visible_text, format_rich_html, rich_message_within_char_limit, sanitize_telegram_html,
     split_telegram_text, split_telegram_text_with_atomic_tail, strip_telegram_html,
 };
@@ -212,7 +211,7 @@ pub struct InlineArticleRequest {
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct InlineQueryAnswerRequest {
     /// Telegram inline query ID.
     pub inline_query_id: String,
@@ -223,7 +222,7 @@ pub struct InlineQueryAnswerRequest {
     pub next_offset: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct GuestQueryAnswerRequest {
     /// Telegram guest query ID.
     pub guest_query_id: String,
@@ -592,14 +591,14 @@ pub fn build_text_message_method(
     part: impl Into<String>,
     is_last_part: bool,
 ) -> Result<SendMessage, OutboundBuildError> {
-    let mut method = SendMessage::new(chat.id, part);
+    let mut text = InputText::from(part.into());
+    if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
+        text = text.with_format(parse_mode);
+    }
+    let mut method = SendMessage::new(chat.id, text);
     if req.disable_notification {
         method = method.with_disable_notification(true);
     }
-    if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
-        method = method.with_parse_mode(parse_mode);
-    }
-
     if let Some(reply) = reply_to {
         method = apply_reply_parameters(method, reply, req.allow_sending_without_reply);
         if let Some(thread_id) = reply_thread_id(reply).filter(|thread_id| *thread_id != 0) {
@@ -626,7 +625,7 @@ pub fn build_text_message_method_without_link_preview(
 ) -> Result<SendMessage, OutboundBuildError> {
     Ok(
         build_text_message_method(req, chat, reply_to, part, is_last_part)?
-            .with_link_preview_options(LinkPreviewOptions::default().with_is_disabled(true)),
+            .with_link_preview_options(LinkPreviewOptions::disabled()),
     )
 }
 
@@ -673,14 +672,14 @@ pub fn build_rich_message_method(
 /// Build an outbound `editMessageText` method.
 pub fn build_edit_text_message_method(
     req: &EditTextMessageRequest,
-) -> Result<EditMessageText, OutboundBuildError> {
+) -> Result<EditTextMessagePlan, OutboundBuildError> {
     validate_text_message_text(&req.text, &req.render_as)?;
     if req.message_id == 0 {
         return Err(OutboundBuildError::MessageIdRequired);
     }
 
     let mut method =
-        EditMessageText::for_chat_message(req.chat.id, req.message_id, req.text.clone());
+        EditTextMessagePlan::for_chat_message(req.chat.id, req.message_id, req.text.clone());
     if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
         method = method.with_parse_mode(parse_mode);
     }
@@ -698,11 +697,12 @@ pub fn build_edit_caption_message_method(
         return Err(OutboundBuildError::MessageIdRequired);
     }
 
-    let mut method = EditMessageCaption::for_chat_message(req.chat.id, req.message_id)
-        .with_caption(req.caption.clone());
+    let mut caption = InputText::from(req.caption.clone());
     if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
-        method = method.with_caption_parse_mode(parse_mode);
+        caption = caption.with_format(parse_mode);
     }
+    let mut method =
+        EditMessageCaption::for_chat_message(req.chat.id, req.message_id).with_caption(caption);
     if let Some(markup) = req.reply_markup.clone() {
         method = method.with_reply_markup(markup);
     }
@@ -787,10 +787,11 @@ pub fn build_callback_answer_method(req: &CallbackAnswerRequest) -> AnswerCallba
 pub fn build_inline_query_result_article(
     req: &InlineArticleRequest,
 ) -> Result<InlineQueryResult, OutboundBuildError> {
-    let mut content = InputMessageContentText::new(req.message_text.clone());
+    let mut text = InputText::from(req.message_text.clone());
     if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
-        content = content.with_parse_mode(parse_mode);
+        text = text.with_format(parse_mode);
     }
+    let content = InputMessageContentText::new(text);
 
     let mut article = InlineQueryResultArticle::new(req.id.clone(), content, req.title.clone());
     if !req.description.is_empty() {
@@ -803,8 +804,8 @@ pub fn build_inline_query_result_article(
 }
 
 /// Build an outbound `answerInlineQuery` method.
-pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> AnswerInlineQuery {
-    let mut method = AnswerInlineQuery::new(req.inline_query_id.clone(), req.results.clone());
+pub fn build_inline_query_answer_method(req: InlineQueryAnswerRequest) -> AnswerInlineQuery {
+    let mut method = AnswerInlineQuery::new(req.inline_query_id.clone(), req.results);
     if req.cache_time != 0 {
         method = method.with_cache_time(req.cache_time);
     }
@@ -818,8 +819,8 @@ pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> Answe
 }
 
 /// Build an outbound `answerGuestQuery` method.
-pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerGuestQuery {
-    AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
+pub fn build_guest_query_answer_method(req: GuestQueryAnswerRequest) -> AnswerGuestQuery {
+    AnswerGuestQuery::new(req.guest_query_id.clone(), req.result)
 }
 
 #[must_use]
@@ -1058,7 +1059,7 @@ pub fn build_guest_html_answer_method(req: &GuestHtmlAnswerRequest) -> Option<An
     })
     .expect("Telegram HTML parse mode is supported");
 
-    Some(build_guest_query_answer_method(&GuestQueryAnswerRequest {
+    Some(build_guest_query_answer_method(GuestQueryAnswerRequest {
         guest_query_id: guest_query_id.to_owned(),
         result: article,
     }))
@@ -1388,7 +1389,7 @@ impl StickerMessagePlan {
             method = method.with_disable_notification(true);
         }
         if let Some(reply) = self.reply_parameters {
-            method = method.with_reply_parameters(reply.into_carapax())?;
+            method = method.with_reply_parameters(reply.into_carapax());
         }
         Ok(method)
     }
@@ -1439,13 +1440,14 @@ impl PhotoMessagePlan {
             method = method.with_caption(self.caption.clone());
         }
         if let Some(parse_mode) = parse_mode_from_go(&self.render_as)? {
-            method = method.with_caption_parse_mode(parse_mode);
+            method =
+                method.with_caption(InputText::from(self.caption.clone()).with_format(parse_mode));
         }
         if self.has_spoiler {
             method = method.with_has_spoiler(true);
         }
         if let Some(reply) = self.reply_parameters {
-            method = method.with_reply_parameters(reply.into_carapax())?;
+            method = method.with_reply_parameters(reply.into_carapax());
         }
         Ok(method)
     }
@@ -1516,10 +1518,11 @@ impl AudioMessagePlan {
             method = method.with_caption(self.caption.clone());
         }
         if let Some(parse_mode) = parse_mode_from_go(&self.render_as)? {
-            method = method.with_caption_parse_mode(parse_mode);
+            method =
+                method.with_caption(InputText::from(self.caption.clone()).with_format(parse_mode));
         }
         if let Some(reply) = self.reply_parameters {
-            method = method.with_reply_parameters(reply.into_carapax())?;
+            method = method.with_reply_parameters(reply.into_carapax());
         }
         Ok(method)
     }
@@ -1592,7 +1595,7 @@ impl MediaGroupMessagePlan {
             method = method.with_disable_notification(true);
         }
         if let Some(reply) = self.reply_parameters {
-            method = method.with_reply_parameters(reply.into_carapax())?;
+            method = method.with_reply_parameters(reply.into_carapax());
         }
         Ok(method)
     }
@@ -1616,26 +1619,21 @@ impl MediaGroupPhotoItem {
     }
 
     fn to_carapax(&self) -> Result<MediaGroupItem, OutboundBuildError> {
-        Ok(MediaGroupItem::for_photo(
-            self.photo.to_input_file(),
-            self.photo_metadata()?,
-        ))
+        Ok(self.photo_metadata()?.into())
     }
 
     fn to_input_media(&self) -> Result<InputMedia, OutboundBuildError> {
-        Ok(InputMedia::for_photo(
-            self.photo.to_input_file(),
-            self.photo_metadata()?,
-        ))
+        Ok(self.photo_metadata()?.into())
     }
 
     fn photo_metadata(&self) -> Result<InputMediaPhoto, OutboundBuildError> {
-        let mut metadata = InputMediaPhoto::default();
+        let mut metadata = InputMediaPhoto::from(self.photo.to_input_file());
         if !self.caption.is_empty() {
             metadata = metadata.with_caption(self.caption.clone());
         }
         if let Some(parse_mode) = parse_mode_from_go(&self.render_as)? {
-            metadata = metadata.with_caption_parse_mode(parse_mode);
+            metadata = metadata
+                .with_caption(InputText::from(self.caption.clone()).with_format(parse_mode));
         }
         if self.has_spoiler {
             metadata = metadata.with_has_spoiler(true);
@@ -1659,25 +1657,13 @@ impl EditMediaMessagePlan {
             self.chat_id,
             self.message_id,
             self.media.to_input_media()?,
-        )?)
-    }
-}
-
-impl From<ReplyParametersError> for OutboundBuildError {
-    fn from(value: ReplyParametersError) -> Self {
-        Self::ReplyParameters(value.to_string())
+        ))
     }
 }
 
 impl From<MediaGroupError> for OutboundBuildError {
     fn from(value: MediaGroupError) -> Self {
         Self::MediaGroup(value.to_string())
-    }
-}
-
-impl From<InputMediaError> for OutboundBuildError {
-    fn from(value: InputMediaError) -> Self {
-        Self::InputMedia(value.to_string())
     }
 }
 
@@ -3016,15 +3002,57 @@ mod tests {
 
     #[test]
     fn telegram_member_permission_matches_go_group_settings_rule() {
-        let creator = ChatMember::Creator(ChatMemberCreator::new(User::new(42, "Ada", false)));
-        let promoting_admin = ChatMember::Administrator(
-            ChatMemberAdministrator::new(User::new(43, "Grace", false))
-                .with_can_promote_members(true),
-        );
-        let non_promoting_admin = ChatMember::Administrator(
-            ChatMemberAdministrator::new(User::new(44, "Alan", false))
-                .with_can_promote_members(false),
-        );
+        let creator = ChatMember::Creator(ChatMemberCreator {
+            user: User::new(42, "Ada", false),
+            is_anonymous: false,
+            custom_title: None,
+        });
+        let promoting_admin = ChatMember::Administrator(ChatMemberAdministrator {
+            user: User::new(43, "Grace", false),
+            can_be_edited: false,
+            can_change_info: false,
+            can_delete_messages: false,
+            can_delete_stories: None,
+            can_edit_messages: None,
+            can_edit_stories: None,
+            can_invite_users: false,
+            can_manage_chat: false,
+            can_manage_direct_messages: None,
+            can_manage_tags: None,
+            can_manage_topics: None,
+            can_manage_video_chats: false,
+            can_pin_messages: None,
+            can_post_messages: None,
+            can_post_stories: None,
+            can_promote_members: true,
+            can_restrict_members: false,
+            can_send_welcome_messages: false,
+            custom_title: None,
+            is_anonymous: false,
+        });
+        let non_promoting_admin = ChatMember::Administrator(ChatMemberAdministrator {
+            user: User::new(44, "Alan", false),
+            can_be_edited: false,
+            can_change_info: false,
+            can_delete_messages: false,
+            can_delete_stories: None,
+            can_edit_messages: None,
+            can_edit_stories: None,
+            can_invite_users: false,
+            can_manage_chat: false,
+            can_manage_direct_messages: None,
+            can_manage_tags: None,
+            can_manage_topics: None,
+            can_manage_video_chats: false,
+            can_pin_messages: None,
+            can_post_messages: None,
+            can_post_stories: None,
+            can_promote_members: false,
+            can_restrict_members: false,
+            can_send_welcome_messages: false,
+            custom_title: None,
+            is_anonymous: false,
+        });
         let member = ChatMember::Member {
             user: User::new(45, "Linus", false),
             tag: None,
@@ -3200,54 +3228,40 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn build_inline_query_answer_method_matches_go_inline_config()
+    #[tokio::test]
+    async fn build_inline_query_answer_method_matches_go_inline_config()
     -> Result<(), Box<dyn std::error::Error>> {
-        let article = build_inline_query_result_article(&InlineArticleRequest {
-            id: "inline-id".to_owned(),
-            title: "Шевелись, Плотва!".to_owned(),
-            message_text: "raw query".to_owned(),
-            render_as: String::new(),
-            description: String::new(),
-            reply_markup: None,
-        })?;
-        let article_payload = serde_json::to_value(article.clone())?;
-        assert_eq!(article_payload["type"], json!("article"));
-        assert_eq!(article_payload["id"], json!("inline-id"));
-        assert_eq!(article_payload["title"], json!("Шевелись, Плотва!"));
-        assert_eq!(
-            article_payload["input_message_content"]["message_text"],
-            json!("raw query")
-        );
-        assert!(
-            article_payload["input_message_content"]
-                .get("parse_mode")
-                .is_none()
-        );
-        assert!(article_payload.get("description").is_none());
-        assert!(article_payload.get("reply_markup").is_none());
-
-        let empty_options = build_inline_query_answer_method(&InlineQueryAnswerRequest {
+        let article = || {
+            build_inline_query_result_article(&InlineArticleRequest {
+                id: "inline-id".to_owned(),
+                title: "Шевелись, Плотва!".to_owned(),
+                message_text: "raw query".to_owned(),
+                render_as: String::new(),
+                description: String::new(),
+                reply_markup: None,
+            })
+        };
+        let empty_options = build_inline_query_answer_method(InlineQueryAnswerRequest {
             inline_query_id: "inline-empty".to_owned(),
-            results: vec![article.clone()],
+            results: vec![article()?],
             cache_time: 0,
             is_personal: false,
             next_offset: String::new(),
         });
-        let empty_payload = serde_json::to_value(empty_options)?;
+        let empty_payload = crate::test_api::bot_api_payload(empty_options).await?;
         assert_eq!(empty_payload["inline_query_id"], json!("inline-empty"));
         assert!(empty_payload.get("cache_time").is_none());
         assert!(empty_payload.get("is_personal").is_none());
         assert!(empty_payload.get("next_offset").is_none());
 
-        let method = build_inline_query_answer_method(&InlineQueryAnswerRequest {
+        let method = build_inline_query_answer_method(InlineQueryAnswerRequest {
             inline_query_id: "inline-id".to_owned(),
-            results: vec![article],
+            results: vec![article()?],
             cache_time: 1,
             is_personal: true,
             next_offset: String::new(),
         });
-        let payload = serde_json::to_value(method)?;
+        let payload = crate::test_api::bot_api_payload(method).await?;
 
         assert_eq!(payload["inline_query_id"], json!("inline-id"));
         assert_eq!(payload["cache_time"], json!(1));
@@ -3263,8 +3277,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn build_guest_query_answer_method_matches_go_guest_article()
+    #[tokio::test]
+    async fn build_guest_query_answer_method_matches_go_guest_article()
     -> Result<(), Box<dyn std::error::Error>> {
         let markup =
             InlineKeyboardMarkup::from([[InlineKeyboardButton::for_callback_data("ok", "ok")]]);
@@ -3276,11 +3290,11 @@ mod tests {
             description: "Готово".to_owned(),
             reply_markup: Some(markup),
         })?;
-        let method = build_guest_query_answer_method(&GuestQueryAnswerRequest {
+        let method = build_guest_query_answer_method(GuestQueryAnswerRequest {
             guest_query_id: "guest-query".to_owned(),
             result: article,
         });
-        let payload = serde_json::to_value(method)?;
+        let payload = crate::test_api::bot_api_payload(method).await?;
 
         assert_eq!(payload["guest_query_id"], json!("guest-query"));
         assert_eq!(payload["result"]["type"], json!("article"));
@@ -3382,8 +3396,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn build_guest_html_answer_method_matches_go_answer_guest_html()
+    #[tokio::test]
+    async fn build_guest_html_answer_method_matches_go_answer_guest_html()
     -> Result<(), Box<dyn std::error::Error>> {
         let method = build_guest_html_answer_method(&GuestHtmlAnswerRequest {
             guest_query_id: "guest-query".to_owned(),
@@ -3394,7 +3408,7 @@ mod tests {
             reply_markup: Some(build_guest_add_to_chat_markup("@PlotvoBot")),
         })
         .expect("non-empty guest query id builds a method");
-        let payload = serde_json::to_value(method)?;
+        let payload = crate::test_api::bot_api_payload(method).await?;
 
         assert_eq!(payload["guest_query_id"], json!("guest-query"));
         assert_eq!(payload["result"]["id"], json!("guest-guest-query"));
@@ -3422,7 +3436,7 @@ mod tests {
             reply_markup: None,
         })
         .expect("fallback still builds a method");
-        let fallback_payload = serde_json::to_value(fallback)?;
+        let fallback_payload = crate::test_api::bot_api_payload(fallback).await?;
         assert!(
             fallback_payload["result"]["input_message_content"]["message_text"]
                 .as_str()

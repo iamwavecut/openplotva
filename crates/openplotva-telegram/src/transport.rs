@@ -5,9 +5,9 @@ use carapax::{
     types::{
         AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery,
         CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
-        EditMessageReplyMarkup, EditMessageResult, EditMessageText, EditUserStarSubscription,
-        Message, RefundStarPayment, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-        SendPhoto, SendSticker, SentGuestMessage, SetMessageReaction,
+        EditMessageReplyMarkup, EditMessageResult, EditUserStarSubscription, Message,
+        RefundStarPayment, SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto,
+        SendSticker, SentGuestMessage, SetMessageReaction,
     },
 };
 
@@ -54,7 +54,7 @@ pub enum TelegramOutboundMethod {
     /// Telegram `editUserStarSubscription`.
     EditUserStarSubscription(Box<EditUserStarSubscription>),
     /// Telegram `editMessageText`.
-    EditMessageText(Box<EditMessageText>),
+    EditMessageText(Box<crate::EditTextMessagePlan>),
     /// Telegram `editMessageText` with rich content instead of plain text.
     EditRichMessage(Box<EditRichMessage>),
     /// Telegram `editMessageCaption`.
@@ -553,7 +553,7 @@ pub async fn execute_telegram_method(
             .await
             .map(TelegramOutboundResponse::Boolean),
         TelegramOutboundMethod::EditMessageText(method) => client
-            .execute(*method)
+            .execute(method.to_carapax())
             .await
             .map(TelegramOutboundResponse::EditMessage),
         TelegramOutboundMethod::EditMessageCaption(method) => client
@@ -871,8 +871,8 @@ impl From<EditUserStarSubscription> for TelegramOutboundMethod {
     }
 }
 
-impl From<EditMessageText> for TelegramOutboundMethod {
-    fn from(value: EditMessageText) -> Self {
+impl From<crate::EditTextMessagePlan> for TelegramOutboundMethod {
+    fn from(value: crate::EditTextMessagePlan) -> Self {
         Self::EditMessageText(Box::new(value))
     }
 }
@@ -1104,16 +1104,26 @@ mod tests {
         })
         .expect("inline article");
         let inline_answer = TelegramOutboundMethod::from(build_inline_query_answer_method(
-            &InlineQueryAnswerRequest {
+            InlineQueryAnswerRequest {
                 inline_query_id: "inline-id".to_owned(),
-                results: vec![inline_article.clone()],
+                results: vec![
+                    build_inline_query_result_article(&InlineArticleRequest {
+                        id: "inline".to_owned(),
+                        title: "Inline".to_owned(),
+                        message_text: "text".to_owned(),
+                        render_as: String::new(),
+                        description: String::new(),
+                        reply_markup: None,
+                    })
+                    .expect("inline article"),
+                ],
                 cache_time: 1,
                 is_personal: true,
                 next_offset: String::new(),
             },
         ));
         let guest_answer = TelegramOutboundMethod::from(build_guest_query_answer_method(
-            &GuestQueryAnswerRequest {
+            GuestQueryAnswerRequest {
                 guest_query_id: "guest-query".to_owned(),
                 result: inline_article,
             },

@@ -139,9 +139,25 @@ jobs:
           ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/maintenance/compose.maintenance.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.maintenance.yml"
+          scp deploy/production/configure-gradius-generation.py "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/configure-gradius-generation.py"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
           # shellcheck disable=SC2029
           ssh "$GETA_SSH_TARGET" "chmod 644 '$GETA_DEPLOY_ROOT/compose.maintenance.yml'; chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+
+      - name: Install generation advertising key
+        shell: bash
+        env:
+          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
+          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
+          GRADIUS_GENERATION_API_KEY: ${{ secrets.GRADIUS_GENERATION_API_KEY }}
+          OPENPLOTVA_PRODUCTION_ENV_B64: ${{ secrets.OPENPLOTVA_PRODUCTION_ENV_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${GRADIUS_GENERATION_API_KEY:-}" ]]; then
+            # shellcheck disable=SC2029
+            python3 -c 'import json, os; print(json.dumps({"key": os.environ["GRADIUS_GENERATION_API_KEY"], "production_env_b64": os.environ.get("OPENPLOTVA_PRODUCTION_ENV_B64", "")}))' |
+              ssh "$GETA_SSH_TARGET" "python3 '$GETA_DEPLOY_ROOT/configure-gradius-generation.py' '$GETA_DEPLOY_ROOT/.env.production'"
+          fi
 
       - name: Apply production deployment
         shell: bash

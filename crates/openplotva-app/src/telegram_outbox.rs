@@ -1048,6 +1048,7 @@ fn telegram_response_history_entries(
     };
     messages
         .into_iter()
+        .filter(|message| message.ephemeral_message_id.is_none() && message.receiver_user.is_none())
         .filter_map(|message| {
             let context = build_fetcher_message_context(message);
             build_history_text_entry(message, &context.original_text, context.meta, bot_id)
@@ -1089,7 +1090,11 @@ fn telegram_receipt_history_entries(
 fn telegram_response_receipt(response: TelegramOutboundResponse) -> TelegramReceipt {
     match response {
         TelegramOutboundResponse::Message(message) => TelegramReceipt {
-            message_ids: vec![message.id],
+            message_ids: if message.ephemeral_message_id.is_none() && message.id > 0 {
+                vec![message.id]
+            } else {
+                Vec::new()
+            },
             value: json!({"kind": "message", "response": message}),
         },
         TelegramOutboundResponse::Messages(messages) => TelegramReceipt {
@@ -1615,7 +1620,7 @@ async fn reconcile_resolved_taskman_batches<Jobs>(
         "SELECT DISTINCT opportunity.outbox_batch_id \
          FROM gradius_ad_opportunities AS opportunity \
          JOIN telegram_outbox AS operation ON operation.batch_id = opportunity.outbox_batch_id \
-         WHERE opportunity.integration_kind = 'native_utility' \
+         WHERE opportunity.integration_kind IN ('native_utility', 'native_generation') \
            AND opportunity.delivery_state = 'queued' \
            AND opportunity.outbox_batch_id IS NOT NULL \
            AND NOT EXISTS (SELECT 1 FROM telegram_outbox AS unresolved \
@@ -1807,11 +1812,19 @@ mod tests {
                 let (_, _, payload) = command
                     .into_storage_parts()
                     .expect("persisted text command");
+                let receiver = payload
+                    .get("ephemeral_message_parameters")
+                    .and_then(|value| value["receiver_user_id"].as_i64());
                 self.sent.lock().expect("sent commands").push(payload);
                 if self.reply_missing {
                     return Err(TelegramOutboundExecuteError::Rich(RichApiError::Api {
                         code: 400,
-                        description: "Bad Request: message to be replied not found".to_owned(),
+                        description: if receiver.is_some() {
+                            "Bad Request: bot is not a chat administrator"
+                        } else {
+                            "Bad Request: message to be replied not found"
+                        }
+                        .to_owned(),
                         retry_after: None,
                     }));
                 }
@@ -1822,19 +1835,28 @@ mod tests {
                         retry_after: None,
                     }));
                 }
-                let message = serde_json::from_value(json!({
-                    "message_id": 982,
-                    "date": 1,
-                    "chat": {"id": self.chat_id, "type": "private", "first_name": "Test"}
-                }))
-                .expect("Telegram receipt");
+                let mut response = json!({"message_id":982,"date":1,
+                "chat": if self.chat_id < 0 {
+                    json!({"id":self.chat_id,"type":"supergroup","title":"Group"})
+                } else {
+                    json!({"id":self.chat_id,"type":"private","first_name":"Test"})
+                }});
+                if let Some(receiver) = receiver {
+                    response["message_id"] = json!(0);
+                    response["ephemeral_message_id"] = json!(982);
+                    response["receiver_user"] =
+                        json!({"id":receiver,"is_bot":false,"first_name":"User"});
+                    response["chat"] =
+                        json!({"id":self.chat_id,"type":"supergroup","title":"Group"});
+                }
+                let message = serde_json::from_value(response).expect("Telegram receipt");
                 Ok(TelegramOutboundResponse::Message(Box::new(message)))
             })
         }
     }
 
     #[tokio::test]
-    async fn postgres_utility_receipts_confirm_delivery_and_recover_missed_callbacks()
+    async fn postgres_gradius_receipts_confirm_delivery_and_recover_missed_callbacks()
     -> Result<(), Box<dyn std::error::Error>> {
         use openplotva_storage::gradius_ads::{GradiusAdOpportunityInput, GradiusStoredAd};
 
@@ -1859,8 +1881,15 @@ mod tests {
             crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(4),
             ledger.clone(),
         );
-        for (already_edited, reply_missing) in [(false, false), (true, false), (false, true)] {
-            let chat_id = if already_edited {
+        for (already_edited, reply_missing, generation_group, ephemeral) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, true),
+            (false, true, true, true),
+            (false, false, true, false),
+        ] {
+            let chat_id = if already_edited || generation_group {
                 -9_820_825_960_i64
             } else {
                 9_820_825_960
@@ -1885,7 +1914,12 @@ mod tests {
                     opportunity_key: format!("{source}:receipt-test"),
                     attempt_key: "attempt-1".to_owned(),
                     dialog_job_id: None,
-                    integration_kind: "native_utility".to_owned(),
+                    integration_kind: if already_edited {
+                        "native_utility"
+                    } else {
+                        "native_generation"
+                    }
+                    .to_owned(),
                     user_id: 9_820_825_960,
                     chat_id,
                     thread_id: 0,
@@ -1910,7 +1944,6 @@ mod tests {
                     },
                 )
                 .await?;
-            let preview = carapax::types::LinkPreviewOptions::default().with_is_disabled(true);
             let method = if already_edited {
                 TelegramOutboundMethod::from(openplotva_telegram::EditRichMessage {
                     chat_id,
@@ -1919,11 +1952,18 @@ mod tests {
                     reply_markup: None,
                 })
             } else {
-                TelegramOutboundMethod::from(
-                    carapax::types::SendMessage::new(chat_id, "📢 Offer")
-                        .with_reply_parameters(carapax::types::ReplyParameters::new(77))
-                        .with_link_preview_options(preview),
-                )
+                TelegramOutboundMethod::from(crate::gradius_utility_outbox::image_ad_message(
+                    chat_id,
+                    9_820_825_960,
+                    if ephemeral {
+                        crate::gradius_utility_outbox::ImageAdDelivery::Ephemeral
+                    } else {
+                        crate::gradius_utility_outbox::ImageAdDelivery::Persistent
+                    },
+                    None,
+                    77,
+                    "📢 Offer",
+                )?)
             };
             let (method_kind, payload_version, payload) =
                 OutboundCommand::try_from_method(method)?.into_storage_parts()?;
@@ -1996,6 +2036,14 @@ mod tests {
             } else {
                 assert_eq!(sent[0]["link_preview_options"]["is_disabled"], true);
                 assert_eq!(sent[0]["reply_parameters"]["message_id"], 77);
+                if ephemeral {
+                    assert_eq!(
+                        sent[0]["ephemeral_message_parameters"]["receiver_user_id"],
+                        9_820_825_960_i64
+                    );
+                } else {
+                    assert!(sent[0].get("ephemeral_message_parameters").is_none());
+                }
             }
             let shown: Option<OffsetDateTime> =
                 sqlx::query_scalar("SELECT shown_at FROM gradius_ad_opportunities WHERE id = $1")
@@ -2232,6 +2280,28 @@ mod tests {
 
         assert_eq!(receipt.message_ids, vec![91]);
         assert_eq!(receipt.value["kind"], "message");
+    }
+
+    #[test]
+    fn ephemeral_receipt_retains_private_identifiers_without_shared_history() {
+        let message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id":0,"ephemeral_message_id":91,
+            "receiver_user":{"id":42,"is_bot":false,"first_name":"User"},
+            "from":{"id":7,"is_bot":true,"first_name":"Plotva"},
+            "date":1,"chat":{"id":-100,"type":"supergroup","title":"Group"},"text":"Private offer"
+        }))
+        .expect("ephemeral response");
+        let response = TelegramOutboundResponse::Message(Box::new(message));
+        assert!(telegram_response_history_entries(&response, 7).is_empty());
+        let receipt = telegram_response_receipt(response);
+        assert!(receipt.message_ids.is_empty());
+        assert_eq!(receipt.value["response"]["ephemeral_message_id"], 91);
+        assert_eq!(receipt.value["response"]["receiver_user"]["id"], 42);
+        assert!(
+            telegram_receipt_history_entries(&receipt.value, 7)
+                .expect("recovered receipt")
+                .is_empty()
+        );
     }
 
     #[test]

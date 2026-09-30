@@ -161,7 +161,7 @@ pub fn inline_query_answer_method(
         },
     )?;
     Ok(openplotva_telegram::build_inline_query_answer_method(
-        &openplotva_telegram::InlineQueryAnswerRequest {
+        openplotva_telegram::InlineQueryAnswerRequest {
             inline_query_id: query.id.clone(),
             results: vec![result],
             cache_time: 1,
@@ -196,15 +196,15 @@ mod tests {
         handle_inline_query_update_or_else, inline_query_answer_method,
     };
 
-    #[test]
-    fn inline_query_answer_method_matches_go_inline_config() -> Result<(), Box<dyn Error>> {
+    #[tokio::test]
+    async fn inline_query_answer_method_matches_go_inline_config() -> Result<(), Box<dyn Error>> {
         let update = inline_query_update()?;
         let carapax::types::UpdateType::InlineQuery(query) = &update.update_type else {
             return Err("expected inline query update".into());
         };
 
         let method = inline_query_answer_method(query)?;
-        let value = serde_json::to_value(method)?;
+        let value = crate::test_bot_api::bot_api_payload(method).await?;
 
         assert_eq!(value["inline_query_id"], json!("inline-query-id"));
         assert_eq!(value["cache_time"], json!(1));
@@ -404,7 +404,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct InlineEffectsStub {
-        methods: Arc<Mutex<Vec<AnswerInlineQuery>>>,
+        methods: Arc<Mutex<Vec<Value>>>,
         artifacts: Arc<Mutex<Vec<(TelegramOutboundMethodKind, Value)>>>,
         fail: bool,
     }
@@ -415,11 +415,7 @@ mod tests {
                 .lock()
                 .expect("inline effects")
                 .iter()
-                .filter_map(|method| {
-                    serde_json::to_value(method)
-                        .ok()
-                        .and_then(|value| value["inline_query_id"].as_str().map(str::to_owned))
-                })
+                .filter_map(|method| method["inline_query_id"].as_str().map(str::to_owned))
                 .collect()
         }
 
@@ -439,11 +435,14 @@ mod tests {
                 if self.fail {
                     return Err(StubError);
                 }
+                let payload = crate::test_bot_api::bot_api_payload(method)
+                    .await
+                    .expect("answerInlineQuery payload");
                 self.artifacts.lock().expect("inline artifacts").push((
                     TelegramOutboundMethodKind::AnswerInlineQuery,
-                    serde_json::to_value(&method).expect("answerInlineQuery payload"),
+                    payload.clone(),
                 ));
-                self.methods.lock().expect("inline effects").push(method);
+                self.methods.lock().expect("inline effects").push(payload);
                 Ok(())
             })
         }
