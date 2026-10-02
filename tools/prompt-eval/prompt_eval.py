@@ -261,23 +261,34 @@ def render_memory_blocks(user: dict[str, Any]) -> str:
 
 
 def resolve_memory_aliases(user: dict[str, Any], parsed: Any) -> Any:
-    """Map the per-call numbers in an extraction answer back to fixture ids (`resolve_prompt_aliases`)."""
+    """Map the per-call numbers in an extraction answer back to fixture ids (`resolve_prompt_aliases`).
+
+    Like the Rust side, a storage id of the window that comes back instead of a
+    number is kept, and so is a `source_entry_ids` value that names a window entry.
+    """
     if not isinstance(parsed, dict):
         return parsed
     parsed = json.loads(json.dumps(parsed))
     people, _ = memory_people(user)
     messages = user.get("messages", [])
     cards = memory_cards(user)
+    window_entries = {(message.get("entry_id") or "").strip() for message in messages} - {""}
 
-    def pick(items: list[Any], number: Any) -> Any:
-        return items[number - 1] if isinstance(number, int) and 1 <= number <= len(items) else None
+    def pick(items: list[Any], number: Any, key: str) -> Any:
+        if isinstance(number, bool) or not isinstance(number, int):
+            return None
+        if 1 <= number <= len(items):
+            return items[number - 1]
+        return next((item for item in items if number and item.get(key) == number), None)
 
     for card in parsed.get("candidate_cards") or []:
         if not isinstance(card, dict):
             continue
-        message_ids, entry_ids = [], []
+        message_ids: list[int] = []
+        entry_ids = [entry.strip() for entry in card.get("source_entry_ids") or [] if isinstance(entry, str) and entry.strip() in window_entries]
+        entry_ids = list(dict.fromkeys(entry_ids))
         for number in card.get("source_message_ids") or []:
-            message = pick(messages, number)
+            message = pick(messages, number, "message_id")
             if message is None:
                 continue
             if message.get("message_id") and message["message_id"] not in message_ids:
@@ -289,14 +300,14 @@ def resolve_memory_aliases(user: dict[str, Any], parsed: Any) -> Any:
         if "source_entry_ids" in card:
             card["source_entry_ids"] = entry_ids
         if "user_id" in card:
-            person = pick(people, card.get("user_id"))
+            person = pick(people, card.get("user_id"), "user_id")
             card["user_id"] = person["user_id"] if person else 0
     for resolution in parsed.get("resolutions") or []:
         if not isinstance(resolution, dict):
             continue
         for key in ("old_card_id", "into_card_id"):
             if key in resolution and (key == "old_card_id" or resolution[key]):
-                card = pick(cards, resolution[key])
+                card = pick(cards, resolution[key], "id")
                 resolution[key] = card.get("id", 0) if card else 0
     return parsed
 
@@ -1037,11 +1048,14 @@ def self_test() -> int:
             "existing_cards": [{"id": 42, "subject": "Bob"}, {"id": 7, "subject": "Ada"}],
             "messages": [{"message_id": 10, "entry_id": "e1", "user_id": 42}, {"message_id": 11, "entry_id": "e2", "user_id": 43}],
         },
-        {"candidate_cards": [{"user_id": 2, "source_message_ids": [2, 9]}], "resolutions": [{"old_card_id": 1, "into_card_id": 2}]},
+        {
+            "candidate_cards": [{"user_id": 2, "source_message_ids": [2, 9]}, {"user_id": 42, "source_message_ids": [10], "source_entry_ids": ["e1", "x"]}],
+            "resolutions": [{"old_card_id": 1, "into_card_id": 2}, {"old_card_id": 42}],
+        },
     )
     if resolved != {
-        "candidate_cards": [{"user_id": 43, "source_message_ids": [11]}],
-        "resolutions": [{"old_card_id": 7, "into_card_id": 42}],
+        "candidate_cards": [{"user_id": 43, "source_message_ids": [11]}, {"user_id": 42, "source_message_ids": [10], "source_entry_ids": ["e1"]}],
+        "resolutions": [{"old_card_id": 7, "into_card_id": 42}, {"old_card_id": 42}],
     }:
         failures += 1
         print(f"FAIL memory aliases: {resolved}")
