@@ -463,9 +463,7 @@ impl RuntimeLlmRunBuffer {
     pub fn clear(&self) {
         let mut inner = self.lock();
         inner.open.clear();
-        for slot in &mut inner.ring {
-            *slot = None;
-        }
+        inner.ring.fill(None);
         inner.write = 0;
         inner.count = 0;
     }
