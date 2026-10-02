@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -31,6 +32,13 @@ pub const MEMORY_TOKEN_ESTIMATOR_SOURCE: &str = "heuristic";
 pub const MAX_FACT_TEXT_LEN: usize = 700;
 pub const DEFAULT_MEMORY_REDACTION_TIMEOUT: StdDuration = StdDuration::from_secs(35);
 pub const DEFAULT_MEMORY_REDACTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// Redaction calls one extraction may keep in flight; matches the privacy-filter
+/// slots Discovery grants (`max_concurrent_jobs`).
+pub const DEFAULT_MEMORY_REDACTION_CONCURRENCY: usize = 4;
+/// Discovery caps `/v1/jobs/sync` and long-poll result waits at two minutes.
+const DISCOVERY_MAX_RESULT_WAIT: StdDuration = StdDuration::from_secs(120);
+/// A long-poll answer faster than this means the server ignored `wait_ms`.
+const DISCOVERY_LONG_POLL_MIN_HOLD: StdDuration = StdDuration::from_millis(50);
 pub const DEFAULT_MEMORY_REDACTION_CAPACITY_WAIT: StdDuration = StdDuration::from_secs(30);
 
 pub type Visibility = String;
@@ -1457,9 +1465,11 @@ where
     fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error> {
         Box::pin(async move {
             let output = self.next.extract(input).await?;
-            match redact_extract_output_with_async(output.clone(), |value| {
-                self.redactor.redact_text(value)
-            })
+            match redact_extract_output_with_async(
+                output.clone(),
+                DEFAULT_MEMORY_REDACTION_CONCURRENCY,
+                |value| self.redactor.redact_text(value),
+            )
             .await
             {
                 Ok(redacted) => Ok(redacted),
@@ -1473,9 +1483,11 @@ where
             let Some(plan) = self.next.resolve(input).await? else {
                 return Ok(None);
             };
-            match redact_resolution_plan_with_async(plan.clone(), |value| {
-                self.redactor.redact_text(value)
-            })
+            match redact_resolution_plan_with_async(
+                plan.clone(),
+                DEFAULT_MEMORY_REDACTION_CONCURRENCY,
+                |value| self.redactor.redact_text(value),
+            )
             .await
             {
                 Ok(redacted) => Ok(Some(redacted)),
@@ -1565,6 +1577,7 @@ pub struct DiscoveryRedactor {
     poll_interval: StdDuration,
     capacity_wait: StdDuration,
     capacity_poll_interval: StdDuration,
+    timeout: StdDuration,
     categories: Vec<String>,
     client: reqwest::Client,
 }
@@ -1572,9 +1585,16 @@ pub struct DiscoveryRedactor {
 impl DiscoveryRedactor {
     /// Build a reqwest-backed Discovery redactor.
     pub fn new(cfg: DiscoveryRedactorConfig) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder().build()?;
+        Ok(Self::with_client(cfg, client))
+    }
+
+    /// Build a redactor on a shared HTTP client so consecutive calls reuse
+    /// pooled keep-alive connections instead of paying a new handshake each.
+    #[must_use]
+    pub fn with_client(cfg: DiscoveryRedactorConfig, client: reqwest::Client) -> Self {
         let cfg = cfg.with_defaults();
-        let client = reqwest::Client::builder().timeout(cfg.timeout).build()?;
-        Ok(Self {
+        Self {
             base_url: cfg.base_url.trim().trim_end_matches('/').to_owned(),
             service_name: cfg.service_name.trim().to_owned(),
             endpoint_name: cfg.endpoint_name.trim().to_owned(),
@@ -1582,9 +1602,10 @@ impl DiscoveryRedactor {
             poll_interval: cfg.poll_interval,
             capacity_wait: cfg.capacity_wait,
             capacity_poll_interval: cfg.capacity_poll_interval,
+            timeout: cfg.timeout,
             categories: cfg.categories,
             client,
-        })
+        }
     }
 
     pub async fn redact_text(&self, text: &str) -> Result<String, DiscoveryRedactorError> {
@@ -1685,6 +1706,7 @@ impl DiscoveryRedactor {
             priority: DISCOVERY_PRIORITY_MEMORY,
             wait_for_capacity_ms: duration_ms(self.capacity_wait),
             capacity_poll_ms: duration_ms(self.capacity_poll_interval),
+            wait_for_result_ms: duration_ms(self.result_wait()),
         };
         let body = serde_json::to_vec(&job_req).map_err(DiscoveryRedactorError::JobBody)?;
         Ok((body, job_id))
@@ -1696,8 +1718,13 @@ impl DiscoveryRedactor {
     ) -> Result<DiscoveryRedactionEnvelope, DiscoveryRedactorError> {
         let response = self
             .client
-            .post(self.endpoint("/v1/jobs/blocking"))
+            .post(self.endpoint("/v1/jobs/sync"))
             .header("Content-Type", "application/json")
+            .timeout(
+                self.capacity_wait
+                    .saturating_add(self.result_wait())
+                    .saturating_add(self.timeout),
+            )
             .body(body)
             .send()
             .await
@@ -1716,22 +1743,40 @@ impl DiscoveryRedactor {
                     job_id: job_id.to_owned(),
                 });
             }
-            tokio::time::sleep(self.poll_interval).await;
-            let envelope = self.fetch_job(job_id).await?;
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(DISCOVERY_MAX_RESULT_WAIT);
+            let asked = Instant::now();
+            let envelope = self.fetch_job(job_id, wait).await?;
             match redaction_result_from_envelope(&envelope, true)? {
                 RedactionEnvelopeResult::Done(result) => return Ok(result),
-                RedactionEnvelopeResult::Pending => {}
+                RedactionEnvelopeResult::Pending => {
+                    if asked.elapsed() < DISCOVERY_LONG_POLL_MIN_HOLD {
+                        // An older Discovery ignores `wait_ms`; fall back to interval polling.
+                        tokio::time::sleep(self.poll_interval).await;
+                    }
+                }
             }
         }
+    }
+
+    fn result_wait(&self) -> StdDuration {
+        self.task_timeout.min(DISCOVERY_MAX_RESULT_WAIT)
     }
 
     async fn fetch_job(
         &self,
         job_id: &str,
+        wait: StdDuration,
     ) -> Result<DiscoveryRedactionEnvelope, DiscoveryRedactorError> {
         let response = self
             .client
-            .get(self.endpoint(&format!("/v1/jobs/{}", job_id.trim())))
+            .get(self.endpoint(&format!(
+                "/v1/jobs/{}?wait_ms={}",
+                job_id.trim(),
+                wait.as_millis()
+            )))
+            .timeout(wait.saturating_add(self.timeout))
             .send()
             .await
             .map_err(|source| DiscoveryRedactorError::Request {
@@ -2602,17 +2647,19 @@ pub fn apply_resolution_plan(
 /// Redact the texts a resolution plan writes onto existing cards.
 pub async fn redact_resolution_plan_with_async<F, Fut, E>(
     mut plan: ResolutionPlan,
-    mut redact: F,
+    concurrency: usize,
+    redact: F,
 ) -> Result<ResolutionPlan, E>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<String, E>> + Send,
 {
-    for choice in &mut plan.decisions {
-        if !choice.new_fact_text.trim().is_empty() {
-            choice.new_fact_text = redact(std::mem::take(&mut choice.new_fact_text)).await?;
-        }
-    }
+    let slots = plan
+        .decisions
+        .iter_mut()
+        .map(|choice| &mut choice.new_fact_text)
+        .collect();
+    redact_slots_concurrently(slots, concurrency, redact).await?;
     Ok(plan)
 }
 
@@ -2995,62 +3042,68 @@ where
 
 pub async fn redact_extract_output_with_async<F, Fut, E>(
     mut output: ExtractOutput,
-    mut redact: F,
+    concurrency: usize,
+    redact: F,
 ) -> Result<ExtractOutput, E>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<String, E>> + Send,
 {
-    let mut cache = HashMap::<String, String>::new();
-    output.episode_summary = redact_text_cached_async(
-        std::mem::take(&mut output.episode_summary),
-        &mut cache,
-        &mut redact,
-    )
-    .await?;
-    for value in &mut output.topics {
-        *value = redact_text_cached_async(std::mem::take(value), &mut cache, &mut redact).await?;
-    }
-    for value in &mut output.participants {
-        *value = redact_text_cached_async(std::mem::take(value), &mut cache, &mut redact).await?;
-    }
+    let mut slots: Vec<&mut String> = vec![&mut output.episode_summary];
+    slots.extend(output.topics.iter_mut());
+    slots.extend(output.participants.iter_mut());
     for card in &mut output.candidate_cards {
-        card.subject =
-            redact_text_cached_async(std::mem::take(&mut card.subject), &mut cache, &mut redact)
-                .await?;
-        card.predicate =
-            redact_text_cached_async(std::mem::take(&mut card.predicate), &mut cache, &mut redact)
-                .await?;
-        card.object =
-            redact_text_cached_async(std::mem::take(&mut card.object), &mut cache, &mut redact)
-                .await?;
-        card.fact_text =
-            redact_text_cached_async(std::mem::take(&mut card.fact_text), &mut cache, &mut redact)
-                .await?;
+        slots.extend([
+            &mut card.subject,
+            &mut card.predicate,
+            &mut card.object,
+            &mut card.fact_text,
+        ]);
     }
     for supersession in &mut output.supersessions {
-        supersession.new_fact_text = redact_text_cached_async(
-            std::mem::take(&mut supersession.new_fact_text),
-            &mut cache,
-            &mut redact,
-        )
-        .await?;
+        slots.push(&mut supersession.new_fact_text);
     }
     for link in &mut output.links {
-        link.from_fact_text = redact_text_cached_async(
-            std::mem::take(&mut link.from_fact_text),
-            &mut cache,
-            &mut redact,
-        )
-        .await?;
-        link.to_fact_text = redact_text_cached_async(
-            std::mem::take(&mut link.to_fact_text),
-            &mut cache,
-            &mut redact,
-        )
-        .await?;
+        slots.extend([&mut link.from_fact_text, &mut link.to_fact_text]);
     }
+    redact_slots_concurrently(slots, concurrency, redact).await?;
     Ok(output)
+}
+
+/// Redact every distinct non-blank slot value once, with up to `concurrency`
+/// redaction calls in flight, then write the results back into all slots.
+async fn redact_slots_concurrently<F, Fut, E>(
+    slots: Vec<&mut String>,
+    concurrency: usize,
+    mut redact: F,
+) -> Result<(), E>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<String, E>> + Send,
+{
+    let mut seen = HashSet::new();
+    let distinct: Vec<String> = slots
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| seen.insert(value.as_str()))
+        .map(|value| (*value).clone())
+        .collect();
+    if distinct.is_empty() {
+        return Ok(());
+    }
+    let redacted: HashMap<String, String> = stream::iter(distinct.into_iter().map(|value| {
+        let call = redact(value.clone());
+        async move { call.await.map(|redacted| (value, redacted)) }
+    }))
+    .buffer_unordered(concurrency.max(1))
+    .try_collect()
+    .await?;
+    for slot in slots {
+        if let Some(value) = redacted.get(slot.as_str()) {
+            slot.clone_from(value);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -3095,6 +3148,9 @@ pub struct DiscoveryRedactionJobRequest {
     /// Capacity-poll milliseconds.
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub capacity_poll_ms: i32,
+    /// How long `/v1/jobs/sync` holds the submit open for the result.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub wait_for_result_ms: i32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -4029,26 +4085,6 @@ where
     Ok(output)
 }
 
-async fn redact_text_cached_async<F, Fut, E>(
-    value: String,
-    cache: &mut HashMap<String, String>,
-    redact: &mut F,
-) -> Result<String, E>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<String, E>> + Send,
-{
-    if value.trim().is_empty() {
-        return Ok(value);
-    }
-    if let Some(cached) = cache.get(value.as_str()) {
-        return Ok(cached.clone());
-    }
-    let redacted = redact(value.clone()).await?;
-    cache.insert(value, redacted.clone());
-    Ok(redacted)
-}
-
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
@@ -4131,6 +4167,65 @@ mod tests {
     use super::*;
     use std::fmt;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[tokio::test]
+    async fn redacts_each_distinct_value_once_with_bounded_parallelism() {
+        let output = ExtractOutput {
+            episode_summary: "summary".to_owned(),
+            topics: vec!["music".to_owned(), "".to_owned()],
+            participants: vec!["Alice".to_owned(), "Bob".to_owned()],
+            candidate_cards: vec![CandidateCard {
+                subject: "Alice".to_owned(),
+                predicate: "likes".to_owned(),
+                object: "music".to_owned(),
+                fact_text: "Alice likes music".to_owned(),
+                ..CandidateCard::default()
+            }],
+            ..ExtractOutput::default()
+        };
+        let calls = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let redacted = redact_extract_output_with_async(output, 3, |value| {
+            let calls = Arc::clone(&calls);
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            async move {
+                use std::sync::atomic::Ordering;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                calls.lock().expect("calls").push(value.clone());
+                Ok::<_, fmt::Error>(format!("<{value}>"))
+            }
+        })
+        .await
+        .expect("redaction");
+
+        let mut seen = calls.lock().expect("calls").clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "Alice",
+                "Alice likes music",
+                "Bob",
+                "likes",
+                "music",
+                "summary"
+            ]
+        );
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=3).contains(&peak), "peak in-flight {peak}");
+        assert_eq!(redacted.episode_summary, "<summary>");
+        assert_eq!(redacted.topics, vec!["<music>", ""]);
+        assert_eq!(redacted.participants, vec!["<Alice>", "<Bob>"]);
+        let card = &redacted.candidate_cards[0];
+        assert_eq!(card.subject, "<Alice>");
+        assert_eq!(card.object, "<music>");
+        assert_eq!(card.fact_text, "<Alice likes music>");
+    }
 
     fn merge_decision(index: i64, action: &str, survivor: Option<i64>) -> SubjectMergeDecision {
         SubjectMergeDecision {

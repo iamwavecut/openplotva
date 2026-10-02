@@ -3196,7 +3196,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].url,
-            "https://discovery.example.test/v1/jobs/blocking"
+            "https://discovery.example.test/v1/jobs/sync"
         );
         let job: DiscoveryJobRequest = serde_json::from_slice(&requests[0].body)?;
         assert_eq!(job.invocation.service_name, LEGACY_VISION_SERVICE_NAME);

@@ -329,6 +329,7 @@ impl DiscoveryAsrClient {
             priority: 0,
             wait_for_capacity_ms: duration_ms(self.cfg.capacity_wait),
             capacity_poll_ms: duration_ms(self.cfg.poll_interval),
+            wait_for_result_ms: 0,
         };
         let deadline = Instant::now() + self.cfg.task_timeout.max(Duration::from_secs(1));
         let envelope = self
