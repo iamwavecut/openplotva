@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0
 ARG TARGETARCH
-LABEL openplotva.maintenance.omp="18.1.14" openplotva.maintenance.rust="1.95.0"
+LABEL openplotva.maintenance.omp="18.1.14" openplotva.maintenance.rust="1.99.0"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 ca-certificates curl git pkg-config libssl-dev clang cmake \
     && rm -rf /var/lib/apt/lists/* \

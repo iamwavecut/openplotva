@@ -45,7 +45,7 @@ all actionable findings; a clean or informational comment does not justify a new
 patch. The controller still checks the current review contents and revision.
 For deep jobs and revise jobs that require a code change, establish whether a patch is justified, add a regression
 check of the promised behavior, and make the smallest complete fix. Follow Rust
-1.95 and the existing architecture. Run cargo fmt --all, workspace clippy and
+1.99 and the existing architecture. Run cargo fmt --all, workspace clippy and
 relevant tests; the controller independently repeats checks. If the fix involves
 web/admin assets, existing design-token and asset-hash guards apply. If a patch
 requires changing forbidden controls, return needs_human.

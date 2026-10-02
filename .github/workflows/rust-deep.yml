@@ -11,7 +11,7 @@ on:
     - cron: "47 4 * * 0"
 
 env:
-  RUST_VERSION: "1.95.0"
+  RUST_VERSION: "1.99.0"
   CARGO_HACK_VERSION: "0.6.44"
   CARGO_SEMVER_CHECKS_VERSION: "0.47.0"
 

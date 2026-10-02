@@ -4,7 +4,7 @@
 
 OpenPlotva is a Telegram bot + web service runtime in Rust (18-crate workspace, edition 2024), migrated from a Go original (`go-plotva`): agentic AI dialog with tool-calling turns, media generation (image/music/vision/youtube), bitemporal memory, content-safety shield, Telegram Stars payments, a token-driven admin Web UI, and an operator GraphQL runtime API. Single process backed by Postgres 17 + pgvector and Dragonfly (Redis).
 
-**Stack**: Rust 1.95.0 · tokio · axum · async-graphql · sqlx 0.9 (Postgres-only) · carapax (Telegram) · pgvector · redis · rustls · handlebars (prompts).
+**Stack**: Rust 1.99.0 · tokio · axum · async-graphql · sqlx 0.9 (Postgres-only) · carapax (Telegram) · pgvector · redis · rustls · handlebars (prompts).
 
 **Structure**: `openplotva-app` is the composition root (binary+lib; `lib.rs` ≈15.6k lines owns `RuntimeWorkers`, `run()`, `start_runtime_workers`); domain crates (`core`, `dialog`, `agent`, `memory`, `history`, `shield`, `taskman`, `updates`) hold pure logic and must not depend on web/Telegram/SQLx/vendor SDKs; integration crates (`telegram`, `llm`, `storage`, `server`, `web`, `media`) own vendor boundaries; `config`/`observability`/`prompts` are cross-cutting leaves. Two axum servers run concurrently: the public web server and a TLS-terminated runtime API (Bearer-token GraphQL). All outbound sends flow through a persisted, debounced, deduped dispatcher queue.
 
