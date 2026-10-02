@@ -23,7 +23,7 @@ manual dispatch. Its backup is stored under
 - `openplotva-state.tar.gz` — runtime TLS/application state when the volume exists;
 - `SHA256SUMS` — checksums verified before the backup is accepted.
 
-The default retention is the newest 14 complete `scheduled-*` directories.
+Only the newest complete backup directory (`scheduled-*` or `predeploy-*`) is kept by default.
 Override it with `OPENPLOTVA_BACKUP_KEEP`.
 
 The uploader's media volume has a separate daily retention job on the production host:
