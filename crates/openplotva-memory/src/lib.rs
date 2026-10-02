@@ -308,82 +308,316 @@ pub const EXTRACTION_TASK_LINE: &str =
     "Based on the window above, return the JSON object described in the system prompt.";
 
 impl ExtractInput {
-    /// Render the extraction user message as delimited data blocks followed by
-    /// the task: `<run>` facts, the compact `<existing_cards>` (one JSON object
-    /// per line, ids kept so resolutions can cite them) and the `<chat_window>`
-    /// with one `<msg>` line per message carrying the ids a card must cite.
+    /// Render the extraction user message as compact data blocks followed by the
+    /// task: `<run>` facts, the `<people>` legend, the existing `<cards>` table and
+    /// the `<chat>` window. Storage ids never reach the model: people, messages
+    /// and cards are numbered `u1…`, `m1…`, `c1…` per call (see [`PromptAliases`])
+    /// and [`resolve_prompt_aliases`] maps the numbers in the answer back.
     pub fn to_prompt_payload(&self) -> Result<String, serde_json::Error> {
-        let mut out = String::from("<run>\n");
-        out.push_str(&serde_json::to_string(&PromptRunFacts::new(self))?);
-        out.push_str("\n</run>\n<existing_cards>\n");
-        for card in compact_existing_cards(&self.existing_cards, self.run.range_end_at) {
-            out.push_str(&serde_json::to_string(&card)?);
-            out.push('\n');
-        }
-        out.push_str("</existing_cards>\n<chat_window>\n");
-        for message in &self.messages {
-            push_prompt_message(&mut out, message);
-        }
-        out.push_str("</chat_window>\n");
+        let aliases = PromptAliases::for_input(self);
+        let mut out = String::new();
+        push_prompt_run(&mut out, self);
+        aliases.push_people(&mut out);
+        aliases.push_cards(&mut out);
+        aliases.push_chat(&mut out, &self.messages);
         out.push_str(EXTRACTION_TASK_LINE);
         Ok(out)
     }
 }
 
-#[derive(Serialize)]
-struct PromptRunFacts<'a> {
-    #[serde(skip_serializing_if = "str::is_empty")]
-    chat_type: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    window_start: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    window_end: Option<String>,
+/// One person in the `<people>` legend.
+#[derive(Clone, Debug, PartialEq)]
+struct PromptPerson {
+    user_id: i64,
+    name: String,
+    username: String,
+    is_bot: bool,
 }
 
-impl<'a> PromptRunFacts<'a> {
-    fn new(input: &'a ExtractInput) -> Self {
-        Self {
-            chat_type: input.chat_type.trim(),
-            window_start: prompt_timestamp(input.run.range_start_at),
-            window_end: prompt_timestamp(input.run.range_end_at),
+/// Per-call numbering of everything the extraction prompt refers to, so the
+/// prompt carries `u3`/`m12`/`c4` instead of ten-digit storage ids. Numbers are
+/// 1-based; the model answers with the bare numbers in the id fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PromptAliases {
+    people: Vec<PromptPerson>,
+    /// Person number (1-based) of each message, in window order.
+    message_people: Vec<usize>,
+    /// `(message_id, entry_id)` of each message, in window order.
+    messages: Vec<(i32, String)>,
+    cards: Vec<CompactExistingCard>,
+}
+
+impl PromptAliases {
+    #[must_use]
+    pub fn for_input(input: &ExtractInput) -> Self {
+        let mut aliases = Self {
+            cards: compact_existing_cards(&input.existing_cards, input.run.range_end_at),
+            ..Self::default()
+        };
+        for message in &input.messages {
+            let person = aliases.person_number(message);
+            aliases.message_people.push(person);
+            aliases
+                .messages
+                .push((message.message_id, message.entry_id.trim().to_owned()));
         }
+        aliases
+    }
+
+    fn person_number(&mut self, message: &Message) -> usize {
+        let name = prompt_author(message);
+        let username = message
+            .sender_username
+            .trim()
+            .trim_start_matches('@')
+            .to_owned();
+        let found = self.people.iter().position(|person| {
+            if message.user_id != 0 {
+                person.user_id == message.user_id
+            } else {
+                person.user_id == 0 && person.name == name
+            }
+        });
+        if let Some(index) = found {
+            return index + 1;
+        }
+        self.people.push(PromptPerson {
+            user_id: message.user_id,
+            name,
+            username,
+            is_bot: message.sender_is_bot,
+        });
+        self.people.len()
+    }
+
+    /// Storage user id behind person number `n`, or 0 when `n` names nobody.
+    /// A value that is no number but a user id of the window is kept as is.
+    #[must_use]
+    pub fn user_id(&self, number: i64) -> i64 {
+        if let Some(index) = self.number_index(number, self.people.len()) {
+            return self.people[index].user_id;
+        }
+        if number != 0 && self.people.iter().any(|person| person.user_id == number) {
+            return number;
+        }
+        0
+    }
+
+    /// `(message_id, entry_id)` behind message number `n`; a value that is no
+    /// number but a message id of the window resolves to that message.
+    #[must_use]
+    pub fn message(&self, number: i64) -> Option<(i32, &str)> {
+        let index = self.number_index(number, self.messages.len()).or_else(|| {
+            self.messages
+                .iter()
+                .position(|(message_id, _)| *message_id != 0 && i64::from(*message_id) == number)
+        })?;
+        let (message_id, entry_id) = &self.messages[index];
+        Some((*message_id, entry_id.as_str()))
+    }
+
+    fn has_entry(&self, entry_id: &str) -> bool {
+        !entry_id.is_empty() && self.messages.iter().any(|(_, entry)| entry == entry_id)
+    }
+
+    /// Card id behind card number `n`, or 0 when `n` names no shown card.
+    #[must_use]
+    pub fn card_id(&self, number: i64) -> i64 {
+        if let Some(index) = self.number_index(number, self.cards.len()) {
+            return self.cards[index].id;
+        }
+        if number != 0 && self.cards.iter().any(|card| card.id == number) {
+            return number;
+        }
+        0
+    }
+
+    fn number_index(&self, number: i64, len: usize) -> Option<usize> {
+        let index = usize::try_from(number).ok()?.checked_sub(1)?;
+        (index < len).then_some(index)
+    }
+
+    fn push_people(&self, out: &mut String) {
+        if self.people.is_empty() {
+            return;
+        }
+        out.push_str("<people>\n");
+        for (index, person) in self.people.iter().enumerate() {
+            out.push_str(&format!("u{}", index + 1));
+            let name = prompt_line(&person.name);
+            if !name.is_empty() {
+                out.push(' ');
+                out.push_str(&name);
+            }
+            if !person.username.is_empty() && name.trim_start_matches('@') != person.username {
+                out.push_str(&format!(" @{}", prompt_line(&person.username)));
+            }
+            if person.is_bot {
+                out.push_str(" bot");
+            }
+            out.push('\n');
+        }
+        out.push_str("</people>\n");
+    }
+
+    fn push_cards(&self, out: &mut String) {
+        if self.cards.is_empty() {
+            return;
+        }
+        out.push_str("<cards>\nc|type|subject|fact|conf|age|flag\n");
+        for (index, card) in self.cards.iter().enumerate() {
+            out.push_str(&format!(
+                "c{}|{}|{}|{}|{}|{}|{}\n",
+                index + 1,
+                prompt_cell(&card.card_type),
+                prompt_cell(&card.subject),
+                prompt_cell(&card.fact),
+                prompt_number(card.conf),
+                card.age,
+                if card.disputed { "disputed" } else { "" },
+            ));
+        }
+        out.push_str("</cards>\n");
+    }
+
+    fn push_chat(&self, out: &mut String, messages: &[Message]) {
+        out.push_str("<chat>\n");
+        let mut day = None;
+        for (index, message) in messages.iter().enumerate() {
+            let at = (message.occurred_at != go_zero_time())
+                .then(|| message.occurred_at.to_offset(time::UtcOffset::UTC));
+            if let Some(at) = at
+                && day != Some(at.date())
+            {
+                day = Some(at.date());
+                out.push_str(&format!(
+                    "# {} {}\n",
+                    at.date(),
+                    weekday_short(at.weekday())
+                ));
+            }
+            out.push_str(&format!("<m{} u{}", index + 1, self.message_people[index]));
+            if let Some(at) = at {
+                out.push_str(&format!(" {:02}:{:02}", at.hour(), at.minute()));
+            }
+            if message.is_automatic_forward {
+                out.push_str(" auto");
+            } else if message.is_forwarded {
+                out.push_str(" fwd");
+            }
+            out.push('>');
+            out.push_str(&escape_prompt_text(&normalized_space(&message.text)));
+            out.push_str("</m>\n");
+        }
+        out.push_str("</chat>\n");
     }
 }
 
-fn prompt_timestamp(value: OffsetDateTime) -> Option<String> {
+/// Map the per-call numbers in a fresh extraction answer back to storage ids:
+/// message numbers become `source_message_ids` plus `source_entry_ids`, person
+/// numbers become `user_id`, card numbers become `old_card_id`/`into_card_id`.
+/// A storage id of the window that comes back instead of a number is kept. Any
+/// other value maps to nothing (empty sources, user 0, card 0), which the
+/// extraction gates then reject. Call it once per `extract` answer.
+#[must_use]
+pub fn resolve_prompt_aliases(input: &ExtractInput, mut output: ExtractOutput) -> ExtractOutput {
+    let aliases = PromptAliases::for_input(input);
+    for card in &mut output.candidate_cards {
+        let mut message_ids = Vec::new();
+        // An answer may still cite window entries by their entry id (an older
+        // prompt, a provider that ignored the numbering); keep exact matches.
+        let mut entry_ids: Vec<String> = Vec::new();
+        for entry in &card.source_entry_ids {
+            let entry = entry.trim();
+            if aliases.has_entry(entry) && !entry_ids.iter().any(|seen| seen == entry) {
+                entry_ids.push(entry.to_owned());
+            }
+        }
+        for number in &card.source_message_ids {
+            if let Some((message_id, entry_id)) = aliases.message(i64::from(*number)) {
+                if message_id != 0 && !message_ids.contains(&message_id) {
+                    message_ids.push(message_id);
+                }
+                if !entry_id.is_empty() && !entry_ids.iter().any(|seen| seen == entry_id) {
+                    entry_ids.push(entry_id.to_owned());
+                }
+            }
+        }
+        card.source_message_ids = message_ids;
+        card.source_entry_ids = entry_ids;
+        card.user_id = aliases.user_id(card.user_id);
+    }
+    for resolution in &mut output.resolutions {
+        resolution.old_card_id = aliases.card_id(resolution.old_card_id);
+        if resolution.into_card_id != 0 {
+            resolution.into_card_id = aliases.card_id(resolution.into_card_id);
+        }
+    }
+    for supersession in &mut output.supersessions {
+        supersession.old_card_id = aliases.card_id(supersession.old_card_id);
+    }
+    output
+}
+
+fn push_prompt_run(out: &mut String, input: &ExtractInput) {
+    let mut facts = Vec::new();
+    let chat_type = prompt_line(input.chat_type.trim());
+    if !chat_type.is_empty() {
+        facts.push(chat_type);
+    }
+    let start = prompt_minute(input.run.range_start_at);
+    let end = prompt_minute(input.run.range_end_at);
+    match (start, end) {
+        (Some(start), Some(end)) => facts.push(format!("{start} → {end} UTC")),
+        (Some(start), None) => facts.push(format!("from {start} UTC")),
+        (None, Some(end)) => facts.push(format!("until {end} UTC")),
+        (None, None) => {}
+    }
+    out.push_str("<run>");
+    out.push_str(&facts.join(" · "));
+    out.push_str("</run>\n");
+}
+
+fn prompt_minute(value: OffsetDateTime) -> Option<String> {
     if value == go_zero_time() {
         return None;
     }
-    value
-        .format(&time::format_description::well_known::Rfc3339)
-        .ok()
+    let value = value.to_offset(time::UtcOffset::UTC);
+    Some(format!(
+        "{} {:02}:{:02}",
+        value.date(),
+        value.hour(),
+        value.minute()
+    ))
 }
 
-fn push_prompt_message(out: &mut String, message: &Message) {
-    out.push_str("<msg");
-    if message.message_id != 0 {
-        out.push_str(&format!(" id=\"{}\"", message.message_id));
+fn weekday_short(day: time::Weekday) -> &'static str {
+    match day {
+        time::Weekday::Monday => "Mon",
+        time::Weekday::Tuesday => "Tue",
+        time::Weekday::Wednesday => "Wed",
+        time::Weekday::Thursday => "Thu",
+        time::Weekday::Friday => "Fri",
+        time::Weekday::Saturday => "Sat",
+        time::Weekday::Sunday => "Sun",
     }
-    let entry_id = message.entry_id.trim();
-    if !entry_id.is_empty() {
-        out.push_str(&format!(" entry=\"{}\"", escape_prompt_attr(entry_id)));
-    }
-    if message.user_id != 0 {
-        out.push_str(&format!(" user=\"{}\"", message.user_id));
-    }
-    let author = prompt_author(message);
-    if !author.is_empty() {
-        out.push_str(&format!(" author=\"{}\"", escape_prompt_attr(&author)));
-    }
-    if let Some(at) = prompt_timestamp(message.occurred_at) {
-        out.push_str(&format!(" at=\"{at}\""));
-    }
-    if message.is_forwarded {
-        out.push_str(" forwarded=\"true\"");
-    }
-    out.push('>');
-    out.push_str(&escape_prompt_text(&normalized_space(&message.text)));
-    out.push_str("</msg>\n");
+}
+
+/// A free-text value on one prompt line: whitespace collapsed, `<` escaped.
+fn prompt_line(text: &str) -> String {
+    escape_prompt_text(&normalized_space(text))
+}
+
+/// A free-text value inside a `|`-separated prompt row.
+fn prompt_cell(text: &str) -> String {
+    prompt_line(text).replace('|', "/")
+}
+
+/// A 0..1 score as the shortest decimal ("0.8", "1", "0.65").
+fn prompt_number(value: f64) -> String {
+    let rounded = round_two(value);
+    let text = format!("{rounded:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 fn prompt_author(message: &Message) -> String {
@@ -402,10 +636,6 @@ fn prompt_author(message: &Message) -> String {
 /// Message text cannot open or close a data block once `<` is escaped.
 fn escape_prompt_text(text: &str) -> String {
     text.replace('<', "&lt;")
-}
-
-fn escape_prompt_attr(text: &str) -> String {
-    escape_prompt_text(text).replace('"', "&quot;")
 }
 
 /// Compact projection of an existing card for the extraction/consolidation
@@ -1957,6 +2187,31 @@ impl SubjectMergeInput {
     pub fn card_ids(&self) -> Vec<i64> {
         self.cards.iter().map(|card| card.id).collect()
     }
+
+    /// Render the merge user message: the subject line and one `|`-separated
+    /// row per card under a header, cards numbered by index from 0.
+    #[must_use]
+    pub fn to_prompt_payload(&self) -> String {
+        let mut out = format!(
+            "<subject>{}</subject>\n<cards>\n",
+            prompt_line(&self.subject)
+        );
+        out.push_str("i|type|predicate|fact|sal|obs|age\n");
+        for card in &self.cards {
+            out.push_str(&format!(
+                "{}|{}|{}|{}|{}|{}|{}\n",
+                card.index,
+                prompt_cell(&card.card_type),
+                prompt_cell(&card.predicate),
+                prompt_cell(&card.fact),
+                prompt_number(card.salience),
+                card.obs,
+                card.age,
+            ));
+        }
+        out.push_str("</cards>");
+        out
+    }
 }
 
 pub const SUBJECT_MERGE_ACTION_KEEP: &str = "keep";
@@ -2463,6 +2718,38 @@ impl ResolutionInput {
             )
             .collect();
         Self { candidates }
+    }
+
+    /// Render the resolution user message: one `#i` line per candidate
+    /// (`type|subject|predicate|fact`) followed by its similar cards, each on an
+    /// indented line numbered within that candidate (`type|subject|predicate|fact|conf|age`).
+    #[must_use]
+    pub fn to_prompt_payload(&self) -> String {
+        let mut out = String::from("<candidates>\n");
+        for candidate in &self.candidates {
+            out.push_str(&format!(
+                "#{} {}|{}|{}|{}\n",
+                candidate.index,
+                prompt_cell(&candidate.card_type),
+                prompt_cell(&candidate.subject),
+                prompt_cell(&candidate.predicate),
+                prompt_cell(&candidate.fact),
+            ));
+            for card in &candidate.similar {
+                out.push_str(&format!(
+                    "  {} {}|{}|{}|{}|{}|{}\n",
+                    card.index,
+                    prompt_cell(&card.card_type),
+                    prompt_cell(&card.subject),
+                    prompt_cell(&card.predicate),
+                    prompt_cell(&card.fact),
+                    prompt_number(card.conf),
+                    card.age,
+                ));
+            }
+        }
+        out.push_str("</candidates>");
+        out
     }
 }
 
@@ -5219,6 +5506,164 @@ mod tests {
         );
     }
 
+    fn alias_input() -> ExtractInput {
+        let message = |message_id: i32, user_id: i64, name: &str, text: &str| Message {
+            entry_id: format!("msg:{message_id}"),
+            message_id,
+            user_id,
+            sender_name: name.to_owned(),
+            text: text.to_owned(),
+            ..Message::default()
+        };
+        ExtractInput {
+            messages: vec![
+                message(9001, 7_000_000_001, "Оля", "я медсестра"),
+                message(9002, 7_000_000_002, "Петя", "а я водитель"),
+                message(9003, 7_000_000_001, "Оля", "и живу в Казани"),
+            ],
+            existing_cards: vec![
+                Card {
+                    id: 501,
+                    subject: "Петя".to_owned(),
+                    fact_text: "Петя водитель".to_owned(),
+                    ..Card::default()
+                },
+                Card {
+                    id: 502,
+                    subject: "Оля".to_owned(),
+                    fact_text: "Оля живёт в Москве".to_owned(),
+                    ..Card::default()
+                },
+            ],
+            ..ExtractInput::default()
+        }
+    }
+
+    #[test]
+    fn prompt_numbers_people_messages_and_cards_once_per_call() {
+        let payload = alias_input().to_prompt_payload().expect("payload");
+
+        assert!(
+            payload.contains("<people>\nu1 Оля\nu2 Петя\n</people>"),
+            "{payload}"
+        );
+        assert!(
+            payload.contains(
+                "<m1 u1>я медсестра</m>\n<m2 u2>а я водитель</m>\n<m3 u1>и живу в Казани</m>"
+            ),
+            "{payload}"
+        );
+        // Cards are numbered in their subject-grouped display order.
+        assert!(payload.contains("c1||Оля|Оля живёт в Москве|"), "{payload}");
+        assert!(payload.contains("c2||Петя|Петя водитель|"), "{payload}");
+        for leaked in ["7000000001", "9001", "msg:", "501", "502"] {
+            assert!(!payload.contains(leaked), "{leaked} leaked:\n{payload}");
+        }
+    }
+
+    #[test]
+    fn resolve_prompt_aliases_maps_numbers_back_and_drops_unknown_ones() {
+        let input = alias_input();
+        let output = ExtractOutput {
+            candidate_cards: vec![
+                CandidateCard {
+                    user_id: 1,
+                    source_message_ids: vec![3, 1, 3, 9],
+                    source_entry_ids: vec!["ignored".to_owned(), "msg:9002".to_owned()],
+                    ..CandidateCard::default()
+                },
+                CandidateCard {
+                    user_id: 7,
+                    source_message_ids: vec![0, -2],
+                    ..CandidateCard::default()
+                },
+                CandidateCard {
+                    user_id: 7_000_000_002,
+                    source_message_ids: vec![9002],
+                    ..CandidateCard::default()
+                },
+            ],
+            resolutions: vec![
+                Resolution {
+                    old_card_id: 1,
+                    into_card_id: 2,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 3,
+                    ..Resolution::default()
+                },
+            ],
+            ..ExtractOutput::default()
+        };
+
+        let resolved = resolve_prompt_aliases(&input, output);
+
+        let first = &resolved.candidate_cards[0];
+        assert_eq!(first.user_id, 7_000_000_001);
+        assert_eq!(first.source_message_ids, vec![9003, 9001]);
+        assert_eq!(
+            first.source_entry_ids,
+            vec!["msg:9002", "msg:9003", "msg:9001"]
+        );
+        let second = &resolved.candidate_cards[1];
+        assert_eq!(second.user_id, 0);
+        assert!(second.source_message_ids.is_empty());
+        assert!(second.source_entry_ids.is_empty());
+        assert_eq!(resolved.resolutions[0].old_card_id, 502);
+        assert_eq!(resolved.resolutions[0].into_card_id, 501);
+        assert_eq!(resolved.resolutions[1].old_card_id, 0);
+        let legacy = &resolved.candidate_cards[2];
+        assert_eq!(legacy.user_id, 7_000_000_002);
+        assert_eq!(legacy.source_message_ids, vec![9002]);
+    }
+
+    #[test]
+    fn resolution_and_merge_payloads_are_header_rows() {
+        let resolution = ResolutionInput {
+            candidates: vec![ResolutionCandidate {
+                index: 0,
+                position: 2,
+                card_type: "identity".to_owned(),
+                subject: "Кирилл".to_owned(),
+                predicate: "lives_in".to_owned(),
+                fact: "Кирилл живёт в Новосибирске".to_owned(),
+                similar: vec![ResolutionCard {
+                    index: 0,
+                    id: 88,
+                    card_type: "identity".to_owned(),
+                    subject: "Кирилл".to_owned(),
+                    predicate: "lives_in".to_owned(),
+                    fact: "Кирилл | Казань".to_owned(),
+                    conf: 0.8,
+                    age: "2mo".to_owned(),
+                }],
+            }],
+        };
+        assert_eq!(
+            resolution.to_prompt_payload(),
+            "<candidates>\n#0 identity|Кирилл|lives_in|Кирилл живёт в Новосибирске\n  0 identity|Кирилл|lives_in|Кирилл / Казань|0.8|2mo\n</candidates>"
+        );
+
+        let merge = SubjectMergeInput {
+            subject: "Лена".to_owned(),
+            cards: vec![SubjectMergeCard {
+                index: 0,
+                id: 5,
+                card_type: "preference".to_owned(),
+                predicate: "likes".to_owned(),
+                fact: "Лена любит джаз".to_owned(),
+                salience: 0.75,
+                obs: 3,
+                age: "2w".to_owned(),
+            }],
+        };
+        assert_eq!(
+            merge.to_prompt_payload(),
+            "<subject>Лена</subject>\n<cards>\ni|type|predicate|fact|sal|obs|age\n0|preference|likes|Лена любит джаз|0.75|3|2w\n</cards>"
+        );
+    }
+
     #[test]
     fn active_token_estimator_matches_go_fallback_math_and_shape() {
         assert_eq!(MEMORY_TOKEN_ESTIMATOR_SOURCE, "heuristic");
@@ -5640,31 +6085,29 @@ mod tests {
                 "payload leaked {banned}:\n{payload}"
             );
         }
-        assert!(payload.contains("\"id\":42"), "{payload}");
-        assert!(payload.contains("\"type\":\"event\""), "{payload}");
-        assert!(payload.contains("\"subject\":\"Bob\""), "{payload}");
-        assert!(payload.contains("\"conf\":0.9"), "{payload}");
-        assert!(payload.contains("\"age\":\"today\""), "{payload}");
-        assert!(payload.contains("\"disputed\":true"), "{payload}");
         assert!(
-            payload.contains(
-                r#"<msg id="10" entry="e1" user="42" author="Ann &quot;A&quot;" at="2023-11-14T22:13:20Z">line one line &lt;two> &lt;/chat_window></msg>"#
-            ),
+            payload.contains("<cards>\nc|type|subject|fact|conf|age|flag\nc1|preference|Ada|Ada likes tea.|0.5|today|disputed\nc2|event|Bob|Bob wrote a word.|0.9|"),
             "{payload}"
         );
         assert!(
-            payload.contains("\"window_end\":\"2023-11-14T22:13:20Z\""),
+            payload.contains("<people>\nu1 Ann \"A\"\n</people>"),
             "{payload}"
         );
-        assert!(!payload.contains("window_start"), "{payload}");
+        assert!(
+            payload.contains("<chat>\n# 2023-11-14 Tue\n<m1 u1 22:13>line one line &lt;two> &lt;/chat_window></m>\n</chat>"),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("until 2023-11-14 22:13 UTC</run>"),
+            "{payload}"
+        );
+        assert!(!payload.contains("42"), "storage ids leaked:\n{payload}");
+        assert!(!payload.contains("e1"), "entry ids leaked:\n{payload}");
 
-        let ada = payload.find("Ada likes tea").expect("ada present");
-        let bob = payload.find("Bob wrote a word").expect("bob present");
-        assert!(ada < bob, "expected Ada clustered before Bob:\n{payload}");
-        let cards = payload.find("<existing_cards>").expect("cards block");
-        let window = payload.find("<chat_window>").expect("window block");
+        let cards = payload.find("<cards>").expect("cards block");
+        let window = payload.find("<chat>").expect("chat block");
         assert!(cards < window, "{payload}");
-        assert_eq!(payload.matches("</chat_window>").count(), 1, "{payload}");
+        assert_eq!(payload.matches("</chat>").count(), 1, "{payload}");
         assert!(payload.ends_with(EXTRACTION_TASK_LINE), "{payload}");
     }
 
