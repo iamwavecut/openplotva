@@ -116,6 +116,7 @@ jobs:
         env:
           GETA_SSH_PRIVATE_KEY: ${{ secrets.GETA_SSH_PRIVATE_KEY }}
           GETA_SSH_KNOWN_HOSTS: ${{ secrets.GETA_SSH_KNOWN_HOSTS }}
+          GETA_SSH_PORT: ${{ vars.GETA_SSH_PORT || '22022' }}
         run: |
           set -euo pipefail
           test -n "$GETA_SSH_PRIVATE_KEY"
@@ -123,6 +124,8 @@ jobs:
           install -m 700 -d "$HOME/.ssh"
           printf '%s\n' "$GETA_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
+          printf 'Host geta.moe 207.244.239.212 2605:a140:2260:6080::1\n  Port %s\n' "$GETA_SSH_PORT" > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
           eval "$(ssh-agent -s)"
           printf '%s\n' "$GETA_SSH_PRIVATE_KEY" | ssh-add -
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"

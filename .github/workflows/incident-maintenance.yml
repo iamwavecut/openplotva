@@ -36,4 +36,5 @@ jobs:
           MAINTENANCE_SSH_KEY: ${{ secrets.MAINTENANCE_SSH_KEY }}
           MAINTENANCE_SSH_KNOWN_HOSTS: ${{ secrets.MAINTENANCE_SSH_KNOWN_HOSTS }}
           MAINTENANCE_DISPATCH_TARGET: ${{ secrets.MAINTENANCE_DISPATCH_TARGET }}
+          MAINTENANCE_SSH_PORT: ${{ vars.GETA_SSH_PORT || '22022' }}
         run: python3 .github/scripts/dispatch_incident.py
