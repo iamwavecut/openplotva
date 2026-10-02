@@ -1813,9 +1813,9 @@ fn decode_with_stringified_arrays<T: serde::de::DeserializeOwned>(
         let parsed = if text.trim().is_empty() {
             Value::Array(Vec::new())
         } else {
-            match serde_json::from_str::<Value>(text) {
-                Ok(array @ Value::Array(_)) => array,
-                _ => continue,
+            match parse_stringified_array(text) {
+                Some(array) => array,
+                None => continue,
             }
         };
         map.insert((*field).to_owned(), parsed);
@@ -1827,6 +1827,20 @@ fn decode_with_stringified_arrays<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value)
         .ok()
         .map(|parsed| (parsed, parsed_fields))
+}
+
+/// Parse a JSON array that arrived inside a string. Models sometimes close the
+/// enclosing object inside the string too (`"[{…}]}"`), so stray closing
+/// brackets after the array are tolerated.
+fn parse_stringified_array(text: &str) -> Option<Value> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    let array @ Value::Array(_) = values.next()?.ok()? else {
+        return None;
+    };
+    let rest = &text[values.byte_offset()..];
+    rest.chars()
+        .all(|c| c.is_whitespace() || c == '}' || c == ']')
+        .then_some(array)
 }
 
 fn salvage_truncated_json<T: serde::de::DeserializeOwned>(fragment: &str) -> Option<T> {
@@ -4329,6 +4343,20 @@ mod tests {
         .expect("decode stringified merge arrays");
         assert_eq!(merge.decisions.len(), 1);
         assert_eq!(merge.stringified_fields, vec!["decisions", "survivors"]);
+
+        // Qwen3.8 on ninfer closes the object inside the string as well.
+        let plan = decode_resolution_plan(
+            r#"{"decisions":"[{\"candidate_index\": 0, \"reason\": \"new\", \"action\": \"add\"}, {\"candidate_index\": 1, \"reason\": \"new\", \"action\": \"add\"}]}"}"#,
+        )
+        .expect("decode stringified array with a stray closer");
+        assert_eq!(plan.decisions.len(), 2);
+        assert_eq!(plan.decisions[1].candidate_index, 1);
+        assert_eq!(plan.stringified_fields, vec!["decisions"]);
+
+        assert!(matches!(
+            decode_resolution_plan(r#"{"decisions":"[{\"candidate_index\": 0}] trailing"}"#),
+            Err(DecodeExtractionError::Decode)
+        ));
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
