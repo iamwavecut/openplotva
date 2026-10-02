@@ -1011,6 +1011,16 @@ WHERE status = 'processing'
   AND attempts >= 5
   AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)"#;
 
+/// Memory runs whose window ended longer ago than this are abandoned: never
+/// claimed and not counted against the queue cap.
+pub const MEMORY_RUN_MAX_CLAIM_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Claims the oldest claimable memory run first, so a backlog drains in age
+/// order instead of starving behind each new daily batch. Runs whose window ended
+/// more than `$4` seconds ago are never claimed (and are not counted as queue
+/// depth); cleanup removes them separately. The ordering is the exact backward
+/// scan of the `idx_memory_runs_claim_*_order` indexes, so no extra index is
+/// needed: within one window it prefers continuations, then newer ids.
 pub const SQL_CLAIM_MEMORY_RUN: &str = r#"WITH current_processing AS (
     SELECT id, 0 AS priority
     FROM (
@@ -1020,11 +1030,12 @@ pub const SQL_CLAIM_MEMORY_RUN: &str = r#"WITH current_processing AS (
           AND status = 'processing'
           AND leased_until < CURRENT_TIMESTAMP
           AND attempts < 5
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) current_processing
@@ -1039,11 +1050,12 @@ current_failed AS (
           AND attempts < 5
           AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
           AND NOT EXISTS (SELECT 1 FROM current_processing)
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) current_failed
@@ -1058,11 +1070,12 @@ current_queued AS (
           AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
           AND NOT EXISTS (SELECT 1 FROM current_processing)
           AND NOT EXISTS (SELECT 1 FROM current_failed)
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) current_queued
@@ -1084,11 +1097,12 @@ legacy_processing AS (
           AND leased_until < CURRENT_TIMESTAMP
           AND attempts < 5
           AND NOT EXISTS (SELECT 1 FROM current_candidate)
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) legacy_processing
@@ -1104,11 +1118,12 @@ legacy_failed AS (
           AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
           AND NOT EXISTS (SELECT 1 FROM current_candidate)
           AND NOT EXISTS (SELECT 1 FROM legacy_processing)
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) legacy_failed
@@ -1124,11 +1139,12 @@ legacy_queued AS (
           AND NOT EXISTS (SELECT 1 FROM current_candidate)
           AND NOT EXISTS (SELECT 1 FROM legacy_processing)
           AND NOT EXISTS (SELECT 1 FROM legacy_failed)
-        ORDER BY range_end_at DESC,
-                 range_start_at DESC,
-                 cursor_after_at ASC,
-                 cursor_after_message_id ASC,
-                 id ASC
+          AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4::double precision)
+        ORDER BY range_end_at ASC,
+                 range_start_at ASC,
+                 cursor_after_at DESC,
+                 cursor_after_message_id DESC,
+                 id DESC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     ) legacy_queued
@@ -1192,7 +1208,7 @@ pub const SQL_RETRY_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued'
 
 pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'failed'";
 
-pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing')";
+pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing') AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $2::double precision)";
 
 pub const SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE: &str = r#"SELECT count(*)::bigint
 FROM memory_runs
@@ -5700,6 +5716,7 @@ impl PostgresMemoryStore {
             .bind(openplotva_memory::PROMPT_VERSION)
             .bind(owner.trim())
             .bind(OffsetDateTime::now_utc() + duration_to_time(lease))
+            .bind(MEMORY_RUN_MAX_CLAIM_AGE.as_secs_f64())
             .fetch_optional(&self.pool)
             .await?;
         row.map(memory_run_from_claim_row).transpose()
@@ -5858,6 +5875,7 @@ impl PostgresMemoryStore {
     async fn active_memory_run_count(&self) -> Result<i64, StorageError> {
         Ok(sqlx::query_scalar(SQL_COUNT_ACTIVE_MEMORY_RUNS)
             .bind(openplotva_memory::PROMPT_VERSION)
+            .bind(MEMORY_RUN_MAX_CLAIM_AGE.as_secs_f64())
             .fetch_one(&self.pool)
             .await?)
     }
@@ -11355,6 +11373,18 @@ mod tests {
                 .contains("WHERE prompt_version = $1\n          AND status = 'queued'")
         );
         assert!(super::SQL_CLAIM_MEMORY_RUN.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(
+            super::SQL_CLAIM_MEMORY_RUN.contains("ORDER BY range_end_at ASC"),
+            "claim must drain the oldest windows first"
+        );
+        assert!(!super::SQL_CLAIM_MEMORY_RUN.contains("range_end_at DESC"));
+        assert_eq!(
+            super::SQL_CLAIM_MEMORY_RUN
+                .matches("range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $4")
+                .count(),
+            6,
+            "every claim lane must skip abandoned runs"
+        );
         assert!(super::SQL_COMPLETE_MEMORY_RUN.contains("cards_superseded = $4"));
         assert!(super::SQL_FAIL_MEMORY_RUN.contains("make_interval"));
         assert!(super::SQL_ENQUEUE_MEMORY_RUN_CONTINUATION.contains("cursor_after_message_id"));

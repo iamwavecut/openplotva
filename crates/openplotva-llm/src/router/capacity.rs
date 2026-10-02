@@ -77,8 +77,12 @@ impl Drop for PoolPermit {
             state.in_flight = state.in_flight.saturating_sub(1);
             drop(state);
             if let Some(released) = self.released.take() {
-                // `notify_one` stores a wakeup when nobody waits yet, closing
-                // the race between a failed acquire scan and the wait call.
+                // Waiters share one registry-wide `Notify` across pools, so wake
+                // all of them: a single wakeup could land on a waiter of another
+                // pool and leave this pool's waiter asleep with a free slot.
+                // `notify_one` additionally stores a wakeup for a waiter that is
+                // between its failed acquire scan and the wait call.
+                released.notify_waiters();
                 released.notify_one();
             }
         }
@@ -366,6 +370,40 @@ mod tests {
         tokio::task::yield_now().await;
         drop(permit);
         assert!(waiter.await.expect("join"), "waiter must wake on release");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_release_wakes_every_waiter() {
+        // Waiters of different pools share the registry Notify; a release must
+        // not be swallowed by a waiter that cannot use the freed slot.
+        let registry = Arc::new(registry_with(&[
+            PoolSpec {
+                id: 1,
+                max_concurrency: Some(1),
+            },
+            PoolSpec {
+                id: 2,
+                max_concurrency: Some(1),
+            },
+        ]));
+        let permit = registry.try_acquire(Some(1)).expect("slot");
+        let _other = registry.try_acquire(Some(2)).expect("slot");
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(
+                    async move { registry.wait_for_release(Duration::from_secs(60)).await },
+                )
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        drop(permit);
+        for waiter in waiters {
+            assert!(
+                waiter.await.expect("join"),
+                "every waiter must wake on release"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

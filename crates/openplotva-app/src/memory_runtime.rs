@@ -3925,6 +3925,7 @@ impl RoutedMemoryExtractor {
 pub struct RoutedDiscoveryRedactor {
     walker: RoutedAttemptWalker,
     config: AppConfig,
+    http: reqwest::Client,
 }
 
 impl RoutedDiscoveryRedactor {
@@ -3933,7 +3934,16 @@ impl RoutedDiscoveryRedactor {
         Self {
             walker,
             config: config.clone(),
+            http: reqwest::Client::new(),
         }
+    }
+
+    /// Redaction calls one extraction keeps in flight.
+    #[must_use]
+    pub fn concurrency(&self) -> usize {
+        usize::try_from(self.config.memory.redaction_concurrency)
+            .unwrap_or(1)
+            .max(1)
     }
 }
 
@@ -3953,6 +3963,7 @@ impl TextRedactor for RoutedDiscoveryRedactor {
     fn redact_text<'a>(&'a self, text: String) -> TextRedactorFuture<'a, Self::Error> {
         Box::pin(async move {
             let config = self.config.clone();
+            let http = self.http.clone();
             let result = self
                 .walker
                 .run(
@@ -3967,8 +3978,11 @@ impl TextRedactor for RoutedDiscoveryRedactor {
                     },
                     move |attempt| {
                         let config = config.clone();
+                        let http = http.clone();
                         let text = text.clone();
-                        async move { redact_text_with_routed_attempt(&config, attempt, &text).await }
+                        async move {
+                            redact_text_with_routed_attempt(&config, http, attempt, &text).await
+                        }
                     },
                     routed_redactor_retryable_reason,
                 )
@@ -4045,8 +4059,10 @@ impl MemoryExtractor for RoutedMemoryExtractor {
                 return Ok(output);
             };
             let original = output.clone();
-            match redact_extract_output_with_async(output, |value| redactor.redact_text(value))
-                .await
+            match redact_extract_output_with_async(output, redactor.concurrency(), |value| {
+                redactor.redact_text(value)
+            })
+            .await
             {
                 Ok(redacted) => Ok(redacted),
                 Err(_) => Ok(original),
@@ -4093,9 +4109,11 @@ impl RoutedMemoryExtractor {
         let (Some(plan), Some(redactor)) = (plan.clone(), &self.redactor) else {
             return Ok(plan);
         };
-        match openplotva_memory::redact_resolution_plan_with_async(plan.clone(), |value| {
-            redactor.redact_text(value)
-        })
+        match openplotva_memory::redact_resolution_plan_with_async(
+            plan.clone(),
+            redactor.concurrency(),
+            |value| redactor.redact_text(value),
+        )
         .await
         {
             Ok(redacted) => Ok(Some(redacted)),
@@ -4141,6 +4159,7 @@ impl openplotva_memory::SubjectMerger for RoutedSubjectMerger {
 
 async fn redact_text_with_routed_attempt(
     config: &AppConfig,
+    http: reqwest::Client,
     attempt: RoutedAttempt,
     text: &str,
 ) -> Result<String, RoutedDiscoveryRedactorError> {
@@ -4156,7 +4175,7 @@ async fn redact_text_with_routed_attempt(
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         cfg.endpoint_name = endpoint.to_owned();
     }
-    let redactor = DiscoveryRedactor::new(cfg)?;
+    let redactor = DiscoveryRedactor::with_client(cfg, http);
     redactor.redact_text(text).await.map_err(Into::into)
 }
 

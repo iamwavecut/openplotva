@@ -106,6 +106,7 @@ impl GpuArbiterReader {
             priority: 0,
             wait_for_capacity_ms: 0,
             capacity_poll_ms: 0,
+            wait_for_result_ms: 0,
         };
         let url = format!(
             "{}/v1/jobs/blocking",
