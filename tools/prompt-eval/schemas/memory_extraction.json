@@ -59,12 +59,6 @@
             ],
             "type": "string"
           },
-          "source_entry_ids": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
           "source_message_ids": {
             "items": {
               "type": "integer"
@@ -93,7 +87,6 @@
           "fact_text",
           "confidence",
           "salience",
-          "source_entry_ids",
           "source_message_ids"
         ],
         "type": "object"

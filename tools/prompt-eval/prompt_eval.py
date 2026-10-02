@@ -155,40 +155,189 @@ def escape_prompt_attr(value: str) -> str:
     return value.replace("<", "&lt;").replace('"', "&quot;")
 
 
+def prompt_line(value: str) -> str:
+    return " ".join((value or "").split()).replace("<", "&lt;")
+
+
+def prompt_cell(value: str) -> str:
+    return prompt_line(value).replace("|", "/")
+
+
+def prompt_number(value: Any) -> str:
+    text = f"{round(float(value or 0), 2):.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def is_zero_time(value: str) -> bool:
+    return not value or value.startswith("0001-")
+
+
+def prompt_minute(value: str) -> str:
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return f"{moment.date().isoformat()} {moment.hour:02d}:{moment.minute:02d}"
+
+
+def memory_people(user: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
+    """People in first-appearance order and each message's 1-based person number (`PromptAliases`)."""
+    people: list[dict[str, Any]] = []
+    numbers: list[int] = []
+    for message in user.get("messages", []):
+        name = (message.get("sender_name") or "").strip()
+        username = (message.get("sender_username") or "").strip().lstrip("@")
+        if not name and username:
+            name = "@" + username
+        user_id = message.get("user_id") or 0
+        found = next(
+            (i for i, person in enumerate(people) if (person["user_id"] == user_id if user_id else (person["user_id"] == 0 and person["name"] == name))),
+            None,
+        )
+        if found is None:
+            people.append({"user_id": user_id, "name": name, "username": username, "bot": bool(message.get("sender_is_bot"))})
+            found = len(people) - 1
+        numbers.append(found + 1)
+    return people, numbers
+
+
+def memory_cards(user: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(user.get("existing_cards", []), key=lambda card: ((card.get("subject") or "").strip().lower(), card.get("id", 0)))
+
+
 def render_memory_blocks(user: dict[str, Any]) -> str:
     """The memory extraction user message, as `ExtractInput::to_prompt_payload` renders it."""
     run = user.get("run", {})
-    facts = {"chat_type": (user.get("chat_type") or "").strip()}
-    for key, name in (("range_start_at", "window_start"), ("range_end_at", "window_end")):
-        value = run.get(key) or ""
-        if value and not value.startswith("0001-"):
-            facts[name] = value
-    facts = {key: value for key, value in facts.items() if value}
-    lines = ["<run>", json.dumps(facts, ensure_ascii=False, separators=(",", ":")), "</run>", "<existing_cards>"]
-    cards = sorted(user.get("existing_cards", []), key=lambda card: ((card.get("subject") or "").strip().lower(), card.get("id", 0)))
-    lines.extend(json.dumps(card, ensure_ascii=False, separators=(",", ":")) for card in cards)
-    lines += ["</existing_cards>", "<chat_window>"]
-    for message in user.get("messages", []):
-        attrs = []
-        if message.get("message_id"):
-            attrs.append(f'id="{message["message_id"]}"')
-        if (message.get("entry_id") or "").strip():
-            attrs.append(f'entry="{escape_prompt_attr(message["entry_id"].strip())}"')
-        if message.get("user_id"):
-            attrs.append(f'user="{message["user_id"]}"')
-        author = (message.get("sender_name") or "").strip()
-        if not author and (message.get("sender_username") or "").strip():
-            author = "@" + message["sender_username"].strip().lstrip("@")
-        if author:
-            attrs.append(f'author="{escape_prompt_attr(author)}"')
-        if message.get("occurred_at"):
-            attrs.append(f'at="{message["occurred_at"]}"')
-        if message.get("is_forwarded"):
-            attrs.append('forwarded="true"')
-        text = " ".join((message.get("text") or "").split()).replace("<", "&lt;")
-        opening = "<msg " + " ".join(attrs) + ">" if attrs else "<msg>"
-        lines.append(f"{opening}{text}</msg>")
-    lines += ["</chat_window>", MEMORY_TASK_LINE]
+    facts = []
+    if (user.get("chat_type") or "").strip():
+        facts.append(prompt_line(user["chat_type"]))
+    start, end = run.get("range_start_at") or "", run.get("range_end_at") or ""
+    if not is_zero_time(start) and not is_zero_time(end):
+        facts.append(f"{prompt_minute(start)} → {prompt_minute(end)} UTC")
+    elif not is_zero_time(start):
+        facts.append(f"from {prompt_minute(start)} UTC")
+    elif not is_zero_time(end):
+        facts.append(f"until {prompt_minute(end)} UTC")
+    lines = ["<run>" + " · ".join(facts) + "</run>"]
+    people, numbers = memory_people(user)
+    if people:
+        lines.append("<people>")
+        for index, person in enumerate(people, 1):
+            line = f"u{index}"
+            name = prompt_line(person["name"])
+            if name:
+                line += " " + name
+            if person["username"] and name.lstrip("@") != person["username"]:
+                line += " @" + prompt_line(person["username"])
+            if person["bot"]:
+                line += " bot"
+            lines.append(line)
+        lines.append("</people>")
+    cards = memory_cards(user)
+    if cards:
+        lines += ["<cards>", "c|type|subject|fact|conf|age|flag"]
+        for index, card in enumerate(cards, 1):
+            lines.append(
+                f"c{index}|{prompt_cell(card.get('type', ''))}|{prompt_cell(card.get('subject', ''))}|{prompt_cell(card.get('fact', ''))}"
+                f"|{prompt_number(card.get('conf', 0))}|{card.get('age', '')}|{'disputed' if card.get('disputed') else ''}"
+            )
+        lines.append("</cards>")
+    lines.append("<chat>")
+    day = None
+    weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    for index, message in enumerate(user.get("messages", []), 1):
+        at = message.get("occurred_at") or ""
+        moment = None if is_zero_time(at) else datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc)
+        if moment and moment.date() != day:
+            day = moment.date()
+            lines.append(f"# {day.isoformat()} {weekdays[day.weekday()]}")
+        tag = f"<m{index} u{numbers[index - 1]}"
+        if moment:
+            tag += f" {moment.hour:02d}:{moment.minute:02d}"
+        if message.get("is_automatic_forward"):
+            tag += " auto"
+        elif message.get("is_forwarded"):
+            tag += " fwd"
+        lines.append(f"{tag}>{prompt_line(message.get('text') or '')}</m>")
+    lines += ["</chat>", MEMORY_TASK_LINE]
+    return "\n".join(lines)
+
+
+def resolve_memory_aliases(user: dict[str, Any], parsed: Any) -> Any:
+    """Map the per-call numbers in an extraction answer back to fixture ids (`resolve_prompt_aliases`).
+
+    Like the Rust side, a storage id of the window that comes back instead of a
+    number is kept, and so is a `source_entry_ids` value that names a window entry.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    parsed = json.loads(json.dumps(parsed))
+    people, _ = memory_people(user)
+    messages = user.get("messages", [])
+    cards = memory_cards(user)
+    window_entries = {(message.get("entry_id") or "").strip() for message in messages} - {""}
+
+    def pick(items: list[Any], number: Any, key: str) -> Any:
+        if isinstance(number, bool) or not isinstance(number, int):
+            return None
+        if 1 <= number <= len(items):
+            return items[number - 1]
+        return next((item for item in items if number and item.get(key) == number), None)
+
+    for card in parsed.get("candidate_cards") or []:
+        if not isinstance(card, dict):
+            continue
+        message_ids: list[int] = []
+        entry_ids = [entry.strip() for entry in card.get("source_entry_ids") or [] if isinstance(entry, str) and entry.strip() in window_entries]
+        entry_ids = list(dict.fromkeys(entry_ids))
+        for number in card.get("source_message_ids") or []:
+            message = pick(messages, number, "message_id")
+            if message is None:
+                continue
+            if message.get("message_id") and message["message_id"] not in message_ids:
+                message_ids.append(message["message_id"])
+            entry = (message.get("entry_id") or "").strip()
+            if entry and entry not in entry_ids:
+                entry_ids.append(entry)
+        card["source_message_ids"] = message_ids
+        if "source_entry_ids" in card:
+            card["source_entry_ids"] = entry_ids
+        if "user_id" in card:
+            person = pick(people, card.get("user_id"), "user_id")
+            card["user_id"] = person["user_id"] if person else 0
+    for resolution in parsed.get("resolutions") or []:
+        if not isinstance(resolution, dict):
+            continue
+        for key in ("old_card_id", "into_card_id"):
+            if key in resolution and (key == "old_card_id" or resolution[key]):
+                card = pick(cards, resolution[key], "id")
+                resolution[key] = card.get("id", 0) if card else 0
+    return parsed
+
+
+def render_resolution_rows(user: dict[str, Any]) -> str:
+    """The candidate resolution user message (`ResolutionInput::to_prompt_payload`)."""
+    lines = ["<candidates>"]
+    for candidate in user.get("candidates", []):
+        lines.append(
+            f"#{candidate.get('index', 0)} {prompt_cell(candidate.get('type', ''))}|{prompt_cell(candidate.get('subject', ''))}"
+            f"|{prompt_cell(candidate.get('predicate', ''))}|{prompt_cell(candidate.get('fact', ''))}"
+        )
+        for card in candidate.get("similar", []):
+            lines.append(
+                f"  {card.get('index', 0)} {prompt_cell(card.get('type', ''))}|{prompt_cell(card.get('subject', ''))}"
+                f"|{prompt_cell(card.get('predicate', ''))}|{prompt_cell(card.get('fact', ''))}|{prompt_number(card.get('conf', 0))}|{card.get('age', '')}"
+            )
+    lines.append("</candidates>")
+    return "\n".join(lines)
+
+
+def render_merge_rows(user: dict[str, Any]) -> str:
+    """The subject merge user message (`SubjectMergeInput::to_prompt_payload`)."""
+    lines = [f"<subject>{prompt_line(user.get('subject', ''))}</subject>", "<cards>", "i|type|predicate|fact|sal|obs|age"]
+    for card in user.get("cards", []):
+        lines.append(
+            f"{card.get('index', 0)}|{prompt_cell(card.get('type', ''))}|{prompt_cell(card.get('predicate', ''))}|{prompt_cell(card.get('fact', ''))}"
+            f"|{prompt_number(card.get('salience', 0))}|{card.get('obs', 0)}|{card.get('age', '')}"
+        )
+    lines.append("</cards>")
     return "\n".join(lines)
 
 
@@ -269,6 +418,10 @@ def build_request(fixture: Fixture, prompt_dir: Path, args: argparse.Namespace) 
     if user_text is not None:
         if data.get("user_layout") == "memory_blocks" and not args.legacy_user_layout:
             user_text = render_memory_blocks(user_text)
+        elif data.get("flow") == "memory_resolution" and isinstance(user_text, dict) and not args.legacy_user_layout:
+            user_text = render_resolution_rows(user_text)
+        elif data.get("flow") == "memory_subject_merge" and isinstance(user_text, dict) and not args.legacy_user_layout:
+            user_text = render_merge_rows(user_text)
         elif data.get("user_layout") == "history_items":
             user_text = render_history_items(user_text)
         elif not isinstance(user_text, str):
@@ -711,6 +864,8 @@ def run_suite(fixtures: list[Fixture], prompt_dir: Path, args: argparse.Namespac
         status, payload, latency = post(args.endpoint, request, headers, args.timeout)
         raw = response_text(payload) if status == 200 else json.dumps(payload)[:500]
         parsed, note = parse_json_output(raw) if status == 200 else (None, "http error")
+        if fixture.data.get("user_layout") == "memory_blocks" and not args.legacy_user_layout:
+            parsed = resolve_memory_aliases(fixture.data.get("user") or {}, parsed)
         usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
         finish = ""
         if isinstance(payload, dict) and payload.get("choices"):
@@ -869,22 +1024,41 @@ def self_test() -> int:
     )
     expected_blocks = "\n".join(
         [
-            "<run>",
-            '{"chat_type":"supergroup","window_end":"2023-11-14T22:13:20Z"}',
-            "</run>",
-            "<existing_cards>",
-            '{"id":7,"type":"preference","subject":"Ada","fact":"a"}',
-            '{"id":42,"type":"event","subject":"Bob","fact":"b"}',
-            "</existing_cards>",
-            "<chat_window>",
-            '<msg id="10" entry="e1" user="42" author="Ann &quot;A&quot;" at="2023-11-14T22:13:20Z">line one line &lt;two></msg>',
-            "</chat_window>",
+            "<run>supergroup · until 2023-11-14 22:13 UTC</run>",
+            "<people>",
+            'u1 Ann "A"',
+            "</people>",
+            "<cards>",
+            "c|type|subject|fact|conf|age|flag",
+            "c1|preference|Ada|a|0||",
+            "c2|event|Bob|b|0||",
+            "</cards>",
+            "<chat>",
+            "# 2023-11-14 Tue",
+            "<m1 u1 22:13>line one line &lt;two></m>",
+            "</chat>",
             MEMORY_TASK_LINE,
         ]
     )
     if blocks != expected_blocks:
         failures += 1
         print(f"FAIL memory blocks:\n{blocks}")
+    resolved = resolve_memory_aliases(
+        {
+            "existing_cards": [{"id": 42, "subject": "Bob"}, {"id": 7, "subject": "Ada"}],
+            "messages": [{"message_id": 10, "entry_id": "e1", "user_id": 42}, {"message_id": 11, "entry_id": "e2", "user_id": 43}],
+        },
+        {
+            "candidate_cards": [{"user_id": 2, "source_message_ids": [2, 9]}, {"user_id": 42, "source_message_ids": [10], "source_entry_ids": ["e1", "x"]}],
+            "resolutions": [{"old_card_id": 1, "into_card_id": 2}, {"old_card_id": 42}],
+        },
+    )
+    if resolved != {
+        "candidate_cards": [{"user_id": 43, "source_message_ids": [11]}, {"user_id": 42, "source_message_ids": [10], "source_entry_ids": ["e1"]}],
+        "resolutions": [{"old_card_id": 7, "into_card_id": 42}, {"old_card_id": 42}],
+    }:
+        failures += 1
+        print(f"FAIL memory aliases: {resolved}")
     if failures:
         print(f"self-test failed: {failures}")
         return 1

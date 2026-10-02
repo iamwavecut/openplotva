@@ -2568,7 +2568,7 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<openplotva_memory::SubjectMergePlan, AifarmMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/subject_merge")?;
-        let payload = serde_json::to_string(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let payload = input.to_prompt_payload();
         let mut request = self.subject_merge_request(&system_prompt, &payload);
         request.trace = Some(aux_llm_call_trace(
             "memory_subject_merge",
@@ -2597,7 +2597,7 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<ResolutionPlan, AifarmMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/resolution")?;
-        let payload = serde_json::to_string(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let payload = input.to_prompt_payload();
         let mut request = self.subject_merge_request(&system_prompt, &payload);
         request.response_format = Some(candidate_resolution_response_format());
         request.trace = Some(aux_llm_call_trace(
@@ -5639,7 +5639,6 @@ fn memory_candidate_card_schema() -> Value {
             "fact_text",
             "confidence",
             "salience",
-            "source_entry_ids",
             "source_message_ids",
         ],
         "properties": {
@@ -5670,10 +5669,6 @@ fn memory_candidate_card_schema() -> Value {
             "confidence": {"type": "number"},
             "salience": {"type": "number"},
             "portable": {"type": "boolean"},
-            "source_entry_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
             "source_message_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
@@ -7426,7 +7421,7 @@ mod tests {
             body["messages"][1]["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(r#"<msg id="1" entry="m1">remember this</msg>"#)
+                .contains("<m1 u1>remember this</m>")
         );
         Ok(())
     }

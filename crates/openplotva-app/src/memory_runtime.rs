@@ -991,6 +991,7 @@ where
         .extract(input)
         .await
         .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+    let output = openplotva_memory::resolve_prompt_aliases(input, output);
     let output = gated_extraction_output(input, output);
     write_memory_extraction_batch_inner(store, embedder, input, output, cfg).await
 }
@@ -1030,6 +1031,7 @@ where
         .extract(&candidates_input)
         .await
         .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+    let output = openplotva_memory::resolve_prompt_aliases(&candidates_input, output);
     let output = gated_extraction_output(&candidates_input, output);
     if output.candidate_cards.is_empty() {
         return Ok(output);
@@ -1852,6 +1854,7 @@ where
                 .extract(&input)
                 .await
                 .map_err(|source| MemoryExtractionWriteError::Extract { source })?;
+            let output = openplotva_memory::resolve_prompt_aliases(&input, output);
             gated_extraction_output(&input, output)
         };
         state.add_extraction_metadata(batch, &output);
