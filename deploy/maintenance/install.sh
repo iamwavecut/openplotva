@@ -19,7 +19,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is req
 image_id=${1:?Pass the immutable image ID built from tools/maintenance/Dockerfile}
 [[ $image_id =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Expected an immutable sha256 image ID." >&2; exit 1; }
 [[ $(docker image inspect "$image_id" --format '{{index .Config.Labels "openplotva.maintenance.omp"}}') == 18.1.14 ]]
-[[ $(docker image inspect "$image_id" --format '{{index .Config.Labels "openplotva.maintenance.rust"}}') == 1.95.0 ]]
+[[ $(docker image inspect "$image_id" --format '{{index .Config.Labels "openplotva.maintenance.rust"}}') == 1.99.0 ]]
 
 install -d -m 0755 /opt/openplotva-maintenance
 install -d -m 0700 /etc/openplotva-maintenance /var/lib/openplotva-maintenance

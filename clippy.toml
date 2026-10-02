@@ -1,0 +1,3 @@
+# axum handlers return `Result<_, Response>` and `Response<Body>` is 128 bytes;
+# boxing it on every early-return path buys nothing on these cold paths.
+large-error-threshold = 192

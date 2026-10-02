@@ -11,7 +11,7 @@ It provides:
 
 ## Requirements
 
-- Rust 1.95.0
+- Rust 1.99.0
 - Docker with Compose for local Postgres, Dragonfly, and Valkey
 - PostgreSQL with pgvector for persistent deployments
 - Dragonfly for primary Redis-compatible state and Valkey with AOF for durable

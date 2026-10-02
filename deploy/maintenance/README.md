@@ -98,7 +98,7 @@ docker image inspect openplotva-maintenance:reviewed --format '{{.Id}}'
 sudo bash deploy/maintenance/install.sh sha256:ACTUAL_IMAGE_ID
 ```
 
-The image pins Rust 1.95.0 and the upstream base-image digest. It pins OMP
+The image pins Rust 1.99.0 and the upstream base-image digest. It pins OMP
 18.1.14 and verifies the upstream release binary SHA-256 for amd64/arm64. Its
 Cargo dependency cache comes from the trusted checkout's lockfile; execution
 uses offline Cargo. A dependency change requiring a new cache needs an operator

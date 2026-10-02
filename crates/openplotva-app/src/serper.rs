@@ -652,10 +652,7 @@ mod tests {
         state: Arc<FixtureState>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (method, path, headers, body) = read_request(&mut stream).await?;
-        let status;
-        let content_type;
-        let response_body;
-        if method == "POST" && path == "/search" {
+        let (status, content_type, response_body) = if method == "POST" && path == "/search" {
             let selected_headers = BTreeMap::from([
                 (
                     "content-type".to_owned(),
@@ -673,19 +670,20 @@ mod tests {
                 headers: selected_headers,
                 body: body_json,
             });
-            status = "200 OK";
-            content_type = "application/json";
-            response_body = r#"{"organic":[{"title":"ok"}]}"#.as_bytes().to_vec();
+            (
+                "200 OK",
+                "application/json",
+                r#"{"organic":[{"title":"ok"}]}"#.as_bytes().to_vec(),
+            )
         } else if method == "GET" && path == "/page" {
-            status = "200 OK";
-            content_type = "text/html; charset=utf-8";
-            response_body =
-                b"<html><body>Hello&nbsp;<b>Plotva</b> &amp; fish</body></html>".to_vec();
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                b"<html><body>Hello&nbsp;<b>Plotva</b> &amp; fish</body></html>".to_vec(),
+            )
         } else {
-            status = "404 Not Found";
-            content_type = "text/plain";
-            response_body = b"missing".to_vec();
-        }
+            ("404 Not Found", "text/plain", b"missing".to_vec())
+        };
         write_response(&mut stream, status, content_type, &response_body).await?;
         Ok(())
     }

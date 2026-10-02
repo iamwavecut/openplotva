@@ -206,7 +206,7 @@ class Runner:
                 raise Deferred("missing host dependency: " + executable)
         image = json.loads(command(["docker", "image", "inspect", self.image]).stdout)[0]
         labels = image.get("Config", {}).get("Labels") or {}
-        if labels.get("openplotva.maintenance.omp") != "18.1.14" or labels.get("openplotva.maintenance.rust") != "1.95.0":
+        if labels.get("openplotva.maintenance.omp") != "18.1.14" or labels.get("openplotva.maintenance.rust") != "1.99.0":
             raise Deferred("worker image provenance/version labels do not match")
         token = secret_file(self.config["gateway_token_file"])
         if self.config["gateway_url"] != "http://127.0.0.1:4000":
