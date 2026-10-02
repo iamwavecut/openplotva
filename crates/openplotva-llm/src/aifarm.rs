@@ -1072,6 +1072,14 @@ where
         nonzero_duration(self.cfg.capacity_wait, StdDuration::from_secs(60))
     }
 
+    /// Cap for `/v1/jobs/sync`: Discovery may first wait for capacity, then hold
+    /// the connection until the result is ready, then the body has to arrive.
+    fn sync_submit_limit(&self) -> StdDuration {
+        self.capacity_wait_limit()
+            .saturating_add(discovery_result_wait(&self.cfg))
+            .saturating_add(self.request_limit())
+    }
+
     async fn send_bounded(
         &self,
         request: AifarmHttpRequest,
@@ -1164,31 +1172,10 @@ where
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
-        let (job_id, initial_status) = self
+        let outcome = self
             .submit_with_capacity_wait(&request, job_id, on_status)
             .await?;
-        emit_status(
-            on_status,
-            StatusUpdate {
-                job_id: job_id.clone(),
-                status: STATUS_SUBMITTED.to_owned(),
-                message: "dialog job submitted".to_owned(),
-                ..StatusUpdate::default()
-            },
-        );
-        if !initial_status.status.is_empty() {
-            emit_status(
-                on_status,
-                StatusUpdate {
-                    job_id: job_id.clone(),
-                    status: initial_status.status.clone(),
-                    message: initial_status.message.clone(),
-                    ..StatusUpdate::default()
-                },
-            );
-        }
-        self.poll_discovery_result(&job_id, &initial_status, on_status)
-            .await
+        self.finish_discovery_submit(outcome, on_status).await
     }
 
     /// Complete a raw JSON request through Discovery.
@@ -1208,31 +1195,10 @@ where
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
-        let (job_id, initial_status) = self
+        let outcome = self
             .submit_json_with_capacity_wait(&request, job_id, on_status)
             .await?;
-        emit_status(
-            on_status,
-            StatusUpdate {
-                job_id: job_id.clone(),
-                status: STATUS_SUBMITTED.to_owned(),
-                message: "dialog job submitted".to_owned(),
-                ..StatusUpdate::default()
-            },
-        );
-        if !initial_status.status.is_empty() {
-            emit_status(
-                on_status,
-                StatusUpdate {
-                    job_id: job_id.clone(),
-                    status: initial_status.status.clone(),
-                    message: initial_status.message.clone(),
-                    ..StatusUpdate::default()
-                },
-            );
-        }
-        self.poll_discovery_result(&job_id, &initial_status, on_status)
-            .await
+        self.finish_discovery_submit(outcome, on_status).await
     }
 
     /// Complete through a direct OpenAI-compatible endpoint with supplied job ID.
@@ -1320,7 +1286,7 @@ where
         request: &ChatCompletionRequest,
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<(String, StatusUpdate), CompletionError> {
+    ) -> Result<DiscoverySubmitOutcome, CompletionError> {
         let wait_deadline = tokio::time::Instant::now() + self.capacity_wait_limit();
         loop {
             match self.submit_discovery(request, job_id).await {
@@ -1357,7 +1323,7 @@ where
         request: &Value,
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<(String, StatusUpdate), CompletionError> {
+    ) -> Result<DiscoverySubmitOutcome, CompletionError> {
         let wait_deadline = tokio::time::Instant::now() + self.capacity_wait_limit();
         loop {
             match self.submit_json_discovery(request, job_id).await {
@@ -1393,7 +1359,7 @@ where
         &self,
         request: &ChatCompletionRequest,
         job_id: &str,
-    ) -> Result<(String, StatusUpdate), CompletionError> {
+    ) -> Result<DiscoverySubmitOutcome, CompletionError> {
         let job_request = build_discovery_job_request(&self.cfg, job_id, request)
             .map_err(|err| Box::new(err) as CompletionError)?;
         let body = serde_json::to_vec(&job_request).map_err(|err| {
@@ -1403,59 +1369,22 @@ where
             .send_bounded(
                 AifarmHttpRequest {
                     method: AifarmHttpMethod::Post,
-                    url: self.cfg.endpoint("/v1/jobs/blocking"),
+                    url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
                 },
-                self.task_limit(),
-                "discovery blocking submit",
+                self.sync_submit_limit(),
+                "discovery sync submit",
             )
             .await?;
-        if !(200..300).contains(&response.status_code) {
-            let body = response_body_text(&response);
-            if is_capacity_unavailable(response.status_code, &body) {
-                return Err(Box::new(ProviderError::new(
-                    "aifarm",
-                    FailureReason::CapacityUnavailable,
-                    format!(
-                        "discovery service capacity unavailable: status {}: {}",
-                        response.status_code, body
-                    ),
-                )));
-            }
-            return Err(Box::new(AifarmClientError::Submit(format!(
-                "status {}: {}",
-                response.status_code, body
-            ))));
-        }
-        let envelope =
-            serde_json::from_slice::<DiscoveryJobEnvelope>(&response.body).map_err(|err| {
-                Box::new(AifarmClientError::Submit(format!(
-                    "decode discovery submit response: {err}"
-                ))) as CompletionError
-            })?;
-        let job = envelope.resolve_job();
-        let resolved_id = fallback_string(&job.resolved_id(), job_id);
-        let error_message = parse_job_error(job.error.as_ref());
-        if !error_message.is_empty() {
-            return Err(Box::new(AifarmClientError::Submit(error_message)));
-        }
-        Ok((
-            resolved_id.clone(),
-            StatusUpdate {
-                job_id: resolved_id,
-                status: normalize_status(&job.resolved_status()),
-                message: parse_job_error(job.error.as_ref()),
-                ..StatusUpdate::default()
-            },
-        ))
+        decode_discovery_submit_response(&response, job_id)
     }
 
     async fn submit_json_discovery(
         &self,
         request: &Value,
         job_id: &str,
-    ) -> Result<(String, StatusUpdate), CompletionError> {
+    ) -> Result<DiscoverySubmitOutcome, CompletionError> {
         let job_request = build_discovery_json_job_request(&self.cfg, job_id, request)
             .map_err(|err| Box::new(err) as CompletionError)?;
         let body = serde_json::to_vec(&job_request).map_err(|err| {
@@ -1465,52 +1394,52 @@ where
             .send_bounded(
                 AifarmHttpRequest {
                     method: AifarmHttpMethod::Post,
-                    url: self.cfg.endpoint("/v1/jobs/blocking"),
+                    url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
                 },
-                self.task_limit(),
-                "discovery blocking submit",
+                self.sync_submit_limit(),
+                "discovery sync submit",
             )
             .await?;
-        if !(200..300).contains(&response.status_code) {
-            let body = response_body_text(&response);
-            if is_capacity_unavailable(response.status_code, &body) {
-                return Err(Box::new(ProviderError::new(
-                    "aifarm",
-                    FailureReason::CapacityUnavailable,
-                    format!(
-                        "discovery service capacity unavailable: status {}: {}",
-                        response.status_code, body
-                    ),
-                )));
-            }
-            return Err(Box::new(AifarmClientError::Submit(format!(
-                "status {}: {}",
-                response.status_code, body
-            ))));
-        }
-        let envelope =
-            serde_json::from_slice::<DiscoveryJobEnvelope>(&response.body).map_err(|err| {
-                Box::new(AifarmClientError::Submit(format!(
-                    "decode discovery submit response: {err}"
-                ))) as CompletionError
-            })?;
-        let job = envelope.resolve_job();
-        let resolved_id = fallback_string(&job.resolved_id(), job_id);
-        let error_message = parse_job_error(job.error.as_ref());
-        if !error_message.is_empty() {
-            return Err(Box::new(AifarmClientError::Submit(error_message)));
-        }
-        Ok((
-            resolved_id.clone(),
+        decode_discovery_submit_response(&response, job_id)
+    }
+
+    async fn finish_discovery_submit(
+        &self,
+        outcome: DiscoverySubmitOutcome,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> Result<CompletionResult, CompletionError> {
+        let DiscoverySubmitOutcome {
+            job_id,
+            initial_status,
+            finished,
+        } = outcome;
+        emit_status(
+            on_status,
             StatusUpdate {
-                job_id: resolved_id,
-                status: normalize_status(&job.resolved_status()),
-                message: parse_job_error(job.error.as_ref()),
+                job_id: job_id.clone(),
+                status: STATUS_SUBMITTED.to_owned(),
+                message: "dialog job submitted".to_owned(),
                 ..StatusUpdate::default()
             },
-        ))
+        );
+        if !initial_status.status.is_empty() {
+            emit_status(
+                on_status,
+                StatusUpdate {
+                    job_id: job_id.clone(),
+                    status: initial_status.status.clone(),
+                    message: initial_status.message.clone(),
+                    ..StatusUpdate::default()
+                },
+            );
+        }
+        if let Some(finished) = finished {
+            return finished;
+        }
+        self.poll_discovery_result(&job_id, &initial_status, on_status)
+            .await
     }
 
     async fn poll_discovery_result(
@@ -1536,13 +1465,21 @@ where
                     "discovery job {job_id} did not finish within the task timeout"
                 ))));
             }
-            tokio::time::sleep(nonzero_duration(
-                self.cfg.poll_interval,
-                StdDuration::from_secs(1),
-            ))
-            .await;
-            let status = self.check_discovery_status(job_id).await?;
+            let remaining = poll_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let wait = remaining.min(DISCOVERY_MAX_RESULT_WAIT);
+            let asked = tokio::time::Instant::now();
+            let status = self.check_discovery_status(job_id, wait).await?;
             let normalized = normalize_status(&status.status);
+            if (is_queued_status(&normalized) || is_running_status(&normalized))
+                && asked.elapsed() < DISCOVERY_LONG_POLL_MIN_HOLD
+            {
+                // An older Discovery ignores `wait_ms`; fall back to interval polling.
+                tokio::time::sleep(nonzero_duration(
+                    self.cfg.poll_interval,
+                    StdDuration::from_secs(1),
+                ))
+                .await;
+            }
             if !running_seen && is_running_status(&normalized) {
                 running_seen = true;
                 poll_deadline = tokio::time::Instant::now() + self.task_limit();
@@ -1561,16 +1498,21 @@ where
     async fn check_discovery_status(
         &self,
         job_id: &str,
+        wait: StdDuration,
     ) -> Result<DiscoveryJobStatus, CompletionError> {
         let response = self
             .send_bounded(
                 AifarmHttpRequest {
                     method: AifarmHttpMethod::Get,
-                    url: self.cfg.endpoint(&format!("/v1/jobs/{}", job_id.trim())),
+                    url: self.cfg.endpoint(&format!(
+                        "/v1/jobs/{}?wait_ms={}",
+                        job_id.trim(),
+                        wait.as_millis()
+                    )),
                     headers: BTreeMap::new(),
                     body: Vec::new(),
                 },
-                self.request_limit(),
+                wait.saturating_add(self.request_limit()),
                 "discovery job status poll",
             )
             .await?;
@@ -4239,6 +4181,9 @@ pub struct DiscoveryJobRequest {
     /// Capacity poll in ms.
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub capacity_poll_ms: i32,
+    /// How long `/v1/jobs/sync` holds the submit open for the job result, in ms.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub wait_for_result_ms: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -4829,6 +4774,7 @@ fn build_discovery_json_payload_job_request(
         priority: cfg.priority.max(0),
         wait_for_capacity_ms: duration_ms(cfg.capacity_wait),
         capacity_poll_ms: duration_ms(cfg.capacity_poll_interval),
+        wait_for_result_ms: duration_ms(discovery_result_wait(cfg)),
     })
 }
 
@@ -4969,6 +4915,74 @@ pub fn job_status_from_envelope(
 ) -> Result<StatusUpdate, AifarmDecodeError> {
     let status = discovery_status_from_envelope(fallback_job_id, envelope)?;
     Ok(status.as_update_with_status(&normalize_status(&status.status)))
+}
+
+/// What `/v1/jobs/sync` returned: the job id and first status, plus the final
+/// result when Discovery already had it.
+struct DiscoverySubmitOutcome {
+    job_id: String,
+    initial_status: StatusUpdate,
+    finished: Option<Result<CompletionResult, CompletionError>>,
+}
+
+fn decode_discovery_submit_response(
+    response: &AifarmHttpResponse,
+    job_id: &str,
+) -> Result<DiscoverySubmitOutcome, CompletionError> {
+    if !(200..300).contains(&response.status_code) {
+        let body = response_body_text(response);
+        if is_capacity_unavailable(response.status_code, &body) {
+            return Err(Box::new(ProviderError::new(
+                "aifarm",
+                FailureReason::CapacityUnavailable,
+                format!(
+                    "discovery service capacity unavailable: status {}: {}",
+                    response.status_code, body
+                ),
+            )));
+        }
+        return Err(Box::new(AifarmClientError::Submit(format!(
+            "status {}: {}",
+            response.status_code, body
+        ))));
+    }
+    let envelope =
+        serde_json::from_slice::<DiscoveryJobEnvelope>(&response.body).map_err(|err| {
+            Box::new(AifarmClientError::Submit(format!(
+                "decode discovery submit response: {err}"
+            ))) as CompletionError
+        })?;
+    let job = envelope.resolve_job();
+    let resolved_id = fallback_string(&job.resolved_id(), job_id);
+    let normalized = normalize_status(&job.resolved_status());
+    let finished = if is_success_status(&normalized) || is_failure_status(&normalized) {
+        let status = discovery_status_from_envelope(&resolved_id, &envelope)
+            .map_err(|err| Box::new(err) as CompletionError)?;
+        Some(
+            discovery_result_from_status(&resolved_id, &status, &normalized).and_then(|result| {
+                result.ok_or_else(|| {
+                    Box::new(AifarmClientError::UnknownStatus(status.status.clone()))
+                        as CompletionError
+                })
+            }),
+        )
+    } else {
+        let error_message = parse_job_error(job.error.as_ref());
+        if !error_message.is_empty() {
+            return Err(Box::new(AifarmClientError::Submit(error_message)));
+        }
+        None
+    };
+    Ok(DiscoverySubmitOutcome {
+        job_id: resolved_id.clone(),
+        initial_status: StatusUpdate {
+            job_id: resolved_id,
+            status: normalized,
+            message: parse_job_error(job.error.as_ref()),
+            ..StatusUpdate::default()
+        },
+        finished,
+    })
 }
 
 pub fn discovery_status_from_envelope(
@@ -5776,6 +5790,16 @@ fn clamp_penalty(value: f64, fallback: f64) -> f64 {
 
 fn default_duration(value: StdDuration, fallback: StdDuration) -> StdDuration {
     if value.is_zero() { fallback } else { value }
+}
+
+/// Discovery caps `/v1/jobs/sync` and long-poll result waits at two minutes.
+const DISCOVERY_MAX_RESULT_WAIT: StdDuration = StdDuration::from_secs(120);
+/// A long-poll answer faster than this means the server ignored `wait_ms`.
+const DISCOVERY_LONG_POLL_MIN_HOLD: StdDuration = StdDuration::from_millis(50);
+
+fn discovery_result_wait(cfg: &AifarmClientConfig) -> StdDuration {
+    nonzero_duration(cfg.task_timeout, StdDuration::from_secs(12 * 60))
+        .min(DISCOVERY_MAX_RESULT_WAIT)
 }
 
 fn duration_ms(value: StdDuration) -> i32 {
@@ -6692,7 +6716,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn discovery_blocking_submit_times_out_on_the_task_budget_not_the_request_budget() {
+    async fn discovery_sync_submit_is_bounded_by_capacity_result_and_request_budgets() {
         let client = AifarmHttpClient::with_transport(
             AifarmClientConfig {
                 request_timeout: StdDuration::from_secs(30),
@@ -6705,8 +6729,10 @@ mod tests {
         let err = client
             .complete(ChatCompletionRequest::default(), &mut on_status)
             .await
-            .expect_err("hung blocking submit must time out");
-        assert!(err.to_string().contains("timed out after 630s"), "{err}");
+            .expect_err("hung sync submit must time out");
+        // Default capacity wait + result wait capped at 120s + the 30s request budget,
+        // instead of the 630s task budget the old blocking submit used.
+        assert!(err.to_string().contains("timed out after 300s"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -7348,10 +7374,7 @@ mod tests {
         assert_eq!(out.output_tokens, 22);
         let requests = transport.requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].url,
-            "https://memory.example.test/v1/jobs/blocking"
-        );
+        assert_eq!(requests[0].url, "https://memory.example.test/v1/jobs/sync");
         let job: DiscoveryJobRequest = serde_json::from_slice(&requests[0].body)?;
         assert_eq!(job.invocation.service_name, DEFAULT_SERVICE_NAME);
         assert_eq!(job.invocation.endpoint_name, DEFAULT_ENDPOINT_NAME);
@@ -9395,6 +9418,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_client_takes_the_result_from_the_sync_submit() -> Result<(), CompletionError> {
+        let completion_payload =
+            r#"{"id":"cmpl-1","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "job": {
+                "job_id": "job-1",
+                "state": "JOB_STATE_SUCCEEDED",
+                "result": {
+                    "response": {
+                        "status_code": 200,
+                        "body": general_purpose::STANDARD.encode(completion_payload),
+                        "content_type": "application/json"
+                    }
+                }
+            }
+        })))]);
+        let probe = transport.clone();
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                base_url: "https://discovery.example.test".to_owned(),
+                task_timeout: StdDuration::from_secs(45),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        );
+        let mut statuses = Vec::new();
+
+        let result = client
+            .complete_discovery_with_job_id(
+                ChatCompletionRequest::default(),
+                "dialog-1",
+                &mut |status| statuses.push(status),
+            )
+            .await?;
+
+        assert_eq!(completion_text(&result), Some("ok"));
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| status.status.as_str())
+                .collect::<Vec<_>>(),
+            vec![STATUS_SUBMITTED, STATUS_SUCCEEDED]
+        );
+        let requests = probe.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no status poll after a finished sync submit"
+        );
+        let job: DiscoveryJobRequest = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(job.wait_for_result_ms, 45_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_client_reports_a_failed_sync_job_as_an_upstream_error() {
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "job": {
+                "job_id": "job-1",
+                "state": "JOB_STATE_FAILED",
+                "error": {"code": "UPSTREAM_TIMEOUT", "message": "upstream timed out"}
+            }
+        })))]);
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                base_url: "https://discovery.example.test".to_owned(),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        );
+        let mut on_status = |_: StatusUpdate| {};
+        let err = client
+            .complete_discovery_with_job_id(
+                ChatCompletionRequest::default(),
+                "dialog-1",
+                &mut on_status,
+            )
+            .await
+            .expect_err("failed job must surface as an error");
+        assert!(
+            matches!(
+                err.downcast_ref::<AifarmClientError>(),
+                Some(AifarmClientError::Upstream(_))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn http_client_completes_discovery_submit_poll_flow() -> Result<(), CompletionError> {
         let completion_payload =
             r#"{"id":"cmpl-1","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
@@ -9466,13 +9578,16 @@ mod tests {
         assert_eq!(requests[0].method, AifarmHttpMethod::Post);
         assert_eq!(
             requests[0].url,
-            "https://discovery.example.test/v1/jobs/blocking"
+            "https://discovery.example.test/v1/jobs/sync"
         );
         assert_eq!(requests[0].headers["Content-Type"], "application/json");
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
-        assert_eq!(
-            requests[1].url,
-            "https://discovery.example.test/v1/jobs/job-1"
+        assert!(
+            requests[1]
+                .url
+                .starts_with("https://discovery.example.test/v1/jobs/job-1?wait_ms="),
+            "{}",
+            requests[1].url
         );
         Ok(())
     }

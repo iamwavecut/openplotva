@@ -1,7 +1,7 @@
 //! Discovery-backed embedder client with a shared, cooling circuit breaker.
 //!
 //! The embedder runs on the AI Farm GPU server and is reached only through
-//! Discovery (`/v1/jobs/blocking` + poll), the same path the LLM uses. A
+//! Discovery (`/v1/jobs/sync` + long-poll), the same path the LLM uses. A
 //! process-shared breaker stops hammering Discovery while the embedder is down:
 //! after `failure_threshold` consecutive failures it opens for `cooldown`, and
 //! every embed call short-circuits to [`EmbedderClientError::Unavailable`] until
@@ -35,6 +35,10 @@ pub const DEFAULT_EMBEDDER_DISCOVERY_ENDPOINT_NAME: &str = "encode";
 const EMBEDDER_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EMBEDDER_DISCOVERY_CAPACITY_WAIT: Duration = Duration::from_secs(2);
 const EMBEDDER_DISCOVERY_CONTENT_TYPE: &str = "application/json";
+/// Discovery caps `/v1/jobs/sync` and long-poll result waits at two minutes.
+const DISCOVERY_MAX_RESULT_WAIT: Duration = Duration::from_secs(120);
+/// A long-poll answer faster than this means the server ignored `wait_ms`.
+const DISCOVERY_LONG_POLL_MIN_HOLD: Duration = Duration::from_millis(50);
 
 /// Process-shared, cooling circuit breaker for the embedder service.
 ///
@@ -323,6 +327,7 @@ impl DiscoveryEmbedderClient {
             priority: 0,
             wait_for_capacity_ms: duration_ms(self.cfg.capacity_wait),
             capacity_poll_ms: duration_ms(self.cfg.poll_interval),
+            wait_for_result_ms: duration_ms(self.result_wait()),
         };
 
         let envelope = self.submit(&job_request).await?;
@@ -339,31 +344,61 @@ impl DiscoveryEmbedderClient {
                     self.cfg.task_timeout
                 )));
             }
-            tokio::time::sleep(self.cfg.poll_interval).await;
-            job = self.poll(&resolved_id).await?.resolve_job();
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(DISCOVERY_MAX_RESULT_WAIT);
+            let asked = Instant::now();
+            job = self.poll(&resolved_id, wait).await?.resolve_job();
+            if asked.elapsed() < DISCOVERY_LONG_POLL_MIN_HOLD && terminal_response(&job)?.is_none()
+            {
+                // An older Discovery ignores `wait_ms`; fall back to interval polling.
+                tokio::time::sleep(self.cfg.poll_interval).await;
+            }
         }
+    }
+
+    fn result_wait(&self) -> Duration {
+        self.cfg
+            .task_timeout
+            .max(Duration::from_secs(1))
+            .min(DISCOVERY_MAX_RESULT_WAIT)
     }
 
     async fn submit(
         &self,
         job: &DiscoveryJobRequest,
     ) -> Result<DiscoveryJobEnvelope, EmbedderClientError> {
-        let url = self.endpoint("/v1/jobs/blocking");
+        let url = self.endpoint("/v1/jobs/sync");
         let response = self
             .client
             .post(url)
             .json(job)
+            .timeout(
+                self.cfg
+                    .capacity_wait
+                    .saturating_add(self.result_wait())
+                    .saturating_add(self.cfg.request_timeout.max(Duration::from_secs(1))),
+            )
             .send()
             .await
             .map_err(|error| EmbedderClientError::discovery(format!("submit: {error}")))?;
         self.read_envelope(response, "submit").await
     }
 
-    async fn poll(&self, job_id: &str) -> Result<DiscoveryJobEnvelope, EmbedderClientError> {
-        let url = self.endpoint(&format!("/v1/jobs/{}", job_id.trim()));
+    async fn poll(
+        &self,
+        job_id: &str,
+        wait: Duration,
+    ) -> Result<DiscoveryJobEnvelope, EmbedderClientError> {
+        let url = self.endpoint(&format!(
+            "/v1/jobs/{}?wait_ms={}",
+            job_id.trim(),
+            wait.as_millis()
+        ));
         let response = self
             .client
             .get(url)
+            .timeout(wait.saturating_add(self.cfg.request_timeout.max(Duration::from_secs(1))))
             .send()
             .await
             .map_err(|error| EmbedderClientError::discovery(format!("poll: {error}")))?;

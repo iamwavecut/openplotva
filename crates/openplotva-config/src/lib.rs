@@ -227,6 +227,8 @@ pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
 
 pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 4;
+/// Matches the privacy-filter `max_concurrent_jobs` registered in Discovery.
+pub const DEFAULT_MEMORY_REDACTION_CONCURRENCY: i32 = 4;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK: i32 = 30;
 
@@ -1083,6 +1085,8 @@ pub struct MemoryConfig {
     pub redaction_poll_seconds: i32,
     pub redaction_capacity_wait_seconds: i32,
     pub redaction_capacity_poll_seconds: i32,
+    /// Redaction calls one extraction keeps in flight (privacy-filter slots).
+    pub redaction_concurrency: i32,
     pub redaction_categories: Vec<String>,
 }
 
@@ -1643,6 +1647,8 @@ pub struct RawConfig {
     pub memory_redaction_capacity_wait_seconds: Option<String>,
     /// `MEMORY_REDACTION_CAPACITY_POLL_SECONDS`.
     pub memory_redaction_capacity_poll_seconds: Option<String>,
+    /// `MEMORY_REDACTION_CONCURRENCY`.
+    pub memory_redaction_concurrency: Option<String>,
     /// `MEMORY_REDACTION_CATEGORIES`.
     pub memory_redaction_categories: Option<String>,
     /// `SHIELD_ENABLED`.
@@ -3052,6 +3058,11 @@ impl AppConfig {
                     raw.memory_redaction_capacity_poll_seconds,
                     1,
                 )?,
+                redaction_concurrency: parse_i32(
+                    "MEMORY_REDACTION_CONCURRENCY",
+                    raw.memory_redaction_concurrency,
+                    DEFAULT_MEMORY_REDACTION_CONCURRENCY,
+                )?,
                 redaction_categories: parse_string_list_or_default(
                     raw.memory_redaction_categories,
                     DEFAULT_MEMORY_REDACTION_CATEGORIES,
@@ -3429,6 +3440,7 @@ impl RawConfig {
             memory_redaction_poll_seconds: env("MEMORY_REDACTION_POLL_SECONDS"),
             memory_redaction_capacity_wait_seconds: env("MEMORY_REDACTION_CAPACITY_WAIT_SECONDS"),
             memory_redaction_capacity_poll_seconds: env("MEMORY_REDACTION_CAPACITY_POLL_SECONDS"),
+            memory_redaction_concurrency: env("MEMORY_REDACTION_CONCURRENCY"),
             memory_redaction_categories: env("MEMORY_REDACTION_CATEGORIES"),
             shield_enabled: env("SHIELD_ENABLED"),
             shield_embedder_service_name: env("SHIELD_EMBEDDER_DISCOVERY_SERVICE_NAME"),
@@ -4250,6 +4262,10 @@ mod tests {
         assert_eq!(config.memory.redaction_poll_seconds, 1);
         assert_eq!(config.memory.redaction_capacity_wait_seconds, 30);
         assert_eq!(config.memory.redaction_capacity_poll_seconds, 1);
+        assert_eq!(
+            config.memory.redaction_concurrency,
+            crate::DEFAULT_MEMORY_REDACTION_CONCURRENCY
+        );
         assert_eq!(
             config.memory.redaction_categories,
             vec![

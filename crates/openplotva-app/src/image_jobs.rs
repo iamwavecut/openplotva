@@ -882,6 +882,7 @@ where
             } else {
                 duration_ms(self.cfg.poll_interval)
             },
+            wait_for_result_ms: 0,
         };
         let body = serde_json::to_vec(&request)
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
