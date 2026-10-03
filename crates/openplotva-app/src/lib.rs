@@ -12378,6 +12378,12 @@ async fn start_runtime_workers(
                         telegram.clone(),
                         bot_key.to_owned(),
                     ),
+                )
+                .with_pending_albums(
+                    bot_identity.id,
+                    openplotva_storage::PostgresTelegramDeliveryStore::new(
+                        service_clients.postgres.clone(),
+                    ),
                 ),
             ));
     let dialog_tool_adapter = Arc::new(

@@ -1579,6 +1579,10 @@ where
     }
     capture_media_group_image_for_message_and_reply(schedulers.1, message);
 
+    if captionless_album_message(message) {
+        return Ok(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
+    }
+
     let parsed = parse_if_addressed(message, &config.bot_user);
     let first_word_lower = parsed.first_word.trim().to_lowercase();
     let sender = resolve_message_sender(Some(message));
@@ -1725,6 +1729,10 @@ where
         return Ok(DialogMessageUpdateRoute::IgnoredInvalidMessage);
     }
     capture_media_group_image_for_message_and_reply(shortcuts.0, message);
+
+    if captionless_album_message(message) {
+        return Ok(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
+    }
 
     let mut parsed = parse_if_addressed(message, &config.bot_user);
     let first_word_lower = parsed.first_word.trim().to_lowercase();
@@ -2257,6 +2265,13 @@ fn is_bang_song_shortcut(first_word: &str) -> bool {
 
 fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Private(_))
+}
+
+fn captionless_album_message(message: &carapax::types::Message) -> bool {
+    !message_media_group_id(message).is_empty()
+        && message
+            .get_text()
+            .is_none_or(|text| text.as_ref().trim().is_empty())
 }
 
 fn is_direct_draw_api_shortcut(first_word: &str) -> bool {
@@ -7550,6 +7565,135 @@ mod tests {
         Ok(())
     }
 
+    struct AlbumFileUrlStub;
+
+    impl crate::dialog_tools::ImageEditFileUrlProvider for AlbumFileUrlStub {
+        fn image_edit_file_url<'a>(
+            &'a self,
+            file_id: &'a str,
+        ) -> crate::dialog_tools::ImageEditFileUrlFuture<'a> {
+            Box::pin(async move { Ok(Some(format!("https://files.test/{file_id}"))) })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_postgres_serialized_album_schedules_one_edit_with_original_caption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        let bot_id = i64::from(rand::random::<u32>()) + 1000;
+        let store = openplotva_storage::PostgresTelegramDeliveryStore::new(pool.clone());
+        let files = openplotva_storage::PostgresTelegramFileStore::new(pool.clone());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for (case, (count, caption_last)) in [(2, false), (10, false), (2, true), (10, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let album = format!("serial-album-{bot_id}-{case}");
+            let caption_index = if caption_last { count - 1 } else { 0 };
+            let prompt = "возьми лицо с первой картинки и помести вместо лица второй картинки";
+            let queue = Arc::new(InMemoryTaskQueue::new());
+            let resolver = crate::dialog_tools::TelegramImageEditFileResolver::new(
+                files.clone(),
+                AlbumFileUrlStub,
+            )
+            .with_media_group_registry(crate::dialog_tools::MediaGroupImageRegistry::new(
+                Duration::ZERO,
+                10,
+            ))
+            .with_pending_albums(bot_id, store.clone());
+            let image_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(queue.clone())
+                .with_draw_image_vip_status(Arc::new(VipStatusStub(true)))
+                .with_image_edit_file_resolver(Arc::new(resolver));
+            let scheduler = SchedulerStub::default();
+            let mut updates = Vec::new();
+            let mut expected_urls = Vec::new();
+            let mut unique_ids = Vec::new();
+            for index in 0..count {
+                let id = format!("serial-file-{bot_id}-{case}-{index}");
+                let message_id = 77 + index as i64;
+                let update_id = case as i64 * 100 + index as i64;
+                let caption = if index == caption_index {
+                    format!("рисуй {prompt}")
+                } else {
+                    String::new()
+                };
+                let update = photo_caption_media_group_update_at(
+                    update_id, message_id, &caption, &album, &id, &id, now,
+                )?;
+                let payload = serde_json::to_vec(&update)?;
+                sqlx::query("INSERT INTO telegram_update_inbox (bot_id, update_id, schema_version, source, stream_ms, stream_seq, last_stream_ms, last_stream_seq, raw_payload, payload_sha256, first_received_at, last_received_at, ordering_key, chat_id) VALUES ($1,$2,1,'webhook',1,$2,1,$2,$3,$4,now(),now(),$5,42)")
+                    .bind(bot_id).bind(update_id).bind(payload).bind(vec![0_u8;32]).bind(format!("dialog:{bot_id}:42:0")).execute(&pool).await?;
+                files
+                    .upsert_metadata(&openplotva_storage::TelegramFileMetadataUpsert {
+                        file_unique_id: id.clone(),
+                        latest_file_id: id.clone(),
+                        media_kind: "photo".to_owned(),
+                        first_seen_chat_id: Some(42),
+                        last_seen_chat_id: Some(42),
+                        first_seen_message_id: Some(message_id),
+                        last_seen_message_id: Some(message_id),
+                        ..Default::default()
+                    })
+                    .await?;
+                unique_ids.push(id.clone());
+                expected_urls.push(format!("https://files.test/{id}"));
+                updates.push(update);
+            }
+            for (index, update) in updates.into_iter().enumerate() {
+                let route = handle_dialog_message_update_or_else_with_image(
+                    &scheduler,
+                    Some(&image_scheduler),
+                    None,
+                    &test_config(),
+                    update,
+                    |_update| async { Err("album should not delegate") },
+                )
+                .await?;
+                if index == caption_index {
+                    assert!(matches!(
+                        route,
+                        DialogMessageUpdateRoute::DrawImageScheduled { .. }
+                    ));
+                } else {
+                    assert_eq!(route, DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
+                }
+                sqlx::query("UPDATE telegram_update_inbox SET status='completed' WHERE bot_id=$1 AND update_id=$2")
+                    .bind(bot_id).bind(case as i64 * 100 + index as i64).execute(&pool).await?;
+            }
+            assert!(scheduler.calls().is_empty());
+            let records = queue.records();
+            assert_eq!(records.len(), 1);
+            let data = &records[0].job.data;
+            let image = data.image_data.as_ref().expect("image edit");
+            assert_eq!(image.image_urls, expected_urls);
+            assert_eq!(image.prompt, prompt);
+            assert_eq!(image.original_text, prompt);
+            assert_eq!(
+                data.telegram_data
+                    .as_ref()
+                    .expect("telegram target")
+                    .message_id,
+                77 + caption_index as i32
+            );
+            sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id=$1")
+                .bind(bot_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM telegram_files WHERE file_unique_id = ANY($1)")
+                .bind(unique_ids)
+                .execute(&pool)
+                .await?;
+        }
+        pool.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_redis_decoded_album_image_edit_captures_sibling_media_when_url_is_set()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -7714,11 +7858,7 @@ mod tests {
         );
         assert_eq!(
             *lock(&second_route),
-            Some(DialogMessageUpdateRoute::Scheduled {
-                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-                delay: Duration::ZERO,
-                replaced: false,
-            })
+            Some(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger)
         );
 
         let captures = image_scheduler.capture_calls();
@@ -7736,7 +7876,7 @@ mod tests {
         assert_eq!(calls[0].prompt, "contrast");
         assert_eq!(calls[0].edit_media_group_id, "album-1");
         assert_eq!(calls[0].attachments[0].file_unique_id, "photo-1");
-        assert_eq!(scheduler.calls(), vec![String::new()]);
+        assert!(scheduler.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
 
         let state_calls = state_store.calls();
@@ -8608,6 +8748,8 @@ mod tests {
             &'a self,
             attachments: &'a [openplotva_core::ChatAttachment],
             media_group_id: &'a str,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
         ) -> crate::dialog_tools::ImageEditFileResolveFuture<'a> {
             let result = self.result.clone();
             lock(&self.calls).push((attachments.to_vec(), media_group_id.to_owned()));

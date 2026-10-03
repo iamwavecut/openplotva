@@ -3409,12 +3409,30 @@ where
     Effects: ImageJobEffects + Sync,
     Cancel: std::future::Future<Output = ()>,
 {
+    execute_image_edit_job_with_caption_and_cancel(editor, effects, params, None, cancelled).await
+}
+
+async fn execute_image_edit_job_with_caption_and_cancel<Editor, Effects, Cancel>(
+    editor: &Editor,
+    effects: &Effects,
+    params: ImageEditJobParams,
+    caption: Option<String>,
+    cancelled: Cancel,
+) -> ImageEditJobExecutionReport
+where
+    Editor: ImageEditor + Sync,
+    Effects: ImageJobEffects + Sync,
+    Cancel: std::future::Future<Output = ()>,
+{
     let params = sanitize_image_edit_job_params(params);
     let expected_image_count = editor
         .expected_image_count()
         .clamp(1, TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
+    let caption = caption
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| sanitize_tool_text(&value));
     let display_caption = build_image_generation_caption(
-        &params.prompt,
+        caption.as_deref().unwrap_or(&params.prompt),
         &params.user_full_name,
         expected_image_count > 1,
         false,
@@ -3988,10 +4006,15 @@ where
             TelegramActivityAction::UploadPhoto,
         )
     });
-    let execution = execute_image_edit_job_with_cancel(
+    let execution = execute_image_edit_job_with_caption_and_cancel(
         editor,
         effects,
         params,
+        work.job
+            .data
+            .image_data
+            .as_ref()
+            .map(|image| image.original_text.clone()),
         wait_for_image_job_cancellation(queue, work.id),
     )
     .await;
@@ -6891,6 +6914,67 @@ mod tests {
             DEFAULT_LLM_JOB_MAX_ATTEMPTS.to_string()
         );
         assert_eq!(event.data["target_queue"], IMAGE_REGULAR_QUEUE_NAME);
+    }
+
+    #[tokio::test]
+    async fn image_edit_worker_keeps_original_caption_separate_from_provider_prompt() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::now_utc();
+        let mut job = new_image_edit_job_at(
+            ImageEditJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                prompt: "Replace the soldier's face using both reference images".to_owned(),
+                photo_urls: vec![
+                    "https://files.test/first.png".to_owned(),
+                    "https://files.test/second.png".to_owned(),
+                ],
+                ..Default::default()
+            },
+            now,
+        );
+        job.data
+            .image_data
+            .as_mut()
+            .expect("image data")
+            .original_text =
+            "возьми лицо с первой картинки и помести вместо лица второй картинки".to_owned();
+        queue.assign(IMAGE_VIP_QUEUE_NAME, job);
+        let editor = EditorStub::success(vec!["https://img.test/result.png".to_owned()]);
+        let effects = EffectsStub::new();
+        let report = run_image_edit_queue_once(
+            &queue,
+            IMAGE_VIP_QUEUE_NAME,
+            &editor,
+            &effects,
+            "caption-worker",
+            now,
+        )
+        .await;
+        assert_eq!(report.outcome, ImageEditQueuePollOutcome::Completed);
+        assert_eq!(
+            editor.requests()[0].prompt,
+            "Replace the soldier's face using both reference images"
+        );
+        assert_eq!(editor.requests()[0].photo_urls.len(), 2);
+        let calls = effects.calls();
+        let placeholders: Vec<_> = calls
+            .iter()
+            .filter(|call| call.starts_with("send_placeholders:"))
+            .collect();
+        let deliveries: Vec<_> = calls
+            .iter()
+            .filter(|call| call.starts_with("replace_placeholder:"))
+            .collect();
+        assert_eq!(placeholders.len(), 1);
+        assert_eq!(deliveries.len(), 1);
+        for call in placeholders.into_iter().chain(deliveries) {
+            assert!(call.contains(
+                "<code>возьми лицо с первой картинки и помести вместо лица второй картинки</code>"
+            ));
+            assert!(!call.contains("Replace the soldier"));
+        }
     }
 
     #[tokio::test]
