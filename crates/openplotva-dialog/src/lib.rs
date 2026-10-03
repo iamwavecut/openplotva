@@ -4344,6 +4344,20 @@ fn parse_xmlish_attr_value(value: &str) -> Option<String> {
 }
 
 fn parse_quoted_xmlish_attr_value(value: &str, quote: u8) -> Option<String> {
+    let body = &value[1..];
+    if body.trim_start().starts_with(['[', '{']) {
+        let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+        if let Some(Ok(Value::Array(_) | Value::Object(_))) = values.next() {
+            let end = values.byte_offset();
+            let rest = body[end..].trim_start();
+            if rest.is_empty()
+                || rest.starts_with(char::from(quote))
+                || rest.starts_with(['>', '/', '<'])
+            {
+                return Some(body[..end].trim().to_owned());
+            }
+        }
+    }
     for idx in 1..value.len() {
         if value.as_bytes()[idx] == quote {
             return Some(unescape_xmlish(value[1..idx].trim()));
@@ -5266,21 +5280,27 @@ mod tests {
     }
 
     #[test]
-    fn draw_image_unquoted_reference_array_preserves_every_source() {
+    fn draw_image_json_reference_arrays_preserve_every_source() {
         for count in [2, 10] {
             let ids: Vec<_> = (1..=count)
                 .map(|index| format!("message_{index}_image_1"))
                 .collect();
             let array = serde_json::to_string_pretty(&ids).expect("reference array");
-            let raw = format!(
-                "<draw_image prompt=\"combine all cards\" file_ids={array} aspect_ratio=\"16:9\" />"
-            );
-            let parsed = parse_assistant_content(&raw).expect("unquoted array");
-            assert_eq!(parsed.tool_steps.len(), 1);
-            assert_eq!(parsed.tool_steps[0].file_ids, ids);
-            assert_eq!(parsed.tool_steps[0].aspect_ratio, "16:9");
+            for array in [&array, &format!("\"{array}\""), &format!("'{array}'")] {
+                let raw = format!(
+                    "<draw_image prompt=\"combine all cards\" file_ids={array} aspect_ratio=\"16:9\" />"
+                );
+                let parsed = parse_assistant_content(&raw).expect("reference array");
+                assert_eq!(parsed.tool_steps.len(), 1);
+                assert_eq!(parsed.tool_steps[0].file_ids, ids);
+                assert_eq!(parsed.tool_steps[0].aspect_ratio, "16:9");
+            }
         }
         assert_eq!(parse_xmlish_attr_value("[\"unfinished\" />"), None);
+        assert_eq!(
+            parse_xmlish_attr_value("\"[1] and more\">"),
+            Some("[1] and more".to_owned())
+        );
     }
 
     #[test]
