@@ -538,7 +538,7 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "file_ids",
         required: false,
-        description: "For editing or combining images, select the file_unique_id or file_id values from the rendered image attachments in this dialog. Pass up to 10 source images together in one call to combine them into one composition. Omit for a new image; current attached or replied-to images are used automatically when present.",
+        description: "Required when editing or combining earlier images: list every requested source using its file_id handle or file_unique_id from the dialog attachments. Pass up to 10 references together in ONE draw_image call. Describing images in prompt does not attach them. Omit only for a new image or when all sources are attached to or quoted by the current message.",
     },
     ToolArgSpec {
         name: "negative_prompt",
@@ -2440,6 +2440,7 @@ fn is_recognized_tool_element(name: &str) -> bool {
         "tool"
             | "tool_call"
             | "tool_calls"
+            | "call_list"
             | "call_name"
             | "tool_name"
             | "arg"
@@ -2846,7 +2847,10 @@ fn scan_xmlish_tool_steps(raw: &str, depth: usize) -> Vec<ToolStep> {
         let name = xmlish_tool_tag_name(tag);
         let lower = name.to_ascii_lowercase();
         let direct = canonical_known_step(&name);
-        let is_wrapper = matches!(lower.as_str(), "call" | "tool" | "tool_call" | "tool_calls");
+        let is_wrapper = matches!(
+            lower.as_str(),
+            "call" | "tool" | "tool_call" | "tool_calls" | "call_list"
+        );
         let names_its_tool = matches!(lower.as_str(), "call_name" | "tool_name" | "name");
         if !is_wrapper && direct.is_none() && !names_its_tool {
             // A reply that first echoes the transcript and then calls a tool still calls it:
@@ -3021,7 +3025,7 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         let body = &remaining[open_end..body_end];
         // A plural container holds calls rather than being one, so its children are parsed
         // in turn; a body that yields none falls through to the single-call reading below.
-        if wrapper == "tool_calls" {
+        if matches!(wrapper, "tool_calls" | "call_list") {
             let nested = parse_xmlish_named_call_steps(body)?;
             if !nested.is_empty() {
                 steps.extend(nested);
@@ -3051,7 +3055,7 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         let arguments_body = xmlish_child_text(body, "arguments")
             .or_else(|| xmlish_child_text(body, "args"))
             .unwrap_or_else(|| {
-                if legacy_call {
+                if legacy_call && xmlish_named_arg_children(body).is_empty() {
                     String::new()
                 } else {
                     body.to_owned()
@@ -3075,7 +3079,8 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
 
 /// Element names models wrap a named tool call in. `starts_with_xml_tag` requires the
 /// whole name, so `<tool_call>` never matches `call` and the list needs no ordering.
-const XMLISH_NAMED_CALL_WRAPPERS: &[&str] = &["call", "tool_call", "tool_calls", "tool"];
+const XMLISH_NAMED_CALL_WRAPPERS: &[&str] =
+    &["call", "tool_call", "tool_calls", "tool", "call_list"];
 
 fn xmlish_named_call_wrapper(raw: &str) -> Option<&'static str> {
     let lower = raw.to_ascii_lowercase();
@@ -5209,6 +5214,33 @@ mod tests {
             tools
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
+        );
+    }
+
+    #[test]
+    fn draw_image_call_list_executes_references_and_keeps_only_reply_text() {
+        let raw = r#"<call_list>
+  <call name="draw_image">
+    <arg name="prompt">combine the original cards</arg>
+    <arg name="file_ids">["message_1_image_1", "message_2_image_1"]</arg>
+  </call>
+</call_list>
+
+Combining the cards."#;
+        let parsed = parse_assistant_content(raw).expect("call list");
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(
+            parsed.tool_steps[0].file_ids,
+            ["message_1_image_1", "message_2_image_1"]
+        );
+        assert_eq!(parsed.text, "Combining the cards.");
+        let quoted = format!("The model wrote: {raw}");
+        assert!(
+            parse_assistant_content(&quoted)
+                .expect("quoted call")
+                .tool_steps
+                .is_empty()
         );
     }
 

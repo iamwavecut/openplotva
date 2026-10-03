@@ -224,6 +224,8 @@ pub trait ImageEditFileResolver: Send + Sync {
         &'a self,
         attachments: &'a [ChatAttachment],
         media_group_id: &'a str,
+        chat_id: i64,
+        thread_id: Option<i32>,
     ) -> ImageEditFileResolveFuture<'a>;
 }
 
@@ -371,7 +373,9 @@ impl MediaGroupImageRegistry {
             return Vec::new();
         };
         let mut unique_ids = Vec::new();
-        for item in entry.items {
+        let mut items = entry.items;
+        items.sort_by_key(|item| item.message_id);
+        for item in items {
             for file_unique_id in item.file_unique_ids {
                 push_unique_trimmed(&mut unique_ids, &file_unique_id);
             }
@@ -385,6 +389,7 @@ pub struct TelegramImageEditFileResolver<UrlProvider> {
     files: openplotva_storage::PostgresTelegramFileStore,
     urls: UrlProvider,
     media_groups: MediaGroupImageRegistry,
+    pending_albums: Option<(i64, openplotva_storage::PostgresTelegramDeliveryStore)>,
 }
 
 impl<UrlProvider> TelegramImageEditFileResolver<UrlProvider> {
@@ -395,6 +400,7 @@ impl<UrlProvider> TelegramImageEditFileResolver<UrlProvider> {
             files,
             urls,
             media_groups: MediaGroupImageRegistry::default(),
+            pending_albums: None,
         }
     }
 
@@ -402,6 +408,16 @@ impl<UrlProvider> TelegramImageEditFileResolver<UrlProvider> {
     #[must_use]
     pub fn with_media_group_registry(mut self, media_groups: MediaGroupImageRegistry) -> Self {
         self.media_groups = media_groups;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pending_albums(
+        mut self,
+        bot_id: i64,
+        store: openplotva_storage::PostgresTelegramDeliveryStore,
+    ) -> Self {
+        self.pending_albums = Some((bot_id, store));
         self
     }
 }
@@ -424,23 +440,40 @@ where
         &'a self,
         attachments: &'a [ChatAttachment],
         media_group_id: &'a str,
+        chat_id: i64,
+        thread_id: Option<i32>,
     ) -> ImageEditFileResolveFuture<'a> {
         Box::pin(async move {
             let file_unique_ids = image_edit_file_unique_ids(attachments);
             if file_unique_ids.is_empty() {
                 return Ok(ImageEditFileSelection::default());
             }
-            let media_group_unique_ids = self
+            let mut media_group_unique_ids = self
                 .media_groups
                 .wait_collect_and_remove_unique_ids(media_group_id)
                 .await;
 
+            if !media_group_id.trim().is_empty()
+                && let Some((bot_id, store)) = &self.pending_albums
+            {
+                let payloads = store
+                    .pending_dialog_payloads(*bot_id, chat_id, thread_id)
+                    .await?;
+                for id in pending_album_image_unique_ids(&payloads, chat_id, media_group_id)? {
+                    push_unique_trimmed(&mut media_group_unique_ids, &id);
+                }
+            }
+            let requested_ids = merge_unique_strings(&file_unique_ids, &media_group_unique_ids);
+            if requested_ids.len() > MAX_IMAGE_EDIT_SOURCE_IMAGES {
+                return Err(
+                    Box::new(std::io::Error::other("too many album reference images"))
+                        as ToolboxError,
+                );
+            }
+
             let rows = self
                 .files
-                .list_files_by_unique_ids(&merge_unique_strings(
-                    &file_unique_ids,
-                    &media_group_unique_ids,
-                ))
+                .list_files_by_unique_ids(&requested_ids)
                 .await
                 .map_err(|error| Box::new(error) as ToolboxError)?;
             let selection =
@@ -450,6 +483,11 @@ where
                 if let Ok(Some(url)) = self.urls.image_edit_file_url(latest_file_id).await {
                     photo_urls.push(url);
                 }
+            }
+            if requested_ids.len() > 1 && photo_urls.len() != requested_ids.len() {
+                return Err(Box::new(std::io::Error::other(
+                    "an album reference image could not be resolved",
+                )) as ToolboxError);
             }
 
             Ok(ImageEditFileSelection {
@@ -465,6 +503,8 @@ impl ImageEditFileResolver for openplotva_storage::PostgresTelegramFileStore {
         &'a self,
         attachments: &'a [ChatAttachment],
         _media_group_id: &'a str,
+        _chat_id: i64,
+        _thread_id: Option<i32>,
     ) -> ImageEditFileResolveFuture<'a> {
         Box::pin(async move {
             let file_unique_ids = image_edit_file_unique_ids(attachments);
@@ -484,6 +524,40 @@ impl ImageEditFileResolver for openplotva_storage::PostgresTelegramFileStore {
             })
         })
     }
+}
+
+fn pending_album_image_unique_ids(
+    payloads: &[Vec<u8>],
+    chat_id: i64,
+    media_group_id: &str,
+) -> Result<Vec<String>, ToolboxError> {
+    let mut messages = Vec::new();
+    for payload in payloads {
+        let update = crate::updates::decode_telegram_update_payload(payload)?;
+        let carapax::types::UpdateType::Message(message) = update.update_type else {
+            continue;
+        };
+        if i64::from(message.chat.get_id()) == chat_id
+            && message
+                .media_group_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == media_group_id)
+        {
+            messages.push(message);
+        }
+    }
+    messages.sort_by_key(|message| message.id);
+    let mut ids = Vec::new();
+    for message in messages {
+        for id in image_edit_file_unique_ids(
+            &openplotva_updates::build_fetcher_message_context(&message)
+                .meta
+                .attachments,
+        ) {
+            push_unique_trimmed(&mut ids, &id);
+        }
+    }
+    Ok(ids)
 }
 
 pub trait DrawImageVipStatus: Send + Sync {
@@ -1475,7 +1549,12 @@ impl TaskmanDialogToolAdapter {
             ));
         };
         let files = resolver
-            .resolve_image_edit_files(&request.attachments, &request.edit_media_group_id)
+            .resolve_image_edit_files(
+                &request.attachments,
+                &request.edit_media_group_id,
+                request.chat_id,
+                request.thread_id,
+            )
             .await?;
         let source_count = image_edit_file_unique_ids(&request.attachments).len();
         if files.photo_file_id.trim().is_empty()
@@ -1502,7 +1581,7 @@ impl TaskmanDialogToolAdapter {
         let user_id = request.user_id;
         let message_id = request.message_id;
         let thread_id = request.thread_id;
-        let job = new_image_edit_job_at(
+        let mut job = new_image_edit_job_at(
             ImageEditJobParams {
                 chat_id: request.chat_id,
                 message_id: request.message_id,
@@ -1517,6 +1596,11 @@ impl TaskmanDialogToolAdapter {
         )
         .with_name("image_edit")
         .with_priority(plan.priority);
+        if !request.original_prompt.trim().is_empty()
+            && let Some(image) = job.data.image_data.as_mut()
+        {
+            image.original_text = sanitize_tool_text(&request.original_prompt);
+        }
 
         if self
             .task_enqueue_limited(plan.queue_name, chat_id, user_id)
@@ -2310,6 +2394,13 @@ where
                 Ok(attachments) => attachments,
                 Err(reason) => return Ok(ToolResult::failed("draw_image_source_invalid", reason)),
             };
+            let original_prompt = if attachments.iter().any(|image| image.kind == "image")
+                && !req.context.message_text.trim().is_empty()
+            {
+                sanitize_tool_text(&req.context.message_text)
+            } else {
+                prompt.clone()
+            };
             let request = DrawImageScheduleRequest {
                 chat_id: req.context.chat_id,
                 thread_id: req.context.thread_id,
@@ -2324,7 +2415,7 @@ where
                 negative_prompt: sanitize_tool_text(&req.negative_prompt),
                 aspect_ratio: sanitize_tool_text(&req.aspect_ratio),
                 seed: sanitize_tool_text(&req.seed),
-                original_prompt: prompt,
+                original_prompt,
             };
             match scheduler.schedule_image(request).await {
                 Ok(result) => Ok(dialog_draw_image_tool_result(&result)),
@@ -3711,6 +3802,8 @@ mod tests {
             &'a self,
             attachments: &'a [ChatAttachment],
             _media_group_id: &'a str,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
         ) -> ImageEditFileResolveFuture<'a> {
             let result = {
                 match self.calls.lock() {
@@ -4161,6 +4254,7 @@ mod tests {
         let request = DrawRequest {
             context: ToolContext {
                 message_meta: meta,
+                message_text: "объедини эти картинки".to_owned(),
                 ..context()
             },
             prompt: "  neon castle  ".to_owned(),
@@ -4203,13 +4297,13 @@ mod tests {
                 user_full_name: "Alice".to_owned(),
                 prompt: "neon castle".to_owned(),
                 prompt_variants: Vec::new(),
-                message_text: "$".to_owned(),
+                message_text: "объедини эти картинки".to_owned(),
                 attachments: vec![attachment],
                 edit_media_group_id: String::new(),
                 negative_prompt: "blur".to_owned(),
                 aspect_ratio: "16:9".to_owned(),
                 seed: "42".to_owned(),
-                original_prompt: "neon castle".to_owned(),
+                original_prompt: "объедини эти картинки".to_owned(),
             }]
         );
         Ok(())

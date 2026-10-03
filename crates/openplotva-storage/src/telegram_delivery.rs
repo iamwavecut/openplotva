@@ -892,6 +892,28 @@ impl PostgresTelegramDeliveryStore {
         &self.pool
     }
 
+    /// Read ahead within one serialized dialog lane without claiming its updates.
+    pub async fn pending_dialog_payloads(
+        &self,
+        bot_id: i64,
+        chat_id: i64,
+        thread_id: Option<i32>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(sqlx::query_scalar(
+            "SELECT raw_payload FROM telegram_update_inbox \
+             WHERE bot_id = $1 AND ordering_key = $2 \
+             AND status IN ('pending', 'processing', 'retry_wait') \
+             ORDER BY stream_ms, stream_seq, id LIMIT 1000",
+        )
+        .bind(bot_id)
+        .bind(format!(
+            "dialog:{bot_id}:{chat_id}:{}",
+            thread_id.unwrap_or_default()
+        ))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Commit a Stream batch with one inbox multi-insert and, when needed, one
     /// quarantine multi-insert. No per-entry SQL is executed.
     pub async fn materialize_update_batch(

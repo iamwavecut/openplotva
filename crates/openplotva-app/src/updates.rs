@@ -1288,7 +1288,9 @@ where
     transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
 }
 
-fn decode_telegram_update_payload(raw_payload: &[u8]) -> Result<TelegramUpdate, serde_json::Error> {
+pub(crate) fn decode_telegram_update_payload(
+    raw_payload: &[u8],
+) -> Result<TelegramUpdate, serde_json::Error> {
     let mut payload = serde_json::from_slice(raw_payload)?;
     remove_legacy_forward_fields(&mut payload);
     prefer_sender_chat_in_messages(&mut payload);
