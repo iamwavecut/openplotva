@@ -3889,9 +3889,14 @@ fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseE
         return Ok((ToolStep::default(), false));
     };
     if !raw.trim_start().starts_with(&tag)
-        && ['"', '\'']
-            .iter()
-            .any(|quote| tag.chars().filter(|ch| ch == quote).count() % 2 != 0)
+        && tag
+            .chars()
+            .fold(None, |quote, ch| match (quote, ch) {
+                (None, '"' | '\'') => Some(ch),
+                (Some(open), ch) if open == ch => None,
+                _ => quote,
+            })
+            .is_some()
     {
         return Ok((ToolStep::default(), false));
     }
