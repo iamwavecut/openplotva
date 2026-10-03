@@ -2522,6 +2522,11 @@ fn draw_image_attachments(req: &DrawRequest) -> Result<Vec<ChatAttachment>, Stri
         let mut selected = Vec::<ChatAttachment>::new();
         for id in &req.file_ids {
             let id = id.trim();
+            let id = req
+                .context
+                .image_reference_ids
+                .get(id)
+                .map_or(id, |value| value.trim());
             let Some(image) = req
                 .context
                 .message_meta
@@ -3875,6 +3880,7 @@ mod tests {
             message_text: "$".to_owned(),
             message_meta: ChatMessageMeta::default(),
             image_attachments: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -4375,7 +4381,9 @@ mod tests {
             &openplotva_dialog::ToolStep {
                 step: "draw_image".to_owned(),
                 prompt: input.message.text.clone(),
-                file_ids: expected_ids,
+                file_ids: (11..=20)
+                    .map(|message_id| format!("message_{message_id}_image_1"))
+                    .collect(),
                 ..Default::default()
             },
         )

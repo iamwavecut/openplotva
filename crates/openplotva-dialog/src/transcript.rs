@@ -24,7 +24,39 @@ pub fn dialog_tool_context(input: &DialogInput) -> ToolContext {
         message_text: input.message.text.clone(),
         message_meta: input.message.meta.clone(),
         image_attachments: dialog_image_attachments(input),
+        image_reference_ids: dialog_image_reference_ids(input),
     }
+}
+
+fn dialog_image_reference_ids(input: &DialogInput) -> std::collections::BTreeMap<String, String> {
+    let mut references = std::collections::BTreeMap::new();
+    for (message_id, meta) in input
+        .history
+        .iter()
+        .map(|message| (message.message_id, &message.meta))
+        .chain(std::iter::once((input.message.id, &input.message.meta)))
+    {
+        let mut media_index = 0;
+        for attachment in &meta.attachments {
+            let kind = attachment.kind.trim().to_ascii_lowercase();
+            if attachment.file_unique_id.trim().is_empty()
+                || !matches!(
+                    kind.as_str(),
+                    "image" | "video" | "animation" | "video_note"
+                )
+            {
+                continue;
+            }
+            media_index += 1;
+            if kind == "image" && message_id > 0 {
+                references.insert(
+                    format!("message_{message_id}_image_{media_index}"),
+                    attachment.file_unique_id.clone(),
+                );
+            }
+        }
+    }
+    references
 }
 
 fn dialog_image_attachments(input: &DialogInput) -> Vec<openplotva_core::ChatAttachment> {
