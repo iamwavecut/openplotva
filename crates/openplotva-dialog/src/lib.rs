@@ -2441,6 +2441,7 @@ fn is_recognized_tool_element(name: &str) -> bool {
             | "tool_call"
             | "tool_calls"
             | "call_list"
+            | "call_batch"
             | "call_name"
             | "tool_name"
             | "arg"
@@ -2849,7 +2850,7 @@ fn scan_xmlish_tool_steps(raw: &str, depth: usize) -> Vec<ToolStep> {
         let direct = canonical_known_step(&name);
         let is_wrapper = matches!(
             lower.as_str(),
-            "call" | "tool" | "tool_call" | "tool_calls" | "call_list"
+            "call" | "tool" | "tool_call" | "tool_calls" | "call_list" | "call_batch"
         );
         let names_its_tool = matches!(lower.as_str(), "call_name" | "tool_name" | "name");
         if !is_wrapper && direct.is_none() && !names_its_tool {
@@ -2943,6 +2944,12 @@ fn xmlish_wrapper_element_step(tag: &str, body: &str) -> Option<ToolStep> {
                 arguments.insert((*key).to_owned(), Value::String(value));
             }
         }
+        if name == STEP_SEND_MESSAGE
+            && !arguments.contains_key("text")
+            && let Some(text) = xmlish_child_text(&arguments_body, "p")
+        {
+            arguments.insert("text".to_owned(), Value::String(text));
+        }
         return decode_tool_call_arguments(name, &Value::Object(arguments)).ok();
     }
     // `<tool_call>{ "name": "draw_image", "arguments": { … } }</tool_call>`
@@ -3025,7 +3032,7 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
         let body = &remaining[open_end..body_end];
         // A plural container holds calls rather than being one, so its children are parsed
         // in turn; a body that yields none falls through to the single-call reading below.
-        if matches!(wrapper, "tool_calls" | "call_list") {
+        if matches!(wrapper, "tool_calls" | "call_list" | "call_batch") {
             let nested = parse_xmlish_named_call_steps(body)?;
             if !nested.is_empty() {
                 steps.extend(nested);
@@ -3067,6 +3074,12 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
                 arguments.insert((*key).to_owned(), Value::String(value));
             }
         }
+        if name == STEP_SEND_MESSAGE
+            && !arguments.contains_key("text")
+            && let Some(text) = xmlish_child_text(&arguments_body, "p")
+        {
+            arguments.insert("text".to_owned(), Value::String(text));
+        }
         let mut step = decode_tool_call_arguments(name, &Value::Object(arguments))?;
         // An element that names its tool in an attribute carries its arguments there too.
         populate_xmlish_tool_attrs(&remaining[..open_end], &mut step)?;
@@ -3079,8 +3092,14 @@ fn parse_xmlish_named_call_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseEr
 
 /// Element names models wrap a named tool call in. `starts_with_xml_tag` requires the
 /// whole name, so `<tool_call>` never matches `call` and the list needs no ordering.
-const XMLISH_NAMED_CALL_WRAPPERS: &[&str] =
-    &["call", "tool_call", "tool_calls", "tool", "call_list"];
+const XMLISH_NAMED_CALL_WRAPPERS: &[&str] = &[
+    "call",
+    "tool_call",
+    "tool_calls",
+    "tool",
+    "call_list",
+    "call_batch",
+];
 
 fn xmlish_named_call_wrapper(raw: &str) -> Option<&'static str> {
     let lower = raw.to_ascii_lowercase();
@@ -4024,7 +4043,7 @@ fn xmlish_reference_list(body: &str) -> Option<Vec<String>> {
         }
         let end = xmlish_tag_end(rest, 0)?;
         let name = xmlish_tool_tag_name(&rest[..=end]);
-        if !matches!(name.as_str(), "arg" | "item" | "string") {
+        if !matches!(name.as_str(), "arg" | "item" | "string" | "file_id") {
             return None;
         }
         let after_open = &rest[end + 1..];
@@ -5215,6 +5234,35 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn draw_image_call_batch_keeps_all_file_id_children() {
+        for count in [2, 10] {
+            let ids: Vec<_> = (1..=count)
+                .map(|index| format!("message_{index}_image_1"))
+                .collect();
+            let children = ids
+                .iter()
+                .map(|id| format!("<file_id>{id}</file_id>"))
+                .collect::<String>();
+            let raw = format!(
+                "<call_batch><call><tool_name>draw_image</tool_name><arguments><prompt>combine all cards</prompt><file_ids>{children}</file_ids></arguments></call><call><tool_name>send_message</tool_name><arguments><p>Combining the cards.</p></arguments></call></call_batch>"
+            );
+            let parsed = parse_assistant_content(&raw).expect("call batch");
+            assert_eq!(parsed.tool_steps.len(), 2);
+            assert_eq!(parsed.tool_steps[0].step, STEP_DRAW_IMAGE);
+            assert_eq!(parsed.tool_steps[0].file_ids, ids);
+            assert_eq!(parsed.tool_steps[1].step, STEP_SEND_MESSAGE);
+            assert_eq!(parsed.tool_steps[1].text, "Combining the cards.");
+            assert_eq!(parsed.text, "");
+            assert!(
+                parse_assistant_content(&format!("The model wrote: {raw}"))
+                    .expect("quoted batch")
+                    .tool_steps
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
