@@ -2444,6 +2444,8 @@ fn is_recognized_tool_element(name: &str) -> bool {
             | "call_batch"
             | "call_name"
             | "tool_name"
+            | "args"
+            | "arguments"
             | "arg"
             | "argument"
             | "param"
@@ -2995,7 +2997,7 @@ fn xmlish_sibling_named_step(name_body: &str, rest: &str) -> Option<ToolStep> {
         .filter_map(|marker| index_fold(rest, marker))
         .min()
         .unwrap_or(rest.len());
-    let arguments = xmlish_named_arg_children(&rest[..end]);
+    let arguments = xmlish_element_arguments("", &rest[..end]);
     (!arguments.is_empty())
         .then(|| decode_tool_call_arguments(name, &Value::Object(arguments)).ok())
         .flatten()
@@ -3886,6 +3888,13 @@ fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseE
     let Some(tag) = first_xmlish_tool_tag(raw) else {
         return Ok((ToolStep::default(), false));
     };
+    if !raw.trim_start().starts_with(&tag)
+        && ['"', '\'']
+            .iter()
+            .any(|quote| tag.chars().filter(|ch| ch == quote).count() % 2 != 0)
+    {
+        return Ok((ToolStep::default(), false));
+    }
     if let Some(call) = xmlish_tool_attr(&tag, "call") {
         return parse_bare_tool_call_step(&call);
     }
@@ -4326,7 +4335,13 @@ fn parse_quoted_xmlish_attr_value(value: &str, quote: u8) -> Option<String> {
             return Some(unescape_xmlish(value[1..idx].trim()));
         }
     }
-    None
+    // Recover an omitted closing quote only for complete JSON before the next tag.
+    let encoded = value[1..].split('<').next()?.trim_end_matches('>').trim();
+    let decoded = unescape_xmlish(encoded);
+    match serde_json::from_str::<Value>(&decoded).ok()? {
+        Value::Object(_) | Value::Array(_) => Some(decoded),
+        _ => None,
+    }
 }
 
 fn unescape_xmlish(value: &str) -> String {
@@ -5234,6 +5249,41 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn draw_image_sibling_and_unclosed_json_arguments_keep_references() {
+        for count in [2, 10] {
+            let ids: Vec<_> = (1..=count)
+                .map(|index| format!("message_{index}_image_1"))
+                .collect();
+            let children = ids
+                .iter()
+                .map(|id| format!("<file_id>{id}</file_id>"))
+                .collect::<String>();
+            let json = serde_json::json!({"prompt":"combine all cards","file_ids":ids})
+                .to_string()
+                .replace('"', "&quot;");
+            for raw in [
+                format!(
+                    "<call_name>draw_image</call_name><args><prompt>combine all cards</prompt><file_ids>{children}</file_ids></args>"
+                ),
+                format!("<tool_call name=\"draw_image\" args=\"{json}</tool_call>"),
+            ] {
+                let parsed = parse_assistant_content(&raw).expect("production arguments");
+                assert_eq!(parsed.tool_steps.len(), 1, "{raw}");
+                assert_eq!(parsed.tool_steps[0].prompt, "combine all cards", "{raw}");
+                assert_eq!(parsed.tool_steps[0].file_ids, ids, "{raw}");
+                assert_eq!(parsed.text, "", "{raw}");
+                assert!(
+                    parse_assistant_content(&format!("The model wrote: {raw}"))
+                        .expect("quoted call")
+                        .tool_steps
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(parse_xmlish_attr_value("\"{broken}</tool_call>"), None);
     }
 
     #[test]
