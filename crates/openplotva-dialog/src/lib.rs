@@ -535,7 +535,7 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "file_ids",
         required: false,
-        description: "For editing or combining images, select the file_unique_id values from the rendered attachments in this dialog. Pass all source images together in one call to combine them into one composition. Use these stable IDs, not message_N_image_M handles. Omit for a new image; current attached or replied-to images are used automatically when present.",
+        description: "For editing or combining images, select the file_unique_id values from the rendered attachments in this dialog. Pass up to 10 source images together in one call to combine them into one composition. Use these stable IDs, not message_N_image_M handles. Omit for a new image; current attached or replied-to images are used automatically when present.",
     },
     ToolArgSpec {
         name: "negative_prompt",
@@ -1039,7 +1039,10 @@ fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
                 "items".to_owned(),
                 json!({"type": "string", "minLength": 1}),
             );
-            schema.insert("maxItems".to_owned(), Value::from(10));
+            schema.insert(
+                "maxItems".to_owned(),
+                Value::from(openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES),
+            );
         }
         "hours" => {
             schema.insert("type".to_owned(), Value::String("integer".to_owned()));

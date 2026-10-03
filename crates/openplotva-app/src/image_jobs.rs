@@ -8379,15 +8379,16 @@ mod tests {
             transport,
         );
 
+        let image_urls: Vec<_> = (0..openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| format!("https://files.test/{index}.png"))
+            .collect();
+        let mut photo_urls = image_urls.clone();
+        photo_urls.push("raw-b64-ignored-because-url-wins".to_owned());
         let result = editor
             .edit_image_with_job_id(
                 ImageEditRequest {
                     prompt: " make it night ".to_owned(),
-                    photo_urls: vec![
-                        " https://files.test/input.png ".to_owned(),
-                        "https://files.test/second.png".to_owned(),
-                        "raw-b64-ignored-because-url-wins".to_owned(),
-                    ],
+                    photo_urls,
                     ..ImageEditRequest::default()
                 },
                 "edit-123",
@@ -8397,6 +8398,13 @@ mod tests {
 
         assert_eq!(result.image_urls, vec!["https://img.test/edit.png"]);
         let requests = probe.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == AifarmHttpMethod::Post)
+                .count(),
+            1
+        );
         let job: DiscoveryJobRequest =
             serde_json::from_slice(&requests[0].body).expect("job request");
         assert_eq!(job.idempotency_key, "edit-123");
@@ -8406,7 +8414,7 @@ mod tests {
             draw_request,
             json!({
                 "prompt": "make it night",
-                "image_url": ["https://files.test/input.png", "https://files.test/second.png"]
+                "image_url": image_urls
             })
         );
     }

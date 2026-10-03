@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
+use openplotva_core::{
+    ChatAttachment, ChatMessageMeta, MAX_IMAGE_EDIT_SOURCE_IMAGES, SENDER_TYPE_USER,
+};
 use openplotva_dialog::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest,
     IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE, RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
@@ -2517,9 +2519,6 @@ where
 fn draw_image_attachments(req: &DrawRequest) -> Result<Vec<ChatAttachment>, String> {
     let available = &req.context.image_attachments;
     if !req.file_ids.is_empty() {
-        if req.file_ids.len() > 10 {
-            return Err("at most 10 source images can be edited together".to_owned());
-        }
         let mut selected = Vec::<ChatAttachment>::new();
         for id in &req.file_ids {
             let id = id.trim();
@@ -2544,7 +2543,7 @@ fn draw_image_attachments(req: &DrawRequest) -> Result<Vec<ChatAttachment>, Stri
                 selected.push(image.clone());
             }
         }
-        return Ok(selected);
+        return validate_image_edit_sources(selected);
     }
 
     let current = &req.context.message_meta.attachments;
@@ -2569,7 +2568,20 @@ fn draw_image_attachments(req: &DrawRequest) -> Result<Vec<ChatAttachment>, Stri
             selected.push(image.clone());
         }
     }
-    Ok(selected)
+    validate_image_edit_sources(selected)
+}
+
+fn validate_image_edit_sources(images: Vec<ChatAttachment>) -> Result<Vec<ChatAttachment>, String> {
+    let source_count = images
+        .iter()
+        .filter(|image| image.kind.trim() == "image")
+        .count();
+    if source_count > MAX_IMAGE_EDIT_SOURCE_IMAGES {
+        return Err(format!(
+            "at most {MAX_IMAGE_EDIT_SOURCE_IMAGES} source images can be edited together"
+        ));
+    }
+    Ok(images)
 }
 
 fn dialog_draw_image_tool_result(result: &DrawImageScheduleResult) -> ToolResult {
@@ -4241,10 +4253,9 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "file-a".to_owned(),
-                photo_urls: vec![
-                    "https://files.test/a.png".to_owned(),
-                    "https://files.test/b.png".to_owned(),
-                ],
+                photo_urls: (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+                    .map(|index| format!("https://files.test/{index}.png"))
+                    .collect(),
             },
         ));
         let adapter = Arc::new(
@@ -4264,6 +4275,12 @@ mod tests {
             media_group_id: "album".to_owned(),
             ..image_attachment("photo-b")
         };
+        let extra: Vec<_> = (2..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| ChatAttachment {
+                media_group_id: "album".to_owned(),
+                ..image_attachment(&format!("photo-{index}"))
+            })
+            .collect();
         let mut input = openplotva_dialog::DialogInput {
             context: openplotva_dialog::DialogContext {
                 chat_id: 42,
@@ -4292,6 +4309,24 @@ mod tests {
             }],
             ..Default::default()
         };
+        for (index, image) in extra.into_iter().enumerate() {
+            input.history.push(openplotva_dialog::HistoryMessage {
+                message_id: 12 + index as i32,
+                meta: ChatMessageMeta {
+                    attachments: vec![image],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        input.message.id = 20;
+        let expected_ids: Vec<_> = std::iter::once("photo-a".to_owned())
+            .chain((2..MAX_IMAGE_EDIT_SOURCE_IMAGES).map(|index| format!("photo-{index}")))
+            .chain(std::iter::once("photo-b".to_owned()))
+            .collect();
+        let expected_urls: Vec<_> = (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| format!("https://files.test/{index}.png"))
+            .collect();
         let result = openplotva_dialog::dispatch_dialog_tool(
             &toolbox,
             &openplotva_dialog::dialog_tool_context(&input),
@@ -4308,7 +4343,7 @@ mod tests {
                 .iter()
                 .map(|image| image.file_unique_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["photo-a", "photo-b"]
+            expected_ids.iter().map(String::as_str).collect::<Vec<_>>()
         );
         let records = queue.records();
         assert_eq!(records.len(), 1);
@@ -4324,14 +4359,14 @@ mod tests {
                 .as_ref()
                 .expect("image edit")
                 .image_urls,
-            vec!["https://files.test/a.png", "https://files.test/b.png"]
+            expected_urls
         );
         input.history.push(openplotva_dialog::HistoryMessage {
             message_id: input.message.id,
             meta: input.message.meta.clone(),
             ..Default::default()
         });
-        input.message.id = 13;
+        input.message.id = 21;
         input.message.text = "combine both photos into one scene".to_owned();
         input.message.meta = ChatMessageMeta::default();
         let result = openplotva_dialog::dispatch_dialog_tool(
@@ -4340,14 +4375,14 @@ mod tests {
             &openplotva_dialog::ToolStep {
                 step: "draw_image".to_owned(),
                 prompt: input.message.text.clone(),
-                file_ids: vec!["photo-a".to_owned(), "photo-b".to_owned()],
+                file_ids: expected_ids,
                 ..Default::default()
             },
         )
         .await?;
         assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
         assert_eq!(resolver.calls().len(), 2);
-        assert_eq!(resolver.calls()[1].len(), 2);
+        assert_eq!(resolver.calls()[1].len(), MAX_IMAGE_EDIT_SOURCE_IMAGES);
         let records = queue.records();
         assert_eq!(records.len(), 2);
         assert!(
@@ -4364,7 +4399,7 @@ mod tests {
                 .expect("followup edit")
                 .image_urls
                 .len(),
-            2
+            MAX_IMAGE_EDIT_SOURCE_IMAGES
         );
         Ok(())
     }
@@ -4437,6 +4472,52 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn draw_image_supports_model_maximum_and_rejects_excess_sources() {
+        for count in [
+            MAX_IMAGE_EDIT_SOURCE_IMAGES,
+            MAX_IMAGE_EDIT_SOURCE_IMAGES + 1,
+        ] {
+            let images: Vec<_> = (0..count)
+                .map(|index| ChatAttachment {
+                    media_group_id: "album".to_owned(),
+                    ..image_attachment(&format!("photo-{index}"))
+                })
+                .collect();
+            let mut request = DrawRequest {
+                context: ToolContext {
+                    message_meta: ChatMessageMeta {
+                        attachments: vec![images[0].clone()],
+                        ..Default::default()
+                    },
+                    image_attachments: images.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            for explicit in [false, true] {
+                request.file_ids = if explicit {
+                    images
+                        .iter()
+                        .map(|image| image.file_unique_id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let selected = draw_image_attachments(&request);
+                if count == MAX_IMAGE_EDIT_SOURCE_IMAGES {
+                    assert_eq!(selected.expect("model maximum"), images);
+                } else {
+                    assert!(
+                        selected
+                            .expect_err("too many sources")
+                            .contains("at most 10")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
