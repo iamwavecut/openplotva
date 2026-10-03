@@ -121,6 +121,9 @@ pub struct ToolContext {
     /// Image references from the materialized dialog, available for explicit edits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_attachments: Vec<openplotva_core::ChatAttachment>,
+    /// Rendered image handles mapped to stable IDs within this dialog.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub image_reference_ids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Deserialize, PartialEq, Serialize)]
@@ -535,7 +538,7 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "file_ids",
         required: false,
-        description: "For editing or combining images, select the file_unique_id values from the rendered attachments in this dialog. Pass up to 10 source images together in one call to combine them into one composition. Use these stable IDs, not message_N_image_M handles. Omit for a new image; current attached or replied-to images are used automatically when present.",
+        description: "For editing or combining images, select the file_unique_id or file_id values from the rendered image attachments in this dialog. Pass up to 10 source images together in one call to combine them into one composition. Omit for a new image; current attached or replied-to images are used automatically when present.",
     },
     ToolArgSpec {
         name: "negative_prompt",
@@ -3967,7 +3970,7 @@ fn xmlish_named_arg_children(body: &str) -> serde_json::Map<String, Value> {
             continue;
         }
         let close = format!("</{element}>");
-        let Some(relative_close) = index_fold(&body[open_end..], &close) else {
+        let Some(relative_close) = xmlish_balanced_close(&body[open_end..], &element) else {
             break;
         };
         let value = unescape_xmlish(body[open_end..open_end + relative_close].trim());
@@ -3977,6 +3980,58 @@ fn xmlish_named_arg_children(body: &str) -> serde_json::Map<String, Value> {
         offset = open_end + relative_close + close.len();
     }
     arguments
+}
+
+fn xmlish_balanced_close(body: &str, name: &str) -> Option<usize> {
+    let mut depth = 1;
+    let mut offset = 0;
+    while let Some(relative_start) = body[offset..].find('<') {
+        let start = offset + relative_start;
+        let end = xmlish_tag_end(body, start)?;
+        let tag = &body[start..=end];
+        let closing = tag.starts_with("</");
+        let open_tag = if closing {
+            tag.replacen("</", "<", 1)
+        } else {
+            tag.to_owned()
+        };
+        if xmlish_tool_tag_name(&open_tag).eq_ignore_ascii_case(name) {
+            if closing {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start);
+                }
+            } else if !tag.trim_end().ends_with("/>") {
+                depth += 1;
+            }
+        }
+        offset = end + 1;
+    }
+    None
+}
+
+fn xmlish_reference_list(body: &str) -> Option<Vec<String>> {
+    let mut rest = body.trim();
+    let mut values = Vec::new();
+    while !rest.is_empty() {
+        if !rest.starts_with('<') {
+            return None;
+        }
+        let end = xmlish_tag_end(rest, 0)?;
+        let name = xmlish_tool_tag_name(&rest[..=end]);
+        if !matches!(name.as_str(), "arg" | "item" | "string") {
+            return None;
+        }
+        let after_open = &rest[end + 1..];
+        let close = xmlish_balanced_close(after_open, &name)?;
+        let value = after_open[..close].trim();
+        if value.is_empty() || value.contains('<') {
+            return None;
+        }
+        values.push(unescape_xmlish(value));
+        rest = after_open[close + name.len() + 3..].trim();
+    }
+    (!values.is_empty()).then_some(values)
 }
 
 fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)>, ToolParseError> {
@@ -4297,7 +4352,9 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     }
     if let Some(value) = lookup("file_ids") {
         step.file_ids = serde_json::from_str(&value)
-            .unwrap_or_else(|_| value.split(',').map(|id| id.trim().to_owned()).collect());
+            .ok()
+            .or_else(|| xmlish_reference_list(&value))
+            .unwrap_or_else(|| value.split(',').map(|id| id.trim().to_owned()).collect());
     }
     if let Some(value) = lookup("query") {
         step.query = value;
@@ -5153,6 +5210,28 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn draw_image_nested_xml_reference_list_preserves_every_item() {
+        for count in [2, 10] {
+            let ids: Vec<_> = (1..=count)
+                .map(|index| format!("message_{index}_image_1"))
+                .collect();
+            let children = ids
+                .iter()
+                .map(|id| format!("<arg>{id}</arg>"))
+                .collect::<String>();
+            let raw = format!(
+                "<call name=\"draw_image\"><args><arg name=\"prompt\">combine all</arg><arg name=\"file_ids\">{children}</arg><arg name=\"seed\">5</arg></args></call>"
+            );
+            let step = parse_assistant_content(&raw)
+                .expect("nested XML")
+                .tool_steps
+                .remove(0);
+            assert_eq!(step.file_ids, ids);
+            assert_eq!(step.seed, "5");
+        }
     }
 
     #[test]
