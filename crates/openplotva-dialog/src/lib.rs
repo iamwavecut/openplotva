@@ -4328,6 +4328,15 @@ fn parse_xmlish_attr_value(value: &str) -> Option<String> {
     if first == b'"' || first == b'\'' {
         return parse_quoted_xmlish_attr_value(value, first);
     }
+    if matches!(first, b'[' | b'{') {
+        let mut values = serde_json::Deserializer::from_str(value).into_iter::<Value>();
+        return match values.next()? {
+            Ok(Value::Array(_) | Value::Object(_)) => {
+                Some(value[..values.byte_offset()].to_owned())
+            }
+            _ => None,
+        };
+    }
     let end = value
         .find([' ', '\t', '\n', '\r', '>', '/'])
         .unwrap_or(value.len());
@@ -5254,6 +5263,24 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn draw_image_unquoted_reference_array_preserves_every_source() {
+        for count in [2, 10] {
+            let ids: Vec<_> = (1..=count)
+                .map(|index| format!("message_{index}_image_1"))
+                .collect();
+            let array = serde_json::to_string_pretty(&ids).expect("reference array");
+            let raw = format!(
+                "<draw_image prompt=\"combine all cards\" file_ids={array} aspect_ratio=\"16:9\" />"
+            );
+            let parsed = parse_assistant_content(&raw).expect("unquoted array");
+            assert_eq!(parsed.tool_steps.len(), 1);
+            assert_eq!(parsed.tool_steps[0].file_ids, ids);
+            assert_eq!(parsed.tool_steps[0].aspect_ratio, "16:9");
+        }
+        assert_eq!(parse_xmlish_attr_value("[\"unfinished\" />"), None);
     }
 
     #[test]
