@@ -32,6 +32,7 @@ pub async fn dispatch_dialog_tool(
                 .draw_image(DrawRequest {
                     context: meta.clone(),
                     prompt: step.prompt.clone(),
+                    file_ids: step.file_ids.clone(),
                     negative_prompt: step.negative_prompt.clone(),
                     aspect_ratio: step.aspect_ratio.clone(),
                     seed: step.seed.clone(),

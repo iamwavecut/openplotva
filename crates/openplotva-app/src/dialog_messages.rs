@@ -2360,7 +2360,17 @@ async fn schedule_direct_image_shortcut(
                     if target_is_current {
                         message_media_group_id(request.message)
                     } else {
-                        String::new()
+                        request
+                            .message
+                            .reply_to
+                            .as_ref()
+                            .and_then(|reply| match reply {
+                                TelegramReplyTo::Message(reply) => {
+                                    Some(message_media_group_id(reply))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
                     },
                 )
             } else {
@@ -2377,7 +2387,15 @@ async fn schedule_direct_image_shortcut(
                 if target_is_current {
                     message_media_group_id(request.message)
                 } else {
-                    String::new()
+                    request
+                        .message
+                        .reply_to
+                        .as_ref()
+                        .and_then(|reply| match reply {
+                            TelegramReplyTo::Message(reply) => Some(message_media_group_id(reply)),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
                 },
             )
         }
@@ -7285,6 +7303,32 @@ mod tests {
         assert_eq!(calls[0].attachments.len(), 1);
         assert_eq!(calls[0].attachments[0].file_unique_id, "reply-photo-1");
         assert_eq!(calls[0].attachments[0].caption, "original caption");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_edit_command_targets_replied_album() -> Result<(), Box<dyn std::error::Error>> {
+        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
+        let scheduler = SchedulerStub::default();
+        let mut update = serde_json::to_value(reply_photo_text_update(
+            "fix brightness",
+            "original caption",
+        )?)?;
+        update["message"]["reply_to_message"]["media_group_id"] = json!("reply-album");
+        handle_dialog_message_update_or_else_with_image(
+            &scheduler,
+            Some(&image_scheduler),
+            None,
+            &test_config(),
+            serde_json::from_value(update)?,
+            |_update| async { Err("should not delegate") },
+        )
+        .await?;
+        assert_eq!(
+            image_scheduler.calls()[0].edit_media_group_id,
+            "reply-album"
+        );
+        assert_eq!(image_scheduler.capture_calls()[0].0, "reply-album");
         Ok(())
     }
 

@@ -265,6 +265,9 @@ pub struct ChatMessageMeta {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatAttachment {
+    /// Telegram album containing this attachment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_group_id: String,
     /// Attachment kind, such as `image`, `audio`, or `contact`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,

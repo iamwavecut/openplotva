@@ -8385,6 +8385,7 @@ mod tests {
                     prompt: " make it night ".to_owned(),
                     photo_urls: vec![
                         " https://files.test/input.png ".to_owned(),
+                        "https://files.test/second.png".to_owned(),
                         "raw-b64-ignored-because-url-wins".to_owned(),
                     ],
                     ..ImageEditRequest::default()
@@ -8405,7 +8406,7 @@ mod tests {
             draw_request,
             json!({
                 "prompt": "make it night",
-                "image_url": "https://files.test/input.png"
+                "image_url": ["https://files.test/input.png", "https://files.test/second.png"]
             })
         );
     }

@@ -118,6 +118,9 @@ pub struct ToolContext {
     /// History/dialog message metadata.
     #[serde(default)]
     pub message_meta: openplotva_core::ChatMessageMeta,
+    /// Image references from the materialized dialog, available for explicit edits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_attachments: Vec<openplotva_core::ChatAttachment>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Deserialize, PartialEq, Serialize)]
@@ -225,6 +228,9 @@ pub struct DrawRequest {
     /// Image prompt.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
+    /// Stable image IDs selected from the current dialog context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
     /// Negative prompt.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub negative_prompt: String,
@@ -435,6 +441,7 @@ const INLINE_TOOL_ARG_KEYS: &[&str] = &[
     "prompt",
     "topic",
     "file_id",
+    "file_ids",
     "query",
     "url",
     "video",
@@ -524,6 +531,11 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
         name: "prompt",
         required: true,
         description: "Image prompt. Prefer concrete visual instructions.",
+    },
+    ToolArgSpec {
+        name: "file_ids",
+        required: false,
+        description: "For editing or combining images, select the file_unique_id values from the rendered attachments in this dialog. Pass all source images together in one call to combine them into one composition. Use these stable IDs, not message_N_image_M handles. Omit for a new image; current attached or replied-to images are used automatically when present.",
     },
     ToolArgSpec {
         name: "negative_prompt",
@@ -1021,6 +1033,14 @@ fn tool_parameters_schema(spec: &ToolSpec) -> Value {
 fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
     let mut schema = Map::new();
     match arg.name {
+        "file_ids" => {
+            schema.insert("type".to_owned(), Value::String("array".to_owned()));
+            schema.insert(
+                "items".to_owned(),
+                json!({"type": "string", "minLength": 1}),
+            );
+            schema.insert("maxItems".to_owned(), Value::from(10));
+        }
         "hours" => {
             schema.insert("type".to_owned(), Value::String("integer".to_owned()));
             schema.insert("minimum".to_owned(), Value::from(1));
@@ -2149,6 +2169,9 @@ pub struct ToolStep {
     /// Vision attachment handle.
     #[serde(default, rename = "file_id", skip_serializing_if = "String::is_empty")]
     pub file_id: String,
+    /// Image references to edit together.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
     /// Web search query.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query: String,
@@ -3137,7 +3160,15 @@ fn populate_json_map_args(map: &Map<String, Value>, step: &mut ToolStep) {
     if let Some(Value::String(value)) = map.get("step") {
         step.step = value.trim().to_owned();
     }
-    populate_tool_args(|key| json_scalar_arg(map.get(key)), step);
+    populate_tool_args(
+        |key| {
+            if key == "file_ids" && map.get(key).is_some_and(Value::is_array) {
+                return map.get(key).map(Value::to_string);
+            }
+            json_scalar_arg(map.get(key))
+        },
+        step,
+    );
 }
 
 fn json_scalar_arg(value: Option<&Value>) -> Option<String> {
@@ -4261,6 +4292,10 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     if let Some(value) = lookup("file_id") {
         step.file_id = value;
     }
+    if let Some(value) = lookup("file_ids") {
+        step.file_ids = serde_json::from_str(&value)
+            .unwrap_or_else(|_| value.split(',').map(|id| id.trim().to_owned()).collect());
+    }
     if let Some(value) = lookup("query") {
         step.query = value;
     }
@@ -4464,6 +4499,11 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     step.prompt = sanitize_tool_text(&step.prompt);
     step.topic = sanitize_tool_text(&step.topic);
     step.file_id = sanitize_tool_text(&step.file_id);
+    step.file_ids = step
+        .file_ids
+        .iter()
+        .map(|id| sanitize_tool_text(id))
+        .collect();
     step.query = sanitize_tool_text(&step.query);
     step.url = sanitize_tool_text(&step.url);
     step.video = sanitize_tool_text(&step.video);
@@ -4494,6 +4534,13 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
 }
 
 fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
+    if step
+        .file_ids
+        .iter()
+        .any(|id| is_protocol_sentinel_value(id))
+    {
+        return true;
+    }
     [
         step.prompt.as_str(),
         step.topic.as_str(),
@@ -5059,6 +5106,7 @@ mod tests {
             .expect("props");
         assert!(properties.contains_key("prompt"));
         assert!(properties.contains_key("negative_prompt"));
+        assert_eq!(properties["file_ids"]["type"], "array");
         assert_eq!(draw.function.parameters["required"], json!(["prompt"]));
         let song = tools
             .iter()
@@ -5102,6 +5150,41 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn draw_image_reference_handles_survive_tool_parsing() {
+        let step: ToolStep = serde_json::from_value(serde_json::json!({
+            "step": "draw_image",
+            "prompt": "combine both photos into one scene",
+            "file_ids": ["photo-a", "photo-b"]
+        }))
+        .expect("draw tool step");
+        let encoded = serde_json::to_value(step).expect("encoded draw step");
+        assert_eq!(
+            encoded["file_ids"],
+            serde_json::json!(["photo-a", "photo-b"])
+        );
+        let native = parse_native_tool_step(&[NativeToolCall {
+            function: NativeToolFunction {
+                name: STEP_DRAW_IMAGE.to_owned(),
+                arguments: json!({"prompt": "combine photos", "file_ids": ["photo-a", "photo-b"]}),
+            },
+            ..Default::default()
+        }])
+        .expect("native draw call");
+        assert_eq!(native.file_ids, vec!["photo-a", "photo-b"]);
+        for content in [
+            r#"<tool_call>{"name":"draw_image","arguments":{"prompt":"combine photos","file_ids":["photo-a","photo-b"]}}</tool_call>"#,
+            r#"<draw_image prompt="combine photos" file_ids='["photo-a","photo-b"]'/>"#,
+            r#"draw_image{prompt:"combine photos",file_ids:["photo-a","photo-b"]}"#,
+        ] {
+            let (parsed, _) = extract_content_tool_step(content).expect("content draw call");
+            assert_eq!(
+                parsed.expect("draw step").file_ids,
+                vec!["photo-a", "photo-b"]
+            );
+        }
     }
 
     #[test]

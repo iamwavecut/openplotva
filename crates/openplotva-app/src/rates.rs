@@ -2672,6 +2672,7 @@ mod tests {
                 message_type: "text".to_owned(),
                 ..openplotva_core::ChatMessageMeta::default()
             },
+            ..ToolContext::default()
         }
     }
 

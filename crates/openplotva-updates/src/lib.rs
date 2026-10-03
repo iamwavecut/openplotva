@@ -1385,6 +1385,15 @@ pub fn telegram_message_attachments(
     append_telegram_contact_attachments(&mut out, &message.data, &source);
     append_telegram_payload_attachments(&mut out, &message.data, &source);
 
+    for attachment in &mut out {
+        attachment.media_group_id = message
+            .media_group_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+    }
+
     out
 }
 
@@ -1435,6 +1444,14 @@ fn collect_dialog_attachments(message: &TelegramMessage) -> Vec<ChatAttachment> 
             "audio",
             first_dialog_audio_unique_id(reply),
         );
+        for attachment in &mut out {
+            attachment.media_group_id = reply
+                .media_group_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+        }
     }
 
     out
@@ -4829,6 +4846,41 @@ mod tests {
         assert_eq!(got[0].file_unique_id, "large-photo");
         assert_eq!(got[0].caption, "photo caption");
 
+        Ok(())
+    }
+
+    #[test]
+    fn fetcher_context_keeps_current_and_reply_album_ids() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 128,
+            "message": {
+                "message_id": 60, "date": 1_710_000_000,
+                "chat": sample_private_chat_json(), "from": sample_user_json(),
+                "media_group_id": "current-album",
+                "photo": [{"file_id": "current-file", "file_unique_id": "current-photo", "height": 512, "width": 512}],
+                "reply_to_message": {
+                    "message_id": 58, "date": 1_710_000_000,
+                    "chat": sample_private_chat_json(), "from": sample_user_json(),
+                    "media_group_id": "reply-album",
+                    "photo": [{"file_id": "reply-file", "file_unique_id": "reply-photo", "height": 512, "width": 512}]
+                }
+            }
+        }))?;
+        let context = super::build_fetcher_message_context(update_message(&update)?);
+        let current = context
+            .meta
+            .attachments
+            .iter()
+            .find(|image| image.source == "message")
+            .expect("current image");
+        let reply = context
+            .meta
+            .attachments
+            .iter()
+            .find(|image| image.source == "quoted")
+            .expect("reply image");
+        assert_eq!(current.media_group_id, "current-album");
+        assert_eq!(reply.media_group_id, "reply-album");
         Ok(())
     }
 

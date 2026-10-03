@@ -6326,6 +6326,9 @@ fn write_attachment_element(
     if !attachment.source.trim().is_empty() {
         write_string_attr(out, "source", &attachment.source);
     }
+    if !attachment.media_group_id.trim().is_empty() {
+        write_string_attr(out, "media_group_id", &attachment.media_group_id);
+    }
     out.push('>');
     media_index = write_attachment_file_id(
         out,
@@ -9929,6 +9932,7 @@ mod tests {
                         kind: "image".to_owned(),
                         source: "quoted".to_owned(),
                         file_unique_id: "AQADexampleImg1".to_owned(),
+                        media_group_id: "album-1".to_owned(),
                         ..ChatAttachment::default()
                     },
                     ChatAttachment {
@@ -9946,6 +9950,7 @@ mod tests {
         assert!(body.contains("<file_id>message_11951604_image_1</file_id>"));
         assert!(body.contains("<file_id>message_11951604_video_2</file_id>"));
         assert!(body.contains("<file_unique_id>AQADexampleImg1</file_unique_id>"));
+        assert!(body.contains(r#"source="quoted" media_group_id="album-1""#));
     }
 
     #[test]
