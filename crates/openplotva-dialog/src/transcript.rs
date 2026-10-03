@@ -23,7 +23,34 @@ pub fn dialog_tool_context(input: &DialogInput) -> ToolContext {
         user_full_name: input.user.full_name.clone(),
         message_text: input.message.text.clone(),
         message_meta: input.message.meta.clone(),
+        image_attachments: dialog_image_attachments(input),
     }
+}
+
+fn dialog_image_attachments(input: &DialogInput) -> Vec<openplotva_core::ChatAttachment> {
+    let mut images = Vec::<openplotva_core::ChatAttachment>::new();
+    let mut history = input.history.iter().collect::<Vec<_>>();
+    history.sort_by_key(|message| message.message_id);
+    for meta in history
+        .iter()
+        .map(|message| &message.meta)
+        .chain(std::iter::once(&input.message.meta))
+    {
+        for attachment in &meta.attachments {
+            if attachment.kind.trim() != "image" || attachment.file_unique_id.trim().is_empty() {
+                continue;
+            }
+            if let Some(index) = images
+                .iter()
+                .position(|image| image.file_unique_id == attachment.file_unique_id)
+            {
+                images[index] = attachment.clone();
+            } else {
+                images.push(attachment.clone());
+            }
+        }
+    }
+    images
 }
 
 /// One tool call as recorded in the session transcript. `arguments` is the

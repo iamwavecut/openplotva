@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
+use openplotva_core::{
+    ChatAttachment, ChatMessageMeta, MAX_IMAGE_EDIT_SOURCE_IMAGES, SENDER_TYPE_USER,
+};
 use openplotva_dialog::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest,
     IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE, RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
@@ -1475,7 +1477,10 @@ impl TaskmanDialogToolAdapter {
         let files = resolver
             .resolve_image_edit_files(&request.attachments, &request.edit_media_group_id)
             .await?;
-        if files.photo_file_id.trim().is_empty() {
+        let source_count = image_edit_file_unique_ids(&request.attachments).len();
+        if files.photo_file_id.trim().is_empty()
+            || (source_count > 1 && files.photo_urls.len() < source_count)
+        {
             return Ok(not_scheduled_draw(
                 DrawImageScheduleRejection::EditSourceUnavailable,
             ));
@@ -2301,6 +2306,10 @@ where
                 ));
             };
             let prompt = sanitize_tool_text(&req.prompt);
+            let attachments = match draw_image_attachments(&req) {
+                Ok(attachments) => attachments,
+                Err(reason) => return Ok(ToolResult::failed("draw_image_source_invalid", reason)),
+            };
             let request = DrawImageScheduleRequest {
                 chat_id: req.context.chat_id,
                 thread_id: req.context.thread_id,
@@ -2310,7 +2319,7 @@ where
                 prompt: prompt.clone(),
                 prompt_variants: Vec::new(),
                 message_text: req.context.message_text,
-                attachments: req.context.message_meta.attachments,
+                attachments,
                 edit_media_group_id: String::new(),
                 negative_prompt: sanitize_tool_text(&req.negative_prompt),
                 aspect_ratio: sanitize_tool_text(&req.aspect_ratio),
@@ -2505,6 +2514,74 @@ where
             }
         })
     }
+}
+
+fn draw_image_attachments(req: &DrawRequest) -> Result<Vec<ChatAttachment>, String> {
+    let available = &req.context.image_attachments;
+    if !req.file_ids.is_empty() {
+        let mut selected = Vec::<ChatAttachment>::new();
+        for id in &req.file_ids {
+            let id = id.trim();
+            let Some(image) = req
+                .context
+                .message_meta
+                .attachments
+                .iter()
+                .chain(available)
+                .find(|image| {
+                    image.kind.trim() == "image"
+                        && image.file_unique_id.trim() == id
+                        && !id.is_empty()
+                })
+            else {
+                return Err("a source image is not available in this dialog; select file_unique_id values from its attachments".to_owned());
+            };
+            if !selected
+                .iter()
+                .any(|image| image.file_unique_id.trim() == id)
+            {
+                selected.push(image.clone());
+            }
+        }
+        return validate_image_edit_sources(selected);
+    }
+
+    let current = &req.context.message_meta.attachments;
+    let mut selected = Vec::<ChatAttachment>::new();
+    for image in current {
+        if image.kind.trim() == "image" && !image.media_group_id.trim().is_empty() {
+            for sibling in available {
+                if sibling.media_group_id == image.media_group_id
+                    && sibling.kind.trim() == "image"
+                    && !selected
+                        .iter()
+                        .any(|item| item.file_unique_id == sibling.file_unique_id)
+                {
+                    selected.push(sibling.clone());
+                }
+            }
+        }
+        if !selected.iter().any(|item| {
+            item == image
+                || (!image.file_unique_id.is_empty() && item.file_unique_id == image.file_unique_id)
+        }) {
+            selected.push(image.clone());
+        }
+    }
+    validate_image_edit_sources(selected)
+}
+
+fn validate_image_edit_sources(images: Vec<ChatAttachment>) -> Result<Vec<ChatAttachment>, String> {
+    let source_count = images
+        .iter()
+        .filter(|image| image.kind.trim() == "image")
+        .count();
+    if source_count > MAX_IMAGE_EDIT_SOURCE_IMAGES {
+        return Err(format!(
+            "at most {MAX_IMAGE_EDIT_SOURCE_IMAGES} source images can be edited together"
+        ));
+    }
+    Ok(images)
 }
 
 fn dialog_draw_image_tool_result(result: &DrawImageScheduleResult) -> ToolResult {
@@ -3797,6 +3874,7 @@ mod tests {
             user_full_name: "Alice".to_owned(),
             message_text: "$".to_owned(),
             message_meta: ChatMessageMeta::default(),
+            image_attachments: Vec::new(),
         }
     }
 
@@ -4080,6 +4158,7 @@ mod tests {
                 ..context()
             },
             prompt: "  neon castle  ".to_owned(),
+            file_ids: Vec::new(),
             negative_prompt: "  blur  ".to_owned(),
             aspect_ratio: " 16:9 ".to_owned(),
             seed: " 42 ".to_owned(),
@@ -4128,6 +4207,317 @@ mod tests {
             }]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_combines_selected_history_images_in_one_edit()
+    -> Result<(), ToolboxError> {
+        let scheduler = Arc::new(ImageSchedulerStub::successful(DrawImageScheduleResult {
+            status: "scheduled".to_owned(),
+            ..DrawImageScheduleResult::default()
+        }));
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok(String::new()),
+        }))
+        .with_image_scheduler(scheduler.clone());
+        let request: DrawRequest = serde_json::from_value(json!({
+            "context": {
+                "chat_id": 42, "message_id": 13, "user_id": 42,
+                "message_text": "combine both photos into one scene",
+                "image_attachments": [
+                    {"kind": "image", "source": "message", "file_unique_id": "photo-a"},
+                    {"kind": "image", "source": "message", "file_unique_id": "photo-b"}
+                ]
+            },
+            "prompt": "combine both photos into one scene",
+            "file_ids": ["photo-a", "photo-b", "photo-a"]
+        }))?;
+        toolbox.draw_image(request).await?;
+        let calls = scheduler.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .attachments
+                .iter()
+                .map(|item| item.file_unique_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["photo-a", "photo-b"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_uses_album_siblings_and_followup_references()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let resolver = Arc::new(ImageEditFileResolverStub::successful(
+            ImageEditFileSelection {
+                photo_file_id: "file-a".to_owned(),
+                photo_urls: (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+                    .map(|index| format!("https://files.test/{index}.png"))
+                    .collect(),
+            },
+        ));
+        let adapter = Arc::new(
+            TaskmanDialogToolAdapter::new(queue.clone())
+                .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)))
+                .with_image_edit_file_resolver(resolver.clone()),
+        );
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok(String::new()),
+        }))
+        .with_image_scheduler(adapter);
+        let first = ChatAttachment {
+            media_group_id: "album".to_owned(),
+            ..image_attachment("photo-a")
+        };
+        let second = ChatAttachment {
+            media_group_id: "album".to_owned(),
+            ..image_attachment("photo-b")
+        };
+        let extra: Vec<_> = (2..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| ChatAttachment {
+                media_group_id: "album".to_owned(),
+                ..image_attachment(&format!("photo-{index}"))
+            })
+            .collect();
+        let mut input = openplotva_dialog::DialogInput {
+            context: openplotva_dialog::DialogContext {
+                chat_id: 42,
+                ..Default::default()
+            },
+            user: openplotva_dialog::DialogUser {
+                id: 42,
+                ..Default::default()
+            },
+            message: openplotva_dialog::DialogMessage {
+                id: 12,
+                meta: ChatMessageMeta {
+                    attachments: vec![second],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            history: vec![openplotva_dialog::HistoryMessage {
+                message_id: 11,
+                text: "combine both photos into one scene".to_owned(),
+                meta: ChatMessageMeta {
+                    attachments: vec![first],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (index, image) in extra.into_iter().enumerate() {
+            input.history.push(openplotva_dialog::HistoryMessage {
+                message_id: 12 + index as i32,
+                meta: ChatMessageMeta {
+                    attachments: vec![image],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        input.message.id = 20;
+        let expected_ids: Vec<_> = std::iter::once("photo-a".to_owned())
+            .chain((2..MAX_IMAGE_EDIT_SOURCE_IMAGES).map(|index| format!("photo-{index}")))
+            .chain(std::iter::once("photo-b".to_owned()))
+            .collect();
+        let expected_urls: Vec<_> = (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| format!("https://files.test/{index}.png"))
+            .collect();
+        let result = openplotva_dialog::dispatch_dialog_tool(
+            &toolbox,
+            &openplotva_dialog::dialog_tool_context(&input),
+            &openplotva_dialog::ToolStep {
+                step: "draw_image".to_owned(),
+                prompt: "combine both photos into one scene".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+        assert_eq!(
+            resolver.calls()[0]
+                .iter()
+                .map(|image| image.file_unique_id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].job.data.job_type,
+            openplotva_taskman::JobType::ImageEdit
+        );
+        assert_eq!(
+            records[0]
+                .job
+                .data
+                .image_data
+                .as_ref()
+                .expect("image edit")
+                .image_urls,
+            expected_urls
+        );
+        input.history.push(openplotva_dialog::HistoryMessage {
+            message_id: input.message.id,
+            meta: input.message.meta.clone(),
+            ..Default::default()
+        });
+        input.message.id = 21;
+        input.message.text = "combine both photos into one scene".to_owned();
+        input.message.meta = ChatMessageMeta::default();
+        let result = openplotva_dialog::dispatch_dialog_tool(
+            &toolbox,
+            &openplotva_dialog::dialog_tool_context(&input),
+            &openplotva_dialog::ToolStep {
+                step: "draw_image".to_owned(),
+                prompt: input.message.text.clone(),
+                file_ids: expected_ids,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+        assert_eq!(resolver.calls().len(), 2);
+        assert_eq!(resolver.calls()[1].len(), MAX_IMAGE_EDIT_SOURCE_IMAGES);
+        let records = queue.records();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.job.data.job_type == openplotva_taskman::JobType::ImageEdit)
+        );
+        assert_eq!(
+            records[1]
+                .job
+                .data
+                .image_data
+                .as_ref()
+                .expect("followup edit")
+                .image_urls
+                .len(),
+            MAX_IMAGE_EDIT_SOURCE_IMAGES
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_rejects_missing_image_reference_without_scheduling()
+    -> Result<(), ToolboxError> {
+        let scheduler = Arc::new(ImageSchedulerStub::successful(
+            DrawImageScheduleResult::default(),
+        ));
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok(String::new()),
+        }))
+        .with_image_scheduler(scheduler.clone());
+        let result = toolbox
+            .draw_image(DrawRequest {
+                context: context(),
+                prompt: "combine photos".to_owned(),
+                file_ids: vec!["not-in-context".to_owned()],
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(result.status, TOOL_RESULT_STATUS_FAILED);
+        assert_eq!(
+            result.error.expect("reference error").code,
+            "draw_image_source_invalid"
+        );
+        assert!(scheduler.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn draw_image_does_not_use_unselected_history_or_other_albums() {
+        let first = ChatAttachment {
+            media_group_id: "album".to_owned(),
+            ..image_attachment("photo-a")
+        };
+        let second = ChatAttachment {
+            media_group_id: "album".to_owned(),
+            ..image_attachment("photo-b")
+        };
+        let unrelated = ChatAttachment {
+            media_group_id: "other".to_owned(),
+            ..image_attachment("photo-c")
+        };
+        let mut request = DrawRequest {
+            context: ToolContext {
+                image_attachments: vec![first.clone(), second.clone(), unrelated],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            draw_image_attachments(&request)
+                .expect("new image")
+                .is_empty()
+        );
+        request.context.message_meta.attachments = vec![ChatAttachment {
+            source: "quoted".to_owned(),
+            ..second.clone()
+        }];
+        assert_eq!(
+            draw_image_attachments(&request).expect("reply album"),
+            vec![first.clone(), second.clone()]
+        );
+        request.file_ids = vec!["photo-b".to_owned()];
+        assert_eq!(
+            draw_image_attachments(&request)
+                .expect("explicit image")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn draw_image_supports_model_maximum_and_rejects_excess_sources() {
+        for count in [
+            MAX_IMAGE_EDIT_SOURCE_IMAGES,
+            MAX_IMAGE_EDIT_SOURCE_IMAGES + 1,
+        ] {
+            let images: Vec<_> = (0..count)
+                .map(|index| ChatAttachment {
+                    media_group_id: "album".to_owned(),
+                    ..image_attachment(&format!("photo-{index}"))
+                })
+                .collect();
+            let mut request = DrawRequest {
+                context: ToolContext {
+                    message_meta: ChatMessageMeta {
+                        attachments: vec![images[0].clone()],
+                        ..Default::default()
+                    },
+                    image_attachments: images.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            for explicit in [false, true] {
+                request.file_ids = if explicit {
+                    images
+                        .iter()
+                        .map(|image| image.file_unique_id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let selected = draw_image_attachments(&request);
+                if count == MAX_IMAGE_EDIT_SOURCE_IMAGES {
+                    assert_eq!(selected.expect("model maximum"), images);
+                } else {
+                    assert!(
+                        selected
+                            .expect_err("too many sources")
+                            .contains("at most 10")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4795,6 +5185,7 @@ mod tests {
             .draw_image(DrawRequest {
                 context: context(),
                 prompt: " neon\u{200f}\tcastle ".to_owned(),
+                file_ids: Vec::new(),
                 negative_prompt: " blur ".to_owned(),
                 aspect_ratio: " 16:9 ".to_owned(),
                 seed: " 42 ".to_owned(),
@@ -5833,6 +6224,35 @@ mod tests {
             telegram_file_url("123:secret", "photos/file-a.jpg"),
             "https://api.telegram.org/file/bot123:secret/photos/file-a.jpg"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_image_edit_rejects_partial_source_resolution() -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let adapter = TaskmanDialogToolAdapter::new(queue.clone())
+            .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)))
+            .with_image_edit_file_resolver(Arc::new(ImageEditFileResolverStub::successful(
+                ImageEditFileSelection {
+                    photo_file_id: "file-a".to_owned(),
+                    photo_urls: vec!["https://files.test/a.png".to_owned()],
+                },
+            )));
+        let result = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: 42,
+                message_id: 13,
+                user_id: 42,
+                prompt: "combine both photos".to_owned(),
+                attachments: vec![image_attachment("photo-a"), image_attachment("photo-b")],
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(
+            result.rejection,
+            Some(DrawImageScheduleRejection::EditSourceUnavailable)
+        );
+        assert!(queue.records().is_empty());
+        Ok(())
     }
 
     #[test]
