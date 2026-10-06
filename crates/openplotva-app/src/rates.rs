@@ -1217,6 +1217,7 @@ impl RatesEffects for RatesUtilityEffects {
             let prepared = ads
                 .prepare(crate::gradius_ads::GradiusUtilityAdRequest {
                     surface: crate::gradius_ads::GradiusUtilitySurface::Rates,
+                    include_vip_appendix: false,
                     source_id: source_id.clone(),
                     attempt_key: format!(
                         "rates-command:{source_id}:{}",

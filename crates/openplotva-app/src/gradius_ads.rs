@@ -482,6 +482,7 @@ impl GradiusUtilitySurface {
 
 pub struct GradiusUtilityAdRequest {
     pub surface: GradiusUtilitySurface,
+    pub include_vip_appendix: bool,
     pub source_id: String,
     pub attempt_key: String,
     pub user_id: i64,
@@ -834,7 +835,7 @@ fn render_utility_ad_html(
         ad_html.push_str("</a>");
     }
     let mut html = format!("{GRADIUS_AD_LABEL}{ad_html}");
-    if request.surface == GradiusUtilitySurface::Image {
+    if request.surface == GradiusUtilitySurface::Image && request.include_vip_appendix {
         let appendix = render_gradius_vip_appendix(&format!("image-job-{}", request.source_id))
             .ok_or_else(|| "Gradius VIP appendix catalog is empty".to_owned())?;
         html.push_str("\n\n");
@@ -1940,6 +1941,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_image_ad_has_no_vip_appendix_in_persisted_html() {
+        let ledger = LedgerStub::default();
+        let service = GradiusUtilityAdService::new(
+            Arc::new(UtilityStub::default()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        let ad = service
+            .prepare(GradiusUtilityAdRequest {
+                surface: GradiusUtilitySurface::Image,
+                include_vip_appendix: false,
+                source_id: "public-image".to_owned(),
+                attempt_key: "claim-1".to_owned(),
+                user_id: 100,
+                chat_id: -100,
+                thread_id: Some(12),
+                prompt: Some("Portrait".to_owned()),
+                result_context: None,
+                completed_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .await
+            .expect("prepared")
+            .expect("ad");
+        assert_eq!(
+            ad.html,
+            "📢 <b>Ad</b> <a href=\"https://ads.example/1\">here</a>"
+        );
+        let stored = ledger.finished_ads.lock().expect("finished ads");
+        assert_eq!(stored[0].1.rendered_html, ad.html);
+    }
+
+    #[tokio::test]
+    async fn private_and_ephemeral_image_ads_keep_vip_appendix_in_persisted_html() {
+        for chat_id in [100, -100] {
+            let ledger = LedgerStub::default();
+            let service = GradiusUtilityAdService::new(
+                Arc::new(UtilityStub::default()),
+                Arc::new(RedactorStub::default()),
+                Arc::new(ledger.clone()),
+                Arc::new(VipStub(false)),
+            );
+            let ad = service
+                .prepare(GradiusUtilityAdRequest {
+                    surface: GradiusUtilitySurface::Image,
+                    include_vip_appendix: true,
+                    source_id: "personal-image".to_owned(),
+                    attempt_key: "claim-1".to_owned(),
+                    user_id: 100,
+                    chat_id,
+                    thread_id: None,
+                    prompt: Some("Portrait".to_owned()),
+                    result_context: None,
+                    completed_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .await
+                .expect("prepared")
+                .expect("ad");
+            assert!(
+                ad.html
+                    .starts_with("📢 <b>Ad</b> <a href=\"https://ads.example/1\">here</a>\n\n")
+            );
+            assert!(ad.html.contains("<tg-spoiler>"));
+            assert!(ad.html.contains("https://t.me/PlotvoBot?start=vip"));
+            let stored = ledger.finished_ads.lock().expect("finished ads");
+            assert_eq!(stored[0].1.rendered_html, ad.html);
+        }
+    }
+
+    #[tokio::test]
     async fn utility_image_redacts_prompt_and_audits_only_selected_placement() {
         let client = UtilityStub::default();
         let ledger = LedgerStub::default();
@@ -1952,6 +2023,7 @@ mod tests {
         let ad = service
             .prepare(GradiusUtilityAdRequest {
                 surface: GradiusUtilitySurface::Image,
+                include_vip_appendix: true,
                 source_id: "42".to_owned(),
                 attempt_key: "claim-1".to_owned(),
                 user_id: 100,
@@ -1995,6 +2067,7 @@ mod tests {
         let ledger = LedgerStub::default();
         let request = |user_id| GradiusUtilityAdRequest {
             surface: GradiusUtilitySurface::Image,
+            include_vip_appendix: true,
             source_id: format!("group-{user_id}"),
             attempt_key: "claim-1".to_owned(),
             user_id,
@@ -2060,6 +2133,7 @@ mod tests {
         let ledger = LedgerStub::default();
         let request = || GradiusUtilityAdRequest {
             surface: GradiusUtilitySurface::Image,
+            include_vip_appendix: true,
             source_id: "privacy-test".to_owned(),
             attempt_key: "claim-1".to_owned(),
             user_id: 100,
@@ -2126,6 +2200,7 @@ mod tests {
         );
         let request = |user_id| GradiusUtilityAdRequest {
             surface: GradiusUtilitySurface::Rates,
+            include_vip_appendix: false,
             source_id: format!("-100:{user_id}"),
             attempt_key: "rates-claim".to_owned(),
             user_id,

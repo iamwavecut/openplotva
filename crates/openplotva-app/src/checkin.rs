@@ -1400,6 +1400,7 @@ where
             .ads
             .prepare(crate::gradius_ads::GradiusUtilityAdRequest {
                 surface: crate::gradius_ads::GradiusUtilitySurface::Checkin,
+                include_vip_appendix: false,
                 source_id: source_id.clone(),
                 attempt_key: format!(
                     "checkin-final:{source_id}:{}",
