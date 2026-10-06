@@ -62,6 +62,7 @@ impl GradiusUtilityImageAds {
             .ads
             .prepare(GradiusUtilityAdRequest {
                 surface: GradiusUtilitySurface::Image,
+                include_vip_appendix: chat_id > 0 || delivery == ImageAdDelivery::Ephemeral,
                 source_id: source_id.clone(),
                 attempt_key,
                 user_id,
