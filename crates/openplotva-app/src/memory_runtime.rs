@@ -3438,9 +3438,7 @@ where
     Embedder: EmbeddingProvider,
 {
     if openplotva_memory::is_memory_spam_fact(&episode.summary_text)
-        || (episode.summary_text.trim().is_empty()
-            && episode.topics.is_empty()
-            && episode.participants.is_empty())
+        || episode.summary_text.trim().is_empty()
     {
         return Ok(());
     }
@@ -7137,5 +7135,88 @@ mod tests {
             assert!(store.episodes.lock().expect("episodes").is_empty());
             assert_eq!(store.completed.lock().expect("completed").len(), 1);
         }
+    }
+
+    #[test]
+    fn subject_merge_after_spam_filter_uses_card_ids_not_original_positions() {
+        let clean = Card {
+            id: 500,
+            fact_text: "Анна живёт в Минске".to_owned(),
+            salience: 0.9,
+            observation_count: 2,
+            ..Card::default()
+        };
+        let duplicate = Card {
+            id: 502,
+            salience: 0.8,
+            observation_count: 3,
+            ..clean.clone()
+        };
+        let ad = Card {
+            id: 501,
+            fact_text: "Предлагает досуг без предоплаты".to_owned(),
+            salience: 1.0,
+            observation_count: 99,
+            ..clean.clone()
+        };
+        let cards = [ad, clean, duplicate];
+        let input = openplotva_memory::SubjectMergeInput {
+            subject: "Anna".to_owned(),
+            cards: openplotva_memory::subject_merge_cards(&cards, OffsetDateTime::UNIX_EPOCH),
+        };
+        assert_eq!(input.card_ids(), vec![500, 502]);
+        let plan = openplotva_memory::SubjectMergePlan {
+            decisions: vec![
+                openplotva_memory::SubjectMergeDecision {
+                    index: 0,
+                    action: "keep".to_owned(),
+                    ..openplotva_memory::SubjectMergeDecision::default()
+                },
+                openplotva_memory::SubjectMergeDecision {
+                    index: 1,
+                    action: "cluster_with".to_owned(),
+                    survivor_index: Some(0),
+                    ..openplotva_memory::SubjectMergeDecision::default()
+                },
+            ],
+            survivors: vec![openplotva_memory::SubjectMergeSurvivor {
+                survivor_index: 0,
+                merged_fact_text: "Анна живёт в Минске".to_owned(),
+            }],
+            ..openplotva_memory::SubjectMergePlan::default()
+        };
+        let validated =
+            openplotva_memory::validate_subject_merge_plan(&plan, &input.card_ids()).expect("plan");
+        let apply = plan_to_subject_merge_apply(validated, &cards, &[501, 500, 502], 0.2);
+        assert_eq!(apply.clusters.len(), 1);
+        assert_eq!(apply.clusters[0].survivor_id, 500);
+        assert_eq!(apply.clusters[0].absorbed_ids, vec![502]);
+        assert_eq!(apply.clusters[0].observation_count, 5);
+    }
+
+    #[tokio::test]
+    async fn empty_episode_with_spam_topics_cannot_create_a_metadata_only_record() {
+        let store = FakeMemoryWriteStore::default();
+        let report = write_memory_extraction_batch(
+            &store,
+            Option::<&FakeEmbedder>::None,
+            &ExtractInput::default(),
+            ExtractOutput {
+                topics: vec!["рекламный шаблон".to_owned()],
+                participants: vec!["Alice".to_owned()],
+                ..ExtractOutput::default()
+            },
+            MemoryExtractionBatchConfig {
+                episode_model: "model",
+                prompt_version: "pv",
+                embedding_dimension: 2,
+                fallback_observed_at: OffsetDateTime::UNIX_EPOCH,
+                batch_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("write");
+        assert!(report.output.topics.is_empty());
+        assert!(store.episodes.lock().expect("episodes").is_empty());
     }
 }

@@ -3303,7 +3303,9 @@ pub fn filter_extraction_spam(
         output.topics.clear();
         output.participants.clear();
     } else {
-        output.topics.retain(|text| !is_memory_spam_fact(text));
+        output.topics.retain(|text| {
+            !is_memory_spam_fact(text) && !contains_any(&fold_for_ads(text), SPAM_SELF_REPORT_STEMS)
+        });
     }
     (output, removed)
 }
