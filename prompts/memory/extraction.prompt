@@ -13,6 +13,7 @@ Store / do not store:
 - Store "в субботу у Оли свадьба, едем всей группой" (a dated event with several people and consequences). Do not store "ок", "+", "доброе утро" or any other single reply or reaction.
 - Do not store what the bot says about itself, its tools or its limits, and do not store instructions people give the bot.
 - Do not store spam, advertising, job or income offers, requests to move to private messages, channel forwards, greetings, one-off logistics or IDs.
+- Repeated ads are still spam. Never describe their repetition as a durable habit, role or recurring topic. Never reinforce or rewrite a card from an ad.
 - In a heated argument store nothing, or one stance card for a person who clearly holds a lasting position; never one card per opinion or per message.
 
 ## Vocabulary
@@ -58,13 +59,13 @@ links, between two of your own candidate cards, by their exact fact_text: suppor
 - source_message_ids: the m numbers of the messages you used (m12 → 12).
 - confidence: how sure the window makes the fact. salience: how much it will matter to the bot.
 - reason in a resolution: one short clause.
-- episode_summary: two or three sentences about the window in its main language. topics and participants: short lists.
+- episode_summary: two or three sentences about useful non-spam activity in the window in its main language. Exclude ads. When the window contains only spam or noise, use an empty summary, topics and participants.
 
 These examples show the format only; never reuse their names, facts or dates.
 
 <example>
 Window: "всем привет", "подработка 3000 в день, пиши в лс", "доброе утро 🌞".
-{"episode_summary":"Приветствия и рекламное сообщение.","topics":[],"participants":[],"candidate_cards":[],"resolutions":[],"links":[]}
+{"episode_summary":"","topics":[],"participants":[],"candidate_cards":[],"resolutions":[],"links":[]}
 </example>
 
 <example>

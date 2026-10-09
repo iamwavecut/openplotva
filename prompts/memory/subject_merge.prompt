@@ -10,6 +10,7 @@ For every index, in order, write exactly one decision, with a short reason befor
 Then, for every kept card that absorbs at least one other card, add one entry to survivors: merged_fact_text is one compact sentence that the survivor and its folded cards jointly support, in their language, keeping whose fact or opinion it is.
 
 Rules:
+- Treat ads and descriptions of repeated ads as noise. Demote them instead of keeping or merging them. Never add advertising to merged_fact_text.
 - Fold genuine repetition hard: most of these sets are a few facts said many times.
 - Never fold cards about different people, and never fold opposite or contradictory views; keep them separate. This rule overrides folding.
 - Never invent a fact: merged_fact_text says only what its cards support.
