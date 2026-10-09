@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenPlotva Period Audit"
+  short_description: "Audit interactions and deliveries over a fixed period."
+  default_prompt: "Use $openplotva-period-audit to report interactions or advertising deliveries over the requested observation window."
