@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenPlotva Runtime API"
+  short_description: "Trace bot requests from ingress to Telegram delivery."
+  default_prompt: "Use $openplotva-runtime-api to trace the failing request through the deployed bot and identify the last confirmed stage."

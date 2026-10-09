@@ -1,6 +1,6 @@
 ---
 name: openplotva-runtime-api
-description: Use this skill to inspect a deployed OpenPlotva Rust bot through the runtime GraphQL API over pinned self-signed HTTPS with a bearer token.
+description: Inspect deployed OpenPlotva through its pinned HTTPS runtime GraphQL API. Trace missing, delayed, duplicate, or failed dialog and media responses from Telegram ingress through LLM, jobs, providers, and outbound delivery.
 ---
 
 # OpenPlotva Runtime API
@@ -54,6 +54,15 @@ completed while the user still receives no picture. Check all boundaries:
 - `message_ops_queue` only for persisted outbound sends; an empty table does
   not prove direct Telegram sends succeeded.
 - provider reachability for the configured draw path before changing code.
+
+## Request Tracing
+
+For a missing, delayed, duplicate, or failed response, read
+[request-tracing.md](references/request-tracing.md). It maps the existing queries
+below to a bounded investigation of text, search, image, and music requests.
+Use the request's correlation IDs and timestamps to find the last confirmed
+stage and the next unconfirmed boundary. Health, an empty queue, or a completed
+provider job alone does not establish a delivered Telegram response.
 
 ## Transport
 
