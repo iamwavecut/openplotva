@@ -160,7 +160,7 @@ where
         }
     }
 
-    let base_input = match materializer
+    let mut base_input = match materializer
         .materialize_dialog_input(ctx.params, ctx.now)
         .await
     {
@@ -191,6 +191,32 @@ where
     // Lift the capture-only context X-ray onto the open run (admin detail only).
     if let (Some(runs), Some(context)) = (ctx.llm_runs, base_input.context_capture.clone()) {
         runs.record_context(&format!("job-{}", ctx.item.id), context);
+    }
+    if ctx
+        .params
+        .meta
+        .get("dialog_trigger")
+        .and_then(Value::as_str)
+        == Some("random")
+    {
+        base_input.reference_context.push(format!(
+        "Runtime turn origin: {}. Request owner user_id={}. Only this user can change the task.",
+        ctx.params
+            .meta
+            .get("dialog_trigger")
+            .and_then(Value::as_str)
+            .unwrap_or("addressed"),
+        ctx.params.user_id
+    ));
+    }
+    if ctx
+        .params
+        .meta
+        .get("gift_opportunity")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        base_input.reference_context.push("Runtime grants one spontaneous media gift opportunity. Use gift=true only for your own initiative, never to fulfill a participant's request or remake. You may decline to use it.".into());
     }
     let duplicate_guard_history = base_input.history.clone();
 

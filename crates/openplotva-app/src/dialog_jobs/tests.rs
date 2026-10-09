@@ -863,8 +863,8 @@ async fn dialog_worker_regenerates_duplicate_answer_with_anti_loop_hint()
     assert_eq!(inputs.len(), 2);
     assert!(inputs[0].reference_context.is_empty());
     assert_eq!(
-        inputs[1].reference_context,
-        vec![openplotva_dialog::turn::ANTI_LOOP_HINT.to_owned()]
+        inputs[1].reference_context, inputs[0].reference_context,
+        "initial packet remains immutable"
     );
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     let record = queue.record(job_id).expect("job record");
@@ -1533,8 +1533,7 @@ async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
 }
 
 #[tokio::test]
-async fn dialog_worker_restores_successful_tool_extension_before_retry_budget_gate()
--> Result<(), Box<dyn Error>> {
+async fn dialog_worker_does_not_extend_past_agent_deadline() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
@@ -1604,12 +1603,8 @@ async fn dialog_worker_restores_successful_tool_extension_before_retry_budget_ga
     )
     .await;
 
-    assert!(report.sent_answer);
-    assert!(report.completed);
-    assert_eq!(provider.inputs().len(), 1);
-    assert_eq!(effects.sent().len(), 1);
-    let rows = ledger_rows(&outcomes);
-    assert_eq!(rows[0].budget_ms, Some(180_000));
+    assert!(report.failed, "{report:?}");
+    assert!(effects.sent().is_empty());
     Ok(())
 }
 
@@ -1845,16 +1840,19 @@ async fn event_append_failure_does_not_leave_job_processing() -> Result<(), Box<
     )
     .await;
 
-    assert!(report.retry_requeued, "status write must win over events");
+    assert!(
+        report.failed,
+        "state persistence failure must stop before model or effects"
+    );
     assert!(report.status_error.is_some(), "append failure is recorded");
-    assert!(!report.failed);
+    assert!(!report.retry_requeued);
     let record = queue
         .inner
         .records()
         .into_iter()
         .find(|record| record.id == job_id)
         .expect("record");
-    assert_eq!(record.status, JobStatus::Pending);
+    assert_eq!(record.status, JobStatus::Failed);
     Ok(())
 }
 
@@ -3432,11 +3430,9 @@ async fn captured_session_link_policy_uses_search_results_before_answering()
         vec![r#"<a href="https://source.test/fact">Fact</a> and decoration"#]
     );
     let requests = provider.requests();
-    assert!(requests[0].input.reference_context.is_empty());
+    assert!(step_context(&requests[0]).is_empty());
     assert!(
-        requests[1]
-            .input
-            .reference_context
+        step_context(&requests[1])
             .iter()
             .any(|item| item.contains("<search_citations>"))
     );
@@ -3523,9 +3519,7 @@ async fn captured_session_link_policy_accepts_crawled_sources() -> Result<(), Bo
         vec![r#"<a href="https://source.test/page">Source</a> and fake"#]
     );
     assert!(
-        provider.requests()[1]
-            .input
-            .reference_context
+        step_context(&provider.requests()[1])
             .iter()
             .any(|item| item.contains("<search_citations>"))
     );
@@ -4309,9 +4303,7 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
     assert!(
-        requests[1]
-            .input
-            .reference_context
+        step_context(&requests[1])
             .iter()
             .any(|item| item.contains("<search_citations>"))
     );
@@ -4320,9 +4312,7 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
         openplotva_dialog::ToolsMode::FinalOnly
     ));
     assert!(
-        requests[2]
-            .input
-            .reference_context
+        step_context(&requests[2])
             .iter()
             .any(|context| context.contains("ПРОВЕРКА ИСТОЧНИКОВ"))
     );
@@ -4450,9 +4440,7 @@ async fn captured_session_repairs_missing_web_citation_for_runtime_smokes()
         openplotva_dialog::ToolsMode::FinalOnly
     ));
     assert!(
-        provider.requests()[2]
-            .input
-            .reference_context
+        step_context(&provider.requests()[2])
             .iter()
             .any(|context| context.contains("ПРОВЕРКА ИСТОЧНИКОВ"))
     );
@@ -5248,10 +5236,7 @@ async fn session_suppresses_replayed_intermediate_batch_and_requires_new_final()
         openplotva_dialog::ToolsMode::FinalOnly
     ));
     assert!(
-        requests[3]
-            .input
-            .reference_context
-            .contains(&openplotva_dialog::turn::ANTI_LOOP_HINT.to_owned())
+        step_context(&requests[3]).contains(&openplotva_dialog::turn::ANTI_LOOP_HINT.to_owned())
     );
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
     let record = queue.record(job_id).expect("job record");
@@ -6130,7 +6115,11 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
             key,
             job_id,
             crate::dialog_turn::InjectedMessage {
-                params: params_from(7, text),
+                params: {
+                    let mut params = params_from(7, text);
+                    params.message_id += call_index as i32;
+                    params
+                },
             },
         ));
     }));
@@ -6151,10 +6140,12 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
     .await;
 
     assert!(report.sent_answer, "{report:?}");
-    assert_eq!(effects.sent()[0].1, "готово: 4");
-    assert!(provider.requests()[1].input.reference_context.is_empty());
-    // The first injected message is the rematerialized current input and is
-    // not repeated in the session transcript.
+    assert!(effects.sent()[0].1.contains("https://example.com/old-turn"));
+    assert_eq!(
+        provider.requests()[0].input.reference_context,
+        provider.requests()[1].input.reference_context
+    );
+    // New messages append to the transcript without replacing the request.
     let requests = provider.requests();
     let injected = requests[1]
         .transcript
@@ -6164,20 +6155,27 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(injected.is_empty(), "{:?}", requests[1].transcript);
+    assert!(
+        injected
+            .iter()
+            .any(|text| text.contains("кстати умножь на два"))
+    );
     assert_eq!(
-        requests[1].input.message.text, "кстати умножь на два",
-        "the newest injected message is fully rematerialized"
+        requests[1].input.message.text, "посчитай мне",
+        "the original request stays intact"
     );
     assert_eq!(
         effects.sent()[0].0,
-        "кстати умножь на два",
-        "the final answer targets the newest injected trigger"
+        "посчитай мне",
+        "the final answer targets the original requester"
     );
     assert_eq!(
         effects.answer_options(),
-        vec![DialogAnswerSendOptions::default()],
-        "absorbing a new user turn must reset successful search state"
+        vec![DialogAnswerSendOptions {
+            disable_link_preview: true,
+            ..DialogAnswerSendOptions::default()
+        }],
+        "new messages preserve the sources already checked"
     );
     // The second injected message was left in the inbox → a follow-up job.
     assert!(report.followup_respawned.is_some(), "{report:?}");
@@ -6192,8 +6190,7 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
 }
 
 #[tokio::test]
-async fn injected_materialization_failure_respawns_consumed_message() -> Result<(), Box<dyn Error>>
-{
+async fn injected_message_does_not_rematerialize_initial_context() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
     let key = crate::dialog_turn::SessionKey::new(42, Some(9));
@@ -6204,23 +6201,30 @@ async fn injected_materialization_failure_respawns_consumed_message() -> Result<
         new_dialog_job_at(params_from(7, "first"), now),
     );
     let inject_registry = Arc::clone(&registry);
-    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
-        "",
-        vec![(
-            "c1",
-            openplotva_dialog::ToolStep {
-                step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
-                query: "first".to_owned(),
-                ..openplotva_dialog::ToolStep::default()
-            },
-        )],
-    ))])
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "c1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "first".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("done")),
+    ])
     .with_on_call(Box::new(move |_| {
         assert!(inject_registry.inject(
             key,
             job_id,
             crate::dialog_turn::InjectedMessage {
-                params: params_from(7, "must survive"),
+                params: {
+                    let mut params = params_from(7, "must survive");
+                    params.message_id += 1;
+                    params
+                },
             },
         ));
     }));
@@ -6240,21 +6244,238 @@ async fn injected_materialization_failure_respawns_consumed_message() -> Result<
     )
     .await;
 
-    assert!(report.failed, "{report:?}");
-    let follow_up_id = report.followup_respawned.expect("follow-up job");
-    let follow_up = queue
-        .records()
-        .into_iter()
-        .find(|record| record.id == follow_up_id)
-        .expect("follow-up record");
-    assert_eq!(
-        follow_up
-            .job
-            .data
-            .dialog_data
-            .expect("dialog params")
-            .message_text,
-        "must survive"
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(provider.requests()[1].input.message.text, "first");
+    assert!(
+        step_context(&provider.requests()[1])
+            .iter()
+            .any(|text| text.contains("must survive"))
     );
+    Ok(())
+}
+
+fn step_context(request: &openplotva_dialog::ChatStepRequest) -> Vec<String> {
+    request
+        .input
+        .reference_context
+        .iter()
+        .cloned()
+        .chain(request.transcript.iter().filter_map(|entry| {
+            match entry {
+                openplotva_dialog::SessionMessage::InjectedUser { rendered } => Some(
+                    rendered
+                        .strip_prefix("Runtime guidance: ")
+                        .unwrap_or(rendered)
+                        .to_owned(),
+                ),
+                _ => None,
+            }
+        }))
+        .collect()
+}
+
+#[tokio::test]
+async fn agent_retry_restores_context_and_completed_tool_results() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("проверь"), now),
+    );
+    let call = || {
+        step_tools(
+            "",
+            vec![(
+                "search",
+                openplotva_dialog::ToolStep {
+                    step: "web_search".into(),
+                    query: "solstice".into(),
+                    ..Default::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(call()),
+        Err("temporary outage".into()),
+        Ok(call()),
+        Ok(step_text("Проверила: 21 июня.")),
+    ]);
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox.clone(), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(first.retry_requeued, "{first:?}");
+    let second = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now + TimeDuration::seconds(1), &outcomes, &wiring),
+    )
+    .await;
+    assert!(second.completed, "{second:?}");
+    assert_eq!(toolbox.web_search_queries.lock().expect("queries").len(), 1);
+    let requests = provider.requests();
+    assert_eq!(requests[0].input, requests[2].input);
+    assert!(requests[2].transcript.iter().any(|message| matches!(
+        message,
+        openplotva_dialog::SessionMessage::ToolResult { .. }
+    )));
+    let record = queue.record(id).expect("record");
+    assert_eq!(
+        record
+            .events
+            .iter()
+            .filter(|event| event.stage == "agent_checkpoint")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_does_not_retry_a_failed_gift_attempt() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let mut params = dialog_params("обычный разговор");
+    params.meta = serde_json::json!({"dialog_trigger":"random","gift_opportunity":true});
+    queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+    let gift = |id, prompt: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: "draw_image".into(),
+                    prompt: prompt.into(),
+                    gift: true,
+                    ..Default::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(gift("a", "fish")),
+        Ok(gift("b", "another fish")),
+        Ok(step_text("Рыба сегодня без портрета.")),
+    ]);
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox.clone(), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.completed, "{report:?}");
+    let draws = toolbox.draw_requests.lock().expect("draws");
+    assert_eq!(draws.len(), 1);
+    assert!(draws[0].context.message_meta.agent_gift);
+    assert!(provider.requests()[2].transcript.iter().any(|message|matches!(message,openplotva_dialog::SessionMessage::ToolResult{content,..} if content.contains("gift_denied"))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_interrupted_effect_fails_without_replaying() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("нарисуй рыбу"), now),
+    );
+    queue.append_job_event(
+        job_id,
+        TaskQueueJobEvent {
+            stage: "agent_effect".into(),
+            data: std::collections::BTreeMap::from([("key".into(), "draw:fish".into())]),
+            ..Default::default()
+        },
+        now,
+    )?;
+    let provider = StepProviderStub::with_steps(Vec::new());
+    let toolbox = Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox.clone(), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.failed, "{report:?}");
+    assert!(!report.retry_requeued);
+    assert!(provider.requests().is_empty());
+    assert!(toolbox.draw_requests.lock().expect("draws").is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn random_finish_keeps_tool_history_and_report() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let mut params = dialog_params("обычный разговор");
+    params.meta = serde_json::json!({"dialog_trigger":"random"});
+    queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "",
+        vec![(
+            "finish",
+            openplotva_dialog::ToolStep {
+                step: "finish_turn".into(),
+                ..Default::default()
+            },
+        )],
+    ))]);
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let history = ToolHistoryStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &history,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.completed, "{report:?}");
+    assert!(report.persisted_tool_call_history);
+    assert_eq!(report.session_tool_calls.len(), 1);
+    assert_eq!(report.session_tool_calls[0].name, "finish_turn");
+    assert!(effects.sent().is_empty());
+    assert!(effects.intermediates().is_empty());
     Ok(())
 }

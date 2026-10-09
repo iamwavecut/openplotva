@@ -147,7 +147,13 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
         event: TaskQueueJobEvent,
         at: OffsetDateTime,
     ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
-        Box::pin(async move { self.append_job_event(job_id, event, at) })
+        Box::pin(async move {
+            if event.stage == "agent_checkpoint" {
+                self.upsert_job_event(job_id, event, at)
+            } else {
+                self.append_job_event(job_id, event, at)
+            }
+        })
     }
 
     fn requeue_retryable_dialog_job<'a>(

@@ -332,6 +332,11 @@ pub type ToolboxFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolResult, ToolboxError>> + Send + 'a>>;
 
 pub trait DialogToolbox: Send + Sync {
+    /// Context and memory tools share the same caller-bound execution boundary.
+    fn agent_tool<'a>(&'a self, _context: ToolContext, _step: ToolStep) -> ToolboxFuture<'a> {
+        unsupported_tool_future("agent_tool")
+    }
+
     /// Currency rates tool.
     fn currency_rates<'a>(&'a self, _req: RatesRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future("currency_rates")
@@ -436,11 +441,26 @@ const ALL_STEPS: &[&str] = &[
     STEP_CHAT_HISTORY_SUMMARY,
     STEP_HISTORY_SEARCH,
     STEP_MEMORY_SEARCH,
+    "draw_api",
+    "get_messages",
+    "get_user_status",
+    "get_job_status",
+    "memory_manage",
+    "finish_turn",
     STEP_SEND_MESSAGE,
     STEP_REACT_TO_MESSAGE,
 ];
 
 const INLINE_TOOL_ARG_KEYS: &[&str] = &[
+    "message_ids",
+    "author_id",
+    "card_id",
+    "job_id",
+    "action",
+    "memory_scope",
+    "quote",
+    "final_reply",
+    "gift",
     "prompt",
     "topic",
     "file_id",
@@ -531,6 +551,11 @@ pub struct ToolSpec {
 
 const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
+        name: "gift",
+        required: false,
+        description: "True only for your own spontaneous gift when runtime grants an opportunity. Never fulfill a non-VIP media request or edit through a gift.",
+    },
+    ToolArgSpec {
         name: "prompt",
         required: true,
         description: "Image prompt. Prefer concrete visual instructions.",
@@ -557,14 +582,21 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     },
 ];
 
-const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
-    name: "topic",
-    required: true,
-    description: "The song brief in the user's own words: the topic or story plus every wish the \
+const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[
+    ToolArgSpec {
+        name: "gift",
+        required: false,
+        description: "True only for your own spontaneous gift when runtime grants an opportunity. Never fulfill a non-VIP media request or edit through a gift.",
+    },
+    ToolArgSpec {
+        name: "topic",
+        required: true,
+        description: "The song brief in the user's own words: the topic or story plus every wish the \
                   user stated about genre, mood, language of the lyrics, vocals (male, female, \
                   instrumental), length and references. Keep names and specific details; do not \
                   summarize them away.",
-}];
+    },
+];
 
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
@@ -590,17 +622,31 @@ const CRAWL_URL_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     description: "Full URL to fetch.",
 }];
 
-const HISTORY_SEARCH_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
-    name: "query",
-    required: true,
-    description: "Keywords to find relevant earlier messages in THIS chat's history.",
-}];
+const HISTORY_SEARCH_ARGS: &[ToolArgSpec] = &[
+    ToolArgSpec {
+        name: "author_id",
+        required: false,
+        description: "Optional author ID; combines with the text query.",
+    },
+    ToolArgSpec {
+        name: "query",
+        required: true,
+        description: "Keywords to find relevant earlier messages in THIS chat's history.",
+    },
+];
 
-const MEMORY_SEARCH_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
-    name: "query",
-    required: true,
-    description: "What to recall from long-term memory about the user or chat.",
-}];
+const MEMORY_SEARCH_ARGS: &[ToolArgSpec] = &[
+    ToolArgSpec {
+        name: "memory_scope",
+        required: false,
+        description: "Use self_global only in the requester's private chat to recall their own facts across chats. Omit for current chat memory.",
+    },
+    ToolArgSpec {
+        name: "query",
+        required: true,
+        description: "What to recall from long-term memory about the user or chat.",
+    },
+];
 
 const YOUTUBE_SUMMARY_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "video",
@@ -650,6 +696,87 @@ const CHAT_HISTORY_SUMMARY_ARGS: &[ToolArgSpec] = &[
 ];
 
 const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
+    ToolSpec {
+        name: "draw_api",
+        summary: "Generate and send an image through the direct Draw API.",
+        when_to_use: "Use for an explicit % image shortcut; draw_image handles ordinary generation and edits.",
+        result: "Returns delivery status. Do not announce success before the result.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[ToolArgSpec {
+            name: "prompt",
+            required: true,
+            description: "Image prompt after the % shortcut.",
+        }],
+    },
+    ToolSpec {
+        name: "get_messages",
+        summary: "Read exact messages, reply chains and nearby context from this chat. Use IDs from history or search results.",
+        when_to_use: "Use when it helps complete the active task or participate appropriately.",
+        result: "Returns a structured result or an explicit error.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[ToolArgSpec {
+            name: "message_ids",
+            required: true,
+            description: "Message IDs to read, up to 20.",
+        }],
+    },
+    ToolSpec {
+        name: "get_user_status",
+        summary: "Read verified VIP status and action permissions for the requester. Unknown status is not a denial.",
+        when_to_use: "Use when it helps complete the active task or participate appropriately.",
+        result: "Returns a structured result or an explicit error.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[],
+    },
+    ToolSpec {
+        name: "get_job_status",
+        summary: "Read the status of a job belonging to this requester in this chat.",
+        when_to_use: "Use when it helps complete the active task or participate appropriately.",
+        result: "Returns a structured result or an explicit error.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[ToolArgSpec {
+            name: "job_id",
+            required: true,
+            description: "Job ID returned by a tool.",
+        }],
+    },
+    ToolSpec {
+        name: "memory_manage",
+        summary: "Remember, update or forget facts about the requester or this chat. Never change another person's facts or disguise personal facts as chat facts.",
+        when_to_use: "Use when it helps complete the active task or participate appropriately.",
+        result: "Returns a structured result or an explicit error.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[
+            ToolArgSpec {
+                name: "action",
+                required: true,
+                description: "remember, update, or forget.",
+            },
+            ToolArgSpec {
+                name: "memory_scope",
+                required: true,
+                description: "self or chat; self_global only for explicit forgetting in a private chat.",
+            },
+            ToolArgSpec {
+                name: "card_id",
+                required: false,
+                description: "Existing card ID for update or forget.",
+            },
+            ToolArgSpec {
+                name: "text",
+                required: false,
+                description: "Fact text for remember or update.",
+            },
+        ],
+    },
+    ToolSpec {
+        name: "finish_turn",
+        summary: "End a random participation silently or after a reaction. Addressed requests need an answer or a clarification.",
+        when_to_use: "Use when it helps complete the active task or participate appropriately.",
+        result: "Returns a structured result or an explicit error.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: &[],
+    },
     ToolSpec {
         name: STEP_DRAW_IMAGE,
         summary: "Create or edit an image from the user's request.",
@@ -770,7 +897,7 @@ pub fn alternative_dialog_tools() -> Vec<ToolSpec> {
 /// Tools exposed only to the reasoning agent (via an explicit allow-list), not to
 /// the conversational model. Kept in the catalog so the agent can resolve their
 /// schemas, but filtered out of the conversational tool list.
-pub const AGENT_ONLY_TOOL_NAMES: &[&str] = &[STEP_MEMORY_SEARCH];
+pub const AGENT_ONLY_TOOL_NAMES: &[&str] = &[];
 
 #[must_use]
 pub fn alternative_dialog_tool_names() -> Vec<&'static str> {
@@ -952,11 +1079,28 @@ pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
              limit is reached, the text duplicates an already-sent message, or the text is empty \
              after sanitization.",
     continuation: ToolContinuation::ExplicitIntermediate,
-    args: &[ToolArgSpec {
-        name: "text",
-        required: true,
-        description: "Message text (Telegram HTML, same format as your normal replies).",
-    }],
+    args: &[
+        ToolArgSpec {
+            name: "message_id",
+            required: false,
+            description: "Target message ID in this chat; defaults to the original request.",
+        },
+        ToolArgSpec {
+            name: "quote",
+            required: false,
+            description: "Exact substring of the target message, at most 1024 characters.",
+        },
+        ToolArgSpec {
+            name: "final_reply",
+            required: false,
+            description: "True to finish the turn after this reply. The final reply must target the original request.",
+        },
+        ToolArgSpec {
+            name: "text",
+            required: true,
+            description: "Message text (Telegram HTML, same format as your normal replies).",
+        },
+    ],
 };
 
 /// `react_to_message` spec, injected by the session engine only.
@@ -1036,6 +1180,20 @@ fn tool_parameters_schema(spec: &ToolSpec) -> Value {
 fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
     let mut schema = Map::new();
     match arg.name {
+        "message_ids" => {
+            schema.extend(
+                serde_json::from_value::<Map<String, Value>>(
+                    json!({"type":"array","items":{"type":"integer"},"maxItems":20}),
+                )
+                .expect("static schema"),
+            );
+        }
+        "author_id" | "card_id" | "job_id" | "message_id" => {
+            schema.insert("type".into(), json!("integer"));
+        }
+        "final_reply" | "gift" => {
+            schema.insert("type".into(), json!("boolean"));
+        }
         "file_ids" => {
             schema.insert("type".to_owned(), Value::String("array".to_owned()));
             schema.insert(
@@ -2163,6 +2321,25 @@ pub fn sanitize_tool_value(value: Value) -> Value {
 /// A parsed dialog tool step.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolStep {
+    #[serde(default)]
+    pub gift: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_ids: Vec<i32>,
+    #[serde(default)]
+    pub author_id: i64,
+    #[serde(default)]
+    pub card_id: i64,
+    #[serde(default)]
+    pub job_id: i64,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub memory_scope: String,
+    #[serde(default)]
+    pub quote: String,
+    #[serde(default)]
+    pub final_reply: bool,
+
     /// Tool name.
     #[serde(default, rename = "step")]
     pub step: String,
@@ -3194,7 +3371,9 @@ fn populate_json_map_args(map: &Map<String, Value>, step: &mut ToolStep) {
     }
     populate_tool_args(
         |key| {
-            if key == "file_ids" && map.get(key).is_some_and(Value::is_array) {
+            if matches!(key, "file_ids" | "message_ids")
+                && map.get(key).is_some_and(Value::is_array)
+            {
                 return map.get(key).map(Value::to_string);
             }
             json_scalar_arg(map.get(key))
@@ -4408,6 +4587,34 @@ fn populate_inline_tool_args(args: &str, step: &mut ToolStep) {
 }
 
 fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut ToolStep) {
+    if let Some(value) = lookup("message_ids") {
+        step.message_ids = serde_json::from_str(&value).unwrap_or_default();
+    }
+    if let Some(value) = lookup("author_id") {
+        step.author_id = value.parse().unwrap_or_default();
+    }
+    if let Some(value) = lookup("card_id") {
+        step.card_id = value.parse().unwrap_or_default();
+    }
+    if let Some(value) = lookup("job_id") {
+        step.job_id = value.parse().unwrap_or_default();
+    }
+    if let Some(value) = lookup("action") {
+        step.action = value;
+    }
+    if let Some(value) = lookup("memory_scope") {
+        step.memory_scope = value;
+    }
+    if let Some(value) = lookup("quote") {
+        step.quote = value;
+    }
+    if let Some(value) = lookup("final_reply") {
+        step.final_reply = value == "true";
+    }
+    if let Some(value) = lookup("gift") {
+        step.gift = value == "true";
+    }
+
     if let Some(value) = lookup("prompt") {
         step.prompt = value;
     }
@@ -4647,6 +4854,20 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
 
     if !is_known_step(&step.step) {
         return Err(ToolParseError::new(format!("unknown step {:?}", step.step)));
+    }
+    if step.step == "get_messages"
+        && (step.message_ids.is_empty()
+            || step.message_ids.len() > 20
+            || step.message_ids.iter().any(|id| *id <= 0))
+    {
+        return Err(ToolParseError::new(
+            "get_messages requires 1 to 20 positive message IDs",
+        ));
+    }
+    if step.step == "get_job_status" && step.job_id <= 0 {
+        return Err(ToolParseError::new(
+            "get_job_status requires a positive job ID",
+        ));
     }
     if step.step == STEP_GENERATE_SONG && step.topic.is_empty() && !step.prompt.is_empty() {
         step.topic = std::mem::take(&mut step.prompt);
@@ -5200,11 +5421,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalog_matches_go_names_and_schema() {
+    fn tool_catalog_preserves_existing_tools_and_exposes_agent_context() {
         let names = alternative_dialog_tool_names();
         assert_eq!(
             names,
             vec![
+                "draw_api",
+                "get_messages",
+                "get_user_status",
+                "get_job_status",
+                "memory_manage",
+                "finish_turn",
                 STEP_DRAW_IMAGE,
                 STEP_GENERATE_SONG,
                 STEP_UNDERSTAND_MEDIA,
@@ -5212,6 +5439,7 @@ mod tests {
                 STEP_WEB_SEARCH,
                 STEP_CRAWL_URL,
                 STEP_HISTORY_SEARCH,
+                STEP_MEMORY_SEARCH,
                 STEP_YOUTUBE_SUMMARY,
                 STEP_QUEUE_STATUS,
                 STEP_CANCEL_DRAWING,
@@ -5277,6 +5505,31 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn agent_arguments_survive_native_and_salvaged_calls() {
+        let read = decode_tool_call_arguments("get_messages", &json!({"message_ids":[12,34]}))
+            .expect("message IDs");
+        assert_eq!(read.message_ids, vec![12, 34]);
+        assert!(decode_tool_call_arguments("get_messages", &json!({"message_ids":"bad"})).is_err());
+        for raw in [
+            r#"send_message{text:"yes",message_id:12,quote:"exact words",final_reply:true}"#,
+            r#"<tool_call>{"name":"send_message","arguments":{"text":"yes","message_id":12,"quote":"exact words","final_reply":true}}</tool_call>"#,
+        ] {
+            let (step, _) = extract_content_tool_step(raw).expect("reply call");
+            let step = step.expect("reply");
+            assert_eq!(step.quote, "exact words");
+            assert_eq!(step.target_message_id, 12);
+            assert!(step.final_reply);
+        }
+        let memory = decode_tool_call_arguments(
+            "memory_manage",
+            &json!({"card_id":42,"action":"forget","memory_scope":"self_global"}),
+        )
+        .expect("memory action");
+        assert_eq!(memory.card_id, 42);
+        assert_eq!(memory.memory_scope, "self_global");
     }
 
     #[test]

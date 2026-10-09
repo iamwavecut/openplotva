@@ -665,6 +665,7 @@ pub struct YouTubeSummaryResult {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrawImageScheduleRequest {
+    pub agent_gift: bool,
     /// Telegram chat ID.
     pub chat_id: i64,
     /// Forum topic ID.
@@ -1290,7 +1291,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                 Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
                 None => false,
             };
-            let plan = image_gen_queue_plan(has_vip);
+            let plan = image_gen_queue_plan(has_vip && !request.agent_gift);
             if self
                 .queue
                 .user_active_count(plan.queue_name, request.user_id)
@@ -1431,7 +1432,7 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                 Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
                 None => false,
             };
-            if !has_vip {
+            if !has_vip && !request.message_meta.agent_gift {
                 return Ok(not_scheduled_song(SongScheduleRejection::VipOnly));
             }
             let topic = request.topic.trim().to_owned();
@@ -1440,6 +1441,7 @@ impl SongScheduler for TaskmanDialogToolAdapter {
             }
             let reference_file_unique_id =
                 song_reference_unique_id(&request.reference_file_unique_id, &request.message_meta);
+            let is_gift = request.message_meta.agent_gift;
             let mut meta = serde_json::to_value(request.message_meta).unwrap_or_else(|_| json!({}));
             crate::music_jobs::SongJobMeta {
                 request_text: request.message_text.trim().to_owned(),
@@ -1457,7 +1459,7 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                     queue_depth,
                 )),
             });
-            let job = new_music_gen_job_at(
+            let mut job = new_music_gen_job_at(
                 MusicGenJobParams {
                     chat_id: request.chat_id,
                     message_id: request.message_id,
@@ -1475,6 +1477,9 @@ impl SongScheduler for TaskmanDialogToolAdapter {
             .with_name("music")
             .with_priority(HIGHEST_PRIORITY);
 
+            if is_gift {
+                job.priority = openplotva_taskman::DEFAULT_PRIORITY;
+            }
             if self
                 .task_enqueue_limited(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
                 .await
@@ -2243,6 +2248,7 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     vision_describer: Option<Arc<dyn VisionDescriber>>,
     history_summarizer: Option<Arc<dyn ChatHistorySummarizer>>,
     history_searcher: Option<Arc<dyn HistorySearcher>>,
+    agent_tools: Option<Arc<dyn DialogToolbox>>,
 }
 
 impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
@@ -2268,6 +2274,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             vision_describer: None,
             history_summarizer: None,
             history_searcher: None,
+            agent_tools: None,
         }
     }
 
@@ -2338,6 +2345,12 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     }
 
     #[must_use]
+    pub fn with_agent_tools(mut self, tools: Arc<dyn DialogToolbox>) -> Self {
+        self.agent_tools = Some(tools);
+        self
+    }
+
+    #[must_use]
     pub fn with_history_searcher(mut self, history_searcher: Arc<dyn HistorySearcher>) -> Self {
         self.history_searcher = Some(history_searcher);
         self
@@ -2402,6 +2415,7 @@ where
                 prompt.clone()
             };
             let request = DrawImageScheduleRequest {
+                agent_gift: req.context.message_meta.agent_gift,
                 chat_id: req.context.chat_id,
                 thread_id: req.context.thread_id,
                 message_id: req.context.message_id,
@@ -2551,8 +2565,36 @@ where
         })
     }
 
+    fn agent_tool<'a>(
+        &'a self,
+        context: openplotva_dialog::ToolContext,
+        step: openplotva_dialog::ToolStep,
+    ) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            match &self.agent_tools {
+                Some(tools) => tools.agent_tool(context, step).await,
+                None => Ok(ToolResult::failed(
+                    "unavailable",
+                    "Context tools are not configured",
+                )),
+            }
+        })
+    }
+
     fn history_search<'a>(&'a self, req: HistorySearchRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
+            if let Some(tools) = &self.agent_tools {
+                return tools
+                    .agent_tool(
+                        req.context.clone(),
+                        openplotva_dialog::ToolStep {
+                            step: "history_search".into(),
+                            query: req.query.clone(),
+                            ..openplotva_dialog::ToolStep::default()
+                        },
+                    )
+                    .await;
+            }
             let Some(searcher) = self.history_searcher.as_deref() else {
                 return Ok(ToolResult::failed(
                     "history_search_unavailable",
@@ -4290,6 +4332,7 @@ mod tests {
         assert_eq!(
             scheduler.calls(),
             vec![DrawImageScheduleRequest {
+                agent_gift: false,
                 chat_id: -100,
                 thread_id: Some(7),
                 message_id: 11,

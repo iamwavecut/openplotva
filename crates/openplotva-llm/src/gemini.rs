@@ -3531,7 +3531,7 @@ mod tests {
                 .as_array()
                 .and_then(|contents| contents.last())
                 .and_then(|content| content["parts"][0]["text"].as_str())
-                .is_some_and(|text| text.starts_with("custom gemini wrapper "))
+                .is_some_and(|text| text.contains("custom gemini wrapper "))
         );
         Ok(())
     }

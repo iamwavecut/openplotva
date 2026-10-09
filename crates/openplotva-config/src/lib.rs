@@ -2700,7 +2700,7 @@ impl AppConfig {
                     session_max_iterations: parse_i32(
                         "DIALOG_SESSION_MAX_ITERATIONS",
                         raw.dialog_session_max_iterations,
-                        8,
+                        36,
                     )?,
                     session_max_messages: parse_i32(
                         "DIALOG_SESSION_MAX_MESSAGES",
@@ -2710,12 +2710,12 @@ impl AppConfig {
                     session_tool_extension_secs: parse_i32(
                         "DIALOG_SESSION_TOOL_EXTENSION_SECS",
                         raw.dialog_session_tool_extension_secs,
-                        60,
+                        0,
                     )?,
                     session_hard_cap_secs: parse_i32(
                         "DIALOG_SESSION_HARD_CAP_SECS",
                         raw.dialog_session_hard_cap_secs,
-                        300,
+                        120,
                     )?,
                     session_max_draws: parse_i32(
                         "DIALOG_SESSION_MAX_DRAWS",

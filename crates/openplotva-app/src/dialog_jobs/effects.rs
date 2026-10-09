@@ -103,6 +103,13 @@ pub trait DialogJobEffects {
     /// Error returned by concrete side effects.
     type Error: fmt::Display + Send + Sync + 'static;
 
+    fn persist_agent_state<'a>(
+        &'a self,
+        _job_id: i64,
+    ) -> crate::task_queue::TaskQueueDurabilityFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn send_dialog_answer<'a>(
         &'a self,
         dialog_job_id: i64,
@@ -142,6 +149,7 @@ pub struct DialogDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
     durable_outbox: Option<DurableDialogOutbox>,
+    durability: Option<Arc<dyn crate::task_queue::TaskQueueDurabilityBarrier>>,
 }
 
 #[derive(Clone)]
@@ -157,7 +165,17 @@ impl DialogDispatcherEffects {
             queue,
             next_virtual_id: monotonic_virtual_id_factory("dialog-vmsg"),
             durable_outbox: None,
+            durability: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_durability_barrier(
+        mut self,
+        durability: Arc<dyn crate::task_queue::TaskQueueDurabilityBarrier>,
+    ) -> Self {
+        self.durability = Some(durability);
+        self
     }
 
     /// Route final answers through the Postgres outbox. Intermediate session
@@ -189,6 +207,18 @@ pub enum DialogDispatchEffectError {
 
 impl DialogJobEffects for DialogDispatcherEffects {
     type Error = DialogDispatchEffectError;
+
+    fn persist_agent_state<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> crate::task_queue::TaskQueueDurabilityFuture<'a> {
+        Box::pin(async move {
+            if let Some(durability) = &self.durability {
+                durability.durability_barrier(job_id).await?;
+            }
+            Ok(())
+        })
+    }
 
     fn send_dialog_answer<'a>(
         &'a self,
@@ -449,7 +479,8 @@ async fn enqueue_durable_dialog_intermediate(
     chat: ChatRef,
     reply_to: Option<&ReplyMessageRef>,
 ) -> Result<(), DialogDispatchEffectError> {
-    let methods = if dialog_response_requires_rich(text) {
+    let methods = if dialog_response_requires_rich(text) && params.meta.get("agent_quote").is_none()
+    {
         let request = RichMessageRequest {
             chat: Some(chat),
             message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
@@ -479,7 +510,28 @@ async fn enqueue_durable_dialog_intermediate(
     let now = OffsetDateTime::now_utc();
     let parts = methods
         .into_iter()
-        .map(|method| durable_outbox_part(method, now))
+        .map(|method| {
+            let method = match method {
+                TelegramOutboundMethod::SendMessage(message)
+                    if params
+                        .meta
+                        .get("agent_quote")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some() =>
+                {
+                    let quote = params.meta["agent_quote"].as_str().unwrap_or_default();
+                    let position = params.meta["agent_quote_position"].as_i64().unwrap_or(0);
+                    let reply = carapax::types::ReplyParameters::new(i64::from(params.message_id))
+                        .with_chat_id(params.chat_id)
+                        .with_quote(carapax::types::ReplyQuote::new(position, quote));
+                    TelegramOutboundMethod::SendMessage(Box::new(
+                        (*message).with_reply_parameters(reply),
+                    ))
+                }
+                method => method,
+            };
+            durable_outbox_part(method, now)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let batch = dialog_intermediate_outbox_batch(
         outbox.bot_id,
@@ -502,7 +554,11 @@ fn dialog_intermediate_outbox_batch(
     parts: Vec<TelegramOutboxPartInput>,
 ) -> TelegramOutboxBatchInput {
     TelegramOutboxBatchInput {
-        batch_id: format!("dialog-intermediate:v1:{bot_id}:{dialog_job_id}:{seq}"),
+        batch_id: if params.meta["agent_final_reply"].as_bool() == Some(true) {
+            dialog_answer_batch_id(bot_id, dialog_job_id)
+        } else {
+            format!("dialog-intermediate:v1:{bot_id}:{dialog_job_id}:{seq}")
+        },
         bot_id,
         chat_id: Some(params.chat_id),
         thread_id: params.thread_id,
@@ -661,6 +717,11 @@ mod tests {
         assert_eq!(batch.dialog_job_id, Some(123));
         assert_eq!(batch.causation_update_id, Some(456));
         assert_eq!(batch.trigger_message_id, Some(11));
+        let mut final_params = params;
+        final_params.meta = serde_json::json!({"agent_final_reply": true});
+        let final_batch =
+            dialog_intermediate_outbox_batch(42, 123, Some(456), &final_params, 2, Vec::new());
+        assert_eq!(final_batch.batch_id, dialog_answer_batch_id(42, 123));
     }
 
     #[test]

@@ -2140,8 +2140,28 @@ impl InMemoryTaskQueue {
     pub fn append_job_event(
         &self,
         job_id: i64,
+        event: TaskQueueJobEvent,
+        at: OffsetDateTime,
+    ) -> Result<(), TaskQueueError> {
+        self.record_job_event(job_id, event, at, false)
+    }
+
+    /// Replace the previous event with the same stage, keeping one current checkpoint.
+    pub fn upsert_job_event(
+        &self,
+        job_id: i64,
+        event: TaskQueueJobEvent,
+        at: OffsetDateTime,
+    ) -> Result<(), TaskQueueError> {
+        self.record_job_event(job_id, event, at, true)
+    }
+
+    fn record_job_event(
+        &self,
+        job_id: i64,
         mut event: TaskQueueJobEvent,
         at: OffsetDateTime,
+        replace: bool,
     ) -> Result<(), TaskQueueError> {
         if event.at.trim().is_empty() {
             event.at = format_time(at);
@@ -2152,6 +2172,9 @@ impl InMemoryTaskQueue {
             .iter_mut()
             .find(|record| record.id == job_id)
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        if replace {
+            record.events.retain(|prior| prior.stage != event.stage);
+        }
         record.events.push(event);
         if record.events.len() > MAX_JOB_EVENTS {
             let remove_count = record.events.len() - MAX_JOB_EVENTS;

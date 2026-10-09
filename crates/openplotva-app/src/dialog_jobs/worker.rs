@@ -210,11 +210,9 @@ where
     report.job_id = Some(item.id);
     report.provider = Some(provider.provider_name().to_owned());
 
-    let budget = crate::dialog_turn::TurnBudget::from_session_events(
+    let budget = crate::dialog_turn::TurnBudget::from_events(
         &item.events,
-        options.turn_budget_secs,
-        options.session.tool_extension_secs,
-        options.session.hard_cap_secs,
+        options.turn_budget_secs.clamp(1, 120),
         options.now,
     );
 

@@ -272,7 +272,12 @@ impl RuntimeVirtualDialogExecutor {
                 run_id: run_id.clone(),
                 run_kind: "console".to_owned(),
             },
-            crate::dialog_turn::run_captured_session(step_provider, toolbox.as_ref(), input, 8),
+            crate::dialog_turn::run_captured_session(
+                step_provider,
+                toolbox.as_ref(),
+                input,
+                openplotva_agent::MAX_STEPS,
+            ),
         )
         .await;
         if let Some(runs) = &self.llm_runs {
@@ -551,15 +556,96 @@ struct LiveCleanupReport {
 #[derive(Clone)]
 pub(crate) struct RuntimeVirtualSafeToolbox {
     inner: Arc<dyn DialogToolbox>,
+    memory: Arc<Mutex<Vec<Value>>>,
 }
 
 impl RuntimeVirtualSafeToolbox {
     pub(crate) fn new(inner: Arc<dyn DialogToolbox>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            memory: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
 impl DialogToolbox for RuntimeVirtualSafeToolbox {
+    fn agent_tool<'a>(
+        &'a self,
+        context: openplotva_dialog::ToolContext,
+        step: openplotva_dialog::ToolStep,
+    ) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            if step.step == "draw_api" {
+                return Ok(ToolResult {
+                    status: "ok".into(),
+                    data: Some(json!({"delivered":true,"tool_mode":"SAFE"})),
+                    ..ToolResult::default()
+                });
+            }
+            if matches!(step.step.as_str(), "memory_search" | "memory_manage") {
+                let mut cards = self.memory.lock().expect("safe memory");
+                let visible = |card: &Value| {
+                    card["chat_id"] == context.chat_id
+                        && (card["user_id"] == context.user_id || card["scope"] == "chat")
+                };
+                if step.step == "memory_search" {
+                    return Ok(ToolResult {
+                        status: "ok".into(),
+                        data: Some(
+                            json!({"cards":cards.iter().filter(|card|visible(card)).collect::<Vec<_>>()}),
+                        ),
+                        ..ToolResult::default()
+                    });
+                }
+                if !matches!(step.memory_scope.as_str(), "self" | "chat") {
+                    return Ok(ToolResult::failed(
+                        "scope_denied",
+                        "SAFE memory supports self and chat scopes",
+                    ));
+                }
+                match step.action.as_str() {
+                    "remember" => {
+                        let id = cards
+                            .iter()
+                            .filter_map(|card| card["id"].as_i64())
+                            .max()
+                            .unwrap_or(0)
+                            + 1;
+                        cards.push(json!({"id":id,"text":step.text,"scope":step.memory_scope,"chat_id":context.chat_id,"user_id":context.user_id}));
+                    }
+                    "update" | "forget" => {
+                        let Some(index) = cards
+                            .iter()
+                            .position(|card| visible(card) && card["id"] == step.card_id)
+                        else {
+                            return Ok(ToolResult::failed(
+                                "not_found_or_denied",
+                                "No permitted card",
+                            ));
+                        };
+                        if step.action == "forget" {
+                            cards.remove(index);
+                        } else {
+                            cards[index]["text"] = json!(step.text);
+                        }
+                    }
+                    _ => {
+                        return Ok(ToolResult::failed(
+                            "invalid_action",
+                            "Use remember, update or forget",
+                        ));
+                    }
+                }
+                return Ok(ToolResult {
+                    status: "ok".into(),
+                    data: Some(json!({"tool_mode":"SAFE"})),
+                    ..ToolResult::default()
+                });
+            }
+            self.inner.agent_tool(context, step).await
+        })
+    }
+
     fn currency_rates<'a>(&'a self, req: RatesRequest) -> ToolboxFuture<'a> {
         self.inner.currency_rates(req)
     }

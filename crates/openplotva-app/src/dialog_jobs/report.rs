@@ -3,8 +3,9 @@
 use crate::telegram_activity::TelegramActivitySnapshot;
 
 /// Result of one dialog taskman worker tick.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DialogJobWorkerReport {
+    pub session_tool_calls: Vec<openplotva_core::ToolCall>,
     /// Queue checked by this tick.
     pub queue_name: String,
     /// Whether a job was dequeued.
@@ -92,7 +93,7 @@ pub struct DialogJobWorkerReport {
 }
 
 /// Aggregate report for a long-running dialog taskman worker.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DialogJobWorkerRunReport {
     /// Number of poll ticks.
     pub ticks: u64,

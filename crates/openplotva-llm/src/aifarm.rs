@@ -4270,8 +4270,16 @@ pub fn reply_leak_guard(messages: &[ChatMessage], input: &DialogInput) -> ReplyL
         let role = message.role.trim();
         let is_runtime_context = role.eq_ignore_ascii_case("user")
             && message.content.trim_start().starts_with("<chat_context");
-        if role.eq_ignore_ascii_case("system") || is_runtime_context {
+        if role.eq_ignore_ascii_case("system") {
             guard = guard.protected_text(&message.content);
+        } else if is_runtime_context {
+            let end = message
+                .content
+                .find("</chat_context>")
+                .map_or(message.content.len(), |index| {
+                    index + "</chat_context>".len()
+                });
+            guard = guard.protected_text(&message.content[..end]);
         }
     }
     for turn in &input.history {
@@ -4309,15 +4317,46 @@ fn build_initial_messages(
     for turn in history {
         let is_current =
             turn.role == ROLE_USER && turn.message_id != 0 && turn.message_id == input.message.id;
-        if let Some(message) =
+        if let Some(mut message) =
             format_history_message_with_store(turn, is_current, &input.multimodal_images, prompts)?
         {
+            if message.role == "assistant" {
+                let mut structured = turn.clone();
+                structured.text = message.content;
+                structured.original_text.clear();
+                message.content = format_message_body(&structured);
+            }
             messages.push(message);
         }
     }
     if let Some(note) = render_resample_note(input, prompts)? {
         append_resample_note(&mut messages, &note);
     }
+    let mut packet = ChatMessage {
+        role: "user".to_owned(),
+        ..ChatMessage::default()
+    };
+    let mut parts = Vec::new();
+    for message in messages.drain(1..) {
+        if !packet.content.is_empty() {
+            packet.content.push_str("\n\n");
+        }
+        packet.content.push_str(&message.content);
+        if message.content_parts.is_empty() {
+            parts.push(ChatContentPart {
+                part_type: "text".into(),
+                text: message.content,
+                image_url: None,
+                video_url: None,
+            });
+        } else {
+            parts.extend(message.content_parts);
+        }
+    }
+    if parts.iter().any(|part| part.part_type != "text") {
+        packet.content_parts = parts;
+    }
+    messages.push(packet);
     Ok(messages)
 }
 
@@ -5884,6 +5923,7 @@ pub fn build_runtime_context(input: &DialogInput) -> String {
         "current_user",
         &fallback_string(&input.user.full_name, "unknown"),
     );
+    write_int_element(&mut out, "  ", "current_user_id", input.user.id);
     write_text_element(
         &mut out,
         "locale",
@@ -6228,6 +6268,9 @@ fn write_message_start(out: &mut String, tag: &str, turn: &HistoryMessage) {
         out.push_str(" timestamp=\"");
         out.push_str(&format_timestamp(timestamp));
         out.push('"');
+    }
+    if turn.user_id != 0 {
+        write_int_attr(out, "user_id", turn.user_id);
     }
     out.push_str(">\n");
 }
@@ -8617,7 +8660,7 @@ mod tests {
             assert!(prompt.contains(&format!("name=\"{}\"", spec.name)));
             assert!(prompt.contains(spec.summary.trim()));
         }
-        assert!(!prompt.contains("name=\"memory_search\""));
+        assert!(prompt.contains("name=\"memory_search\""));
         Ok(())
     }
 
@@ -8646,7 +8689,7 @@ mod tests {
         assert!(prompt.contains("<base_voice>"));
         assert!(prompt.contains("<persona_layers>"));
         assert!(prompt.contains("не услужливость"));
-        assert!(prompt.contains("Не используй обращения и приветствия"));
+        assert!(prompt.contains("Обращайся по имени"));
         assert!(prompt.contains("не больше одной черты"));
         assert!(prompt.contains("custom_persona"));
         assert!(prompt.contains("daily_persona_accent"));
@@ -8699,7 +8742,7 @@ mod tests {
             context.find("<custom_persona>").expect("custom persona")
                 < context.find("<shield_context>").expect("shield context")
         );
-        assert!(!context.contains("user_id"));
+        assert!(context.contains("<current_user_id>"));
         assert!(!context.contains("chat_id"));
     }
 
@@ -8774,7 +8817,7 @@ mod tests {
         let messages = build_initial_messages_with_options(&input, &history, true)?;
         let current = messages.last().expect("current");
         assert!(current.content.contains("что на картинке?"));
-        assert_eq!(current.content_parts.len(), 2);
+        assert_eq!(current.content_parts.len(), 3);
 
         let body = serde_json::to_string(current)?;
         assert!(body.contains(r#""type":"text""#));
@@ -9910,12 +9953,12 @@ mod tests {
             ..HistoryMessage::default()
         });
 
-        assert!(
-            body.contains(r#"<message id="10" thread_id="7" timestamp="2026-05-01T11:59:00Z">"#)
-        );
+        assert!(body.contains(
+            r#"<message id="10" thread_id="7" timestamp="2026-05-01T11:59:00Z" user_id="77">"#
+        ));
         assert!(body.contains(r#"<user username="bob" type="user">Bob</user>"#));
         assert!(body.contains(r#"<reply to_id="9"><to_user>Alice</to_user></reply>"#));
-        assert!(!body.contains("user_id"));
+        assert!(body.contains("user_id=\"77\""));
         assert!(!body.contains("sender_id"));
     }
 
@@ -10019,19 +10062,19 @@ mod tests {
 
         let history = build_session_history_with_limit(&input, DEFAULT_CONTEXT_HISTORY_LIMIT);
         let messages = build_initial_messages_with_options(&input, &history, true)?;
-        assert_eq!(messages.len(), 5);
-        assert!(messages[2].content.contains("<tool_result"));
-        assert_eq!(messages[3].role, "assistant");
-        assert_eq!(messages[3].content, "делаю");
-        assert!(!messages[3].content.contains("<assistant_message"));
-        assert!(messages[4].content.contains("а теперь напиши рассказ"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("<tool_result"));
+        assert!(messages[1].content.contains("<assistant_message"));
+        assert!(messages[1].content.contains("делаю"));
+        assert!(messages[1].content.contains("а теперь напиши рассказ"));
 
         let rendered = messages
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let history_and_current = messages[2..]
+        let history_and_current = messages[1..]
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
@@ -10061,7 +10104,7 @@ mod tests {
 
         let history = build_session_history_with_limit(&input, DEFAULT_CONTEXT_HISTORY_LIMIT);
         let messages = build_initial_messages_with_options(&input, &history, true)?;
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         let rendered = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -10097,7 +10140,7 @@ mod tests {
 
         let history = build_session_history_with_limit(&input, DEFAULT_CONTEXT_HISTORY_LIMIT);
         assert_eq!(history.len(), DEFAULT_CONTEXT_HISTORY_LIMIT);
-        assert_eq!(history[0].message_id, 87);
+        assert_eq!(history[0].message_id, 70);
         assert_eq!(history[history.len() - 2].message_id, 100);
         assert_eq!(history[history.len() - 1].message_id, 101);
     }
@@ -10851,7 +10894,7 @@ mod tests {
                 .last()
                 .expect("current user message")
                 .content
-                .starts_with("custom wrapper ")
+                .contains("custom wrapper ")
         );
         Ok(())
     }

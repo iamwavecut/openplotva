@@ -238,6 +238,10 @@ pub fn filter_non_terminator_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatMessageMeta {
+    /// Server-granted permission for one spontaneous gift; never copied from a tool argument.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_gift: bool,
+
     #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
     pub message_type: String,
     /// Optional annotation.

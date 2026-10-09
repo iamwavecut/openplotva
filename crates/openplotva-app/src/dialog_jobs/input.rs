@@ -60,6 +60,16 @@ pub trait DialogToolCallHistoryStore {
 pub struct NoopDialogToolCallHistoryStore;
 
 pub trait DialogInputMaterializer {
+    fn observe_dialog_messages<'a>(
+        &'a self,
+        _params: &'a DialogJobParams,
+        _after: i32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<serde_json::Value>, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Materialize one provider input. Canonical history failures are propagated.
     fn materialize_dialog_input<'a>(
         &'a self,
@@ -211,6 +221,21 @@ impl PostgresDialogInputMaterializer {
 }
 
 impl DialogInputMaterializer for PostgresDialogInputMaterializer {
+    fn observe_dialog_messages<'a>(
+        &'a self,
+        params: &'a DialogJobParams,
+        after: i32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<serde_json::Value>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.history
+                .agent_messages_since(params.chat_id, params.thread_id.unwrap_or(0), after)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
     fn materialize_dialog_input<'a>(
         &'a self,
         params: &'a DialogJobParams,
@@ -303,7 +328,16 @@ pub(crate) fn dialog_job_params_from_input(
         user_full_name: input.user.full_name.clone(),
         message_text: input.message.text.clone(),
         original_text: input.message.original_text.clone(),
-        meta: serde_json::to_value(&input.message.meta).unwrap_or_default(),
+        meta: {
+            let mut meta = scheduled.meta.clone();
+            if let (Some(dst), Ok(serde_json::Value::Object(src))) = (
+                meta.as_object_mut(),
+                serde_json::to_value(&input.message.meta),
+            ) {
+                dst.extend(src);
+            }
+            meta
+        },
         max_output_tokens: scheduled.max_output_tokens,
         thread_id: input.context.thread_id,
     }
@@ -1660,7 +1694,7 @@ mod context_artifact_tests {
         assert!(artifact.tools_offered);
         assert!(artifact.shield_on);
         assert_eq!(artifact.reference_context_chars, 10);
-        assert_eq!(artifact.history_len, 14);
+        assert_eq!(artifact.history_len, 20);
         assert_eq!(artifact.materialized_history_len, 22);
         assert_eq!(artifact.tool_history_len, 2);
         assert_eq!(artifact.media_count, 2);

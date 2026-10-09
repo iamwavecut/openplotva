@@ -1,5 +1,7 @@
 //! Storage boundary for Postgres, pgvector, SQLx, Redis, and Dragonfly.
 
+mod agent_tools;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
