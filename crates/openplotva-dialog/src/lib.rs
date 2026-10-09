@@ -755,7 +755,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
             ToolArgSpec {
                 name: "memory_scope",
                 required: true,
-                description: "self or chat; self_global only for explicit forgetting in a private chat.",
+                description: "self = facts about the requester, chat = shared chat facts. self_global is only for explicit forgetting in the requester's private chat.",
             },
             ToolArgSpec {
                 name: "card_id",
@@ -817,7 +817,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: STEP_WEB_SEARCH,
         summary: "Search the web for current, changeable, or uncertain external facts.",
-        when_to_use: "MUST use before answering when accuracy depends on facts that may have changed since model knowledge, including news, prices, weather, schedules, availability, laws, versions, current roles, sports, or economic indicators, or when an external fact is uncertain. An explicit request to search is not required. Prefer a specialized live tool when it fully answers the request; do not search for stable common knowledge, opinions, creative work, or facts supplied by the user.",
+        when_to_use: "Search when current or uncertain external facts need verification. If the task refers to a specific URL in current or earlier messages, FIRST read that exact URL with crawl_url; search snippets cannot verify what that page says. Use search afterwards for independent evidence. Prefer specialized tools for rates and similar live data. Skip search for ordinary conversation.",
         result: "Returns search results with source titles, snippets, and links. Follow promising links with crawl_url when snippets are not enough.",
         continuation: ToolContinuation::RequiresFollowup,
         args: WEB_SEARCH_ARGS,
@@ -825,9 +825,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: STEP_CRAWL_URL,
         summary: "Fetch and extract readable text from a URL.",
-        when_to_use: "Use to read a page found via web_search, or when the latest user message asks \
-                      to inspect, summarize, or quote a specific webpage.",
-        result: "Returns extracted page content — the natural follow-up to web_search links.",
+        when_to_use: "Use FIRST when checking, summarizing or quoting a specific page, including a URL from earlier messages referred to as this, that link or check above. Resolve the URL from chat context or history tools. Do not replace reading that page with a general search.",
+        result: "Returns the content of the exact page. If unavailable, state that limitation and use web_search for other evidence.",
         continuation: ToolContinuation::RequiresFollowup,
         args: CRAWL_URL_ARGS,
     },
@@ -1069,12 +1068,12 @@ pub const SESSION_REACTION_ALLOWED_EMOJI: &[&str] = &[
 /// `send_message` spec, injected by the session engine only.
 pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
     name: STEP_SEND_MESSAGE,
-    summary: "Send an intermediate message to the chat NOW, without ending your turn.",
+    summary: "Send a separate chat reply, optionally to an exact message or quote. Set final_reply=true when this is the complete answer.",
     when_to_use: "Use it for a short heads-up before slow work (a search, reading pages), or to \
                   split a long reply into several messages sent back to back. Plain assistant \
                   text WITHOUT tool calls always ends your turn — call send_message when you \
                   intend to continue working or writing afterwards. Never repeat a message you \
-                  already sent this turn.",
+                  already sent this turn. A simple answer or acknowledgment needs plain assistant text, not this tool.",
     result: "Delivers the message immediately; returns ok, or an error when the per-turn message \
              limit is reached, the text duplicates an already-sent message, or the text is empty \
              after sanitization.",
@@ -1854,6 +1853,8 @@ const REASONING_CHANNEL_MARKERS: &[&str] =
 const REASONING_CHANNEL_LABELS: &[&str] = &["thought", "analysis", "commentary"];
 
 const REPLY_LEAK_MARKERS: &[&str] = &[
+    "wait, looking at the system rules",
+    "(this is my mental scratchpad",
     "<|channel",
     "<channel|",
     "</|channel",
@@ -1933,9 +1934,20 @@ fn strip_leading_channel_label(value: &str) -> &str {
 pub fn reply_has_residual_leak(value: &str) -> bool {
     // Only a leak that *opens* the reply — a tag quoted mid-text is fine.
     let lower = value.trim_start().to_lowercase();
-    REPLY_LEAK_MARKERS
-        .iter()
-        .any(|marker| lower.starts_with(marker))
+    let tool_envelope = serde_json::Deserializer::from_str(value)
+        .into_iter::<Value>()
+        .next()
+        .is_some_and(|value| {
+            value.is_ok_and(|value| {
+                value.get("tool").is_some()
+                    && value.get("ref").is_some()
+                    && value.get("output").is_some()
+            })
+        });
+    tool_envelope
+        || REPLY_LEAK_MARKERS
+            .iter()
+            .any(|marker| lower.starts_with(marker))
         || REPLY_LEAK_TAGS
             .iter()
             .any(|tag| starts_with_xml_tag(&lower, tag))
@@ -5491,7 +5503,7 @@ mod tests {
             search
                 .function
                 .description
-                .contains("MUST use before answering")
+                .contains("FIRST read that exact URL with crawl_url")
         );
         assert!(
             search

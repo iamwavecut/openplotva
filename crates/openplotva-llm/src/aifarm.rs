@@ -20,11 +20,10 @@ use url::Url;
 use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
-    DialogLeak, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage,
-    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
-    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard,
-    STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolSpec, ToolStep, ToolsMode,
-    alternative_dialog_tool_names, alternative_dialog_tools, clone_history_messages,
+    DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
+    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
+    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard, STEP_SEND_MESSAGE,
+    SessionMessage, ToolParseDecision, ToolStep, ToolsMode, clone_history_messages,
     decode_plotva_final_response_with_salvage, is_dialog_history_noise_tool_call_name,
     normalize_history_message, parse_assistant_content, parse_native_tool_step, sanitize_tool_text,
     select_llm_history_messages_for_context, tool_telemetry,
@@ -3051,8 +3050,8 @@ where
                 })
             }
             Ok(ToolStepSelection::Steps {
-                steps,
-                text,
+                mut steps,
+                mut text,
                 residual_protocol,
             }) => {
                 if residual_protocol {
@@ -3061,7 +3060,7 @@ where
                     );
                     return Err(aifarm_step_error_with_trace(error, trace));
                 }
-                if let Some(error) = tool_step_text_leak_error(&guard, &text, &steps) {
+                if let Some(error) = sanitize_tool_step_text(&guard, &mut text, &mut steps) {
                     return Err(aifarm_step_error_with_trace(error, trace));
                 }
                 let mut tool_calls = Vec::with_capacity(steps.len());
@@ -4430,7 +4429,6 @@ fn build_system_prompt(
         "toolMode": mode.as_prompt_value(),
         "hasTools": mode.has_tools(),
         "guestMode": input.guest_mode,
-        "toolCatalog": render_alternative_tool_catalog(),
         "locale": xml_text(locale),
     });
     let rendered = match prompts {
@@ -4438,16 +4436,6 @@ fn build_system_prompt(
         None => openplotva_prompts::render("aifarm/system", &data)?,
     };
     Ok(rendered.trim().to_owned())
-}
-
-#[must_use]
-pub fn render_alternative_tool_catalog() -> String {
-    let names = alternative_dialog_tool_names();
-    let tools = alternative_dialog_tools()
-        .into_iter()
-        .filter(|spec| names.contains(&spec.name))
-        .collect::<Vec<_>>();
-    render_tool_catalog(&tools)
 }
 
 #[must_use]
@@ -5384,26 +5372,29 @@ fn final_answer_error_from_suppression(
 
 // Text that reaches the chat next to tool calls (the announcement and every
 // `send_message` body) is held to the same leak rules as a final answer.
-fn tool_step_text_leak_error(
+fn sanitize_tool_step_text(
     guard: &ReplyLeakGuard,
-    text: &str,
-    steps: &[PendingToolStep],
+    text: &mut String,
+    steps: &mut [PendingToolStep],
 ) -> Option<CompletionError> {
-    let announcement = (!text.trim().is_empty()).then_some(text);
     let bodies = steps
-        .iter()
+        .iter_mut()
         .filter(|pending| pending.step.step == STEP_SEND_MESSAGE)
-        .map(|pending| pending.step.text.as_str());
-    announcement
-        .into_iter()
+        .map(|pending| &mut pending.step.text);
+    for candidate in std::iter::once(text)
         .chain(bodies)
-        .find_map(|candidate| guard.detect(candidate))
-        .map(|leak| {
-            tool_protocol_completion_error(match leak {
-                DialogLeak::Prompt => "assistant text beside tool calls copied prompt context",
-                DialogLeak::Transcript => "assistant text beside tool calls copied the transcript",
-            })
-        })
+        .filter(|text| !text.trim().is_empty())
+    {
+        match openplotva_dialog::finalize_dialog_reply_with_guard(candidate, guard) {
+            openplotva_dialog::DialogReplyOutcome::Reply(answer) => *candidate = answer,
+            openplotva_dialog::DialogReplyOutcome::Suppressed(reason) => {
+                return Some(tool_protocol_completion_error(format!(
+                    "assistant text beside tool calls rejected: {reason:?}"
+                )));
+            }
+        }
+    }
+    None
 }
 
 fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
@@ -5858,47 +5849,6 @@ fn timeout_ms(value: StdDuration) -> i32 {
 
 fn saturating_i32(value: u128) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
-}
-
-fn render_tool_catalog(tools: &[ToolSpec]) -> String {
-    let mut out = String::new();
-    out.push_str("    <tools>\n");
-    for spec in tools {
-        out.push_str("      <tool name=\"");
-        out.push_str(&xml_attr(spec.name));
-        out.push_str("\">\n");
-        out.push_str("        <summary>");
-        out.push_str(&xml_text(spec.summary));
-        out.push_str("</summary>\n");
-        if !spec.when_to_use.trim().is_empty() {
-            out.push_str("        <use_when>");
-            out.push_str(&xml_text(spec.when_to_use));
-            out.push_str("</use_when>\n");
-        }
-        if !spec.result.trim().is_empty() {
-            out.push_str("        <result>");
-            out.push_str(&xml_text(spec.result));
-            out.push_str("</result>\n");
-        }
-        if !spec.args.is_empty() {
-            out.push_str("        <args>\n");
-            for arg in spec.args {
-                out.push_str("          <arg name=\"");
-                out.push_str(&xml_attr(arg.name));
-                out.push_str("\" required=\"");
-                out.push_str(if arg.required { "true" } else { "false" });
-                out.push_str("\">");
-                if !arg.description.trim().is_empty() {
-                    out.push_str(&xml_text(arg.description));
-                }
-                out.push_str("</arg>\n");
-            }
-            out.push_str("        </args>\n");
-        }
-        out.push_str("      </tool>\n");
-    }
-    out.push_str("    </tools>\n");
-    out
 }
 
 #[must_use]
@@ -8406,27 +8356,42 @@ mod tests {
             decision: ToolParseDecision::default(),
             native_ref: None,
         };
-        let leak = tool_step_text_leak_error(
-            &guard,
-            "",
-            &[send(
-                "Ты любишь фисташки и используешь их в качестве всего.",
-            )],
-        )
-        .expect("send_message leak");
+        let check = |text: &str, body: &str| {
+            sanitize_tool_step_text(&guard, &mut text.to_owned(), &mut [send(body)])
+        };
+        let leak = check("", "Ты любишь фисташки и используешь их в качестве всего.")
+            .expect("send_message leak");
         assert_eq!(
             retryable_reason(leak.as_ref()),
             Some(FailureReason::ModelOutputRejected)
         );
         assert!(
-            tool_step_text_leak_error(
-                &guard,
+            check(
                 "Ты — собеседник в живом Telegram-чате, а персонаж — только окраска твоего голоса.",
-                &[]
+                ""
             )
             .is_some()
         );
-        assert!(tool_step_text_leak_error(&guard, "щас гляну", &[send("минутку")]).is_none());
+        assert!(check("щас гляну", "минутку").is_none());
+        assert!(
+            check(
+                "Wait, looking at the system rules, I need to execute the tool properly.",
+                ""
+            )
+            .is_some()
+        );
+        assert!(check("<analysis>internal deliberation", "").is_some());
+        assert!(
+            check(
+                r#"{"output":{"data":{}},"ref":"call-1","tool":"memory_search"}
+Готово."#,
+                ""
+            )
+            .is_some()
+        );
+        let mut announcement = "<think>internal deliberation</think>Секунду.".to_owned();
+        assert!(sanitize_tool_step_text(&guard, &mut announcement, &mut []).is_none());
+        assert_eq!(announcement, "Секунду.");
     }
 
     #[test]
@@ -8635,32 +8600,15 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_includes_tool_catalog() -> Result<(), AifarmMessageError> {
+    fn native_system_prompt_does_not_duplicate_function_schemas() -> Result<(), AifarmMessageError>
+    {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
-
         assert!(prompt.contains("собеседник в живом Telegram-чате"));
-        assert!(prompt.contains("Большинство реплик не требуют tool"));
-        assert!(prompt.contains("Никогда не используй translate_text"));
-        assert!(prompt.contains("<system_contract>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<freshness_grounding>"));
-        assert!(prompt.contains("потребность в актуальности сама является основанием для tool"));
-        assert!(prompt.contains("Сначала используй специализированный live-tool"));
-        assert!(prompt.contains("не выдумывай источники"));
-        assert!(prompt.contains("MUST use before answering"));
-        assert!(prompt.contains("Prefer a specialized live tool"));
+        assert!(prompt.contains("native tool calls по JSON-схемам"));
+        assert!(prompt.contains("прочитай именно её через crawl_url"));
+        assert!(!prompt.contains("<tools>"));
+        assert!(!prompt.contains("<arg name="));
         assert!(!prompt.contains("<search_citations>"));
-        assert!(!prompt.contains("&lt;a href="));
-        assert!(!prompt.contains("semantic inline HTML link"));
-        let names = alternative_dialog_tool_names();
-        for spec in alternative_dialog_tools()
-            .into_iter()
-            .filter(|spec| names.contains(&spec.name))
-        {
-            assert!(prompt.contains(&format!("name=\"{}\"", spec.name)));
-            assert!(prompt.contains(spec.summary.trim()));
-        }
-        assert!(prompt.contains("name=\"memory_search\""));
         Ok(())
     }
 
@@ -10802,7 +10750,7 @@ mod tests {
                 tools: openplotva_dialog::ToolsMode::Native(
                     openplotva_dialog::chat_completion_tools_for_specs(&[
                         SESSION_SEND_MESSAGE_SPEC,
-                        alternative_dialog_tools()
+                        openplotva_dialog::alternative_dialog_tools()
                             .into_iter()
                             .find(|tool| tool.name == STEP_UNDERSTAND_MEDIA)
                             .expect("vision tool"),
