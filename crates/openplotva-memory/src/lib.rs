@@ -23,7 +23,7 @@ pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
-pub const PROMPT_VERSION: &str = "chat_memory_daily_v6";
+pub const PROMPT_VERSION: &str = "chat_memory_daily_v7";
 pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const DEFAULT_MEMORY_REDACTION_SERVICE_NAME: &str = "privacy-filter";
 pub const DEFAULT_MEMORY_REDACTION_ENDPOINT_NAME: &str = "redact";
@@ -2267,6 +2267,8 @@ pub enum SubjectMergePlanError {
     InvalidSurvivor { index: usize, survivor: Option<i64> },
     #[error("survivor index {0} has no merged text")]
     MissingMergedText(usize),
+    #[error("survivor index {0} contains spam in its merged text")]
+    SpamMergedText(usize),
 }
 
 /// One cluster of the validated plan: fold `absorbed_ids` into `survivor_id`
@@ -2290,7 +2292,10 @@ pub struct ValidatedSubjectMerge {
 /// model sees the likeliest survivors at the top, and number them in that order.
 #[must_use]
 pub fn subject_merge_cards(cards: &[Card], as_of: OffsetDateTime) -> Vec<SubjectMergeCard> {
-    let mut ordered: Vec<&Card> = cards.iter().collect();
+    let mut ordered: Vec<&Card> = cards
+        .iter()
+        .filter(|card| !is_memory_spam_card(card))
+        .collect();
     ordered.sort_by(|left, right| {
         right
             .salience
@@ -2418,6 +2423,9 @@ pub fn validate_subject_merge_plan(
             .map(|survivor| survivor.merged_fact_text.trim())
             .find(|text| !text.is_empty())
             .ok_or(SubjectMergePlanError::MissingMergedText(head))?;
+        if is_memory_spam_fact(merged_fact_text) {
+            return Err(SubjectMergePlanError::SpamMergedText(head));
+        }
         clusters.push(ValidatedMergeCluster {
             survivor_id: card_ids[head],
             absorbed_ids,
@@ -2962,6 +2970,8 @@ const KNOWN_FACT_WORD_OVERLAP: f64 = 0.8;
 /// What `gate_extraction_output` removed or rewrote, one counter per rule.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExtractionGateReport {
+    /// Spam candidates, resolutions, and episode summaries removed by policy.
+    pub spam: usize,
     /// Cards citing no message of the window.
     pub unsourced: usize,
     /// Cards whose evidence quote is missing or not found in a cited message.
@@ -2988,6 +2998,8 @@ impl ExtractionGateReport {
 }
 
 /// Enforce the extraction contract in code, whatever the model wrote: a card
+/// describing an ad or spam (in the model's own reasoning, by its content or
+/// by the messages it cites) is dropped, a card
 /// must quote a message it cites, an event needs more than one short reply, a
 /// fact keeps its sources' script, a restated existing fact becomes a
 /// reinforcement, a window adds at most `MAX_CANDIDATE_CARDS_PER_WINDOW` cards
@@ -3000,7 +3012,12 @@ pub fn gate_extraction_output(
     input: &ExtractInput,
     mut output: ExtractOutput,
 ) -> (ExtractOutput, ExtractionGateReport) {
-    let mut report = ExtractionGateReport::default();
+    let (filtered, spam) = filter_extraction_spam(input, output);
+    output = filtered;
+    let mut report = ExtractionGateReport {
+        spam,
+        ..ExtractionGateReport::default()
+    };
     for legacy in std::mem::take(&mut output.supersessions) {
         output.resolutions.push(Resolution {
             old_card_id: legacy.old_card_id,
@@ -3082,6 +3099,213 @@ pub fn gate_extraction_output(
         }
     }
     (output, report)
+}
+
+/// Stems with which the extractor labels its own card as spam or advertising
+/// ("устойчивый рекламный шаблон", "спамит одним объявлением"): it recognises
+/// an ad it was told to skip and stores it as a pattern anyway.
+const SPAM_SELF_REPORT_STEMS: &[&str] =
+    &["спам", "реклам", "рассылк", "объявлени", "spam", "advertis"];
+/// Reasons that rest a card's durability on repetition inside the window
+/// ("постит одно и то же 3 раза за час"): the pattern of ad rotations.
+const REPEATED_IN_WINDOW_REASONS: &[&str] = &[
+    "раз за час",
+    "раза за час",
+    "раз за окно",
+    "раза за окно",
+    "дважды за",
+    "трижды за",
+    "одно и то же",
+    "один и тот же пост",
+    "один и тот же текст",
+    "один и тот же шаблон",
+];
+
+/// Vocabulary of the offers the extractor stores as facts about their authors:
+/// escort and hookup ads, gig recruiting, crypto and loans, account trading,
+/// floods. Matched in the card's subject, predicate, object and fact, and in
+/// the messages it cites.
+const AD_CARD_NEEDLES: &[&str] = &[
+    "эскорт",
+    "escort",
+    "индивидуалк",
+    "без предоплат",
+    "досуг",
+    "за мп",
+    "госпож",
+    "фемдом",
+    "femdom",
+    "onlyfans",
+    "вебкам",
+    "webcam",
+    "секс-услуг",
+    "услуги для взрослых",
+    "прайс",
+    "₽/час",
+    "$/час",
+    "вирт-переписк",
+    "🔞",
+    "впиш",
+    "ищет девушк",
+    "ищет парн",
+    "ищет женщин",
+    "ищет мужчин",
+    "ищет постоянную девушк",
+    "фото в лс",
+    "подработ",
+    "ваканси",
+    "калым",
+    "разгрузк",
+    "погрузк",
+    "оплата каждый",
+    "ищет работник",
+    "usdt",
+    "p2p",
+    "обмен валют",
+    "дам в долг",
+    "микрозайм",
+    "заработок от",
+    "доход от",
+    "скупает",
+    "покупает аккаунт",
+    "продает аккаунт",
+    "флуд",
+    "копипаст",
+    "шаблонн",
+];
+
+fn fold_for_ads(text: &str) -> String {
+    text.to_lowercase().replace('ё', "е")
+}
+
+fn describes_spam(candidate: &CandidateCard) -> bool {
+    let why = fold_for_ads(&candidate.why_durable);
+    let content = fold_for_ads(&format!(
+        "{} | {} | {} | {}",
+        candidate.subject, candidate.predicate, candidate.object, candidate.fact_text
+    ));
+    contains_any(&why, REPEATED_IN_WINDOW_REASONS)
+        || is_memory_spam_fact(&content)
+        || [
+            why,
+            fold_for_ads(&candidate.predicate),
+            fold_for_ads(&candidate.subject),
+        ]
+        .iter()
+        .any(|field| contains_any(field, SPAM_SELF_REPORT_STEMS))
+}
+
+/// A cited message carrying ad vocabulary: whatever the card says, it rests on
+/// an offer.
+fn reads_as_ad(text: &str) -> bool {
+    contains_any(&fold_for_ads(text), AD_CARD_NEEDLES)
+}
+
+/// Reject advertising text wherever a memory model can write or reinforce it.
+/// The vocabulary policy is intentionally aggressive and does not classify
+/// commercial discussion separately from offers.
+#[must_use]
+pub fn is_memory_spam_fact(text: &str) -> bool {
+    !text.trim().is_empty()
+        && (reads_as_ad(text) || looks_like_memory_spam(text) || looks_like_ad_copy(text))
+}
+
+#[must_use]
+pub fn is_memory_spam_card(card: &Card) -> bool {
+    is_memory_spam_fact(&format!(
+        "{} | {} | {} | {}",
+        card.subject, card.predicate, card.object, card.fact_text
+    )) || contains_any(&fold_for_ads(&card.subject), SPAM_SELF_REPORT_STEMS)
+        || contains_any(&fold_for_ads(&card.predicate), SPAM_SELF_REPORT_STEMS)
+}
+
+/// Apply the spam policy without changing the other extraction validations.
+/// This also protects callers that persist an already extracted batch.
+#[must_use]
+pub fn filter_extraction_spam(
+    input: &ExtractInput,
+    mut output: ExtractOutput,
+) -> (ExtractOutput, usize) {
+    let spam_sources = consolidation_spam_indices(&input.messages);
+    let mut blocked_card_ids: HashSet<i64> = input
+        .existing_cards
+        .iter()
+        .filter(|card| is_memory_spam_card(card))
+        .map(|card| card.id)
+        .collect();
+    let mut blocked_facts = HashSet::new();
+    let mut removed = 0;
+    output.candidate_cards.retain(|candidate| {
+        let blocked = describes_spam(candidate)
+            || input.messages.iter().enumerate().any(|(index, message)| {
+                message_matches_candidate_source(message, candidate)
+                    && (spam_sources.contains(&index) || is_memory_spam_fact(&message.text))
+            });
+        if blocked {
+            removed += 1;
+            let key = normalized_fact_text_key(&candidate.fact_text);
+            if !key.is_empty() {
+                blocked_facts.insert(key);
+            }
+            if let Some(id) = known_fact_id(candidate, &input.existing_cards) {
+                blocked_card_ids.insert(id);
+            }
+        }
+        !blocked
+    });
+    let safe_replacement = |old_id: i64, new_text: &str, reason: &str| {
+        !blocked_card_ids.contains(&old_id)
+            && !is_memory_spam_fact(new_text)
+            && !blocked_facts.contains(&normalized_fact_text_key(new_text))
+            && !contains_any(&fold_for_ads(reason), SPAM_SELF_REPORT_STEMS)
+    };
+    let before = output.resolutions.len() + output.supersessions.len();
+    output.resolutions.retain(|resolution| {
+        safe_replacement(
+            resolution.old_card_id,
+            &resolution.new_fact_text,
+            &resolution.reason,
+        ) && (resolution.decision != ResolutionDecision::Merge
+            || !blocked_card_ids.contains(&resolution.into_card_id))
+    });
+    output.supersessions.retain(|resolution| {
+        safe_replacement(
+            resolution.old_card_id,
+            &resolution.new_fact_text,
+            &resolution.reason,
+        )
+    });
+    removed += before - output.resolutions.len() - output.supersessions.len();
+    let rejected_window = !spam_sources.is_empty()
+        && input
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| !is_non_spam_memory_noise_message(message))
+            .all(|(index, _)| spam_sources.contains(&index));
+    if rejected_window {
+        removed +=
+            output.candidate_cards.len() + output.resolutions.len() + output.supersessions.len();
+        output.candidate_cards.clear();
+        output.resolutions.clear();
+        output.supersessions.clear();
+        output.links.clear();
+    }
+    if rejected_window
+        || is_memory_spam_fact(&output.episode_summary)
+        || contains_any(
+            &fold_for_ads(&output.episode_summary),
+            SPAM_SELF_REPORT_STEMS,
+        )
+    {
+        removed += usize::from(!output.episode_summary.is_empty());
+        output.episode_summary.clear();
+        output.topics.clear();
+        output.participants.clear();
+    } else {
+        output.topics.retain(|text| !is_memory_spam_fact(text));
+    }
+    (output, removed)
 }
 
 fn evidence_is_quoted(quote: &str, sources: &[&Message]) -> bool {
@@ -3305,6 +3529,9 @@ pub const EXISTING_SINGLE_OBSERVATION_MIN_SALIENCE: f64 = 0.6;
 /// only once stay out of the prompt.
 #[must_use]
 pub fn worth_showing_as_existing(card: &Card, as_of: OffsetDateTime) -> bool {
+    if is_memory_spam_card(card) {
+        return false;
+    }
     if card.card_type == CARD_TYPE_EVENT {
         let seen = card.created_at.or(card.last_observed_at);
         if seen.is_none_or(|seen| {
@@ -3670,20 +3897,116 @@ pub fn format_memory_confidence(confidence: f64) -> String {
     format!("{confidence:.2}")
 }
 
+/// Messages of one window that may reach the extractor: noise out, and ad
+/// copies out (relayed, letter-swapped, or one text posted
+/// `REPEATED_TEXT_LIMIT` or more times). When ad copies make up
+/// `AD_BOARD_PERCENT` of the window, nothing is kept: such a chat is an ad
+/// board, and the single ads in it slip past the per-message rules.
 #[must_use]
 pub fn filter_consolidation_messages(messages: &[Message]) -> Vec<Message> {
-    if messages.is_empty() {
-        return Vec::new();
-    }
+    let spam = consolidation_spam_indices(messages);
     messages
         .iter()
-        .filter(|message| !is_memory_noise_message(message))
-        .cloned()
+        .enumerate()
+        .filter(|(index, message)| !is_memory_noise_message(message) && !spam.contains(index))
+        .map(|(_, message)| message.clone())
         .collect()
+}
+
+fn consolidation_spam_indices(messages: &[Message]) -> HashSet<usize> {
+    let human: Vec<(usize, &Message)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| !is_non_spam_memory_noise_message(message))
+        .collect();
+    let repeated = repeated_text_keys(
+        &human
+            .iter()
+            .map(|(_, message)| *message)
+            .collect::<Vec<_>>(),
+    );
+    let spam: HashSet<usize> = human
+        .iter()
+        .filter(|(_, message)| {
+            is_memory_spam_fact(&message.text)
+                || text_copy_keys(&message.text)
+                    .is_some_and(|keys| keys.iter().any(|key| repeated.contains(key)))
+        })
+        .map(|(index, _)| *index)
+        .collect();
+    if !spam.is_empty() && spam.len() * 100 >= human.len() * AD_BOARD_PERCENT {
+        human.into_iter().map(|(index, _)| index).collect()
+    } else {
+        spam
+    }
+}
+
+/// Share of ad copies, in percent of a window's human messages, at which the
+/// whole window is skipped.
+pub const AD_BOARD_PERCENT: usize = 20;
+/// Copies of one text in a window at which every copy is dropped.
+pub const REPEATED_TEXT_LIMIT: usize = 3;
+/// Shortest text, after handles are removed, that counts as a repeated copy.
+const MIN_REPEATED_TEXT_CHARS: usize = 20;
+/// Characters compared at each end of a text when counting copies: the head
+/// survives rotating signatures and links at the end of an ad, the tail
+/// survives rotating prefixes and numbering at its start.
+const REPEATED_TEXT_KEY_CHARS: usize = 64;
+
+fn repeated_text_keys(messages: &[&Message]) -> HashSet<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for message in messages {
+        for key in text_copy_keys(&message.text).into_iter().flatten() {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count >= REPEATED_TEXT_LIMIT)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Head and tail keys of a text with `@handles` removed, `ё` folded,
+/// lowercased and whitespace collapsed: its first and last
+/// `REPEATED_TEXT_KEY_CHARS` characters, marked so a head never matches a
+/// tail; `None` when shorter than `MIN_REPEATED_TEXT_CHARS`.
+fn text_copy_keys(text: &str) -> Option<[String; 2]> {
+    let mut without_handles = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '@' && chars.peek().is_some_and(|next| is_handle_char(*next)) {
+            while chars.peek().is_some_and(|next| is_handle_char(*next)) {
+                chars.next();
+            }
+            continue;
+        }
+        without_handles.push(match ch {
+            'ё' | 'Ё' => 'е',
+            other => other,
+        });
+    }
+    let normalized: Vec<char> = normalized_lower_space(&without_handles).chars().collect();
+    if normalized.len() < MIN_REPEATED_TEXT_CHARS {
+        return None;
+    }
+    let head: String = normalized.iter().take(REPEATED_TEXT_KEY_CHARS).collect();
+    let tail: String = normalized[normalized.len().saturating_sub(REPEATED_TEXT_KEY_CHARS)..]
+        .iter()
+        .collect();
+    Some([format!("^{head}"), format!("${tail}")])
+}
+
+fn is_handle_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 #[must_use]
 pub fn is_memory_noise_message(message: &Message) -> bool {
+    is_non_spam_memory_noise_message(message) || is_memory_spam_fact(&message.text)
+}
+
+fn is_non_spam_memory_noise_message(message: &Message) -> bool {
     if message.sender_is_bot {
         return true;
     }
@@ -3696,7 +4019,7 @@ pub fn is_memory_noise_message(message: &Message) -> bool {
     if is_noisy_memory_forward_origin(&message.forward_origin_type) {
         return true;
     }
-    looks_like_memory_spam(&message.text) || cannot_carry_memory_fact(&message.text)
+    cannot_carry_memory_fact(&message.text)
 }
 
 /// Shortest one-word message that still reaches the extractor.
@@ -3721,7 +4044,7 @@ pub fn cannot_carry_memory_fact(text: &str) -> bool {
 
 #[must_use]
 pub fn looks_like_memory_spam(text: &str) -> bool {
-    let lower = text.trim().replace('ё', "е").to_lowercase();
+    let lower = fold_for_ads(text.trim());
     if lower.is_empty() {
         return true;
     }
@@ -3735,6 +4058,29 @@ pub fn looks_like_memory_spam(text: &str) -> bool {
     }
     contains_any(&lower, MEMORY_SPAM_URL_NEEDLES)
         && contains_any(&lower, MEMORY_SPAM_COMMERCIAL_NEEDLES)
+}
+
+/// A copy posted by a mass-mailing tool (it signs every copy), or a text that
+/// swaps look-alike letters to slip past filters ("Поkупаю акkаунт"), which
+/// people practically never do in two words of one message.
+fn looks_like_ad_copy(text: &str) -> bool {
+    let lower = normalized_lower_space(&text.replace(['ё', 'Ё'], "е"));
+    contains_any(&lower, MEMORY_SPAM_RELAY_NEEDLES)
+        || script_mixed_words(text) >= MIN_SCRIPT_MIXED_WORDS
+}
+
+/// Words mixing Latin and Cyrillic letters at which a message is an ad copy.
+const MIN_SCRIPT_MIXED_WORDS: usize = 2;
+
+fn script_mixed_words(text: &str) -> usize {
+    text.split(|ch: char| !ch.is_alphabetic())
+        .filter(|word| word.chars().count() >= 3)
+        .filter(|word| {
+            word.chars()
+                .any(|ch| ('\u{0400}'..='\u{04FF}').contains(&ch))
+                && word.chars().any(|ch| ch.is_ascii_alphabetic())
+        })
+        .count()
 }
 
 #[must_use]
@@ -4402,6 +4748,16 @@ const MEMORY_SPAM_IMMEDIATE_NEEDLES: &[&str] = &[
     "open the link",
     "follow the link",
 ];
+/// Signatures mass-mailing tools append to every copy they post.
+const MEMORY_SPAM_RELAY_NEEDLES: &[&str] = &[
+    "отправлено через @",
+    "отправлено с помощью @",
+    "рассылка через @",
+    "передано через @",
+    "разослано через @",
+    "sent via @",
+    "posted via @",
+];
 const MEMORY_SPAM_JOB_OFFER_NEEDLES: &[&str] = &[
     "подработка",
     "предложение работы",
@@ -5014,9 +5370,12 @@ mod tests {
             },
         ];
 
-        let filtered = filter_consolidation_messages(&messages);
+        assert!(filter_consolidation_messages(&messages).is_empty());
+        let mut mixed = messages;
+        mixed.extend(chatter(20));
+        let filtered = filter_consolidation_messages(&mixed);
 
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 22);
         assert_eq!(filtered[0].entry_id, "normal-work");
         assert_eq!(filtered[1].entry_id, "normal-link");
     }
@@ -6201,6 +6560,53 @@ mod tests {
     }
 
     #[test]
+    fn gates_drop_cards_the_extractor_calls_spam() {
+        let mut pattern = gate_card(1, "Anna", "Анна не ест мясо", "не ем мясо");
+        pattern.why_durable = "её устойчивый рекламный шаблон, повторяет каждый час".to_owned();
+        let mut spammer = gate_card(4, "Anna B", "Анна живёт в Минске", "живу в Минске");
+        spammer.predicate = "spams".to_owned();
+        let mut rotation = gate_card(1, "Anna D", "Анна ищет компанию на вечер", "не ем мясо");
+        rotation.why_durable = "постит одно и то же 3 раза за час".to_owned();
+        let mut offer = gate_card(
+            1,
+            "Anna E",
+            "Анна предлагает досуг без предоплаты",
+            "не ем мясо",
+        );
+        offer.why_durable = "её устойчивая роль в группе".to_owned();
+        let mut kept = gate_card(1, "Anna C", "Анна вегетарианка", "полгода как вегетарианка");
+        kept.why_durable =
+            "устойчивая привычка в еде, пригодится при выборе места встречи".to_owned();
+        let (gated, report) = gate(ExtractOutput {
+            candidate_cards: vec![pattern, spammer, rotation, offer, kept],
+            ..ExtractOutput::default()
+        });
+        assert_eq!(gated.candidate_cards.len(), 1);
+        assert_eq!(gated.candidate_cards[0].subject, "Anna C");
+        assert_eq!(report.spam, 4);
+    }
+
+    #[test]
+    fn gates_drop_cards_citing_an_ad() {
+        let mut input = gate_input();
+        let mut ad = input.messages[3].clone();
+        ad.message_id = 5;
+        ad.entry_id = "m5".to_owned();
+        ad.text = "Приглашаю в гости, без предоплаты, район Минска".to_owned();
+        input.messages.push(ad);
+        let innocent = gate_card(5, "Katya", "Катя живёт в Минске", "район Минска");
+        let (gated, report) = gate_extraction_output(
+            &input,
+            ExtractOutput {
+                candidate_cards: vec![innocent],
+                ..ExtractOutput::default()
+            },
+        );
+        assert!(gated.candidate_cards.is_empty());
+        assert_eq!(report.spam, 1);
+    }
+
+    #[test]
     fn gates_drop_events_resting_on_one_short_reply() {
         let mut short = gate_card(2, "Boris", "Борис ответил коротко", "ага");
         short.card_type = CARD_TYPE_EVENT.to_owned();
@@ -6593,5 +6999,255 @@ mod tests {
                 "/ну и что",
             ]
         );
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message {
+            sender_type: "user".to_owned(),
+            text: text.to_owned(),
+            ..Message::default()
+        }
+    }
+
+    fn chatter(count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                user_message(&format!(
+                    "Обсуждаем планы на выходные, вариант номер {index}"
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filter_consolidation_messages_drops_relayed_disguised_and_repeated_ads() {
+        let disguised = "Продаю аккаунты недорого"
+            .replace('р', "p")
+            .replace('о', "o")
+            .replace('а', "a");
+        let mut messages = chatter(30);
+        for text in [
+            "Заходите на сервер, выдам любой кит. Отправлено через @relay_example_bot",
+            disguised.as_str(),
+            "Сдаю квартиру посуточно в центре, звоните @owner_one",
+            "Я наконец-то купил себе iPhoneище",
+            "Сдаю квартиру посуточно в центре, звоните @owner_two",
+            "Мы переезжаем в Казань в октябре, уже нашли квартиру",
+            "Сдаю квартиру посуточно в центре, звоните @owner_three",
+            "Мы переезжаем в Казань в октябре, уже нашли квартиру",
+            "всем доброе утро",
+            "всем доброе утро",
+            "всем доброе утро",
+            "1) Отдам котят в добрые руки, забирать в центре города, звоните вечером после семи",
+            "2) Отдам котят в добрые руки, забирать в центре города, звоните вечером после семи",
+            "3) Отдам котят в добрые руки, забирать в центре города, звоните вечером после семи",
+        ] {
+            messages.push(user_message(text));
+        }
+        let kept: Vec<String> = filter_consolidation_messages(&messages)
+            .into_iter()
+            .skip(30)
+            .map(|message| message.text)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "Я наконец-то купил себе iPhoneище",
+                "Мы переезжаем в Казань в октябре, уже нашли квартиру",
+                "Мы переезжаем в Казань в октябре, уже нашли квартиру",
+                "всем доброе утро",
+                "всем доброе утро",
+                "всем доброе утро",
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_consolidation_messages_skips_an_ad_board_window() {
+        let ad = |index: usize| {
+            user_message(&format!(
+                "Приглашаю в гости, фото в профиле, вариант {index}. Отправлено через @relay_example_bot"
+            ))
+        };
+        let mut board = chatter(8);
+        board.extend((0..2).map(ad));
+        assert!(filter_consolidation_messages(&board).is_empty());
+
+        let mut chat = chatter(9);
+        chat.push(ad(0));
+        assert_eq!(filter_consolidation_messages(&chat).len(), 9);
+    }
+
+    #[test]
+    fn spam_gates_block_resolution_and_episode_bypasses() {
+        let mut input = gate_input();
+        input.existing_cards.push(Card {
+            id: 501,
+            subject: "Offer".to_owned(),
+            fact_text: "Предлагает досуг без предоплаты".to_owned(),
+            ..input.existing_cards[0].clone()
+        });
+        let output = ExtractOutput {
+            candidate_cards: vec![gate_card(1, "Anna", "Анна не ест мясо", "не ем мясо")],
+            episode_summary: "Предлагает досуг без предоплаты".to_owned(),
+            resolutions: vec![
+                Resolution {
+                    old_card_id: 501,
+                    decision: ResolutionDecision::Reinforce,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 500,
+                    new_fact_text: "Предлагает досуг без предоплаты".to_owned(),
+                    decision: ResolutionDecision::Update,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 500,
+                    into_card_id: 501,
+                    decision: ResolutionDecision::Merge,
+                    ..Resolution::default()
+                },
+                Resolution {
+                    old_card_id: 500,
+                    decision: ResolutionDecision::Reinforce,
+                    ..Resolution::default()
+                },
+            ],
+            ..ExtractOutput::default()
+        };
+        let (gated, _) = gate_extraction_output(&input, output);
+        assert_eq!(gated.candidate_cards.len(), 1);
+        assert_eq!(gated.resolutions.len(), 1);
+        assert_eq!(gated.resolutions[0].old_card_id, 500);
+        assert!(gated.episode_summary.is_empty());
+    }
+
+    #[test]
+    fn spam_gates_reject_reinforcement_based_on_an_ad_source() {
+        let mut input = gate_input();
+        input.messages[3].text = "Приглашаю в гости без предоплаты, живу в Минске".to_owned();
+        let (gated, _) = gate_extraction_output(
+            &input,
+            ExtractOutput {
+                candidate_cards: vec![gate_card(4, "Anna", "Анна живёт в Минске", "живу в Минске")],
+                resolutions: vec![Resolution {
+                    old_card_id: 500,
+                    decision: ResolutionDecision::Reinforce,
+                    ..Resolution::default()
+                }],
+                ..ExtractOutput::default()
+            },
+        );
+        assert!(gated.candidate_cards.is_empty());
+        assert!(gated.resolutions.is_empty());
+    }
+
+    #[test]
+    fn spam_cards_do_not_prime_extraction_or_subject_merge() {
+        let input = gate_input();
+        let clean = &input.existing_cards[0];
+        let ad = Card {
+            id: 501,
+            fact_text: "Предлагает досуг без предоплаты".to_owned(),
+            ..clean.clone()
+        };
+        assert!(!worth_showing_as_existing(&ad, input.run.range_end_at));
+        assert!(worth_showing_as_existing(clean, input.run.range_end_at));
+        let shown = subject_merge_cards(&[ad, clean.clone()], input.run.range_end_at);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].id, 500);
+        assert_eq!(shown[0].index, 0);
+    }
+
+    #[test]
+    fn known_spam_counts_toward_the_ad_board_threshold() {
+        let mut messages: Vec<Message> = (0..8)
+            .map(|index| user_message(&format!("На выходных встречаемся у друга номер {index}")))
+            .collect();
+        messages.extend([
+            user_message("Подработка, оплата каждый день"),
+            user_message("Заработок от 5000, пиши в лс"),
+        ]);
+        assert!(filter_consolidation_messages(&messages).is_empty());
+    }
+
+    #[test]
+    fn spam_merged_text_is_rejected_without_changing_clean_plans() {
+        let mut plan = SubjectMergePlan {
+            decisions: vec![
+                SubjectMergeDecision {
+                    index: 0,
+                    action: "keep".to_owned(),
+                    ..SubjectMergeDecision::default()
+                },
+                SubjectMergeDecision {
+                    index: 1,
+                    action: "cluster_with".to_owned(),
+                    survivor_index: Some(0),
+                    ..SubjectMergeDecision::default()
+                },
+            ],
+            survivors: vec![SubjectMergeSurvivor {
+                survivor_index: 0,
+                merged_fact_text: "Предлагает досуг без предоплаты".to_owned(),
+            }],
+            ..SubjectMergePlan::default()
+        };
+        assert_eq!(
+            validate_subject_merge_plan(&plan, &[500, 501]),
+            Err(SubjectMergePlanError::SpamMergedText(0))
+        );
+        plan.survivors[0].merged_fact_text = "Анна не ест мясо".to_owned();
+        assert!(validate_subject_merge_plan(&plan, &[500, 501]).is_ok());
+    }
+
+    #[test]
+    fn spam_only_windows_cannot_create_opaque_memory_output() {
+        let mut input = gate_input();
+        input.messages = vec![user_message("Подработка, оплата каждый день")];
+        let (output, removed) = filter_extraction_spam(
+            &input,
+            ExtractOutput {
+                episode_summary: "An apparently ordinary discussion".to_owned(),
+                topics: vec!["topic".to_owned()],
+                participants: vec!["someone".to_owned()],
+                candidate_cards: vec![CandidateCard {
+                    fact_text: "A harmless-looking fact".to_owned(),
+                    ..CandidateCard::default()
+                }],
+                resolutions: vec![Resolution {
+                    old_card_id: 500,
+                    decision: ResolutionDecision::Reinforce,
+                    ..Resolution::default()
+                }],
+                input_tokens: 5,
+                output_tokens: 8,
+                ..ExtractOutput::default()
+            },
+        );
+        assert!(output.candidate_cards.is_empty());
+        assert!(output.resolutions.is_empty());
+        assert!(output.episode_summary.is_empty());
+        assert!(output.topics.is_empty());
+        assert!(output.participants.is_empty());
+        assert!(removed > 0);
+        assert_eq!((output.input_tokens, output.output_tokens), (5, 8));
+    }
+
+    #[test]
+    fn gates_drop_obfuscated_ads_even_when_the_source_is_clean() {
+        let mut candidate = gate_card(1, "Anna", "Продаю аккаунты недорого", "не ем мясо");
+        candidate.fact_text = candidate
+            .fact_text
+            .replace('р', "p")
+            .replace('о', "o")
+            .replace('а', "a");
+        let (output, report) = gate(ExtractOutput {
+            candidate_cards: vec![candidate],
+            ..ExtractOutput::default()
+        });
+        assert!(output.candidate_cards.is_empty());
+        assert_eq!(report.spam, 1);
     }
 }

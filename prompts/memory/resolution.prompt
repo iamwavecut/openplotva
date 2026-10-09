@@ -10,6 +10,7 @@ For every candidate, in order, write exactly one decision, with a short reason b
 - competing: the fresh fact contradicts a similar card and you cannot tell which is true; set card_index. Both are kept.
 
 Rules:
+- Never add advertising to new_fact_text. Repeating an offer does not make it a durable fact.
 - Never reinforce, update or supersede a card about another person or another attribute.
 - Shared words are not a shared meaning: "Аня не ест мясо" and "Аня ест мясо" are competing, not reinforce.
 - card_index always points into that candidate's own similar list.

@@ -987,6 +987,27 @@ where
     Store: MemoryWriteStore,
     Embedder: EmbeddingProvider,
 {
+    let filtered_input = ExtractInput {
+        messages: openplotva_memory::filter_consolidation_messages(&input.messages),
+        existing_cards: input
+            .existing_cards
+            .iter()
+            .filter(|card| !openplotva_memory::is_memory_spam_card(card))
+            .cloned()
+            .collect(),
+        ..input.clone()
+    };
+    let input = &filtered_input;
+    if input.messages.is_empty() {
+        return write_memory_extraction_batch_inner(
+            store,
+            embedder,
+            input,
+            ExtractOutput::default(),
+            cfg,
+        )
+        .await;
+    }
     let output = extractor
         .extract(input)
         .await
@@ -1189,6 +1210,7 @@ fn gated_extraction_output(input: &ExtractInput, output: ExtractOutput) -> Extra
     if !report.is_clean() {
         tracing::warn!(
             run_id = input.run.id,
+            spam = report.spam,
             unsourced = report.unsourced,
             unquoted_evidence = report.unquoted_evidence,
             short_single_message_events = report.short_single_message_events,
@@ -2380,10 +2402,8 @@ where
 fn consolidation_retrieval_query(messages: &[openplotva_memory::Message]) -> Option<String> {
     let mut names: Vec<&str> = Vec::new();
     let mut body = String::new();
-    for message in messages {
-        if message.sender_is_bot {
-            continue;
-        }
+    let filtered = openplotva_memory::filter_consolidation_messages(messages);
+    for message in &filtered {
         let name = message.sender_name.trim();
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
@@ -2568,6 +2588,14 @@ where
     Store: MemoryWriteStore,
     Embedder: EmbeddingProvider,
 {
+    let (output, spam) = openplotva_memory::filter_extraction_spam(input, output);
+    if spam > 0 {
+        tracing::warn!(
+            run_id = input.run.id,
+            spam,
+            "memory write gate rejected spam"
+        );
+    }
     let mut report = MemoryExtractionWriteReport {
         stats: RunStats {
             input_tokens: if output.input_tokens == 0 {
@@ -2585,8 +2613,9 @@ where
         write_memory_extraction_cards(store, embedder, input, &report.output, cfg).await?;
     merge_card_report(&mut report, card_report);
 
-    let episode = episode_from_extraction_batch(input, &report.output);
-    insert_memory_episode(store, embedder, episode, &input.messages, cfg, &mut report).await?;
+    let source_messages = openplotva_memory::filter_consolidation_messages(&input.messages);
+    let episode = episode_from_run(&input.run, &report.output, source_messages.len());
+    insert_memory_episode(store, embedder, episode, &source_messages, cfg, &mut report).await?;
 
     Ok(report)
 }
@@ -3013,9 +3042,13 @@ where
     };
     // A group whose plan stayed invalid is still marked reviewed (empty apply),
     // so it waits out the cooldown instead of costing a model call every tick.
-    let validated = plan_subject_merge(merger, &input)
-        .await?
-        .unwrap_or_default();
+    let validated = if input.cards.len() < 2 {
+        openplotva_memory::ValidatedSubjectMerge::default()
+    } else {
+        plan_subject_merge(merger, &input)
+            .await?
+            .unwrap_or_default()
+    };
     let mut apply =
         plan_to_subject_merge_apply(validated, &cards, &group_ids, cfg.demote_confidence_delta);
     embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
@@ -3404,6 +3437,13 @@ where
     Store: MemoryWriteStore,
     Embedder: EmbeddingProvider,
 {
+    if openplotva_memory::is_memory_spam_fact(&episode.summary_text)
+        || (episode.summary_text.trim().is_empty()
+            && episode.topics.is_empty()
+            && episode.participants.is_empty())
+    {
+        return Ok(());
+    }
     let episode_embedding = match (embedder, !episode.summary_text.trim().is_empty()) {
         (Some(provider), true) => match provider
             .embed_one(
@@ -3455,10 +3495,6 @@ where
     provider
         .embed_batch(&texts, dimension, MEMORY_CARD_EMBEDDING_TASK)
         .await
-}
-
-fn episode_from_extraction_batch(input: &ExtractInput, output: &ExtractOutput) -> Episode {
-    episode_from_run(&input.run, output, input.messages.len())
 }
 
 fn episode_from_run(
@@ -6943,6 +6979,163 @@ mod tests {
             created_at: None,
             updated_at: None,
             ..Card::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn spam_only_batch_skips_model_and_all_memory_writes() {
+        let input = ExtractInput {
+            messages: vec![openplotva_memory::Message {
+                text: "Подработка, оплата каждый день".to_owned(),
+                ..openplotva_memory::Message::default()
+            }],
+            ..ExtractInput::default()
+        };
+        let extractor = FakeMemoryExtractor {
+            output: ExtractOutput::default(),
+            inputs: Mutex::new(Vec::new()),
+        };
+        let store = FakeMemoryWriteStore::default();
+        execute_memory_extraction_batch(
+            &extractor,
+            &store,
+            Option::<&FakeEmbedder>::None,
+            &input,
+            MemoryExtractionBatchConfig {
+                episode_model: "model",
+                prompt_version: "pv",
+                embedding_dimension: 2,
+                fallback_observed_at: OffsetDateTime::UNIX_EPOCH,
+                batch_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("batch");
+        assert!(extractor.inputs.lock().expect("inputs").is_empty());
+        assert!(store.cards.lock().expect("cards").is_empty());
+        assert!(store.episodes.lock().expect("episodes").is_empty());
+        assert!(consolidation_retrieval_query(&input.messages).is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_extracted_write_filters_spam_cards_resolutions_and_summary() {
+        let clean = openplotva_memory::CandidateCard {
+            scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
+            fact_text: "Alice likes Rust".to_owned(),
+            source_message_ids: vec![1],
+            ..openplotva_memory::CandidateCard::default()
+        };
+        let input = ExtractInput {
+            messages: vec![openplotva_memory::Message {
+                message_id: 1,
+                text: "Alice likes Rust".to_owned(),
+                ..openplotva_memory::Message::default()
+            }],
+            existing_cards: vec![Card {
+                id: 10,
+                fact_text: "Alice likes Rust".to_owned(),
+                ..Card::default()
+            }],
+            ..ExtractInput::default()
+        };
+        let store = FakeMemoryWriteStore {
+            ids: vec![101],
+            ..FakeMemoryWriteStore::default()
+        };
+        let report = write_memory_extraction_batch(
+            &store,
+            Option::<&FakeEmbedder>::None,
+            &input,
+            ExtractOutput {
+                candidate_cards: vec![
+                    clean.clone(),
+                    openplotva_memory::CandidateCard {
+                        fact_text: "Предлагает досуг без предоплаты".to_owned(),
+                        ..clean
+                    },
+                ],
+                resolutions: vec![openplotva_memory::Resolution {
+                    old_card_id: 10,
+                    decision: openplotva_memory::ResolutionDecision::Update,
+                    new_fact_text: "Предлагает досуг без предоплаты".to_owned(),
+                    ..openplotva_memory::Resolution::default()
+                }],
+                episode_summary: "Предлагает досуг без предоплаты".to_owned(),
+                ..ExtractOutput::default()
+            },
+            MemoryExtractionBatchConfig {
+                episode_model: "model",
+                prompt_version: "pv",
+                embedding_dimension: 2,
+                fallback_observed_at: OffsetDateTime::UNIX_EPOCH,
+                batch_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("write");
+        assert_eq!(report.stats.cards_inserted, 1);
+        assert_eq!(
+            store.cards.lock().expect("cards")[0].fact_text,
+            "Alice likes Rust"
+        );
+        assert!(store.resolution_ops.lock().expect("ops").is_empty());
+        assert!(store.episodes.lock().expect("episodes").is_empty());
+    }
+
+    #[tokio::test]
+    async fn spam_model_output_cannot_reach_resolution_or_storage_in_either_mode() {
+        for two_phase in [false, true] {
+            let store = FakeMemoryWriteStore {
+                run: Mutex::new(Some(openplotva_memory::Run {
+                    id: 99,
+                    chat_id: 42,
+                    ..openplotva_memory::Run::default()
+                })),
+                messages: Mutex::new(vec![openplotva_memory::Message {
+                    message_id: 1,
+                    text: "Alice likes Rust".to_owned(),
+                    ..openplotva_memory::Message::default()
+                }]),
+                ..FakeMemoryWriteStore::default()
+            };
+            let extractor = ResolvingExtractor {
+                output: ExtractOutput {
+                    candidate_cards: vec![openplotva_memory::CandidateCard {
+                        fact_text: "Предлагает досуг без предоплаты".to_owned(),
+                        source_message_ids: vec![1],
+                        evidence_quote: "Alice likes Rust".to_owned(),
+                        ..openplotva_memory::CandidateCard::default()
+                    }],
+                    episode_summary: "Предлагает досуг без предоплаты".to_owned(),
+                    ..ExtractOutput::default()
+                },
+                plan: openplotva_memory::ResolutionPlan::default(),
+                inputs: Mutex::new(Vec::new()),
+                resolutions: Mutex::new(Vec::new()),
+            };
+            let result = process_next_memory_run(
+                &extractor,
+                &store,
+                Option::<&FakeEmbedder>::None,
+                MemoryRunProcessConfig {
+                    two_phase,
+                    ..MemoryRunProcessConfig::default()
+                },
+            )
+            .await
+            .expect("run");
+            assert!(result.processed);
+            assert_eq!(extractor.inputs.lock().expect("inputs").len(), 1);
+            assert!(
+                extractor
+                    .resolutions
+                    .lock()
+                    .expect("resolutions")
+                    .is_empty()
+            );
+            assert!(store.cards.lock().expect("cards").is_empty());
+            assert!(store.episodes.lock().expect("episodes").is_empty());
+            assert_eq!(store.completed.lock().expect("completed").len(), 1);
         }
     }
 }
