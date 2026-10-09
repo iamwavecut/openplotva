@@ -8389,6 +8389,13 @@ mod tests {
             )
             .is_some()
         );
+        assert!(
+            check(
+                r#"{"tool":"external_api","ref":"example","output":{"data":{}}}"#,
+                ""
+            )
+            .is_none()
+        );
         let mut announcement = "<think>internal deliberation</think>Секунду.".to_owned();
         assert!(sanitize_tool_step_text(&guard, &mut announcement, &mut []).is_none());
         assert_eq!(announcement, "Секунду.");

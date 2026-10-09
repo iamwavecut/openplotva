@@ -1939,7 +1939,10 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
         .next()
         .is_some_and(|value| {
             value.is_ok_and(|value| {
-                value.get("tool").is_some()
+                value
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_known_step)
                     && value.get("ref").is_some()
                     && value.get("output").is_some()
             })
