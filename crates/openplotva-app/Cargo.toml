@@ -35,7 +35,7 @@ image.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 redis = { workspace = true, features = ["tokio-comp"] }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["gzip"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1.workspace = true
