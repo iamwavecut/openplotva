@@ -603,22 +603,22 @@ mod tests {
     }
 
     #[test]
-    fn render_supports_partials_raw_values_and_if_equals() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn render_supports_partials_native_tools_and_if_equals()
+    -> Result<(), Box<dyn std::error::Error>> {
         let rendered = render(
             "aifarm/system",
             &serde_json::json!({
                 "toolMode": "native",
                 "hasTools": true,
                 "guestMode": true,
-                "toolCatalog": "<tools><tool name=\"draw_image\"></tool></tools>",
                 "locale": "ru",
             }),
         )?;
 
         assert!(rendered.contains("<system_contract>"));
         assert!(rendered.contains("OpenAI tools доступны"));
-        assert!(rendered.contains("<tools><tool name=\"draw_image\"></tool></tools>"));
+        assert!(!rendered.contains("<tools>"));
+        assert!(rendered.contains("native tool calls по JSON-схемам"));
         assert!(rendered.contains("<guest_mode>"));
         assert!(rendered.contains("<locale_policy>"));
         assert!(rendered.contains("доставляется в чат ровно один раз"));

@@ -603,7 +603,7 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
                         "SAFE memory supports self and chat scopes",
                     ));
                 }
-                match step.action.as_str() {
+                let data = match step.action.as_str() {
                     "remember" => {
                         let id = cards
                             .iter()
@@ -612,12 +612,14 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
                             .unwrap_or(0)
                             + 1;
                         cards.push(json!({"id":id,"text":step.text,"scope":step.memory_scope,"chat_id":context.chat_id,"user_id":context.user_id}));
+                        json!({"card_ids":[id],"tool_mode":"SAFE"})
                     }
                     "update" | "forget" => {
-                        let Some(index) = cards
-                            .iter()
-                            .position(|card| visible(card) && card["id"] == step.card_id)
-                        else {
+                        let Some(index) = cards.iter().position(|card| {
+                            visible(card)
+                                && card["id"] == step.card_id
+                                && card["scope"] == step.memory_scope
+                        }) else {
                             return Ok(ToolResult::failed(
                                 "not_found_or_denied",
                                 "No permitted card",
@@ -628,6 +630,7 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
                         } else {
                             cards[index]["text"] = json!(step.text);
                         }
+                        json!({"changed":1,"tool_mode":"SAFE"})
                     }
                     _ => {
                         return Ok(ToolResult::failed(
@@ -635,10 +638,10 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
                             "Use remember, update or forget",
                         ));
                     }
-                }
+                };
                 return Ok(ToolResult {
                     status: "ok".into(),
-                    data: Some(json!({"tool_mode":"SAFE"})),
+                    data: Some(data),
                     ..ToolResult::default()
                 });
             }
@@ -1030,6 +1033,69 @@ mod tests {
         assert_eq!(
             result.data.as_ref().and_then(|data| data.get("tool_mode")),
             Some(&json!("SAFE"))
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_memory_returns_mutation_ids_and_enforces_scope() {
+        let toolbox = RuntimeVirtualSafeToolbox::new(Arc::new(ToolboxStub));
+        let context = openplotva_dialog::ToolContext {
+            chat_id: -91,
+            user_id: -92,
+            ..Default::default()
+        };
+        let remember = openplotva_dialog::ToolStep {
+            step: "memory_manage".into(),
+            action: "remember".into(),
+            memory_scope: "self".into(),
+            text: "Favorite color is turquoise".into(),
+            ..Default::default()
+        };
+        let result = toolbox
+            .agent_tool(context.clone(), remember)
+            .await
+            .expect("remember");
+        let id = result.data.expect("data")["card_ids"][0]
+            .as_i64()
+            .expect("card id");
+        let mut forget = openplotva_dialog::ToolStep {
+            step: "memory_manage".into(),
+            action: "forget".into(),
+            memory_scope: "chat".into(),
+            card_id: id,
+            ..Default::default()
+        };
+        assert_eq!(
+            toolbox
+                .agent_tool(context.clone(), forget.clone())
+                .await
+                .expect("wrong scope")
+                .status,
+            "failed"
+        );
+        forget.memory_scope = "self".into();
+        assert_eq!(
+            toolbox
+                .agent_tool(context.clone(), forget)
+                .await
+                .expect("forget")
+                .data
+                .expect("data")["changed"],
+            1
+        );
+        let search = openplotva_dialog::ToolStep {
+            step: "memory_search".into(),
+            query: "color".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            toolbox
+                .agent_tool(context, search)
+                .await
+                .expect("search")
+                .data
+                .expect("data")["cards"],
+            json!([])
         );
     }
 
