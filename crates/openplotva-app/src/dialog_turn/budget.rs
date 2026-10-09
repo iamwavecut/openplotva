@@ -42,7 +42,7 @@ pub fn turn_started_at(events: &[TaskQueueJobEvent]) -> Option<OffsetDateTime> {
 }
 
 /// Wall-clock budget for one dialog turn across all of its attempts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnBudget {
     pub anchor: OffsetDateTime,
     pub limit: TimeDuration,
@@ -117,7 +117,7 @@ impl TurnBudget {
 /// `DIALOG_SESSION_HARD_CAP_SECS`. Successful calls are recorded as durable
 /// events and restored by [`TurnBudget::from_session_events`] on a later
 /// attempt; failed or interrupted calls keep only their in-memory extension.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionBudget {
     base: TurnBudget,
     extension: TimeDuration,

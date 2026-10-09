@@ -64,9 +64,6 @@ pub const SESSION_ITERATION_STAGE: &str = "session_iteration";
 /// Job event stage recording why a tool-call batch continued or completed.
 pub const SESSION_BATCH_STAGE: &str = "session_batch";
 
-/// A session never starts an iteration it cannot plausibly finish.
-const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
-
 /// A duplicate final answer is regenerated only with this much budget left.
 const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 
@@ -79,7 +76,7 @@ const SEARCH_CITATION_HINT: &str = include_str!("../../../../prompts/chat/search
 const SEARCH_CITATION_REPAIR_HINT: &str = "ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ИСТОЧНИКОВ: предыдущий черновик финального ответа не содержит требуемой inline-ссылки на реально найденный источник. Перепиши финальный ответ без нового поиска и без упоминания этой проверки. Если ты используешь сведения из web_search/crawl_url, ответ ОБЯЗАН содержать хотя бы одну семантическую inline HTML-ссылку вида <a href=\"URL\">подтверждаемая фраза</a>, где href в точности совпадает с одним из URL в уже имеющихся результатах. Размещай ссылку прямо на подтверждаемом утверждении; не печатай raw URL или отдельную библиографию.";
 
 /// Slice reserved for the final send after a tool call finishes.
-const TOOL_RESERVE: TimeDuration = TimeDuration::seconds(5);
+const TOOL_RESERVE: TimeDuration = TimeDuration::seconds(20);
 
 /// Submit independent media reads together. The routing capacity pools still
 /// serialize calls that land on the same single-slot GPU.
@@ -146,6 +143,7 @@ impl SessionWorkerWiring {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SentLog {
     texts: Vec<String>,
     intermediate_count: u32,
@@ -313,6 +311,30 @@ pub(crate) struct SessionRunContext<'a> {
     pub llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionState {
+    tool_context: ToolContext,
+    gift_used: bool,
+    budget: SessionBudget,
+    agent: openplotva_agent::AgentLoop,
+    sent: SentLog,
+    side_effect_tickets: Vec<QueuedSideEffect>,
+    recorded_tool_calls: Vec<ToolCall>,
+    regenerations: i32,
+    anti_loop: bool,
+    repeated_final_repair: bool,
+    requires_novel_final: bool,
+    draws_scheduled: i32,
+    songs_scheduled: i32,
+    reacted_message_ids: BTreeSet<i64>,
+    tool_result_cache: BTreeMap<String, (String, ToolResult)>,
+    media_reference_aliases: BTreeMap<String, String>,
+    successful_web_search: bool,
+    web_source_urls: BTreeSet<String>,
+    links: DialogLinks,
+    search_citation_repairs: i32,
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) async fn run_dialog_session<Queue, Effects, Materializer, ToolHistory>(
     ctx: SessionRunContext<'_>,
@@ -350,12 +372,34 @@ where
         };
     }
 
-    let mut budget = SessionBudget::new(ctx.budget, cfg.tool_extension_secs, cfg.hard_cap_secs);
-    let mut base_input = base_input;
-    let mut duplicate_guard_history = duplicate_guard_history.to_vec();
-    let mut active_params =
-        crate::dialog_jobs::dialog_job_params_from_input(ctx.params, &base_input);
-    let mut meta = dialog_tool_context(&base_input);
+    let budget = SessionBudget::new(
+        TurnBudget {
+            anchor: ctx.budget.anchor,
+            limit: ctx.budget.limit.min(TimeDuration::seconds(120)),
+        },
+        0,
+        120,
+    );
+    let checkpoint = ctx
+        .item_events
+        .iter()
+        .rev()
+        .find(|event| event.stage == "agent_checkpoint")
+        .and_then(|event| event.data.get("checkpoint"))
+        .map(|value| serde_json::from_str::<(DialogInput, SessionState)>(value))
+        .transpose();
+    let checkpoint = match checkpoint {
+        Ok(state) => state,
+        Err(error) => {
+            return agent_persistence_failed(format!("Invalid stored agent state: {error}"));
+        }
+    };
+    let (base_input, restored) = checkpoint.map_or((base_input.clone(), None), |(input, state)| {
+        (input, Some(state))
+    });
+    let duplicate_guard_history = duplicate_guard_history.to_vec();
+    let active_params = crate::dialog_jobs::dialog_job_params_from_input(ctx.params, &base_input);
+    let meta = dialog_tool_context(&base_input);
     let native_tools = match session_native_tools() {
         Ok(tools) => tools,
         Err(error) => {
@@ -373,130 +417,198 @@ where
 
     let processing_started = tokio::time::Instant::now();
     let run_id = format!("job-{}", ctx.item_id);
-    let mut transcript: Vec<SessionMessage> = Vec::new();
-    let mut sent = SentLog::new();
-    let mut side_effect_tickets: Vec<QueuedSideEffect> = Vec::new();
-    let mut recorded_tool_calls: Vec<ToolCall> = Vec::new();
-    let mut regenerations: i32 = 0;
-    let mut anti_loop = false;
-    let mut repeated_final_repair = false;
+    let agent = openplotva_agent::AgentLoop {
+        observed_message_id: active_params.message_id,
+        ..openplotva_agent::AgentLoop::default()
+    };
+    let sent = SentLog::new();
+    let side_effect_tickets: Vec<QueuedSideEffect> = Vec::new();
+    let recorded_tool_calls: Vec<ToolCall> = Vec::new();
+    let regenerations: i32 = 0;
+    let anti_loop = false;
+    let repeated_final_repair = false;
     // After a work tool, progress messages alone cannot satisfy the answer.
-    let mut requires_novel_final = false;
-    let mut draws_scheduled: i32 = 0;
-    let mut songs_scheduled: i32 = 0;
-    let mut reacted_message_ids: BTreeSet<i64> = BTreeSet::new();
-    let mut tool_result_cache: BTreeMap<String, (String, ToolResult)> = BTreeMap::new();
-    let mut media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
-    let mut successful_web_search = false;
-    let mut web_source_urls = BTreeSet::new();
-    let mut links = DialogLinks::from_input(&base_input);
-    let mut search_citation_repairs: i32 = 0;
+    let requires_novel_final = false;
+    let draws_scheduled: i32 = 0;
+    let songs_scheduled: i32 = 0;
+    let reacted_message_ids: BTreeSet<i64> = BTreeSet::new();
+    let tool_result_cache: BTreeMap<String, (String, ToolResult)> = BTreeMap::new();
+    let media_reference_aliases: BTreeMap<String, String> = BTreeMap::new();
+    let successful_web_search = false;
+    let web_source_urls = BTreeSet::new();
+    let links = DialogLinks::from_input(&base_input);
+    let search_citation_repairs: i32 = 0;
     let max_iterations = cfg.max_iterations.max(1);
 
-    let mut iteration: i32 = 0;
-    loop {
-        iteration += 1;
-        if let Some(inbox) = ctx.inbox.as_ref()
-            && let Some(injected) = inbox.drain_open().into_iter().last()
-        {
-            let injected_params = injected.params;
-            match materializer
-                .materialize_dialog_input(&injected_params, OffsetDateTime::now_utc())
-                .await
-            {
-                Ok(input) => {
-                    active_params =
-                        crate::dialog_jobs::dialog_job_params_from_input(&injected_params, &input);
-                    meta = dialog_tool_context(&input);
-                    duplicate_guard_history.clone_from(&input.history);
-                    links = DialogLinks::from_input(&input);
-                    base_input = input;
-                    transcript.clear();
-                    tool_result_cache.clear();
-                    media_reference_aliases.clear();
-                    successful_web_search = false;
-                    web_source_urls.clear();
-                    search_citation_repairs = 0;
-                    repeated_final_repair = false;
+    let mut state = restored.unwrap_or(SessionState {
+        tool_context: meta,
+        gift_used: false,
+        budget,
+        agent,
+        sent,
+        side_effect_tickets,
+        recorded_tool_calls,
+        regenerations,
+        anti_loop,
+        repeated_final_repair,
+        requires_novel_final,
+        draws_scheduled,
+        songs_scheduled,
+        reacted_message_ids,
+        tool_result_cache,
+        media_reference_aliases,
+        successful_web_search,
+        web_source_urls,
+        links,
+        search_citation_repairs,
+    });
+    // A crash after a committed intent has an unknown outcome. Never repeat the effect.
+    for event in ctx
+        .item_events
+        .iter()
+        .filter(|event| event.stage == "agent_effect")
+    {
+        if let Some(key) = event.data.get("key") {
+            let result = event.data.get("result").and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_else(|| ToolResult::failed("effect_outcome_unknown", "An earlier attempt started this action. Inspect its status. Do not repeat it."));
+            state
+                .tool_result_cache
+                .insert(key.clone(), ("recovered".into(), result));
+            if event.data.get("gift").is_some_and(|value| value == "true") {
+                state.gift_used = true;
+            }
+        }
+    }
+    if state.tool_result_cache.values().any(|(_, result)| {
+        result
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "effect_outcome_unknown")
+    }) {
+        return agent_persistence_failed(
+            "An effect was interrupted with an unknown outcome. Automatic replay is disabled."
+                .into(),
+        );
+    }
+    let recovered_tickets = state
+        .tool_result_cache
+        .values()
+        .filter_map(|(_, result)| queued_generation_side_effect(result))
+        .collect::<Vec<_>>();
+    if !recovered_tickets.is_empty() {
+        return session_delegated(&state.sent, &recovered_tickets);
+    }
+    state.agent.tool_attempts = state.agent.tool_attempts.max(
+        ctx.item_events
+            .iter()
+            .filter(|event| event.stage == SESSION_TOOL_STAGE)
+            .count()
+            .min(32) as u32,
+    );
+    let ctx = &ctx;
+    let base_input = &base_input;
+    let active_params = &active_params;
+    let native_tools = &native_tools;
+    let duplicate_guard_history = &duplicate_guard_history;
+    let run_id = &run_id;
+    openplotva_agent::run((state, report), |(state, report)| async move {
+        if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_checkpoint", BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
+            return std::ops::ControlFlow::Break(agent_persistence_failed(error));
+        }
+        let SessionState { mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs } = state;
+        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs }, report)) }; }
+
+        if let Ok(Ok(messages)) = tokio::time::timeout(std::time::Duration::from_secs(2), materializer.observe_dialog_messages(active_params, agent.observed_message_id)).await {
+            for mut message in messages {
+                if let Some(id) = message.get("message_id").and_then(Value::as_i64).and_then(|id| i32::try_from(id).ok()) {
+                    agent.observed_message_id = agent.observed_message_id.max(id);
                 }
-                Err(crate::dialog_jobs::DialogInputMaterializationError::SenderNotMember {
-                    ..
-                }) => {
-                    tracing::debug!(
-                        chat_id = injected_params.chat_id,
-                        user_id = injected_params.user_id,
-                        "dropping injected message from a departed member"
-                    );
+                message["can_change_task"] = Value::Bool(message.get("user_id").and_then(Value::as_i64) == Some(active_params.user_id));
+                remember_context_images(&mut tool_context, &message);
+                links.record_tool_result(&ToolResult {status:"ok".into(), data:Some(message.clone()), ..ToolResult::default()});
+                agent.transcript.push(SessionMessage::InjectedUser { rendered:message.to_string() });
+            }
+        }
+        if let Some(inbox) = ctx.inbox.as_ref() {
+            let mut incoming = inbox.drain_open();
+            incoming.sort_by_key(|message| message.params.message_id);
+            for injected in incoming {
+                let params = injected.params;
+                if let Ok(meta) = serde_json::from_value::<openplotva_core::ChatMessageMeta>(params.meta.clone()) {
+                    extend_context_images(&mut tool_context, params.message_id, meta.attachments);
                 }
-                Err(error) => {
-                    let error = format!("materialize injected dialog input: {error}");
-                    report.materialization_error = Some(error.clone());
-                    return TurnResolution {
-                        outcome: TurnOutcome::TerminalFailed {
-                            reason: "injected_input_materialization",
-                            error: error.clone(),
-                            user_signal: UserSignalPlan::React,
-                        },
-                        disposition: JobDisposition::Fail(error),
-                    };
-                }
+                if params.message_id <= agent.observed_message_id { continue; }
+                agent.observed_message_id = params.message_id;
+                links.record_tool_result(&ToolResult {status:"ok".into(), message:params.message_text.clone(), ..ToolResult::default()});
+                agent.transcript.push(SessionMessage::InjectedUser {
+                    rendered: serde_json::json!({
+                        "message_id": params.message_id,
+                        "user_id": params.user_id,
+                        "name": params.user_full_name,
+                        "text": params.message_text,
+                        "meta": params.meta,
+                        "can_change_task": params.user_id == active_params.user_id,
+                    })
+                    .to_string(),
+                });
             }
         }
         let round_now =
             ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
-        if budget.remaining(round_now) < MIN_GENERATION_BUDGET || iteration > max_iterations {
-            return session_exhausted(ctx.item_id, &sent, &side_effect_tickets, &budget, round_now);
+        let next = agent.next_step(
+            std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default(),
+            max_iterations,
+        );
+        let iteration = agent.iteration;
+        if next == openplotva_agent::NextStep::Exhausted {
+            return std::ops::ControlFlow::Break( session_exhausted(ctx.item_id, &sent, &side_effect_tickets, &budget, round_now));
         }
 
-        let force_final = iteration == max_iterations;
+        let force_final = next == openplotva_agent::NextStep::Final;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
         } else if force_final || search_citation_repairs > 0 || repeated_final_repair {
             ToolsMode::FinalOnly
         } else {
-            ToolsMode::Native(native_tools.clone())
+            ToolsMode::Native((*native_tools).clone())
         };
 
-        let mut input = base_input.clone();
-        if anti_loop {
-            input.reference_context.push(ANTI_LOOP_HINT.to_owned());
-        }
-        if !web_source_urls.is_empty() {
-            input
-                .reference_context
-                .push(SEARCH_CITATION_HINT.trim().to_owned());
-        }
-        if search_citation_repairs > 0 {
-            input
-                .reference_context
-                .push(SEARCH_CITATION_REPAIR_HINT.to_owned());
-        }
+        let input = (*base_input).clone();
+        let mut add_hint = |hint: &str| {
+            let rendered = format!("Runtime guidance: {hint}");
+            if !agent.transcript.iter().any(|message| matches!(message, SessionMessage::InjectedUser { rendered: prior } if prior == &rendered)) {
+                agent.transcript.push(SessionMessage::InjectedUser { rendered });
+            }
+        };
+        if anti_loop { add_hint(ANTI_LOOP_HINT); }
+        if !web_source_urls.is_empty() { add_hint(SEARCH_CITATION_HINT.trim()); }
+        if search_citation_repairs > 0 { add_hint(SEARCH_CITATION_REPAIR_HINT); }
+        if force_final { add_hint("Tool budget is exhausted or the deadline is near. Finish with the available evidence. State any unfinished work briefly."); }
         let provider_deadline = Instant::now()
             + std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default();
         let step_started = tokio::time::Instant::now();
-        let result = TURN_DEADLINE
+        let result = tokio::time::timeout(std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default(), TURN_DEADLINE
             .scope(
                 Some(provider_deadline),
                 step_provider.run_chat_step(ChatStepRequest {
                     input,
-                    transcript: transcript.clone(),
+                    transcript: agent.transcript.clone(),
                     tools,
                     iteration: usize::try_from(iteration).unwrap_or(1),
                 }),
-            )
-            .await;
+            )).await.unwrap_or_else(|_| Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Agent turn deadline reached"))));
         let failure_now =
             ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
         let step = match result {
             Ok(step) => step,
             Err(error) if openplotva_llm::is_content_blocked_error(error.as_ref()) => {
                 report.content_blocked = true;
-                return TurnResolution {
+                return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::NoReplyIntentional {
                         reason: "content_blocked",
                     },
                     disposition: JobDisposition::Complete,
-                };
+                });
             }
             Err(error) => {
                 let retryable_reason = openplotva_llm::retry::retryable_reason(error.as_ref());
@@ -509,19 +621,19 @@ where
                         // Never replay a partially delivered session: the
                         // user saw messages; a requeue would regenerate and
                         // resend nondeterministically.
-                        return TurnResolution {
+                        return std::ops::ControlFlow::Break( TurnResolution {
                             outcome: TurnOutcome::TerminalFailed {
                                 reason: "llm_failed_after_partial",
                                 error: error.clone(),
                                 user_signal: UserSignalPlan::React,
                             },
                             disposition: JobDisposition::Fail(error),
-                        };
+                        });
                     }
-                    return handle_retryable_dialog_provider_error(
+                    return std::ops::ControlFlow::Break( handle_retryable_dialog_provider_error(
                         queue,
                         ctx.item,
-                        &active_params,
+                        active_params,
                         ctx.routing_events,
                         RetryableDialogProviderFailure {
                             queue_name: ctx.queue_name,
@@ -535,19 +647,20 @@ where
                         },
                         report,
                     )
-                    .await;
+                    .await);
                 }
-                return TurnResolution {
+                return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::TerminalFailed {
                         reason: "provider_error",
                         error: error.clone(),
                         user_signal: UserSignalPlan::React,
                     },
                     disposition: JobDisposition::Fail(error),
-                };
+                });
             }
         };
         report.session_iterations = iteration;
+        report.provider = Some(step.provider.clone());
         append_session_iteration_event(
             queue,
             ctx.item_id,
@@ -572,20 +685,20 @@ where
                 if !side_effect_tickets.is_empty() {
                     // Silent side-effect finish (should have terminated at
                     // the tool batch already; kept as a safety net).
-                    return session_delegated(&sent, &side_effect_tickets);
+                    return std::ops::ControlFlow::Break( session_delegated(&sent, &side_effect_tickets));
                 }
                 if sent.any() {
                     let error =
                         "dialog provider returned no final answer after intermediate messages"
                             .to_owned();
-                    return TurnResolution {
+                    return std::ops::ControlFlow::Break( TurnResolution {
                         outcome: TurnOutcome::TerminalFailed {
                             reason: "empty_final_after_partial",
                             error: error.clone(),
                             user_signal: UserSignalPlan::React,
                         },
                         disposition: JobDisposition::Fail(error),
-                    };
+                    });
                 }
                 let (codes, error) = if raw_answer.trim().is_empty() {
                     (
@@ -599,10 +712,10 @@ where
                     )
                 };
                 report.empty_answer_error = Some(error.to_owned());
-                return handle_retryable_dialog_provider_error(
+                return std::ops::ControlFlow::Break( handle_retryable_dialog_provider_error(
                     queue,
                     ctx.item,
-                    &active_params,
+                    active_params,
                     ctx.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
@@ -616,7 +729,7 @@ where
                     },
                     report,
                 )
-                .await;
+                .await);
             }
 
             if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)
@@ -632,7 +745,7 @@ where
                         sources = web_source_urls.len(),
                         "regenerating searched answer without a source citation"
                     );
-                    continue;
+                    return next_step!();
                 }
                 tracing::warn!(
                     job_id = ctx.item_id,
@@ -659,37 +772,37 @@ where
                             failure_now,
                         )
                         .await;
-                        continue;
+                        return next_step!();
                     }
                     let error = format!(
                         "dialog final answer only replayed intermediate messages after {regenerations} regeneration(s)"
                     );
-                    return TurnResolution {
+                    return std::ops::ControlFlow::Break( TurnResolution {
                         outcome: TurnOutcome::TerminalFailed {
                             reason: "repeated_final_after_partial",
                             error: error.clone(),
                             user_signal: UserSignalPlan::React,
                         },
                         disposition: JobDisposition::Fail(error),
-                    };
+                    });
                 }
                 report.sent_answer = true;
                 if let Some(runs) = ctx.llm_runs {
-                    runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                    runs.mark_round_sent(run_id, crate::runtime_llm_runs::RunRoundSent::Final);
                 }
                 let sent_now = ctx.now
                     + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
                 append_session_sent_marker(queue, ctx.item_id, sent_now).await;
-                return TurnResolution {
+                return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::Sent {
                         parts: sent.total_count,
                         side_effect_tickets: ticket_ids(&side_effect_tickets),
                     },
                     disposition: JobDisposition::Complete,
-                };
+                });
             }
             let (duplicate_message_id, duplicate) =
-                should_suppress_duplicate_bot_reply(&duplicate_guard_history, &sanitized);
+                should_suppress_duplicate_bot_reply(duplicate_guard_history, &sanitized);
             if duplicate {
                 if regenerations < ctx.max_regenerations.max(0)
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
@@ -705,49 +818,49 @@ where
                         failure_now,
                     )
                     .await;
-                    continue;
+                    return next_step!();
                 }
                 report.suppressed_duplicate_message_id = Some(duplicate_message_id);
                 let error = format!(
                     "dialog answer duplicated bot message {duplicate_message_id} after {regenerations} regeneration(s)"
                 );
                 if sent.any() {
-                    return TurnResolution {
+                    return std::ops::ControlFlow::Break( TurnResolution {
                         outcome: TurnOutcome::TerminalFailed {
                             reason: "duplicate_exhausted_after_partial",
                             error: error.clone(),
                             user_signal: UserSignalPlan::React,
                         },
                         disposition: JobDisposition::Fail(error),
-                    };
+                    });
                 }
-                return TurnResolution {
+                return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::TerminalFailed {
                         reason: "duplicate_exhausted",
                         error: error.clone(),
                         user_signal: UserSignalPlan::React,
                     },
                     disposition: JobDisposition::Fail(error),
-                };
+                });
             }
 
             if let Err(validation) = validate_dialog_answer_deliverable(&sanitized) {
                 let error = format!("dialog answer rejected by outbound validation: {validation}");
                 report.empty_answer_error = Some(error.clone());
                 if sent.any() {
-                    return TurnResolution {
+                    return std::ops::ControlFlow::Break( TurnResolution {
                         outcome: TurnOutcome::TerminalFailed {
                             reason: "undeliverable_after_partial",
                             error: error.clone(),
                             user_signal: UserSignalPlan::React,
                         },
                         disposition: JobDisposition::Fail(error),
-                    };
+                    });
                 }
-                return handle_retryable_dialog_provider_error(
+                return std::ops::ControlFlow::Break( handle_retryable_dialog_provider_error(
                     queue,
                     ctx.item,
-                    &active_params,
+                    active_params,
                     ctx.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
@@ -761,7 +874,7 @@ where
                     },
                     report,
                 )
-                .await;
+                .await);
             }
 
             let mut final_answer = sanitized.clone();
@@ -840,7 +953,7 @@ where
                 .send_dialog_answer(
                     ctx.item_id,
                     ctx.item.latest_update_id,
-                    &active_params,
+                    active_params,
                     &final_answer,
                     DialogAnswerSendOptions {
                         disable_link_preview: successful_web_search,
@@ -900,7 +1013,7 @@ where
                 }
             }
 
-            return match send_result {
+            return std::ops::ControlFlow::Break( match send_result {
                 Ok(receipt) if receipt.requires_delivery_wait() => {
                     report.queued_answer = true;
                     let queued_now = ctx.now
@@ -930,7 +1043,7 @@ where
                     sent.record(&final_answer, false);
                     report.sent_answer = true;
                     if let Some(runs) = ctx.llm_runs {
-                        runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                        runs.mark_round_sent(run_id, crate::runtime_llm_runs::RunRoundSent::Final);
                     }
                     let sent_now = ctx.now
                         + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
@@ -955,13 +1068,13 @@ where
                         disposition: JobDisposition::Fail(error),
                     }
                 }
-            };
+            });
         }
 
         // ---- Tool iteration: record the assistant step, deliver its visible
         // text once, execute every call in order, then let the typed batch
         // semantics decide whether tool results require another model step.
-        transcript.push(SessionMessage::Assistant {
+        agent.transcript.push(SessionMessage::Assistant {
             text: step.text.clone(),
             tool_calls: step
                 .tool_calls
@@ -978,7 +1091,7 @@ where
             false
         } else {
             let delivery = try_send_intermediate(
-                &active_params,
+                active_params,
                 effects,
                 queue,
                 ctx.item_id,
@@ -991,7 +1104,7 @@ where
             .await;
             let delivered = delivery.status == openplotva_dialog::TOOL_RESULT_STATUS_OK;
             if delivered && let Some(runs) = ctx.llm_runs {
-                runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Intermediate);
+                runs.mark_round_sent(run_id, crate::runtime_llm_runs::RunRoundSent::Intermediate);
             }
             delivered
                 || delivery.error.as_ref().is_some_and(|error| {
@@ -1010,16 +1123,23 @@ where
                 requires_novel_final = true;
             }
             if call.step.step == STEP_UNDERSTAND_MEDIA
+                && agent.tool_attempts < openplotva_agent::MAX_TOOL_CALLS
+                && budget.remaining(
+                    ctx.now
+                        + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default(),
+                ) > TOOL_RESERVE
                 && !parallel_media_results.contains_key(&call_index)
             {
                 let batch_len =
-                    consecutive_understand_media_call_count(&step.tool_calls, call_index);
+                    consecutive_understand_media_call_count(&step.tool_calls, call_index)
+                        .min((openplotva_agent::MAX_TOOL_CALLS - agent.tool_attempts) as usize);
+                agent.tool_attempts += batch_len as u32;
                 parallel_media_results.extend(
                     execute_parallel_understand_media_calls(
                         &step.tool_calls[call_index..call_index + batch_len],
                         call_index,
                         cfg,
-                        &meta,
+                        &tool_context,
                         active_params.message_id,
                         &media_reference_aliases,
                         &tool_result_cache,
@@ -1037,11 +1157,23 @@ where
                 &media_reference_aliases,
             );
             let mut budget_extension_granted = false;
-            let (result, tool_duration_ms, executed) = if let Some(prepared) =
-                parallel_media_results.remove(&call_index)
-            {
-                budget_extension_granted = true;
+            let remaining = budget.remaining(
+                ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default(),
+            );
+            let (result, tool_duration_ms, executed) = if let Some(prepared) = parallel_media_results.remove(&call_index) {
                 (prepared.result, prepared.duration_ms, true)
+            } else if !agent
+                .admit_tool(std::time::Duration::try_from(remaining).unwrap_or_default())
+            {
+                (
+                    ToolResult::failed(
+                        "tool_budget_exhausted",
+                        "Tool limit or deadline reached. Finish using the available results.",
+                    ),
+                    0,
+                    false,
+                )
+
             } else if let Some((original_call_id, cached)) = tool_result_cache.get(&semantic_key) {
                 (
                     reused_tool_result(cached, original_call_id),
@@ -1049,12 +1181,18 @@ where
                     false,
                 )
             } else {
-                let result = execute_session_tool(
+                if effect_tool(&call.step.step)
+                    && let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_effect", BTreeMap::from([("key".into(), semantic_key.clone()), ("gift".into(), call.step.gift.to_string())]), failure_now).await {
+                        return std::ops::ControlFlow::Break(agent_persistence_failed(error));
+                }
+                let slice = session_tool_slice(&budget, cfg, failure_now);
+                let result = tokio::time::timeout(slice, execute_session_tool(
                     SessionToolExecution {
                         call,
                         cfg,
-                        meta: &meta,
-                        params: &active_params,
+                        meta: &tool_context,
+                        gift_used: &mut gift_used,
+                        params: active_params,
                         causation_update_id: ctx.item.latest_update_id,
                         budget: &mut budget,
                         sent: &mut sent,
@@ -1069,10 +1207,16 @@ where
                     effects,
                     queue,
                     ctx.item_id,
-                )
-                .await;
+                )).await.unwrap_or_else(|_| ToolResult::failed("effect_outcome_unknown", "The tool deadline expired. Do not repeat an action whose outcome is unknown."));
                 (result, tool_started.elapsed().as_millis(), true)
             };
+            if executed && effect_tool(&call.step.step)
+                && let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_effect", BTreeMap::from([("key".into(), semantic_key.clone()), ("gift".into(), call.step.gift.to_string()), ("result".into(), serde_json::to_string(&result).expect("serializable tool result"))]), failure_now).await {
+                    return std::ops::ControlFlow::Break(agent_persistence_failed(error));
+            }
+            if effect_tool(&call.step.step) && result.error.as_ref().is_some_and(|error| error.code == "effect_outcome_unknown") {
+                return std::ops::ControlFlow::Break(agent_persistence_failed("An action timed out with an unknown outcome. Automatic replay is disabled.".into()));
+            }
             if executed {
                 remember_media_reference_alias(&mut media_reference_aliases, &call.step, &result);
                 let resolved_key = semantic_tool_call_key(
@@ -1087,6 +1231,7 @@ where
             if let Some(effect) = queued_generation_side_effect(&result) {
                 batch_side_effects.push(effect);
             }
+            if let Some(data) = &result.data { remember_context_images(&mut tool_context, data); }
             links.record_tool_result(&result);
             if matches!(call.step.step.as_str(), STEP_WEB_SEARCH | STEP_CRAWL_URL)
                 && result
@@ -1108,7 +1253,7 @@ where
             .await;
             if let Some(runs) = ctx.llm_runs {
                 runs.record_tool_result(
-                    &run_id,
+                    run_id,
                     crate::runtime_llm_runs::RunToolCall {
                         name: call.step.step.clone(),
                         status: result.status.clone(),
@@ -1121,7 +1266,7 @@ where
                     && result.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
                 {
                     runs.mark_round_sent(
-                        &run_id,
+                        run_id,
                         crate::runtime_llm_runs::RunRoundSent::Intermediate,
                     );
                 }
@@ -1130,7 +1275,7 @@ where
                 &call.step, &result, &call.id, iteration,
             ));
             batch_results.push(result.clone());
-            transcript.push(SessionMessage::ToolResult {
+            agent.transcript.push(SessionMessage::ToolResult {
                 tool_call_id: call.id.clone(),
                 name: call.step.step.clone(),
                 content: serde_json::to_string(&result)
@@ -1138,14 +1283,30 @@ where
             });
         }
 
-        match persist_dialog_tool_calls(tool_history, &active_params, &recorded_tool_calls).await {
+        if step
+            .tool_calls
+            .iter()
+            .zip(&batch_results)
+            .any(|(call, result)| call.step.step == "finish_turn" && result.status == "ok")
+        {
+            return std::ops::ControlFlow::Break( TurnResolution {
+                outcome: TurnOutcome::NoReplyIntentional {
+                    reason: "agent_finished",
+                },
+                disposition: JobDisposition::Complete,
+            });
+        }
+        report.session_tool_calls.clone_from(&recorded_tool_calls);
+        match persist_dialog_tool_calls(tool_history, active_params, &recorded_tool_calls).await {
             Ok(persisted) => report.persisted_tool_call_history = persisted,
             Err(error) => {
                 report.tool_call_history_error = Some(error.to_string());
             }
         }
 
-        let disposition = if !announcement.trim().is_empty() && !step_text_accounted_for {
+        let disposition = if step.tool_calls.iter().zip(&batch_results).any(|(call,result)| call.step.step == STEP_SEND_MESSAGE && call.step.final_reply && result.status == "ok") {
+            SessionBatchDisposition::CompleteAfterSidecars
+        } else if !announcement.trim().is_empty() && !step_text_accounted_for {
             SessionBatchDisposition::ContinueForResults
         } else {
             session_batch_disposition(&step.tool_calls, &batch_results, step_text_accounted_for)
@@ -1171,23 +1332,133 @@ where
                     report.sent_answer = true;
                     append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
                 }
-                return session_delegated(&sent, &side_effect_tickets);
+                return std::ops::ControlFlow::Break( session_delegated(&sent, &side_effect_tickets));
             }
             SessionBatchDisposition::CompleteAfterSidecars => {
+                match effects.queued_dialog_answer(ctx.item_id).await {
+                    Ok(Some(receipt)) if !receipt.delivery_complete() => {
+                        report.queued_answer = true;
+                        return std::ops::ControlFlow::Break(TurnResolution {
+                            outcome: TurnOutcome::QueuedForDelivery {
+                                batch_id: receipt.batch_id,
+                                operation_ids: receipt.operation_ids,
+                                side_effect_tickets: ticket_ids(&side_effect_tickets),
+                            },
+                            disposition: JobDisposition::WaitForDelivery,
+                        });
+                    }
+                    Err(error) => return std::ops::ControlFlow::Break(agent_persistence_failed(format!("Check final tool delivery: {error}"))),
+                    _ => {}
+                }
                 report.sent_answer = true;
                 if let Some(runs) = ctx.llm_runs {
-                    runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                    runs.mark_round_sent(run_id, crate::runtime_llm_runs::RunRoundSent::Final);
                 }
                 append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
-                return TurnResolution {
+                return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::Sent {
                         parts: sent.total_count,
                         side_effect_tickets: ticket_ids(&side_effect_tickets),
                     },
                     disposition: JobDisposition::Complete,
-                };
+                });
             }
         }
+        next_step!()
+    }).await
+}
+
+fn extend_context_images(
+    context: &mut ToolContext,
+    message_id: i32,
+    attachments: Vec<openplotva_core::ChatAttachment>,
+) {
+    for (index, attachment) in attachments
+        .into_iter()
+        .filter(|a| a.kind == "image")
+        .enumerate()
+    {
+        if attachment.file_unique_id.is_empty() {
+            continue;
+        }
+        context.image_reference_ids.insert(
+            format!("message_{message_id}_image_{}", index + 1),
+            attachment.file_unique_id.clone(),
+        );
+        if !context
+            .image_attachments
+            .iter()
+            .any(|existing| existing.file_unique_id == attachment.file_unique_id)
+        {
+            context.image_attachments.push(attachment);
+        }
+    }
+}
+
+fn remember_context_images(context: &mut ToolContext, data: &Value) {
+    if let Some(message) = data.get("message")
+        && let Ok(entry) =
+            openplotva_history::decode_summary_message_entry_payload(message.to_string().as_bytes())
+    {
+        extend_context_images(context, entry.message_id, entry.meta.attachments);
+    }
+    for key in ["messages", "nearby"] {
+        if let Some(messages) = data.get(key).and_then(Value::as_array) {
+            for message in messages {
+                remember_context_images(context, message);
+            }
+        }
+    }
+}
+
+fn effect_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "draw_image"
+            | "generate_song"
+            | "draw_api"
+            | "send_message"
+            | "react_to_message"
+            | "memory_manage"
+            | "cancel_drawing"
+    )
+}
+
+async fn persist_agent_event<
+    Q: DialogJobWorkerQueue + Sync + ?Sized,
+    E: DialogJobEffects + Sync + ?Sized,
+>(
+    queue: &Q,
+    effects: &E,
+    job_id: i64,
+    stage: &str,
+    data: BTreeMap<String, String>,
+    now: OffsetDateTime,
+) -> Result<(), String> {
+    queue
+        .append_dialog_job_event(
+            job_id,
+            TaskQueueJobEvent {
+                level: "info".into(),
+                stage: stage.into(),
+                data,
+                ..TaskQueueJobEvent::default()
+            },
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    effects.persist_agent_state(job_id).await
+}
+
+fn agent_persistence_failed(error: String) -> TurnResolution {
+    TurnResolution {
+        outcome: TurnOutcome::TerminalFailed {
+            reason: "agent_persistence_failed",
+            error: error.clone(),
+            user_signal: UserSignalPlan::React,
+        },
+        disposition: JobDisposition::Fail(error),
     }
 }
 
@@ -1505,14 +1776,10 @@ async fn execute_timed_session_tool(
 
 fn session_tool_slice(
     budget: &SessionBudget,
-    cfg: &SessionTurnConfig<'_>,
+    _cfg: &SessionTurnConfig<'_>,
     round_now: OffsetDateTime,
 ) -> std::time::Duration {
-    let slice = (budget.remaining(round_now) - TOOL_RESERVE)
-        .min(TimeDuration::seconds(i64::from(
-            cfg.tool_extension_secs.max(1),
-        )))
-        .max(TimeDuration::seconds(1));
+    let slice = (budget.remaining(round_now) - TOOL_RESERVE).max(TimeDuration::milliseconds(1));
     std::time::Duration::try_from(slice).unwrap_or(std::time::Duration::from_secs(1))
 }
 
@@ -1536,6 +1803,7 @@ struct SessionToolExecution<'a, 'b> {
     call: &'a ChatStepToolCall,
     cfg: &'a SessionTurnConfig<'b>,
     meta: &'a ToolContext,
+    gift_used: &'a mut bool,
     params: &'a openplotva_taskman::DialogJobParams,
     causation_update_id: Option<i64>,
     budget: &'a mut SessionBudget,
@@ -1560,8 +1828,133 @@ where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
 {
     let step = &exec.call.step;
+    let mut tool_meta = exec.meta.clone();
+    tool_meta.message_meta.agent_gift = false;
+    if step.gift {
+        let granted = exec
+            .params
+            .meta
+            .get("dialog_trigger")
+            .and_then(Value::as_str)
+            == Some("random")
+            && exec
+                .params
+                .meta
+                .get("gift_opportunity")
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !granted
+            || *exec.gift_used
+            || *exec.draws_scheduled + *exec.songs_scheduled > 0
+            || !step.file_ids.is_empty()
+            || !tool_meta.message_meta.attachments.is_empty()
+            || !matches!(step.step.as_str(), STEP_DRAW_IMAGE | STEP_GENERATE_SONG)
+        {
+            return ToolResult::failed(
+                "gift_denied",
+                "No unused spontaneous gift opportunity, or this is an edit. Apply ordinary requester permissions.",
+            );
+        }
+        *exec.gift_used = true;
+        tool_meta.message_meta.agent_gift = true;
+    }
     match step.step.as_str() {
+        "finish_turn" => {
+            if exec
+                .params
+                .meta
+                .get("dialog_trigger")
+                .and_then(Value::as_str)
+                != Some("random")
+            {
+                return ToolResult::failed(
+                    "answer_required",
+                    "Answer or clarify the addressed request",
+                );
+            }
+            ToolResult {
+                status: "ok".into(),
+                ..ToolResult::default()
+            }
+        }
         STEP_SEND_MESSAGE => {
+            let mut target = exec.params.clone();
+            target.meta["agent_final_reply"] = Value::Bool(step.final_reply);
+            if step.target_message_id != 0 {
+                let Ok(id) = i32::try_from(step.target_message_id) else {
+                    return ToolResult::failed("invalid_target", "Invalid message ID");
+                };
+                if step.final_reply && id != exec.params.message_id {
+                    return ToolResult::failed(
+                        "final_target",
+                        "The final answer must reply to the original requester",
+                    );
+                }
+                target.message_id = id;
+            }
+            if !step.quote.is_empty() && step.quote.chars().count() > 1024 {
+                return ToolResult::failed("quote_too_long", "Quote at most 1024 characters");
+            }
+            if target.message_id != exec.params.message_id || !step.quote.is_empty() {
+                let result = exec
+                    .cfg
+                    .toolbox
+                    .agent_tool(
+                        exec.meta.clone(),
+                        ToolStep {
+                            step: "get_messages".into(),
+                            message_ids: vec![target.message_id],
+                            ..ToolStep::default()
+                        },
+                    )
+                    .await;
+                let source = result
+                    .ok()
+                    .and_then(|result| result.data)
+                    .and_then(|data| {
+                        data.get("messages")
+                            .and_then(Value::as_array)
+                            .and_then(|messages| {
+                                messages.iter().find(|message| {
+                                    message["message_id"].as_i64()
+                                        == Some(i64::from(target.message_id))
+                                })
+                            })
+                            .cloned()
+                    })
+                    .and_then(|message| message.get("message").cloned())
+                    .and_then(|payload| {
+                        openplotva_history::decode_summary_message_entry_payload(
+                            payload.to_string().as_bytes(),
+                        )
+                        .ok()
+                    });
+                let Some(source) = source else {
+                    return ToolResult::failed(
+                        "unknown_target",
+                        "Read a retained message from this chat before replying to it",
+                    );
+                };
+                if !step.quote.is_empty() {
+                    let source_text = if !source.text.is_empty() {
+                        &source.text
+                    } else if !source.caption.is_empty() {
+                        &source.caption
+                    } else {
+                        &source.original_text
+                    };
+                    let Some(position) = source_text.find(&step.quote) else {
+                        return ToolResult::failed(
+                            "invalid_quote",
+                            "Quote must exactly match the target message",
+                        );
+                    };
+                    target.meta["agent_quote"] = Value::String(step.quote.clone());
+                    target.meta["agent_quote_position"] =
+                        serde_json::json!(source_text[..position].encode_utf16().count());
+                }
+                target.meta["agent_reply_explicit"] = Value::Bool(true);
+            }
             let sanitized = exec.links.prepare_response(&step.text);
             if sanitized.trim().is_empty() {
                 return ToolResult::failed("empty_text", "message text is empty after sanitizing");
@@ -1569,7 +1962,7 @@ where
             let round_now = exec.now
                 + TimeDuration::try_from(exec.processing_started.elapsed()).unwrap_or_default();
             try_send_intermediate(
-                exec.params,
+                &target,
                 effects,
                 queue,
                 item_id,
@@ -1633,7 +2026,7 @@ where
                 + TimeDuration::try_from(exec.processing_started.elapsed()).unwrap_or_default();
             let slice = session_tool_slice(exec.budget, exec.cfg, round_now);
             let result =
-                dispatch_session_tool_with_timeout(exec.cfg.toolbox, exec.meta, step, slice).await;
+                dispatch_session_tool_with_timeout(exec.cfg.toolbox, &tool_meta, step, slice).await;
             if queued_generation_side_effect(&result).is_some() {
                 match step.step.as_str() {
                     STEP_DRAW_IMAGE => *exec.draws_scheduled += 1,
@@ -1677,6 +2070,11 @@ where
         return ToolResult::failed("undeliverable", validation.to_string());
     }
     let first_send = !sent.any();
+    let explicit_reply = params
+        .meta
+        .get("agent_reply_explicit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let seq = sent.intermediate_count + 1;
     match effects
         .send_dialog_intermediate(
@@ -1685,7 +2083,7 @@ where
             params,
             sanitized,
             seq,
-            first_send,
+            first_send || explicit_reply,
         )
         .await
     {
@@ -1937,178 +2335,142 @@ pub struct CapturedSessionOutput {
     pub provider: String,
 }
 
-/// Drive the session loop for the admin console: the toolbox is an argument
-/// (SAFE/REAL is the caller's choice per message, not a provider property),
-/// send_message and text-next-to-tools are captured instead of dispatched,
-/// and errors surface directly — no retries, durable markers, or durable ledger.
+/// Run the production engine with in-memory delivery and history.
 pub async fn run_captured_session(
     step_provider: &dyn ChatStepProvider,
     toolbox: &dyn DialogToolbox,
     base_input: DialogInput,
     max_iterations: i32,
 ) -> Result<CapturedSessionOutput, String> {
-    let meta = dialog_tool_context(&base_input);
-    let native_tools = session_native_tools().map_err(|error| error.to_string())?;
-    let mut transcript: Vec<SessionMessage> = Vec::new();
-    let mut messages: Vec<String> = Vec::new();
-    let mut sent = SentLog::new();
-    let mut recorded: Vec<ToolCall> = Vec::new();
-    let mut provider = String::new();
-    let mut web_source_urls = BTreeSet::new();
-    let mut links = DialogLinks::from_input(&base_input);
-    let mut search_citation_repairs: i32 = 0;
-    let max_iterations = max_iterations.max(1);
-
-    for iteration in 1..=max_iterations {
-        let force_final = iteration == max_iterations;
-        let tools = if base_input.disable_tools {
-            ToolsMode::Disabled
-        } else if force_final || search_citation_repairs > 0 {
-            ToolsMode::FinalOnly
-        } else {
-            ToolsMode::Native(native_tools.clone())
-        };
-        let mut input = base_input.clone();
-        if !web_source_urls.is_empty() {
-            input
-                .reference_context
-                .push(SEARCH_CITATION_HINT.trim().to_owned());
+    use crate::dialog_jobs::{BasicDialogInputMaterializer, NoopDialogToolCallHistoryStore};
+    let now = OffsetDateTime::now_utc();
+    let seed = openplotva_taskman::DialogJobParams {
+        chat_id: base_input.context.chat_id,
+        message_id: base_input.message.id,
+        user_id: base_input.user.id,
+        user_full_name: base_input.user.full_name.clone(),
+        message_text: base_input.message.text.clone(),
+        original_text: String::new(),
+        meta: serde_json::Value::Null,
+        max_output_tokens: base_input.max_output_tokens,
+        thread_id: base_input.context.thread_id,
+    };
+    let queue = openplotva_taskman::InMemoryTaskQueue::default();
+    let job = openplotva_taskman::new_dialog_job_at(seed.clone(), now);
+    let id = queue.assign("captured-dialog", job.clone());
+    let item = crate::dialog_jobs::DialogJobWorkItem {
+        id,
+        job,
+        events: Vec::new(),
+        claim_started_at: now,
+        source_update_ids: Vec::new(),
+        latest_update_id: None,
+    };
+    let capture = CaptureDelivery::default();
+    let cfg = SessionTurnConfig {
+        toolbox,
+        reactor: Some(&capture),
+        gradius: None,
+        max_iterations,
+        max_messages: 4,
+        tool_extension_secs: 0,
+        hard_cap_secs: 120,
+        max_draws: 1,
+        max_songs: 1,
+    };
+    let ctx = SessionRunContext {
+        item_id: id,
+        item_events: &[],
+        params: &seed,
+        queue_name: "captured-dialog",
+        max_llm_job_attempts: 1,
+        max_regenerations: 2,
+        budget: TurnBudget::from_events(&[], 120, now),
+        now,
+        routing_events: None,
+        item: &item,
+        inbox: None,
+        llm_runs: None,
+    };
+    let history = base_input.history.clone();
+    let mut report = DialogJobWorkerReport::default();
+    let resolution = run_dialog_session(
+        ctx,
+        &cfg,
+        step_provider,
+        base_input,
+        &history,
+        &queue,
+        &capture,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        &mut report,
+    )
+    .await;
+    match resolution.disposition {
+        JobDisposition::Fail(error) => return Err(error),
+        JobDisposition::Requeue(_) => {
+            return Err("The captured turn ended without a usable answer".into());
         }
-        if search_citation_repairs > 0 {
-            input
-                .reference_context
-                .push(SEARCH_CITATION_REPAIR_HINT.to_owned());
-        }
-        let step = step_provider
-            .run_chat_step(ChatStepRequest {
-                input,
-                transcript: transcript.clone(),
-                tools,
-                iteration: usize::try_from(iteration).unwrap_or(1),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        provider = step.provider.clone();
-
-        if step.tool_calls.is_empty() || force_final || search_citation_repairs > 0 {
-            let sanitized = links.prepare_response(&step.text);
-            if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)
-            {
-                if search_citation_repairs < MAX_SEARCH_CITATION_REPAIRS
-                    && iteration < max_iterations
-                {
-                    search_citation_repairs += 1;
-                    continue;
-                }
-                tracing::warn!(
-                    attempts = search_citation_repairs,
-                    sources = web_source_urls.len(),
-                    "sending captured searched answer without a source citation after repair attempts"
-                );
-            }
-            if !sanitized.trim().is_empty() && !sent.matches_delivery(&sanitized) {
-                sent.record(&sanitized, false);
-                messages.push(sanitized);
-            }
-            return Ok(CapturedSessionOutput {
-                messages,
-                tool_calls: recorded,
-                provider,
-            });
-        }
-
-        transcript.push(SessionMessage::Assistant {
-            text: step.text.clone(),
-            tool_calls: step
-                .tool_calls
-                .iter()
-                .map(|call| SessionToolCall {
-                    id: call.id.clone(),
-                    name: call.step.step.clone(),
-                    arguments: serde_json::to_value(&call.step).unwrap_or(Value::Null),
-                })
-                .collect(),
-        });
-        let announcement = links.prepare_response(&step.text);
-        let step_text_accounted_for = if announcement.trim().is_empty() {
-            false
-        } else if sent.matches_delivery(&announcement) {
-            true
-        } else {
-            sent.record(&announcement, true);
-            messages.push(announcement);
-            true
-        };
-
-        let mut batch_results = Vec::with_capacity(step.tool_calls.len());
-        for call in &step.tool_calls {
-            let step_def = &call.step;
-            let result = match step_def.step.as_str() {
-                STEP_SEND_MESSAGE => {
-                    let sanitized = links.prepare_response(&step_def.text);
-                    if sanitized.trim().is_empty() {
-                        ToolResult::failed("empty_text", "message text is empty after sanitizing")
-                    } else if sent.matches_delivery(&sanitized) {
-                        ToolResult::failed(
-                            "duplicate_message",
-                            "this text was already sent this turn",
-                        )
-                    } else {
-                        sent.record(&sanitized, true);
-                        messages.push(sanitized);
-                        ToolResult {
-                            status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
-                            message: "message sent".to_owned(),
-                            ..ToolResult::default()
-                        }
-                    }
-                }
-                STEP_REACT_TO_MESSAGE => ToolResult {
-                    status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
-                    message: format!("reaction captured: {}", step_def.emoji),
-                    ..ToolResult::default()
-                },
-                _ => match dispatch_dialog_tool(toolbox, &meta, step_def).await {
-                    Ok(result) => result,
-                    Err(error) => ToolResult::failed("tool_error", error.to_string()),
-                },
-            };
-            links.record_tool_result(&result);
-            if matches!(step_def.step.as_str(), STEP_WEB_SEARCH | STEP_CRAWL_URL)
-                && result
-                    .status
-                    .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
-            {
-                collect_web_source_urls(&result, &mut web_source_urls);
-            }
-            recorded.push(recorded_session_tool_call(
-                step_def, &result, &call.id, iteration,
-            ));
-            batch_results.push(result.clone());
-            transcript.push(SessionMessage::ToolResult {
-                tool_call_id: call.id.clone(),
-                name: step_def.step.clone(),
-                content: serde_json::to_string(&result)
-                    .unwrap_or_else(|_| "{\"status\":\"failed\"}".to_owned()),
-            });
-        }
-        if matches!(
-            session_batch_disposition(&step.tool_calls, &batch_results, step_text_accounted_for),
-            SessionBatchDisposition::CompleteWithSideEffect
-                | SessionBatchDisposition::CompleteAfterSidecars
-        ) {
-            return Ok(CapturedSessionOutput {
-                messages,
-                tool_calls: recorded,
-                provider,
-            });
-        }
+        _ => {}
+    }
+    if let Some(error) = report.provider_error {
+        return Err(error);
     }
     Ok(CapturedSessionOutput {
-        messages,
-        tool_calls: recorded,
-        provider,
+        messages: capture.messages.into_inner().expect("capture delivery"),
+        tool_calls: report.session_tool_calls,
+        provider: report.provider.unwrap_or_default(),
     })
+}
+
+#[derive(Default)]
+struct CaptureDelivery {
+    messages: std::sync::Mutex<Vec<String>>,
+}
+impl SessionReactor for CaptureDelivery {
+    fn react<'a>(&'a self, _: i64, _: i64, _: &'a str) -> SessionReactionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+impl DialogJobEffects for CaptureDelivery {
+    type Error = String;
+    fn send_dialog_answer<'a>(
+        &'a self,
+        _: i64,
+        _: Option<i64>,
+        _: &'a openplotva_taskman::DialogJobParams,
+        answer: &'a str,
+        _: DialogAnswerSendOptions,
+    ) -> crate::dialog_jobs::DialogJobReceiptFuture<'a, String> {
+        Box::pin(async move {
+            self.messages
+                .lock()
+                .expect("capture delivery")
+                .push(answer.to_owned());
+            Ok(crate::dialog_jobs::QueuedBatchReceipt::dispatcher(
+                "capture".to_owned(),
+                Vec::new(),
+            ))
+        })
+    }
+    fn send_dialog_intermediate<'a>(
+        &'a self,
+        _: i64,
+        _: Option<i64>,
+        _: &'a openplotva_taskman::DialogJobParams,
+        text: &'a str,
+        _: u32,
+        _: bool,
+    ) -> crate::dialog_jobs::DialogJobEffectFuture<'a, String> {
+        Box::pin(async move {
+            self.messages
+                .lock()
+                .expect("capture delivery")
+                .push(text.to_owned());
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2121,6 +2483,90 @@ mod tests {
     use openplotva_dialog::{ToolboxFuture, VisionRequest};
 
     use super::*;
+
+    #[derive(Default)]
+    struct BudgetProbe {
+        requests: std::sync::Mutex<Vec<ChatStepRequest>>,
+        tool_executions: AtomicUsize,
+    }
+    impl ChatStepProvider for BudgetProbe {
+        fn provider_name(&self) -> &str {
+            "probe"
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn run_chat_step<'a>(
+            &'a self,
+            request: ChatStepRequest,
+        ) -> openplotva_llm::ChatStepFuture<'a> {
+            Box::pin(async move {
+                let final_only = matches!(request.tools, ToolsMode::FinalOnly);
+                let iteration = request.iteration;
+                self.requests.lock().expect("requests").push(request);
+                Ok(openplotva_dialog::ChatStepOutput {
+                    provider: "probe".into(),
+                    text: if final_only {
+                        "Проверено.".into()
+                    } else {
+                        String::new()
+                    },
+                    tool_calls: if final_only {
+                        Vec::new()
+                    } else {
+                        vec![ChatStepToolCall {
+                            id: format!("call-{iteration}"),
+                            step: ToolStep {
+                                step: openplotva_dialog::STEP_CURRENCY_RATES.into(),
+                                ..Default::default()
+                            },
+                            salvaged: false,
+                        }]
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    impl DialogToolbox for BudgetProbe {
+        fn currency_rates<'a>(&'a self, _: openplotva_dialog::RatesRequest) -> ToolboxFuture<'a> {
+            self.tool_executions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ToolResult {
+                    status: "ok".into(),
+                    data: Some(serde_json::json!({"rate":1})),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn captured_and_production_loop_count_cached_calls_and_keep_initial_packet() {
+        let probe = BudgetProbe::default();
+        let mut input = DialogInput::default();
+        input.context.chat_id = -100;
+        input.user.id = 99;
+        input.message.id = 7;
+        input.message.text = "проверь".into();
+        let output = run_captured_session(&probe, &probe, input.clone(), 36)
+            .await
+            .expect("session");
+        assert_eq!(output.messages, vec!["Проверено."]);
+        assert_eq!(output.tool_calls.len(), 32);
+        assert_eq!(probe.tool_executions.load(Ordering::SeqCst), 1);
+        let requests = probe.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 33);
+        assert!(requests.iter().all(|request| request.input == input));
+        assert!(matches!(
+            requests.last().expect("last step").tools,
+            ToolsMode::FinalOnly
+        ));
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| pair[1].transcript.len() > pair[0].transcript.len())
+        );
+    }
 
     #[test]
     fn sent_log_matches_html_equivalent_and_aggregate_replays() {
@@ -2231,7 +2677,7 @@ mod tests {
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert!(!names.contains(&openplotva_dialog::STEP_MEMORY_SEARCH));
+        assert!(names.contains(&openplotva_dialog::STEP_MEMORY_SEARCH));
         assert!(names.contains(&STEP_SEND_MESSAGE));
         assert!(names.contains(&STEP_REACT_TO_MESSAGE));
     }

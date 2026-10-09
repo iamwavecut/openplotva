@@ -36,7 +36,7 @@ pub enum ReplyMaterial {
 }
 
 /// One generation job queued by a tool during the turn.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedSideEffect {
     /// `image_generation_job` or `music_generation_job`.
     pub kind: String,

@@ -8,6 +8,7 @@
 //! assistant/tool roles for OpenAI-compatible endpoints, plain-text context
 //! blocks for tool-less echelons).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{DialogInput, DialogTraceArtifacts, ToolContext, ToolStep};
@@ -88,7 +89,7 @@ fn dialog_image_attachments(input: &DialogInput) -> Vec<openplotva_core::ChatAtt
 /// One tool call as recorded in the session transcript. `arguments` is the
 /// JSON value the model produced (object or encoded string) so the call
 /// round-trips into the next request byte-comparably.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionToolCall {
     pub id: String,
     pub name: String,
@@ -96,7 +97,7 @@ pub struct SessionToolCall {
 }
 
 /// One in-session message. Ordering in the transcript is chronological.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SessionMessage {
     /// A completed assistant step: optional visible text plus the tool calls
     /// it issued (empty for a text-only intermediate recorded mid-session).
@@ -148,7 +149,7 @@ pub struct ChatStepRequest {
 /// [`ToolStep`] plus the wire-level id that links its result back into the
 /// transcript. `salvaged` marks calls recovered from assistant text by the
 /// content parsers rather than the native `tool_calls` array.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatStepToolCall {
     pub id: String,
     pub step: ToolStep,

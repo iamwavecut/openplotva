@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::dialog_jobs::prepare_dialog_chat_response;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DialogLinks {
     urls: BTreeSet<String>,
 }

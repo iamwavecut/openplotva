@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod agent_runtime;
+mod agent_tools;
 pub mod asr;
 pub mod callbacks;
 pub mod checkin;
@@ -12347,6 +12348,7 @@ async fn start_runtime_workers(
     );
 
     let music_service_available = config.music.acestep.enabled;
+    let media_failure_explainer = Arc::new(std::sync::OnceLock::new());
     let delivery_obligation_store = Arc::new(
         openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
     );
@@ -12413,6 +12415,7 @@ async fn start_runtime_workers(
             Arc::clone(&dispatcher_queue),
             watcher_signal.clone(),
         );
+        obligation_notifier.explainer = Arc::clone(&media_failure_explainer);
         {
             let reactions = &generation_reactions;
             obligation_notifier =
@@ -12643,6 +12646,16 @@ async fn start_runtime_workers(
             None
         }
     };
+    let mut direct_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
+    direct_draw_api_config.timeout = Duration::from_secs(120);
+    let direct_draw_api_effects = Arc::new(
+        dialog_messages::DirectDrawApiRuntimeEffects::new(
+            telegram.clone(),
+            image_jobs::AifarmDrawApiImageGenerator::new(direct_draw_api_config),
+        )
+        .with_send_policies(rate_limit_policy.clone(), permission_policy.clone())
+        .with_history_store(Arc::new(history_store.clone()), bot_identity.id),
+    );
     let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
         Some(Arc::clone(&rates_fetcher)),
         Some(rates_tool_dispatcher),
@@ -12657,6 +12670,13 @@ async fn start_runtime_workers(
         agent_runtime::PostgresHistorySearch::new(history_store.clone()),
     );
     app_dialog_toolbox = app_dialog_toolbox.with_history_searcher(dialog_history_searcher);
+    app_dialog_toolbox =
+        app_dialog_toolbox.with_agent_tools(Arc::new(agent_tools::AgentContextTools {
+            history: history_store.clone(),
+            memory: memory_store.clone(),
+            vip: vip_status_for_updates.clone(),
+            direct_draw: direct_draw_api_effects.clone(),
+        }));
     if let Some(history_summarizer) = history_summarizer {
         app_dialog_toolbox = app_dialog_toolbox.with_history_summarizer(history_summarizer);
     }
@@ -12857,6 +12877,7 @@ async fn start_runtime_workers(
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_effects =
                 dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+                    .with_durability_barrier(Arc::new(shared_task_queue.clone()))
                     .with_durable_outbox(
                         openplotva_storage::PostgresTelegramOutboxStore::new(
                             service_clients.critical_postgres.clone(),
@@ -12897,6 +12918,11 @@ async fn start_runtime_workers(
                 dialog_materializer.with_asr_materializer(Arc::clone(&dialog_context_asr));
             dialog_materializer =
                 dialog_materializer.with_vision_materializer(dialog_context_vision);
+            let _ = media_failure_explainer.set(agent_tools::MediaFailureExplainer {
+                provider: Arc::clone(&dialog_provider),
+                materializer: dialog_materializer.clone(),
+                history: history_store.clone(),
+            });
             let safe_dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
             );
@@ -13624,16 +13650,6 @@ async fn start_runtime_workers(
         let random_dialog_effects = Arc::new(dialog_messages::RandomDialogDispatcherEffects::new(
             Arc::clone(&dispatcher_queue_for_updates),
         ));
-        let mut direct_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
-        direct_draw_api_config.timeout = Duration::from_secs(120);
-        let direct_draw_api_effects = Arc::new(
-            dialog_messages::DirectDrawApiRuntimeEffects::new(
-                telegram.clone(),
-                image_jobs::AifarmDrawApiImageGenerator::new(direct_draw_api_config),
-            )
-            .with_send_policies(rate_limit_policy.clone(), permission_policy.clone())
-            .with_history_store(history_store_for_updates.clone(), bot_identity.id),
-        );
         let terminal = Arc::new(RuntimeUnhandledUpdateHandler);
         let dialog_terminal = Arc::new(
             dialog_messages::DialogMessageUpdateHandler::new(
@@ -13732,33 +13748,6 @@ async fn start_runtime_workers(
                 )),
                 reset_handler,
             ));
-        let translate_handler = Arc::new(translate::TranslateCommandUpdateHandler::new(
-            translate::TranslateBotIdentity {
-                user: bot_user_from_get_me(&bot_identity),
-            },
-            Arc::new(MessageGateCheckedTranslatePermission),
-            Arc::clone(&control_queue_for_updates),
-            Arc::new(translate::TranslateDispatcherEffects::new(Arc::clone(
-                &dispatcher_queue_for_updates,
-            ))),
-            delete_drawing_command,
-        ));
-        let mut rates_effects = rates::RatesUtilityEffects::new(Arc::clone(&rich_sender));
-        if config.gradius.utility_rates_enabled
-            && let Some((ads, outbox)) = &gradius_utility
-        {
-            rates_effects = rates_effects.with_utility_ads(Arc::clone(ads), Arc::clone(outbox));
-        }
-        let rates_handler = Arc::new(rates::RatesCommandUpdateHandler::new(
-            rates::RatesBotIdentity {
-                user: bot_user_from_get_me(&bot_identity),
-            },
-            Arc::new(MessageGateCheckedRatesPermission),
-            Some(Arc::clone(&rates_fetcher)),
-            Arc::new(RuntimeRatesHeaderProvider),
-            Arc::new(rates_effects),
-            translate_handler,
-        ));
         let checkin_command = Arc::new(checkin::CheckinCommandUpdateHandler::new(
             Arc::clone(&control_queue_for_updates),
             checkin_game_store_for_updates,
@@ -13768,7 +13757,7 @@ async fn start_runtime_workers(
                 Arc::clone(&rich_sender),
             )),
             bot_identity.username.clone(),
-            rates_handler,
+            delete_drawing_command,
         ));
         let post_service_blocked_gate =
             Arc::new(message_gate::PostServiceBlockedChatUpdateHandler::new(
@@ -14708,33 +14697,6 @@ fn bot_user_from_get_me(bot: &carapax::types::Bot) -> carapax::types::User {
     user
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MessageGateCheckedTranslatePermission;
-
-impl translate::TranslateSendPermission for MessageGateCheckedTranslatePermission {
-    fn can_send_translate_text(&self, _chat: &carapax::types::Chat) -> bool {
-        true
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MessageGateCheckedRatesPermission;
-
-impl rates::RatesSendPermission for MessageGateCheckedRatesPermission {
-    fn can_send_rates_text(&self, _chat: &carapax::types::Chat) -> bool {
-        true
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RuntimeRatesHeaderProvider;
-
-impl rates::RatesHeaderProvider for RuntimeRatesHeaderProvider {
-    fn rates_header(&self, user_full_name: &str) -> String {
-        rates::random_rates_header(user_full_name)
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 struct RuntimeUnhandledUpdateHandler;
 
@@ -14805,18 +14767,6 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
-
-    #[test]
-    fn runtime_rates_header_restores_the_legacy_joke() {
-        let header =
-            <super::RuntimeRatesHeaderProvider as crate::rates::RatesHeaderProvider>::rates_header(
-                &super::RuntimeRatesHeaderProvider,
-                "Ada Lovelace",
-            );
-
-        assert_ne!(header, "Ada Lovelace");
-        assert!(header.contains("Ada Lovelace"));
-    }
 
     #[tokio::test]
     async fn runtime_worker_readiness_names_an_early_exit() {

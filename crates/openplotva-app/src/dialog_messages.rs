@@ -17,8 +17,8 @@ use openplotva_taskman::{
 };
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, PhotoMessageRequest, PhotoSource,
-    ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-    TelegramClient, TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
+    ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest, TelegramClient,
+    TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
     TextMessageRequest,
 };
 use openplotva_updates::{
@@ -34,10 +34,7 @@ use time::OffsetDateTime;
 use crate::{
     dialog_debounce::InMemoryDialogDebounce,
     dialog_runtime,
-    dialog_tools::{
-        DrawImageScheduleRejection, DrawImageScheduleRequest, ImageScheduler,
-        SongScheduleRejection, SongScheduleRequest, SongScheduleResult, SongScheduler,
-    },
+    dialog_tools::{ImageScheduler, SongScheduler},
     image_jobs::{
         ImageGenerationError, ImageGenerationRequest, ImageGenerationResult, ImageGenerator,
     },
@@ -1119,7 +1116,22 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
                 user_full_name: schedule.user_full_name.clone(),
                 message_text: clean_unicode_non_printables(schedule.message_text),
                 original_text: schedule.original_text.trim().to_owned(),
-                meta: serde_json::to_value(schedule.meta)?,
+                meta: {
+                    let mut meta = serde_json::to_value(schedule.meta)?;
+                    meta["dialog_trigger"] =
+                        serde_json::json!(if schedule.title == "dialog (random)" {
+                            "random"
+                        } else {
+                            "addressed"
+                        });
+                    use std::hash::{Hash, Hasher};
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    (schedule.chat_id, schedule.message_id).hash(&mut hash);
+                    meta["gift_opportunity"] = serde_json::json!(
+                        schedule.title == "dialog (random)" && hash.finish().is_multiple_of(100)
+                    );
+                    meta
+                },
                 max_output_tokens: schedule.max_output_tokens,
                 thread_id: schedule.thread_id,
             };
@@ -1585,36 +1597,19 @@ where
 
     let parsed = parse_if_addressed(message, &config.bot_user);
     let first_word_lower = parsed.first_word.trim().to_lowercase();
-    let sender = resolve_message_sender(Some(message));
     let bot_username = config
         .bot_user
         .username
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
-    if (is_bang_song_shortcut(&first_word_lower)
+    if parsed.is_addressed
+        || crate::rates::is_rates_command_message(message, &config.bot_user)
+        || is_bang_draw_shortcut(&first_word_lower)
+        || is_bang_song_shortcut(&first_word_lower)
         || is_song_command_for_bot(message, &first_word_lower, &bot_username)
-        || !parsed.is_addressed)
-        && let Some(route) = schedule_direct_song_shortcut(
-            schedulers.2,
-            Some(effects as &dyn DirectSongNoticeEffects),
-            DirectSongShortcutRequest {
-                message,
-                chat_id,
-                message_id,
-                sender: &sender,
-                is_addressed: parsed.is_addressed,
-                first_word_lower: &first_word_lower,
-                rest_text: &parsed.rest_text,
-                bot_username: &bot_username,
-            },
-        )
-        .await?
+        || is_search_command_for_bot(message, &first_word_lower, &bot_username)
     {
-        return Ok(route);
-    }
-
-    if parsed.is_addressed || is_bang_draw_shortcut(&first_word_lower) {
         return handle_dialog_message_update_or_else_with_image_and_song_notices(
             schedulers.0,
             (
@@ -1758,82 +1753,17 @@ where
     {
         parsed.is_addressed = true;
     }
+    parsed.is_addressed |= crate::rates::is_rates_command_message(message, &config.bot_user);
+    parsed.is_addressed |= is_bang_draw_shortcut(&first_word_lower)
+        || direct_song_shortcut_topic(
+            message,
+            parsed.is_addressed,
+            &first_word_lower,
+            &parsed.rest_text,
+            &bot_username,
+        )
+        .is_some();
     let parsed = parsed;
-    if let Some(route) = schedule_direct_song_shortcut(
-        shortcuts.1,
-        shortcuts.2,
-        DirectSongShortcutRequest {
-            message,
-            chat_id,
-            message_id,
-            sender: &sender,
-            is_addressed: parsed.is_addressed,
-            first_word_lower: &first_word_lower,
-            rest_text: &parsed.rest_text,
-            bot_username: &bot_username,
-        },
-    )
-    .await?
-    {
-        return Ok(route);
-    }
-    if parsed.is_addressed && is_direct_draw_api_shortcut(&first_word_lower) {
-        let Some(effects) = shortcuts.3 else {
-            tracing::debug!(
-                chat_id,
-                message_id,
-                "direct draw-api shortcut skipped because effects are not configured"
-            );
-            return Ok(DialogMessageUpdateRoute::DirectDrawApi {
-                sent: false,
-                error: Some("draw api not configured".to_owned()),
-            });
-        };
-        let report = effects
-            .send_direct_draw_api(DirectDrawApiRequest {
-                chat_id,
-                message_id,
-                user_id: sender.id,
-                user_full_name: message_user_full_name(&sender),
-                prompt: parsed.rest_text.clone(),
-                thread_id: message
-                    .message_thread_id
-                    .and_then(|thread_id| i32::try_from(thread_id).ok())
-                    .filter(|thread_id| *thread_id != 0),
-                is_forum: message.message_thread_id.is_some(),
-            })
-            .await;
-        if let Some(error) = report.error.as_deref() {
-            tracing::debug!(
-                chat_id,
-                message_id,
-                %error,
-                "direct draw-api shortcut failed"
-            );
-        }
-        return Ok(DialogMessageUpdateRoute::DirectDrawApi {
-            sent: report.sent,
-            error: report.error,
-        });
-    }
-    if let Some(route) = schedule_direct_image_shortcut(
-        shortcuts.0,
-        shortcuts.2,
-        DirectDrawShortcutRequest {
-            message,
-            chat_id,
-            message_id,
-            sender: &sender,
-            is_addressed: parsed.is_addressed,
-            first_word_lower: &first_word_lower,
-            rest_text: &parsed.rest_text,
-        },
-    )
-    .await?
-    {
-        return Ok(route);
-    }
-
     if !parsed.is_addressed {
         if is_bang_draw_shortcut(&first_word_lower) {
             return Ok(DialogMessageUpdateRoute::DrawImageScheduled {
@@ -1849,22 +1779,61 @@ where
         return Ok(DialogMessageUpdateRoute::Delegated);
     }
 
-    if should_delegate_react_command_alias(&parsed.first_word) {
-        if is_draw_react_alias(&first_word_lower) && shortcuts.0.is_none() {
-            return Ok(DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            });
+    let mut context = build_fetcher_message_context(message);
+    if let Some(TelegramReplyTo::Message(reply)) = &message.reply_to {
+        let mut attachments =
+            openplotva_updates::collect_media_attachments(Some(reply), &context.meta.attachments);
+        for attachment in &mut attachments {
+            attachment.source = "quoted".into();
         }
-        handle_other(update)
-            .await
-            .map_err(|error| DialogMessageUpdateError::Downstream {
-                message: error.to_string(),
-            })?;
-        return Ok(DialogMessageUpdateRoute::Delegated);
+        context.meta.attachments.extend(attachments);
+    }
+    let reply_context = reply_image_context(message);
+    let editable = context_has_editable_image(&context)
+        || reply_context
+            .as_ref()
+            .is_some_and(context_has_editable_image);
+    let intent = if is_direct_draw_api_shortcut(&first_word_lower) {
+        Some(format!(
+            "Requested tool: draw_api. Prompt: {}",
+            parsed.rest_text
+        ))
+    } else if let Some(topic) = direct_song_shortcut_topic(
+        message,
+        parsed.is_addressed,
+        &first_word_lower,
+        &parsed.rest_text,
+        &bot_username,
+    ) {
+        Some(format!(
+            "Requested tool: generate_song. Topic: {}",
+            resolve_song_topic(message, &topic).unwrap_or_default()
+        ))
+    } else {
+        direct_image_shortcut(
+            message,
+            parsed.is_addressed,
+            &first_word_lower,
+            &parsed.rest_text,
+            editable,
+        )
+        .map(|action| match action {
+            DirectImageShortcut::Draw(prompt) => {
+                format!("Requested tool: draw_image. Prompt: {prompt}")
+            }
+            DirectImageShortcut::Edit(prompt) => format!(
+                "Requested tool: draw_image with source attachments. Edit: {}",
+                resolve_direct_image_edit_prompt(
+                    &prompt,
+                    reply_context.as_ref().unwrap_or(&context)
+                )
+            ),
+        })
+    };
+    if let Some(intent) = intent {
+        context.meta.annotation.push_str(&format!("\n{intent}"));
     }
 
-    let context = build_fetcher_message_context(message);
     if !dialog_context_has_payload(&context) {
         return Ok(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
     }
@@ -1914,194 +1883,6 @@ where
         delay: report.delay,
         replaced: report.replaced,
     })
-}
-
-struct DirectDrawShortcutRequest<'a> {
-    message: &'a carapax::types::Message,
-    chat_id: i64,
-    message_id: i32,
-    sender: &'a MessageSender,
-    is_addressed: bool,
-    first_word_lower: &'a str,
-    rest_text: &'a str,
-}
-
-struct DirectSongShortcutRequest<'a> {
-    message: &'a carapax::types::Message,
-    chat_id: i64,
-    message_id: i32,
-    sender: &'a MessageSender,
-    is_addressed: bool,
-    first_word_lower: &'a str,
-    rest_text: &'a str,
-    bot_username: &'a str,
-}
-
-async fn schedule_direct_song_shortcut(
-    song_scheduler: Option<&dyn SongScheduler>,
-    song_notice_effects: Option<&dyn DirectSongNoticeEffects>,
-    request: DirectSongShortcutRequest<'_>,
-) -> Result<Option<DialogMessageUpdateRoute>, DialogMessageUpdateError> {
-    let Some(raw_topic) = direct_song_shortcut_topic(
-        request.message,
-        request.is_addressed,
-        request.first_word_lower,
-        request.rest_text,
-        request.bot_username,
-    ) else {
-        return Ok(None);
-    };
-    let Some(topic) = resolve_song_topic(request.message, &raw_topic) else {
-        send_direct_song_notice(
-            song_notice_effects,
-            request.message,
-            DIRECT_SONG_TOPIC_REQUIRED_NOTICE,
-            String::new(),
-            Duration::from_secs(120),
-        )
-        .await;
-        return Ok(Some(DialogMessageUpdateRoute::SongMissingTopic));
-    };
-    let Some(song_scheduler) = song_scheduler else {
-        let result = SongScheduleResult {
-            status: "not_scheduled".to_owned(),
-            message: String::new(),
-            no_reply: true,
-            queue_notice: None,
-            rejection: Some(SongScheduleRejection::ServiceUnavailable),
-            job_id: None,
-        };
-        send_direct_song_result_notices(song_notice_effects, request.message, &result).await;
-        return Ok(Some(DialogMessageUpdateRoute::SongScheduled {
-            status: result.status,
-            no_reply: result.no_reply,
-        }));
-    };
-
-    let context = build_fetcher_message_context(request.message);
-    let (reference_file_id, reference_file_unique_id) =
-        song_audio_reference_from_reply(request.message).unwrap_or_default();
-    let thread_id = request
-        .message
-        .message_thread_id
-        .and_then(|thread_id| i32::try_from(thread_id).ok())
-        .filter(|thread_id| *thread_id != 0);
-    let result = song_scheduler
-        .schedule_song(SongScheduleRequest {
-            chat_id: request.chat_id,
-            thread_id,
-            message_id: request.message_id,
-            user_id: request.sender.id,
-            user_full_name: message_user_full_name(request.sender),
-            topic,
-            message_text: context.text,
-            message_meta: context.meta,
-            reference_file_id,
-            reference_file_unique_id,
-        })
-        .await
-        .map_err(|error| DialogMessageUpdateError::ScheduleSong {
-            message: error.to_string(),
-        })?;
-    send_direct_song_result_notices(song_notice_effects, request.message, &result).await;
-
-    Ok(Some(DialogMessageUpdateRoute::SongScheduled {
-        status: result.status,
-        no_reply: result.no_reply,
-    }))
-}
-
-const DIRECT_SONG_TOPIC_REQUIRED_NOTICE: &str =
-    "Укажите тему: /song <тема> или используйте команду в ответ на сообщение с текстом.";
-const DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE: &str =
-    "Сервис генерации музыки временно недоступен. Попробуйте позже.";
-const DIRECT_SONG_AUDIO_NOT_ALLOWED_NOTICE: &str = "Я не могу отправлять аудио в этот чат.";
-const DIRECT_SONG_EMPTY_TOPIC_NOTICE: &str = "Не удалось определить тему песни.";
-const DIRECT_SONG_VIP_ONLY_NOTICE: &str = "Функция генерации музыки доступна только для <a href='https://t.me/PlotvoBot?start=vip'>VIP-пользователей</a>.";
-const DIRECT_SONG_ACTIVE_LIMIT_NOTICE: &str =
-    "У вас уже 2 активных музыкальных задач (лимит VIP). Дождитесь завершения и попробуйте снова.";
-const DIRECT_SONG_RATE_LIMITED_NOTICE: &str =
-    "Слишком много запросов за короткое время. Подождите немного и попробуйте снова.";
-
-async fn send_direct_song_result_notices(
-    effects: Option<&dyn DirectSongNoticeEffects>,
-    message: &carapax::types::Message,
-    result: &SongScheduleResult,
-) {
-    if let Some(rejection) = result.rejection {
-        let (text, render_as, delete_after) = match rejection {
-            SongScheduleRejection::ServiceUnavailable => (
-                DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE,
-                String::new(),
-                Duration::from_secs(120),
-            ),
-            SongScheduleRejection::AudioNotAllowed => (
-                DIRECT_SONG_AUDIO_NOT_ALLOWED_NOTICE,
-                String::new(),
-                Duration::from_secs(120),
-            ),
-            SongScheduleRejection::VipOnly => (
-                DIRECT_SONG_VIP_ONLY_NOTICE,
-                TELEGRAM_PARSE_MODE_HTML.to_owned(),
-                Duration::from_secs(60),
-            ),
-            SongScheduleRejection::EmptyTopic => (
-                DIRECT_SONG_EMPTY_TOPIC_NOTICE,
-                String::new(),
-                Duration::from_secs(120),
-            ),
-            SongScheduleRejection::ActiveLimit => (
-                DIRECT_SONG_ACTIVE_LIMIT_NOTICE,
-                String::new(),
-                Duration::from_secs(60),
-            ),
-            SongScheduleRejection::RateLimited => (
-                DIRECT_SONG_RATE_LIMITED_NOTICE,
-                String::new(),
-                Duration::from_secs(60),
-            ),
-        };
-        send_direct_song_notice(effects, message, text, render_as, delete_after).await;
-        return;
-    }
-
-    if let Some(notice) = result.queue_notice.as_ref() {
-        let text = format!(
-            "Песня добавлена в очередь. Перед вами {} задач. Примерное ожидание: {}",
-            notice.position, notice.estimated_wait
-        );
-        send_direct_song_notice(
-            effects,
-            message,
-            &text,
-            String::new(),
-            Duration::from_secs(300),
-        )
-        .await;
-    }
-}
-
-async fn send_direct_song_notice(
-    effects: Option<&dyn DirectSongNoticeEffects>,
-    message: &carapax::types::Message,
-    text: &str,
-    render_as: String,
-    delete_after: Duration,
-) {
-    let Some(effects) = effects else {
-        return;
-    };
-    if let Err(error) = effects
-        .send_direct_song_notice(direct_song_notice_plan(
-            message,
-            text.to_owned(),
-            render_as,
-            delete_after,
-        ))
-        .await
-    {
-        tracing::debug!(%error, "failed to send direct song notice");
-    }
 }
 
 fn direct_song_shortcut_topic(
@@ -2165,47 +1946,6 @@ fn song_topic_from_reply(message: &carapax::types::Message) -> Option<String> {
 fn trimmed_non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-fn song_audio_reference_from_reply(message: &carapax::types::Message) -> Option<(String, String)> {
-    let Some(TelegramReplyTo::Message(reply)) = message.reply_to.as_ref() else {
-        return None;
-    };
-    extract_song_audio_reference(reply)
-}
-
-fn extract_song_audio_reference(message: &carapax::types::Message) -> Option<(String, String)> {
-    match &message.data {
-        TelegramMessageData::Audio(audio) => {
-            file_reference(&audio.data.file_id, &audio.data.file_unique_id)
-        }
-        TelegramMessageData::Voice(voice) => {
-            file_reference(&voice.data.file_id, &voice.data.file_unique_id)
-        }
-        TelegramMessageData::Document(document)
-            if document
-                .data
-                .mime_type
-                .as_deref()
-                .is_some_and(mime_is_audio) =>
-        {
-            file_reference(&document.data.file_id, &document.data.file_unique_id)
-        }
-        _ => None,
-    }
-}
-
-fn file_reference(file_id: &str, file_unique_id: &str) -> Option<(String, String)> {
-    let file_id = file_id.trim();
-    let file_unique_id = file_unique_id.trim();
-    (!file_id.is_empty() && !file_unique_id.is_empty())
-        .then(|| (file_id.to_owned(), file_unique_id.to_owned()))
-}
-
-fn mime_is_audio(mime: &str) -> bool {
-    mime.trim()
-        .get(.."audio/".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("audio/"))
 }
 
 fn is_song_command_for_bot(
@@ -2329,293 +2069,6 @@ fn direct_draw_api_sent_history_entry(
     build_history_text_entry(message, &original_text, meta, bot_id)
 }
 
-async fn schedule_direct_image_shortcut(
-    image_scheduler: Option<&dyn ImageScheduler>,
-    notice_effects: Option<&dyn DirectSongNoticeEffects>,
-    request: DirectDrawShortcutRequest<'_>,
-) -> Result<Option<DialogMessageUpdateRoute>, DialogMessageUpdateError> {
-    let control_context = build_fetcher_message_context(request.message);
-    let reply_context = reply_image_context(request.message);
-    let current_has_image = context_has_editable_image(&control_context);
-    let reply_has_image = reply_context
-        .as_ref()
-        .is_some_and(context_has_editable_image);
-    let edit_target = if current_has_image {
-        Some((&control_context, true))
-    } else if reply_has_image {
-        reply_context.as_ref().map(|context| (context, false))
-    } else {
-        None
-    };
-    let Some(shortcut) = direct_image_shortcut(
-        request.message,
-        request.is_addressed,
-        request.first_word_lower,
-        request.rest_text,
-        edit_target.is_some(),
-    ) else {
-        return Ok(None);
-    };
-    let Some(image_scheduler) = image_scheduler else {
-        return Ok(None);
-    };
-    let has_edit_target = edit_target.is_some();
-    let draw_edit_requires_vip_preflight =
-        matches!(&shortcut, DirectImageShortcut::Draw(_)) && has_edit_target;
-    let edit_command_requires_vip_before_file_resolution =
-        matches!(&shortcut, DirectImageShortcut::Edit(_));
-
-    let (prompt, attachments, edit_media_group_id) = match shortcut {
-        DirectImageShortcut::Draw(prompt) => {
-            if let Some((image_context, target_is_current)) = edit_target {
-                let prompt = resolve_direct_image_edit_prompt(&prompt, image_context);
-                (
-                    prompt,
-                    image_context.meta.attachments.clone(),
-                    if target_is_current {
-                        message_media_group_id(request.message)
-                    } else {
-                        request
-                            .message
-                            .reply_to
-                            .as_ref()
-                            .and_then(|reply| match reply {
-                                TelegramReplyTo::Message(reply) => {
-                                    Some(message_media_group_id(reply))
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_default()
-                    },
-                )
-            } else {
-                (prompt, control_context.meta.attachments, String::new())
-            }
-        }
-        DirectImageShortcut::Edit(prompt) => {
-            let Some((image_context, target_is_current)) = edit_target else {
-                return Ok(None);
-            };
-            (
-                resolve_direct_image_edit_prompt(&prompt, image_context),
-                image_context.meta.attachments.clone(),
-                if target_is_current {
-                    message_media_group_id(request.message)
-                } else {
-                    request
-                        .message
-                        .reply_to
-                        .as_ref()
-                        .and_then(|reply| match reply {
-                            TelegramReplyTo::Message(reply) => Some(message_media_group_id(reply)),
-                            _ => None,
-                        })
-                        .unwrap_or_default()
-                },
-            )
-        }
-    };
-
-    if has_edit_target
-        && let Some(rejection) = image_scheduler
-            .direct_draw_image_rejection(request.chat_id)
-            .await
-    {
-        send_direct_draw_failure_notice(notice_effects, request.message, rejection).await;
-        return Ok(Some(DialogMessageUpdateRoute::DrawImageScheduled {
-            status: "not_scheduled".to_owned(),
-            no_reply: true,
-        }));
-    }
-
-    if draw_edit_requires_vip_preflight
-        && matches!(
-            image_scheduler
-                .direct_image_edit_vip_status(request.sender.id)
-                .await,
-            Some(false)
-        )
-    {
-        send_direct_image_vip_only_notice(notice_effects, request.message).await;
-        return Ok(Some(DialogMessageUpdateRoute::DrawImageScheduled {
-            status: "not_scheduled".to_owned(),
-            no_reply: true,
-        }));
-    }
-
-    if prompt.trim().is_empty() {
-        send_direct_image_notice(
-            notice_effects,
-            request.message,
-            IMAGE_EDIT_MISSING_PROMPT_TEXT,
-            String::new(),
-            Duration::from_secs(120),
-        )
-        .await;
-        return Ok(Some(DialogMessageUpdateRoute::ImageEditMissingPrompt));
-    }
-
-    if edit_command_requires_vip_before_file_resolution
-        && matches!(
-            image_scheduler
-                .direct_image_edit_vip_status(request.sender.id)
-                .await,
-            Some(false)
-        )
-    {
-        send_direct_image_vip_only_notice(notice_effects, request.message).await;
-        return Ok(Some(DialogMessageUpdateRoute::DrawImageScheduled {
-            status: "not_scheduled".to_owned(),
-            no_reply: true,
-        }));
-    }
-
-    let thread_id = request
-        .message
-        .message_thread_id
-        .and_then(|thread_id| i32::try_from(thread_id).ok())
-        .filter(|thread_id| *thread_id != 0);
-    let prompt = prompt.trim().to_owned();
-    let prompt_variants = if is_bang_draw_shortcut(request.first_word_lower) {
-        vec![prompt.clone()]
-    } else {
-        Vec::new()
-    };
-    let result = image_scheduler
-        .schedule_image(DrawImageScheduleRequest {
-            chat_id: request.chat_id,
-            thread_id,
-            message_id: request.message_id,
-            user_id: request.sender.id,
-            user_full_name: message_user_full_name(request.sender),
-            prompt: prompt.clone(),
-            prompt_variants,
-            message_text: control_context.text,
-            attachments,
-            edit_media_group_id,
-            negative_prompt: String::new(),
-            aspect_ratio: String::new(),
-            seed: String::new(),
-            original_prompt: prompt,
-        })
-        .await
-        .map_err(|error| DialogMessageUpdateError::ScheduleDraw {
-            message: error.to_string(),
-        })?;
-
-    match result.rejection {
-        Some(DrawImageScheduleRejection::VipOnly) => {
-            send_direct_image_vip_only_notice(notice_effects, request.message).await;
-        }
-        Some(DrawImageScheduleRejection::RateLimited) => {
-            send_direct_image_notice(
-                notice_effects,
-                request.message,
-                &result.message,
-                String::new(),
-                Duration::from_secs(60),
-            )
-            .await;
-        }
-        Some(
-            rejection @ (DrawImageScheduleRejection::DrawDisabled
-            | DrawImageScheduleRejection::ImageNotAllowed),
-        ) => {
-            send_direct_draw_failure_notice(notice_effects, request.message, rejection).await;
-        }
-        // Dialog-loop-only rejection classes: the direct command path
-        // historically sent nothing for them, and still does not.
-        Some(
-            DrawImageScheduleRejection::ActiveJobLimit
-            | DrawImageScheduleRejection::EnqueueRateLimited
-            | DrawImageScheduleRejection::QueueFull
-            | DrawImageScheduleRejection::EditSourceUnavailable,
-        )
-        | None => {}
-    }
-
-    Ok(Some(DialogMessageUpdateRoute::DrawImageScheduled {
-        status: result.status,
-        no_reply: result.no_reply,
-    }))
-}
-
-const IMAGE_EDIT_MISSING_PROMPT_TEXT: &str = "Нужно указать, что изменить в изображении.";
-const DIRECT_IMAGE_EDIT_VIP_ONLY_NOTICE: &str = "Функция редактирования изображений доступна только для <a href='https://t.me/PlotvoBot?start=vip'>VIP-пользователей</a>.";
-const DIRECT_DRAW_FAILURE_TEXT: &str =
-    "Я не смогла написать картину, создать шедевр, потому-что у меня лапки (копытца-плавники).";
-const DIRECT_DRAW_DISABLED_NOTICE: &str =
-    "Извините, функция рисования отключена в настройках чата.";
-const DIRECT_IMAGE_NOT_ALLOWED_NOTICE: &str = "Я не могу отправлять изображения в этот чат.";
-
-async fn send_direct_draw_failure_notice(
-    effects: Option<&dyn DirectSongNoticeEffects>,
-    message: &carapax::types::Message,
-    rejection: DrawImageScheduleRejection,
-) {
-    let Some(effects) = effects else {
-        return;
-    };
-    let Some((restriction_text, restriction_delete_after)) =
-        draw_failure_restriction_notice(rejection)
-    else {
-        return;
-    };
-    if let Err(error) = effects
-        .send_direct_draw_failure(direct_draw_failure_plan(
-            message,
-            restriction_text.to_owned(),
-            restriction_delete_after,
-        ))
-        .await
-    {
-        tracing::debug!(%error, "failed to send direct draw failure notice");
-    }
-}
-
-fn draw_failure_restriction_notice(
-    rejection: DrawImageScheduleRejection,
-) -> Option<(&'static str, Duration)> {
-    match rejection {
-        DrawImageScheduleRejection::DrawDisabled => {
-            Some((DIRECT_DRAW_DISABLED_NOTICE, Duration::from_secs(60)))
-        }
-        DrawImageScheduleRejection::ImageNotAllowed => {
-            Some((DIRECT_IMAGE_NOT_ALLOWED_NOTICE, Duration::from_secs(120)))
-        }
-        DrawImageScheduleRejection::VipOnly
-        | DrawImageScheduleRejection::RateLimited
-        | DrawImageScheduleRejection::ActiveJobLimit
-        | DrawImageScheduleRejection::EnqueueRateLimited
-        | DrawImageScheduleRejection::QueueFull
-        | DrawImageScheduleRejection::EditSourceUnavailable => None,
-    }
-}
-
-async fn send_direct_image_vip_only_notice(
-    effects: Option<&dyn DirectSongNoticeEffects>,
-    message: &carapax::types::Message,
-) {
-    send_direct_image_notice(
-        effects,
-        message,
-        DIRECT_IMAGE_EDIT_VIP_ONLY_NOTICE,
-        "HTML".to_owned(),
-        Duration::from_secs(60),
-    )
-    .await;
-}
-
-async fn send_direct_image_notice(
-    effects: Option<&dyn DirectSongNoticeEffects>,
-    message: &carapax::types::Message,
-    text: &str,
-    parse_mode: String,
-    delete_after: Duration,
-) {
-    send_direct_song_notice(effects, message, text, parse_mode, delete_after).await;
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DirectImageShortcut {
     Draw(String),
@@ -2720,7 +2173,7 @@ fn resolve_direct_image_edit_prompt(prompt: &str, image_context: &FetcherMessage
 async fn handle_random_dialog_message<Scheduler, Settings, Effects, Rng>(
     scheduler: &Scheduler,
     settings: &Settings,
-    effects: &Effects,
+    _effects: &Effects,
     rng: &Rng,
     config: &DialogMessageUpdateConfig,
     message: &carapax::types::Message,
@@ -2767,14 +2220,9 @@ where
         });
     }
 
+    let mut context = context;
     if settings_row.enable_obscenifier && rng.obscenifier_roll() == 0 {
-        let text = obscenify_string(&context.text, rng.obscenify_variant_roll());
-        let send_error = effects
-            .send_random_obscenified_text(random_obscenified_text_plan(message, text.clone()))
-            .await
-            .err()
-            .map(|error| error.to_string());
-        return Ok(DialogMessageUpdateRoute::RandomObscenified { text, send_error });
+        context.meta.annotation.push_str(&format!(" Optional wordplay for this random turn: {:?}. Use it only if it fits the conversation.", obscenify_string(&context.text, rng.obscenify_variant_roll())));
     }
 
     let thread_id = message
@@ -2836,33 +2284,6 @@ where
         .is_some_and(|settings| settings.disable_random_reactivity)
 }
 
-fn should_delegate_react_command_alias(first_word: &str) -> bool {
-    let first_word = first_word.trim().to_lowercase();
-    if first_word.is_empty() {
-        return false;
-    }
-    matches!(
-        first_word.as_str(),
-        "song"
-            | "песня"
-            | "!song"
-            | "!песня"
-            | "нарисуй"
-            | "draw"
-            | "рисуй"
-            | "переведи"
-            | "перевод"
-            | "translate"
-    ) || is_bang_draw_shortcut(&first_word)
-}
-
-fn is_draw_react_alias(first_word: &str) -> bool {
-    matches!(
-        first_word.trim(),
-        "нарисуй" | "draw" | "рисуй" | "!рис" | "!draw"
-    )
-}
-
 fn is_bang_draw_shortcut(first_word: &str) -> bool {
     matches!(first_word.trim(), "!рис" | "!draw")
 }
@@ -2911,116 +2332,6 @@ fn random_response_triggers(reactivity_percentage: i32, roll: i32) -> bool {
         return false;
     }
     roll > 100 - reactivity_percentage
-}
-
-fn random_obscenified_text_plan(
-    message: &carapax::types::Message,
-    text: String,
-) -> RandomObscenifiedTextPlan {
-    let chat = ChatRef {
-        id: message.chat.get_id().into(),
-        is_forum: message.message_thread_id.is_some(),
-    };
-    RandomObscenifiedTextPlan {
-        message: TextMessageRequest {
-            chat: Some(chat),
-            message_thread_id: message.message_thread_id.unwrap_or_default(),
-            disable_notification: false,
-            allow_sending_without_reply: None,
-            text,
-            render_as: String::new(),
-            reply_markup: None,
-        },
-        reply_to: ReplyMessageRef {
-            message_id: message.id,
-            chat,
-            is_topic_message: message.message_thread_id.is_some(),
-            message_thread_id: message.message_thread_id.unwrap_or_default(),
-        },
-    }
-}
-
-fn direct_song_notice_plan(
-    message: &carapax::types::Message,
-    text: String,
-    render_as: String,
-    delete_after: Duration,
-) -> DirectSongNoticePlan {
-    let chat = ChatRef {
-        id: message.chat.get_id().into(),
-        is_forum: message.message_thread_id.is_some(),
-    };
-    DirectSongNoticePlan {
-        message: TextMessageRequest {
-            chat: Some(chat),
-            message_thread_id: message.message_thread_id.unwrap_or_default(),
-            disable_notification: false,
-            allow_sending_without_reply: None,
-            text,
-            render_as,
-            reply_markup: None,
-        },
-        reply_to: ReplyMessageRef {
-            message_id: message.id,
-            chat,
-            is_topic_message: message.message_thread_id.is_some(),
-            message_thread_id: message.message_thread_id.unwrap_or_default(),
-        },
-        delete_after,
-    }
-}
-
-fn direct_draw_failure_plan(
-    message: &carapax::types::Message,
-    restriction_text: String,
-    restriction_delete_after: Duration,
-) -> DirectDrawFailurePlan {
-    let chat = ChatRef {
-        id: message.chat.get_id().into(),
-        is_forum: message.message_thread_id.is_some(),
-    };
-    let reply_to = ReplyMessageRef {
-        message_id: message.id,
-        chat,
-        is_topic_message: message.message_thread_id.is_some(),
-        message_thread_id: message.message_thread_id.unwrap_or_default(),
-    };
-    DirectDrawFailurePlan {
-        sticker: StickerMessageRequest {
-            chat: None,
-            message_thread_id: 0,
-            disable_notification: true,
-            file_id: crate::image_jobs::STICKER_DOWN_FILE_ID.to_owned(),
-        },
-        sticker_reply_to: reply_to,
-        sticker_delete_after: Duration::from_secs(60),
-        failure_notice: DirectSongNoticePlan {
-            message: TextMessageRequest {
-                chat: Some(chat),
-                message_thread_id: message.message_thread_id.unwrap_or_default(),
-                disable_notification: false,
-                allow_sending_without_reply: None,
-                text: DIRECT_DRAW_FAILURE_TEXT.to_owned(),
-                render_as: String::new(),
-                reply_markup: None,
-            },
-            reply_to,
-            delete_after: Duration::from_secs(60),
-        },
-        restriction_notice: DirectSongNoticePlan {
-            message: TextMessageRequest {
-                chat: Some(chat),
-                message_thread_id: message.message_thread_id.unwrap_or_default(),
-                disable_notification: false,
-                allow_sending_without_reply: None,
-                text: restriction_text,
-                render_as: String::new(),
-                reply_markup: None,
-            },
-            reply_to,
-            delete_after: restriction_delete_after,
-        },
-    }
 }
 
 fn obscenify_string(text: &str, variant_roll: i32) -> String {
@@ -3143,6 +2454,8 @@ const GO_OBSCENIFY_VOWELS: &str = "ауоыиэяюёе";
 
 #[cfg(test)]
 mod tests {
+    use crate::dialog_tools::DrawImageScheduleRequest;
+    use openplotva_telegram::TELEGRAM_PARSE_MODE_HTML;
     use std::{
         collections::VecDeque,
         env, fmt,
@@ -3154,7 +2467,7 @@ mod tests {
 
     use openplotva_taskman::{
         DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
-        JobStatus, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, new_music_gen_job_at,
+        JobStatus, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
     };
     use openplotva_telegram::{
         DispatcherConfig, TelegramOutboundMethod, TelegramOutboundMethodKind,
@@ -3917,35 +3230,13 @@ mod tests {
                 "user:99:Ada:ada_l".to_owned()
             ]
         );
-        assert_eq!(
+        assert!(matches!(
             *lock(&route),
-            Some(DialogMessageUpdateRoute::RandomObscenified {
-                text: "пиздоисходит ".to_owned(),
-                send_error: None,
-            })
-        );
-        assert!(scheduler.calls().is_empty());
-
-        let snapshot = dispatcher_queue.snapshot();
-        assert!(snapshot.immediate.is_empty());
-        assert_eq!(snapshot.regular.len(), 1);
-        assert_eq!(snapshot.regular[0].virtual_id, "random-obscenifier-vmsg-1");
-        assert_eq!(snapshot.regular[0].ephemeral_delete_after, None);
-        let item = dispatcher_queue
-            .dequeue_regular()
-            .ok_or_else(|| std::io::Error::other("expected queued obscenifier text"))?;
-        assert_eq!(item.metadata().virtual_id, "random-obscenifier-vmsg-1");
-        assert_eq!(item.ephemeral_delete_after(), None);
-        assert!(!item.bypasses_chat_restrictions());
-        let method = item
-            .into_method()
-            .ok_or_else(|| std::io::Error::other("expected obscenifier sendMessage"))?;
-        assert_eq!(method.kind(), TelegramOutboundMethodKind::SendMessage);
-        let payload = outbound_method_payload(&method);
-        assert_eq!(payload["chat_id"], json!(-100));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(78));
-        assert_eq!(payload["text"], json!("пиздоисходит "));
-        assert!(payload.get("parse_mode").is_none());
+            Some(DialogMessageUpdateRoute::Scheduled { .. })
+        ));
+        assert_eq!(scheduler.calls().len(), 1);
+        assert!(scheduler.metas()[0].annotation.contains("пиздоисходит"));
+        assert!(dispatcher_queue.snapshot().regular.is_empty());
         assert_eq!(update_queue.len().await?, 0);
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
@@ -5112,92 +4403,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addressed_draw_command_schedules_image_job_when_scheduler_is_wired()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let image_scheduler =
-            crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue));
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            message_update("draw cat")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.queue_name, IMAGE_REGULAR_QUEUE_NAME);
-        assert_eq!(record.job.title, "image");
-        assert_eq!(record.job.priority, DEFAULT_PRIORITY);
-        let image = record.job.data.image_data.as_ref().expect("image");
-        assert_eq!(image.prompt, "cat");
-        assert!(image.prompt_variants.is_empty());
-        assert_eq!(image.original_text, "cat");
-        assert_eq!(image.author, "Ada");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bang_draw_shortcut_schedules_image_job_without_group_addressing()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let image_scheduler =
-            crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, Some(&image_scheduler), None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!draw neon cat")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.queue_name, IMAGE_REGULAR_QUEUE_NAME);
-        let image = record.job.data.image_data.as_ref().expect("image");
-        assert_eq!(image.prompt, "neon cat");
-        assert_eq!(image.prompt_variants, ["neon cat"]);
-        assert_eq!(image.original_text, "neon cat");
-        assert_eq!(image.author, "Ada");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn live_redis_decoded_bang_draw_schedules_and_completes_image_job_when_url_is_set()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
@@ -5398,87 +4603,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addressed_percent_shortcut_uses_direct_draw_api_effects()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let direct_draw = DirectDrawApiEffectsStub::sent();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
-            (&scheduler, None, None, Some(&direct_draw)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            message_update("% neon koi")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DirectDrawApi {
-                sent: true,
-                error: None,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        assert_eq!(
-            direct_draw.calls(),
-            vec![DirectDrawApiRequest {
-                chat_id: 42,
-                message_id: 77,
-                user_id: 99,
-                user_full_name: "Ada".to_owned(),
-                prompt: "neon koi".to_owned(),
-                thread_id: None,
-                is_forum: false,
-            }]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn addressed_percent_shortcut_without_effects_consumes_like_go_nil_draw_api()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
-            (&scheduler, None, None, None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            message_update("% neon koi")?,
-            |_update| async { Err("nil draw api should be consumed") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DirectDrawApi {
-                sent: false,
-                error: Some("draw api not configured".to_owned()),
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn unaddressed_percent_message_uses_random_path_not_terminal_delegate()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = SchedulerStub::default();
@@ -5574,121 +4698,6 @@ mod tests {
             );
         }
         assert!(scheduler.calls().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explicit_content_shortcuts_never_fall_into_terminal_when_owner_slice_is_absent()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::with_chat(random_chat_settings(0, false));
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 99,
-            obscenifier: 1,
-            obscenify_variant: 0,
-        };
-
-        for text in ["$", ";"] {
-            let route = handle_dialog_or_random_message_update_or_else_with_image(
-                (&scheduler, None, None),
-                &settings,
-                &effects,
-                &rng,
-                &test_config(),
-                group_message_update(text)?,
-                |_update| async { Err("rates fallback should not hit terminal") },
-            )
-            .await?;
-
-            assert_eq!(
-                route,
-                DialogMessageUpdateRoute::RandomSkippedReactivityOff,
-                "{text}"
-            );
-        }
-
-        let draw_route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!draw castle")?,
-            |_update| async { Err("bang draw without scheduler should not hit terminal") },
-        )
-        .await?;
-        assert_eq!(
-            draw_route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            }
-        );
-
-        for text in ["draw castle", "нарисуй замок", "рисуй замок"] {
-            let route = handle_dialog_or_random_message_update_or_else_with_image(
-                (&scheduler, None, None),
-                &settings,
-                &effects,
-                &rng,
-                &test_config(),
-                message_update(text)?,
-                |_update| async { Err("addressed draw without scheduler should not hit terminal") },
-            )
-            .await?;
-
-            assert_eq!(
-                route,
-                DialogMessageUpdateRoute::DrawImageScheduled {
-                    status: "not_scheduled".to_owned(),
-                    no_reply: true,
-                },
-                "{text}"
-            );
-        }
-
-        let song_missing_topic = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song")?,
-            |_update| async { Err("bang song without topic should not hit terminal") },
-        )
-        .await?;
-        assert_eq!(
-            song_missing_topic,
-            DialogMessageUpdateRoute::SongMissingTopic
-        );
-
-        let song_unavailable = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song neon rain")?,
-            |_update| async { Err("bang song without scheduler should not hit terminal") },
-        )
-        .await?;
-        assert_eq!(
-            song_unavailable,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            }
-        );
-
-        assert!(scheduler.calls().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 2);
-        assert_eq!(notices[0].message.text, DIRECT_SONG_TOPIC_REQUIRED_NOTICE);
-        assert_eq!(
-            notices[1].message.text,
-            DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE
-        );
         Ok(())
     }
 
@@ -6378,146 +5387,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bang_song_shortcut_schedules_music_job_without_group_addressing()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song neon rain")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.queue_name, MUSIC_VIP_QUEUE_NAME);
-        assert_eq!(record.job.title, "music");
-        assert_eq!(record.job.priority, HIGHEST_PRIORITY);
-        let music = record.job.data.music_data.as_ref().expect("music");
-        assert_eq!(music.topic, "neon rain");
-        assert_eq!(music.reference_file_id, "");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn targeted_group_song_command_schedules_music_job_like_go()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("/song@plotva_bot neon rain")?,
-            |_update| async { Err("targeted /song command should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        assert!(effects.sent_song_notices().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.queue_name, MUSIC_VIP_QUEUE_NAME);
-        assert_eq!(record.job.title, "music");
-        assert_eq!(record.job.priority, HIGHEST_PRIORITY);
-        let music = record.job.data.music_data.as_ref().expect("music");
-        assert_eq!(music.topic, "neon rain");
-        assert_eq!(music.reference_file_id, "");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn private_song_command_with_any_target_schedules_like_go()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            message_update("/song@other_bot neon rain")?,
-            |_update| async { Err("private targeted /song command should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        assert!(effects.sent_song_notices().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.queue_name, MUSIC_VIP_QUEUE_NAME);
-        assert_eq!(record.job.title, "music");
-        assert_eq!(record.job.priority, HIGHEST_PRIORITY);
-        let music = record.job.data.music_data.as_ref().expect("music");
-        assert_eq!(music.topic, "neon rain");
-        assert_eq!(music.reference_file_id, "");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn untargeted_group_song_commands_use_random_path_like_go()
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = Arc::new(InMemoryTaskQueue::new());
@@ -6756,594 +5625,6 @@ mod tests {
         assert_eq!(update_queue.len().await?, 0);
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn live_redis_decoded_song_negative_notices_queue_ephemeral_payload_when_url_is_set()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
-            return Ok(());
-        };
-
-        run_live_decoded_song_notice_case(LiveSongNoticeCase {
-            redis_url: &redis_url,
-            command: "!song",
-            vip: true,
-            music_available: true,
-            audio_allowed: true,
-            expected_route: DialogMessageUpdateRoute::SongMissingTopic,
-            expected_text: DIRECT_SONG_TOPIC_REQUIRED_NOTICE,
-            expected_parse_mode: None,
-            expected_delete_after: Duration::from_secs(120),
-            virtual_id: "song-notice-topic-vmsg",
-        })
-        .await?;
-        run_live_decoded_song_notice_case(LiveSongNoticeCase {
-            redis_url: &redis_url,
-            command: "!song neon rain",
-            vip: false,
-            music_available: true,
-            audio_allowed: true,
-            expected_route: DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: false,
-            },
-            expected_text: DIRECT_SONG_VIP_ONLY_NOTICE,
-            expected_parse_mode: Some(TELEGRAM_PARSE_MODE_HTML),
-            expected_delete_after: Duration::from_secs(60),
-            virtual_id: "song-notice-vip-vmsg",
-        })
-        .await?;
-        run_live_decoded_song_notice_case(LiveSongNoticeCase {
-            redis_url: &redis_url,
-            command: "!song neon rain",
-            vip: true,
-            music_available: false,
-            audio_allowed: true,
-            expected_route: DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: false,
-            },
-            expected_text: DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE,
-            expected_parse_mode: None,
-            expected_delete_after: Duration::from_secs(120),
-            virtual_id: "song-notice-service-vmsg",
-        })
-        .await?;
-        run_live_decoded_song_notice_case(LiveSongNoticeCase {
-            redis_url: &redis_url,
-            command: "!song neon rain",
-            vip: true,
-            music_available: true,
-            audio_allowed: false,
-            expected_route: DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: false,
-            },
-            expected_text: DIRECT_SONG_AUDIO_NOT_ALLOWED_NOTICE,
-            expected_parse_mode: None,
-            expected_delete_after: Duration::from_secs(120),
-            virtual_id: "song-notice-audio-vmsg",
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    struct LiveSongNoticeCase<'a> {
-        redis_url: &'a str,
-        command: &'a str,
-        vip: bool,
-        music_available: bool,
-        audio_allowed: bool,
-        expected_route: DialogMessageUpdateRoute,
-        expected_text: &'a str,
-        expected_parse_mode: Option<&'a str>,
-        expected_delete_after: Duration,
-        virtual_id: &'static str,
-    }
-
-    async fn run_live_decoded_song_notice_case(
-        case: LiveSongNoticeCase<'_>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let redis_client = redis::Client::open(case.redis_url)?;
-        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let key = format!(
-            "openplotva:test:decoded-song-notice:{}:{suffix}",
-            case.virtual_id
-        );
-        let update_queue =
-            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
-        let mut redis = redis_client.get_multiplexed_async_connection().await?;
-        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        update_queue
-            .enqueue_update(&group_message_update_at(case.command, now_secs as i64)?)
-            .await?;
-        let decoded = update_queue
-            .dequeue_update(Duration::from_secs(1))
-            .await?
-            .ok_or_else(|| std::io::Error::other("expected decoded song notice update"))?;
-
-        let state_store = UpdateStateStoreStub::default();
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(case.vip)))
-            .with_song_service_available(case.music_available)
-            .with_song_audio_permission(Arc::new(SongAudioPermissionStub(case.audio_allowed)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let virtual_id = case.virtual_id;
-        let effects = RandomDialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
-            .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-        let route = Arc::new(Mutex::new(None));
-        let captured_route = Arc::clone(&route);
-
-        let report = process_update_with_state_store_at(
-            decoded,
-            UpdateConsumerConfig {
-                dequeue_timeout: Duration::from_millis(1),
-                state_timeout: Duration::from_secs(1),
-                handle_timeout: Duration::from_secs(1),
-                side_effect_max_age: Duration::from_secs(60),
-                worker_limit: 1,
-            },
-            UNIX_EPOCH + Duration::from_secs(now_secs),
-            &state_store,
-            |update| async {
-                let handled = handle_dialog_or_random_message_update_or_else_with_image(
-                    (&scheduler, None, Some(&song_scheduler)),
-                    &settings,
-                    &effects,
-                    &rng,
-                    &test_config(),
-                    update,
-                    |_update| async {
-                        Err::<(), std::io::Error>(std::io::Error::other("should not delegate"))
-                    },
-                )
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-                *lock(&captured_route) = Some(handled);
-                Ok::<(), std::io::Error>(())
-            },
-        )
-        .await;
-
-        assert_eq!(report.update_id, 22345);
-        assert_eq!(report.update_name, "message");
-        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
-        assert_eq!(
-            report.handle.as_ref().map(|stage| &stage.outcome),
-            Some(&UpdateStageOutcome::Completed)
-        );
-        assert!(!report.skipped_handle);
-        assert_eq!(
-            state_store.calls(),
-            vec![
-                "chat:-100:supergroup:Group:".to_owned(),
-                "user:99:Ada:ada_l".to_owned()
-            ]
-        );
-        assert_eq!(*lock(&route), Some(case.expected_route));
-        assert!(queue.records().is_empty());
-        let snapshot = dispatcher_queue.snapshot();
-        assert_eq!(snapshot.immediate.len(), 1);
-        assert!(snapshot.regular.is_empty());
-        assert_eq!(snapshot.immediate[0].virtual_id, case.virtual_id);
-        assert_eq!(
-            snapshot.immediate[0].ephemeral_delete_after,
-            Some(case.expected_delete_after)
-        );
-
-        let item = dispatcher_queue
-            .dequeue_immediate()
-            .ok_or_else(|| std::io::Error::other("expected queued song notice"))?;
-        assert_eq!(item.metadata().virtual_id, case.virtual_id);
-        assert_eq!(
-            item.ephemeral_delete_after(),
-            Some(case.expected_delete_after)
-        );
-        assert!(!item.bypasses_chat_restrictions());
-        let method = item
-            .into_method()
-            .ok_or_else(|| std::io::Error::other("expected song notice method"))?;
-        assert_eq!(method.kind(), TelegramOutboundMethodKind::SendMessage);
-        let payload = outbound_method_payload(&method);
-        assert_eq!(payload["chat_id"], json!(-100));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(78));
-        assert_eq!(payload["text"], json!(case.expected_text));
-        if let Some(parse_mode) = case.expected_parse_mode {
-            assert_eq!(payload["parse_mode"], json!(parse_mode));
-        } else {
-            assert!(payload.get("parse_mode").is_none());
-        }
-        assert_eq!(update_queue.len().await?, 0);
-        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bang_song_shortcut_without_vip_sends_go_vip_notice()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(false)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song neon rain")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(queue.records().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.text, DIRECT_SONG_VIP_ONLY_NOTICE);
-        assert_eq!(notices[0].message.render_as, TELEGRAM_PARSE_MODE_HTML);
-        assert_eq!(notices[0].delete_after, Duration::from_secs(60));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bang_song_shortcut_with_backlog_sends_go_queue_notice()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        for user_id in [1, 2, 3] {
-            queue.assign(
-                MUSIC_VIP_QUEUE_NAME,
-                new_music_gen_job_at(
-                    MusicGenJobParams {
-                        chat_id: -100,
-                        message_id: user_id,
-                        user_id: i64::from(user_id),
-                        user_full_name: format!("User {user_id}"),
-                        topic: "queued song".to_owned(),
-                        ..MusicGenJobParams::default()
-                    },
-                    OffsetDateTime::UNIX_EPOCH,
-                )
-                .with_name("music")
-                .with_priority(HIGHEST_PRIORITY),
-            );
-        }
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song neon rain")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert_eq!(queue.records().len(), 4);
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(
-            notices[0].message.text,
-            "Песня добавлена в очередь. Перед вами 4 задач. Примерное ожидание: 2m24s"
-        );
-        assert_eq!(notices[0].delete_after, Duration::from_secs(300));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bang_song_shortcut_without_topic_sends_go_topic_notice()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, Some(&song_scheduler)),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(route, DialogMessageUpdateRoute::SongMissingTopic);
-        assert!(queue.records().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.text, DIRECT_SONG_TOPIC_REQUIRED_NOTICE);
-        assert_eq!(notices[0].delete_after, Duration::from_secs(120));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bang_song_shortcut_without_scheduler_sends_go_service_notice_not_terminal()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, None, None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            group_message_update("!song neon rain")?,
-            |_update| async { Ok::<(), std::convert::Infallible>(()) },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(
-            notices[0].message.text,
-            DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE
-        );
-        assert_eq!(notices[0].delete_after, Duration::from_secs(120));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn addressed_song_uses_reply_audio_topic_and_reference()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            None,
-            Some(&song_scheduler),
-            &test_config(),
-            reply_audio_text_update("song")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let records = queue.records();
-        assert_eq!(records.len(), 1);
-        let music = records[0].job.data.music_data.as_ref().expect("music");
-        assert_eq!(music.topic, "Artist Title");
-        assert_eq!(music.reference_file_id, "audio-file");
-        assert_eq!(music.reference_file_unique_id, "audio-unique");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn addressed_song_reply_video_filename_does_not_become_topic_like_go()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
-        let scheduler = SchedulerStub::default();
-        let effects = EffectsStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image_and_song_notices(
-            &scheduler,
-            (None, Some(&song_scheduler), Some(&effects), None),
-            &test_config(),
-            reply_video_text_update("song")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(route, DialogMessageUpdateRoute::SongMissingTopic);
-        assert!(scheduler.calls().is_empty());
-        assert!(queue.records().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.text, DIRECT_SONG_TOPIC_REQUIRED_NOTICE);
-        assert_eq!(notices[0].delete_after, Duration::from_secs(120));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn addressed_image_edit_command_routes_image_attachment_to_scheduler()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            photo_caption_update("fix contrast")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let calls = image_scheduler.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].prompt, "contrast");
-        assert_eq!(calls[0].message_text, "fix contrast");
-        assert_eq!(calls[0].attachments.len(), 1);
-        assert_eq!(calls[0].attachments[0].kind, "image");
-        assert_eq!(calls[0].attachments[0].file_unique_id, "photo-1");
-        assert_eq!(calls[0].attachments[0].caption, "fix contrast");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn current_image_edit_captures_album_and_passes_media_group_id_to_scheduler()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            photo_caption_media_group_update("fix contrast", "album-1")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        let captures = image_scheduler.capture_calls();
-        assert_eq!(captures.len(), 1);
-        assert_eq!(captures[0].0, "album-1");
-        assert_eq!(captures[0].1, 77);
-        assert_eq!(captures[0].2.len(), 1);
-        assert_eq!(captures[0].2[0].file_unique_id, "photo-1");
-
-        let calls = image_scheduler.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].edit_media_group_id, "album-1");
-        assert_eq!(calls[0].attachments[0].file_unique_id, "photo-1");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn image_edit_command_targets_replied_image_attachment()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            reply_photo_text_update("fix brightness", "original caption")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let calls = image_scheduler.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].message_id, 79);
-        assert_eq!(calls[0].prompt, "brightness");
-        assert_eq!(calls[0].message_text, "fix brightness");
-        assert_eq!(calls[0].attachments.len(), 1);
-        assert_eq!(calls[0].attachments[0].file_unique_id, "reply-photo-1");
-        assert_eq!(calls[0].attachments[0].caption, "original caption");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn image_edit_command_targets_replied_album() -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-        let mut update = serde_json::to_value(reply_photo_text_update(
-            "fix brightness",
-            "original caption",
-        )?)?;
-        update["message"]["reply_to_message"]["media_group_id"] = json!("reply-album");
-        handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            serde_json::from_value(update)?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-        assert_eq!(
-            image_scheduler.calls()[0].edit_media_group_id,
-            "reply-album"
-        );
-        assert_eq!(image_scheduler.capture_calls()[0].0, "reply-album");
         Ok(())
     }
 
@@ -7903,204 +6184,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_redis_decoded_image_edit_negative_notices_queue_ephemeral_payload_when_url_is_set()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
-            return Ok(());
-        };
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-
-        run_live_decoded_image_edit_notice_case(LiveImageEditNoticeCase {
-            redis_url: &redis_url,
-            update: photo_caption_update_at("fix", now_secs)?,
-            expected_update_id: 12346,
-            vip: true,
-            expected_state_calls: &[
-                "chat:42:private:Ada:ada_l",
-                "user:99:Ada:ada_l",
-                "file:photo-1",
-            ],
-            expected_route: DialogMessageUpdateRoute::ImageEditMissingPrompt,
-            expected_text: IMAGE_EDIT_MISSING_PROMPT_TEXT,
-            expected_parse_mode: None,
-            expected_delete_after: Duration::from_secs(120),
-            virtual_id: "image-edit-notice-missing-prompt-vmsg",
-        })
-        .await?;
-
-        run_live_decoded_image_edit_notice_case(LiveImageEditNoticeCase {
-            redis_url: &redis_url,
-            update: photo_caption_update_at("fix contrast", now_secs + 1)?,
-            expected_update_id: 12346,
-            vip: false,
-            expected_state_calls: &[
-                "chat:42:private:Ada:ada_l",
-                "user:99:Ada:ada_l",
-                "file:photo-1",
-            ],
-            expected_route: DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            },
-            expected_text: DIRECT_IMAGE_EDIT_VIP_ONLY_NOTICE,
-            expected_parse_mode: Some(TELEGRAM_PARSE_MODE_HTML),
-            expected_delete_after: Duration::from_secs(60),
-            virtual_id: "image-edit-notice-vip-vmsg",
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    struct LiveImageEditNoticeCase<'a> {
-        redis_url: &'a str,
-        update: TelegramUpdate,
-        expected_update_id: i64,
-        vip: bool,
-        expected_state_calls: &'a [&'a str],
-        expected_route: DialogMessageUpdateRoute,
-        expected_text: &'a str,
-        expected_parse_mode: Option<&'a str>,
-        expected_delete_after: Duration,
-        virtual_id: &'static str,
-    }
-
-    async fn run_live_decoded_image_edit_notice_case(
-        case: LiveImageEditNoticeCase<'_>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let redis_client = redis::Client::open(case.redis_url)?;
-        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let key = format!(
-            "openplotva:test:decoded-image-edit-notice:{}:{suffix}",
-            case.virtual_id
-        );
-        let update_queue =
-            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
-        let mut redis = redis_client.get_multiplexed_async_connection().await?;
-        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-
-        update_queue.enqueue_update(&case.update).await?;
-        let decoded = update_queue
-            .dequeue_update(Duration::from_secs(1))
-            .await?
-            .ok_or_else(|| std::io::Error::other("expected decoded image-edit notice update"))?;
-
-        let state_store = UpdateStateStoreStub::default();
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let resolver = Arc::new(ImageEditFileResolverStub::successful(
-            crate::dialog_tools::ImageEditFileSelection {
-                photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: vec!["https://files.test/photo.png".to_owned()],
-            },
-        ));
-        let image_scheduler =
-            crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-                .with_draw_image_vip_status(Arc::new(VipStatusStub(case.vip)))
-                .with_image_edit_file_resolver(resolver.clone());
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let virtual_id = case.virtual_id;
-        let effects = RandomDialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
-            .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-        let route = Arc::new(Mutex::new(None));
-        let captured_route = Arc::clone(&route);
-
-        let report = process_update_with_state_store_at(
-            decoded,
-            UpdateConsumerConfig {
-                dequeue_timeout: Duration::from_millis(1),
-                state_timeout: Duration::from_secs(1),
-                handle_timeout: Duration::from_secs(1),
-                side_effect_max_age: Duration::from_secs(60),
-                worker_limit: 1,
-            },
-            SystemTime::now(),
-            &state_store,
-            |update| async {
-                let handled = handle_dialog_or_random_message_update_or_else_with_image(
-                    (&scheduler, Some(&image_scheduler), None),
-                    &settings,
-                    &effects,
-                    &rng,
-                    &test_config(),
-                    update,
-                    |_update| async {
-                        Err::<(), std::io::Error>(std::io::Error::other("should not delegate"))
-                    },
-                )
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-                *lock(&captured_route) = Some(handled);
-                Ok::<(), std::io::Error>(())
-            },
-        )
-        .await;
-
-        assert_eq!(report.update_id, case.expected_update_id);
-        assert_eq!(report.update_name, "message");
-        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
-        assert_eq!(
-            report.handle.as_ref().map(|stage| &stage.outcome),
-            Some(&UpdateStageOutcome::Completed)
-        );
-        assert!(!report.skipped_handle);
-        assert_eq!(
-            state_store.calls(),
-            case.expected_state_calls
-                .iter()
-                .map(|call| (*call).to_owned())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(*lock(&route), Some(case.expected_route));
-        assert!(scheduler.calls().is_empty());
-        assert!(queue.records().is_empty());
-        assert!(resolver.calls().is_empty());
-        assert!(resolver.capture_calls().is_empty());
-
-        let snapshot = dispatcher_queue.snapshot();
-        assert_eq!(snapshot.immediate.len(), 1);
-        assert!(snapshot.regular.is_empty());
-        assert_eq!(snapshot.immediate[0].virtual_id, case.virtual_id);
-        assert_eq!(
-            snapshot.immediate[0].ephemeral_delete_after,
-            Some(case.expected_delete_after)
-        );
-
-        let item = dispatcher_queue
-            .dequeue_immediate()
-            .ok_or_else(|| std::io::Error::other("expected queued image-edit notice"))?;
-        assert_eq!(item.metadata().virtual_id, case.virtual_id);
-        assert_eq!(
-            item.ephemeral_delete_after(),
-            Some(case.expected_delete_after)
-        );
-        assert!(!item.bypasses_chat_restrictions());
-        let method = item
-            .into_method()
-            .ok_or_else(|| std::io::Error::other("expected image-edit notice method"))?;
-        assert_eq!(method.kind(), TelegramOutboundMethodKind::SendMessage);
-        let payload = outbound_method_payload(&method);
-        assert_eq!(payload["chat_id"], json!(42));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(77));
-        assert_eq!(payload["text"], json!(case.expected_text));
-        if let Some(parse_mode) = case.expected_parse_mode {
-            assert_eq!(payload["parse_mode"], json!(parse_mode));
-        } else {
-            assert!(payload.get("parse_mode").is_none());
-        }
-        assert_eq!(update_queue.len().await?, 0);
-
-        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn addressed_edit_without_image_schedules_dialog_like_go()
     -> Result<(), Box<dyn std::error::Error>> {
         let image_scheduler = ImageSchedulerCaptureStub::scheduled();
@@ -8202,182 +6285,6 @@ mod tests {
         );
         assert_eq!(audio_scheduler.calls(), vec![String::new()]);
         assert_eq!(audio_scheduler.metas()[0].message_type, "audio");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn image_edit_command_without_prompt_sends_go_error_notice()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, Some(&image_scheduler), None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            photo_caption_update("fix")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(route, DialogMessageUpdateRoute::ImageEditMissingPrompt);
-        assert!(scheduler.calls().is_empty());
-        assert!(image_scheduler.calls().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.text, IMAGE_EDIT_MISSING_PROMPT_TEXT);
-        assert_eq!(notices[0].delete_after, Duration::from_secs(120));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn draw_command_permission_rejections_send_go_failure_artifacts()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for (rejection, restriction_text, restriction_delete_after) in [
-            (
-                DrawImageScheduleRejection::DrawDisabled,
-                DIRECT_DRAW_DISABLED_NOTICE,
-                Duration::from_secs(60),
-            ),
-            (
-                DrawImageScheduleRejection::ImageNotAllowed,
-                DIRECT_IMAGE_NOT_ALLOWED_NOTICE,
-                Duration::from_secs(120),
-            ),
-        ] {
-            let image_scheduler = ImageSchedulerCaptureStub::rejected(rejection);
-            let scheduler = SchedulerStub::default();
-            let effects = EffectsStub::default();
-
-            let route = handle_dialog_message_update_or_else_with_image_and_song_notices(
-                &scheduler,
-                (Some(&image_scheduler), None, Some(&effects), None),
-                &test_config(),
-                message_update("!draw castle")?,
-                |_update| async { Err("should not delegate") },
-            )
-            .await?;
-
-            assert_eq!(
-                route,
-                DialogMessageUpdateRoute::DrawImageScheduled {
-                    status: "not_scheduled".to_owned(),
-                    no_reply: true,
-                }
-            );
-            assert!(scheduler.calls().is_empty());
-            assert_eq!(image_scheduler.calls().len(), 1);
-            assert!(effects.sent_song_notices().is_empty());
-            let failures = effects.sent_draw_failures();
-            assert_eq!(failures.len(), 1);
-            assert_eq!(
-                failures[0].sticker.file_id,
-                crate::image_jobs::STICKER_DOWN_FILE_ID
-            );
-            assert_eq!(failures[0].sticker_delete_after, Duration::from_secs(60));
-            assert_eq!(
-                failures[0].failure_notice.message.text,
-                DIRECT_DRAW_FAILURE_TEXT
-            );
-            assert_eq!(
-                failures[0].failure_notice.delete_after,
-                Duration::from_secs(60)
-            );
-            assert_eq!(
-                failures[0].restriction_notice.message.text,
-                restriction_text
-            );
-            assert_eq!(
-                failures[0].restriction_notice.delete_after,
-                restriction_delete_after
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn draw_command_with_image_without_vip_sends_go_vip_notice_before_prompt_validation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let image_scheduler =
-            crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-                .with_draw_image_vip_status(Arc::new(VipStatusStub(false)));
-        let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::default();
-        let effects = EffectsStub::default();
-        let rng = RngStub {
-            random_response: 0,
-            obscenifier: 0,
-            obscenify_variant: 0,
-        };
-
-        let route = handle_dialog_or_random_message_update_or_else_with_image(
-            (&scheduler, Some(&image_scheduler), None),
-            &settings,
-            &effects,
-            &rng,
-            &test_config(),
-            photo_caption_update("!draw")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "not_scheduled".to_owned(),
-                no_reply: true,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        assert!(queue.records().is_empty());
-        let notices = effects.sent_song_notices();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.text, DIRECT_IMAGE_EDIT_VIP_ONLY_NOTICE);
-        assert_eq!(notices[0].delete_after, Duration::from_secs(60));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn draw_command_with_replied_image_becomes_image_edit_with_caption_fallback()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let image_scheduler = ImageSchedulerCaptureStub::scheduled();
-        let scheduler = SchedulerStub::default();
-
-        let route = handle_dialog_message_update_or_else_with_image(
-            &scheduler,
-            Some(&image_scheduler),
-            None,
-            &test_config(),
-            reply_photo_text_update("draw", "fix contrast")?,
-            |_update| async { Err("should not delegate") },
-        )
-        .await?;
-
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::DrawImageScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        let calls = image_scheduler.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].prompt, "contrast",
-            "Image-edit routing falls back to target image caption and parses edit verbs there"
-        );
-        assert_eq!(calls[0].attachments[0].file_unique_id, "reply-photo-1");
         Ok(())
     }
 
@@ -8486,15 +6393,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(
-            route,
-            DialogMessageUpdateRoute::RandomObscenified {
-                text: "пиздоисходит ".to_owned(),
-                send_error: None,
-            }
-        );
-        assert!(scheduler.calls().is_empty());
-        assert_eq!(effects.sent_texts(), vec!["пиздоисходит ".to_owned()]);
+        assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
+        assert_eq!(scheduler.calls().len(), 1);
+        assert!(scheduler.metas()[0].annotation.contains("пиздоисходит"));
+        assert!(effects.sent_texts().is_empty());
         Ok(())
     }
 
@@ -8552,6 +6454,67 @@ mod tests {
         assert_eq!(obscenify_string("тсс", 1), "");
     }
 
+    #[tokio::test]
+    async fn content_shortcuts_enter_the_agent_with_explicit_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (text, tool) in [
+            ("!song neon rain", "generate_song"),
+            ("!song", "generate_song"),
+            ("/song@plotva_bot neon rain", "generate_song"),
+            ("@plotva_bot песня про море", "generate_song"),
+            ("!draw red fish", "draw_image"),
+            ("@plotva_bot нарисуй рыбу", "draw_image"),
+            ("@plotva_bot % red fish", "draw_api"),
+        ] {
+            let scheduler = SchedulerStub::default();
+            let route = handle_dialog_message_update_or_else(
+                &scheduler,
+                &test_config(),
+                group_message_update(text)?,
+                |_| async {
+                    Err::<(), std::io::Error>(std::io::Error::other(format!(
+                        "shortcut delegated: {text}"
+                    )))
+                },
+            )
+            .await?;
+            assert!(
+                matches!(route, DialogMessageUpdateRoute::Scheduled { .. }),
+                "{text}: {route:?}"
+            );
+            assert_eq!(scheduler.calls().len(), 1, "{text}");
+            assert!(
+                scheduler.metas()[0].annotation.contains(tool),
+                "{text}: {:?}",
+                scheduler.metas()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachment_shortcuts_keep_media_in_agent_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for update in [
+            photo_caption_update("@plotva_bot нарисуй рыбу")?,
+            reply_photo_text_update("@plotva_bot нарисуй иначе", "рыба")?,
+            reply_audio_text_update("!song снова")?,
+            reply_video_text_update("@plotva_bot что здесь?")?,
+        ] {
+            let scheduler = SchedulerStub::default();
+            let route = handle_dialog_message_update_or_else(
+                &scheduler,
+                &test_config(),
+                update,
+                |_| async { Err("unexpected delegation") },
+            )
+            .await?;
+            assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
+            assert!(!scheduler.metas()[0].attachments.is_empty());
+        }
+        Ok(())
+    }
+
     #[derive(Default)]
     struct SchedulerStub {
         calls: Mutex<Vec<String>>,
@@ -8607,24 +6570,8 @@ mod tests {
             }
         }
 
-        fn rejected(rejection: DrawImageScheduleRejection) -> Self {
-            Self {
-                result: crate::dialog_tools::DrawImageScheduleResult {
-                    status: "not_scheduled".to_owned(),
-                    no_reply: true,
-                    rejection: Some(rejection),
-                    ..crate::dialog_tools::DrawImageScheduleResult::default()
-                },
-                ..Self::default()
-            }
-        }
-
         fn calls(&self) -> Vec<DrawImageScheduleRequest> {
             lock(&self.calls).clone()
-        }
-
-        fn capture_calls(&self) -> Vec<(String, i32, Vec<openplotva_core::ChatAttachment>)> {
-            lock(&self.capture_calls).clone()
         }
     }
 
@@ -9171,18 +7118,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct SongAudioPermissionStub(bool);
-
-    impl crate::dialog_tools::SongAudioPermission for SongAudioPermissionStub {
-        fn can_send_song_audio<'a>(
-            &'a self,
-            _chat_id: i64,
-        ) -> crate::dialog_tools::SongAudioPermissionFuture<'a> {
-            Box::pin(async move { self.0 })
-        }
-    }
-
     #[derive(Default)]
     struct SettingsStoreStub {
         chat: Mutex<Option<ChatSettings>>,
@@ -9261,10 +7196,6 @@ mod tests {
 
         fn sent_song_notices(&self) -> Vec<DirectSongNoticePlan> {
             lock(&self.song_notices).clone()
-        }
-
-        fn sent_draw_failures(&self) -> Vec<DirectDrawFailurePlan> {
-            lock(&self.draw_failures).clone()
         }
     }
 
@@ -9518,39 +7449,6 @@ mod tests {
                 lock(&self.entries).push(entry);
                 Ok(())
             })
-        }
-    }
-
-    #[derive(Clone)]
-    struct DirectDrawApiEffectsStub {
-        result: DirectDrawApiResult,
-        calls: Arc<Mutex<Vec<DirectDrawApiRequest>>>,
-    }
-
-    impl DirectDrawApiEffectsStub {
-        fn sent() -> Self {
-            Self {
-                result: DirectDrawApiResult {
-                    sent: true,
-                    error: None,
-                },
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> Vec<DirectDrawApiRequest> {
-            lock(&self.calls).clone()
-        }
-    }
-
-    impl DirectDrawApiEffects for DirectDrawApiEffectsStub {
-        fn send_direct_draw_api<'a>(
-            &'a self,
-            request: DirectDrawApiRequest,
-        ) -> DirectDrawApiFuture<'a> {
-            let result = self.result.clone();
-            lock(&self.calls).push(request);
-            Box::pin(async move { result })
         }
     }
 
@@ -9886,21 +7784,6 @@ mod tests {
                 ]
             }
         }))
-    }
-
-    fn photo_caption_media_group_update(
-        caption: &str,
-        media_group_id: &str,
-    ) -> Result<TelegramUpdate, serde_json::Error> {
-        photo_caption_media_group_update_at(
-            12348,
-            77,
-            caption,
-            media_group_id,
-            "photo-file",
-            "photo-1",
-            1_710_000_000,
-        )
     }
 
     fn photo_caption_media_group_update_at(

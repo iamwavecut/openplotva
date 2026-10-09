@@ -436,20 +436,19 @@ impl GuestMessageEffects for GuestRuntimeEffects {
                     "guest dialog provider has no chat-step support".to_owned(),
                 ));
             };
-            let step_request = openplotva_dialog::ChatStepRequest {
-                input: dialog_input,
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Disabled,
-                iteration: 1,
-            };
-            let output =
-                tokio::time::timeout(GUEST_DIALOG_TIMEOUT, step.run_chat_step(step_request))
-                    .await
-                    .map_err(|_| GuestRuntimeEffectError::DialogTimeout)?
-                    .map_err(|error| GuestRuntimeEffectError::Dialog(error.to_string()))?;
+            struct GuestTools;
+            impl openplotva_dialog::DialogToolbox for GuestTools {}
+            let output = tokio::time::timeout(
+                GUEST_DIALOG_TIMEOUT,
+                crate::dialog_turn::run_captured_session(step, &GuestTools, dialog_input, 1),
+            )
+            .await
+            .map_err(|_| GuestRuntimeEffectError::DialogTimeout)?
+            .map_err(GuestRuntimeEffectError::Dialog)?;
+            let text = output.messages.join("\n");
             Ok(GuestDialogOutput {
-                answer: output.text.clone(),
-                response: output.text,
+                answer: text.clone(),
+                response: text,
             })
         })
     }

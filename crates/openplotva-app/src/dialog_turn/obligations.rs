@@ -32,6 +32,9 @@ use crate::{DispatchFailureRecord, DispatchFailureRing};
 
 /// Visible in-character text when a promised generation failed, vanished, or
 /// expired. Sent as a protected reply to the trigger message.
+pub const OBLIGATION_PARTIAL_NOTICE: &str =
+    "Получилась только часть результата. Остальная генерация завершилась ошибкой.";
+
 pub const OBLIGATION_FAILURE_NOTICE: &str = "Не получилось сгенерировать 😿 Попробуй ещё раз.";
 
 /// One-time notice when a generation runs past its deadline but is still alive
@@ -384,6 +387,7 @@ pub struct DispatcherDeliveryObligationNotifier {
     queue: Arc<DispatcherQueue>,
     signal: DispatcherTerminalUserSignal,
     next_virtual_id: VirtualIdFactory,
+    pub(crate) explainer: Arc<std::sync::OnceLock<crate::agent_tools::MediaFailureExplainer>>,
     lifecycle_reactions: Option<crate::reactions::GenerationReactions>,
 }
 
@@ -395,6 +399,7 @@ impl DispatcherDeliveryObligationNotifier {
             signal,
             next_virtual_id: monotonic_virtual_id_factory("dialog-obligation"),
             lifecycle_reactions: None,
+            explainer: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -423,6 +428,29 @@ impl DeliveryObligationNotifier for DispatcherDeliveryObligationNotifier {
         target: ObligationNoticeTarget<'a>,
     ) -> Pin<Box<dyn Future<Output = ObligationNoticeResult> + Send + 'a>> {
         Box::pin(async move {
+            let generated = if matches!(
+                target.text,
+                OBLIGATION_FAILURE_NOTICE | OBLIGATION_PARTIAL_NOTICE
+            ) {
+                if let Some(explainer) = self.explainer.get() {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        explainer.explain(
+                            target.chat_id,
+                            target.thread_id,
+                            target.trigger_message_id,
+                            target.text,
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let chat = ChatRef {
                 id: target.chat_id,
                 is_forum: target.thread_id.is_some(),
@@ -438,7 +466,7 @@ impl DeliveryObligationNotifier for DispatcherDeliveryObligationNotifier {
                 message_thread_id: target.thread_id.map(i64::from).unwrap_or_default(),
                 disable_notification: false,
                 allow_sending_without_reply: None,
-                text: target.text.to_owned(),
+                text: generated.as_deref().unwrap_or(target.text).to_owned(),
                 render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
                 reply_markup: None,
             };
@@ -665,6 +693,14 @@ async fn resolve_obligation(
                         .await?
                     {
                         report.delivered += 1;
+                        if record
+                            .events
+                            .iter()
+                            .any(|event| event.stage == "image_partial_result")
+                        {
+                            send_notice(notifier, obligation, OBLIGATION_PARTIAL_NOTICE, report)
+                                .await;
+                        }
                         notifier
                             .clear_lifecycle_reaction(obligation_reaction_target(obligation))
                             .await;

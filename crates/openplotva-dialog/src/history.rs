@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use openplotva_core::{ChatAttachment, ChatMessageMeta, ToolCall};
 
-pub const DEFAULT_CONTEXT_HISTORY_LIMIT: usize = 15;
+pub const DEFAULT_CONTEXT_HISTORY_LIMIT: usize = 32;
 
 const REPLY_CHAIN_EXTRA_DEPTH: usize = 4;
 

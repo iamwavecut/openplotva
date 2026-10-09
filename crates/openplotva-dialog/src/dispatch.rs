@@ -21,6 +21,12 @@ pub async fn dispatch_dialog_tool(
     step: &ToolStep,
 ) -> Result<ToolResult, ToolboxError> {
     match step.step.as_str() {
+        "draw_api" | "get_messages" | "get_user_status" | "get_job_status" | "memory_search"
+        | "memory_manage" => toolbox.agent_tool(meta.clone(), step.clone()).await,
+
+        STEP_HISTORY_SEARCH if step.author_id != 0 => {
+            toolbox.agent_tool(meta.clone(), step.clone()).await
+        }
         STEP_DRAW_IMAGE => {
             if step.prompt.trim().is_empty() {
                 return Ok(ToolResult::failed(
