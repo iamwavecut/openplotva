@@ -917,6 +917,23 @@ pub fn dialog_tool_continuation(name: &str) -> Option<ToolContinuation> {
         .map(|spec| spec.continuation)
 }
 
+/// Serialize only arguments declared by the selected native tool schema.
+#[must_use]
+pub fn tool_call_arguments(step: &ToolStep) -> Value {
+    let spec = ALTERNATIVE_DIALOG_TOOL_CATALOG
+        .iter()
+        .copied()
+        .chain([SESSION_SEND_MESSAGE_SPEC, SESSION_REACT_TO_MESSAGE_SPEC])
+        .find(|spec| spec.name.eq_ignore_ascii_case(step.step.trim()));
+    let mut arguments = serde_json::to_value(step).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = arguments.as_object_mut() {
+        object.retain(|name, _| {
+            spec.is_some_and(|spec| spec.args.iter().any(|arg| arg.name == name))
+        });
+    }
+    arguments
+}
+
 /// Return whether a tool call should be omitted from dialog history.
 #[must_use]
 pub fn is_dialog_history_noise_tool_call_name(name: &str) -> bool {
@@ -4967,6 +4984,52 @@ fn is_zero_i32(value: &i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_transcript_excludes_internal_and_other_tool_arguments() {
+        let step = ToolStep {
+            step: "memory_manage".into(),
+            action: "remember".into(),
+            memory_scope: "chat".into(),
+            text: "favorite color: turquoise".into(),
+            query: "unrelated".into(),
+            ..ToolStep::default()
+        };
+        assert_eq!(
+            tool_call_arguments(&step),
+            serde_json::json!({
+                "action": "remember", "memory_scope": "chat", "card_id": 0,
+                "text": "favorite color: turquoise"
+            })
+        );
+        assert_eq!(
+            tool_call_arguments(&ToolStep {
+                step: "finish_turn".into(),
+                ..step.clone()
+            }),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            tool_call_arguments(&ToolStep {
+                step: "web_search".into(),
+                ..step.clone()
+            }),
+            serde_json::json!({"query": "unrelated"})
+        );
+        assert_eq!(
+            tool_call_arguments(&ToolStep {
+                step: "send_message".into(),
+                target_message_id: 42,
+                quote: "favorite color".into(),
+                final_reply: true,
+                ..step
+            }),
+            serde_json::json!({
+                "message_id": 42, "quote": "favorite color", "final_reply": true,
+                "text": "favorite color: turquoise"
+            })
+        );
+    }
 
     #[test]
     fn every_session_tool_has_explicit_continuation_semantics() {
