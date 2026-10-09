@@ -3174,37 +3174,41 @@ where
     let mut report = CardExtractionWriteReport::default();
     let cards =
         openplotva_memory::cards_from_extraction_at(input, output, cfg.fallback_observed_at);
-    if cards.is_empty() {
+    if cards.is_empty() && output.resolutions.is_empty() && output.supersessions.is_empty() {
         return Ok(report);
     }
-
-    let embeddings = match embedder {
-        Some(provider) => {
-            match embed_memory_cards(provider, &cards, cfg.embedding_dimension).await {
-                Ok(embeddings) => embeddings,
-                Err(error) if error.is_availability_failure() => {
-                    return Err(MemoryExtractionWriteError::EmbedderUnavailable { source: error });
-                }
-                Err(error) => {
-                    report.card_embedding_error = Some(error.to_string());
-                    Vec::new()
+    if !cards.is_empty() {
+        let embeddings = match embedder {
+            Some(provider) => {
+                match embed_memory_cards(provider, &cards, cfg.embedding_dimension).await {
+                    Ok(embeddings) => embeddings,
+                    Err(error) if error.is_availability_failure() => {
+                        return Err(MemoryExtractionWriteError::EmbedderUnavailable {
+                            source: error,
+                        });
+                    }
+                    Err(error) => {
+                        report.card_embedding_error = Some(error.to_string());
+                        Vec::new()
+                    }
                 }
             }
-        }
-        None => Vec::new(),
-    };
-    let (card_stats, card_ids) = store
-        .upsert_cards_with_embeddings(&cards, &embeddings)
-        .await
-        .map_err(|source| MemoryExtractionWriteError::StoreCards { source })?;
-    report.stats.cards_inserted += card_stats.cards_inserted;
-    report.stats.cards_updated += card_stats.cards_updated;
-    report.card_ids = card_ids;
+            None => Vec::new(),
+        };
+        let (card_stats, card_ids) = store
+            .upsert_cards_with_embeddings(&cards, &embeddings)
+            .await
+            .map_err(|source| MemoryExtractionWriteError::StoreCards { source })?;
+        report.stats.cards_inserted += card_stats.cards_inserted;
+        report.stats.cards_updated += card_stats.cards_updated;
+        report.card_ids = card_ids;
 
-    let links = openplotva_memory::links_from_extraction(&cards, &report.card_ids, &output.links);
-    report.links_inserted = links.len();
-    if let Err(error) = store.insert_links(&links).await {
-        report.link_error = Some(error.to_string());
+        let links =
+            openplotva_memory::links_from_extraction(&cards, &report.card_ids, &output.links);
+        report.links_inserted = links.len();
+        if let Err(error) = store.insert_links(&links).await {
+            report.link_error = Some(error.to_string());
+        }
     }
 
     // The model's scored resolutions split into outright supersessions (the new
@@ -7218,5 +7222,80 @@ mod tests {
         .expect("write");
         assert!(report.output.topics.is_empty());
         assert!(store.episodes.lock().expect("episodes").is_empty());
+    }
+
+    #[tokio::test]
+    async fn clean_resolutions_still_apply_after_the_last_spam_candidate_is_removed() {
+        for decision in [
+            openplotva_memory::ResolutionDecision::Reinforce,
+            openplotva_memory::ResolutionDecision::Update,
+            openplotva_memory::ResolutionDecision::Merge,
+        ] {
+            let store = FakeMemoryWriteStore::default();
+            let embedder = FakeEmbedder::default();
+            let input = ExtractInput {
+                messages: vec![openplotva_memory::Message {
+                    message_id: 1,
+                    text: "Alice likes Rust".to_owned(),
+                    ..openplotva_memory::Message::default()
+                }],
+                existing_cards: vec![
+                    Card {
+                        id: 10,
+                        fact_text: "Alice likes Rust".to_owned(),
+                        ..Card::default()
+                    },
+                    Card {
+                        id: 11,
+                        fact_text: "Alice likes Rust".to_owned(),
+                        ..Card::default()
+                    },
+                ],
+                ..ExtractInput::default()
+            };
+            let output = ExtractOutput {
+                candidate_cards: vec![openplotva_memory::CandidateCard {
+                    fact_text: "Предлагает досуг без предоплаты".to_owned(),
+                    source_message_ids: vec![1],
+                    ..openplotva_memory::CandidateCard::default()
+                }],
+                resolutions: vec![openplotva_memory::Resolution {
+                    old_card_id: 10,
+                    into_card_id: 11,
+                    decision,
+                    new_fact_text: if decision == openplotva_memory::ResolutionDecision::Reinforce {
+                        String::new()
+                    } else {
+                        "Alice uses Rust daily".to_owned()
+                    },
+                    ..openplotva_memory::Resolution::default()
+                }],
+                ..ExtractOutput::default()
+            };
+            let report = write_memory_extraction_batch(
+                &store,
+                Some(&embedder),
+                &input,
+                output,
+                MemoryExtractionBatchConfig {
+                    episode_model: "model",
+                    prompt_version: "pv",
+                    embedding_dimension: 2,
+                    fallback_observed_at: OffsetDateTime::UNIX_EPOCH,
+                    batch_input_tokens: 0,
+                },
+            )
+            .await
+            .expect("write");
+            assert!(report.output.candidate_cards.is_empty());
+            assert_eq!(report.output.resolutions.len(), 1);
+            assert!(!store.resolution_ops.lock().expect("ops").is_empty());
+            assert!(store.cards.lock().expect("cards").is_empty());
+            assert!(store.episodes.lock().expect("episodes").is_empty());
+            assert_eq!(
+                embedder.calls.lock().expect("calls").len(),
+                usize::from(decision != openplotva_memory::ResolutionDecision::Reinforce)
+            );
+        }
     }
 }
