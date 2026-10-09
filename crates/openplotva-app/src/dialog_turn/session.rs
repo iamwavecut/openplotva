@@ -1283,19 +1283,6 @@ where
             });
         }
 
-        if step
-            .tool_calls
-            .iter()
-            .zip(&batch_results)
-            .any(|(call, result)| call.step.step == "finish_turn" && result.status == "ok")
-        {
-            return std::ops::ControlFlow::Break( TurnResolution {
-                outcome: TurnOutcome::NoReplyIntentional {
-                    reason: "agent_finished",
-                },
-                disposition: JobDisposition::Complete,
-            });
-        }
         report.session_tool_calls.clone_from(&recorded_tool_calls);
         match persist_dialog_tool_calls(tool_history, active_params, &recorded_tool_calls).await {
             Ok(persisted) => report.persisted_tool_call_history = persisted,
@@ -1304,6 +1291,23 @@ where
             }
         }
 
+        if step
+            .tool_calls
+            .iter()
+            .zip(&batch_results)
+            .any(|(call, result)| call.step.step == "finish_turn" && result.status == "ok")
+        {
+            side_effect_tickets.extend(batch_side_effects);
+            if !side_effect_tickets.is_empty() {
+                return std::ops::ControlFlow::Break(session_delegated(&sent, &side_effect_tickets));
+            }
+            return std::ops::ControlFlow::Break( TurnResolution {
+                outcome: TurnOutcome::NoReplyIntentional {
+                    reason: "agent_finished",
+                },
+                disposition: JobDisposition::Complete,
+            });
+        }
         let disposition = if step.tool_calls.iter().zip(&batch_results).any(|(call,result)| call.step.step == STEP_SEND_MESSAGE && call.step.final_reply && result.status == "ok") {
             SessionBatchDisposition::CompleteAfterSidecars
         } else if !announcement.trim().is_empty() && !step_text_accounted_for {

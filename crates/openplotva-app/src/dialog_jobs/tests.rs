@@ -6437,3 +6437,45 @@ async fn agent_interrupted_effect_fails_without_replaying() -> Result<(), Box<dy
     assert!(toolbox.draw_requests.lock().expect("draws").is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn random_finish_keeps_tool_history_and_report() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let mut params = dialog_params("обычный разговор");
+    params.meta = serde_json::json!({"dialog_trigger":"random"});
+    queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "",
+        vec![(
+            "finish",
+            openplotva_dialog::ToolStep {
+                step: "finish_turn".into(),
+                ..Default::default()
+            },
+        )],
+    ))]);
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let history = ToolHistoryStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &history,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.completed, "{report:?}");
+    assert!(report.persisted_tool_call_history);
+    assert_eq!(report.session_tool_calls.len(), 1);
+    assert_eq!(report.session_tool_calls[0].name, "finish_turn");
+    assert!(effects.sent().is_empty());
+    assert!(effects.intermediates().is_empty());
+    Ok(())
+}
