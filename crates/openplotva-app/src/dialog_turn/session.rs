@@ -26,7 +26,7 @@ use openplotva_dialog::{
     STEP_CRAWL_URL, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE,
     STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, SessionMessage, SessionToolCall, ToolContext,
     ToolContinuation, ToolResult, ToolStep, ToolsMode, chat_completion_tools_for_specs,
-    dialog_tool_context, dialog_tool_continuation, dispatch_dialog_tool,
+    dialog_tool_context, dialog_tool_continuation, dispatch_dialog_tool, tool_call_arguments,
     turn::{
         ANTI_LOOP_HINT, QueuedSideEffect, SIDE_EFFECT_KIND_IMAGE, SIDE_EFFECT_KIND_MUSIC,
         SIDE_EFFECT_STATE_QUEUED,
@@ -1082,7 +1082,7 @@ where
                 .map(|call| SessionToolCall {
                     id: call.id.clone(),
                     name: call.step.step.clone(),
-                    arguments: serde_json::to_value(&call.step).unwrap_or(Value::Null),
+                    arguments: tool_call_arguments(&call.step),
                 })
                 .collect(),
         });
