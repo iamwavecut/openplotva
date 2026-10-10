@@ -582,6 +582,23 @@ WITH finished AS (
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
 "#;
 
+/// Missing terminal reactions for ambiguous creates; never replays the create itself.
+pub const SQL_MISSING_AMBIGUITY_REACTIONS: &str = r#"
+SELECT operation_id, bot_id, chat_id, thread_id, ordering_key,
+       causation_update_id, trigger_message_id
+FROM telegram_outbox AS source
+WHERE source.state = 'ambiguous'
+  AND source.delivery_policy = 'create'
+  AND source.chat_id IS NOT NULL
+  AND source.trigger_message_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM telegram_outbox AS reaction
+      WHERE reaction.batch_id = $1 || source.operation_id
+  )
+ORDER BY source.id
+LIMIT $2
+"#;
+
 const SQL_PENDING_HISTORY_RECEIPTS: &str = r#"
 SELECT id, batch_id, bot_id, receipt
 FROM telegram_outbox
@@ -1810,6 +1827,58 @@ mod tests {
             .await?
             .ok_or("second item missing")?;
         assert_eq!(second_item.state, "ambiguous");
+        sqlx::query("UPDATE telegram_outbox SET protected = FALSE WHERE id = $1")
+            .bind(second[0].id)
+            .execute(&pool)
+            .await?;
+        let missing = sqlx::query(SQL_MISSING_AMBIGUITY_REACTIONS)
+            .bind("tgamb:v1:")
+            .bind(10_i64)
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0].get::<String, _>("operation_id"),
+            second[0].operation_id
+        );
+
+        let mut connection = pool.acquire().await?;
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *connection)
+            .await?;
+        for (query, index) in [
+            (
+                SQL_PENDING_HISTORY_RECEIPTS,
+                "telegram_outbox_pending_history_idx",
+            ),
+            (
+                SQL_MISSING_AMBIGUITY_REACTIONS,
+                "telegram_outbox_ambiguous_create_idx",
+            ),
+        ] {
+            let explain = format!("EXPLAIN {query}");
+            let plan = if query == SQL_MISSING_AMBIGUITY_REACTIONS {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(explain))
+                    .bind("tgamb:v1:")
+                    .bind(10_i64)
+            } else {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(explain)).bind(10_i64)
+            }
+            .fetch_all(&mut *connection)
+            .await?;
+            assert!(
+                plan.join("\n").contains(index),
+                "{index} must support the recovery scan: {plan:?}"
+            );
+        }
+        sqlx::query("SET enable_seqscan = on")
+            .execute(&mut *connection)
+            .await?;
+        drop(connection);
+        sqlx::query("UPDATE telegram_outbox SET protected = TRUE WHERE id = $1")
+            .bind(second[0].id)
+            .execute(&pool)
+            .await?;
         assert!(matches!(
             store
                 .retry_operation_manually(&second[0].operation_id, false)

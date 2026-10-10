@@ -874,9 +874,9 @@ pub const SQL_UPSERT_CHAT_HISTORY_RESET: &str = "INSERT INTO chat_history_resets
 pub const SQL_GET_CHAT_HISTORY_RESET_AT: &str =
     "SELECT reset_at FROM chat_history_resets WHERE chat_id = $1 AND thread_id = $2";
 
-pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
+pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($2::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($5::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
 
-pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
+pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($4::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
 
 pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id <> $4 OR occurred_at > $5) ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
 
@@ -13601,7 +13601,8 @@ mod tests {
         let chat_id = -9_001_222_333_444_i64;
         let message_id = i32::try_from(suffix % 1_000_000_000)?;
         let entry_id = format!("msg:{message_id}");
-        let occurred_at = time::OffsetDateTime::now_utc();
+        let occurred_at =
+            time::OffsetDateTime::now_utc().replace_time(time::Time::from_hms(0, 30, 0)?);
         let bucket_day = occurred_at.date();
         let payload = serde_json::json!({
             "entry_id": entry_id,
@@ -13670,6 +13671,22 @@ mod tests {
                 )
                 .await?;
             assert!(wrong_thread_payloads.is_empty());
+
+            // UTC partitions must remain visible across midnight in the session and input offsets.
+            sqlx::query("SET TIME ZONE 'Pacific/Honolulu'").execute(&pool).await?;
+            let cutoff = range_start.to_offset(time::UtcOffset::from_hms(-10, 0, 0)?);
+            let trigger = super::HistoryMessagePosition {
+                occurred_at: occurred_at.to_offset(time::UtcOffset::from_hms(14, 0, 0)?),
+                message_id,
+            };
+            assert_eq!(store.recent_chat_history_payloads(chat_id, cutoff, 77, cutoff, trigger, 10).await?.len(), 1);
+            assert_eq!(store.recent_thread_history_payloads(chat_id, 77, cutoff, trigger, 10).await?.len(), 1);
+            assert!(store.recent_thread_history_payloads(chat_id, 78, cutoff, trigger, 10).await?.is_empty());
+            assert!(store.recent_chat_history_payloads(chat_id, cutoff, 77, range_end, trigger, 10).await?.is_empty());
+            let before_message = super::HistoryMessagePosition { message_id: message_id - 1, ..trigger };
+            assert!(store.recent_chat_history_payloads(chat_id, cutoff, 0, cutoff, before_message, 10).await?.is_empty());
+            assert!(store.recent_thread_history_payloads(chat_id, 77, range_end, trigger, 10).await?.is_empty());
+            sqlx::query("SET TIME ZONE 'UTC'").execute(&pool).await?;
 
             let sender_payloads = store
                 .search_history_entries_by_sender_id(chat_id, 77, 100, range_start, 10)

@@ -1441,35 +1441,22 @@ async fn reconcile_ambiguity_reactions(
     store: &PostgresTelegramOutboxStore,
     report: &mut TelegramOutboxWorkerReport,
 ) {
-    let rows = match sqlx::query(
-        "SELECT operation_id, bot_id, chat_id, thread_id, ordering_key, \
-                causation_update_id, trigger_message_id \
-         FROM telegram_outbox AS source \
-         WHERE source.state = 'ambiguous' \
-           AND source.delivery_policy = 'create' \
-           AND source.chat_id IS NOT NULL \
-           AND source.trigger_message_id IS NOT NULL \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM telegram_outbox AS reaction \
-               WHERE reaction.batch_id = $1 || source.operation_id \
-           ) \
-         ORDER BY source.id \
-         LIMIT $2",
-    )
-    .bind(AMBIGUITY_REACTION_BATCH_PREFIX)
-    .bind(i64::try_from(OUTBOX_MAINTENANCE_LIMIT).unwrap_or(1_000))
-    .fetch_all(store.pool())
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            record_worker_error(
-                report,
-                format!("scan missing ambiguous-create reactions: {error}"),
-            );
-            return;
-        }
-    };
+    let rows =
+        match sqlx::query(openplotva_storage::telegram_outbox::SQL_MISSING_AMBIGUITY_REACTIONS)
+            .bind(AMBIGUITY_REACTION_BATCH_PREFIX)
+            .bind(i64::try_from(OUTBOX_MAINTENANCE_LIMIT).unwrap_or(1_000))
+            .fetch_all(store.pool())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                record_worker_error(
+                    report,
+                    format!("scan missing ambiguous-create reactions: {error}"),
+                );
+                return;
+            }
+        };
 
     for row in rows {
         let result = enqueue_ambiguity_reaction_fields(
