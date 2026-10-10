@@ -476,8 +476,12 @@ where
                 .list_files_by_unique_ids(&requested_ids)
                 .await
                 .map_err(|error| Box::new(error) as ToolboxError)?;
-            let selection =
-                image_edit_file_id_selection(&file_unique_ids, &media_group_unique_ids, &rows);
+            let selection = image_edit_file_id_selection(
+                &file_unique_ids,
+                &media_group_unique_ids,
+                &rows,
+                attachments,
+            );
             let mut photo_urls = Vec::new();
             for latest_file_id in &selection.url_file_ids {
                 if let Ok(Some(url)) = self.urls.image_edit_file_url(latest_file_id).await {
@@ -516,7 +520,8 @@ impl ImageEditFileResolver for openplotva_storage::PostgresTelegramFileStore {
                 .list_files_by_unique_ids(&file_unique_ids)
                 .await
                 .map_err(|error| Box::new(error) as ToolboxError)?;
-            let latest_file_ids = latest_file_ids_in_attachment_order(&file_unique_ids, &rows);
+            let latest_file_ids =
+                latest_file_ids_in_attachment_order(&file_unique_ids, &rows, attachments);
 
             Ok(ImageEditFileSelection {
                 photo_file_id: latest_file_ids.first().cloned().unwrap_or_default(),
@@ -2147,10 +2152,12 @@ fn image_edit_file_id_selection(
     target_file_unique_ids: &[String],
     media_group_file_unique_ids: &[String],
     rows: &[openplotva_storage::TelegramFileRecord],
+    attachments: &[ChatAttachment],
 ) -> ImageEditFileIdSelection {
-    let target_file_ids = latest_file_ids_in_attachment_order(target_file_unique_ids, rows);
+    let target_file_ids =
+        latest_file_ids_in_attachment_order(target_file_unique_ids, rows, attachments);
     let media_group_file_ids =
-        latest_file_ids_in_attachment_order(media_group_file_unique_ids, rows);
+        latest_file_ids_in_attachment_order(media_group_file_unique_ids, rows, attachments);
     ImageEditFileIdSelection {
         photo_file_id: target_file_ids.first().cloned().unwrap_or_default(),
         url_file_ids: if media_group_file_ids.is_empty() {
@@ -2180,18 +2187,27 @@ fn push_unique_trimmed(out: &mut Vec<String>, value: &str) {
 fn latest_file_ids_in_attachment_order(
     file_unique_ids: &[String],
     rows: &[openplotva_storage::TelegramFileRecord],
+    attachments: &[ChatAttachment],
 ) -> Vec<String> {
     let mut latest_file_ids = Vec::new();
     for file_unique_id in file_unique_ids {
-        let Some(row) = rows
+        let file_id = rows
             .iter()
             .find(|row| row.file_unique_id.trim() == file_unique_id)
-        else {
-            continue;
-        };
-        let latest_file_id = row.latest_file_id.trim();
-        if !latest_file_id.is_empty() {
-            latest_file_ids.push(latest_file_id.to_owned());
+            .map(|row| row.latest_file_id.trim())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                attachments
+                    .iter()
+                    .find(|attachment| {
+                        attachment.kind.trim() == "image"
+                            && attachment.file_unique_id.trim() == file_unique_id
+                            && !attachment.file_id.trim().is_empty()
+                    })
+                    .map(|attachment| attachment.file_id.trim())
+            });
+        if let Some(file_id) = file_id {
+            latest_file_ids.push(file_id.to_owned());
         }
     }
     latest_file_ids
@@ -6394,6 +6410,56 @@ mod tests {
     }
 
     #[test]
+    fn image_edit_source_metadata_survives_missing_file_rows() {
+        let attachments = vec![
+            ChatAttachment {
+                kind: "image".to_owned(),
+                file_unique_id: "first".to_owned(),
+                file_id: "history-first".to_owned(),
+                ..Default::default()
+            },
+            ChatAttachment {
+                kind: "image".to_owned(),
+                file_unique_id: "second".to_owned(),
+                file_id: "history-second".to_owned(),
+                ..Default::default()
+            },
+            ChatAttachment {
+                kind: "audio".to_owned(),
+                file_unique_id: "audio".to_owned(),
+                file_id: "audio-file".to_owned(),
+                ..Default::default()
+            },
+            ChatAttachment {
+                kind: "image".to_owned(),
+                file_unique_id: "empty".to_owned(),
+                ..Default::default()
+            },
+        ];
+        let ids = vec!["second".to_owned(), "first".to_owned()];
+        assert_eq!(
+            image_edit_file_id_selection(&ids, &[], &[], &attachments),
+            ImageEditFileIdSelection {
+                photo_file_id: "history-second".to_owned(),
+                url_file_ids: vec!["history-second".to_owned(), "history-first".to_owned()],
+            }
+        );
+        let rows = vec![telegram_file_record("second", "current-second")];
+        assert_eq!(
+            latest_file_ids_in_attachment_order(&ids, &rows, &attachments),
+            vec!["current-second".to_owned(), "history-first".to_owned()]
+        );
+        assert!(
+            latest_file_ids_in_attachment_order(
+                &["unknown".to_owned(), "audio".to_owned(), "empty".to_owned()],
+                &[],
+                &attachments,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn image_edit_file_selection_preserves_attachment_order_and_go_file_url_shape() {
         let file_unique_ids = vec![
             "unique-a".to_owned(),
@@ -6407,7 +6473,7 @@ mod tests {
         ];
 
         assert_eq!(
-            latest_file_ids_in_attachment_order(&file_unique_ids, &rows),
+            latest_file_ids_in_attachment_order(&file_unique_ids, &rows, &[]),
             vec!["file-a".to_owned(), "file-b".to_owned()]
         );
         assert_eq!(
@@ -6455,7 +6521,7 @@ mod tests {
         ];
 
         assert_eq!(
-            image_edit_file_id_selection(&target_unique_ids, &media_group_unique_ids, &rows),
+            image_edit_file_id_selection(&target_unique_ids, &media_group_unique_ids, &rows, &[]),
             ImageEditFileIdSelection {
                 photo_file_id: "file-b".to_owned(),
                 url_file_ids: vec!["file-a".to_owned(), "file-b".to_owned()],
