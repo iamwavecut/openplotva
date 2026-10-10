@@ -4414,6 +4414,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_style_followup_edits_the_selected_result_with_a_separate_caption()
+    -> Result<(), ToolboxError> {
+        for (request, caption, prompt) in [
+            (
+                "А перерисуй мелками",
+                "Золотая рыбка в кляре, нарисованная мелками",
+                "Edit the supplied golden fish in batter image: redraw in chalk, preserving its subject and composition",
+            ),
+            (
+                "А теперь сделай это пластилиновым мультиком",
+                "Золотая рыбка в кляре, в стиле пластилинового мультика",
+                "Edit the supplied golden fish in batter image: clay animation style, preserving its subject and composition",
+            ),
+        ] {
+            let queue = Arc::new(InMemoryTaskQueue::new());
+            let resolver = Arc::new(ImageEditFileResolverStub::successful(
+                ImageEditFileSelection {
+                    photo_file_id: "generated-goldfish-file".to_owned(),
+                    photo_urls: vec!["https://files.test/generated-goldfish.png".to_owned()],
+                },
+            ));
+            let scheduler = Arc::new(
+                TaskmanDialogToolAdapter::new(queue.clone())
+                    .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)))
+                    .with_image_edit_file_resolver(resolver.clone()),
+            );
+            let toolbox = toolbox(Some(TranslatorStub {
+                result: Ok(String::new()),
+            }))
+            .with_image_scheduler(scheduler);
+            let input = openplotva_dialog::DialogInput {
+                context: openplotva_dialog::DialogContext {
+                    chat_id: 42,
+                    ..Default::default()
+                },
+                user: openplotva_dialog::DialogUser {
+                    id: 42,
+                    ..Default::default()
+                },
+                message: openplotva_dialog::DialogMessage {
+                    id: 13,
+                    text: request.to_owned(),
+                    ..Default::default()
+                },
+                history: vec![
+                    openplotva_dialog::HistoryMessage {
+                        message_id: 11,
+                        text: "Золотая рыбка в кляре".to_owned(),
+                        meta: ChatMessageMeta {
+                            attachments: vec![image_attachment("generated-goldfish")],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    openplotva_dialog::HistoryMessage {
+                        message_id: 12,
+                        text: "Another user's cat".to_owned(),
+                        meta: ChatMessageMeta {
+                            attachments: vec![image_attachment("unrelated-cat")],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            let step =
+                openplotva_dialog::parse_native_tool_step(&[openplotva_dialog::NativeToolCall {
+                    function: openplotva_dialog::NativeToolFunction {
+                        name: "draw_image".to_owned(),
+                        arguments: json!({
+                            "prompt": prompt,
+                            "caption": caption,
+                            "file_ids": ["message_11_image_1"]
+                        }),
+                    },
+                    ..Default::default()
+                }])
+                .expect("native edit call");
+            let result = openplotva_dialog::dispatch_dialog_tool(
+                &toolbox,
+                &openplotva_dialog::dialog_tool_context(&input),
+                &step,
+            )
+            .await?;
+            assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+            assert_eq!(
+                resolver.calls(),
+                vec![vec![image_attachment("generated-goldfish")]]
+            );
+            let records = queue.records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].job.data.job_type,
+                openplotva_taskman::JobType::ImageEdit
+            );
+            let image = records[0].job.data.image_data.as_ref().expect("image edit");
+            assert!(image.is_image_edit);
+            assert_eq!(image.image_file_id, "generated-goldfish-file");
+            assert_eq!(
+                image.image_urls,
+                vec!["https://files.test/generated-goldfish.png"]
+            );
+            assert_eq!(image.original_text, caption);
+            assert_eq!(image.prompt, prompt);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_dialog_toolbox_combines_selected_history_images_in_one_edit()
     -> Result<(), ToolboxError> {
         let scheduler = Arc::new(ImageSchedulerStub::successful(DrawImageScheduleResult {
