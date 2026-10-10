@@ -1456,6 +1456,20 @@ where
             SessionBatchDisposition::ContinueForResults
             | SessionBatchDisposition::ContinueWithoutFinal => {}
             SessionBatchDisposition::CompleteWithSideEffect => {
+                let delivered_images = step.tool_calls.iter().zip(&batch_results)
+                    .filter(|(call, result)| direct_draw_delivered(&call.step.step, result))
+                    .count();
+                if delivered_images > 0 {
+                    report.sent_answer = true;
+                    append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
+                    return std::ops::ControlFlow::Break(TurnResolution {
+                        outcome: TurnOutcome::Sent {
+                            parts: sent.total_count + delivered_images,
+                            side_effect_tickets: ticket_ids(&side_effect_tickets),
+                        },
+                        disposition: JobDisposition::Complete,
+                    });
+                }
                 if sent.any() {
                     report.sent_answer = true;
                     append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
@@ -1641,11 +1655,17 @@ fn queued_generation_side_effect(result: &ToolResult) -> Option<QueuedSideEffect
     })
 }
 
+fn direct_draw_delivered(name: &str, result: &ToolResult) -> bool {
+    name == "draw_api"
+        && result.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
+        && result.data.as_ref().and_then(|data| data.get("delivered")) == Some(&Value::Bool(true))
+}
+
 fn session_batch_disposition(
     calls: &[ChatStepToolCall],
     results: &[ToolResult],
 ) -> SessionBatchDisposition {
-    let mut queued_generation = false;
+    let mut completed_generation = false;
 
     for (index, call) in calls.iter().enumerate() {
         let Some(continuation) = dialog_tool_continuation(&call.step.step) else {
@@ -1660,8 +1680,10 @@ fn session_batch_disposition(
                 let Some(result) = results.get(index) else {
                     return SessionBatchDisposition::ContinueForResults;
                 };
-                if queued_generation_side_effect(result).is_some() {
-                    queued_generation = true;
+                if queued_generation_side_effect(result).is_some()
+                    || direct_draw_delivered(&call.step.step, result)
+                {
+                    completed_generation = true;
                 } else {
                     return SessionBatchDisposition::ContinueForResults;
                 }
@@ -1670,7 +1692,7 @@ fn session_batch_disposition(
         }
     }
 
-    if queued_generation {
+    if completed_generation {
         SessionBatchDisposition::CompleteWithSideEffect
     } else {
         SessionBatchDisposition::ContinueWithoutFinal
@@ -2777,6 +2799,34 @@ mod tests {
         assert_eq!(
             session_batch_disposition(&[call(STEP_SEND_MESSAGE)], &[ok()]),
             SessionBatchDisposition::ContinueWithoutFinal
+        );
+        let delivered = || ToolResult {
+            data: Some(serde_json::json!({"delivered": true})),
+            ..ok()
+        };
+        assert_eq!(
+            session_batch_disposition(&[call("draw_api")], &[delivered()]),
+            SessionBatchDisposition::CompleteWithSideEffect
+        );
+        for result in [
+            ok(),
+            ToolResult::failed("draw_api_failed", "not delivered"),
+            ToolResult {
+                data: Some(serde_json::json!({"delivered": false})),
+                ..ok()
+            },
+        ] {
+            assert_eq!(
+                session_batch_disposition(&[call("draw_api")], &[result]),
+                SessionBatchDisposition::ContinueForResults
+            );
+        }
+        assert_eq!(
+            session_batch_disposition(
+                &[call("draw_api"), call(STEP_WEB_SEARCH)],
+                &[delivered(), ok()],
+            ),
+            SessionBatchDisposition::ContinueForResults
         );
     }
 
