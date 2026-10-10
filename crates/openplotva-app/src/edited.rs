@@ -169,18 +169,23 @@ fn pending_dialog_record(
     chat_id: i64,
     message_id: i32,
 ) -> Option<TaskQueueRecord> {
-    queue.records().into_iter().find(|record| {
-        record.status == JobStatus::Pending
-            && record.job.data.job_type == JobType::Dialog
-            && record
-                .job
-                .data
-                .telegram_data
-                .as_ref()
-                .is_some_and(|telegram| {
-                    telegram.chat_id == chat_id && telegram.message_id == message_id
-                })
-            && record.job.data.dialog_data.is_some()
+    queue.inspect_records(|records| {
+        records
+            .iter()
+            .find(|record| {
+                record.status == JobStatus::Pending
+                    && record.job.data.job_type == JobType::Dialog
+                    && record
+                        .job
+                        .data
+                        .telegram_data
+                        .as_ref()
+                        .is_some_and(|telegram| {
+                            telegram.chat_id == chat_id && telegram.message_id == message_id
+                        })
+                    && record.job.data.dialog_data.is_some()
+            })
+            .cloned()
     })
 }
 
@@ -492,7 +497,7 @@ mod tests {
     use super::{
         EditedDialogJobUpdate, EditedImageJobUpdate, EditedMessageEffects, EditedMessageFuture,
         EditedMessageUpdateHandler, EditedMessageUpdateRoute, TaskmanEditedMessageEffects,
-        handle_edited_message_update_or_else,
+        handle_edited_message_update_or_else, pending_dialog_record,
     };
 
     #[tokio::test]
@@ -625,6 +630,49 @@ mod tests {
         assert_eq!(effects.dialog_updates().len(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn edited_dialog_lookup_preserves_pending_status_and_source_identity() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::now_utc();
+        let completed = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("done", now, 111, 42, 77),
+        );
+        queue.complete(completed, now).expect("complete first");
+        let processing = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("busy", now, 111, 42, 77),
+        );
+        assert_eq!(
+            queue
+                .dequeue(DIALOG_AIFARM_QUEUE_NAME, "worker", now)
+                .expect("claim")
+                .id,
+            processing
+        );
+        queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("other chat", now, 111, 43, 77),
+        );
+        queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("other message", now, 111, 42, 78),
+        );
+        let pending = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("target", now, 111, 42, 77),
+        );
+        assert_eq!(
+            pending_dialog_record(&queue, 42, 77)
+                .expect("pending source")
+                .id,
+            pending
+        );
+        assert!(pending_dialog_record(&queue, 42, 79).is_none());
+        queue.complete(pending, now).expect("complete target");
+        assert!(pending_dialog_record(&queue, 42, 77).is_none());
     }
 
     #[tokio::test]
