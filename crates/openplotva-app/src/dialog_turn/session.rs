@@ -609,6 +609,7 @@ where
                 Some(provider_deadline),
                 step_provider.run_chat_step(ChatStepRequest {
                     input,
+                    preferred_target: agent.preferred_target.clone(),
                     transcript: agent.transcript.clone(),
                     tools,
                     iteration: usize::try_from(iteration).unwrap_or(1),
@@ -678,6 +679,8 @@ where
         };
         report.session_iterations = iteration;
         report.provider = Some(step.provider.clone());
+        agent.preferred_target = (!step.provider.is_empty() && !step.model.is_empty())
+            .then(|| (step.provider.clone(), step.model.clone()));
         append_session_iteration_event(
             queue,
             ctx.item_id,
@@ -2455,6 +2458,7 @@ mod tests {
                 self.requests.lock().expect("requests").push(request);
                 Ok(openplotva_dialog::ChatStepOutput {
                     provider: "probe".into(),
+                    model: "probe-model".into(),
                     text: if final_only {
                         "Проверено.".into()
                     } else {
@@ -2506,6 +2510,10 @@ mod tests {
         let requests = probe.requests.lock().expect("requests");
         assert_eq!(requests.len(), 33);
         assert!(requests.iter().all(|request| request.input == input));
+        assert!(requests[0].preferred_target.is_none());
+        assert!(requests[1..].iter().all(|request| {
+            request.preferred_target.as_ref() == Some(&("probe".into(), "probe-model".into()))
+        }));
         assert!(matches!(
             requests.last().expect("last step").tools,
             ToolsMode::FinalOnly

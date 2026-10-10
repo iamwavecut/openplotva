@@ -228,7 +228,7 @@ impl RoutedAttemptWalker {
         // against the wall clock, so pool queueing never eats the retry budget.
         'passes: loop {
             let selection_now = Instant::now();
-            let attempts = {
+            let mut attempts = {
                 let liveness = BreakerLiveness::new(&self.breakers, selection_now);
                 let mut rng = rand::rng();
                 select_chain(route, &liveness, self.triggers.as_ref(), &mut rng)
@@ -242,6 +242,22 @@ impl RoutedAttemptWalker {
                     })
                     .collect::<Vec<_>>()
             };
+            if let Some((provider_name, model_name)) = &context.preferred_target
+                && let Some(index) = attempts.iter().position(|attempt| {
+                    table
+                        .provider(attempt.provider)
+                        .is_some_and(|provider| provider.name == *provider_name)
+                        && table
+                            .model(attempt.model)
+                            .is_some_and(|model| model.model_name == *model_name)
+                        && self
+                            .breakers
+                            .is_live_at(attempt.provider, attempt.model, selection_now)
+                })
+            {
+                let preferred = attempts.remove(index);
+                attempts.insert(0, preferred);
+            }
             if attempts.is_empty() {
                 self.record_event(routing_event(
                     "no_candidates",
@@ -708,6 +724,8 @@ pub struct RoutedRequestContext {
     pub vip: bool,
     /// Capabilities every selected provider model must advertise.
     pub required_capabilities: Vec<String>,
+    /// Previous successful step target. Capacity and breaker guards still apply.
+    pub preferred_target: Option<(String, String)>,
     /// The walker will not start an attempt at or past this instant, so one
     /// call cannot overshoot the caller's turn budget by a full attempt.
     pub deadline: Option<Instant>,
@@ -1021,6 +1039,99 @@ mod tests {
         snap.assignments.push(fallback);
         snap.workflows[0].retry_max_hops = 2;
         snap
+    }
+
+    #[tokio::test]
+    async fn previous_successful_target_continues_with_normal_failure_fallback() {
+        let walker = walker_for(snapshot_with_fallback());
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::clone(&executed);
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".into(),
+                    preferred_target: Some(("genkit".into(), "db/fallback".into())),
+                    ..Default::default()
+                },
+                move |attempt| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.lock().expect("attempts").push(attempt.model_id);
+                        if attempt.model_id == 20 {
+                            Err(openplotva_llm::retry::ProviderError::new(
+                                "genkit",
+                                FailureReason::ProviderUnavailable,
+                                "unavailable",
+                            ))
+                        } else {
+                            Ok("recovered")
+                        }
+                    }
+                },
+                |error| Some(error.reason()),
+            )
+            .await
+            .expect("fallback recovery");
+        assert_eq!(output, "recovered");
+        assert_eq!(*executed.lock().expect("attempts"), vec![20, 10]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_unknown_previous_target_keeps_the_live_primary() {
+        for previous in ["db/fallback", "removed-model"] {
+            let breakers = Arc::new(BreakerSet::new());
+            breakers.record_failure(
+                2,
+                20,
+                BreakerConfig {
+                    fail_threshold: 1,
+                    cooldown: Duration::from_secs(60),
+                },
+            );
+            let walker = walker_with_breakers(snapshot_with_fallback(), breakers);
+            let selected = walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "dialog".into(),
+                        preferred_target: Some(("genkit".into(), previous.into())),
+                        ..Default::default()
+                    },
+                    |attempt| async move { Ok::<_, std::io::Error>(attempt.model_id) },
+                    |_| None,
+                )
+                .await
+                .expect("live primary");
+            assert_eq!(selected, 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_previous_target_does_not_bypass_its_capacity_pool() {
+        let mut snapshot = snapshot_with_fallback();
+        snapshot.models[1].pool_id = Some(1);
+        snapshot.pools.push(PoolRecord {
+            id: 1,
+            name: "fallback-pool".into(),
+            max_concurrency: Some(1),
+            description: None,
+            config: json!({}),
+        });
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy preferred pool");
+        let selected = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".into(),
+                    preferred_target: Some(("genkit".into(), "db/fallback".into())),
+                    ..Default::default()
+                },
+                |attempt| async move { Ok::<_, std::io::Error>(attempt.model_id) },
+                |_| None,
+            )
+            .await
+            .expect("free primary");
+        assert_eq!(selected, 10);
     }
 
     #[tokio::test]

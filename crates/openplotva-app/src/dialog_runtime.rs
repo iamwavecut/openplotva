@@ -347,6 +347,7 @@ impl ChatStepProvider for RouterChatProvider {
                         deadline: crate::dialog_turn::current_turn_deadline(),
                         suppress_all_attempts_exhausted_admin_report: true,
                         required_capabilities,
+                        preferred_target: request.preferred_target.clone(),
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {
@@ -1583,6 +1584,7 @@ mod tests {
             .as_chat_step()
             .expect("step seam")
             .run_chat_step(openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: live_dialog_smoke_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Disabled,
@@ -1951,6 +1953,7 @@ mod tests {
 
     fn default_step_request() -> openplotva_dialog::ChatStepRequest {
         openplotva_dialog::ChatStepRequest {
+            preferred_target: None,
             input: DialogInput::default(),
             transcript: Vec::new(),
             tools: openplotva_dialog::ToolsMode::Disabled,
@@ -2014,6 +2017,7 @@ mod tests {
 
     fn step_request() -> ChatStepRequest {
         ChatStepRequest {
+            preferred_target: None,
             input: DialogInput::default(),
             transcript: Vec::new(),
             tools: ToolsMode::Native(vec![json!({"type": "function"})]),

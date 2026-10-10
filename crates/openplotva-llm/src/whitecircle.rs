@@ -1562,6 +1562,7 @@ mod tests {
         // first step; the audit must still dispatch for that turn.
         let first = seam
             .run_chat_step(ChatStepRequest {
+                preferred_target: None,
                 input: step_check_input(),
                 transcript: vec![openplotva_dialog::SessionMessage::InjectedUser {
                     rendered: "injected before the first step".to_owned(),
@@ -1576,6 +1577,7 @@ mod tests {
 
         let second = seam
             .run_chat_step(ChatStepRequest {
+                preferred_target: None,
                 input: step_check_input(),
                 transcript: vec![openplotva_dialog::SessionMessage::Assistant {
                     text: "step reply".to_owned(),

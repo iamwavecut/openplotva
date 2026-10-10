@@ -10079,6 +10079,7 @@ mod tests {
             AifarmDialogConfig::default(),
         );
         let request = openplotva_dialog::ChatStepRequest {
+            preferred_target: None,
             input: base_input(),
             transcript: Vec::new(),
             tools: openplotva_dialog::ToolsMode::Native(
@@ -10135,6 +10136,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Native(
@@ -10181,6 +10183,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Native(
@@ -10222,6 +10225,7 @@ mod tests {
         let error = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Native(
@@ -10258,6 +10262,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::FinalOnly,
@@ -10301,6 +10306,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &native_provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: transcript.clone(),
                 tools: openplotva_dialog::ToolsMode::Native(
@@ -10316,6 +10322,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &final_provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript,
                 tools: openplotva_dialog::ToolsMode::FinalOnly,
@@ -10392,6 +10399,7 @@ mod tests {
             let error = crate::ChatStepProvider::run_chat_step(
                 &provider,
                 openplotva_dialog::ChatStepRequest {
+                    preferred_target: None,
                     input: base_input(),
                     transcript: Vec::new(),
                     tools: openplotva_dialog::ToolsMode::Native(
@@ -10483,6 +10491,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input,
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Disabled,
@@ -10512,6 +10521,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Disabled,
@@ -10547,6 +10557,7 @@ mod tests {
         let error = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::Native(

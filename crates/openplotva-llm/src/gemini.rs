@@ -3191,6 +3191,7 @@ mod tests {
 
     fn gemini_step_request() -> openplotva_dialog::ChatStepRequest {
         openplotva_dialog::ChatStepRequest {
+            preferred_target: None,
             input: openplotva_dialog::DialogInput {
                 context: openplotva_dialog::DialogContext {
                     locale: "ru".to_owned(),
@@ -3510,6 +3511,7 @@ mod tests {
 
         let output = provider
             .run_step(openplotva_dialog::ChatStepRequest {
+                preferred_target: None,
                 input,
                 transcript: Vec::new(),
                 tools: openplotva_dialog::ToolsMode::FinalOnly,
