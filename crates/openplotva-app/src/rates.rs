@@ -367,9 +367,7 @@ impl MarketRatesClient {
         let (body, stale) = self
             .fetch_bytes(&self.urls.cbr_xml_url, MARKET_RATES_DAILY_TTL)
             .await?;
-        let text =
-            String::from_utf8(body).map_err(|error| MarketRatesError::Decode(error.to_string()))?;
-        let parsed: CbrValCurs = quick_xml::de::from_str(&text)
+        let parsed: CbrValCurs = quick_xml::de::from_reader(body.as_slice())
             .map_err(|error| MarketRatesError::Decode(error.to_string()))?;
         parsed
             .valutes
@@ -2422,6 +2420,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn market_rates_client_parses_windows_1251_cbr_xml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let xml = b"<?xml version=\"1.0\" encoding=\"windows-1251\"?><ValCurs Date=\"19.06.2026\"><Valute><CharCode>USD</CharCode><Nominal>1</Nominal><Name>\xC4\xEE\xEB\xEB\xE0\xF0</Name><Value>78,1234</Value></Valute></ValCurs>";
+        let (urls, server) = spawn_market_fixture_server(vec![FixtureResponse {
+            status: 200,
+            body: xml,
+        }])?;
+        let client = market_test_client(urls)?;
+        let snapshot = fetch_dialog_rates(&client, parse_rates_selection("USD/RUB")).await;
+        assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+        assert_eq!(snapshot.rows[0].value, 78.1234);
+        assert_eq!(snapshot.rows[0].timestamp.as_deref(), Some("19.06.2026"));
+        assert_eq!(snapshot.rows[0].source, "cbr_cross");
+        let requests = server
+            .join()
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests, vec!["/cbr".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn market_rates_client_fetches_cbr_cross_pairs() -> Result<(), Box<dyn std::error::Error>>
     {
         let (urls, server) = spawn_market_fixture_server(vec![FixtureResponse::ok(cbr_fixture())])?;
@@ -2684,16 +2703,22 @@ mod tests {
     #[derive(Clone)]
     struct FixtureResponse {
         status: u16,
-        body: &'static str,
+        body: &'static [u8],
     }
 
     impl FixtureResponse {
         fn ok(body: &'static str) -> Self {
-            Self { status: 200, body }
+            Self {
+                status: 200,
+                body: body.as_bytes(),
+            }
         }
 
         fn status(status: u16, body: &'static str) -> Self {
-            Self { status, body }
+            Self {
+                status,
+                body: body.as_bytes(),
+            }
         }
     }
 
@@ -2731,11 +2756,11 @@ mod tests {
                 );
                 write!(
                     stream,
-                    "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     response.status,
-                    response.body.len(),
-                    response.body
+                    response.body.len()
                 )?;
+                stream.write_all(response.body)?;
             }
             Ok(requests)
         });
