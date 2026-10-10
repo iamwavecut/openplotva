@@ -1,7 +1,7 @@
 //! Observable and recoverable background task orchestration.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     sync::{Arc, Mutex, MutexGuard},
@@ -1352,6 +1352,7 @@ impl InMemoryTaskQueue {
         let mut state = self.lock();
         let mut report = StartupReleaseReport::default();
         let mut ids = Vec::new();
+        let mut pending_keys = pending_debounce_keys(&state.records);
         for record in &mut state.records {
             if record.status != JobStatus::Processing {
                 continue;
@@ -1360,12 +1361,7 @@ impl InMemoryTaskQueue {
                 record.worker_id = None;
                 report.agent_kept += 1;
             } else {
-                record.status = JobStatus::Pending;
-                record.worker_id = None;
-                record.started_at = None;
-                record.execution_started_at = None;
-                record.completed_at = None;
-                record.error = None;
+                requeue_record(record, &mut pending_keys);
                 report.requeued += 1;
             }
             ids.push(record.id);
@@ -3475,16 +3471,39 @@ fn dialog_lane_key(record: &TaskQueueRecord) -> (i64, i32) {
     )
 }
 
+fn pending_debounce_keys(records: &[TaskQueueRecord]) -> BTreeSet<(String, String)> {
+    records
+        .iter()
+        .filter(|record| record.status == JobStatus::Pending)
+        .filter_map(|record| {
+            record
+                .debounce_key
+                .as_ref()
+                .map(|key| (record.queue_name.clone(), key.clone()))
+        })
+        .collect()
+}
+
+fn requeue_record(record: &mut TaskQueueRecord, pending_keys: &mut BTreeSet<(String, String)>) {
+    if let Some(key) = &record.debounce_key
+        && !pending_keys.insert((record.queue_name.clone(), key.clone()))
+    {
+        record.debounce_key = None;
+    }
+    record.status = JobStatus::Pending;
+    record.worker_id = None;
+    record.started_at = None;
+    record.execution_started_at = None;
+    record.completed_at = None;
+    record.error = None;
+}
+
 fn requeue_processing_records(records: &mut [TaskQueueRecord]) -> usize {
     let mut requeued = 0;
+    let mut pending_keys = pending_debounce_keys(records);
     for record in records {
         if record.status == JobStatus::Processing {
-            record.status = JobStatus::Pending;
-            record.worker_id = None;
-            record.started_at = None;
-            record.execution_started_at = None;
-            record.completed_at = None;
-            record.error = None;
+            requeue_record(record, &mut pending_keys);
             requeued += 1;
         }
     }
@@ -3496,16 +3515,12 @@ fn requeue_expired_processing_records(
     now: OffsetDateTime,
 ) -> Vec<i64> {
     let mut requeued = Vec::new();
+    let mut pending_keys = pending_debounce_keys(records);
     for record in records {
         if !processing_record_expired(record, now) {
             continue;
         }
-        record.status = JobStatus::Pending;
-        record.worker_id = None;
-        record.started_at = None;
-        record.execution_started_at = None;
-        record.completed_at = None;
-        record.error = None;
+        requeue_record(record, &mut pending_keys);
         requeued.push(record.id);
     }
     requeued
@@ -5360,6 +5375,102 @@ mod tests {
         queue.fail(second.unwrap_or_default(), "boom", now)?;
         assert_eq!(queue.active_count(TEXT_QUEUE_NAME), 0);
         Ok(())
+    }
+
+    #[test]
+    fn recovery_keeps_new_pending_debounce_owner_and_both_dialogs() {
+        for recovery in ["startup", "orphaned", "expired"] {
+            let queue = InMemoryTaskQueue::new();
+            let now = OffsetDateTime::now_utc();
+            let schedule = || TaskQueueSchedule {
+                debounce_key: Some("dialog-source".to_owned()),
+                lane_key: Some("chat-lane".to_owned()),
+                ..TaskQueueSchedule::default()
+            };
+            let mut old = dialog_job_at("unfinished", now, 7, 10, 1).with_name("unfinished");
+            old.processing_timeout_seconds = 1;
+            let old_id = queue.assign_with_schedule(TEXT_QUEUE_NAME, old, schedule());
+            queue
+                .dequeue(TEXT_QUEUE_NAME, "old-worker", now)
+                .expect("claim old");
+            let next_id = queue.assign_with_schedule(
+                TEXT_QUEUE_NAME,
+                dialog_job_at("new input", now + TimeDuration::seconds(1), 7, 10, 2)
+                    .with_name("new input"),
+                schedule(),
+            );
+            match recovery {
+                "startup" => assert_eq!(queue.requeue_processing_for_startup(), 1),
+                "orphaned" => {
+                    assert_eq!(queue.release_orphaned_processing_for_startup().requeued, 1)
+                }
+                _ => assert_eq!(
+                    queue.requeue_expired_processing(now + TimeDuration::seconds(2)),
+                    vec![old_id]
+                ),
+            }
+            let old = queue.record(old_id).expect("old survives");
+            let next = queue.record(next_id).expect("new survives");
+            assert_eq!(old.status, JobStatus::Pending);
+            assert_eq!(old.debounce_key, None, "{recovery}");
+            assert_eq!(next.debounce_key.as_deref(), Some("dialog-source"));
+            assert_eq!(old.lane_key, next.lane_key);
+            assert_eq!(old.job.title, "unfinished");
+            assert_eq!(next.job.title, "new input");
+            assert_eq!(
+                queue
+                    .dequeue(
+                        TEXT_QUEUE_NAME,
+                        "new-worker",
+                        now + TimeDuration::seconds(3)
+                    )
+                    .expect("old first")
+                    .id,
+                old_id
+            );
+            queue
+                .complete(old_id, now + TimeDuration::seconds(3))
+                .expect("finish old");
+            assert_eq!(
+                queue
+                    .dequeue(
+                        TEXT_QUEUE_NAME,
+                        "new-worker",
+                        now + TimeDuration::seconds(4)
+                    )
+                    .expect("new second")
+                    .id,
+                next_id
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_uncontested_debounce_keys_scoped_to_each_queue() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::now_utc();
+        let schedule = || TaskQueueSchedule {
+            debounce_key: Some("source".to_owned()),
+            ..TaskQueueSchedule::default()
+        };
+        let id = queue.assign_with_schedule(
+            TEXT_QUEUE_NAME,
+            job_at("old", DEFAULT_PRIORITY, now, 7, 10, 1),
+            schedule(),
+        );
+        queue
+            .dequeue(TEXT_QUEUE_NAME, "worker", now)
+            .expect("claim");
+        queue.assign_with_schedule(
+            CONTROL_QUEUE_NAME,
+            job_at("different queue", DEFAULT_PRIORITY, now, 7, 10, 2),
+            schedule(),
+        );
+        assert_eq!(queue.release_orphaned_processing_for_startup().requeued, 1);
+        assert_eq!(
+            queue.record(id).expect("recovered").debounce_key.as_deref(),
+            Some("source")
+        );
     }
 
     #[test]
