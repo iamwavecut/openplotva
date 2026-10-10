@@ -14,6 +14,9 @@ pub enum FailureReason {
     ProviderTimeout,
     /// Provider returned a protocol-level invalid response.
     ProviderProtocolError,
+    /// This request exceeds the selected model's context window. Another
+    /// model may accept it; repeating it cannot repair the limit.
+    ContextLengthExceeded,
     /// The provider answered, but our validators rejected what the model wrote.
     /// The provider is healthy, so a fresh sample from the same model is the
     /// cheapest repair; walking to another model usually lands on a weaker one.
@@ -29,6 +32,7 @@ impl FailureReason {
             Self::ProviderOverloaded => "provider_overloaded",
             Self::ProviderTimeout => "provider_timeout",
             Self::ProviderProtocolError => "provider_protocol_error",
+            Self::ContextLengthExceeded => "context_length_exceeded",
             Self::ModelOutputRejected => "model_output_rejected",
         }
     }
@@ -217,6 +221,15 @@ const RETRYABLE_REJECT_PHRASES: &[&str] = &[
 ];
 
 const RETRYABLE_MESSAGE_RULES: &[(FailureReason, &[&str])] = &[
+    (
+        FailureReason::ContextLengthExceeded,
+        &[
+            "maximum context length",
+            "context length exceeded",
+            "context_length_exceeded",
+            "exceeds the context window",
+        ],
+    ),
     (
         FailureReason::CapacityUnavailable,
         &[
@@ -454,6 +467,28 @@ mod tests {
             "user cancelled the job",
             "user canceled the job",
             "",
+        ] {
+            assert_eq!(retryable_reason_from_message(message), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn context_limits_allow_fallback_without_retrying_invalid_requests() {
+        for message in [
+            "upstream returned status 400: This model's maximum context length is 40192 tokens. However, you requested 1024 output tokens and your prompt contains at least 39169 input tokens",
+            "chat completion: status 400: context_length_exceeded",
+            "input exceeds the context window",
+        ] {
+            assert_eq!(
+                retryable_reason_from_message(message),
+                Some(FailureReason::ContextLengthExceeded),
+                "{message}"
+            );
+        }
+        for message in [
+            "upstream returned status 400: model does not exist",
+            "upstream returned status 400: invalid tool schema",
+            "validation failed: maximum context length",
         ] {
             assert_eq!(retryable_reason_from_message(message), None, "{message}");
         }
