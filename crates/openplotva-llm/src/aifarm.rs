@@ -4362,7 +4362,7 @@ fn render_resample_note(
     }
     let data = json!({
         "verdict": verdict,
-        "specialClosing": matches!(verdict, "no_tool_calls" | "budget_exhausted" | "reasoning_only"),
+        "specialClosing": matches!(verdict, "protocol_only" | "no_tool_calls" | "budget_exhausted" | "reasoning_only"),
     });
     let rendered = match prompts {
         Some(prompts) => prompts.render("aifarm/resample_note", &data)?,
@@ -8140,6 +8140,17 @@ mod tests {
     }
 
     #[test]
+    fn protocol_resample_note_keeps_native_tool_execution_available() {
+        let mut input = base_input();
+        input.resample_verdict = "protocol_only".to_owned();
+        let note = render_resample_note(&input, None)
+            .expect("render")
+            .expect("note");
+        assert!(note.contains("native tool_calls"));
+        assert!(!note.contains("напиши ответ заново"));
+    }
+
+    #[test]
     fn resample_note_follows_the_last_message_and_leaves_the_prefix_alone() {
         let mut input = base_input();
         input.message.id = 11;
@@ -8556,7 +8567,7 @@ mod tests {
     {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
         assert!(prompt.contains("собеседник в живом Telegram-чате"));
-        assert!(prompt.contains("native tool_calls по JSON-схемам"));
+        assert!(prompt.contains("native tool calls по JSON-схемам"));
         assert!(prompt.contains("прочитай именно её через crawl_url"));
         assert!(!prompt.contains("<tools>"));
         assert!(!prompt.contains("<arg name="));
