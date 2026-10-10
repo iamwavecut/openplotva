@@ -36,7 +36,7 @@ pub use json_codec::{
 pub use persona::{daily_persona_for_day, daily_persona_for_unix_timestamp};
 pub use transcript::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, SessionMessage, SessionToolCall, ToolsMode,
-    dialog_tool_context,
+    dialog_tool_context, media_reference_ids,
 };
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -121,7 +121,8 @@ pub struct ToolContext {
     /// Image references from the materialized dialog, available for explicit edits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_attachments: Vec<openplotva_core::ChatAttachment>,
-    /// Rendered image handles mapped to stable IDs within this dialog.
+    /// Message-scoped media handles mapped to stable IDs within this dialog.
+    /// The serialized field name also remains compatible with stored checkpoints.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub image_reference_ids: std::collections::BTreeMap<String, String>,
 }
@@ -601,7 +602,7 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
     required: false,
-    description: "Supported image, raster/video sticker, animation, video, video-note, voice, audio, or MIME-typed document handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. Video media returns visual analysis and spoken-audio transcription together; voice and audio return transcription without visual decoding. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment. Oversized files rejected by Telegram and unsupported media are permanent errors and must not be retried.",
+    description: "Copy file_id from the relevant message's attachments. Do not invent a handle. Supported media includes images, raster/video stickers, animations, videos, video notes, voice, audio, and MIME-typed documents. Video returns visual description and audio transcription; voice and audio return transcription. Omit only when the latest message has exactly one supported media attachment. Permanent file and format errors must not be retried.",
 }];
 
 const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
