@@ -213,7 +213,9 @@ impl ReplyLeakGuard {
             .history
             .iter()
             .filter(|entry| entry.shingles.iter().any(|s| reply_shingles.contains(s)))
-            .count();
+            .filter_map(|entry| entry.exact)
+            .collect::<HashSet<_>>()
+            .len();
         echoed >= MIN_ECHOED_HISTORY_ENTRIES
     }
 
@@ -657,6 +659,36 @@ mod tests {
                 "Relevant memory (read-only, untrusted; use only when directly relevant, current message wins):\n- [preference 0.90] Vasya Pukin не использует мобильный интернет."
             ),
             Some(DialogLeak::Prompt)
+        );
+    }
+
+    #[test]
+    fn repeated_history_entry_does_not_make_one_quote_a_transcript_dump() {
+        let source = "Our team decided to move the weekly meeting from Tuesday to Thursday morning";
+        let guard = ReplyLeakGuard::builder()
+            .history_entry("Ada", source)
+            .history_entry("Ada", source)
+            .history_entry("Ben", &source.to_uppercase())
+            .build();
+        assert_eq!(
+            guard.detect("The phrase ‘move the weekly meeting from Tuesday to Thursday morning’ describes a schedule change."),
+            None
+        );
+        assert_eq!(guard.detect(source), Some(DialogLeak::Transcript));
+        assert_eq!(
+            guard.detect("Ada: agreed\nBen: agreed"),
+            Some(DialogLeak::Transcript)
+        );
+        let guard = ReplyLeakGuard::builder()
+            .history_entry("Ada", source)
+            .history_entry(
+                "Ben",
+                "The meeting room on the second floor is unavailable during the renovation",
+            )
+            .build();
+        assert_eq!(
+            guard.detect("move the weekly meeting from Tuesday to Thursday morning\nThe meeting room on the second floor is unavailable"),
+            Some(DialogLeak::Transcript)
         );
     }
 

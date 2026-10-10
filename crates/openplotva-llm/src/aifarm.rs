@@ -8256,6 +8256,41 @@ mod tests {
     }
 
     #[test]
+    fn reply_leak_guard_allows_one_quote_from_the_current_history_message() {
+        let mut input = base_input();
+        input.message.id = 11;
+        input.message.text =
+            "Our team decided to move the weekly meeting from Tuesday to Thursday morning".into();
+        input.history.push(HistoryMessage {
+            role: ROLE_USER.into(),
+            kind: MESSAGE_KIND_TEXT.into(),
+            name: input.user.full_name.clone(),
+            text: input.message.text.clone(),
+            message_id: input.message.id,
+            ..Default::default()
+        });
+        let messages =
+            build_initial_messages_with_tool_prompt(&input, &input.history, ToolPromptMode::Native)
+                .expect("messages");
+        let guard = reply_leak_guard(&messages, &input);
+        let answer = "‘move the weekly meeting from Tuesday to Thursday morning’ describes a schedule change.";
+        let completion = |content: &str| json!({"choices":[{"message":{"content":content}}]});
+        assert_eq!(
+            extract_final_answer_for_provider(&completion(answer), PROVIDER_AIFARM, &guard)
+                .expect("a quote is allowed"),
+            answer
+        );
+        assert!(
+            extract_final_answer_for_provider(
+                &completion(&input.message.text),
+                PROVIDER_AIFARM,
+                &guard
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reply_leak_guard_rejects_prompt_and_transcript_copies() {
         let mut input = base_input();
         input.persona.custom_persona =
