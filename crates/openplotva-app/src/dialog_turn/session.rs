@@ -2047,7 +2047,7 @@ where
             } else {
                 i64::from(exec.params.message_id)
             };
-            if !exec.reacted_message_ids.insert(message_id) {
+            if exec.reacted_message_ids.contains(&message_id) {
                 return ToolResult::failed(
                     "already_reacted",
                     "you already reacted to this message this turn; a new reaction only replaces it",
@@ -2059,11 +2059,14 @@ where
             // The chat id is always the session's own chat — the model cannot
             // react into other chats no matter what it passes.
             match reactor.react(exec.params.chat_id, message_id, emoji).await {
-                Ok(()) => ToolResult {
-                    status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
-                    message: "reaction set".to_owned(),
-                    ..ToolResult::default()
-                },
+                Ok(()) => {
+                    exec.reacted_message_ids.insert(message_id);
+                    ToolResult {
+                        status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+                        message: "reaction set".to_owned(),
+                        ..ToolResult::default()
+                    }
+                }
                 Err(error) => ToolResult::failed("reaction_failed", error),
             }
         }
