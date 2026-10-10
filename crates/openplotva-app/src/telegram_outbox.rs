@@ -698,34 +698,38 @@ async fn execute_with_lease_renewal<Transport>(
 where
     Transport: TelegramOutboxTransport,
 {
-    let response = enforce_send_deadline(send_timeout, transport.execute(command));
-    tokio::pin!(response);
-    let mut ticker = tokio::time::interval(renew_interval.max(Duration::from_millis(1)));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-
-    loop {
-        tokio::select! {
-            response = &mut response => {
-                return match response {
-                    Ok(response) => LeasedExecution::Response(response),
-                    Err(SendDeadlineExceeded) => LeasedExecution::TimedOut,
-                };
-            },
-            _ = ticker.tick() => {
-                match store
-                    .renew_operation_lease(operation.id, operation.lease_token)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => return LeasedExecution::LeaseLost,
-                    Err(error) => record_worker_error(
-                        report,
-                        format!("renew Telegram outbox lease: {error}"),
-                    ),
+    let renewal = async {
+        let mut ticker = tokio::time::interval(renew_interval.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match store
+                .renew_operation_lease(operation.id, operation.lease_token)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    record_worker_error(report, format!("renew Telegram outbox lease: {error}"))
                 }
             }
         }
+    };
+    await_leased_response(transport.execute(command), renewal, send_timeout).await
+}
+
+async fn await_leased_response(
+    response: TelegramOutboxTransportFuture<'_>,
+    renewal: impl Future<Output = ()>,
+    send_timeout: Duration,
+) -> LeasedExecution {
+    tokio::select! {
+        response = enforce_send_deadline(send_timeout, response) => match response {
+            Ok(response) => LeasedExecution::Response(response),
+            Err(SendDeadlineExceeded) => LeasedExecution::TimedOut,
+        },
+        () = renewal => LeasedExecution::LeaseLost,
     }
 }
 
@@ -2264,6 +2268,66 @@ mod tests {
 
         assert_eq!(result, Err(SendDeadlineExceeded));
         assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_lease_renewal_does_not_delay_telegram_receipt() {
+        let started = tokio::time::Instant::now();
+        let response = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let message = serde_json::from_value(json!({
+                "message_id": 91, "date": 1,
+                "chat": {"id": 42, "type": "private", "first_name": "Test"}
+            }))
+            .expect("message");
+            Ok(TelegramOutboundResponse::Message(Box::new(message)))
+        });
+        let renewal = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            std::future::pending::<()>().await;
+        };
+
+        let result = await_leased_response(response, renewal, Duration::from_secs(60)).await;
+
+        let LeasedExecution::Response(Ok(response)) = result else {
+            panic!("receipt must win while renewal is blocked");
+        };
+        assert_eq!(telegram_response_receipt(response).message_ids, vec![91]);
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_lease_renewal_does_not_hide_send_deadline() {
+        let started = tokio::time::Instant::now();
+        let renewal = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            std::future::pending::<()>().await;
+        };
+
+        let result = await_leased_response(
+            Box::pin(std::future::pending()),
+            renewal,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(matches!(result, LeasedExecution::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_lease_cancels_pending_send_before_deadline() {
+        let started = tokio::time::Instant::now();
+
+        let result = await_leased_response(
+            Box::pin(std::future::pending()),
+            tokio::time::sleep(Duration::from_secs(5)),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(matches!(result, LeasedExecution::LeaseLost));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
     }
 
     #[test]
