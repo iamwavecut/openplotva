@@ -3390,9 +3390,8 @@ async fn session_link_policy_filters_every_visible_message() -> Result<(), Box<d
     )
     .await;
     assert!(report.sent_answer, "{report:?}");
-    assert_eq!(effects.intermediates().len(), 2);
-    assert_eq!(effects.intermediates()[0].0, "An ordinary remark");
-    assert_eq!(effects.intermediates()[1].0, "<p>Another <b>remark</b></p>");
+    assert_eq!(effects.intermediates().len(), 1);
+    assert_eq!(effects.intermediates()[0].0, "<p>Another <b>remark</b></p>");
     assert_eq!(
         effects.sent()[0].1,
         r#"The <a href="https://source.test/page?a=1&amp;b=2">provided page</a>, invented variant and decoration"#
@@ -3466,7 +3465,6 @@ async fn captured_session_link_policy_filters_intermediates_without_search()
     assert_eq!(
         output.messages,
         vec![
-            "An ordinary remark",
             r#"A <a href="https://user.test">user link</a> and fake"#,
             "Done",
         ]
@@ -4375,27 +4373,30 @@ async fn session_sends_second_uncited_web_citation_repair_when_exhausted()
 }
 
 #[tokio::test]
-async fn captured_session_text_with_reaction_is_returned_once_without_another_model_step()
+async fn captured_session_reaction_discards_draft_and_returns_final_once()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
-        "Смешно вышло.",
-        vec![(
-            "reaction-call",
-            openplotva_dialog::ToolStep {
-                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
-                emoji: "🤣".to_owned(),
-                target_message_id: 100,
-                ..openplotva_dialog::ToolStep::default()
-            },
-        )],
-    ))]);
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "Смешно вышло.",
+            vec![(
+                "reaction-call",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: "🤣".to_owned(),
+                    target_message_id: 100,
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("Смешно вышло.")),
+    ]);
     let toolbox = SessionToolboxStub::default();
     let input = dialog_input_from_job_params_at(&dialog_params("рассмеши"), now);
 
     let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
 
-    assert_eq!(provider.calls(), 1);
+    assert_eq!(provider.calls(), 2);
     assert_eq!(output.messages, vec!["Смешно вышло."]);
     assert_eq!(output.tool_calls.len(), 1);
     Ok(())
@@ -4893,7 +4894,7 @@ async fn merged_and_deferred_turns_do_not_open_agent_runs() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn Error>> {
+async fn session_does_not_publish_drafts_next_to_tool_calls() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     queue.assign(
@@ -4934,10 +4935,9 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
     .await;
 
     assert!(report.sent_answer);
-    assert_eq!(
-        effects.intermediates(),
-        vec![("щас гляну".to_owned(), 1, true)],
-        "text next to tool calls goes to the chat as the first send (reply-to)"
+    assert!(
+        effects.intermediates().is_empty(),
+        "tool-adjacent draft is private"
     );
     assert_eq!(effects.sent().len(), 1, "final answer still lands");
     assert_eq!(
@@ -4947,11 +4947,11 @@ async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn E
             contains_advertising: false,
             advertising_tail_bytes: None,
         }],
-        "the intermediate send is unchanged while the final records successful search"
+        "the final records successful search"
     );
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
-    assert_eq!(rows[0].sent_message_parts, Some(2));
+    assert_eq!(rows[0].sent_message_parts, Some(1));
     Ok(())
 }
 
@@ -5301,8 +5301,7 @@ async fn session_queued_draw_terminates_without_confirmation_text() -> Result<()
 }
 
 #[tokio::test]
-async fn session_queued_draw_delivers_adjacent_text_once_and_terminates()
--> Result<(), Box<dyn Error>> {
+async fn session_queued_draw_discards_draft_and_delegates_artifact() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
@@ -5338,24 +5337,12 @@ async fn session_queued_draw_delivers_adjacent_text_once_and_terminates()
     .await;
 
     assert_eq!(provider.calls(), 1);
-    assert_eq!(
-        effects.intermediates(),
-        vec![("Начинаю рисовать кота.".to_owned(), 1, true)]
-    );
+    assert!(effects.intermediates().is_empty());
     assert!(effects.sent().is_empty());
-    assert!(report.sent_answer, "{report:?}");
+    assert!(!report.sent_answer, "{report:?}");
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
-    assert!(
-        queue
-            .record(job_id)
-            .expect("job record")
-            .events
-            .iter()
-            .any(|event| event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE),
-        "terminal tool text must leave the same crash-reentry marker as a final answer"
-    );
     let rows = ledger_rows(&outcomes);
-    assert_eq!(rows[0].outcome, "sent");
+    assert_eq!(rows[0].outcome, "side_effect_delegated");
     assert_eq!(rows[0].side_effect_ticket_id, Some(77));
     Ok(())
 }
@@ -5424,7 +5411,7 @@ async fn session_queued_draw_with_search_continues_for_search_result() -> Result
         2,
         "search results require a follow-up step"
     );
-    assert_eq!(effects.intermediates().len(), 1);
+    assert!(effects.intermediates().is_empty());
     assert_eq!(effects.sent().len(), 1);
     assert!(report.sent_answer, "{report:?}");
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
@@ -5477,10 +5464,7 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
 
     assert!(report.sent_answer, "{report:?}");
     assert_eq!(provider.calls(), 2, "the error came back to the model");
-    assert_eq!(
-        effects.intermediates(),
-        vec![("Пробую запустить рисование.".to_owned(), 1, true)]
-    );
+    assert!(effects.intermediates().is_empty());
     let requests = provider.requests();
     let openplotva_dialog::SessionMessage::ToolResult { content, .. } = &requests[1].transcript[1]
     else {
@@ -5488,6 +5472,54 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
     };
     assert!(content.contains("draw_down"));
     assert_eq!(effects.sent()[0].1, "рисовалка прилегла, потом попробуем");
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_send_message_omits_bad_optional_quote_but_rejects_unknown_target()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for (target_message_id, expected_status) in [(0, "ok"), (999, "failed")] {
+        let provider = StepProviderStub::with_steps(vec![
+            Ok(step_tools(
+                "",
+                vec![(
+                    "send",
+                    openplotva_dialog::ToolStep {
+                        step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                        text: "Проверяю источник.".to_owned(),
+                        quote: "Not a retained quote".to_owned(),
+                        target_message_id,
+                        final_reply: true,
+                        ..Default::default()
+                    },
+                )],
+            )),
+            Ok(step_text("Проверено.")),
+        ]);
+        let toolbox = SessionToolboxStub::default();
+        let input = dialog_input_from_job_params_at(&dialog_params("проверь"), now);
+        let output =
+            crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
+        assert_eq!(
+            provider.calls(),
+            2,
+            "send_message cannot terminate the turn"
+        );
+        assert_eq!(
+            output.tool_calls[0].output.as_ref().expect("result")["status"],
+            expected_status
+        );
+        if target_message_id == 0 {
+            assert_eq!(output.messages, vec!["Проверяю источник.", "Проверено."]);
+        } else {
+            assert_eq!(output.messages, vec!["Проверено."]);
+            assert_eq!(
+                output.tool_calls[0].output.as_ref().expect("result")["error"]["code"],
+                "unknown_target"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5721,8 +5753,8 @@ async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Bo
 }
 
 #[tokio::test]
-async fn session_text_with_reaction_is_delivered_once_without_another_model_step()
--> Result<(), Box<dyn Error>> {
+async fn session_reaction_discards_draft_and_delivers_followup_final() -> Result<(), Box<dyn Error>>
+{
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
@@ -5730,18 +5762,21 @@ async fn session_text_with_reaction_is_delivered_once_without_another_model_step
         new_dialog_job_at(dialog_params("покажи юмор"), now),
     );
     let reply = "Ну и юмор, будто из трясины выудили. Почти как наши шутки в чате.";
-    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
-        reply,
-        vec![(
-            "reaction-call",
-            openplotva_dialog::ToolStep {
-                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
-                emoji: "🤣".to_owned(),
-                target_message_id: 100,
-                ..openplotva_dialog::ToolStep::default()
-            },
-        )],
-    ))]);
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            reply,
+            vec![(
+                "reaction-call",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: "🤣".to_owned(),
+                    target_message_id: 100,
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text(reply)),
+    ]);
     let reactor = Arc::new(ReactorStub::default());
     let wiring = session_wiring(
         Arc::new(SessionToolboxStub::default()),
@@ -5763,13 +5798,9 @@ async fn session_text_with_reaction_is_delivered_once_without_another_model_step
     )
     .await;
 
-    assert_eq!(provider.calls(), 1, "a sidecar must not reopen the model");
-    assert_eq!(
-        effects.intermediates(),
-        vec![(reply.to_owned(), 1, true)],
-        "the adjacent response text must be delivered exactly once"
-    );
-    assert!(effects.sent().is_empty());
+    assert_eq!(provider.calls(), 2);
+    assert!(effects.intermediates().is_empty());
+    assert_eq!(effects.sent()[0].1, reply);
     assert_eq!(
         reactor.reactions.lock().expect("reactions").clone(),
         vec![(42, 100, "🤣".to_owned())]
@@ -5779,7 +5810,7 @@ async fn session_text_with_reaction_is_delivered_once_without_another_model_step
     let record = queue.record(job_id).expect("job record");
     assert!(record.events.iter().any(|event| {
         event.stage == crate::dialog_turn::SESSION_BATCH_STAGE
-            && event.data.get("disposition").map(String::as_str) == Some("complete_after_sidecars")
+            && event.data.get("disposition").map(String::as_str) == Some("continue_without_final")
     }));
     Ok(())
 }
@@ -5838,11 +5869,7 @@ async fn session_suppresses_html_equivalent_tool_text_but_executes_later_tools()
         vec!["first fact".to_owned(), "second fact".to_owned()],
         "duplicate visible text must not suppress its adjacent tool"
     );
-    assert_eq!(
-        effects.intermediates(),
-        vec![("<b>Проверяю.</b>".to_owned(), 1, true)],
-        "HTML-equivalent visible text must be queued only once"
-    );
+    assert!(effects.intermediates().is_empty());
     assert_eq!(effects.sent()[0].1, "Оба факта проверены.");
     assert!(report.sent_answer, "{report:?}");
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
@@ -5893,8 +5920,8 @@ async fn session_retry_semantics_depend_on_first_send() -> Result<(), Box<dyn Er
             vec![(
                 "c1",
                 openplotva_dialog::ToolStep {
-                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
-                    query: "x".to_owned(),
+                    step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                    text: "щас".to_owned(),
                     ..openplotva_dialog::ToolStep::default()
                 },
             )],

@@ -621,8 +621,8 @@ mod tests {
         assert!(rendered.contains("native tool calls по JSON-схемам"));
         assert!(rendered.contains("<guest_mode>"));
         assert!(rendered.contains("<locale_policy>"));
-        assert!(rendered.contains("доставляется в чат ровно один раз"));
-        assert!(rendered.contains("не повторяй эту реплику отдельным финалом"));
+        assert!(rendered.contains("Текст рядом с tool call не публикуется"));
+        assert!(rendered.contains("Финальный ответ через send_message не отправляй"));
         Ok(())
     }
 

@@ -1085,15 +1085,15 @@ pub const SESSION_REACTION_ALLOWED_EMOJI: &[&str] = &[
 /// `send_message` spec, injected by the session engine only.
 pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
     name: STEP_SEND_MESSAGE,
-    summary: "Send a separate chat reply, optionally to an exact message or quote. Set final_reply=true when this is the complete answer.",
+    summary: "Send an intermediate chat reply before continuing work, optionally replying to a retained message.",
     when_to_use: "Use it for a short heads-up before slow work (a search, reading pages), or to \
                   split a long reply into several messages sent back to back. Plain assistant \
                   text WITHOUT tool calls always ends your turn — call send_message when you \
                   intend to continue working or writing afterwards. Never repeat a message you \
                   already sent this turn. A simple answer or acknowledgment needs plain assistant text, not this tool.",
     result: "Delivers the message immediately; returns ok, or an error when the per-turn message \
-             limit is reached, the text duplicates an already-sent message, or the text is empty \
-             after sanitization.",
+             limit is reached or the text is empty after sanitization. Already delivered text \
+             returns success without another send; an unavailable optional quote is omitted.",
     continuation: ToolContinuation::ExplicitIntermediate,
     args: &[
         ToolArgSpec {
@@ -1105,11 +1105,6 @@ pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
             name: "quote",
             required: false,
             description: "Exact substring of the target message, at most 1024 characters.",
-        },
-        ToolArgSpec {
-            name: "final_reply",
-            required: false,
-            description: "True to finish the turn after this reply. The final reply must target the original request.",
         },
         ToolArgSpec {
             name: "text",
@@ -1964,14 +1959,34 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
                     && value.get("output").is_some()
             })
         });
-    let self_instruction = lower.lines().any(|line| {
-        let line = line.trim_start();
-        [
-            "(wait, i should just output",
-            "actually, let me just give you the clean version according to the rules",
+    let outside_code = leak_guard::mask_code_spans(value).to_ascii_lowercase();
+    let self_instruction = outside_code.lines().any(|line| {
+        let line = line.trim_start_matches([' ', '\t', '(', '*']);
+        let correction = line.starts_with("wait,") || line.starts_with("actually,");
+        let self_rewrite = (line.contains("i should ")
+            && ["just", "reformat", "re-format"]
+                .iter()
+                .any(|term| line.contains(term)))
+            || (line.contains("let me ") && (line.contains("actual ") || line.contains("clean ")))
+            || (line.contains("i see ")
+                && (line.contains("system") || line.contains("logic loop")));
+        let output_contract = [
+            "response",
+            "output",
+            "format",
+            "instruction",
+            "system prompt",
+            "normally",
+            "logic loop",
         ]
         .iter()
-        .any(|marker| line.starts_with(marker))
+        .any(|term| line.contains(term));
+        (correction && self_rewrite && output_contract)
+            || (line.starts_with("note:") && line.contains("i am simulating") && output_contract)
+            || line.starts_with("final response construction:")
+            || (line.starts_with("//")
+                && line.contains("scratchpad")
+                && line.contains("shouldn't be seen"))
     });
     tool_envelope
         || self_instruction
@@ -4996,6 +5011,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn final_reply_rejects_self_correction_without_rejecting_quoted_examples() {
+        for text in [
+            "Ответ.\n\n(Wait, I should just write normally as instructed)",
+            "Wait, I should re-format the response according to the instructions.",
+            "(Wait, I see my logic loop. Let me just give the actual response.)",
+            "(Note: Since I am simulating the response process, here is the actual output.)",
+            "**Final Response Construction:**\nMy response will be short.",
+            "// Mental scratchpad stuff that shouldn't be seen by users normally",
+        ] {
+            assert!(reply_has_residual_leak(text), "{text}");
+            assert!(
+                matches!(
+                    finalize_dialog_reply(text),
+                    DialogReplyOutcome::Suppressed { .. }
+                ),
+                "{text}"
+            );
+        }
+        for text in [
+            "Wait, I should buy groceries before going home.",
+            "The response format follows the instructions.",
+            "Actually, let me check the response format before answering.",
+            "Wait, I need the output format for the API example.",
+            "Let me format the output as a table.",
+            "Wait, I should check the response format.",
+            "<pre>Wait, I should re-format the response according to the instructions.</pre>",
+            "> Wait, I should re-format the response according to the instructions.",
+            "\"Wait, I should re-format the response according to the instructions.\"",
+        ] {
+            assert!(!reply_has_residual_leak(text), "{text}");
+        }
+    }
+
+    #[test]
     fn rejects_observed_mid_reply_self_instructions_without_rejecting_quotations() {
         assert!(reply_has_residual_leak(
             "Normal reply.\n\n(Wait, I should just output the actual response as instructed.)"
@@ -5048,7 +5097,7 @@ mod tests {
                 ..step
             }),
             serde_json::json!({
-                "message_id": 42, "quote": "favorite color", "final_reply": true,
+                "message_id": 42, "quote": "favorite color",
                 "text": "favorite color: turquoise"
             })
         );
