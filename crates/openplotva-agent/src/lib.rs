@@ -19,6 +19,9 @@ pub enum AgentError {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AgentLoop {
     pub transcript: Vec<SessionMessage>,
+    /// Provider and model that successfully handled the previous step.
+    #[serde(default)]
+    pub preferred_target: Option<(String, String)>,
     pub iteration: i32,
     pub observed_message_id: i32,
     pub tool_attempts: u32,
@@ -81,9 +84,14 @@ mod tests {
         for _ in 0..32 {
             assert!(state.admit_tool(Duration::from_secs(60)));
         }
+        state.preferred_target = Some(("fallback".into(), "native-model".into()));
         let mut state: AgentLoop =
             serde_json::from_str(&serde_json::to_string(&state).expect("serialize state"))
                 .expect("restore state");
+        assert_eq!(
+            state.preferred_target,
+            Some(("fallback".into(), "native-model".into()))
+        );
         assert!(!state.admit_tool(Duration::from_secs(60)));
         assert_eq!(
             state.next_step(Duration::from_secs(60), MAX_STEPS),
@@ -102,5 +110,16 @@ mod tests {
             state.next_step(Duration::ZERO, MAX_STEPS),
             NextStep::Exhausted
         );
+    }
+
+    #[test]
+    fn checkpoints_without_a_previous_target_still_restore() {
+        let mut value = serde_json::to_value(AgentLoop::default()).expect("serialize state");
+        value
+            .as_object_mut()
+            .expect("state object")
+            .remove("preferred_target");
+        let restored: AgentLoop = serde_json::from_value(value).expect("old checkpoint");
+        assert!(restored.preferred_target.is_none());
     }
 }

@@ -158,6 +158,8 @@ pub struct ChatStepRequest {
     /// In-session messages so far; empty on the first iteration.
     pub transcript: Vec<SessionMessage>,
     pub tools: ToolsMode,
+    /// Continue with this provider/model pair when it remains eligible and live.
+    pub preferred_target: Option<(String, String)>,
     /// 1-based session iteration, used for trace/telemetry tagging.
     pub iteration: usize,
 }
