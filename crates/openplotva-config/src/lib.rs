@@ -79,11 +79,9 @@ pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
 /// Default `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
 /// router waits for a busy primary pool before falling back.
 pub const DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS: i32 = 12_000;
-/// Extra samples the dialog router takes from the same model when a validator
-/// rejects its output. Four covers 99.6% of the recoveries seen in production
-/// (409 turns recovered on the first re-sample, 42 on the second, 17 on the
-/// third, 4 on the fourth over seven days).
-pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 4;
+/// One corrected sample before the dialog router tries the next model.
+/// Repeated invalid samples must leave time for fallback and delivery.
+pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 1;
 
 pub const DEFAULT_RUNTIME_API_PORT: u16 = 9091;
 

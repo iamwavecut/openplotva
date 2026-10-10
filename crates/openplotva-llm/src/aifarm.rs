@@ -3052,14 +3052,7 @@ where
             Ok(ToolStepSelection::Steps {
                 mut steps,
                 mut text,
-                residual_protocol,
             }) => {
-                if residual_protocol {
-                    let error = tool_protocol_completion_error(
-                        "assistant content retained ambiguous protocol markup",
-                    );
-                    return Err(aifarm_step_error_with_trace(error, trace));
-                }
                 if let Some(error) = sanitize_tool_step_text(&guard, &mut text, &mut steps) {
                     return Err(aifarm_step_error_with_trace(error, trace));
                 }
@@ -3092,9 +3085,7 @@ where
                         });
                     tool_calls.push(ChatStepToolCall { id, step, salvaged });
                 }
-                // Native calls arrive in their own channel. Pseudo calls are
-                // removed by exact protocol spans before the remaining
-                // intermediate text reaches this boundary.
+                // Content beside native calls is a draft, never a chat delivery.
                 Ok(ChatStepOutput {
                     provider: self.provider().to_owned(),
                     model,
@@ -5164,7 +5155,6 @@ enum ToolStepSelection {
     Steps {
         steps: Vec<PendingToolStep>,
         text: String,
-        residual_protocol: bool,
     },
 }
 
@@ -5195,13 +5185,6 @@ fn dialog_response_semantic_error(
                 .err()
                 .map(|error| error.to_string())
         }
-        Ok(ToolStepSelection::Steps {
-            residual_protocol: true,
-            ..
-        }) => Some(
-            tool_protocol_completion_error("assistant content retained ambiguous protocol markup")
-                .to_string(),
-        ),
         Ok(ToolStepSelection::Steps { .. }) => None,
     }
 }
@@ -5216,29 +5199,7 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
             serde_json::from_value::<Vec<NativeToolCall>>(tool_calls.clone()).map_err(|err| {
                 tool_protocol_completion_error(format!("decode native tool calls: {err}"))
             })?;
-        let content = message
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let parsed = parse_assistant_content(content)
-            .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
-        let mut steps = Vec::with_capacity(calls.len() + parsed.tool_steps.len());
-        for step in parsed
-            .tool_steps
-            .into_iter()
-            .filter(|step| step.step == STEP_SEND_MESSAGE)
-        {
-            steps.push(PendingToolStep {
-                decision: ToolParseDecision {
-                    form: "content_preamble".to_owned(),
-                    tool: step.step.clone(),
-                    outcome: "detected".to_owned(),
-                    reason: String::new(),
-                },
-                step,
-                native_ref: None,
-            });
-        }
+        let mut steps = Vec::with_capacity(calls.len());
         let mut seen_ids = std::collections::BTreeSet::new();
         for call in calls {
             let native_ref = if call.id.trim().is_empty() || !seen_ids.insert(call.id.clone()) {
@@ -5257,8 +5218,7 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
         }
         return Ok(ToolStepSelection::Steps {
             steps,
-            text: parsed.text,
-            residual_protocol: parsed.residual_protocol,
+            text: String::new(),
         });
     }
 
@@ -5269,27 +5229,12 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
         .trim();
     let parsed = parse_assistant_content(content)
         .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
-    if !parsed.tool_steps.is_empty() {
-        Ok(ToolStepSelection::Steps {
-            steps: parsed
-                .tool_steps
-                .into_iter()
-                .map(|step| {
-                    let mut decision = parsed.decision.clone();
-                    decision.tool = step.step.clone();
-                    PendingToolStep {
-                        step,
-                        decision,
-                        native_ref: None,
-                    }
-                })
-                .collect(),
-            text: parsed.text,
-            residual_protocol: parsed.residual_protocol,
-        })
-    } else {
-        Ok(ToolStepSelection::None(parsed.decision))
+    if !parsed.tool_steps.is_empty() || parsed.residual_protocol {
+        return Err(tool_protocol_completion_error(
+            "Use native tool_calls; assistant text cannot execute tools",
+        ));
     }
+    Ok(ToolStepSelection::None(parsed.decision))
 }
 
 fn tool_protocol_completion_error(message: impl Into<String>) -> CompletionError {
@@ -6549,9 +6494,9 @@ mod tests {
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
         HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, SESSION_REACT_TO_MESSAGE_SPEC,
-        SESSION_SEND_MESSAGE_SPEC, STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE,
-        STEP_HISTORY_SEARCH, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, STEP_UNDERSTAND_MEDIA,
-        STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
+        STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH,
+        STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH,
+        TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -8611,7 +8556,7 @@ mod tests {
     {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
         assert!(prompt.contains("собеседник в живом Telegram-чате"));
-        assert!(prompt.contains("native tool calls по JSON-схемам"));
+        assert!(prompt.contains("native tool_calls по JSON-схемам"));
         assert!(prompt.contains("прочитай именно её через crawl_url"));
         assert!(!prompt.contains("<tools>"));
         assert!(!prompt.contains("<arg name="));
@@ -10101,7 +10046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_step_parses_native_tool_calls_with_ids_and_intermediate_text()
+    async fn chat_step_parses_native_tool_calls_without_publishing_adjacent_text()
     -> Result<(), CompletionError> {
         let (provider, transport, toolbox) = direct_dialog_provider(
             json!({
@@ -10133,7 +10078,7 @@ mod tests {
 
         let output = crate::ChatStepProvider::run_chat_step(&provider, request).await?;
 
-        assert_eq!(output.text, "щас гляну");
+        assert_eq!(output.text, "");
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "call-abc");
         assert_eq!(output.tool_calls[0].step.step, STEP_WEB_SEARCH);
@@ -10421,176 +10366,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_step_salvages_content_tool_calls_and_strips_them_from_text()
-    -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-        );
-        let output = crate::ChatStepProvider::run_chat_step(
-            &provider,
-            openplotva_dialog::ChatStepRequest {
-                input: base_input(),
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Native(
-                    native_tool_values(&[STEP_DRAW_IMAGE]).expect("tool defs"),
-                ),
-                iteration: 1,
-            },
-        )
-        .await?;
-
-        assert_eq!(output.tool_calls.len(), 1);
-        assert!(output.tool_calls[0].salvaged);
-        assert_eq!(output.tool_calls[0].step.step, STEP_DRAW_IMAGE);
-        assert_eq!(output.tool_calls[0].step.prompt, "cat");
-        assert!(!output.tool_calls[0].id.trim().is_empty());
-        assert_eq!(
-            output.text, "",
-            "salvaged tool markup must not leak into the chat text"
-        );
-        Ok(())
+    async fn chat_step_rejects_textual_tool_calls_without_executing_them() {
+        for content in [
+            "<tool_call>draw_image{prompt:\"cat\"}</tool_call>",
+            "<react_to_message emoji=\"🤣\" message_id=\"42\" />",
+            "<react_to_message emoji=\"🤣\" message_id=\"42\" />\n<send_message text=\"Проверяю.\" />",
+            "<call><tool_name>react_to_message</tool_name><arguments><emoji>🤣</emoji><message_id>42</message_id></arguments></call>",
+            "<send_message><text>Сейчас гляну</text></send_message><understand_media><file_id>message_42_video_1</file_id></understand_media>",
+        ] {
+            let (provider, _, toolbox) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": content}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let error = crate::ChatStepProvider::run_chat_step(
+                &provider,
+                openplotva_dialog::ChatStepRequest {
+                    input: base_input(),
+                    transcript: Vec::new(),
+                    tools: openplotva_dialog::ToolsMode::Native(
+                        native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+                    ),
+                    iteration: 1,
+                },
+            )
+            .await
+            .expect_err("text cannot execute a tool");
+            assert_eq!(
+                crate::retry::retryable_reason(error.as_ref()),
+                Some(FailureReason::ModelOutputRejected)
+            );
+            assert!(toolbox.web_search_queries().is_empty());
+        }
     }
 
-    #[tokio::test]
-    async fn chat_step_salvages_direct_session_tool_tags() -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<react_to_message chat_id=\"-1009876543210\" emoji=\"🤣\" message_id=\"424242\" />"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-        );
-        let output = crate::ChatStepProvider::run_chat_step(
-            &provider,
-            openplotva_dialog::ChatStepRequest {
-                input: base_input(),
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Native(
-                    openplotva_dialog::chat_completion_tools_for_specs(&[
-                        SESSION_REACT_TO_MESSAGE_SPEC,
-                    ])
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("tool defs"),
-                ),
-                iteration: 1,
-            },
-        )
-        .await?;
-
-        assert_eq!(output.tool_calls.len(), 1);
-        assert!(output.tool_calls[0].salvaged);
-        assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
-        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
-        assert_eq!(output.tool_calls[0].step.target_chat_id, -1009876543210);
-        assert_eq!(output.tool_calls[0].step.target_message_id, 424242);
-        assert_eq!(
-            output.text, "",
-            "salvaged session tool markup must not leak into the chat text"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn chat_step_salvages_multiple_direct_session_tool_tags() -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<react_to_message chat_id=\"-1009876543210\" emoji=\"🤣\" message_id=\"424242\" />\n<send_message text=\"Проверяю.\" />"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-        );
-        let output = crate::ChatStepProvider::run_chat_step(
-            &provider,
-            openplotva_dialog::ChatStepRequest {
-                input: base_input(),
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Native(
-                    openplotva_dialog::chat_completion_tools_for_specs(&[
-                        SESSION_REACT_TO_MESSAGE_SPEC,
-                        SESSION_SEND_MESSAGE_SPEC,
-                    ])
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("tool defs"),
-                ),
-                iteration: 1,
-            },
-        )
-        .await?;
-
-        assert_eq!(output.tool_calls.len(), 2);
-        assert!(output.tool_calls.iter().all(|call| call.salvaged));
-        assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
-        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
-        assert_eq!(output.tool_calls[0].step.target_message_id, 424242);
-        assert_eq!(output.tool_calls[1].step.step, STEP_SEND_MESSAGE);
-        assert_eq!(output.tool_calls[1].step.text, "Проверяю.");
-        assert_eq!(
-            output.text, "",
-            "salvaged session tool markup must not leak into the chat text"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn chat_step_salvages_production_named_call_sequence() -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<|channel>thought\n<channel|><call>\n  <tool_name>react_to_message</tool_name>\n  <arguments><emoji>🤣</emoji><message_id>999948</message_id></arguments>\n</call>\n<call>\n  <tool_name>react_to_message</tool_name>\n  <arguments><emoji>😂</emoji><message_id>999949</message_id></arguments>\n</call>\n\nНу и за что тебе такое наказание божье?"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-        );
-        let output = crate::ChatStepProvider::run_chat_step(
-            &provider,
-            openplotva_dialog::ChatStepRequest {
-                input: base_input(),
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Native(
-                    openplotva_dialog::chat_completion_tools_for_specs(&[
-                        SESSION_REACT_TO_MESSAGE_SPEC,
-                    ])
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("tool defs"),
-                ),
-                iteration: 1,
-            },
-        )
-        .await?;
-
-        assert_eq!(output.tool_calls.len(), 2);
-        assert!(output.tool_calls.iter().all(|call| call.salvaged));
-        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
-        assert_eq!(output.tool_calls[0].step.target_message_id, 999948);
-        assert_eq!(output.tool_calls[1].step.emoji, "😂");
-        assert_eq!(output.tool_calls[1].step.target_message_id, 999949);
-        assert_eq!(output.text, "Ну и за что тебе такое наказание божье?");
-        Ok(())
+    #[test]
+    fn native_calls_ignore_textual_preamble_calls_and_drafts() {
+        let response = json!({"choices": [{"message": {
+            "content": "<send_message text=\"Do not publish this draft\" />",
+            "tool_calls": [{"id": "native-search", "type": "function", "function": {
+                "name": "web_search", "arguments": "{\"query\":\"facts\"}"
+            }}]
+        }}]});
+        let ToolStepSelection::Steps { steps, text } =
+            first_choice_tool_steps(&response).expect("native calls")
+        else {
+            panic!("expected native call");
+        };
+        assert!(text.is_empty());
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].step.step, STEP_WEB_SEARCH);
+        assert_eq!(steps[0].native_ref.as_deref(), Some("native-search"));
     }
 
     #[test]
@@ -10624,7 +10449,7 @@ mod tests {
         assert!(preset.iter().any(|word| word == "<message"));
         assert!(
             !preset.iter().any(|word| word.starts_with("<tool_call")),
-            "textual tool calls are how the model calls tools; banning them costs calls"
+            "native tool parsers consume delimiters before our response boundary"
         );
 
         assert_eq!(
@@ -10733,51 +10558,6 @@ mod tests {
             Some(FailureReason::ModelOutputRejected)
         );
         assert!(error.to_string().contains("tool protocol error"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn chat_step_salvages_production_nested_video_preamble_sequence()
-    -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><understand_media><file_id>message_1110901_video_1</file_id></understand_media>"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-        );
-        let output = crate::ChatStepProvider::run_chat_step(
-            &provider,
-            openplotva_dialog::ChatStepRequest {
-                input: base_input(),
-                transcript: Vec::new(),
-                tools: openplotva_dialog::ToolsMode::Native(
-                    openplotva_dialog::chat_completion_tools_for_specs(&[
-                        SESSION_SEND_MESSAGE_SPEC,
-                        openplotva_dialog::alternative_dialog_tools()
-                            .into_iter()
-                            .find(|tool| tool.name == STEP_UNDERSTAND_MEDIA)
-                            .expect("vision tool"),
-                    ])
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("tool defs"),
-                ),
-                iteration: 1,
-            },
-        )
-        .await?;
-
-        assert_eq!(output.text, "");
-        assert_eq!(output.tool_calls.len(), 2);
-        assert_eq!(output.tool_calls[0].step.step, STEP_SEND_MESSAGE);
-        assert_eq!(output.tool_calls[1].step.step, STEP_UNDERSTAND_MEDIA);
-        assert!(output.tool_calls.iter().all(|call| call.salvaged));
-        Ok(())
     }
 
     #[test]
