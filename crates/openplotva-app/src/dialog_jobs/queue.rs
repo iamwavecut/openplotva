@@ -101,9 +101,7 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
             );
             Ok(item.map(|item| {
                 let schedule = self
-                    .records()
-                    .into_iter()
-                    .find(|record| record.id == item.id)
+                    .record(item.id)
                     .map(|record| (record.source_update_ids, record.latest_update_id))
                     .unwrap_or_default();
                 dialog_work_item_from_taskman(item, schedule.0, schedule.1)

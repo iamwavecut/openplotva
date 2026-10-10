@@ -27,7 +27,7 @@ pub(crate) struct RuntimeTaskmanInspectorHandle {
 
 impl RuntimeTaskmanInspectorHandle {
     pub(crate) fn is_configured(&self) -> bool {
-        self.records().is_some()
+        self.shared_queue().is_ok()
     }
 
     pub(crate) fn set_shared_queue(
