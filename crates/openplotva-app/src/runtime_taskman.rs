@@ -720,15 +720,25 @@ fn first_preview<const N: usize>(fields: [&str; N]) -> Option<String> {
 }
 
 fn shrink_preview(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    trim_preview_runes(&compact, 160)
-}
-
-fn trim_preview_runes(value: &str, limit: usize) -> String {
-    let Some((index, _)) = value.char_indices().nth(limit) else {
-        return value.to_owned();
-    };
-    format!("{}...", &value[..index])
+    let mut preview = String::new();
+    let mut length = 0;
+    let mut space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            space = !preview.is_empty();
+            continue;
+        }
+        for ch in space.then_some(' ').into_iter().chain(std::iter::once(ch)) {
+            if length == 160 {
+                preview.push_str("...");
+                return preview;
+            }
+            preview.push(ch);
+            length += 1;
+        }
+        space = false;
+    }
+    preview
 }
 
 fn taskman_queue_names(records: &[&TaskQueueRecord], queues: Vec<String>) -> Vec<String> {
@@ -804,6 +814,27 @@ mod tests {
         TaskQueueJobEvent, TaskQueueJobMessageParams, new_control_job_at, new_dialog_job_at,
         new_image_gen_job_at,
     };
+
+    #[test]
+    fn taskman_preview_preserves_whitespace_and_unicode_truncation() {
+        for text in [
+            "",
+            " \n\t ",
+            "  cat\n\t dog  ",
+            "рыба\u{2003} кот",
+            &"🐟".repeat(160),
+            &"🐟".repeat(161),
+            &format!("{}   fish", "🐟".repeat(159)),
+            &format!("{}   ", "🐟".repeat(160)),
+        ] {
+            let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = compact
+                .char_indices()
+                .nth(160)
+                .map_or_else(|| compact.clone(), |(i, _)| format!("{}...", &compact[..i]));
+            assert_eq!(shrink_preview(text), expected);
+        }
+    }
 
     #[tokio::test]
     async fn runtime_taskman_inspector_lists_live_persistent_control_queue() {
