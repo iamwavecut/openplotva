@@ -426,8 +426,10 @@ impl PostgresDialogInputMaterializer {
             .await?;
         let user = self.load_user(params.user_id).await;
         let history = self.load_history(params, trigger_at, now).await?;
-        let (reference_context, captured_memories) = self.load_reference_context(params).await;
-        let shield_context = self.load_shield_context(params, &history).await;
+        let ((reference_context, captured_memories), shield_context) = tokio::join!(
+            self.load_reference_context(params),
+            self.load_shield_context(params, &history),
+        );
         let mut input = dialog_input_from_materialized_context(
             params,
             now,
