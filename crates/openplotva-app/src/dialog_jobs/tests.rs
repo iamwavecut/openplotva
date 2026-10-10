@@ -80,6 +80,42 @@ fn activity_pulse(
 }
 
 #[tokio::test]
+async fn dialog_dequeue_preserves_claim_and_causation_with_terminal_history()
+-> Result<(), Box<dyn Error>> {
+    let queue = InMemoryTaskQueue::new();
+    let now = OffsetDateTime::now_utc();
+    let old_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("old"), now),
+    );
+    queue.complete(old_id, now)?;
+    let expected = queue.assign_with_schedule(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("current"), now),
+        openplotva_taskman::TaskQueueSchedule {
+            source_update_ids: vec![71, 72],
+            latest_update_id: Some(72),
+            ..Default::default()
+        },
+    );
+    let item = queue
+        .dequeue_dialog_job(DIALOG_AIFARM_QUEUE_NAME)
+        .await?
+        .expect("current dialog");
+    assert_eq!(item.id, expected);
+    assert_eq!(item.source_update_ids, vec![71, 72]);
+    assert_eq!(item.latest_update_id, Some(72));
+    let record = queue.record(expected).expect("claimed record");
+    assert_eq!(record.status, JobStatus::Processing);
+    assert_eq!(record.started_at, Some(item.claim_started_at));
+    assert_eq!(
+        queue.record(old_id).expect("terminal history").status,
+        JobStatus::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<(), Box<dyn Error>>
 {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;

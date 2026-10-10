@@ -514,7 +514,7 @@ impl SharedTaskQueueRuntime {
             journal.flush_dirty().await?;
         }
         let report = SharedTaskQueueRestoreReport {
-            restored: queue.records().len().max(restored_before_requeue),
+            restored: restored_before_requeue,
             requeued,
         };
         Ok((
