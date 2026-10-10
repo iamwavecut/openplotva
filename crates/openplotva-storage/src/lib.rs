@@ -874,9 +874,9 @@ pub const SQL_UPSERT_CHAT_HISTORY_RESET: &str = "INSERT INTO chat_history_resets
 pub const SQL_GET_CHAT_HISTORY_RESET_AT: &str =
     "SELECT reset_at FROM chat_history_resets WHERE chat_id = $1 AND thread_id = $2";
 
-pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($2::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($5::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
+pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($2::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($5::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND occurred_at > $2 AND occurred_at <= $5 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
 
-pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($4::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
+pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($4::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND occurred_at <= $4 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
 
 pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id <> $4 OR occurred_at > $5) ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
 
@@ -13687,6 +13687,30 @@ mod tests {
             assert!(store.recent_chat_history_payloads(chat_id, cutoff, 0, cutoff, before_message, 10).await?.is_empty());
             assert!(store.recent_thread_history_payloads(chat_id, 77, range_end, trigger, 10).await?.is_empty());
             sqlx::query("SET TIME ZONE 'UTC'").execute(&pool).await?;
+            // The causal timestamp must constrain the index scan, rather than filter newer rows.
+            sqlx::query("SET enable_seqscan = off").execute(&pool).await?;
+            let chat_plan: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN (FORMAT JSON) {}", super::SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS
+            )))
+                .bind(chat_id).bind(cutoff).bind(77_i32).bind(cutoff)
+                .bind(trigger.occurred_at).bind(message_id).bind(10_i64)
+                .fetch_one(&pool).await?;
+            let thread_plan: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN (FORMAT JSON) {}", super::SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS
+            )))
+                .bind(chat_id).bind(77_i32).bind(cutoff).bind(trigger.occurred_at)
+                .bind(message_id).bind(10_i64).fetch_one(&pool).await?;
+            for plan in [chat_plan, thread_plan] {
+                let mut nodes = vec![&plan.0[0]["Plan"]];
+                let mut bounded_index = false;
+                while let Some(node) = nodes.pop() {
+                    bounded_index |= node["Index Cond"].as_str().is_some_and(|condition| condition.contains("occurred_at <="));
+                    if let Some(children) = node["Plans"].as_array() { nodes.extend(children); }
+                }
+                assert!(bounded_index, "history scan lacks its causal upper bound: {}", plan.0);
+            }
+            sqlx::query("SET enable_seqscan = on").execute(&pool).await?;
+
 
             let sender_payloads = store
                 .search_history_entries_by_sender_id(chat_id, 77, 100, range_start, 10)
