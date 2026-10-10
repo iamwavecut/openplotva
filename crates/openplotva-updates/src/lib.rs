@@ -1811,9 +1811,29 @@ pub fn resolve_draw_prompt_from_message(
     first_word_lower: &str,
     rest_text: &str,
 ) -> Option<String> {
-    DRAW_VERB_ALIASES
-        .contains(&first_word_lower)
-        .then(|| draw_prompt_with_reply_context(rest_text, Some(message)))
+    let mut verb = first_word_lower.trim_end_matches(',').to_owned();
+    let mut prompt = rest_text.trim().to_owned();
+    let mut request_prefix = false;
+    for _ in 0..2 {
+        if !matches!(verb.as_str(), "пожалуйста" | "прошу" | "можешь" | "можете")
+        {
+            break;
+        }
+        request_prefix = true;
+        (verb, prompt) = cut_first_word(&prompt);
+        verb = verb.trim_end_matches(',').to_lowercase();
+    }
+    let image_generation = matches!(
+        verb.as_str(),
+        "сгенерируй" | "сгенерь" | "создай" | "сделай" | "generate"
+    ) && matches!(
+        cut_first_word(&prompt.to_lowercase()).0.as_str(),
+        "картинку" | "изображение" | "рисунок" | "картину" | "image" | "picture"
+    );
+    (DRAW_VERB_ALIASES.contains(&verb.as_str())
+        || (request_prefix && verb == "нарисовать")
+        || image_generation)
+        .then(|| draw_prompt_with_reply_context(&prompt, Some(message)))
 }
 
 #[must_use]
@@ -3209,7 +3229,14 @@ fn addressed_bot_response_bucket(chat_id: i64, message_id: i64) -> u64 {
 
 const BOT_ADDRESSED_RESPONSE_SAMPLING_DIVISOR: u64 = 3;
 
-const DRAW_VERB_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
+const DRAW_VERB_ALIASES: &[&str] = &[
+    "нарисуй",
+    "нарисуйте",
+    "draw",
+    "рисуй",
+    "рисуйте",
+    "изобрази",
+];
 
 const GUEST_DRAW_BANG_ALIASES: &[&str] = &["!рис", "!draw"];
 
@@ -6375,6 +6402,22 @@ mod tests {
         assert_eq!(
             resolve_draw_prompt_from_message(&text_reply, "song", "cat"),
             None
+        );
+        for (first, rest) in [
+            ("не", "нарисуй рыбу"),
+            ("расскажи", "как нарисовать рыбу"),
+            ("можешь", "объяснить рисование"),
+            ("сгенерируй", "песню про рыбу"),
+            ("нарисовать", "такое сложно?"),
+        ] {
+            assert_eq!(
+                resolve_draw_prompt_from_message(&text_reply, first, rest),
+                None
+            );
+        }
+        assert_eq!(
+            resolve_draw_prompt_from_message(&text_reply, "пожалуйста,", "можешь Нарисовать рыбу"),
+            Some("рыбу".into())
         );
 
         Ok(())

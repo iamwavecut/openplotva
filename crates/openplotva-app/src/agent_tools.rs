@@ -46,6 +46,11 @@ impl DialogToolbox for AgentContextTools {
                             user_id: ctx.user_id,
                             user_full_name: ctx.user_full_name,
                             prompt: step.prompt,
+                            caption: if step.caption.trim().is_empty() {
+                                ctx.message_text
+                            } else {
+                                step.caption
+                            },
                             thread_id: ctx.thread_id,
                             is_forum: ctx.thread_id.is_some(),
                         })

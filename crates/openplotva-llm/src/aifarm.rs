@@ -2968,7 +2968,7 @@ where
     ) -> Result<ChatStepOutput, CompletionError> {
         let history = build_session_history_with_limit(&request.input, self.cfg.max_history);
         let iteration = request.iteration.max(1);
-        let completion_request = self
+        let mut completion_request = self
             .step_request_with_history(
                 &request.input,
                 &history,
@@ -2977,6 +2977,17 @@ where
                 iteration,
             )
             .map_err(|error| Box::new(error) as CompletionError)?;
+        if let Some(name) = request.required_tool.as_deref()
+            && !request.input.disable_tools
+            && matches!(request.tools, ToolsMode::Native(_))
+            && completion_request
+                .tools
+                .iter()
+                .any(|tool| tool["function"]["name"].as_str() == Some(name))
+        {
+            completion_request.tool_choice =
+                Some(json!({"type":"function", "function":{"name":name}}));
+        }
         let model = completion_request.model.clone();
         let guard = reply_leak_guard(&completion_request.messages, &request.input);
         let traced = self
@@ -5800,6 +5811,17 @@ fn saturating_i32(value: u128) -> i32 {
 pub fn build_runtime_context(input: &DialogInput) -> String {
     let mut out = String::new();
     out.push_str("<chat_context>\n");
+    let requested_tool = input.message.meta.requested_tool.as_str();
+    if !input.disable_tools && matches!(requested_tool, "draw_image" | "draw_api" | "generate_song")
+    {
+        write_text_element(
+            &mut out,
+            "explicit_tool_request",
+            &format!(
+                "The current user explicitly requested {requested_tool}. Execute this action through the tool; a text description or promise does not fulfill it. A recorded tool result fulfills the request, including an actual failure."
+            ),
+        );
+    }
     write_text_element(
         &mut out,
         "bot_name",
@@ -8608,6 +8630,29 @@ mod tests {
     }
 
     #[test]
+    fn explicit_image_intent_is_in_the_first_dynamic_message_not_only_history()
+    -> Result<(), AifarmMessageError> {
+        let mut input = base_input();
+        input.message.meta.requested_tool = "draw_image".into();
+        input.message.text = "Плотва, нарисуй рыбу".into();
+        let messages = build_default_initial_messages(&input)?;
+        assert_eq!(messages[0].role, "system");
+        assert!(!messages[0].content.contains("<explicit_tool_request>"));
+        assert_eq!(messages[1].role, "user");
+        assert!(
+            messages[1].content.contains(
+                "<explicit_tool_request>The current user explicitly requested draw_image."
+            )
+        );
+        let explicit_system = messages[0].content.clone();
+        input.message.meta.requested_tool.clear();
+        let ordinary = build_default_initial_messages(&input)?;
+        assert_eq!(ordinary[0].content, explicit_system);
+        assert!(!ordinary[1].content.contains("<explicit_tool_request>"));
+        Ok(())
+    }
+
+    #[test]
     fn runtime_context_uses_names_custom_persona_and_raw_shield() {
         let input = DialogInput {
             context: DialogContext {
@@ -10057,6 +10102,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_step_forces_only_an_available_native_tool_for_an_explicit_action()
+    -> Result<(), CompletionError> {
+        for (required, disabled, final_step, forced) in [
+            ("draw_image", false, false, true),
+            ("draw_image", true, false, false),
+            ("draw_image", false, true, false),
+            ("not_advertised", false, false, false),
+        ] {
+            let (provider, transport, _) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": "answer"}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let mut input = base_input();
+            input.disable_tools = disabled;
+            crate::ChatStepProvider::run_chat_step(
+                &provider,
+                ChatStepRequest {
+                    required_tool: Some(required.into()),
+                    preferred_target: None,
+                    input,
+                    transcript: Vec::new(),
+                    tools: if final_step {
+                        ToolsMode::FinalOnly
+                    } else {
+                        ToolsMode::Native(native_tool_values(&["draw_image"]).expect("draw tool"))
+                    },
+                    iteration: 2,
+                },
+            )
+            .await?;
+            let requests = transport.requests();
+            let body: Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
+            assert_eq!(
+                body["tool_choice"].is_object(),
+                forced,
+                "{required}, disabled={disabled}, final={final_step}: {body}"
+            );
+            if forced {
+                assert_eq!(
+                    body["tool_choice"],
+                    json!({"type": "function", "function": {"name": "draw_image"}})
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn chat_step_parses_native_tool_calls_without_publishing_adjacent_text()
     -> Result<(), CompletionError> {
         let (provider, transport, toolbox) = direct_dialog_provider(
@@ -10079,6 +10172,7 @@ mod tests {
             AifarmDialogConfig::default(),
         );
         let request = openplotva_dialog::ChatStepRequest {
+            required_tool: None,
             preferred_target: None,
             input: base_input(),
             transcript: Vec::new(),
@@ -10136,6 +10230,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
@@ -10183,6 +10278,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
@@ -10225,6 +10321,7 @@ mod tests {
         let error = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
@@ -10262,6 +10359,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
@@ -10306,6 +10404,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &native_provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: transcript.clone(),
@@ -10322,6 +10421,7 @@ mod tests {
         let output = crate::ChatStepProvider::run_chat_step(
             &final_provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript,
@@ -10399,6 +10499,7 @@ mod tests {
             let error = crate::ChatStepProvider::run_chat_step(
                 &provider,
                 openplotva_dialog::ChatStepRequest {
+                    required_tool: None,
                     preferred_target: None,
                     input: base_input(),
                     transcript: Vec::new(),
@@ -10491,6 +10592,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input,
                 transcript: Vec::new(),
@@ -10521,6 +10623,7 @@ mod tests {
         crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),
@@ -10557,6 +10660,7 @@ mod tests {
         let error = crate::ChatStepProvider::run_chat_step(
             &provider,
             openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: base_input(),
                 transcript: Vec::new(),

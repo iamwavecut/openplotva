@@ -245,8 +245,10 @@ pub struct DirectDrawApiRequest {
     pub user_id: i64,
     /// Caller display name.
     pub user_full_name: String,
-    /// Raw shortcut prompt after `%`.
+    /// Technical generation prompt after `%`.
     pub prompt: String,
+    /// Readable caption, independent from generation instructions.
+    pub caption: String,
     /// Forum topic ID.
     pub thread_id: Option<i32>,
     /// Whether the target chat is a forum.
@@ -574,7 +576,11 @@ where
                 user_full_name: request.user_full_name.clone(),
                 thread_id: request.thread_id,
                 prompt: request.prompt.clone(),
-                caption_text: request.prompt.clone(),
+                caption_text: if request.caption.trim().is_empty() {
+                    request.prompt.clone()
+                } else {
+                    request.caption.clone()
+                },
                 ..ImageGenerationRequest::default()
             };
             let result = match self.generator.generate_image(generation).await {
@@ -1794,9 +1800,9 @@ where
             .as_ref()
             .is_some_and(context_has_editable_image);
     let intent = if is_direct_draw_api_shortcut(&first_word_lower) {
-        Some(format!(
-            "Requested tool: draw_api. Prompt: {}",
-            parsed.rest_text
+        Some((
+            "draw_api",
+            format!("Requested tool: draw_api. Prompt: {}", parsed.rest_text),
         ))
     } else if let Some(topic) = direct_song_shortcut_topic(
         message,
@@ -1805,9 +1811,12 @@ where
         &parsed.rest_text,
         &bot_username,
     ) {
-        Some(format!(
-            "Requested tool: generate_song. Topic: {}",
-            resolve_song_topic(message, &topic).unwrap_or_default()
+        Some((
+            "generate_song",
+            format!(
+                "Requested tool: generate_song. Topic: {}",
+                resolve_song_topic(message, &topic).unwrap_or_default()
+            ),
         ))
     } else {
         direct_image_shortcut(
@@ -1818,19 +1827,24 @@ where
             editable,
         )
         .map(|action| match action {
-            DirectImageShortcut::Draw(prompt) => {
-                format!("Requested tool: draw_image. Prompt: {prompt}")
-            }
-            DirectImageShortcut::Edit(prompt) => format!(
-                "Requested tool: draw_image with source attachments. Edit: {}",
-                resolve_direct_image_edit_prompt(
-                    &prompt,
-                    reply_context.as_ref().unwrap_or(&context)
-                )
+            DirectImageShortcut::Draw(prompt) => (
+                "draw_image",
+                format!("Requested tool: draw_image. Prompt: {prompt}"),
+            ),
+            DirectImageShortcut::Edit(prompt) => (
+                "draw_image",
+                format!(
+                    "Requested tool: draw_image with source attachments. Edit: {}",
+                    resolve_direct_image_edit_prompt(
+                        &prompt,
+                        reply_context.as_ref().unwrap_or(&context)
+                    )
+                ),
             ),
         })
     };
-    if let Some(intent) = intent {
+    if let Some((tool, intent)) = intent {
+        context.meta.requested_tool = tool.to_owned();
         context.meta.annotation.push_str(&format!("\n{intent}"));
     }
 
@@ -2048,8 +2062,17 @@ fn direct_draw_api_photo_request(
         },
         disable_notification: false,
         photo,
-        caption: String::new(),
-        render_as: String::new(),
+        caption: crate::image_jobs::build_image_generation_caption(
+            if request.caption.trim().is_empty() {
+                &request.prompt
+            } else {
+                &request.caption
+            },
+            &request.user_full_name,
+            false,
+            false,
+        ),
+        render_as: "HTML".to_owned(),
         has_spoiler: false,
         reply_parameters: Some(ReplyParametersPlan {
             message_id: i64::from(request.message_id),
@@ -5063,6 +5086,7 @@ mod tests {
                 user_id: 99,
                 user_full_name: "Ada".to_owned(),
                 prompt: "neon koi".to_owned(),
+                caption: String::new(),
                 thread_id: Some(9),
                 is_forum: true,
             })
@@ -5137,6 +5161,7 @@ mod tests {
                 user_id: 99,
                 user_full_name: "Ada".to_owned(),
                 prompt: "neon koi".to_owned(),
+                caption: String::new(),
                 thread_id: None,
                 is_forum: false,
             })
@@ -5181,6 +5206,7 @@ mod tests {
                 user_id: 99,
                 user_full_name: "Ada".to_owned(),
                 prompt: "neon koi".to_owned(),
+                caption: String::new(),
                 thread_id: None,
                 is_forum: false,
             })
@@ -5352,6 +5378,7 @@ mod tests {
             user_id: 99,
             user_full_name: "Ada".to_owned(),
             prompt: "neon koi".to_owned(),
+            caption: "Неоновая рыба".to_owned(),
             thread_id: Some(9),
             is_forum: true,
         };
@@ -5364,6 +5391,9 @@ mod tests {
             },
         )
         .expect("bytes photo");
+        assert!(bytes.caption.contains("Неоновая рыба"));
+        assert!(!bytes.caption.contains("neon koi"));
+        assert_eq!(bytes.render_as, "HTML");
         assert_eq!(
             bytes.photo,
             PhotoSource::Bytes {
@@ -6464,6 +6494,9 @@ mod tests {
             ("@plotva_bot песня про море", "generate_song"),
             ("!draw red fish", "draw_image"),
             ("@plotva_bot нарисуй рыбу", "draw_image"),
+            ("@plotva_bot пожалуйста, нарисуй рыбу", "draw_image"),
+            ("@plotva_bot можешь нарисовать рыбу", "draw_image"),
+            ("@plotva_bot сгенерируй картинку рыбы", "draw_image"),
             ("@plotva_bot % red fish", "draw_api"),
         ] {
             let scheduler = SchedulerStub::default();
@@ -6483,6 +6516,7 @@ mod tests {
                 "{text}: {route:?}"
             );
             assert_eq!(scheduler.calls().len(), 1, "{text}");
+            assert_eq!(scheduler.metas()[0].requested_tool, tool, "{text}");
             assert!(
                 scheduler.metas()[0].annotation.contains(tool),
                 "{text}: {:?}",

@@ -229,9 +229,12 @@ fn is_false(value: &bool) -> bool {
 pub struct DrawRequest {
     /// Tool context.
     pub context: ToolContext,
-    /// Image prompt.
+    /// Technical image prompt; never used as the caption when a source request is available.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
+    /// Optional readable caption in the user's language, separate from generation instructions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
     /// Stable image IDs selected from the current dialog context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_ids: Vec<String>,
@@ -463,6 +466,7 @@ const INLINE_TOOL_ARG_KEYS: &[&str] = &[
     "final_reply",
     "gift",
     "prompt",
+    "caption",
     "topic",
     "file_id",
     "file_ids",
@@ -559,7 +563,12 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "prompt",
         required: true,
-        description: "Image prompt. Prefer concrete visual instructions.",
+        description: "Technical visual instructions for generation, separate from the visible caption. Keep the user's requested content.",
+    },
+    ToolArgSpec {
+        name: "caption",
+        required: false,
+        description: "Optional readable caption in the user's language. Use their original request verbatim or a concise faithful adaptation. Omit to show the source message. Never put the technical or optimized generation prompt here.",
     },
     ToolArgSpec {
         name: "file_ids",
@@ -703,11 +712,18 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         when_to_use: "Use for an explicit % image shortcut; draw_image handles ordinary generation and edits.",
         result: "Returns delivery status. Do not announce success before the result.",
         continuation: ToolContinuation::RequiresFollowup,
-        args: &[ToolArgSpec {
-            name: "prompt",
-            required: true,
-            description: "Image prompt after the % shortcut.",
-        }],
+        args: &[
+            ToolArgSpec {
+                name: "prompt",
+                required: true,
+                description: "Technical generation instructions after the % shortcut.",
+            },
+            ToolArgSpec {
+                name: "caption",
+                required: false,
+                description: "Readable caption: the user's original request or a faithful adaptation in their language. Omit to show the source message; never expose the technical generation prompt.",
+            },
+        ],
     },
     ToolSpec {
         name: "get_messages",
@@ -2401,9 +2417,12 @@ pub struct ToolStep {
     /// Tool name.
     #[serde(default, rename = "step")]
     pub step: String,
-    /// Image prompt.
+    /// Technical image prompt; never used as the caption when a source request is available.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
+    /// Optional readable caption in the user's language, separate from generation instructions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
     /// Song topic.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub topic: String,

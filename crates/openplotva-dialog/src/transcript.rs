@@ -22,7 +22,11 @@ pub fn dialog_tool_context(input: &DialogInput) -> ToolContext {
         message_id: input.message.id,
         user_id: input.user.id,
         user_full_name: input.user.full_name.clone(),
-        message_text: input.message.text.clone(),
+        message_text: if input.message.original_text.trim().is_empty() {
+            input.message.text.clone()
+        } else {
+            input.message.original_text.clone()
+        },
         message_meta: input.message.meta.clone(),
         image_attachments: dialog_image_attachments(input),
         image_reference_ids: dialog_image_reference_ids(input),
@@ -158,6 +162,8 @@ pub struct ChatStepRequest {
     /// In-session messages so far; empty on the first iteration.
     pub transcript: Vec<SessionMessage>,
     pub tools: ToolsMode,
+    /// Require this native function for an explicit action that has not been attempted.
+    pub required_tool: Option<String>,
     /// Continue with this provider/model pair when it remains eligible and live.
     pub preferred_target: Option<(String, String)>,
     /// 1-based session iteration, used for trace/telemetry tagging.

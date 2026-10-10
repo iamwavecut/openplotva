@@ -303,6 +303,22 @@ fn session_native_tools(allow_finish: bool) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+fn pending_image_tool<'a>(
+    context: &'a ToolContext,
+    calls: &[ToolCall],
+    call_offset: usize,
+) -> Option<&'a str> {
+    let tool = context.message_meta.requested_tool.as_str();
+    matches!(tool, "draw_image" | "draw_api")
+        .then_some(tool)
+        .filter(|name| {
+            !calls
+                .iter()
+                .skip(call_offset)
+                .any(|call| call.name == *name)
+        })
+}
+
 fn record_rejected_final(agent: &mut openplotva_agent::AgentLoop, text: &str, reason: &str) {
     agent.transcript.push(SessionMessage::Assistant {
         text: text.to_owned(),
@@ -334,6 +350,8 @@ pub(crate) struct SessionRunContext<'a> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SessionState {
+    #[serde(default)]
+    requested_tool_call_offset: usize,
     tool_context: ToolContext,
     gift_used: bool,
     budget: SessionBudget,
@@ -468,6 +486,7 @@ where
     let max_iterations = cfg.max_iterations.max(1);
 
     let mut state = restored.unwrap_or(SessionState {
+        requested_tool_call_offset: 0,
         tool_context: meta,
         gift_used: false,
         budget,
@@ -542,15 +561,22 @@ where
         if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_checkpoint", BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
             return std::ops::ControlFlow::Break(agent_persistence_failed(error));
         }
-        let SessionState { mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs } = state;
-        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs }, report)) }; }
+        let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs } = state;
+        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { requested_tool_call_offset, tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs }, report)) }; }
 
+        let previously_observed_message_id = agent.observed_message_id;
         if let Ok(Ok(messages)) = tokio::time::timeout(std::time::Duration::from_secs(2), materializer.observe_dialog_messages(active_params, agent.observed_message_id)).await {
             for mut message in messages {
                 if let Some(id) = message.get("message_id").and_then(Value::as_i64).and_then(|id| i32::try_from(id).ok()) {
                     agent.observed_message_id = agent.observed_message_id.max(id);
                 }
                 message["can_change_task"] = Value::Bool(message.get("user_id").and_then(Value::as_i64) == Some(active_params.user_id));
+                if message["can_change_task"] == true {
+                    tool_context.message_id = message["message_id"].as_i64().and_then(|id| i32::try_from(id).ok()).unwrap_or(tool_context.message_id);
+                    tool_context.message_meta.requested_tool = message["meta"]["requested_tool"].as_str().unwrap_or_default().to_owned();
+                    requested_tool_call_offset = recorded_tool_calls.len();
+                    if let Some(text) = message["text"].as_str() { tool_context.message_text = text.to_owned(); }
+                }
                 remember_context_images(&mut tool_context, &message);
                 links.record_tool_result(&ToolResult {status:"ok".into(), data:Some(message.clone()), ..ToolResult::default()});
                 agent.transcript.push(SessionMessage::InjectedUser { rendered:message.to_string() });
@@ -563,6 +589,12 @@ where
                 let params = injected.params;
                 if let Ok(meta) = serde_json::from_value::<openplotva_core::ChatMessageMeta>(params.meta.clone()) {
                     extend_context_images(&mut tool_context, params.message_id, meta.attachments);
+                }
+                if params.message_id > previously_observed_message_id && params.message_id >= tool_context.message_id && params.user_id == active_params.user_id {
+                    tool_context.message_id = params.message_id;
+                    tool_context.message_meta.requested_tool = params.meta["requested_tool"].as_str().unwrap_or_default().to_owned();
+                    requested_tool_call_offset = recorded_tool_calls.len();
+                    tool_context.message_text = if params.original_text.trim().is_empty() { params.message_text.clone() } else { params.original_text.clone() };
                 }
                 if params.message_id <= agent.observed_message_id { continue; }
                 agent.observed_message_id = params.message_id;
@@ -600,7 +632,8 @@ where
             ToolsMode::Native((*native_tools).clone())
         };
 
-        let input = (*base_input).clone();
+        let mut input = (*base_input).clone();
+        input.message.meta.requested_tool = tool_context.message_meta.requested_tool.clone();
         let mut add_hint = |hint: &str| {
             let rendered = format!("Runtime guidance: {hint}");
             if !agent.transcript.iter().any(|message| matches!(message, SessionMessage::InjectedUser { rendered: prior } if prior == &rendered)) {
@@ -619,6 +652,7 @@ where
                 Some(provider_deadline),
                 step_provider.run_chat_step(ChatStepRequest {
                     input,
+                    required_tool: pending_image_tool(&tool_context, &recorded_tool_calls, requested_tool_call_offset).map(str::to_owned),
                     preferred_target: agent.preferred_target.clone(),
                     transcript: agent.transcript.clone(),
                     tools,
@@ -711,7 +745,11 @@ where
             // stands on its own.
             let raw_answer = step.text.clone();
             let sanitized = links.prepare_response(&raw_answer);
-            if sanitized.trim().is_empty() {
+            let image_action_missing = !base_input.disable_tools
+                && pending_image_tool(&tool_context, &recorded_tool_calls, requested_tool_call_offset).is_some();
+            if sanitized.trim().is_empty() || (image_action_missing
+                && (force_final || regenerations >= ctx.max_regenerations.max(0)
+                    || budget.remaining(failure_now) < MIN_REGENERATION_BUDGET)) {
                 if !side_effect_tickets.is_empty() {
                     // Silent side-effect finish (should have terminated at
                     // the tool batch already; kept as a safety net).
@@ -730,7 +768,12 @@ where
                         disposition: JobDisposition::Fail(error),
                     });
                 }
-                let (codes, error) = if raw_answer.trim().is_empty() {
+                let (codes, error) = if image_action_missing {
+                    (
+                        SANITIZED_EMPTY_RETRY_CODES,
+                        "dialog provider did not execute the explicitly requested image tool",
+                    )
+                } else if raw_answer.trim().is_empty() {
                     (
                         PROVIDER_EMPTY_RETRY_CODES,
                         "dialog provider returned no answer, response, or queued tool material",
@@ -760,6 +803,18 @@ where
                     report,
                 )
                 .await);
+            }
+
+            if !base_input.disable_tools && !force_final
+                && let Some(tool) = pending_image_tool(&tool_context, &recorded_tool_calls, requested_tool_call_offset)
+                && regenerations < ctx.max_regenerations.max(0)
+                && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
+            {
+                let reason = format!("The user explicitly requested {tool}, but it was not called. Execute the image tool with the user's request; do not replace the action with text.");
+                regenerations += 1;
+                report.regenerations = regenerations;
+                record_rejected_final(&mut agent, &sanitized, &reason);
+                return next_step!();
             }
 
             if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)

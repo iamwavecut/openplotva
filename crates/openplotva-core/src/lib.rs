@@ -244,6 +244,9 @@ pub struct ChatMessageMeta {
 
     #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
     pub message_type: String,
+    /// Explicit action recognized by the trusted message router.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_tool: String,
     /// Optional annotation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub annotation: String,
