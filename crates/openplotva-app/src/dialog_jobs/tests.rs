@@ -3843,6 +3843,7 @@ impl openplotva_dialog::DialogToolbox for SessionToolboxStub {
 #[derive(Default)]
 struct ReactorStub {
     reactions: Mutex<Vec<(i64, i64, String)>>,
+    responses: Mutex<VecDeque<Result<(), String>>>,
 }
 
 impl crate::dialog_turn::SessionReactor for ReactorStub {
@@ -3856,7 +3857,13 @@ impl crate::dialog_turn::SessionReactor for ReactorStub {
             .lock()
             .expect("reactions")
             .push((chat_id, message_id, emoji.to_owned()));
-        Box::pin(async { Ok(()) })
+        let response = self
+            .responses
+            .lock()
+            .expect("responses")
+            .pop_front()
+            .unwrap_or(Ok(()));
+        Box::pin(async move { response })
     }
 }
 
@@ -5753,6 +5760,77 @@ async fn session_intermediate_without_final_answer_is_terminal_failure()
             .iter()
             .any(|event| { event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_reaction_denial_allows_repair_before_success() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("смешно же"), now),
+    );
+    let react = |emoji: &str, id: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: emoji.to_owned(),
+                    target_chat_id: -999,
+                    target_message_id: 100,
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(react("🤯", "denied")),
+        Ok(react("👍", "repaired")),
+        Ok(react("🔥", "repeat")),
+        Ok(step_text("ну да")),
+    ]);
+    let reactor = Arc::new(ReactorStub {
+        responses: Mutex::new(VecDeque::from([
+            Err("Bad Request: REACTION_INVALID".to_owned()),
+            Ok(()),
+        ])),
+        ..ReactorStub::default()
+    });
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(
+        toolbox,
+        Some(Arc::clone(&reactor) as Arc<dyn crate::dialog_turn::SessionReactor>),
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(report.sent_answer);
+    assert_eq!(
+        reactor.reactions.lock().expect("attempts").clone(),
+        vec![(42, 100, "🤯".to_owned()), (42, 100, "👍".to_owned())],
+        "a denied reaction permits another emoji; a success prevents replacement"
+    );
+    let transcript = format!(
+        "{:?}",
+        provider.requests().last().expect("final").transcript
+    );
+    assert!(transcript.contains("reaction_failed"));
+    assert!(transcript.contains("already_reacted"));
     Ok(())
 }
 
