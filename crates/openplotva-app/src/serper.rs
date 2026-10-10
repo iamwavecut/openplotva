@@ -114,22 +114,7 @@ impl SerperClient {
             .send()
             .await
             .map_err(|error| SerperError::Request(error.without_url()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SerperError::message(format!(
-                "crawl failed with status {}",
-                status.as_u16()
-            )));
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| SerperError::ReadResponseBody(error.without_url()))?;
-        let body = String::from_utf8_lossy(&body).trim().to_owned();
-        if body.is_empty() {
-            return Err(SerperError::message("empty response body".to_owned()));
-        }
-        Ok(html_body_to_plain_text(&body))
+        read_crawl_response(response).await
     }
 
     async fn perform_search_with_retry(
@@ -193,6 +178,43 @@ impl SerperClient {
             .map_err(|error| SerperError::message(format!("unmarshal response: {error}")))?;
         Ok(String::from_utf8_lossy(&body).trim().to_owned())
     }
+}
+
+async fn read_crawl_response(mut response: reqwest::Response) -> Result<String, SerperError> {
+    if !response.status().is_success() {
+        return Err(SerperError::message(format!(
+            "crawl failed with status {}",
+            response.status().as_u16()
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| SerperError::ReadResponseBody(error.without_url()))?
+    {
+        if body.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+            return Err(SerperError::message(
+                "page exceeds 2 MiB decoded limit".to_owned(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body)
+        .map_err(|_| SerperError::message("page is not UTF-8 text".to_owned()))?;
+    if body
+        .chars()
+        .any(|ch| ch.is_control() && !ch.is_whitespace())
+    {
+        return Err(SerperError::message(
+            "page contains binary control characters".to_owned(),
+        ));
+    }
+    let text = html_body_to_plain_text(body.trim());
+    if text.is_empty() {
+        return Err(SerperError::message("empty response body".to_owned()));
+    }
+    Ok(text)
 }
 
 impl WebSearchProvider for SerperClient {
@@ -570,6 +592,63 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn crawl_decodes_gzip_and_rejects_binary_or_oversized_pages() -> Result<(), Box<dyn Error>>
+    {
+        let gzip: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 179, 201, 40, 201, 205, 177, 179, 73, 202, 79, 169,
+            180, 11, 168, 44, 201, 200, 207, 83, 72, 43, 74, 77, 213, 45, 201, 40, 74, 77, 76, 201,
+            204, 75, 87, 200, 44, 86, 200, 47, 40, 201, 204, 207, 75, 204, 209, 179, 209, 7, 43,
+            180, 209, 7, 235, 2, 0, 4, 118, 198, 225, 60, 0, 0, 0,
+        ];
+        for (body, encoding, expected) in [
+            (
+                gzip.to_vec(),
+                "gzip",
+                Ok("Python free-threading is optional."),
+            ),
+            (b"text\0binary".to_vec(), "identity", Err("binary control")),
+            (vec![0xff], "identity", Err("not UTF-8")),
+            (
+                vec![b'a'; 2 * 1024 * 1024 + 1],
+                "identity",
+                Err("decoded limit"),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                read_request(&mut stream)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await?;
+                stream.write_all(&body).await?;
+                Ok::<_, std::io::Error>(())
+            });
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}"))
+                .send()
+                .await?;
+            let result = read_crawl_response(response).await;
+            match expected {
+                Ok(text) => assert_eq!(result?, text),
+                Err(message) => assert!(
+                    result
+                        .expect_err("invalid page")
+                        .to_string()
+                        .contains(message)
+                ),
+            }
+            server.await??;
+        }
+        Ok(())
+    }
+
     #[test]
     fn crawl_url_policy_accepts_only_public_addresses() {
         assert!(is_public_destination_ip(
@@ -608,6 +687,27 @@ mod tests {
         assert!(!should_retry_serper_error("api error: status 401", 0));
         assert!(!should_retry_serper_error("unmarshal response: EOF", 0));
         assert!(!should_retry_serper_error("api error: status 503", 3));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_crawl_smoke_reads_text() -> Result<(), Box<dyn Error>> {
+        let url = env::var("OPENPLOTVA_CRAWL_SMOKE_URL")?;
+        let expected = env::var("OPENPLOTVA_CRAWL_SMOKE_EXPECT")?;
+        let config = AppConfig::from_raw(RawConfig {
+            serper_api_key: Some("crawl-does-not-use-serper-key".to_owned()),
+            serper_timeout_seconds: Some("20".to_owned()),
+            ..RawConfig::default()
+        })?;
+        let client = SerperClient::from_config(&config.serper)?
+            .ok_or_else(|| std::io::Error::other("crawler was not built"))?;
+        let text = client.crawl_url(&url).await?;
+        assert!(
+            text.contains(&expected),
+            "page did not contain expected text"
+        );
+        assert!(!text.contains('\0'));
+        Ok(())
     }
 
     #[tokio::test]

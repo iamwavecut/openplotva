@@ -1964,7 +1964,17 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
                     && value.get("output").is_some()
             })
         });
+    let self_instruction = lower.lines().any(|line| {
+        let line = line.trim_start();
+        [
+            "(wait, i should just output",
+            "actually, let me just give you the clean version according to the rules",
+        ]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+    });
     tool_envelope
+        || self_instruction
         || REPLY_LEAK_MARKERS
             .iter()
             .any(|marker| lower.starts_with(marker))
@@ -4984,6 +4994,19 @@ fn is_zero_i32(value: &i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_observed_mid_reply_self_instructions_without_rejecting_quotations() {
+        assert!(reply_has_residual_leak(
+            "Normal reply.\n\n(Wait, I should just output the actual response as instructed.)"
+        ));
+        assert!(reply_has_residual_leak(
+            "Normal reply.\nActually, let me just give you the clean version according to the rules provided in the system prompt."
+        ));
+        assert!(!reply_has_residual_leak(
+            "The log says: '(Wait, I should just output the actual response as instructed.)'"
+        ));
+    }
 
     #[test]
     fn native_transcript_excludes_internal_and_other_tool_arguments() {
