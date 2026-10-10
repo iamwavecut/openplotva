@@ -6319,6 +6319,121 @@ fn step_context(request: &openplotva_dialog::ChatStepRequest) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for queued in [true, false] {
+        let queue = InMemoryTaskQueue::new();
+        let mut params = dialog_params("Плотва, нарисуй рыбу в космосе");
+        params.meta = serde_json::json!({"requested_tool": "draw_image"});
+        queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+        let provider = StepProviderStub::with_steps(vec![
+            Ok(step_text("Сначала я подумаю, как изобразить эту рыбу.")),
+            Ok(step_tools(
+                "",
+                vec![(
+                    "draw",
+                    openplotva_dialog::ToolStep {
+                        step: "draw_image".into(),
+                        prompt: "A fish floating in space, cinematic lighting".into(),
+                        caption: "Рыба в космосе".into(),
+                        ..Default::default()
+                    },
+                )],
+            )),
+            Ok(step_text("Сервис рисования сейчас недоступен.")),
+        ]);
+        let toolbox = Arc::new(if queued {
+            SessionToolboxStub::with_queued_draw("image-ticket")
+        } else {
+            SessionToolboxStub::default()
+        });
+        let wiring = session_wiring(toolbox.clone(), None);
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            session_options(now, &outcomes, &wiring),
+        )
+        .await;
+        assert!(report.completed, "{report:?}");
+        assert!(!report.failed, "{report:?}");
+        assert_eq!(report.regenerations, 1);
+        let requests = provider.requests();
+        assert_eq!(requests[0].required_tool.as_deref(), Some("draw_image"));
+        assert_eq!(requests[1].required_tool.as_deref(), Some("draw_image"));
+        assert!(
+            step_context(&requests[1])
+                .iter()
+                .any(|context| context.contains("explicitly requested draw_image"))
+        );
+        assert!(effects.intermediates().is_empty());
+        assert!(
+            effects
+                .sent()
+                .iter()
+                .all(|(_, text)| !text.contains("Сначала я подумаю"))
+        );
+        let draws = toolbox.draw_requests.lock().expect("draw requests");
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].caption, "Рыба в космосе");
+        assert_eq!(
+            draws[0].context.message_text,
+            "Плотва, нарисуй рыбу в космосе"
+        );
+        if !queued {
+            assert_eq!(requests[2].required_tool, None);
+            assert_eq!(effects.sent()[0].1, "Сервис рисования сейчас недоступен.");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_image_request_never_publishes_a_promise_after_exhausted_repairs()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let mut params = dialog_params("Плотва, нарисуй рыбу");
+    params.meta = serde_json::json!({"requested_tool": "draw_image"});
+    queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+    let provider =
+        StepProviderStub::with_steps((0..3).map(|_| Ok(step_text("Сейчас нарисую."))).collect());
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert!(!report.sent_answer, "{report:?}");
+    assert!(effects.sent().is_empty());
+    assert!(effects.intermediates().is_empty());
+    assert_eq!(provider.requests().len(), 3);
+    assert!(
+        report
+            .empty_answer_error
+            .as_deref()
+            .is_some_and(|error| error.contains("requested image tool"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_returns_rejected_duplicate_draft_to_the_agent() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();

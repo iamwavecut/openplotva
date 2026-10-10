@@ -303,6 +303,13 @@ fn session_native_tools(allow_finish: bool) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+fn pending_image_tool<'a>(context: &'a ToolContext, calls: &[ToolCall]) -> Option<&'a str> {
+    let tool = context.message_meta.requested_tool.as_str();
+    matches!(tool, "draw_image" | "draw_api")
+        .then_some(tool)
+        .filter(|name| !calls.iter().any(|call| call.name == *name))
+}
+
 fn record_rejected_final(agent: &mut openplotva_agent::AgentLoop, text: &str, reason: &str) {
     agent.transcript.push(SessionMessage::Assistant {
         text: text.to_owned(),
@@ -565,6 +572,9 @@ where
                     extend_context_images(&mut tool_context, params.message_id, meta.attachments);
                 }
                 if params.message_id <= agent.observed_message_id { continue; }
+                if params.user_id == active_params.user_id {
+                    tool_context.message_meta.requested_tool.clear();
+                }
                 agent.observed_message_id = params.message_id;
                 links.record_tool_result(&ToolResult {status:"ok".into(), message:params.message_text.clone(), ..ToolResult::default()});
                 agent.transcript.push(SessionMessage::InjectedUser {
@@ -600,7 +610,8 @@ where
             ToolsMode::Native((*native_tools).clone())
         };
 
-        let input = (*base_input).clone();
+        let mut input = (*base_input).clone();
+        input.message.meta.requested_tool = tool_context.message_meta.requested_tool.clone();
         let mut add_hint = |hint: &str| {
             let rendered = format!("Runtime guidance: {hint}");
             if !agent.transcript.iter().any(|message| matches!(message, SessionMessage::InjectedUser { rendered: prior } if prior == &rendered)) {
@@ -619,6 +630,7 @@ where
                 Some(provider_deadline),
                 step_provider.run_chat_step(ChatStepRequest {
                     input,
+                    required_tool: pending_image_tool(&tool_context, &recorded_tool_calls).map(str::to_owned),
                     preferred_target: agent.preferred_target.clone(),
                     transcript: agent.transcript.clone(),
                     tools,
@@ -711,7 +723,11 @@ where
             // stands on its own.
             let raw_answer = step.text.clone();
             let sanitized = links.prepare_response(&raw_answer);
-            if sanitized.trim().is_empty() {
+            let image_action_missing = !base_input.disable_tools
+                && pending_image_tool(&tool_context, &recorded_tool_calls).is_some();
+            if sanitized.trim().is_empty() || (image_action_missing
+                && (force_final || regenerations >= ctx.max_regenerations.max(0)
+                    || budget.remaining(failure_now) < MIN_REGENERATION_BUDGET)) {
                 if !side_effect_tickets.is_empty() {
                     // Silent side-effect finish (should have terminated at
                     // the tool batch already; kept as a safety net).
@@ -730,7 +746,12 @@ where
                         disposition: JobDisposition::Fail(error),
                     });
                 }
-                let (codes, error) = if raw_answer.trim().is_empty() {
+                let (codes, error) = if image_action_missing {
+                    (
+                        SANITIZED_EMPTY_RETRY_CODES,
+                        "dialog provider did not execute the explicitly requested image tool",
+                    )
+                } else if raw_answer.trim().is_empty() {
                     (
                         PROVIDER_EMPTY_RETRY_CODES,
                         "dialog provider returned no answer, response, or queued tool material",
@@ -760,6 +781,18 @@ where
                     report,
                 )
                 .await);
+            }
+
+            if !base_input.disable_tools && !force_final
+                && let Some(tool) = pending_image_tool(&tool_context, &recorded_tool_calls)
+                && regenerations < ctx.max_regenerations.max(0)
+                && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
+            {
+                let reason = format!("The user explicitly requested {tool}, but it was not called. Execute the image tool with the user's request; do not replace the action with text.");
+                regenerations += 1;
+                report.regenerations = regenerations;
+                record_rejected_final(&mut agent, &sanitized, &reason);
+                return next_step!();
             }
 
             if !web_source_urls.is_empty() && !answer_cites_web_source(&sanitized, &web_source_urls)

@@ -691,6 +691,7 @@ pub struct DrawImageScheduleRequest {
     pub aspect_ratio: String,
     /// Sanitized seed.
     pub seed: String,
+    /// Readable caption; stored independently from the technical generation prompt.
     pub original_prompt: String,
 }
 
@@ -1333,7 +1334,11 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     user_id: request.user_id,
                     user_full_name: request.user_full_name,
                     prompt: base_prompt.clone(),
-                    original_text: base_prompt,
+                    original_text: if request.original_prompt.trim().is_empty() {
+                        base_prompt
+                    } else {
+                        sanitize_tool_text(&request.original_prompt)
+                    },
                     meta,
                     prompt_variants: request.prompt_variants,
                     negative_prompt: request.negative_prompt,
@@ -2407,7 +2412,9 @@ where
                 Ok(attachments) => attachments,
                 Err(reason) => return Ok(ToolResult::failed("draw_image_source_invalid", reason)),
             };
-            let original_prompt = if attachments.iter().any(|image| image.kind == "image")
+            let original_prompt = if !req.caption.trim().is_empty() {
+                sanitize_tool_text(&req.caption)
+            } else if !req.context.message_meta.agent_gift
                 && !req.context.message_text.trim().is_empty()
             {
                 sanitize_tool_text(&req.context.message_text)
@@ -4300,6 +4307,7 @@ mod tests {
                 ..context()
             },
             prompt: "  neon castle  ".to_owned(),
+            caption: String::new(),
             file_ids: Vec::new(),
             negative_prompt: "  blur  ".to_owned(),
             aspect_ratio: " 16:9 ".to_owned(),
@@ -4349,6 +4357,42 @@ mod tests {
                 original_prompt: "объедини эти картинки".to_owned(),
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_caption_uses_the_request_or_readable_caption_without_changing_generation()
+    -> Result<(), ToolboxError> {
+        for (caption, gift, expected) in [
+            ("", false, "Плотва, нарисуй рыбу в космосе"),
+            ("Рыба в космосе", false, "Рыба в космосе"),
+            ("Подарок: рыба в космосе", true, "Подарок: рыба в космосе"),
+        ] {
+            let scheduler = Arc::new(ImageSchedulerStub::successful(DrawImageScheduleResult {
+                status: "scheduled".to_owned(),
+                ..Default::default()
+            }));
+            let tools = toolbox(None).with_image_scheduler(scheduler.clone());
+            let result = tools
+                .draw_image(DrawRequest {
+                    context: ToolContext {
+                        message_text: "Плотва, нарисуй рыбу в космосе".into(),
+                        message_meta: ChatMessageMeta {
+                            agent_gift: gift,
+                            ..Default::default()
+                        },
+                        ..context()
+                    },
+                    prompt: "A fish in space, cinematic lighting".into(),
+                    caption: caption.into(),
+                    ..Default::default()
+                })
+                .await?;
+            assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+            let calls = scheduler.calls();
+            assert_eq!(calls[0].prompt, "A fish in space, cinematic lighting");
+            assert_eq!(calls[0].original_prompt, expected);
+        }
         Ok(())
     }
 
@@ -5330,6 +5374,7 @@ mod tests {
             .draw_image(DrawRequest {
                 context: context(),
                 prompt: " neon\u{200f}\tcastle ".to_owned(),
+                caption: "Нарисуй неоновый замок".to_owned(),
                 file_ids: Vec::new(),
                 negative_prompt: " blur ".to_owned(),
                 aspect_ratio: " 16:9 ".to_owned(),
@@ -5363,7 +5408,7 @@ mod tests {
             .as_ref()
             .expect("image job should carry image data");
         assert_eq!(image.prompt, "neon castle");
-        assert_eq!(image.original_text, "neon castle");
+        assert_eq!(image.original_text, "Нарисуй неоновый замок");
         assert_eq!(image.author, "Alice");
         assert_eq!(image.raw_negative_prompt, "blur");
         assert_eq!(image.raw_aspect_ratio, "16:9");

@@ -1584,6 +1584,7 @@ mod tests {
             .as_chat_step()
             .expect("step seam")
             .run_chat_step(openplotva_dialog::ChatStepRequest {
+                required_tool: None,
                 preferred_target: None,
                 input: live_dialog_smoke_input(),
                 transcript: Vec::new(),
@@ -1953,6 +1954,7 @@ mod tests {
 
     fn default_step_request() -> openplotva_dialog::ChatStepRequest {
         openplotva_dialog::ChatStepRequest {
+            required_tool: None,
             preferred_target: None,
             input: DialogInput::default(),
             transcript: Vec::new(),
@@ -2017,6 +2019,7 @@ mod tests {
 
     fn step_request() -> ChatStepRequest {
         ChatStepRequest {
+            required_tool: None,
             preferred_target: None,
             input: DialogInput::default(),
             transcript: Vec::new(),
