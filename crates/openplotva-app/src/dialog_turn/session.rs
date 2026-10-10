@@ -719,8 +719,23 @@ where
                 let retry_provider =
                     openplotva_llm::retry::provider_name(error.as_ref()).to_owned();
                 let error = error.to_string();
-                report.provider_error = Some(error.clone());
                 if let Some(reason) = retryable_reason {
+                    if sent.any()
+                        && regenerations == 0
+                        && ctx.max_regenerations > 0
+                        && !force_final
+                        && iteration < max_iterations
+                        && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
+                    {
+                        regenerations += 1;
+                        report.regenerations = regenerations;
+                        agent.transcript.push(SessionMessage::InjectedUser {
+                            rendered: "Runtime guidance: The previous model step failed. Continue from this turn's existing tool results and finish the answer. Do not repeat messages already sent.".to_owned(),
+                        });
+                        tracing::info!(job_id = ctx.item_id, %reason, "retrying model step within partially delivered session");
+                        return next_step!();
+                    }
+                    report.provider_error = Some(error.clone());
                     if sent.any() {
                         // Never replay a partially delivered session: the
                         // user saw messages; a requeue would regenerate and
@@ -753,6 +768,7 @@ where
                     )
                     .await);
                 }
+                report.provider_error = Some(error.clone());
                 return std::ops::ControlFlow::Break( TurnResolution {
                     outcome: TurnOutcome::TerminalFailed {
                         reason: "provider_error",

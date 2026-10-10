@@ -6071,8 +6071,8 @@ async fn session_retry_semantics_depend_on_first_send() -> Result<(), Box<dyn Er
     assert!(report.retry_requeued, "{report:?}");
     assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
 
-    // After an intermediate went out: the same error is terminal, never a
-    // replay of a partially delivered session.
+    // After an intermediate went out: one in-session retry is allowed,
+    // then failure is terminal; the partially delivered session never restarts.
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
@@ -6091,6 +6091,7 @@ async fn session_retry_semantics_depend_on_first_send() -> Result<(), Box<dyn Er
             )],
         )),
         Err("aifarm down".to_owned()),
+        Err("aifarm still down".to_owned()),
     ]);
     let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
         Arc::new(SessionToolboxStub::default());
@@ -6115,6 +6116,91 @@ async fn session_retry_semantics_depend_on_first_send() -> Result<(), Box<dyn Er
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "terminal_failed");
     assert_eq!(rows[0].reason.as_deref(), Some("llm_failed_after_partial"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_repairs_rejected_output_after_partial_without_replay() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for error in [
+        "chat completion returned empty final text",
+        "workflow capacity unavailable: all pools busy after 2002ms slot wait",
+    ] {
+        for (repair_enabled, repair_succeeds) in [(true, true), (true, false), (false, true)] {
+            let queue = InMemoryTaskQueue::new();
+            let job_id = queue.assign(
+                DIALOG_AIFARM_QUEUE_NAME,
+                new_dialog_job_at(dialog_params("проверь результат"), now),
+            );
+            let send = |id: &str| {
+                step_tools(
+                    "",
+                    vec![(
+                        id,
+                        openplotva_dialog::ToolStep {
+                            step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                            text: "Проверяю.".to_owned(),
+                            ..openplotva_dialog::ToolStep::default()
+                        },
+                    )],
+                )
+            };
+            let mut steps = vec![Ok(send("first")), Err(error.to_owned())];
+            if repair_succeeds {
+                steps.push(Ok(send("repeat")));
+                steps.push(Ok(step_text("Результат проверен.")));
+            } else {
+                steps.push(Err(error.to_owned()));
+                steps.push(Ok(step_text("Этот ответ не должен исполняться.")));
+            }
+            let provider = StepProviderStub {
+                retryable_errors: false,
+                ..StepProviderStub::with_steps(steps)
+            };
+            let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+                Arc::new(SessionToolboxStub::default());
+            let wiring = session_wiring(toolbox, None);
+            let effects = EffectsStub::default();
+            let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+                crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+                None,
+            );
+            let mut options = session_options(now, &outcomes, &wiring);
+            if !repair_enabled {
+                options.max_regenerations = 0;
+            }
+            let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+                &queue,
+                &provider,
+                &effects,
+                &BasicDialogInputMaterializer,
+                &NoopDialogToolCallHistoryStore,
+                options,
+            )
+            .await;
+            assert!(!report.retry_requeued, "a partial turn must never restart");
+            assert_eq!(
+                effects.intermediates().len(),
+                1,
+                "the sent tool must not replay"
+            );
+            if repair_enabled && repair_succeeds {
+                assert!(report.sent_answer, "{report:?}");
+                assert!(!report.failed, "{report:?}");
+                assert_eq!(provider.calls(), 4);
+                assert_eq!(effects.sent()[0].1, "Результат проверен.");
+                assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+                let transcript = format!("{:?}", provider.requests()[2].transcript);
+                assert!(transcript.contains("Do not repeat messages already sent"));
+            } else {
+                assert!(report.failed, "{report:?}");
+                assert_eq!(provider.calls(), if repair_enabled { 3 } else { 2 });
+                assert!(effects.sent().is_empty());
+                assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+            }
+        }
+    }
     Ok(())
 }
 
