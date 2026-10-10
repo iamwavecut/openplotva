@@ -1251,6 +1251,9 @@ fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
         }
     }
     match arg.name {
+        "emoji" => {
+            schema.insert("enum".to_owned(), json!(SESSION_REACTION_ALLOWED_EMOJI));
+        }
         "scope" => {
             schema.insert("enum".to_owned(), json!(["thread", "chat"]));
         }
@@ -5587,6 +5590,26 @@ mod tests {
             DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
                 "excessive paragraph count".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn reaction_schema_rejects_unsupported_and_lifecycle_emoji() {
+        let schema = tool_parameters_schema(&SESSION_REACT_TO_MESSAGE_SPEC);
+        let emoji = &schema["properties"]["emoji"];
+        assert_eq!(emoji["type"], "string");
+        let choices = emoji["enum"].as_array().expect("bounded emoji choices");
+        for allowed in ["🤣", "😁", "👍", "❤"] {
+            assert!(choices.contains(&json!(allowed)));
+        }
+        for rejected in ["😂", "🤫", "😄", "👀", "✍", "🤔"] {
+            assert!(!choices.contains(&json!(rejected)));
+        }
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required arguments")
+                .contains(&json!("emoji"))
         );
     }
 
