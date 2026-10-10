@@ -319,6 +319,39 @@ fn pending_image_tool<'a>(
         })
 }
 
+fn replaces_pending_image_request(pending: bool, requested_tool: &str, text: &str) -> bool {
+    if !pending || matches!(requested_tool, "draw_image" | "draw_api") {
+        return true;
+    }
+    let text = text.trim().to_lowercase();
+    let text = text
+        .strip_prefix("плотва")
+        .or_else(|| text.strip_prefix("plotva"))
+        .unwrap_or(&text)
+        .trim_matches(|c: char| c.is_whitespace() || ",.!?".contains(c));
+    matches!(
+        text,
+        "отмена" | "стоп" | "cancel" | "/cancel" | "/cancel_drawing"
+    ) || [
+        "не рисуй",
+        "не надо рисовать",
+        "не нужно рисовать",
+        "перестань рисовать",
+        "отмени рисунок",
+        "отмени генерацию",
+        "не генерируй",
+        "cancel drawing",
+        "stop drawing",
+        "do not draw",
+        "don't draw",
+    ]
+    .iter()
+    .any(|prefix| {
+        text.strip_prefix(prefix)
+            .is_some_and(|tail| tail.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    })
+}
+
 fn record_rejected_final(agent: &mut openplotva_agent::AgentLoop, text: &str, reason: &str) {
     agent.transcript.push(SessionMessage::Assistant {
         text: text.to_owned(),
@@ -571,7 +604,11 @@ where
                     agent.observed_message_id = agent.observed_message_id.max(id);
                 }
                 message["can_change_task"] = Value::Bool(message.get("user_id").and_then(Value::as_i64) == Some(active_params.user_id));
-                if message["can_change_task"] == true {
+                if message["can_change_task"] == true && replaces_pending_image_request(
+                    pending_image_tool(&tool_context, &recorded_tool_calls, requested_tool_call_offset).is_some(),
+                    message["meta"]["requested_tool"].as_str().unwrap_or_default(),
+                    message["text"].as_str().unwrap_or_default(),
+                ) {
                     tool_context.message_id = message["message_id"].as_i64().and_then(|id| i32::try_from(id).ok()).unwrap_or(tool_context.message_id);
                     tool_context.message_meta.requested_tool = message["meta"]["requested_tool"].as_str().unwrap_or_default().to_owned();
                     requested_tool_call_offset = recorded_tool_calls.len();
@@ -590,7 +627,12 @@ where
                 if let Ok(meta) = serde_json::from_value::<openplotva_core::ChatMessageMeta>(params.meta.clone()) {
                     extend_context_images(&mut tool_context, params.message_id, meta.attachments);
                 }
-                if params.message_id > previously_observed_message_id && params.message_id >= tool_context.message_id && params.user_id == active_params.user_id {
+                if params.message_id > previously_observed_message_id && params.message_id >= tool_context.message_id && params.user_id == active_params.user_id
+                    && replaces_pending_image_request(
+                        pending_image_tool(&tool_context, &recorded_tool_calls, requested_tool_call_offset).is_some(),
+                        params.meta["requested_tool"].as_str().unwrap_or_default(),
+                        &params.message_text,
+                    ) {
                     tool_context.message_id = params.message_id;
                     tool_context.message_meta.requested_tool = params.meta["requested_tool"].as_str().unwrap_or_default().to_owned();
                     requested_tool_call_offset = recorded_tool_calls.len();

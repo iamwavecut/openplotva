@@ -6512,6 +6512,139 @@ async fn explicit_image_request_never_publishes_a_promise_after_exhausted_repair
 }
 
 #[tokio::test]
+async fn pending_image_request_survives_initiator_thanks() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for observed in [true, false] {
+        let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+        let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+        let toolbox = Arc::new(SessionToolboxStub::with_queued_draw("image-ticket"));
+        let wiring = crate::dialog_turn::SessionWorkerWiring {
+            registry: registry.clone(),
+            ..session_wiring(toolbox.clone(), None)
+        };
+        let queue = InMemoryTaskQueue::new();
+        let mut params = dialog_params("нарисуй рыбу");
+        params.meta = serde_json::json!({"requested_tool": "draw_image"});
+        let job = queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+        let materializer = MaterializerStub::default();
+        let mut thanks = dialog_params("Спасибо большое Плотва");
+        thanks.message_id += 1;
+        if observed {
+            materializer
+                .observed
+                .lock()
+                .expect("observed")
+                .push(serde_json::json!({
+                    "message_id": thanks.message_id, "user_id": thanks.user_id,
+                    "text": thanks.message_text, "meta": {}
+                }));
+        }
+        let draw = step_tools(
+            "",
+            vec![(
+                "draw",
+                openplotva_dialog::ToolStep {
+                    step: "draw_image".into(),
+                    prompt: "A fish".into(),
+                    ..Default::default()
+                },
+            )],
+        );
+        let provider = StepProviderStub::with_steps(if observed {
+            vec![Ok(draw)]
+        } else {
+            vec![Ok(step_text("Сейчас подумаю.")), Ok(draw)]
+        })
+        .with_on_call(Box::new(move |index| {
+            if !observed && index == 1 {
+                assert!(registry.inject(
+                    key,
+                    job,
+                    crate::dialog_turn::InjectedMessage {
+                        params: thanks.clone()
+                    }
+                ));
+            }
+        }));
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &materializer,
+            &NoopDialogToolCallHistoryStore,
+            session_options(now, &outcomes, &wiring),
+        )
+        .await;
+        assert!(report.completed, "{report:?}");
+        for request in provider.requests() {
+            assert_eq!(
+                request.required_tool.as_deref(),
+                Some("draw_image"),
+                "observed={observed}"
+            );
+        }
+        let draws = toolbox.draw_requests.lock().expect("draws");
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].context.message_text, "нарисуй рыбу");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_image_request_can_be_cancelled_before_the_first_step() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for text in [
+        "Плотва, не рисуй",
+        "Отмена!",
+        "стоп",
+        "не надо рисовать",
+        "stop drawing",
+    ] {
+        let queue = InMemoryTaskQueue::new();
+        let mut params = dialog_params("нарисуй рыбу");
+        params.meta = serde_json::json!({"requested_tool":"draw_image"});
+        let message_id = params.message_id + 1;
+        let user_id = params.user_id;
+        queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+        let materializer = MaterializerStub::default();
+        materializer
+            .observed
+            .lock()
+            .expect("observed")
+            .push(serde_json::json!({
+                "message_id":message_id, "user_id":user_id, "text":text, "meta":{}
+            }));
+        let toolbox = Arc::new(SessionToolboxStub::with_queued_draw("image-ticket"));
+        let wiring = session_wiring(toolbox.clone(), None);
+        let provider = StepProviderStub::with_steps(vec![Ok(step_text("Отменила."))]);
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &materializer,
+            &NoopDialogToolCallHistoryStore,
+            session_options(now, &outcomes, &wiring),
+        )
+        .await;
+        assert!(report.completed, "{text}: {report:?}");
+        assert_eq!(provider.requests()[0].required_tool, None, "{text}");
+        assert!(toolbox.draw_requests.lock().expect("draws").is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn newer_initiator_image_intent_replaces_the_previous_attempt() -> Result<(), Box<dyn Error>>
 {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
