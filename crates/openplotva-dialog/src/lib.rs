@@ -568,12 +568,12 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "caption",
         required: true,
-        description: "Short image title in the user's language. Preserve the requested subject, names and details. Remove the bot address, drawing request and politeness. Start with a capital letter. Never include technical instructions or details added for generation.",
+        description: "Short image title in the user's language. Preserve the requested subject, names and details. For edits, carry forward the source image's subject and add the requested change or style. Remove the bot address, drawing request and politeness. Start with a capital letter. Never include technical instructions or details added for generation.",
     },
     ToolArgSpec {
         name: "file_ids",
         required: false,
-        description: "Required when editing or combining earlier images: list every requested source using its file_id handle or file_unique_id from the dialog attachments. Pass up to 10 references together in ONE draw_image call. Describing images in prompt does not attach them. Omit only for a new image or when all sources are attached to or quoted by the current message.",
+        description: "Required when editing or combining earlier images: list every requested source using its file_id handle or file_unique_id from the dialog attachments. A style change to a previous generation must reference its generated result. Pass up to 10 references together in ONE draw_image call. Describing images in prompt does not attach them. Omit only for a new image or when all sources are attached to or quoted by the current message.",
     },
     ToolArgSpec {
         name: "negative_prompt",
@@ -4704,6 +4704,9 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     if let Some(value) = lookup("prompt") {
         step.prompt = value;
     }
+    if let Some(value) = lookup("caption") {
+        step.caption = value;
+    }
     if let Some(value) = lookup("topic") {
         step.topic = value;
     }
@@ -5910,6 +5913,28 @@ Combining the cards."#;
                 .remove(0);
             assert_eq!(step.file_ids, ids);
             assert_eq!(step.seed, "5");
+        }
+    }
+
+    #[test]
+    fn native_image_calls_preserve_caption_separately_from_prompt() {
+        for name in [STEP_DRAW_IMAGE, "draw_api"] {
+            let args = json!({
+                "prompt": "Golden fish in batter, warm lighting, clay animation",
+                "caption": "Золотая рыбка в кляре, в стиле пластилинового мультика"
+            });
+            for arguments in [args.clone(), Value::String(args.to_string())] {
+                let step = parse_native_tool_step(&[NativeToolCall {
+                    function: NativeToolFunction {
+                        name: name.to_owned(),
+                        arguments,
+                    },
+                    ..Default::default()
+                }])
+                .expect("native image call");
+                assert_eq!(step.prompt, args["prompt"].as_str().expect("prompt"));
+                assert_eq!(step.caption, args["caption"].as_str().expect("caption"));
+            }
         }
     }
 

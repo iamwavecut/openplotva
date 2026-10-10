@@ -1801,7 +1801,16 @@ pub fn parse_edit_command(text: &str) -> Option<String> {
         return None;
     }
 
-    let (first_word, rest_text) = cut_first_word(trimmed);
+    let (mut first_word, mut rest_text) = cut_first_word(trimmed);
+    for _ in 0..3 {
+        if !matches!(
+            first_word.trim_end_matches(',').to_lowercase().as_str(),
+            "а" | "теперь" | "пожалуйста" | "please"
+        ) {
+            break;
+        }
+        (first_word, rest_text) = cut_first_word(&rest_text);
+    }
     is_edit_verb(&first_word).then(|| rest_text.trim().to_owned())
 }
 
@@ -3269,6 +3278,8 @@ const EDIT_VERB_ALIASES: &[&str] = &[
     "переделайте",
     "перерисуй",
     "перерисуйте",
+    "сделай",
+    "сделайте",
     "замени",
     "замените",
     "убери",
@@ -6337,6 +6348,19 @@ mod tests {
             Some("contrast".to_owned())
         );
         assert_eq!(parse_edit_command("ИЗМЕНИ"), Some(String::new()));
+        assert_eq!(
+            parse_edit_command("А перерисуй мелками"),
+            Some("мелками".to_owned())
+        );
+        assert_eq!(
+            parse_edit_command("А теперь сделай это пластилиновым мультиком"),
+            Some("это пластилиновым мультиком".to_owned())
+        );
+        assert_eq!(
+            parse_edit_command("пожалуйста, перерисуй акварелью"),
+            Some("акварелью".to_owned())
+        );
+        assert_eq!(parse_edit_command("А теперь поговорим о мелках"), None);
 
         assert_eq!(parse_edit_command("нарисуй кота"), None);
         assert_eq!(parse_edit_command("  "), None);
