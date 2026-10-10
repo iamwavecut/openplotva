@@ -59,21 +59,9 @@ impl RuntimeTaskmanInspectorHandle {
             .clone()
     }
 
-    fn records(&self) -> Option<Vec<RuntimeTaskmanRecord>> {
-        // Control jobs ride the same shared queue, so the shared queue is the single
-        // source of truth for diagnostics.
-        let shared_records = self
-            .shared_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|queue| queue.records())?;
-        Some(
-            shared_records
-                .into_iter()
-                .map(RuntimeTaskmanRecord::new)
-                .collect(),
-        )
+    fn inspect_records<R>(&self, inspect: impl FnOnce(Vec<&TaskQueueRecord>) -> R) -> Option<R> {
+        let queue = self.shared_queue().ok()?;
+        Some(queue.inspect_records(|records| inspect(records.iter().collect())))
     }
 
     fn worker_count(&self, queue_name: &str) -> i32 {
@@ -101,30 +89,25 @@ impl RuntimeTaskmanInspectorHandle {
         &self,
         filter: RuntimeTaskmanJobsFilter,
     ) -> Result<RuntimeTaskmanDeleteResult, String> {
-        let Some(records) = self.records() else {
-            return Err("task manager not configured".to_owned());
-        };
+        let queue = self.shared_queue()?;
         let filter = NormalizedTaskmanFilter::try_from(filter)?;
+        let records = queue.inspect_records(|records| {
+            records
+                .iter()
+                .filter(|record| filter.matches(record))
+                .map(|record| (record.id, record.status.is_active()))
+                .collect::<Vec<_>>()
+        });
         let mut result = RuntimeTaskmanDeleteResult::default();
-        for record in records {
-            if !filter.matches(&record) {
-                continue;
-            }
+        for (id, active) in records {
             result.matched += 1;
-            if record.record.status.is_active() {
+            if active {
                 result.deleted_active += 1;
             }
-            self.delete_record(&record)?;
+            queue.delete(id).map_err(|error| error.to_string())?;
             result.deleted += 1;
         }
         Ok(result)
-    }
-
-    fn delete_record(&self, record: &RuntimeTaskmanRecord) -> Result<(), String> {
-        self.shared_queue()?
-            .delete(record.diagnostic_id)
-            .map_err(|error| error.to_string())?;
-        Ok(())
     }
 
     fn shared_queue(&self) -> Result<Arc<InMemoryTaskQueue>, String> {
@@ -133,21 +116,6 @@ impl RuntimeTaskmanInspectorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .ok_or_else(|| "task manager not configured".to_owned())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RuntimeTaskmanRecord {
-    diagnostic_id: i64,
-    record: TaskQueueRecord,
-}
-
-impl RuntimeTaskmanRecord {
-    fn new(record: TaskQueueRecord) -> Self {
-        Self {
-            diagnostic_id: record.id,
-            record,
-        }
     }
 }
 
@@ -164,32 +132,30 @@ impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
         &self,
         filter: RuntimeTaskmanJobsFilter,
     ) -> Result<RuntimeTaskmanJobListResultData, String> {
-        let Some(mut records) = self.records() else {
-            return Ok(empty_taskman_job_list());
-        };
-        let filter = NormalizedTaskmanFilter::try_from(filter)?;
-        records.retain(|record| filter.matches(record));
-
-        let total = records.len() as i32;
-        let summary = taskman_summary(&records);
-        sort_taskman_records(&mut records, &filter.sort_by, &filter.sort_dir);
-
-        let offset = filter.offset.min(total.max(0)) as usize;
-        let limit = filter.limit as usize;
-        let items = records
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(taskman_list_entry_from_record)
-            .collect();
-
-        Ok(RuntimeTaskmanJobListResultData {
-            total,
-            offset: filter.offset,
-            limit: filter.limit,
-            summary,
-            items,
-        })
+        Ok(self
+            .inspect_records(|mut records| {
+                let filter = NormalizedTaskmanFilter::try_from(filter)?;
+                records.retain(|record| filter.matches(record));
+                let total = records.len() as i32;
+                let summary = taskman_summary(&records);
+                sort_taskman_records(&mut records, &filter.sort_by, &filter.sort_dir);
+                let offset = filter.offset.min(total.max(0)) as usize;
+                let items = records
+                    .into_iter()
+                    .skip(offset)
+                    .take(filter.limit as usize)
+                    .map(taskman_list_entry_from_record)
+                    .collect();
+                Ok::<_, String>(RuntimeTaskmanJobListResultData {
+                    total,
+                    offset: filter.offset,
+                    limit: filter.limit,
+                    summary,
+                    items,
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(empty_taskman_job_list))
     }
 
     fn job<'a>(&'a self, id: i64) -> RuntimeTaskmanJobFuture<'a> {
@@ -211,7 +177,6 @@ impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
             let Some(record) = record else {
                 return Ok(None);
             };
-            let record = RuntimeTaskmanRecord::new(record);
             Ok(Some(RuntimeTaskmanJobDetailsData {
                 job: taskman_job_from_record(&record),
                 messages: taskman_messages_from_record(&record),
@@ -225,50 +190,52 @@ impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
         queues: Vec<String>,
         priority: i32,
     ) -> Result<RuntimeTaskmanDiagnosticsData, String> {
-        let Some(records) = self.records() else {
-            return Ok(RuntimeTaskmanDiagnosticsData::default());
-        };
-        let queue_names = taskman_queue_names(&records, queues);
-        let now = OffsetDateTime::now_utc();
-        let active = records
-            .iter()
-            .filter(|record| record.record.status == JobStatus::Processing)
-            .count() as i32;
-        let started1m = records
-            .iter()
-            .filter(|record| recent(record.record.started_at, now))
-            .count() as i32;
-        let completed1m = records
-            .iter()
-            .filter(|record| recent(record.record.completed_at, now))
-            .count() as i32;
-        let queues = queue_names
-            .into_iter()
-            .map(|queue_name| {
-                let pending_or_higher = count_pending_or_higher(&records, &queue_name, priority);
-                RuntimeTaskmanQueueDiagnosticsData {
-                    pending: count_pending_exact(&records, &queue_name, priority),
-                    pending_or_higher,
-                    active: count_processing(&records, &queue_name),
-                    worker_count: self.worker_count(&queue_name),
-                    eta_seconds: fallback_eta_seconds(&queue_name, pending_or_higher),
-                    priority,
-                    queue_name,
+        Ok(self
+            .inspect_records(|records| {
+                let queue_names = taskman_queue_names(&records, queues);
+                let now = OffsetDateTime::now_utc();
+                let active = records
+                    .iter()
+                    .filter(|record| record.status == JobStatus::Processing)
+                    .count() as i32;
+                let started1m = records
+                    .iter()
+                    .filter(|record| recent(record.started_at, now))
+                    .count() as i32;
+                let completed1m = records
+                    .iter()
+                    .filter(|record| recent(record.completed_at, now))
+                    .count() as i32;
+                let queues = queue_names
+                    .into_iter()
+                    .map(|queue_name| {
+                        let pending_or_higher =
+                            count_pending_or_higher(&records, &queue_name, priority);
+                        RuntimeTaskmanQueueDiagnosticsData {
+                            pending: count_pending_exact(&records, &queue_name, priority),
+                            pending_or_higher,
+                            active: count_processing(&records, &queue_name),
+                            worker_count: self.worker_count(&queue_name),
+                            eta_seconds: fallback_eta_seconds(&queue_name, pending_or_higher),
+                            priority,
+                            queue_name,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let worker_count = queues.iter().map(|queue| queue.worker_count).sum();
+
+                RuntimeTaskmanDiagnosticsData {
+                    running: true,
+                    active,
+                    started1m,
+                    completed1m,
+                    worker_count,
+                    queue_signal_count: 0,
+                    slow_job_count: 0,
+                    queues,
                 }
             })
-            .collect::<Vec<_>>();
-        let worker_count = queues.iter().map(|queue| queue.worker_count).sum();
-
-        Ok(RuntimeTaskmanDiagnosticsData {
-            running: true,
-            active,
-            started1m,
-            completed1m,
-            worker_count,
-            queue_signal_count: 0,
-            slow_job_count: 0,
-            queues,
-        })
+            .unwrap_or_default())
     }
 }
 
@@ -353,11 +320,11 @@ impl TryFrom<RuntimeTaskmanJobsFilter> for NormalizedTaskmanFilter {
 }
 
 impl NormalizedTaskmanFilter {
-    fn matches(&self, record: &RuntimeTaskmanRecord) -> bool {
-        if !self.status.is_empty() && !self.status.contains(record.record.status.as_str()) {
+    fn matches(&self, record: &TaskQueueRecord) -> bool {
+        if !self.status.is_empty() && !self.status.contains(record.status.as_str()) {
             return false;
         }
-        if !self.queue.is_empty() && !self.queue.contains(&record.record.queue_name) {
+        if !self.queue.is_empty() && !self.queue.contains(&record.queue_name) {
             return false;
         }
         if self
@@ -378,7 +345,7 @@ impl NormalizedTaskmanFilter {
         self.q.is_empty() || taskman_search_haystack(record).contains(&self.q)
     }
 
-    fn matches_time(&self, record: &RuntimeTaskmanRecord) -> bool {
+    fn matches_time(&self, record: &TaskQueueRecord) -> bool {
         if self.from.is_none() && self.to.is_none() {
             return true;
         }
@@ -432,16 +399,14 @@ fn parse_optional_time(value: &str, error: &str) -> Result<Option<OffsetDateTime
         .map_err(|_| error.to_owned())
 }
 
-fn taskman_summary(records: &[RuntimeTaskmanRecord]) -> RuntimeTaskmanJobSummaryData {
+fn taskman_summary(records: &[&TaskQueueRecord]) -> RuntimeTaskmanJobSummaryData {
     let mut by_status = BTreeMap::<String, i32>::new();
     let mut by_queue = BTreeMap::<String, i32>::new();
     for record in records {
         *by_status
-            .entry(record.record.status.as_str().to_owned())
+            .entry(record.status.as_str().to_owned())
             .or_default() += 1;
-        *by_queue
-            .entry(record.record.queue_name.clone())
-            .or_default() += 1;
+        *by_queue.entry(record.queue_name.clone()).or_default() += 1;
     }
     RuntimeTaskmanJobSummaryData {
         by_status: json!(by_status),
@@ -449,44 +414,44 @@ fn taskman_summary(records: &[RuntimeTaskmanRecord]) -> RuntimeTaskmanJobSummary
     }
 }
 
-fn sort_taskman_records(records: &mut [RuntimeTaskmanRecord], sort_by: &str, sort_dir: &str) {
+fn sort_taskman_records(records: &mut [&TaskQueueRecord], sort_by: &str, sort_dir: &str) {
     records.sort_by(|left, right| compare_taskman_records(left, right, sort_by, sort_dir));
 }
 
 fn compare_taskman_records(
-    left: &RuntimeTaskmanRecord,
-    right: &RuntimeTaskmanRecord,
+    left: &TaskQueueRecord,
+    right: &TaskQueueRecord,
     sort_by: &str,
     sort_dir: &str,
 ) -> Ordering {
     match sort_by {
-        "id" => compare_i64(left.diagnostic_id, right.diagnostic_id, sort_dir),
+        "id" => compare_i64(left.id, right.id, sort_dir),
         "priority" => compare_i32_then_id(
-            left.record.job.priority,
-            right.record.job.priority,
-            left.diagnostic_id,
-            right.diagnostic_id,
+            left.job.priority,
+            right.job.priority,
+            left.id,
+            right.id,
             sort_dir,
         ),
         "started_at" => compare_optional_time(
-            left.record.started_at,
-            right.record.started_at,
-            left.diagnostic_id,
-            right.diagnostic_id,
+            left.started_at,
+            right.started_at,
+            left.id,
+            right.id,
             sort_dir,
         ),
         "completed_at" => compare_optional_time(
-            left.record.completed_at,
-            right.record.completed_at,
-            left.diagnostic_id,
-            right.diagnostic_id,
+            left.completed_at,
+            right.completed_at,
+            left.id,
+            right.id,
             sort_dir,
         ),
         _ => compare_time(
-            left.record.job.created,
-            right.record.job.created,
-            left.diagnostic_id,
-            right.diagnostic_id,
+            left.job.created,
+            right.job.created,
+            left.id,
+            right.id,
             sort_dir,
         ),
     }
@@ -554,36 +519,36 @@ fn compare_time(
     }
 }
 
-fn taskman_list_entry_from_record(record: RuntimeTaskmanRecord) -> RuntimeTaskmanJobListEntryData {
-    let telegram = telegram_data(&record);
+fn taskman_list_entry_from_record(record: &TaskQueueRecord) -> RuntimeTaskmanJobListEntryData {
+    let telegram = telegram_data(record);
     let user_id = telegram.map_or(0, |data| data.user_id);
     let chat_id = telegram.map_or(0, |data| data.chat_id);
     let trigger_message_id = telegram.map_or(0, |data| data.message_id);
     let thread_message_id = telegram.and_then(|data| data.thread_message_id);
-    let job_type = job_type_name(record.record.job.data.job_type).to_owned();
-    let preview = job_preview(&record.record.job.data);
-    let created_at = format_time(record.record.job.created);
-    let started_at = record.record.started_at.map(format_time);
-    let completed_at = record.record.completed_at.map(format_time);
+    let job_type = job_type_name(record.job.data.job_type).to_owned();
+    let preview = job_preview(&record.job.data);
+    let created_at = format_time(record.job.created);
+    let started_at = record.started_at.map(format_time);
+    let completed_at = record.completed_at.map(format_time);
     RuntimeTaskmanJobListEntryData {
-        id: record.diagnostic_id,
-        queue_name: record.record.queue_name,
-        priority: record.record.job.priority,
-        title: record.record.job.title,
+        id: record.id,
+        queue_name: record.queue_name.clone(),
+        priority: record.job.priority,
+        title: record.job.title.clone(),
         job_type,
-        status: record.record.status.as_str().to_owned(),
+        status: record.status.as_str().to_owned(),
         user_id,
         chat_id,
         trigger_message_id,
         thread_message_id,
-        progress_message_id: record.record.progress_message_id,
-        result_message_id: record.record.result_message_id,
-        worker_id: record.record.worker_id,
+        progress_message_id: record.progress_message_id,
+        result_message_id: record.result_message_id,
+        worker_id: record.worker_id.clone(),
         created_at,
         started_at,
         completed_at,
-        error_message: record.record.error,
-        processing_timeout_seconds: record.record.job.processing_timeout_seconds,
+        error_message: record.error.clone(),
+        processing_timeout_seconds: record.job.processing_timeout_seconds,
         prompt_hash: None,
         estimated_processing_time: None,
         actual_processing_time: None,
@@ -591,26 +556,26 @@ fn taskman_list_entry_from_record(record: RuntimeTaskmanRecord) -> RuntimeTaskma
     }
 }
 
-fn taskman_job_from_record(record: &RuntimeTaskmanRecord) -> RuntimeTaskmanJobData {
+fn taskman_job_from_record(record: &TaskQueueRecord) -> RuntimeTaskmanJobData {
     RuntimeTaskmanJobData {
-        id: record.diagnostic_id,
-        queue_name: record.record.queue_name.clone(),
-        priority: record.record.job.priority,
-        title: record.record.job.title.clone(),
-        payload: serde_json::to_value(&record.record.job.data).ok(),
-        status: record.record.status.as_str().to_owned(),
+        id: record.id,
+        queue_name: record.queue_name.clone(),
+        priority: record.job.priority,
+        title: record.job.title.clone(),
+        payload: serde_json::to_value(&record.job.data).ok(),
+        status: record.status.as_str().to_owned(),
         user_id: telegram_data(record).map_or(0, |data| data.user_id),
         chat_id: telegram_data(record).map_or(0, |data| data.chat_id),
         trigger_message_id: telegram_data(record).map_or(0, |data| data.message_id),
         thread_message_id: telegram_data(record).and_then(|data| data.thread_message_id),
-        progress_message_id: record.record.progress_message_id,
-        result_message_id: record.record.result_message_id,
-        worker_id: record.record.worker_id.clone(),
-        created_at: format_time(record.record.job.created),
-        started_at: record.record.started_at.map(format_time),
-        completed_at: record.record.completed_at.map(format_time),
-        error_message: record.record.error.clone(),
-        processing_timeout_seconds: record.record.job.processing_timeout_seconds,
+        progress_message_id: record.progress_message_id,
+        result_message_id: record.result_message_id,
+        worker_id: record.worker_id.clone(),
+        created_at: format_time(record.job.created),
+        started_at: record.started_at.map(format_time),
+        completed_at: record.completed_at.map(format_time),
+        error_message: record.error.clone(),
+        processing_timeout_seconds: record.job.processing_timeout_seconds,
         prompt_hash: None,
         estimated_processing_time: None,
         actual_processing_time: None,
@@ -618,15 +583,15 @@ fn taskman_job_from_record(record: &RuntimeTaskmanRecord) -> RuntimeTaskmanJobDa
 }
 
 fn taskman_messages_from_record(
-    record: &RuntimeTaskmanRecord,
+    record: &TaskQueueRecord,
 ) -> Vec<openplotva_server::RuntimeTaskmanJobMessageData> {
-    let mut messages = record.record.messages.clone();
+    let mut messages = record.messages.clone();
     messages.sort_by_key(|message| std::cmp::Reverse(message.created_at));
     messages
         .into_iter()
         .map(|message| openplotva_server::RuntimeTaskmanJobMessageData {
             id: message.id,
-            job_id: record.diagnostic_id,
+            job_id: record.id,
             message_type: message.message_type,
             chat_id: message.chat_id,
             message_id: message.message_id,
@@ -636,11 +601,11 @@ fn taskman_messages_from_record(
         .collect()
 }
 
-fn taskman_events_from_record(record: &RuntimeTaskmanRecord) -> Option<serde_json::Value> {
-    if record.record.events.is_empty() {
+fn taskman_events_from_record(record: &TaskQueueRecord) -> Option<serde_json::Value> {
+    if record.events.is_empty() {
         None
     } else {
-        serde_json::to_value(&record.record.events).ok()
+        serde_json::to_value(&record.events).ok()
     }
 }
 
@@ -648,35 +613,33 @@ fn format_time(value: OffsetDateTime) -> String {
     value.format(&Rfc3339).unwrap_or_else(|_| value.to_string())
 }
 
-fn telegram_data(record: &RuntimeTaskmanRecord) -> Option<&openplotva_taskman::TelegramData> {
-    record.record.job.data.telegram_data.as_ref()
+fn telegram_data(record: &TaskQueueRecord) -> Option<&openplotva_taskman::TelegramData> {
+    record.job.data.telegram_data.as_ref()
 }
 
-fn record_user_id(record: &RuntimeTaskmanRecord) -> i64 {
+fn record_user_id(record: &TaskQueueRecord) -> i64 {
     telegram_data(record).map_or(0, |data| data.user_id)
 }
 
-fn record_chat_id(record: &RuntimeTaskmanRecord) -> i64 {
+fn record_chat_id(record: &TaskQueueRecord) -> i64 {
     telegram_data(record).map_or(0, |data| data.chat_id)
 }
 
-fn record_time_field(record: &RuntimeTaskmanRecord, field: &str) -> Option<OffsetDateTime> {
+fn record_time_field(record: &TaskQueueRecord, field: &str) -> Option<OffsetDateTime> {
     match field {
-        "started_at" => record.record.started_at,
-        "completed_at" => record.record.completed_at,
-        _ => Some(record.record.job.created),
+        "started_at" => record.started_at,
+        "completed_at" => record.completed_at,
+        _ => Some(record.job.created),
     }
 }
 
-fn taskman_search_haystack(record: &RuntimeTaskmanRecord) -> String {
+fn taskman_search_haystack(record: &TaskQueueRecord) -> String {
     [
-        record.record.queue_name.as_str(),
-        record.record.job.title.as_str(),
-        job_type_name(record.record.job.data.job_type),
-        record.record.status.as_str(),
-        job_preview(&record.record.job.data)
-            .as_deref()
-            .unwrap_or_default(),
+        record.queue_name.as_str(),
+        record.job.title.as_str(),
+        job_type_name(record.job.data.job_type),
+        record.status.as_str(),
+        job_preview(&record.job.data).as_deref().unwrap_or_default(),
         telegram_data(record)
             .map(|data| data.user_full_name.as_str())
             .unwrap_or_default(),
@@ -768,7 +731,7 @@ fn trim_preview_runes(value: &str, limit: usize) -> String {
     format!("{}...", &value[..index])
 }
 
-fn taskman_queue_names(records: &[RuntimeTaskmanRecord], queues: Vec<String>) -> Vec<String> {
+fn taskman_queue_names(records: &[&TaskQueueRecord], queues: Vec<String>) -> Vec<String> {
     let mut queue_names = queues
         .into_iter()
         .map(|queue| queue.trim().to_owned())
@@ -777,7 +740,7 @@ fn taskman_queue_names(records: &[RuntimeTaskmanRecord], queues: Vec<String>) ->
     if queue_names.is_empty() {
         queue_names = records
             .iter()
-            .map(|record| record.record.queue_name.clone())
+            .map(|record| record.queue_name.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -795,28 +758,24 @@ fn recent(value: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     })
 }
 
-fn count_pending_exact(records: &[RuntimeTaskmanRecord], queue_name: &str, priority: i32) -> i32 {
+fn count_pending_exact(records: &[&TaskQueueRecord], queue_name: &str, priority: i32) -> i32 {
     records
         .iter()
         .filter(|record| {
-            record.record.queue_name == queue_name
-                && record.record.status == JobStatus::Pending
-                && record.record.job.priority == priority
+            record.queue_name == queue_name
+                && record.status == JobStatus::Pending
+                && record.job.priority == priority
         })
         .count() as i32
 }
 
-fn count_pending_or_higher(
-    records: &[RuntimeTaskmanRecord],
-    queue_name: &str,
-    priority: i32,
-) -> i32 {
+fn count_pending_or_higher(records: &[&TaskQueueRecord], queue_name: &str, priority: i32) -> i32 {
     records
         .iter()
         .filter(|record| {
-            record.record.queue_name == queue_name
-                && record.record.status == JobStatus::Pending
-                && record.record.job.priority >= priority
+            record.queue_name == queue_name
+                && record.status == JobStatus::Pending
+                && record.job.priority >= priority
         })
         .count() as i32
 }
@@ -827,12 +786,10 @@ fn fallback_eta_seconds(queue_name: &str, pending_or_higher: i32) -> i32 {
     i32::try_from(seconds).unwrap_or(i32::MAX)
 }
 
-fn count_processing(records: &[RuntimeTaskmanRecord], queue_name: &str) -> i32 {
+fn count_processing(records: &[&TaskQueueRecord], queue_name: &str) -> i32 {
     records
         .iter()
-        .filter(|record| {
-            record.record.queue_name == queue_name && record.record.status == JobStatus::Processing
-        })
+        .filter(|record| record.queue_name == queue_name && record.status == JobStatus::Processing)
         .count() as i32
 }
 
@@ -1015,6 +972,41 @@ mod tests {
         assert_eq!(result.items[1].queue_name, IMAGE_REGULAR_QUEUE_NAME);
         assert_eq!(result.items[1].job_type, "image_gen");
         assert_eq!(result.items[1].preview.as_deref(), Some("cat"));
+
+        let page = inspector
+            .list_jobs(RuntimeTaskmanJobsFilter {
+                sort_by: "id".to_owned(),
+                sort_dir: "asc".to_owned(),
+                offset: 1,
+                limit: 1,
+                ..RuntimeTaskmanJobsFilter::default()
+            })
+            .expect("second page");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.summary.by_status["pending"], 2);
+        assert_eq!(page.summary.by_queue[TEXT_QUEUE_NAME], 1);
+        assert_eq!(page.summary.by_queue[IMAGE_REGULAR_QUEUE_NAME], 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, image_id);
+        assert_eq!(page.items[0].preview.as_deref(), Some("cat"));
+        let filtered = inspector
+            .list_jobs(RuntimeTaskmanJobsFilter {
+                q: "cat".to_owned(),
+                status: vec!["pending".to_owned()],
+                ..RuntimeTaskmanJobsFilter::default()
+            })
+            .expect("filtered image");
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.summary.by_queue[IMAGE_REGULAR_QUEUE_NAME], 1);
+        assert_eq!(filtered.items[0].id, image_id);
+        assert!(
+            inspector
+                .list_jobs(RuntimeTaskmanJobsFilter {
+                    status: vec!["not_a_status".to_owned()],
+                    ..RuntimeTaskmanJobsFilter::default()
+                })
+                .is_err()
+        );
 
         let diagnostics = inspector
             .queue_diagnostics(

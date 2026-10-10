@@ -2186,6 +2186,12 @@ impl InMemoryTaskQueue {
         Ok(())
     }
 
+    /// Inspect queue records under the state lock without copying job payloads.
+    /// The callback must not call other methods on this queue.
+    pub fn inspect_records<R>(&self, inspect: impl FnOnce(&[TaskQueueRecord]) -> R) -> R {
+        inspect(&self.lock().records)
+    }
+
     /// Return a stable ID-ordered snapshot of queue records.
     #[must_use]
     pub fn records(&self) -> Vec<TaskQueueRecord> {
