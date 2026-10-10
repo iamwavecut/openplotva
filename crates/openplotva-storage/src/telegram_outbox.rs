@@ -523,7 +523,8 @@ RETURNING id
 const SQL_START_OPERATION_REQUEST: &str = r#"
 WITH active AS (
     UPDATE telegram_outbox
-    SET updated_at = statement_timestamp()
+    SET leased_until = statement_timestamp() + interval '90 seconds',
+        updated_at = statement_timestamp()
     WHERE id = $1
       AND lease_token = $2
       AND state = 'leased'
@@ -1689,6 +1690,27 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].part_index, 0);
         assert!(first[0].blob.is_some());
+        sqlx::query(
+            "UPDATE telegram_outbox SET leased_until = statement_timestamp() + interval '10 seconds' WHERE id = $1",
+        )
+        .bind(first[0].id)
+        .execute(&pool)
+        .await?;
+        assert!(
+            !store
+                .mark_request_started(first[0].id, first[0].lease_token + 1)
+                .await?
+        );
+        let remaining_lease: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch FROM leased_until - statement_timestamp())::double precision FROM telegram_outbox WHERE id = $1",
+        )
+        .bind(first[0].id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            remaining_lease <= 10.0,
+            "a stale token cannot renew the lease"
+        );
         assert!(
             !store
                 .mark_delivered(
@@ -1705,6 +1727,16 @@ mod tests {
             store
                 .mark_request_started(first[0].id, first[0].lease_token)
                 .await?
+        );
+        let remaining_lease: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch FROM leased_until - statement_timestamp())::double precision FROM telegram_outbox WHERE id = $1",
+        )
+        .bind(first[0].id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            remaining_lease > 80.0,
+            "request start needs a fresh send lease"
         );
         assert!(
             store
