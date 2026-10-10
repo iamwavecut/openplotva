@@ -710,8 +710,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: "draw_api",
         summary: "Generate and send an image through the direct Draw API.",
         when_to_use: "Use for an explicit % image shortcut; draw_image handles ordinary generation and edits.",
-        result: "Returns delivery status. Do not announce success before the result.",
-        continuation: ToolContinuation::RequiresFollowup,
+        result: "Confirmed delivery completes the image request without another text reply. Continue on failure.",
+        continuation: ToolContinuation::MayTerminateOnSuccess,
         args: &[
             ToolArgSpec {
                 name: "prompt",

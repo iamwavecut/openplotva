@@ -5344,6 +5344,81 @@ async fn session_suppresses_replayed_intermediate_batch_and_requires_new_final()
 }
 
 #[tokio::test]
+async fn session_direct_draw_stops_only_after_confirmed_delivery() -> Result<(), Box<dyn Error>> {
+    struct DirectDrawToolbox(bool);
+    impl openplotva_dialog::DialogToolbox for DirectDrawToolbox {
+        fn agent_tool<'a>(
+            &'a self,
+            _context: openplotva_dialog::ToolContext,
+            step: openplotva_dialog::ToolStep,
+        ) -> openplotva_dialog::ToolboxFuture<'a> {
+            assert_eq!(step.step, "draw_api");
+            Box::pin(async move {
+                Ok(openplotva_dialog::ToolResult {
+                    status: "ok".to_owned(),
+                    data: Some(serde_json::json!({"delivered": self.0})),
+                    ..openplotva_dialog::ToolResult::default()
+                })
+            })
+        }
+    }
+
+    for delivered in [true, false] {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("нарисуй кота"), now),
+        );
+        let provider = StepProviderStub::with_steps(vec![
+            Ok(step_tools(
+                "Начинаю рисовать.",
+                vec![(
+                    "direct-draw",
+                    openplotva_dialog::ToolStep {
+                        step: "draw_api".to_owned(),
+                        prompt: "a cat".to_owned(),
+                        ..openplotva_dialog::ToolStep::default()
+                    },
+                )],
+            )),
+            Ok(step_text("Изображение не доставлено.")),
+        ]);
+        let wiring = session_wiring(Arc::new(DirectDrawToolbox(delivered)), None);
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            session_options(now, &outcomes, &wiring),
+        )
+        .await;
+
+        assert!(!report.failed, "{report:?}");
+        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        assert!(effects.intermediates().is_empty());
+        if delivered {
+            assert_eq!(provider.calls(), 1);
+            assert!(effects.sent().is_empty());
+            assert!(report.sent_answer);
+            let rows = ledger_rows(&outcomes);
+            assert_eq!(rows[0].outcome, "sent");
+            assert_eq!(rows[0].sent_message_parts, Some(1));
+        } else {
+            assert_eq!(provider.calls(), 2);
+            assert_eq!(effects.sent().len(), 1);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_queued_draw_terminates_without_confirmation_text() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
