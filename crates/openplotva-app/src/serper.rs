@@ -21,6 +21,7 @@ const SERPER_RETRY_COUNT: usize = 3;
 const SERPER_RETRY_BASE_DELAY: StdDuration = StdDuration::from_secs(1);
 const SERPER_QUERY_MAX_BYTES: usize = 400;
 const SERPER_CRAWL_MAX_BYTES: usize = 6000;
+const CRAWL_MAX_REDIRECTS: usize = 5;
 
 #[derive(Clone)]
 pub struct SerperClient {
@@ -100,21 +101,33 @@ impl SerperClient {
         if crawl_url.is_empty() {
             return Err(SerperError::EmptyUrl);
         }
-        let destination = validate_public_crawl_url(crawl_url).await?;
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.timeout);
-        if let Some(host) = &destination.resolved_host {
-            builder = builder.resolve_to_addrs(host, &destination.addresses);
-        }
-        let http = builder.build().map_err(SerperError::HttpClient)?;
-        let response = http
-            .get(destination.url)
-            .send()
-            .await
-            .map_err(|error| SerperError::Request(error.without_url()))?;
-        read_crawl_response(response).await
+        tokio::time::timeout(self.timeout, async {
+            let mut url = crawl_url.to_owned();
+            let mut redirects = 0;
+            loop {
+                let destination = validate_public_crawl_url(&url).await?;
+                let mut builder = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(self.timeout);
+                if let Some(host) = &destination.resolved_host {
+                    builder = builder.resolve_to_addrs(host, &destination.addresses);
+                }
+                let http = builder.build().map_err(SerperError::HttpClient)?;
+                let response = http
+                    .get(destination.url)
+                    .send()
+                    .await
+                    .map_err(|error| SerperError::Request(error.without_url()))?;
+                let Some(target) = crawl_redirect_target(&response, redirects)? else {
+                    return read_crawl_response(response).await;
+                };
+                url = target.into();
+                redirects += 1;
+            }
+        })
+        .await
+        .map_err(|_| SerperError::message("crawl timed out".to_owned()))?
     }
 
     async fn perform_search_with_retry(
@@ -178,6 +191,31 @@ impl SerperClient {
             .map_err(|error| SerperError::message(format!("unmarshal response: {error}")))?;
         Ok(String::from_utf8_lossy(&body).trim().to_owned())
     }
+}
+
+fn crawl_redirect_target(
+    response: &reqwest::Response,
+    redirects: usize,
+) -> Result<Option<Url>, SerperError> {
+    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+    if redirects >= CRAWL_MAX_REDIRECTS {
+        return Err(SerperError::message(
+            "crawl exceeded 5 redirects".to_owned(),
+        ));
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| SerperError::message("crawl redirect has no usable location".to_owned()))?;
+    response
+        .url()
+        .join(location)
+        .map(Some)
+        .map_err(|_| SerperError::message("crawl redirect has an invalid location".to_owned()))
 }
 
 async fn read_crawl_response(mut response: reqwest::Response) -> Result<String, SerperError> {
@@ -678,6 +716,75 @@ mod tests {
             html_body_to_plain_text("<html><body>Hello <b>Plotva</b> &amp; fish</body></html>"),
             "Hello Plotva & fish"
         );
+    }
+
+    #[tokio::test]
+    async fn crawl_redirects_resolve_locations_and_revalidate_destinations()
+    -> Result<(), Box<dyn Error>> {
+        for status in [301, 302, 303, 307, 308] {
+            let response = redirect_response(status, Some("../notes?version=1")).await?;
+            let base = response.url().clone();
+            assert_eq!(
+                crawl_redirect_target(&response, 0)?.expect("redirect"),
+                base.join("../notes?version=1")?
+            );
+            assert!(
+                crawl_redirect_target(&response, CRAWL_MAX_REDIRECTS)
+                    .expect_err("bounded redirects")
+                    .to_string()
+                    .contains("exceeded 5")
+            );
+        }
+        for location in [
+            "http://127.0.0.1/internal",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/internal",
+            "http://user:password@example.com/",
+            "file:///etc/passwd",
+        ] {
+            let response = redirect_response(302, Some(location)).await?;
+            let target = crawl_redirect_target(&response, 0)?.expect("redirect");
+            assert!(validate_public_crawl_url(target.as_str()).await.is_err());
+        }
+        for location in [None, Some(""), Some("http://[invalid")] {
+            let response = redirect_response(302, location).await?;
+            assert!(crawl_redirect_target(&response, 0).is_err());
+        }
+        let response = redirect_response(304, Some("/cached")).await?;
+        assert!(crawl_redirect_target(&response, 0)?.is_none());
+        assert!(read_crawl_response(response).await.is_err());
+        Ok(())
+    }
+
+    async fn redirect_response(
+        status: u16,
+        location: Option<&str>,
+    ) -> Result<reqwest::Response, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let location = location
+            .map(|value| format!("Location: {value}\r\n"))
+            .unwrap_or_default();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            read_request(&mut stream)
+                .await
+                .map_err(std::io::Error::other)?;
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status} Redirect\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+        });
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .get(format!("http://{address}/start/page"))
+            .send()
+            .await?;
+        server.await??;
+        Ok(response)
     }
 
     #[test]
