@@ -3115,6 +3115,7 @@ impl DialogToolCallHistoryStore for ToolHistoryStub {
 #[derive(Clone, Default)]
 struct MaterializerStub {
     history: Vec<HistoryMessage>,
+    observed: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3161,11 +3162,37 @@ impl DialogInputMaterializer for FailingInjectedMaterializer {
 
 impl MaterializerStub {
     fn with_history(history: Vec<HistoryMessage>) -> Self {
-        Self { history }
+        Self {
+            history,
+            ..Default::default()
+        }
     }
 }
 
 impl DialogInputMaterializer for MaterializerStub {
+    fn observe_dialog_messages<'a>(
+        &'a self,
+        _params: &'a DialogJobParams,
+        after: i32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<serde_json::Value>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(self
+                .observed
+                .lock()
+                .expect("observed messages")
+                .iter()
+                .filter(|message| {
+                    message["message_id"]
+                        .as_i64()
+                        .is_some_and(|id| id > i64::from(after))
+                })
+                .cloned()
+                .collect())
+        })
+    }
+
     fn materialize_dialog_input<'a>(
         &'a self,
         params: &'a DialogJobParams,
@@ -6430,6 +6457,102 @@ async fn explicit_image_request_never_publishes_a_promise_after_exhausted_repair
             .as_deref()
             .is_some_and(|error| error.contains("requested image tool"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn newer_initiator_image_intent_replaces_the_previous_attempt() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    for observed_first in [false, true] {
+        for (sender, requested, expected) in [
+            (7, "draw_image", Some("draw_image")),
+            (7, "", None),
+            (8, "draw_image", None),
+        ] {
+            let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+            let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+            let toolbox = Arc::new(SessionToolboxStub::default());
+            let materializer = MaterializerStub::default();
+            let observed_messages = materializer.observed.clone();
+            let wiring = crate::dialog_turn::SessionWorkerWiring {
+                registry: registry.clone(),
+                ..session_wiring(toolbox.clone(), None)
+            };
+            let queue = InMemoryTaskQueue::new();
+            let mut params = dialog_params("нарисуй рыбу");
+            params.meta = serde_json::json!({"requested_tool": "draw_image"});
+            let job = queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+            let draw = |id, prompt: &str| {
+                step_tools(
+                    "",
+                    vec![(
+                        id,
+                        openplotva_dialog::ToolStep {
+                            step: "draw_image".into(),
+                            prompt: prompt.into(),
+                            ..Default::default()
+                        },
+                    )],
+                )
+            };
+            let provider = StepProviderStub::with_steps(vec![
+                Ok(draw("old", "fish")),
+                Ok(if expected.is_some() {
+                    draw("new", "cat")
+                } else {
+                    step_text("Приняла новое сообщение.")
+                }),
+                Ok(step_text("Рисование сейчас недоступно.")),
+            ])
+            .with_on_call(Box::new(move |index| {
+                if index != 1 {
+                    return;
+                }
+                let mut params = dialog_params("нарисуй кота");
+                params.message_id += 1;
+                params.user_id = sender;
+                params.meta = serde_json::json!({"requested_tool": requested});
+                if observed_first {
+                    observed_messages
+                        .lock()
+                        .expect("observed messages")
+                        .push(serde_json::json!({
+                            "message_id": params.message_id, "user_id": sender,
+                            "text": params.message_text, "meta": {}
+                        }));
+                }
+                assert!(registry.inject(key, job, crate::dialog_turn::InjectedMessage { params }));
+            }));
+            let effects = EffectsStub::default();
+            let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+                crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+                None,
+            );
+            let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+                &queue,
+                &provider,
+                &effects,
+                &materializer,
+                &NoopDialogToolCallHistoryStore,
+                session_options(now, &outcomes, &wiring),
+            )
+            .await;
+            assert!(report.completed, "{report:?}");
+            let requests = provider.requests();
+            assert_eq!(requests[0].required_tool.as_deref(), Some("draw_image"));
+            assert_eq!(
+                requests[1].required_tool.as_deref(),
+                expected,
+                "sender={sender}, requested={requested}"
+            );
+            if expected.is_some() {
+                let draws = toolbox.draw_requests.lock().expect("draws");
+                assert_eq!(draws.len(), 2);
+                assert_eq!(draws[1].context.message_text, "нарисуй кота");
+            }
+        }
+    }
     Ok(())
 }
 
