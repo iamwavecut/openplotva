@@ -3115,6 +3115,7 @@ impl DialogToolCallHistoryStore for ToolHistoryStub {
 #[derive(Clone, Default)]
 struct MaterializerStub {
     history: Vec<HistoryMessage>,
+    canonical_trigger: Option<HistoryMessage>,
     observed: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
@@ -3199,7 +3200,12 @@ impl DialogInputMaterializer for MaterializerStub {
         now: OffsetDateTime,
     ) -> DialogInputMaterializerFuture<'a> {
         Box::pin(async move {
-            let mut input = dialog_input_from_job_params_at(params, now);
+            let canonical = self
+                .canonical_trigger
+                .clone()
+                .map(|message| super::input::canonical_dialog_job_params(params, message));
+            let mut input =
+                dialog_input_from_job_params_at(canonical.as_ref().unwrap_or(params), now);
             input.history = self.history.clone();
             Ok(input)
         })
@@ -6352,6 +6358,15 @@ async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), 
         let queue = InMemoryTaskQueue::new();
         let mut params = dialog_params("Плотва, нарисуй рыбу в космосе");
         params.meta = serde_json::json!({"requested_tool": "draw_image"});
+        let materializer = MaterializerStub {
+            canonical_trigger: Some(HistoryMessage {
+                message_id: params.message_id,
+                user_id: params.user_id,
+                text: params.message_text.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
         let provider = StepProviderStub::with_steps(vec![
             Ok(step_text("Сначала я подумаю, как изобразить эту рыбу.")),
@@ -6384,7 +6399,7 @@ async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), 
             &queue,
             &provider,
             &effects,
-            &BasicDialogInputMaterializer,
+            &materializer,
             &NoopDialogToolCallHistoryStore,
             session_options(now, &outcomes, &wiring),
         )

@@ -404,13 +404,7 @@ impl PostgresDialogInputMaterializer {
                         scheduled.chat_id, scheduled.message_id
                     ),
                 })?;
-        let mut params = scheduled.clone();
-        params.message_text = message.text;
-        params.original_text = message.original_text;
-        params.user_id = message.user_id;
-        params.user_full_name = message.name;
-        params.thread_id = (message.thread_id != 0).then_some(message.thread_id);
-        params.meta = serde_json::to_value(message.meta).unwrap_or_default();
+        let params = canonical_dialog_job_params(scheduled, message);
         Ok((params, trigger_at, payload))
     }
 
@@ -912,6 +906,39 @@ impl PostgresDialogInputMaterializer {
     ) -> Result<Option<OffsetDateTime>, openplotva_storage::StorageError> {
         self.history.history_reset_at(chat_id, thread_id).await
     }
+}
+
+pub(crate) fn canonical_dialog_job_params(
+    scheduled: &DialogJobParams,
+    mut message: HistoryMessage,
+) -> DialogJobParams {
+    let scheduled_text = if scheduled.original_text.trim().is_empty() {
+        &scheduled.message_text
+    } else {
+        &scheduled.original_text
+    };
+    let canonical_text = if message.original_text.trim().is_empty() {
+        &message.text
+    } else {
+        &message.original_text
+    };
+    let requested_tool = scheduled.meta["requested_tool"]
+        .as_str()
+        .unwrap_or_default();
+    if scheduled.user_id == message.user_id
+        && scheduled_text.trim() == canonical_text.trim()
+        && !requested_tool.is_empty()
+    {
+        message.meta.requested_tool = requested_tool.to_owned();
+    }
+    let mut params = scheduled.clone();
+    params.message_text = message.text;
+    params.original_text = message.original_text;
+    params.user_id = message.user_id;
+    params.user_full_name = message.name;
+    params.thread_id = (message.thread_id != 0).then_some(message.thread_id);
+    params.meta = serde_json::to_value(message.meta).unwrap_or_default();
+    params
 }
 
 #[must_use]
@@ -1515,6 +1542,40 @@ fn stored_member_is_inactive(member: &openplotva_storage::ChatMemberRecord) -> b
 mod context_artifact_tests {
     use super::*;
     use openplotva_memory::{Card, RetrievedMemory};
+
+    #[test]
+    fn canonical_trigger_preserves_intent_only_for_the_unchanged_request() {
+        for (original, text, user_id, expected) in [
+            ("", "draw a fish", 42, "draw_image"),
+            ("draw a fish", "draw a fish", 42, "draw_image"),
+            ("draw a fish", "never mind", 42, ""),
+            ("draw a fish", "draw a fish", 43, ""),
+        ] {
+            let scheduled = DialogJobParams {
+                chat_id: -100,
+                message_id: 7,
+                user_id: 42,
+                user_full_name: "User".into(),
+                message_text: "draw a fish".into(),
+                original_text: original.into(),
+                meta: serde_json::json!({"requested_tool":"draw_image"}),
+                max_output_tokens: 321,
+                thread_id: None,
+            };
+            let canonical = canonical_dialog_job_params(
+                &scheduled,
+                HistoryMessage {
+                    user_id,
+                    text: text.into(),
+                    ..Default::default()
+                },
+            );
+            let input = dialog_input_from_job_params_at(&canonical, OffsetDateTime::UNIX_EPOCH);
+            assert_eq!(input.message.meta.requested_tool, expected);
+            assert_eq!(input.message.text, text);
+            assert_eq!(input.user.id, user_id);
+        }
+    }
 
     #[test]
     fn membership_gate_distinguishes_unknown_restricted_and_departed_users() {
