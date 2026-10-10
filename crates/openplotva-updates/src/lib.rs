@@ -1813,11 +1813,13 @@ pub fn resolve_draw_prompt_from_message(
 ) -> Option<String> {
     let mut verb = first_word_lower.trim_end_matches(',').to_owned();
     let mut prompt = rest_text.trim().to_owned();
+    let mut request_prefix = false;
     for _ in 0..2 {
         if !matches!(verb.as_str(), "пожалуйста" | "прошу" | "можешь" | "можете")
         {
             break;
         }
+        request_prefix = true;
         (verb, prompt) = cut_first_word(&prompt);
         verb = verb.trim_end_matches(',').to_lowercase();
     }
@@ -1828,7 +1830,9 @@ pub fn resolve_draw_prompt_from_message(
         cut_first_word(&prompt.to_lowercase()).0.as_str(),
         "картинку" | "изображение" | "рисунок" | "картину" | "image" | "picture"
     );
-    (DRAW_VERB_ALIASES.contains(&verb.as_str()) || verb == "нарисовать" || image_generation)
+    (DRAW_VERB_ALIASES.contains(&verb.as_str())
+        || (request_prefix && verb == "нарисовать")
+        || image_generation)
         .then(|| draw_prompt_with_reply_context(&prompt, Some(message)))
 }
 
@@ -6404,6 +6408,7 @@ mod tests {
             ("расскажи", "как нарисовать рыбу"),
             ("можешь", "объяснить рисование"),
             ("сгенерируй", "песню про рыбу"),
+            ("нарисовать", "такое сложно?"),
         ] {
             assert_eq!(
                 resolve_draw_prompt_from_message(&text_reply, first, rest),
