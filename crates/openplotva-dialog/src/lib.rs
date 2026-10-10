@@ -1254,6 +1254,12 @@ fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
         "emoji" => {
             schema.insert("enum".to_owned(), json!(SESSION_REACTION_ALLOWED_EMOJI));
         }
+        "memory_scope" => {
+            schema.insert("enum".to_owned(), json!(["self", "chat", "self_global"]));
+        }
+        "action" => {
+            schema.insert("enum".to_owned(), json!(["remember", "update", "forget"]));
+        }
         "scope" => {
             schema.insert("enum".to_owned(), json!(["thread", "chat"]));
         }
@@ -5590,6 +5596,47 @@ mod tests {
             DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
                 "excessive paragraph count".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn memory_schema_keeps_memory_scopes_distinct_from_history_scopes() {
+        let tools = chat_completion_tools_for_names(&[
+            "memory_manage",
+            STEP_MEMORY_SEARCH,
+            STEP_CHAT_HISTORY_SUMMARY,
+        ]);
+        let parameters = |name: &str| {
+            &tools
+                .iter()
+                .find(|tool| tool.function.name == name)
+                .expect("native tool")
+                .function
+                .parameters
+        };
+        for name in ["memory_manage", STEP_MEMORY_SEARCH] {
+            let choices = parameters(name)["properties"]["memory_scope"]["enum"]
+                .as_array()
+                .expect("memory scope choices");
+            for accepted in ["self", "chat", "self_global"] {
+                assert!(choices.contains(&json!(accepted)));
+            }
+            for rejected in ["thread", "chat`}", "global"] {
+                assert!(!choices.contains(&json!(rejected)));
+            }
+        }
+        let actions = parameters("memory_manage")["properties"]["action"]["enum"]
+            .as_array()
+            .expect("memory actions");
+        for accepted in ["remember", "update", "forget"] {
+            assert!(actions.contains(&json!(accepted)));
+        }
+        assert!(!actions.contains(&json!("delete")));
+        assert!(
+            parameters(STEP_CHAT_HISTORY_SUMMARY)["properties"]["scope"]["enum"]
+                .as_array()
+                .expect("history scope choices")
+                .contains(&json!("thread"))
         );
     }
 
