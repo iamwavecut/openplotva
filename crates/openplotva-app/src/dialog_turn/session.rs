@@ -303,6 +303,16 @@ fn session_native_tools(allow_finish: bool) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+fn record_rejected_final(agent: &mut openplotva_agent::AgentLoop, text: &str, reason: &str) {
+    agent.transcript.push(SessionMessage::Assistant {
+        text: text.to_owned(),
+        tool_calls: Vec::new(),
+    });
+    agent.transcript.push(SessionMessage::InjectedUser {
+        rendered: format!("Runtime guidance: The preceding draft was not sent. {reason}"),
+    });
+}
+
 /// Immutable inputs of one session run, borrowed from the turn engine.
 pub(crate) struct SessionRunContext<'a> {
     pub item_id: i64,
@@ -759,6 +769,11 @@ where
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
                 {
                     search_citation_repairs += 1;
+                    record_rejected_final(
+                        &mut agent,
+                        &sanitized,
+                        "It does not cite a retrieved source. Include a link returned by the tools.",
+                    );
                     tracing::info!(
                         job_id = ctx.item_id,
                         attempt = search_citation_repairs,
@@ -785,6 +800,11 @@ where
                         report.regenerations = regenerations;
                         anti_loop = true;
                         repeated_final_repair = true;
+                        record_rejected_final(
+                            &mut agent,
+                            &sanitized,
+                            "It repeats this turn's intermediate messages. Give the completed answer using the tool results.",
+                        );
                         append_repeated_final_regeneration_event(
                             queue,
                             ctx.item_id,
@@ -830,6 +850,11 @@ where
                     regenerations += 1;
                     report.regenerations = regenerations;
                     anti_loop = true;
+                    record_rejected_final(
+                        &mut agent,
+                        &sanitized,
+                        "It repeats an earlier bot reply. Answer the current request without copying that reply.",
+                    );
                     append_session_regeneration_event(
                         queue,
                         ctx.item_id,
