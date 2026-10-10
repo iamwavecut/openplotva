@@ -477,7 +477,11 @@ impl RoutedAttemptWalker {
                             // Not even the sample that spends the budget charges the breaker:
                             // the model answered every time, and opening its circuit would
                             // hand the next turns to the fallback this policy exists to avoid.
-                            if reason != FailureReason::ModelOutputRejected {
+                            if !matches!(
+                                reason,
+                                FailureReason::ModelOutputRejected
+                                    | FailureReason::ContextLengthExceeded
+                            ) {
                                 self.breakers.record_failure(
                                     attempt.provider,
                                     attempt.model,
@@ -1155,6 +1159,41 @@ mod tests {
             vec![10, 20],
             "a dead provider is walked past immediately, not re-sampled"
         );
+    }
+
+    #[tokio::test]
+    async fn walker_falls_back_on_context_limit_without_opening_the_circuit() {
+        let mut snap = snapshot_with_fallback();
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers)).with_model_output_retries(3);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_models = Arc::clone(&seen);
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let seen_models = Arc::clone(&seen_models);
+                    async move {
+                        seen_models.lock().expect("models").push(attempt.model_id);
+                        if attempt.model_id == 10 {
+                            Err("upstream returned status 400: maximum context length".to_owned())
+                        } else {
+                            Ok("fallback answer")
+                        }
+                    }
+                },
+                |error: &String| openplotva_llm::retry::retryable_reason_from_message(error),
+            )
+            .await
+            .expect("the larger-context fallback answers");
+
+        assert_eq!(output, "fallback answer");
+        assert_eq!(*seen.lock().expect("models"), vec![10, 20]);
+        assert!(breakers.is_live_at(1, 10, Instant::now()));
     }
 
     #[tokio::test]
