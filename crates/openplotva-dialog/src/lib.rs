@@ -1962,13 +1962,14 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
     let outside_code = leak_guard::mask_code_spans(value).to_ascii_lowercase();
     let self_instruction = outside_code.lines().any(|line| {
         let line = line.trim_start_matches([' ', '\t', '(', '*']);
-        let correction = line.starts_with("wait,")
-            || line.starts_with("actually,")
-            || line.starts_with("let me ");
-        let first_person = line.contains("i should ")
-            || line.contains("i need ")
-            || line.contains("i see ")
-            || line.contains("let me ");
+        let correction = line.starts_with("wait,") || line.starts_with("actually,");
+        let self_rewrite = (line.contains("i should ")
+            && ["just", "reformat", "re-format"]
+                .iter()
+                .any(|term| line.contains(term)))
+            || (line.contains("let me ") && (line.contains("actual ") || line.contains("clean ")))
+            || (line.contains("i see ")
+                && (line.contains("system") || line.contains("logic loop")));
         let output_contract = [
             "response",
             "output",
@@ -1980,7 +1981,7 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
         ]
         .iter()
         .any(|term| line.contains(term));
-        (correction && first_person && output_contract)
+        (correction && self_rewrite && output_contract)
             || (line.starts_with("note:") && line.contains("i am simulating") && output_contract)
             || line.starts_with("final response construction:")
             || (line.starts_with("//")
@@ -5031,6 +5032,10 @@ mod tests {
         for text in [
             "Wait, I should buy groceries before going home.",
             "The response format follows the instructions.",
+            "Actually, let me check the response format before answering.",
+            "Wait, I need the output format for the API example.",
+            "Let me format the output as a table.",
+            "Wait, I should check the response format.",
             "<pre>Wait, I should re-format the response according to the instructions.</pre>",
             "> Wait, I should re-format the response according to the instructions.",
             "\"Wait, I should re-format the response according to the instructions.\"",
