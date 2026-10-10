@@ -4300,6 +4300,14 @@ async fn session_repairs_searched_answer_until_it_cites_an_actual_source()
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
+    assert!(requests[2].transcript.iter().any(|entry| matches!(
+        entry,
+        openplotva_dialog::SessionMessage::Assistant { text, tool_calls }
+            if text.contains("с выдуманной ссылкой") && tool_calls.is_empty()
+    )));
+    assert!(step_context(&requests[2]).iter().any(|context| {
+        context.contains("The preceding draft was not sent") && context.contains("retrieved source")
+    }));
     assert!(
         step_context(&requests[1])
             .iter()
@@ -5231,6 +5239,15 @@ async fn session_suppresses_replayed_intermediate_batch_and_requires_new_final()
         )]
     );
     let requests = provider.requests();
+    assert!(requests[3].transcript.iter().any(|entry| matches!(
+        entry,
+        openplotva_dialog::SessionMessage::Assistant { text, tool_calls }
+            if text == &replay && tool_calls.is_empty()
+    )));
+    assert!(step_context(&requests[3]).iter().any(|context| {
+        context.contains("The preceding draft was not sent")
+            && context.contains("intermediate messages")
+    }));
     assert!(matches!(
         requests[3].tools,
         openplotva_dialog::ToolsMode::FinalOnly
@@ -6299,6 +6316,59 @@ fn step_context(request: &openplotva_dialog::ChatStepRequest) -> Vec<String> {
             }
         }))
         .collect()
+}
+
+#[tokio::test]
+async fn session_returns_rejected_duplicate_draft_to_the_agent() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("what changed?"), now),
+    );
+    let duplicate = duplicate_answer_output().answer;
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_text(&duplicate)),
+        Ok(step_text("A fresh answer to the current request")),
+    ]);
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &MaterializerStub::with_history(duplicate_guard_history_fixture()),
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert!(!report.failed, "{report:?}");
+    assert_eq!(report.regenerations, 1);
+    assert_eq!(effects.sent()[0].1, "A fresh answer to the current request");
+    assert!(effects.intermediates().is_empty());
+    let requests = provider.requests();
+    assert!(requests[0].transcript.is_empty());
+    assert_eq!(
+        requests[0].input.reference_context,
+        requests[1].input.reference_context
+    );
+    assert!(requests[1].transcript.iter().any(|entry| matches!(
+        entry,
+        openplotva_dialog::SessionMessage::Assistant { text, tool_calls }
+            if text == duplicate.trim() && tool_calls.is_empty()
+    )));
+    assert!(step_context(&requests[1]).iter().any(|context| {
+        context.contains("The preceding draft was not sent")
+            && context.contains("earlier bot reply")
+    }));
+    Ok(())
 }
 
 #[tokio::test]
