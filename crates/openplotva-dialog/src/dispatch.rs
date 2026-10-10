@@ -159,19 +159,35 @@ pub async fn dispatch_dialog_tool(
     }
 }
 
-/// Explicit `file_id`, or the single image attached to the trigger message.
+/// Resolve an explicit handle, or the single media attachment on the trigger.
 fn vision_tool_file_id(file_id: &str, meta: &ToolContext) -> Option<String> {
     let file_id = file_id.trim();
     if !file_id.is_empty() {
-        return Some(file_id.to_owned());
+        let normalized = file_id.replace("\\_", "_");
+        return Some(
+            meta.image_reference_ids
+                .get(&normalized)
+                .cloned()
+                .unwrap_or(normalized),
+        );
     }
-    single_current_image_file_id(&meta.message_meta)
+    single_current_media_file_id(&meta.message_meta)
 }
 
-fn single_current_image_file_id(meta: &ChatMessageMeta) -> Option<String> {
+fn single_current_media_file_id(meta: &ChatMessageMeta) -> Option<String> {
     let mut found = None;
     for attachment in &meta.attachments {
-        if !attachment.kind.trim().eq_ignore_ascii_case("image") {
+        if !matches!(
+            attachment.kind.trim().to_ascii_lowercase().as_str(),
+            "image"
+                | "video"
+                | "animation"
+                | "video_note"
+                | "voice"
+                | "audio"
+                | "sticker"
+                | "document"
+        ) {
             continue;
         }
         let file_id = attachment.file_unique_id.trim();
@@ -223,6 +239,94 @@ mod tests {
             self.topics.lock().expect("recorder lock").push(req.topic);
             Box::pin(async { Ok(ToolResult::failed("test_sink", "recorded")) })
         }
+    }
+
+    #[derive(Default)]
+    struct MediaRecorder(Mutex<Vec<String>>);
+
+    impl DialogToolbox for MediaRecorder {
+        fn understand_media<'a>(&'a self, req: VisionRequest) -> ToolboxFuture<'a> {
+            self.0.lock().expect("media").push(req.file_id);
+            Box::pin(async { Ok(ToolResult::default()) })
+        }
+    }
+
+    #[test]
+    fn media_dispatch_resolves_previous_message_handles_without_guessing() {
+        use openplotva_core::ChatAttachment;
+        let attachments = ["voice", "image", "audio", "video"]
+            .into_iter()
+            .map(|kind| ChatAttachment {
+                kind: kind.to_owned(),
+                file_unique_id: format!("stable-{kind}"),
+                ..ChatAttachment::default()
+            })
+            .collect();
+        let input = crate::DialogInput {
+            history: vec![crate::HistoryMessage {
+                message_id: 77,
+                meta: ChatMessageMeta {
+                    attachments,
+                    ..ChatMessageMeta::default()
+                },
+                ..crate::HistoryMessage::default()
+            }],
+            ..crate::DialogInput::default()
+        };
+        let meta = crate::dialog_tool_context(&input);
+        let toolbox = MediaRecorder::default();
+        for reference in [
+            "message_77_voice_1",
+            "message_77_audio_1",
+            "message_77_image_1",
+            "message\\_77\\_video\\_2",
+            "message_78_voice_1",
+        ] {
+            poll_ready(dispatch_dialog_tool(
+                &toolbox,
+                &meta,
+                &ToolStep {
+                    step: STEP_UNDERSTAND_MEDIA.to_owned(),
+                    file_id: reference.to_owned(),
+                    ..ToolStep::default()
+                },
+            ))
+            .expect("media dispatch");
+        }
+        assert_eq!(
+            *toolbox.0.lock().expect("media"),
+            [
+                "stable-voice",
+                "stable-audio",
+                "stable-image",
+                "stable-video",
+                "message_78_voice_1"
+            ]
+        );
+        assert_eq!(meta.image_attachments.len(), 1);
+    }
+
+    #[test]
+    fn omitted_media_reference_requires_one_current_attachment() {
+        let voice = openplotva_core::ChatAttachment {
+            kind: "voice".to_owned(),
+            file_unique_id: "stable-voice".to_owned(),
+            ..openplotva_core::ChatAttachment::default()
+        };
+        let mut meta = ChatMessageMeta {
+            attachments: vec![voice.clone()],
+            ..ChatMessageMeta::default()
+        };
+        assert_eq!(
+            single_current_media_file_id(&meta).as_deref(),
+            Some("stable-voice")
+        );
+        meta.attachments.push(voice);
+        assert_eq!(single_current_media_file_id(&meta), None);
+        assert_eq!(
+            single_current_media_file_id(&ChatMessageMeta::default()),
+            None
+        );
     }
 
     #[test]

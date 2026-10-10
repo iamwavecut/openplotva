@@ -5067,7 +5067,7 @@ async fn session_reuses_understand_media_result_by_resolved_unique_id() -> Resul
             .lock()
             .expect("media refs")
             .as_slice(),
-        ["message\\_77\\_video\\_1"]
+        ["message_77_video_1"]
     );
     Ok(())
 }

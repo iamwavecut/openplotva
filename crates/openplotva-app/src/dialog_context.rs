@@ -73,7 +73,7 @@ pub fn vision_attachment_file_id_candidates(
             return vec![image.file_unique_id.clone()];
         }
     }
-    if images.len() == 1 {
+    if images.len() == 1 && input.is_empty() {
         return vec![images[0].file_unique_id.clone()];
     }
     Vec::new()
@@ -304,7 +304,9 @@ fn matches_message_scoped_vision_attachment_alias(
 ) -> bool {
     message_id > 0
         && (matches_message_media_alias(input, "message_", message_id, media_kind, image_index)
-            || matches_message_media_alias(input, "msg_", message_id, media_kind, image_index))
+            || matches_message_media_alias(input, "msg_", message_id, media_kind, image_index)
+            || matches_message_media_alias(input, "message_", message_id, "image", image_index)
+            || matches_message_media_alias(input, "msg_", message_id, "image", image_index))
 }
 
 fn matches_source_vision_attachment_alias(
@@ -573,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn vision_attachment_file_id_candidates_fall_back_to_single_image_like_go() {
+    fn vision_attachment_file_id_candidates_default_only_for_omitted_reference() {
         let meta = ChatMessageMeta {
             attachments: vec![ChatAttachment {
                 kind: "image".to_owned(),
@@ -586,7 +588,7 @@ mod tests {
 
         assert_eq!(
             vision_attachment_file_id_candidates("anything", 42, &meta),
-            vec!["only-image"]
+            Vec::<String>::new()
         );
         assert_eq!(
             vision_attachment_file_id_candidates("", 42, &meta),

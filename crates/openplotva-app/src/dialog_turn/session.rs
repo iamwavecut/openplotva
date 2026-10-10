@@ -1331,18 +1331,16 @@ fn extend_context_images(
     message_id: i32,
     attachments: Vec<openplotva_core::ChatAttachment>,
 ) {
-    for (index, attachment) in attachments
-        .into_iter()
-        .filter(|a| a.kind == "image")
-        .enumerate()
-    {
+    context
+        .image_reference_ids
+        .extend(openplotva_dialog::media_reference_ids(
+            message_id,
+            &attachments,
+        ));
+    for attachment in attachments.into_iter().filter(|a| a.kind == "image") {
         if attachment.file_unique_id.is_empty() {
             continue;
         }
-        context.image_reference_ids.insert(
-            format!("message_{message_id}_image_{}", index + 1),
-            attachment.file_unique_id.clone(),
-        );
         if !context
             .image_attachments
             .iter()

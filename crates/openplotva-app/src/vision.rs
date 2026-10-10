@@ -2889,6 +2889,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_media_reference_does_not_select_an_unrelated_current_photo() {
+        let mut request = VisionDescribeRequest {
+            file_id: "previous-voice".to_owned(),
+            message_id: 88,
+            message_meta: ChatMessageMeta {
+                attachments: vec![ChatAttachment {
+                    kind: "image".to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: "current-photo".to_owned(),
+                    ..ChatAttachment::default()
+                }],
+                ..ChatMessageMeta::default()
+            },
+            ..VisionDescribeRequest::default()
+        };
+        assert!(request_media_attachment(&request).is_none());
+        request.file_id = "message_88_image_1".to_owned();
+        assert_eq!(
+            request_media_attachment(&request)
+                .expect("current photo")
+                .file_unique_id,
+            "current-photo"
+        );
+    }
+
+    #[test]
     fn telegram_vision_data_url_from_bytes_rejects_empty_or_unknown_payloads() {
         assert_eq!(
             telegram_vision_data_url_from_bytes(&[]),

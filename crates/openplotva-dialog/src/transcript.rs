@@ -37,25 +37,42 @@ fn dialog_image_reference_ids(input: &DialogInput) -> std::collections::BTreeMap
         .map(|message| (message.message_id, &message.meta))
         .chain(std::iter::once((input.message.id, &input.message.meta)))
     {
-        let mut media_index = 0;
-        for attachment in &meta.attachments {
-            let kind = attachment.kind.trim().to_ascii_lowercase();
-            if attachment.file_unique_id.trim().is_empty()
-                || !matches!(
-                    kind.as_str(),
-                    "image" | "video" | "animation" | "video_note"
-                )
-            {
-                continue;
-            }
-            media_index += 1;
-            if kind == "image" && message_id > 0 {
-                references.insert(
-                    format!("message_{message_id}_image_{media_index}"),
-                    attachment.file_unique_id.clone(),
-                );
-            }
+        references.extend(media_reference_ids(message_id, &meta.attachments));
+    }
+    references
+}
+
+/// Resolve message-scoped handles without changing existing visual indexes.
+pub fn media_reference_ids(
+    message_id: i32,
+    attachments: &[openplotva_core::ChatAttachment],
+) -> std::collections::BTreeMap<String, String> {
+    let mut references = std::collections::BTreeMap::new();
+    let mut visual_index = 0;
+    let mut other_indexes = std::collections::BTreeMap::<String, usize>::new();
+    for attachment in attachments {
+        let kind = attachment.kind.trim().to_ascii_lowercase();
+        let id = attachment.file_unique_id.trim();
+        if message_id <= 0 || id.is_empty() {
+            continue;
         }
+        let index = if matches!(
+            kind.as_str(),
+            "image" | "video" | "animation" | "video_note"
+        ) {
+            visual_index += 1;
+            visual_index
+        } else if matches!(kind.as_str(), "voice" | "audio" | "sticker" | "document") {
+            let index = other_indexes.entry(kind.clone()).or_default();
+            *index += 1;
+            *index
+        } else {
+            continue;
+        };
+        references.insert(
+            format!("message_{message_id}_{kind}_{index}"),
+            id.to_owned(),
+        );
     }
     references
 }
