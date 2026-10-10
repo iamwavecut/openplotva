@@ -1,5 +1,7 @@
 //! Dialog tools scoped to the authenticated requester and current chat.
-use openplotva_dialog::{DialogToolbox, ToolContext, ToolResult, ToolStep, ToolboxFuture};
+use openplotva_dialog::{
+    DialogToolbox, ToolContext, ToolResult, ToolStep, ToolboxFuture, sanitize_tool_text,
+};
 use openplotva_memory::{CardInput, ObservationScope, RetrievalScope};
 use openplotva_storage::{PostgresHistoryStore, PostgresMemoryStore};
 use serde_json::{Value, json};
@@ -46,11 +48,7 @@ impl DialogToolbox for AgentContextTools {
                             user_id: ctx.user_id,
                             user_full_name: ctx.user_full_name,
                             prompt: step.prompt,
-                            caption: if step.caption.trim().is_empty() {
-                                ctx.message_text
-                            } else {
-                                step.caption
-                            },
+                            caption: sanitize_tool_text(&step.caption),
                             thread_id: ctx.thread_id,
                             is_forum: ctx.thread_id.is_some(),
                         })

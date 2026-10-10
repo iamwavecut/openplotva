@@ -20,6 +20,14 @@ pub async fn dispatch_dialog_tool(
     meta: &ToolContext,
     step: &ToolStep,
 ) -> Result<ToolResult, ToolboxError> {
+    if matches!(step.step.as_str(), STEP_DRAW_IMAGE | "draw_api")
+        && crate::sanitize_tool_text(&step.caption).is_empty()
+    {
+        return Ok(ToolResult::failed(
+            "image_caption_required",
+            "Retry with a nonempty caption describing the requested image in the user's language. Remove the bot address and the request to draw. Keep generation instructions in prompt.",
+        ));
+    }
     match step.step.as_str() {
         "draw_api" | "get_messages" | "get_user_status" | "get_job_status" | "memory_search"
         | "memory_manage" => toolbox.agent_tool(meta.clone(), step.clone()).await,
@@ -240,6 +248,83 @@ mod tests {
             self.topics.lock().expect("recorder lock").push(req.topic);
             Box::pin(async { Ok(ToolResult::failed("test_sink", "recorded")) })
         }
+    }
+
+    #[derive(Default)]
+    struct ImageRecorder(Mutex<Vec<(String, String)>>);
+
+    impl DialogToolbox for ImageRecorder {
+        fn draw_image<'a>(&'a self, req: DrawRequest) -> ToolboxFuture<'a> {
+            self.0
+                .lock()
+                .expect("images")
+                .push((req.prompt, req.caption));
+            Box::pin(async { Ok(ToolResult::default()) })
+        }
+
+        fn agent_tool<'a>(&'a self, _: ToolContext, step: ToolStep) -> ToolboxFuture<'a> {
+            self.0
+                .lock()
+                .expect("images")
+                .push((step.prompt, step.caption));
+            Box::pin(async { Ok(ToolResult::default()) })
+        }
+    }
+
+    #[test]
+    fn image_dispatch_requires_a_separate_caption_before_generation() {
+        let toolbox = ImageRecorder::default();
+        let meta = ToolContext {
+            message_text: "Плотва, нарисуй собаквака".to_owned(),
+            ..ToolContext::default()
+        };
+        for tool in [STEP_DRAW_IMAGE, "draw_api"] {
+            for caption in [
+                "",
+                "  ",
+                "<tool_call>private generation instructions</tool_call>",
+            ] {
+                let result = poll_ready(dispatch_dialog_tool(
+                    &toolbox,
+                    &meta,
+                    &ToolStep {
+                        step: tool.to_owned(),
+                        prompt: "A dog-frog hybrid, cinematic lighting".to_owned(),
+                        caption: caption.to_owned(),
+                        ..ToolStep::default()
+                    },
+                ))
+                .expect("image dispatch");
+                assert_eq!(
+                    result.error.expect("missing caption").code,
+                    "image_caption_required"
+                );
+            }
+        }
+        assert!(toolbox.0.lock().expect("images").is_empty());
+        for tool in [STEP_DRAW_IMAGE, "draw_api"] {
+            poll_ready(dispatch_dialog_tool(
+                &toolbox,
+                &meta,
+                &ToolStep {
+                    step: tool.to_owned(),
+                    prompt: "A dog-frog hybrid, cinematic lighting".to_owned(),
+                    caption: "Собака-квака".to_owned(),
+                    ..ToolStep::default()
+                },
+            ))
+            .expect("corrected image dispatch");
+        }
+        assert_eq!(
+            *toolbox.0.lock().expect("images"),
+            vec![
+                (
+                    "A dog-frog hybrid, cinematic lighting".to_owned(),
+                    "Собака-квака".to_owned()
+                );
+                2
+            ]
+        );
     }
 
     #[derive(Default)]

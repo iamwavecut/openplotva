@@ -312,10 +312,13 @@ fn pending_image_tool<'a>(
     matches!(tool, "draw_image" | "draw_api")
         .then_some(tool)
         .filter(|name| {
-            !calls
-                .iter()
-                .skip(call_offset)
-                .any(|call| call.name == *name)
+            !calls.iter().skip(call_offset).any(|call| {
+                call.name == *name
+                    && call
+                        .output
+                        .as_ref()
+                        .is_none_or(|output| output["error"]["code"] != "image_caption_required")
+            })
         })
 }
 

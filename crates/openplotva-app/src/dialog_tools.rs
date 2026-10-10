@@ -2428,15 +2428,7 @@ where
                 Ok(attachments) => attachments,
                 Err(reason) => return Ok(ToolResult::failed("draw_image_source_invalid", reason)),
             };
-            let original_prompt = if !req.caption.trim().is_empty() {
-                sanitize_tool_text(&req.caption)
-            } else if !req.context.message_meta.agent_gift
-                && !req.context.message_text.trim().is_empty()
-            {
-                sanitize_tool_text(&req.context.message_text)
-            } else {
-                prompt.clone()
-            };
+            let original_prompt = sanitize_tool_text(&req.caption);
             let request = DrawImageScheduleRequest {
                 agent_gift: req.context.message_meta.agent_gift,
                 chat_id: req.context.chat_id,
@@ -4323,7 +4315,7 @@ mod tests {
                 ..context()
             },
             prompt: "  neon castle  ".to_owned(),
-            caption: String::new(),
+            caption: "Объединённые картинки".to_owned(),
             file_ids: Vec::new(),
             negative_prompt: "  blur  ".to_owned(),
             aspect_ratio: " 16:9 ".to_owned(),
@@ -4370,19 +4362,24 @@ mod tests {
                 negative_prompt: "blur".to_owned(),
                 aspect_ratio: "16:9".to_owned(),
                 seed: "42".to_owned(),
-                original_prompt: "объедини эти картинки".to_owned(),
+                original_prompt: "Объединённые картинки".to_owned(),
             }]
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn image_caption_uses_the_request_or_readable_caption_without_changing_generation()
+    async fn image_caption_preserves_the_subject_without_changing_generation()
     -> Result<(), ToolboxError> {
-        for (caption, gift, expected) in [
-            ("", false, "Плотва, нарисуй рыбу в космосе"),
-            ("Рыба в космосе", false, "Рыба в космосе"),
-            ("Подарок: рыба в космосе", true, "Подарок: рыба в космосе"),
+        for (request, caption, gift) in [
+            ("Плотва, нарисуй собаквака", "Собака-квака", false),
+            (
+                "Плотва, а нарисуй же мне, пожалуйста, золотую рыбку в кляре",
+                "Золотая рыбка в кляре",
+                false,
+            ),
+            ("Плотва отдыхает", "Плотва отдыхает", false),
+            ("Как прошёл день?", "Подарок: рыба в космосе", true),
         ] {
             let scheduler = Arc::new(ImageSchedulerStub::successful(DrawImageScheduleResult {
                 status: "scheduled".to_owned(),
@@ -4392,22 +4389,26 @@ mod tests {
             let result = tools
                 .draw_image(DrawRequest {
                     context: ToolContext {
-                        message_text: "Плотва, нарисуй рыбу в космосе".into(),
+                        message_text: request.into(),
                         message_meta: ChatMessageMeta {
                             agent_gift: gift,
                             ..Default::default()
                         },
                         ..context()
                     },
-                    prompt: "A fish in space, cinematic lighting".into(),
+                    prompt: "Enriched visual instructions, cinematic lighting".into(),
                     caption: caption.into(),
                     ..Default::default()
                 })
                 .await?;
             assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
             let calls = scheduler.calls();
-            assert_eq!(calls[0].prompt, "A fish in space, cinematic lighting");
-            assert_eq!(calls[0].original_prompt, expected);
+            assert_eq!(
+                calls[0].prompt,
+                "Enriched visual instructions, cinematic lighting"
+            );
+            assert_eq!(calls[0].original_prompt, caption);
+            assert_eq!(calls[0].message_text, request);
         }
         Ok(())
     }
@@ -4536,6 +4537,7 @@ mod tests {
             &openplotva_dialog::ToolStep {
                 step: "draw_image".to_owned(),
                 prompt: "combine both photos into one scene".to_owned(),
+                caption: "Combined photos".to_owned(),
                 ..Default::default()
             },
         )
@@ -4578,6 +4580,7 @@ mod tests {
             &openplotva_dialog::ToolStep {
                 step: "draw_image".to_owned(),
                 prompt: input.message.text.clone(),
+                caption: "Combined photos".to_owned(),
                 file_ids: (11..=20)
                     .map(|message_id| format!("message_{message_id}_image_1"))
                     .collect(),
@@ -5390,7 +5393,7 @@ mod tests {
             .draw_image(DrawRequest {
                 context: context(),
                 prompt: " neon\u{200f}\tcastle ".to_owned(),
-                caption: "Нарисуй неоновый замок".to_owned(),
+                caption: "Неоновый замок".to_owned(),
                 file_ids: Vec::new(),
                 negative_prompt: " blur ".to_owned(),
                 aspect_ratio: " 16:9 ".to_owned(),
@@ -5424,7 +5427,7 @@ mod tests {
             .as_ref()
             .expect("image job should carry image data");
         assert_eq!(image.prompt, "neon castle");
-        assert_eq!(image.original_text, "Нарисуй неоновый замок");
+        assert_eq!(image.original_text, "Неоновый замок");
         assert_eq!(image.author, "Alice");
         assert_eq!(image.raw_negative_prompt, "blur");
         assert_eq!(image.raw_aspect_ratio, "16:9");
