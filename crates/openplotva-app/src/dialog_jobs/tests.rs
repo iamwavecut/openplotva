@@ -5378,6 +5378,7 @@ async fn session_direct_draw_stops_only_after_confirmed_delivery() -> Result<(),
                     openplotva_dialog::ToolStep {
                         step: "draw_api".to_owned(),
                         prompt: "a cat".to_owned(),
+                        caption: "Кот".into(),
                         ..openplotva_dialog::ToolStep::default()
                     },
                 )],
@@ -5433,6 +5434,7 @@ async fn session_queued_draw_terminates_without_confirmation_text() -> Result<()
             openplotva_dialog::ToolStep {
                 step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
                 prompt: "кот".to_owned(),
+                caption: "Кот".into(),
                 ..openplotva_dialog::ToolStep::default()
             },
         )],
@@ -5483,6 +5485,7 @@ async fn session_queued_draw_discards_draft_and_delegates_artifact() -> Result<(
             openplotva_dialog::ToolStep {
                 step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
                 prompt: "кот".to_owned(),
+                caption: "Кот".into(),
                 ..openplotva_dialog::ToolStep::default()
             },
         )],
@@ -5534,6 +5537,7 @@ async fn session_queued_draw_with_search_continues_for_search_result() -> Result
                     openplotva_dialog::ToolStep {
                         step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
                         prompt: "кот".to_owned(),
+                        caption: "Кот".into(),
                         ..openplotva_dialog::ToolStep::default()
                     },
                 ),
@@ -5604,6 +5608,7 @@ async fn session_failed_draw_feeds_back_and_loop_continues() -> Result<(), Box<d
                 openplotva_dialog::ToolStep {
                     step: openplotva_dialog::STEP_DRAW_IMAGE.to_owned(),
                     prompt: "кот".to_owned(),
+                    caption: "Кот".into(),
                     ..openplotva_dialog::ToolStep::default()
                 },
             )],
@@ -6629,7 +6634,7 @@ fn step_context(request: &openplotva_dialog::ChatStepRequest) -> Vec<String> {
 #[tokio::test]
 async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-    for queued in [true, false] {
+    for (queued, missing_caption) in [(true, false), (false, false), (true, true), (false, true)] {
         let queue = InMemoryTaskQueue::new();
         let mut params = dialog_params("Плотва, нарисуй рыбу в космосе");
         params.meta = serde_json::json!({"requested_tool": "draw_image"});
@@ -6644,7 +6649,21 @@ async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), 
         };
         queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
         let provider = StepProviderStub::with_steps(vec![
-            Ok(step_text("Сначала я подумаю, как изобразить эту рыбу.")),
+            Ok(if missing_caption {
+                step_tools(
+                    "",
+                    vec![(
+                        "missing-caption",
+                        openplotva_dialog::ToolStep {
+                            step: "draw_image".into(),
+                            prompt: "A fish floating in space, cinematic lighting".into(),
+                            ..Default::default()
+                        },
+                    )],
+                )
+            } else {
+                step_text("Сначала я подумаю, как изобразить эту рыбу.")
+            }),
             Ok(step_tools(
                 "",
                 vec![(
@@ -6681,15 +6700,17 @@ async fn explicit_image_request_repairs_text_into_a_native_draw() -> Result<(), 
         .await;
         assert!(report.completed, "{report:?}");
         assert!(!report.failed, "{report:?}");
-        assert_eq!(report.regenerations, 1);
+        assert_eq!(report.regenerations, i32::from(!missing_caption));
         let requests = provider.requests();
         assert_eq!(requests[0].required_tool.as_deref(), Some("draw_image"));
         assert_eq!(requests[1].required_tool.as_deref(), Some("draw_image"));
-        assert!(
-            step_context(&requests[1])
-                .iter()
-                .any(|context| context.contains("explicitly requested draw_image"))
-        );
+        if !missing_caption {
+            assert!(
+                step_context(&requests[1])
+                    .iter()
+                    .any(|context| context.contains("explicitly requested draw_image"))
+            );
+        }
         assert!(effects.intermediates().is_empty());
         assert!(
             effects
@@ -6785,6 +6806,7 @@ async fn pending_image_request_survives_initiator_thanks() -> Result<(), Box<dyn
                 openplotva_dialog::ToolStep {
                     step: "draw_image".into(),
                     prompt: "A fish".into(),
+                    caption: "Рыба".into(),
                     ..Default::default()
                 },
             )],
@@ -6914,6 +6936,7 @@ async fn newer_initiator_image_intent_replaces_the_previous_attempt() -> Result<
                         openplotva_dialog::ToolStep {
                             step: "draw_image".into(),
                             prompt: prompt.into(),
+                            caption: prompt.into(),
                             ..Default::default()
                         },
                     )],
@@ -7120,6 +7143,7 @@ async fn agent_does_not_retry_a_failed_gift_attempt() -> Result<(), Box<dyn Erro
                 openplotva_dialog::ToolStep {
                     step: "draw_image".into(),
                     prompt: prompt.into(),
+                    caption: prompt.into(),
                     gift: true,
                     ..Default::default()
                 },

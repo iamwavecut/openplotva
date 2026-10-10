@@ -232,7 +232,7 @@ pub struct DrawRequest {
     /// Technical image prompt; never used as the caption when a source request is available.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
-    /// Optional readable caption in the user's language, separate from generation instructions.
+    /// Image subject in the user's language, separate from generation instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caption: String,
     /// Stable image IDs selected from the current dialog context.
@@ -567,8 +567,8 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     },
     ToolArgSpec {
         name: "caption",
-        required: false,
-        description: "Optional readable caption in the user's language. Use their original request verbatim or a concise faithful adaptation. Omit to show the source message. Never put the technical or optimized generation prompt here.",
+        required: true,
+        description: "Short image title in the user's language. Preserve the requested subject, names and details. Remove the bot address, drawing request and politeness. Start with a capital letter. Never include technical instructions or details added for generation.",
     },
     ToolArgSpec {
         name: "file_ids",
@@ -720,8 +720,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
             },
             ToolArgSpec {
                 name: "caption",
-                required: false,
-                description: "Readable caption: the user's original request or a faithful adaptation in their language. Omit to show the source message; never expose the technical generation prompt.",
+                required: true,
+                description: "Short image title in the user's language. Preserve the requested subject, names and details. Remove the bot address, drawing request, % shortcut and politeness. Start with a capital letter. Never include technical instructions or details added for generation.",
             },
         ],
     },
@@ -2429,7 +2429,7 @@ pub struct ToolStep {
     /// Technical image prompt; never used as the caption when a source request is available.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
-    /// Optional readable caption in the user's language, separate from generation instructions.
+    /// Image subject in the user's language, separate from generation instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caption: String,
     /// Song topic.
@@ -4917,6 +4917,7 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
         step.step = STEP_UNDERSTAND_MEDIA.to_owned();
     }
     step.prompt = sanitize_tool_text(&step.prompt);
+    step.caption = sanitize_tool_text(&step.caption);
     step.topic = sanitize_tool_text(&step.topic);
     step.file_id = sanitize_tool_text(&step.file_id);
     step.file_ids = step
@@ -5702,7 +5703,10 @@ mod tests {
         assert!(properties.contains_key("prompt"));
         assert!(properties.contains_key("negative_prompt"));
         assert_eq!(properties["file_ids"]["type"], "array");
-        assert_eq!(draw.function.parameters["required"], json!(["prompt"]));
+        assert_eq!(
+            draw.function.parameters["required"],
+            json!(["prompt", "caption"])
+        );
         let song = tools
             .iter()
             .find(|tool| tool.function.name == STEP_GENERATE_SONG)
