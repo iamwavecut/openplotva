@@ -64,6 +64,11 @@ pub const SESSION_ITERATION_STAGE: &str = "session_iteration";
 /// Job event stage recording why a tool-call batch continued or completed.
 pub const SESSION_BATCH_STAGE: &str = "session_batch";
 
+/// Shown once the model repeats a call whose failure it already received.
+const REPEATED_FAILED_TOOL_HINT: &str = "You repeated a tool call that already failed; its result is above. Tools are closed for the rest of this turn. Answer the user now without that action.";
+/// A turn that skips the explicitly requested drawing is replayed at most this many times
+/// in total: the same model, prompt and request repeat the same outcome.
+const IMAGE_ACTION_MISSING_MAX_ATTEMPTS: i32 = 2;
 /// A duplicate final answer is regenerated only with this much budget left.
 const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
 
@@ -408,6 +413,8 @@ struct SessionState {
     web_source_urls: BTreeSet<String>,
     links: DialogLinks,
     search_citation_repairs: i32,
+    #[serde(default)]
+    repeated_failed_tool_call: bool,
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -519,6 +526,7 @@ where
     let web_source_urls = BTreeSet::new();
     let links = DialogLinks::from_input(&base_input);
     let search_citation_repairs: i32 = 0;
+    let repeated_failed_tool_call = false;
     let max_iterations = cfg.max_iterations.max(1);
 
     let mut state = restored.unwrap_or(SessionState {
@@ -543,6 +551,7 @@ where
         web_source_urls,
         links,
         search_citation_repairs,
+        repeated_failed_tool_call,
     });
     // A crash after a committed intent has an unknown outcome. Never repeat the effect.
     for event in ctx
@@ -597,8 +606,8 @@ where
         if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_checkpoint", BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
             return std::ops::ControlFlow::Break(agent_persistence_failed(error));
         }
-        let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs } = state;
-        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { requested_tool_call_offset, tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs }, report)) }; }
+        let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs, mut repeated_failed_tool_call } = state;
+        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { requested_tool_call_offset, tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs, repeated_failed_tool_call }, report)) }; }
 
         let previously_observed_message_id = agent.observed_message_id;
         if let Ok(Ok(messages)) = tokio::time::timeout(std::time::Duration::from_secs(2), materializer.observe_dialog_messages(active_params, agent.observed_message_id)).await {
@@ -671,7 +680,11 @@ where
         let force_final = next == openplotva_agent::NextStep::Final;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
-        } else if force_final || search_citation_repairs > 0 || repeated_final_repair {
+        } else if force_final
+            || search_citation_repairs > 0
+            || repeated_final_repair
+            || repeated_failed_tool_call
+        {
             ToolsMode::FinalOnly
         } else {
             ToolsMode::Native((*native_tools).clone())
@@ -686,6 +699,7 @@ where
             }
         };
         if anti_loop { add_hint(ANTI_LOOP_HINT); }
+        if repeated_failed_tool_call { add_hint(REPEATED_FAILED_TOOL_HINT); }
         if !web_source_urls.is_empty() { add_hint(SEARCH_CITATION_HINT.trim()); }
         if search_citation_repairs > 0 { add_hint(SEARCH_CITATION_REPAIR_HINT); }
         if force_final { add_hint("Tool budget is exhausted or the deadline is near. Finish with the available evidence. State any unfinished work briefly."); }
@@ -857,7 +871,11 @@ where
                         reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
                         codes,
                         error,
-                        max_attempts: ctx.max_llm_job_attempts.max(1),
+                        max_attempts: if image_action_missing {
+                            ctx.max_llm_job_attempts.clamp(1, IMAGE_ACTION_MISSING_MAX_ATTEMPTS)
+                        } else {
+                            ctx.max_llm_job_attempts.max(1)
+                        },
                         now: failure_now,
                         budget_deadline: budget.deadline(),
                     },
@@ -1248,6 +1266,7 @@ where
         let mut parallel_media_results = BTreeMap::new();
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
         let mut batch_results = Vec::with_capacity(step.tool_calls.len());
+        let mut only_repeated_failures = !step.tool_calls.is_empty();
         for (call_index, call) in step.tool_calls.iter().enumerate() {
             if !matches!(
                 call.step.step.as_str(),
@@ -1308,6 +1327,12 @@ where
                 )
 
             } else if let Some((original_call_id, cached)) = tool_result_cache.get(&semantic_key) {
+                if cached
+                    .status
+                    .eq_ignore_ascii_case(openplotva_dialog::TOOL_RESULT_STATUS_OK)
+                {
+                    only_repeated_failures = false;
+                }
                 (
                     reused_tool_result(cached, original_call_id),
                     tool_started.elapsed().as_millis(),
@@ -1343,6 +1368,9 @@ where
                 )).await.unwrap_or_else(|_| ToolResult::failed("effect_outcome_unknown", "The tool deadline expired. Do not repeat an action whose outcome is unknown."));
                 (result, tool_started.elapsed().as_millis(), true)
             };
+            if executed {
+                only_repeated_failures = false;
+            }
             if executed && effect_tool(&call.step.step)
                 && let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_effect", BTreeMap::from([("key".into(), semantic_key.clone()), ("gift".into(), call.step.gift.to_string()), ("result".into(), serde_json::to_string(&result).expect("serializable tool result"))]), failure_now).await {
                     return std::ops::ControlFlow::Break(agent_persistence_failed(error));
@@ -1416,6 +1444,9 @@ where
             });
         }
 
+        if only_repeated_failures {
+            repeated_failed_tool_call = true;
+        }
         report.session_tool_calls.clone_from(&recorded_tool_calls);
         match persist_dialog_tool_calls(tool_history, active_params, &recorded_tool_calls).await {
             Ok(persisted) => report.persisted_tool_call_history = persisted,
@@ -2080,7 +2111,10 @@ where
             if !SESSION_REACTION_ALLOWED_EMOJI.contains(&emoji) {
                 return ToolResult::failed(
                     "emoji_not_allowed",
-                    "this emoji is not in the allowed reaction list",
+                    format!(
+                        "this emoji is not in the allowed reaction list; use one of: {}",
+                        SESSION_REACTION_ALLOWED_EMOJI.join(" ")
+                    ),
                 );
             }
             let message_id = if step.target_message_id != 0 {

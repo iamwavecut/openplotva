@@ -21,12 +21,13 @@ use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
     DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
-    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
-    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard, STEP_SEND_MESSAGE,
-    SessionMessage, ToolParseDecision, ToolStep, ToolsMode, clone_history_messages,
-    decode_plotva_final_response_with_salvage, is_dialog_history_noise_tool_call_name,
-    normalize_history_message, parse_assistant_content, parse_native_tool_step, sanitize_tool_text,
-    select_llm_history_messages_for_context, tool_telemetry,
+    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, NativeToolFunction,
+    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard,
+    STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolStep, ToolsMode,
+    clone_history_messages, decode_plotva_final_response_with_salvage,
+    is_dialog_history_noise_tool_call_name, normalize_history_message, parse_assistant_content,
+    parse_native_tool_step, sanitize_tool_text, select_llm_history_messages_for_context,
+    tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, stages::HistoryStage,
@@ -3016,14 +3017,25 @@ where
                 iteration,
             )
             .map_err(|error| Box::new(error) as CompletionError)?;
-        if let Some(name) = request.required_tool.as_deref()
-            && !request.input.disable_tools
-            && matches!(request.tools, ToolsMode::Native(_))
-            && completion_request
-                .tools
-                .iter()
-                .any(|tool| tool["function"]["name"].as_str() == Some(name))
-        {
+        let forced_tool = request
+            .required_tool
+            .as_deref()
+            .filter(|_| {
+                !request.input.disable_tools && matches!(request.tools, ToolsMode::Native(_))
+            })
+            .and_then(|name| {
+                completion_request
+                    .tools
+                    .iter()
+                    .find(|tool| tool["function"]["name"].as_str() == Some(name))
+                    .map(|tool| {
+                        (
+                            name.to_owned(),
+                            tool["function"]["parameters"]["properties"].clone(),
+                        )
+                    })
+            });
+        if let Some((name, _)) = &forced_tool {
             completion_request.tool_choice =
                 Some(json!({"type":"function", "function":{"name":name}}));
         }
@@ -3083,7 +3095,18 @@ where
             });
         }
 
-        match first_choice_tool_steps(response, request.input.textual_tool_calls) {
+        let mut selection = first_choice_tool_steps(response, request.input.textual_tool_calls);
+        if request.input.textual_tool_calls
+            && matches!(selection, Ok(ToolStepSelection::None(_)))
+            && let Some((name, parameters)) = &forced_tool
+            && let Some(step) = forced_tool_markup_step(response, name, parameters)
+        {
+            selection = Ok(ToolStepSelection::Steps {
+                steps: vec![step],
+                text: String::new(),
+            });
+        }
+        match selection {
             Ok(ToolStepSelection::None(decision)) => {
                 self.record_step_parser_decision(&model, iteration, &decision);
                 let text =
@@ -5359,6 +5382,77 @@ fn first_choice_tool_steps(
         ));
     }
     Ok(ToolStepSelection::None(parsed.decision))
+}
+
+/// The arguments of a required tool written as bare `<parameter>value</parameter>`
+/// elements, the shape a model without native tool calling falls back to when the
+/// request names one tool; the engine's own call wrapper may enclose them. Every element
+/// must name a parameter of that tool, and nothing else may surround them.
+fn forced_tool_markup_step(
+    response: &Value,
+    name: &str,
+    parameters: &Value,
+) -> Option<PendingToolStep> {
+    let parameters = parameters.as_object()?;
+    let content = first_choice_message_value(response)
+        .ok()?
+        .get("content")
+        .and_then(Value::as_str)?;
+    let function_open = format!("<function={name}>");
+    let wrappers = [
+        "<tool_call>",
+        "</tool_call>",
+        function_open.as_str(),
+        "<function>",
+        "</function>",
+    ];
+    let mut rest = content.trim();
+    let mut arguments = serde_json::Map::new();
+    while !rest.is_empty() {
+        if let Some(after) = wrappers
+            .iter()
+            .find_map(|wrapper| rest.strip_prefix(wrapper))
+        {
+            rest = after.trim_start();
+            continue;
+        }
+        let tail = rest.strip_prefix('<')?;
+        let tag_end = tail.find('>')?;
+        let tag = &tail[..tag_end];
+        let schema = parameters.get(tag)?;
+        let body = &tail[tag_end + 1..];
+        let close = format!("</{tag}>");
+        let value_end = body.find(&close)?;
+        let raw = body[..value_end].trim();
+        let value = match schema.get("type").and_then(Value::as_str) {
+            Some("string") | None => Value::String(raw.to_owned()),
+            Some(_) => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
+        };
+        arguments.insert(tag.to_owned(), value);
+        rest = body[value_end + close.len()..].trim_start();
+    }
+    if arguments.is_empty() {
+        return None;
+    }
+    let step = parse_native_tool_step(&[NativeToolCall {
+        id: String::new(),
+        call_type: "function".to_owned(),
+        function: NativeToolFunction {
+            name: name.to_owned(),
+            arguments: Value::Object(arguments),
+        },
+    }])
+    .ok()?;
+    Some(PendingToolStep {
+        decision: ToolParseDecision {
+            form: "forced_markup".to_owned(),
+            tool: name.to_owned(),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        },
+        step,
+        native_ref: None,
+    })
 }
 
 fn tool_protocol_completion_error(message: impl Into<String>) -> CompletionError {
@@ -10852,6 +10946,88 @@ mod tests {
             );
             assert!(toolbox.web_search_queries().is_empty());
         }
+    }
+
+    async fn forced_draw_step(
+        content: &str,
+        textual_tool_calls: bool,
+    ) -> Result<ChatStepOutput, CompletionError> {
+        let (provider, _, _) = direct_dialog_provider(
+            json!({"choices": [{"message": {"role": "assistant", "content": content}}]}),
+            AifarmDialogConfig::default(),
+        );
+        let mut input = base_input();
+        input.textual_tool_calls = textual_tool_calls;
+        crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                required_tool: Some(STEP_DRAW_IMAGE.to_owned()),
+                preferred_target: None,
+                input,
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    native_tool_values(&[STEP_WEB_SEARCH, STEP_DRAW_IMAGE]).expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn forced_tool_arguments_written_as_markup_become_that_tool_call() {
+        let output = forced_draw_step(
+            "<caption>Золотая кошка</caption>\n<prompt>A golden cat with a heart pattern</prompt>",
+            true,
+        )
+        .await
+        .expect("forced call executes");
+
+        assert_eq!(output.tool_calls.len(), 1);
+        let call = &output.tool_calls[0];
+        assert_eq!(call.step.step, STEP_DRAW_IMAGE);
+        assert_eq!(call.step.prompt, "A golden cat with a heart pattern");
+        assert_eq!(call.step.caption, "Золотая кошка");
+        assert!(call.salvaged);
+        assert_eq!(output.text, "");
+
+        let wrapped = forced_draw_step(
+            "<caption>Хеллоуинский персонаж</caption>\n<file_ids>[\"message_42_image_1\"]</file_ids>\n<prompt>Make it spooky</prompt>\n</function>\n</tool_call>",
+            true,
+        )
+        .await
+        .expect("the engine's call closers do not hide the call");
+        assert_eq!(wrapped.tool_calls.len(), 1);
+        assert_eq!(wrapped.tool_calls[0].step.prompt, "Make it spooky");
+        assert_eq!(
+            wrapped.tool_calls[0].step.file_ids,
+            vec!["message_42_image_1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_tool_argument_markup_needs_the_model_flag_and_only_its_parameters() {
+        let without_flag = forced_draw_step(
+            "<caption>Золотая кошка</caption>\n<prompt>A golden cat</prompt>",
+            false,
+        )
+        .await
+        .map(|output| output.tool_calls.len())
+        .unwrap_or_default();
+        assert_eq!(without_flag, 0);
+
+        let foreign_tag =
+            forced_draw_step("<caption>Золотая кошка</caption>\n<mood>happy</mood>", true)
+                .await
+                .map(|output| output.tool_calls.len())
+                .unwrap_or_default();
+        assert_eq!(foreign_tag, 0);
+
+        let prose = forced_draw_step("Сейчас нарисую <prompt>a cat</prompt>", true)
+            .await
+            .map(|output| output.tool_calls.len())
+            .unwrap_or_default();
+        assert_eq!(prose, 0);
     }
 
     #[tokio::test]
