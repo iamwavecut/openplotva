@@ -5915,6 +5915,72 @@ async fn session_reaction_denial_allows_repair_before_success() -> Result<(), Bo
 }
 
 #[tokio::test]
+async fn session_closes_tools_after_the_model_repeats_a_failed_call() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("ужас"), now),
+    );
+    let react = |id: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: "🎨".to_owned(),
+                    target_message_id: 100,
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(react("c1")),
+        Ok(react("c2")),
+        Ok(step_text("жесть, конечно")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let reactor = Arc::new(ReactorStub::default());
+    let wiring = session_wiring(
+        toolbox,
+        Some(Arc::clone(&reactor) as Arc<dyn crate::dialog_turn::SessionReactor>),
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(matches!(
+        requests[1].tools,
+        openplotva_dialog::ToolsMode::Native(_)
+    ));
+    assert!(
+        matches!(requests[2].tools, openplotva_dialog::ToolsMode::FinalOnly),
+        "a step made only of repeated failed calls closes the tools"
+    );
+    assert!(format!("{:?}", requests[2].transcript).contains("already failed"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
@@ -5977,6 +6043,10 @@ async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Bo
         provider.requests().last().expect("final").transcript
     );
     assert!(transcript_json.contains("emoji_not_allowed"));
+    assert!(
+        transcript_json.contains("use one of"),
+        "the rejection names the emoji the model may use"
+    );
     assert!(transcript_json.contains("already_reacted"));
     let record = queue.record(job_id).expect("job record");
     assert!(
@@ -6768,6 +6838,50 @@ async fn explicit_image_request_never_publishes_a_promise_after_exhausted_repair
             .as_deref()
             .is_some_and(|error| error.contains("requested image tool"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_image_request_stops_retrying_after_one_repeat() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let mut params = dialog_params("Плотва, нарисуй рыбу");
+    params.meta = serde_json::json!({"requested_tool": "draw_image"});
+    let job_id = queue.assign(DIALOG_AIFARM_QUEUE_NAME, new_dialog_job_at(params, now));
+    queue.append_job_event(
+        job_id,
+        TaskQueueJobEvent {
+            stage: openplotva_taskman::LLM_JOB_RETRY_STAGE.to_owned(),
+            attempt: 1,
+            ..TaskQueueJobEvent::default()
+        },
+        now - TimeDuration::seconds(5),
+    )?;
+    let provider =
+        StepProviderStub::with_steps((0..3).map(|_| Ok(step_text("Сейчас нарисую."))).collect());
+    let wiring = session_wiring(Arc::new(SessionToolboxStub::default()), None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+    let mut options = session_options(now, &outcomes, &wiring);
+    options.max_llm_job_attempts = DEFAULT_LLM_JOB_MAX_ATTEMPTS;
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        options,
+    )
+    .await;
+    assert!(
+        report.retry_exhausted,
+        "a turn that keeps skipping the requested drawing is not replayed five times: {report:?}"
+    );
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].reason.as_deref(), Some("sanitized_empty_exhausted"));
     Ok(())
 }
 
