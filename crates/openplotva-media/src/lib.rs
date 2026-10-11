@@ -372,16 +372,17 @@ pub const QWEN_IMAGE_PROMPT_MAX_CHARS: usize = 2800;
 /// Krea 2 rules ask for up to 200 words.
 pub const KREA2_PROMPT_MAX_CHARS: usize = 1600;
 
-/// Add a `maxLength` bound to every string of the schema's `outputs` array.
-#[must_use]
-pub fn with_output_max_chars(mut schema: Value, max_chars: usize) -> Value {
-    if let Some(items) = schema
-        .pointer_mut("/properties/outputs/items")
-        .and_then(Value::as_object_mut)
-    {
-        items.insert("maxLength".to_owned(), json!(max_chars));
+/// Cut every optimized output to at most `max_chars` characters. The bound is applied
+/// after decoding rather than as a schema `maxLength`: a bounded string makes the
+/// structured-output grammar of large-vocabulary engines slow to compile and decode.
+pub fn truncate_outputs_to_chars(outputs: &mut [String], max_chars: usize) {
+    for output in outputs {
+        if let Some((cut, _)) = output.char_indices().nth(max_chars) {
+            output.truncate(cut);
+            let kept = output.trim_end().len();
+            output.truncate(kept);
+        }
     }
-    schema
 }
 
 /// Template data for the image prompts: the slot count, which model each slot
@@ -926,16 +927,21 @@ mod tests {
     }
 
     #[test]
-    fn output_strings_get_a_length_bound() {
-        let schema = with_output_max_chars(
-            optimize_prompt_terminator_definition(1).input_schema,
-            IMAGE_PROMPT_MAX_CHARS,
-        );
-        assert_eq!(
-            schema["properties"]["outputs"]["items"]["maxLength"],
-            IMAGE_PROMPT_MAX_CHARS
-        );
+    fn optimizer_schema_strings_carry_no_length_bound() {
+        let schema = optimize_prompt_terminator_definition(1).input_schema;
+        assert!(schema["properties"]["outputs"]["items"]["maxLength"].is_null());
         assert_eq!(schema["properties"]["outputs"]["maxItems"], 1);
+    }
+
+    #[test]
+    fn outputs_are_cut_to_the_limit_in_characters() {
+        let mut outputs = vec![
+            "ж".repeat(10),
+            "short".to_owned(),
+            format!("{} {}", "a".repeat(4), "b".repeat(5)),
+        ];
+        truncate_outputs_to_chars(&mut outputs, 5);
+        assert_eq!(outputs, vec!["жжжжж", "short", "aaaa"]);
     }
 
     #[test]

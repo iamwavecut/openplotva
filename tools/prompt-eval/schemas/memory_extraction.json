@@ -33,7 +33,6 @@
             "type": "string"
           },
           "evidence_quote": {
-            "maxLength": 200,
             "type": "string"
           },
           "fact_text": {

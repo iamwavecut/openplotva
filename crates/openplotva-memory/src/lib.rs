@@ -2029,7 +2029,25 @@ impl TextRedactor for DiscoveryRedactor {
     }
 }
 
+/// Longest evidence quote kept from an extraction. The response schema states no
+/// `maxLength`, which slows structured-output grammars, so the bound applies here.
+pub const EVIDENCE_QUOTE_MAX_CHARS: usize = 200;
+
 pub fn decode_extraction_json(raw: &str) -> Result<ExtractOutput, DecodeExtractionError> {
+    let mut output = decode_extraction_object(raw)?;
+    for card in &mut output.candidate_cards {
+        if let Some((cut, _)) = card
+            .evidence_quote
+            .char_indices()
+            .nth(EVIDENCE_QUOTE_MAX_CHARS)
+        {
+            card.evidence_quote.truncate(cut);
+        }
+    }
+    Ok(output)
+}
+
+fn decode_extraction_object(raw: &str) -> Result<ExtractOutput, DecodeExtractionError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(DecodeExtractionError::Empty);
@@ -5184,6 +5202,19 @@ mod tests {
         assert_eq!(direct.episode_summary, "готово");
         assert_eq!(embedded.topics, vec!["memory"]);
         assert_eq!(null, ExtractOutput::default());
+    }
+
+    #[test]
+    fn decode_extraction_json_cuts_evidence_quotes_to_the_limit_in_characters() {
+        let quote = "ж".repeat(EVIDENCE_QUOTE_MAX_CHARS + 30);
+        let decoded = decode_extraction_json(&format!(
+            r#"{{"episode_summary":"готово","candidate_cards":[{{"evidence_quote":"{quote}"}}]}}"#
+        ))
+        .expect("decoded");
+        assert_eq!(
+            decoded.candidate_cards[0].evidence_quote,
+            "ж".repeat(EVIDENCE_QUOTE_MAX_CHARS)
+        );
     }
 
     #[test]

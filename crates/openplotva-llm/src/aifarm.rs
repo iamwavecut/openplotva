@@ -2226,10 +2226,7 @@ where
                 AifarmStructuredJsonRequest {
                     name: "optimize_prompt".to_owned(),
                     messages: optimizer_messages(&prompt, text),
-                    schema: openplotva_media::with_output_max_chars(
-                        tool.input_schema,
-                        render_options.targets.prompt_max_chars(),
-                    ),
+                    schema: tool.input_schema,
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
                     ..AifarmStructuredJsonRequest::default()
@@ -2237,12 +2234,17 @@ where
                 on_status,
             )
             .await?;
-        openplotva_media::decode_image_optimize_payload(&content, text, variant_count).map_err(
-            |source| AifarmMediaOptimizerError::Decode {
-                label: "AI Farm image optimizer",
-                source,
-            },
-        )
+        let mut optimized =
+            openplotva_media::decode_image_optimize_payload(&content, text, variant_count)
+                .map_err(|source| AifarmMediaOptimizerError::Decode {
+                    label: "AI Farm image optimizer",
+                    source,
+                })?;
+        openplotva_media::truncate_outputs_to_chars(
+            &mut optimized.outputs,
+            render_options.targets.prompt_max_chars(),
+        );
+        Ok(optimized)
     }
 
     pub async fn optimize_image_edit_prompt(
@@ -2272,10 +2274,7 @@ where
                 AifarmStructuredJsonRequest {
                     name: "optimize_edit_prompt".to_owned(),
                     messages: optimizer_messages(&prompt, text),
-                    schema: openplotva_media::with_output_max_chars(
-                        tool.input_schema,
-                        render_options.targets.prompt_max_chars(),
-                    ),
+                    schema: tool.input_schema,
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
                     ..AifarmStructuredJsonRequest::default()
@@ -2283,12 +2282,17 @@ where
                 on_status,
             )
             .await?;
-        openplotva_media::decode_image_edit_optimize_payload(&content, text, variant_count).map_err(
-            |source| AifarmMediaOptimizerError::Decode {
-                label: "AI Farm edit optimizer",
-                source,
-            },
-        )
+        let mut optimized =
+            openplotva_media::decode_image_edit_optimize_payload(&content, text, variant_count)
+                .map_err(|source| AifarmMediaOptimizerError::Decode {
+                    label: "AI Farm edit optimizer",
+                    source,
+                })?;
+        openplotva_media::truncate_outputs_to_chars(
+            &mut optimized.outputs,
+            render_options.targets.prompt_max_chars(),
+        );
+        Ok(optimized)
     }
 
     pub async fn optimize_song_prompt(
@@ -5835,7 +5839,7 @@ fn memory_candidate_card_schema() -> Value {
             "source_message_ids",
         ],
         "properties": {
-            "evidence_quote": {"type": "string", "maxLength": 200},
+            "evidence_quote": {"type": "string"},
             "why_durable": {"type": "string"},
             "scope_type": {"type": "string", "enum": ["chat", "thread", "user"]},
             "user_id": {"type": "integer"},
@@ -7671,7 +7675,10 @@ mod tests {
             card["properties"]["durability"]["enum"],
             json!(["permanent", "long", "short", "ephemeral"])
         );
-        assert_eq!(card["properties"]["evidence_quote"]["maxLength"], 200);
+        assert!(
+            card["properties"]["evidence_quote"]["maxLength"].is_null(),
+            "the quote bound is applied after decoding"
+        );
     }
 
     #[test]
@@ -7933,6 +7940,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aifarm_optimizers_cut_overlong_outputs_to_the_prompt_limit()
+    -> Result<(), Box<dyn Error>> {
+        let limit = openplotva_media::ImageTargets::default().prompt_max_chars();
+        let overlong = "ж".repeat(limit + 50);
+        let response = |extra: &str| {
+            json!({"choices": [{"message": {"role": "assistant", "content": format!(
+                r#"{{"input":"cat","outputs":["{overlong}"]{extra},"nsfw_result":"safe"}}"#
+            )}}]})
+        };
+        let ok = |value: Value| -> Result<AifarmHttpResponse, CompletionError> {
+            Ok(AifarmHttpResponse {
+                status_code: 200,
+                status_text: "OK".to_owned(),
+                body: serde_json::to_vec(&value).expect("body"),
+                ..AifarmHttpResponse::default()
+            })
+        };
+        let transport = FakeTransport::new(vec![
+            ok(response(r#","aspect_ratio":"1:1""#)),
+            ok(response("")),
+        ]);
+        let generator = AifarmStructuredJsonGenerator::with_transport(
+            AifarmStructuredJsonConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                ..AifarmStructuredJsonConfig::default()
+            },
+            transport,
+        );
+
+        let image = generator
+            .optimize_image_prompt("cat", Default::default(), &mut |_| {})
+            .await?;
+        assert_eq!(image.outputs[0].chars().count(), limit);
+        let edit = generator
+            .optimize_image_edit_prompt("cat", Default::default(), &mut |_| {})
+            .await?;
+        assert_eq!(edit.outputs[0].chars().count(), limit);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aifarm_structured_json_generator_executes_media_optimizers()
     -> Result<(), Box<dyn Error>> {
         let image_response = json!({
@@ -8031,6 +8082,12 @@ mod tests {
             image_body["response_format"]["json_schema"]["schema"]["properties"]["aspect_ratio"]["type"],
             "string"
         );
+        assert!(
+            image_body["response_format"]["json_schema"]["schema"]["properties"]["outputs"]["items"]
+                ["maxLength"]
+                .is_null(),
+            "a maxLength makes the engine's structured-output grammar slow"
+        );
         assert_eq!(
             image_body["messages"][0]["content"],
             cached_system_content("custom image variants=2")
@@ -8046,6 +8103,11 @@ mod tests {
         );
         assert!(
             edit_body["response_format"]["json_schema"]["schema"]["properties"]["aspect_ratio"]
+                .is_null()
+        );
+        assert!(
+            edit_body["response_format"]["json_schema"]["schema"]["properties"]["outputs"]["items"]
+                ["maxLength"]
                 .is_null()
         );
         assert_eq!(
