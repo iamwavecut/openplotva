@@ -761,6 +761,21 @@ impl RoutedAttempt {
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
+
+    #[must_use]
+    pub fn supports_cache_control(&self) -> bool {
+        provider_supports_cache_control(&self.provider_config)
+    }
+}
+
+/// Whether a provider takes `cache_control` breakpoints on system messages; on unless its
+/// config turns `supports_cache_control` off.
+#[must_use]
+pub fn provider_supports_cache_control(provider_config: &Value) -> bool {
+    provider_config
+        .get("supports_cache_control")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
 }
 
 #[derive(Debug)]

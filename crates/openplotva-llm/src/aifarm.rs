@@ -143,6 +143,9 @@ pub struct ChatContentPart {
     /// Video URL part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_url: Option<ChatVideoUrlPart>,
+    /// Prompt-cache breakpoint at the end of this part (`{"type":"ephemeral"}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<Value>,
 }
 
 /// AIFarm image URL payload.
@@ -411,7 +414,7 @@ impl Serialize for RedactedChatContentPart<'_> {
         use serde::ser::SerializeStruct;
 
         let part = self.0;
-        let mut state = serializer.serialize_struct("ChatContentPart", 4)?;
+        let mut state = serializer.serialize_struct("ChatContentPart", 5)?;
         state.serialize_field("type", &part.part_type)?;
         if !part.text.is_empty() {
             state.serialize_field("text", &part.text)?;
@@ -421,6 +424,9 @@ impl Serialize for RedactedChatContentPart<'_> {
         }
         if let Some(value) = &part.video_url {
             state.serialize_field("video_url", &RedactedChatVideoUrl(value))?;
+        }
+        if let Some(value) = &part.cache_control {
+            state.serialize_field("cache_control", value)?;
         }
         state.end()
     }
@@ -3387,6 +3393,7 @@ mod call_trace_artifact_tests {
                             detail: "auto".to_owned(),
                         }),
                         video_url: None,
+                        cache_control: None,
                     },
                     ChatContentPart {
                         part_type: "video_url".to_owned(),
@@ -3395,6 +3402,7 @@ mod call_trace_artifact_tests {
                         video_url: Some(ChatVideoUrlPart {
                             url: "data:video/mp4;base64,user-video-secret".to_owned(),
                         }),
+                        cache_control: None,
                     },
                     ChatContentPart {
                         part_type: "image_url".to_owned(),
@@ -3404,6 +3412,7 @@ mod call_trace_artifact_tests {
                             detail: "auto".to_owned(),
                         }),
                         video_url: None,
+                        cache_control: None,
                     },
                 ],
                 ..ChatMessage::default()
@@ -3469,6 +3478,7 @@ mod call_trace_artifact_tests {
                             detail: "auto".to_owned(),
                         }),
                         video_url: None,
+                        cache_control: None,
                     },
                     ChatContentPart {
                         part_type: "video_url".to_owned(),
@@ -3477,6 +3487,7 @@ mod call_trace_artifact_tests {
                         video_url: Some(ChatVideoUrlPart {
                             url: format!("data:video/mp4;base64,{}", "V".repeat(16 * 1024 * 1024)),
                         }),
+                        cache_control: None,
                     },
                 ],
                 ..ChatMessage::default()
@@ -4061,6 +4072,8 @@ pub struct AifarmClientConfig {
     pub runtime_hint: String,
     /// Whether the upstream accepts the optional OpenAI `messages[].name` field.
     pub supports_message_name: bool,
+    /// Whether system messages are sent as text parts ending in a `cache_control` breakpoint.
+    pub supports_cache_control: bool,
     /// Discovery priority.
     pub priority: i32,
     /// Workload label.
@@ -4119,6 +4132,7 @@ impl Default for AifarmClientConfig {
             default_model: String::new(),
             runtime_hint: String::new(),
             supports_message_name: true,
+            supports_cache_control: true,
             priority: 0,
             workload: String::new(),
             fail_fast_on_capacity_unavailable: false,
@@ -4349,6 +4363,7 @@ fn build_initial_messages(
                 text: message.content,
                 image_url: None,
                 video_url: None,
+                cache_control: None,
             });
         } else {
             parts.extend(message.content_parts);
@@ -4668,6 +4683,46 @@ fn normalize_request_for_client(request: &mut ChatCompletionRequest, cfg: &Aifar
     if !cfg.supports_message_name {
         for message in &mut request.messages {
             message.name = None;
+        }
+    }
+    if cfg.supports_cache_control {
+        mark_system_cache_breakpoints(request);
+    }
+}
+
+/// The `cache_control` value of an ephemeral prompt-cache breakpoint.
+#[must_use]
+pub fn ephemeral_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// End every system message in a cache breakpoint, so the instructions many requests share
+/// stay reusable whatever follows them. Idempotent: the client normalizes a request more
+/// than once on its way to the wire.
+fn mark_system_cache_breakpoints(request: &mut ChatCompletionRequest) {
+    for message in &mut request.messages {
+        if !message.role.eq_ignore_ascii_case("system") {
+            continue;
+        }
+        if message.content_parts.is_empty() {
+            if message.content.trim().is_empty() {
+                continue;
+            }
+            message.content_parts.push(ChatContentPart {
+                part_type: "text".to_owned(),
+                text: message.content.clone(),
+                image_url: None,
+                video_url: None,
+                cache_control: None,
+            });
+        }
+        if let Some(part) = message
+            .content_parts
+            .iter_mut()
+            .rev()
+            .find(|part| part.part_type == "text")
+        {
+            part.cache_control = Some(ephemeral_cache_control());
         }
     }
 }
@@ -6063,6 +6118,7 @@ fn multimodal_content_parts(
                 detail: "auto".to_owned(),
             }),
             video_url: None,
+            cache_control: None,
         });
     }
     if parts.is_empty() {
@@ -6073,6 +6129,7 @@ fn multimodal_content_parts(
         text: text.trim().to_owned(),
         image_url: None,
         video_url: None,
+        cache_control: None,
     });
     parts
 }
@@ -6843,6 +6900,7 @@ mod tests {
                         detail: "auto".to_owned(),
                     }),
                     video_url: None,
+                    cache_control: None,
                 }],
                 ..ChatMessage::default()
             }],
@@ -7099,7 +7157,7 @@ mod tests {
         assert_eq!(body["top_p"], 0.8);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert!(
-            body["messages"][0]["content"]
+            body["messages"][0]["content"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("Ты выделяешь события")
@@ -7374,7 +7432,7 @@ mod tests {
         );
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(
-            body["messages"][0]["content"]
+            body["messages"][0]["content"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("memory consolidation worker")
@@ -7608,7 +7666,10 @@ mod tests {
             false
         );
         assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][0]["content"], "optimize");
+        assert_eq!(
+            body["messages"][0]["content"],
+            cached_system_content("optimize")
+        );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "cat");
         assert_eq!(body["response_format"]["type"], "json_schema");
@@ -7820,7 +7881,7 @@ mod tests {
         );
         assert_eq!(
             image_body["messages"][0]["content"],
-            "custom image variants=2"
+            cached_system_content("custom image variants=2")
         );
         assert_eq!(image_body["messages"][1]["content"], "cat");
         assert_eq!(image_body["max_tokens"], 4096);
@@ -7837,7 +7898,7 @@ mod tests {
         );
         assert_eq!(
             edit_body["messages"][0]["content"],
-            "custom edit variants=2"
+            cached_system_content("custom edit variants=2")
         );
         assert_eq!(edit_body["messages"][1]["content"], "edit it");
         assert_eq!(edit_body["max_tokens"], 4096);
@@ -7964,7 +8025,7 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
             body["messages"][0]["content"],
-            "custom song system night city"
+            cached_system_content("custom song system night city")
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(
@@ -9165,17 +9226,13 @@ mod tests {
         let payload = general_purpose::STANDARD
             .decode(&job.invocation.body)
             .expect("base64 body");
-        let chat_req: ChatCompletionRequest =
-            serde_json::from_slice(&payload).expect("chat completion request");
-        assert_eq!(chat_req.model, "default");
-        assert!(!chat_req.stream);
-        assert_eq!(chat_req.messages[0].role, "system");
+        let body: Value = serde_json::from_slice(&payload).expect("chat completion request");
+        assert_eq!(body["model"], "default");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
-            chat_req
-                .response_format
-                .as_ref()
-                .and_then(|value| value["json_schema"]["name"].as_str()),
-            Some("plotva_step")
+            body["response_format"]["json_schema"]["name"],
+            "plotva_step"
         );
     }
 
@@ -9212,6 +9269,160 @@ mod tests {
             assert_eq!(body["messages"][0]["tool_call_id"], "call-1");
             assert_eq!(body["messages"][0]["content"], r#"{"ok":true}"#);
         }
+    }
+
+    fn cached_system_content(text: &str) -> Value {
+        json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}])
+    }
+
+    fn discovery_job_body(cfg: &AifarmClientConfig, request: &ChatCompletionRequest) -> Value {
+        let job = build_discovery_job_request(cfg, "dialog-cache", request)
+            .expect("Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        serde_json::from_slice(&payload).expect("request JSON")
+    }
+
+    #[test]
+    fn discovery_job_marks_every_system_message_as_a_cache_breakpoint() {
+        let request = ChatCompletionRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_owned(),
+                    content: "Stable instructions.".to_owned(),
+                    ..ChatMessage::default()
+                },
+                ChatMessage {
+                    role: "user".to_owned(),
+                    content: "hi".to_owned(),
+                    ..ChatMessage::default()
+                },
+                ChatMessage {
+                    role: "system".to_owned(),
+                    content: "Late instructions.".to_owned(),
+                    ..ChatMessage::default()
+                },
+            ],
+            ..ChatCompletionRequest::default()
+        };
+
+        let body = discovery_job_body(&AifarmClientConfig::default().with_defaults(), &request);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{
+                "type": "text",
+                "text": "Stable instructions.",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+        assert_eq!(body["messages"][1]["content"], "hi");
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{
+                "type": "text",
+                "text": "Late instructions.",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+    }
+
+    #[test]
+    fn providers_without_cache_control_keep_plain_system_strings() {
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "system".to_owned(),
+                content: "Stable instructions.".to_owned(),
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+        let cfg = AifarmClientConfig {
+            supports_cache_control: false,
+            ..AifarmClientConfig::default()
+        }
+        .with_defaults();
+
+        let body = discovery_job_body(&cfg, &request);
+
+        assert_eq!(body["messages"][0]["content"], "Stable instructions.");
+    }
+
+    #[test]
+    fn repeated_normalization_keeps_one_cache_breakpoint_per_system_message() {
+        let cfg = AifarmClientConfig::default().with_defaults();
+        let mut request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "system".to_owned(),
+                content: "Stable instructions.".to_owned(),
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+
+        normalize_request_for_client(&mut request, &cfg);
+        normalize_request_for_client(&mut request, &cfg);
+
+        let parts = &request.messages[0].content_parts;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].text, "Stable instructions.");
+        assert_eq!(parts[0].cache_control, Some(ephemeral_cache_control()));
+    }
+
+    #[test]
+    fn the_traced_request_shows_the_cache_breakpoint_sent_on_the_wire() {
+        let mut request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "system".to_owned(),
+                content: "Stable instructions.".to_owned(),
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+        normalize_request_for_client(&mut request, &AifarmClientConfig::default().with_defaults());
+
+        let traced =
+            serde_json::to_value(RedactedChatCompletionRequest(&request)).expect("traced request");
+
+        assert_eq!(
+            traced["messages"][0]["content"],
+            serde_json::to_value(&request).expect("wire request")["messages"][0]["content"]
+        );
+        assert_eq!(
+            traced["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn system_content_parts_carry_the_cache_breakpoint_on_their_last_text_part() {
+        let text_part = |text: &str| ChatContentPart {
+            part_type: "text".to_owned(),
+            text: text.to_owned(),
+            image_url: None,
+            video_url: None,
+            cache_control: None,
+        };
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "system".to_owned(),
+                content: "first\n\nsecond".to_owned(),
+                content_parts: vec![text_part("first"), text_part("second")],
+                ..ChatMessage::default()
+            }],
+            ..ChatCompletionRequest::default()
+        };
+
+        let body = discovery_job_body(&AifarmClientConfig::default().with_defaults(), &request);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}},
+            ])
+        );
     }
 
     #[test]

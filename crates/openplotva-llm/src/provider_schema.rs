@@ -135,6 +135,7 @@ pub struct ProviderCommonConfig {
     pub timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
     pub supports_message_name: Option<bool>,
+    pub supports_cache_control: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -238,6 +239,7 @@ pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value 
             { "key": "timeout_ms", "kind": "int", "label": "Request timeout (ms)" },
             { "key": "connect_timeout_ms", "kind": "int", "label": "Connect timeout (ms)" },
             { "key": "supports_message_name", "kind": "bool", "default": true, "label": "Supports message name" },
+            { "key": "supports_cache_control", "kind": "bool", "default": true, "label": "Cache-control breakpoints on system messages" },
         ]),
         Protocol::Genkit | Protocol::AceStep => json!([
             { "key": "timeout_ms", "kind": "int", "label": "Request timeout (ms)" },
@@ -374,5 +376,33 @@ mod tests {
         );
         let descriptor = param_descriptor(Protocol::PrivacyFilter, None);
         assert_eq!(descriptor["supports_model_listing"], json!(false));
+    }
+
+    #[test]
+    fn openai_compat_providers_offer_a_typed_cache_control_switch() {
+        let descriptor = param_descriptor(Protocol::OpenAiCompat, None);
+        assert_eq!(
+            descriptor["provider_fields"]
+                .as_array()
+                .and_then(|fields| fields
+                    .iter()
+                    .find(|field| field["key"] == "supports_cache_control"))
+                .map(|field| (field["kind"].clone(), field["default"].clone())),
+            Some((json!("bool"), json!(true)))
+        );
+        assert!(
+            validate_provider_config(
+                Protocol::OpenAiCompat,
+                &json!({ "supports_cache_control": false })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_provider_config(
+                Protocol::OpenAiCompat,
+                &json!({ "supports_cache_control": "off" })
+            )
+            .is_err()
+        );
     }
 }
