@@ -256,6 +256,10 @@ pub struct ChatCompletionRequest {
     /// Trace metadata for low-level call observation. Never serialized to the wire.
     #[serde(skip)]
     pub trace: Option<crate::trace::LlmCallTrace>,
+    /// Tool calls written as markup in the text execute instead of rejecting the sample.
+    /// Client-side policy, never serialized to the wire.
+    #[serde(skip)]
+    pub textual_tool_calls: bool,
 }
 
 impl ChatCompletionRequest {
@@ -1030,6 +1034,7 @@ struct PendingAifarmTrace {
     context: crate::trace::LlmCallContext,
     artifact: DialogTraceArtifacts,
     tools_offered: bool,
+    textual_tool_calls: bool,
 }
 
 impl AifarmHttpClient<ReqwestAifarmTransport> {
@@ -1169,6 +1174,7 @@ where
             context,
             mut artifact,
             tools_offered,
+            textual_tool_calls,
         } = pending?;
         match result {
             Ok(completion) => {
@@ -1178,6 +1184,7 @@ where
                         completion.response.as_ref(),
                         &artifact.provider,
                         tools_offered,
+                        textual_tool_calls,
                     )
                 {
                     artifact.error = error;
@@ -3076,7 +3083,7 @@ where
             });
         }
 
-        match first_choice_tool_steps(response) {
+        match first_choice_tool_steps(response, request.input.textual_tool_calls) {
             Ok(ToolStepSelection::None(decision)) => {
                 self.record_step_parser_decision(&model, iteration, &decision);
                 let text =
@@ -3192,6 +3199,7 @@ where
             request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
         request.bad_words = input.bad_words.clone();
+        request.textual_tool_calls = input.textual_tool_calls;
         let docs_chars = input
             .reference_context
             .iter()
@@ -3346,6 +3354,7 @@ fn pending_aifarm_trace(request: &ChatCompletionRequest) -> Option<PendingAifarm
         context: trace.context.clone(),
         artifact,
         tools_offered: !request.tools.is_empty(),
+        textual_tool_calls: request.textual_tool_calls,
     })
 }
 
@@ -5260,6 +5269,7 @@ fn dialog_response_semantic_error(
     response: Option<&Value>,
     provider: &str,
     tools_offered: bool,
+    textual_tool_calls: bool,
 ) -> Option<String> {
     let Some(response) = response else {
         return Some("chat completion response is nil".to_owned());
@@ -5270,7 +5280,7 @@ fn dialog_response_semantic_error(
             .err()
             .map(|error| error.to_string());
     }
-    match first_choice_tool_steps(response) {
+    match first_choice_tool_steps(response, textual_tool_calls) {
         Err(error) => Some(error.to_string()),
         Ok(ToolStepSelection::None(_)) => {
             extract_final_answer_for_provider(response, provider, &guard)
@@ -5281,7 +5291,10 @@ fn dialog_response_semantic_error(
     }
 }
 
-fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, CompletionError> {
+fn first_choice_tool_steps(
+    response: &Value,
+    textual_tool_calls: bool,
+) -> Result<ToolStepSelection, CompletionError> {
     let message = first_choice_message_value(response)?;
     if let Some(tool_calls) = message
         .get("tool_calls")
@@ -5321,6 +5334,25 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
         .trim();
     let parsed = parse_assistant_content(content)
         .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
+    if textual_tool_calls && !parsed.tool_steps.is_empty() && !parsed.residual_protocol {
+        let steps = parsed
+            .tool_steps
+            .into_iter()
+            .map(|step| {
+                let mut decision = parsed.decision.clone();
+                decision.tool = step.step.clone();
+                PendingToolStep {
+                    step,
+                    decision,
+                    native_ref: None,
+                }
+            })
+            .collect();
+        return Ok(ToolStepSelection::Steps {
+            steps,
+            text: parsed.text,
+        });
+    }
     if !parsed.tool_steps.is_empty() || parsed.residual_protocol {
         return Err(tool_protocol_completion_error(
             "Use native tool_calls; assistant text cannot execute tools",
@@ -10822,6 +10854,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_step_executes_textual_tool_calls_for_models_that_write_them() {
+        for content in [
+            "<react_to_message emoji=\"🤣\" message_id=\"42\" />",
+            "<call><tool_name>react_to_message</tool_name><arguments><emoji>🤣</emoji><message_id>42</message_id></arguments></call>",
+        ] {
+            let (provider, _, _) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": content}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let mut input = base_input();
+            input.textual_tool_calls = true;
+            let output = crate::ChatStepProvider::run_chat_step(
+                &provider,
+                openplotva_dialog::ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input,
+                    transcript: Vec::new(),
+                    tools: openplotva_dialog::ToolsMode::Native(
+                        native_tool_values(&[STEP_WEB_SEARCH, STEP_REACT_TO_MESSAGE])
+                            .expect("tool defs"),
+                    ),
+                    iteration: 1,
+                },
+            )
+            .await
+            .expect("textual call executes");
+
+            assert_eq!(output.tool_calls.len(), 1, "{content}");
+            assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
+            assert!(output.tool_calls[0].salvaged);
+            assert!(!output.tool_calls[0].id.trim().is_empty());
+            assert_eq!(
+                output.trace.as_ref().map(|trace| trace.error.as_str()),
+                Some(""),
+                "an executed textual call is not a rejected sample"
+            );
+        }
+    }
+
     #[test]
     fn native_calls_ignore_textual_preamble_calls_and_drafts() {
         let response = json!({"choices": [{"message": {
@@ -10831,7 +10904,7 @@ mod tests {
             }}]
         }}]});
         let ToolStepSelection::Steps { steps, text } =
-            first_choice_tool_steps(&response).expect("native calls")
+            first_choice_tool_steps(&response, false).expect("native calls")
         else {
             panic!("expected native call");
         };

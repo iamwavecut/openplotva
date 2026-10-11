@@ -255,6 +255,15 @@ pub struct DialogInput {
     /// config of the model that serves it; empty for engines without the control.
     #[serde(default, rename = "BadWords", skip_serializing_if = "Vec::is_empty")]
     pub bad_words: Vec<String>,
+    /// The serving model writes tool calls as markup in its text instead of native
+    /// `tool_calls`; chosen by that model's routing config. The parsed calls then
+    /// execute instead of rejecting the sample.
+    #[serde(
+        default,
+        rename = "TextualToolCalls",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub textual_tool_calls: bool,
     /// Verdict that rejected the previous sample of this turn, as a stable code
     /// (`context_leak`, `empty`, …); empty on the first attempt. The message builder
     /// turns it into a short note after the rendered last message, so a re-sample is

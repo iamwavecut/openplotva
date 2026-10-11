@@ -10004,6 +10004,27 @@ mod tests {
     }
 
     #[test]
+    fn gemma_textual_tool_calls_flag_is_scoped_and_reversible() {
+        const UP: &str = include_str!("../../../migrations/195_gemma_textual_tool_calls.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/195_gemma_textual_tool_calls.down.sql");
+
+        for value in [
+            "'{\"textual_tool_calls\": true}'::jsonb",
+            "provider.name = 'aifarm-vllm-gpu0'",
+            "model.model_name = 'Gemma 4 26B Heretic'",
+            "textual_tool_calls_v1_previous",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing textual tool-call contract {value}"
+            );
+        }
+        assert!(DOWN.contains("config - 'textual_tool_calls' - 'textual_tool_calls_v1_previous'"));
+        assert!(DOWN.contains("WHERE config ? 'textual_tool_calls_v1_previous'"));
+    }
+
+    #[test]
     fn gpu0_gemma_routing_widens_the_pool_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/194_gpu0_gemma_parallel_routing.up.sql");
         const DOWN: &str =
