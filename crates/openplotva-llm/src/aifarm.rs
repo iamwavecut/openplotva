@@ -199,7 +199,11 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     /// Top-k.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_top_k"
+    )]
     pub top_k: Option<f64>,
     /// llama.cpp repeat penalty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,7 +298,9 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
         }
         serialize_optional_field(&mut state, "temperature", request.temperature)?;
         serialize_optional_field(&mut state, "top_p", request.top_p)?;
-        serialize_optional_field(&mut state, "top_k", request.top_k)?;
+        if let Some(top_k) = request.top_k {
+            state.serialize_field("top_k", &top_k_wire_value(top_k))?;
+        }
         serialize_optional_field(&mut state, "repeat_penalty", request.repeat_penalty)?;
         serialize_optional_field(&mut state, "repetition_penalty", request.repetition_penalty)?;
         serialize_optional_field(&mut state, "frequency_penalty", request.frequency_penalty)?;
@@ -320,6 +326,26 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
             state.serialize_field("extra_body", value)?;
         }
         state.end()
+    }
+}
+
+/// Strict-schema engines (NInfer) accept `top_k` only as an integer, so a whole value goes
+/// out without a fractional part.
+fn top_k_wire_value(top_k: f64) -> Value {
+    if top_k.fract() == 0.0 && top_k.abs() < 9.0e15 {
+        json!(top_k as i64)
+    } else {
+        json!(top_k)
+    }
+}
+
+fn serialize_top_k<S>(top_k: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match top_k {
+        Some(value) => top_k_wire_value(*value).serialize(serializer),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -9120,7 +9146,7 @@ mod tests {
             Some(json!({ "chat_template_kwargs": {"enable_thinking": false} }))
         );
         let body = serde_json::to_value(&direct).expect("direct request JSON");
-        assert_eq!(body["top_k"], json!(20.0));
+        assert_eq!(body["top_k"], json!(20));
         assert_eq!(body["repetition_penalty"], json!(1.0));
         assert!(body.get("repeat_penalty").is_none());
         assert!(body.get("frequency_penalty").is_none());
@@ -9233,6 +9259,37 @@ mod tests {
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
             "plotva_step"
+        );
+    }
+
+    #[test]
+    fn whole_top_k_goes_on_the_wire_as_an_integer() {
+        let request = ChatCompletionRequest {
+            top_k: Some(20.0),
+            ..ChatCompletionRequest::default()
+        };
+        let job = build_discovery_job_request(
+            &AifarmClientConfig::default().with_defaults(),
+            "top-k",
+            &request,
+        )
+        .expect("Discovery job request");
+        let payload = general_purpose::STANDARD
+            .decode(&job.invocation.body)
+            .expect("base64 body");
+        let body: Value = serde_json::from_slice(&payload).expect("request JSON");
+        assert_eq!(body["top_k"].as_i64(), Some(20));
+
+        let traced = serde_json::to_value(RedactedChatCompletionRequest(&request)).expect("trace");
+        assert_eq!(traced["top_k"].as_i64(), Some(20));
+
+        let fractional = ChatCompletionRequest {
+            top_k: Some(0.5),
+            ..ChatCompletionRequest::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&fractional).expect("wire")["top_k"].as_f64(),
+            Some(0.5)
         );
     }
 
@@ -9465,7 +9522,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false,
                 "max_tokens": 256,
-                "top_k": 40.0,
+                "top_k": 40,
                 "repeat_penalty": 1.1
             })
         );
