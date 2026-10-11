@@ -14,6 +14,7 @@ use openplotva_dialog::{DialogTraceArtifacts, DialogTraceUsage};
 use openplotva_llm::aifarm::{
     AIFARM_WORKLOAD_SUMMARY, AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport,
     ChatCompletionRequest, ChatMessage, GatewayRequestFields, StatusUpdate,
+    ephemeral_cache_control,
 };
 use openplotva_llm::gemini::{MODEL_GEMINI_FLASH_LITE, cache_contour_model};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
@@ -564,7 +565,8 @@ impl OpenAiCompatibleYouTubeSummarizer {
         payload: &str,
     ) -> Result<String, YouTubeSummaryError> {
         let system = openplotva_prompts::read(stage.prompt_name())?;
-        let request = youtube_summary_openai_request(&self.cfg.model, &system, payload, stage);
+        let request =
+            youtube_summary_openai_request(&self.cfg.model, &system, payload, stage, true);
         let trace = YouTubeCallTrace::begin(
             YouTubeTraceTags {
                 provider: self.provider,
@@ -622,7 +624,13 @@ async fn generate_youtube_summary_with_attempt(
     }
     let system = openplotva_prompts::read(stage.prompt_name())?;
     let model = attempt.model_name.trim().to_owned();
-    let mut request = youtube_summary_openai_request(&model, &system, payload, stage);
+    let mut request = youtube_summary_openai_request(
+        &model,
+        &system,
+        payload,
+        stage,
+        attempt.supports_cache_control(),
+    );
     let gateway = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
     request.provider = gateway.provider;
     request.reasoning = gateway.reasoning;
@@ -749,6 +757,7 @@ fn youtube_farm_client_config(config: &AppConfig, attempt: &RoutedAttempt) -> Ai
         default_model: attempt.model_name.trim().to_owned(),
         runtime_hint: attempt.provider_runtime_hint.clone().unwrap_or_default(),
         supports_message_name: attempt.supports_message_name(),
+        supports_cache_control: attempt.supports_cache_control(),
         workload: AIFARM_WORKLOAD_SUMMARY.to_owned(),
         ..AifarmClientConfig::default()
     }
@@ -1362,18 +1371,24 @@ fn youtube_summary_openai_request(
     system: &str,
     payload: &str,
     stage: YouTubeStage,
+    system_cache_breakpoint: bool,
 ) -> OpenAiChatCompletionRequest {
     let (temperature, top_p, top_k) = youtube_sampling(model);
+    let system_content = if system_cache_breakpoint {
+        json!([{ "type": "text", "text": system, "cache_control": ephemeral_cache_control() }])
+    } else {
+        json!(system)
+    };
     OpenAiChatCompletionRequest {
         model: model.to_owned(),
         messages: vec![
             OpenAiChatMessage {
                 role: "system".to_owned(),
-                content: system.to_owned(),
+                content: system_content,
             },
             OpenAiChatMessage {
                 role: "user".to_owned(),
-                content: payload.to_owned(),
+                content: json!(payload),
             },
         ],
         max_tokens: stage.max_output_tokens(),
@@ -1433,7 +1448,7 @@ struct OpenAiChatCompletionRequest {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct OpenAiChatMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 fn gemini_generate_url(base_url: &str, model: &str) -> Result<String, YouTubeSummaryError> {
@@ -2033,8 +2048,13 @@ mod tests {
 
     #[test]
     fn youtube_summary_openai_request_uses_family_sampling_without_a_response_format() {
-        let request =
-            youtube_summary_openai_request("gpt-5-mini", "sys", "payload", YouTubeStage::Summary);
+        let request = youtube_summary_openai_request(
+            "gpt-5-mini",
+            "sys",
+            "payload",
+            YouTubeStage::Summary,
+            false,
+        );
         let value = serde_json::to_value(&request).expect("json");
 
         assert_eq!(value["model"], "gpt-5-mini");
@@ -2046,13 +2066,45 @@ mod tests {
         assert!(value.get("response_format").is_none(), "{value}");
         assert!(value.get("reasoning").is_none(), "{value}");
 
-        let qwen =
-            youtube_summary_openai_request("qwen3.6-27b", "sys", "payload", YouTubeStage::Merge);
+        let qwen = youtube_summary_openai_request(
+            "qwen3.6-27b",
+            "sys",
+            "payload",
+            YouTubeStage::Merge,
+            false,
+        );
         let qwen = serde_json::to_value(&qwen).expect("json");
         assert_eq!(qwen["max_tokens"], 8192);
         assert_eq!(qwen["temperature"], 0.7);
         assert_eq!(qwen["top_p"], 0.8);
         assert_eq!(qwen["top_k"], 20);
+    }
+
+    #[test]
+    fn youtube_summary_openai_request_ends_the_system_prompt_in_a_cache_breakpoint_when_allowed() {
+        let cached = serde_json::to_value(youtube_summary_openai_request(
+            "gpt-5-mini",
+            "sys",
+            "payload",
+            YouTubeStage::Summary,
+            true,
+        ))
+        .expect("json");
+        assert_eq!(
+            cached["messages"][0]["content"],
+            json!([{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert_eq!(cached["messages"][1]["content"], "payload");
+
+        let plain = serde_json::to_value(youtube_summary_openai_request(
+            "gpt-5-mini",
+            "sys",
+            "payload",
+            YouTubeStage::Summary,
+            false,
+        ))
+        .expect("json");
+        assert_eq!(plain["messages"][0]["content"], "sys");
     }
 
     fn caption(start: f64, text: &str) -> TranscriptLine {
@@ -2301,6 +2353,7 @@ mod tests {
                 "system",
                 "0.5: hello",
                 YouTubeStage::Summary,
+                false,
             ),
         );
         let artifact = youtube_trace_artifact(
@@ -2403,6 +2456,7 @@ mod tests {
         assert_eq!(client.endpoint_name, "chat_completions");
         assert_eq!(client.runtime_hint, "ninfer");
         assert!(!client.supports_message_name);
+        assert!(client.supports_cache_control);
         assert_eq!(client.workload, AIFARM_WORKLOAD_SUMMARY);
         assert_eq!(client.default_model, "qwen3.8-27b");
 
@@ -2413,6 +2467,14 @@ mod tests {
         assert_eq!(
             youtube_farm_client_config(&config, &with_endpoint).base_url,
             "https://discovery.example.test"
+        );
+
+        let without_cache_control = RoutedAttempt {
+            provider_config: json!({ "supports_cache_control": false }),
+            ..farm_attempt()
+        };
+        assert!(
+            !youtube_farm_client_config(&config, &without_cache_control).supports_cache_control
         );
     }
 

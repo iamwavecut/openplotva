@@ -477,6 +477,7 @@ fn vision_config_for_attempt(
     if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
         config.client.endpoint_name = endpoint.to_owned();
     }
+    config.client.supports_cache_control = attempt.supports_cache_control();
     if let Some(max_tokens) = attempt.overrides.max_tokens
         && max_tokens > 0
     {
@@ -553,6 +554,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                 video_url: Some(ChatVideoUrlPart {
                     url: data_url.trim().to_owned(),
                 }),
+                cache_control: None,
             }
         } else {
             ChatContentPart {
@@ -563,6 +565,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                     detail: "auto".to_owned(),
                 }),
                 video_url: None,
+                cache_control: None,
             }
         };
         let mut completion_request = ChatCompletionRequest {
@@ -584,6 +587,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                             text: user_prompt.trim().to_owned(),
                             image_url: None,
                             video_url: None,
+                            cache_control: None,
                         },
                     ],
                     ..ChatMessage::default()
@@ -3002,9 +3006,13 @@ mod tests {
             false
         );
         assert!(
-            body["messages"][0]["content"]
+            body["messages"][0]["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("vision-модуль"))
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
         );
         assert!(
             body["messages"][1]["content"][1]["text"]

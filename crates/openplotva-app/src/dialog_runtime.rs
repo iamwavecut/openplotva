@@ -166,6 +166,8 @@ impl ChatClientFactory {
             .get("supports_message_name")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        cfg.client.supports_cache_control =
+            crate::routed_attempts::provider_supports_cache_control(&row.config);
         match (&row.discovery_service_name, &row.endpoint) {
             (Some(service), _) => {
                 cfg.client.service_name = service.clone();
@@ -1741,6 +1743,29 @@ mod tests {
             !Arc::ptr_eq(&first, &third),
             "a runtime-hint-only change must invalidate the cached client"
         );
+    }
+
+    #[test]
+    fn factory_config_follows_the_provider_cache_control_switch() {
+        let mut snapshot =
+            admin_created_provider_snapshot("openai_compat", "https://gateway.local/v1");
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
+        let config_for = |handle: &RouterHandle| {
+            let table = handle.snapshot();
+            let row = table.provider(5).expect("provider row");
+            factory
+                .dynamic_dialog_config(row, GatewayRequestFields::default())
+                .expect("dynamic config")
+        };
+
+        assert!(config_for(&handle).client.supports_cache_control);
+
+        snapshot.providers[0].config = json!({ "supports_cache_control": false });
+        handle.store(crate::model_routing::build_routing_table(&snapshot));
+        assert!(!config_for(&handle).client.supports_cache_control);
     }
 
     #[test]
