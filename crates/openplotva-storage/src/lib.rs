@@ -10004,6 +10004,44 @@ mod tests {
     }
 
     #[test]
+    fn gpu0_gemma_routing_widens_the_pool_and_is_reversible() {
+        const UP: &str = include_str!("../../../migrations/194_gpu0_gemma_parallel_routing.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/194_gpu0_gemma_parallel_routing.down.sql");
+
+        for value in [
+            "max_concurrency = 8",
+            "'aifarm-vllm-gpu0'",
+            "'aifarm-vision'",
+            "('dialog', 'primary', 'aifarm-vllm-gpu0', 'Gemma 4 26B Heretic', 100, NULL::INTEGER)",
+            "('dialog', 'fallback', 'aifarm-ninfer-gpu2', 'qwen3.8-27b', NULL::INTEGER, 0)",
+            "('dialog', 'fallback', 'openrouter', '~openai/gpt-luna-latest', NULL::INTEGER, 99)",
+            "gpu0_gemma_routing_v1_previous",
+            "gpu0_gemma_routing_v1_previous_max_concurrency",
+            "gpu0_gemma_routing_v1_previous_pool_id",
+            "created_by_gpu0_gemma_routing_v1",
+        ] {
+            assert!(UP.contains(value), "missing GPU0 routing contract {value}");
+        }
+        assert!(!UP.contains("'memory_extraction'"));
+        assert!(!UP.contains("'memory_subject_merge'"));
+        assert!(!UP.contains("DELETE FROM workflow_assignments"));
+        assert!(!UP.contains("DELETE FROM provider_models"));
+
+        for value in [
+            "DELETE FROM workflow_assignments\nWHERE inference_overrides ? 'created_by_gpu0_gemma_routing_v1'",
+            "inference_overrides - 'gpu0_gemma_routing_v1_previous'",
+            "config - 'gpu0_gemma_routing_v1_previous_pool_id'",
+            "config - 'gpu0_gemma_routing_v1_previous_max_concurrency'",
+        ] {
+            assert!(
+                DOWN.contains(value),
+                "missing GPU0 routing rollback {value}"
+            );
+        }
+    }
+
+    #[test]
     fn ninfer_gpu2_cutover_retires_conflicting_runtimes_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/182_ninfer_gpu2_cutover.up.sql");
         const DOWN: &str = include_str!("../../../migrations/182_ninfer_gpu2_cutover.down.sql");
