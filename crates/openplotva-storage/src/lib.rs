@@ -10067,6 +10067,33 @@ mod tests {
     }
 
     #[test]
+    fn gpu2_history_summary_routing_is_scoped_and_reversible() {
+        const UP: &str =
+            include_str!("../../../migrations/196_gpu2_history_summary_routing.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/196_gpu2_history_summary_routing.down.sql");
+
+        for value in [
+            "('aifarm-ninfer-gpu2', 'qwen3.8-27b', 'primary', 100, NULL::INTEGER, TRUE)",
+            "('aifarm-vllm-gpu0', 'Gemma 4 26B Heretic', 'fallback', NULL::INTEGER, 0, FALSE)",
+            "assignment.workflow_key = 'history_summary'",
+            "gpu2_history_summary_v1_previous",
+            "WHERE primary_target.role = 'primary'",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing GPU2 history summary contract {value}"
+            );
+        }
+        assert!(!UP.contains("gpt-luna"));
+        assert!(!UP.contains("llm_capacity_pools"));
+        assert!(!UP.contains("DELETE FROM"));
+        assert!(!UP.contains("INSERT INTO"));
+        assert!(DOWN.contains("inference_overrides - 'gpu2_history_summary_v1_previous'"));
+        assert!(DOWN.contains("WHERE inference_overrides ? 'gpu2_history_summary_v1_previous'"));
+    }
+
+    #[test]
     fn gpu0_gemma_routing_widens_the_pool_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/194_gpu0_gemma_parallel_routing.up.sql");
         const DOWN: &str =
