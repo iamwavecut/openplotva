@@ -115,8 +115,10 @@ For each candidate in chain order, the walker:
 The admission budget is the time left until the request deadline minus a fallback reserve: the
 time the next candidate needs to answer. The reserve is a per-workflow value
 (`workflows.fallback_reserve_ms`): 30 s for interactive and user-tool workflows, 0 for
-background ones. A request without a deadline (background work) waits in its queue without a
-limit and never falls back because of load.
+background ones. Background work without a deadline waits in its queue without a limit and never
+falls back because of load. An interactive or user-tool request whose caller sets no deadline gets
+an admission deadline 300 s after its run starts (the old all-busy cap), so a lane that stays busy
+hands it to the next candidate or to the caller's retry instead of holding it forever.
 
 `primary_slot_wait`, the busy-skip pass and the per-construction `max_slot_wait` disappear; the
 policy is the same for all 25 walker constructions. Unpooled candidates are admitted at once.

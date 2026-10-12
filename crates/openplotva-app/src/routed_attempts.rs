@@ -10,6 +10,12 @@ use openplotva_llm::router::{
 };
 use serde_json::{Value, json};
 
+/// Admission deadline, from the start of a run, for an interactive or
+/// user-tool request whose caller set no deadline: a lane that stays busy this
+/// long hands the request to the next candidate or to the caller's retry.
+/// Background work without a deadline keeps its place in the queue.
+const NO_DEADLINE_LANE_WAIT: Duration = Duration::from_secs(300);
+
 /// Minimum share of the caller's budget an attempt must have received for a
 /// deadline cut to count against the provider's circuit breaker.
 const ATTEMPT_BREAKER_MIN_SLICE: Duration = Duration::from_secs(30);
@@ -106,16 +112,17 @@ impl RoutedAttemptWalker {
 
     /// Admit one candidate through its lane queue. A free lane is taken at once.
     /// A candidate with an open breaker is never waited for. Otherwise the
-    /// request waits in the lane queue until `deadline - reserve`, keeping the
-    /// workflow's fallback reserve only while another candidate follows, and
-    /// moves on at once when the forecast wait already exceeds that budget.
-    /// Lane time is charged to the caller's deadline, not to the retry wall.
+    /// request waits in the lane queue until `admission_deadline - reserve`,
+    /// keeping the workflow's fallback reserve only while another candidate
+    /// follows, and moves on at once when the forecast wait already exceeds that
+    /// budget. Lane time is charged to the deadline, not to the retry wall.
     #[allow(clippy::too_many_arguments)]
     async fn admit_lane(
         &self,
         pool: Option<PoolId>,
         live: bool,
         has_next_candidate: bool,
+        admission_deadline: Option<Instant>,
         route: &WorkflowRoute,
         context: &RoutedRequestContext,
         attempt: &Attempt,
@@ -133,7 +140,7 @@ impl RoutedAttemptWalker {
         } else {
             Duration::ZERO
         };
-        let budget = context.deadline.map(|deadline| {
+        let budget = admission_deadline.map(|deadline| {
             deadline
                 .saturating_duration_since(Instant::now())
                 .saturating_sub(reserve)
@@ -245,6 +252,10 @@ impl RoutedAttemptWalker {
         };
 
         let started = Instant::now();
+        let admission_deadline = context.deadline.or_else(|| {
+            (context.lane_priority.unwrap_or(route.lane_priority) != LanePriority::Background)
+                .then(|| started + NO_DEADLINE_LANE_WAIT)
+        });
         let max_hops = route.retry.max_hops.max(1) as usize;
         let mut started_attempts = 0usize;
         let mut total_slot_wait = Duration::ZERO;
@@ -377,6 +388,7 @@ impl RoutedAttemptWalker {
                             pool_id,
                             live,
                             has_next_candidate,
+                            admission_deadline,
                             route,
                             &context,
                             attempt,
@@ -2125,6 +2137,53 @@ mod tests {
         assert!(result.is_err());
         assert!(executed.is_empty());
         assert_eq!(pools.occupancy()[0].queued, [0, 0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_without_a_deadline_stops_waiting_at_the_lane_cap() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the only lane");
+        let started = tokio::time::Instant::now();
+
+        let (result, executed) = run_recording(&walker, None, None).await;
+
+        assert!(executed.is_empty());
+        assert!(matches!(
+            result,
+            Err(RoutedAttemptRunError::Routing(error))
+                if error.kind() == RoutedRoutingErrorKind::CapacityWaitTimeout
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited > NO_DEADLINE_LANE_WAIT - Duration::from_secs(1)
+                && waited <= NO_DEADLINE_LANE_WAIT,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_work_without_a_deadline_waits_past_the_lane_cap() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the only lane");
+
+        let waiting = tokio::time::timeout(
+            NO_DEADLINE_LANE_WAIT * 2,
+            run_recording(&walker, None, Some(LanePriority::Background)),
+        )
+        .await;
+
+        assert!(
+            waiting.is_err(),
+            "background work keeps its place in the queue"
+        );
     }
 
     #[tokio::test]
