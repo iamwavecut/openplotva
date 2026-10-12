@@ -271,7 +271,7 @@ ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE
     metrics = EXCLUDED.metrics,
     updated_at = CURRENT_TIMESTAMP"#;
 // Purge terminal memory_runs after they are rolled up. Cutoff = retention_days,
-// which (default 14) MUST stay >= the memory pipeline's ensure_daily window
+// which (default 14) MUST stay >= the memory pipeline's enqueue window
 // (MEMORY_RETENTION_HOURS=168=7d) so re-creation never violates the runs' UNIQUE
 // idempotency constraint. Never touches queued/processing runs.
 const SQL_DELETE_OLD_MEMORY_RUNS: &str = r#"

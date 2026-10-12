@@ -1273,7 +1273,7 @@ pub const SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS: &str = r#"WITH grouped_windows AS (
     FROM chat_history_entries h
     LEFT JOIN telegram_chats_effective c ON c.id = h.chat_id
     WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
-      AND h.bucket_day < $3::timestamptz::date
+      AND h.bucket_day <= $3::timestamptz::date
       AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
       AND h.occurred_at < $3::timestamptz
       AND h.kind = 'text'
@@ -1375,7 +1375,7 @@ ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE
     metrics = EXCLUDED.metrics,
     updated_at = CURRENT_TIMESTAMP"#;
 
-pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
+pub const SQL_ENSURE_HOURLY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
     SELECT
         h.chat_id,
         CASE
@@ -1387,7 +1387,7 @@ pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
     FROM chat_history_entries h
     LEFT JOIN telegram_chats_effective c ON c.id = h.chat_id
     WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
-      AND h.bucket_day < $3::timestamptz::date
+      AND h.bucket_day <= $3::timestamptz::date
       AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
       AND h.occurred_at < $3::timestamptz
       AND h.kind = 'text'
@@ -5818,10 +5818,15 @@ impl PostgresMemoryStore {
             .rows_affected())
     }
 
-    pub async fn ensure_daily_runs(
+    /// Enqueue a run for every chat hour that completed before `now`, started
+    /// within the last `lookback` (at most `retention`), and has enough
+    /// messages: newest first, within the queue and daily caps. The enqueue
+    /// rollups still describe whole UTC days of the scanned range.
+    pub async fn ensure_hourly_runs(
         &self,
         now: OffsetDateTime,
         retention: Duration,
+        lookback: Duration,
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> Result<u64, StorageError> {
         let retention = if retention.is_zero() {
@@ -5831,19 +5836,21 @@ impl PostgresMemoryStore {
         };
         let policy = policy.normalized();
         let now = now.to_offset(time::UtcOffset::UTC);
-        let day_end = now.date().midnight().assume_utc();
+        let day_start = now.date().midnight().assume_utc();
+        let completed_hours_end = day_start + time::Duration::hours(i64::from(now.hour()));
         let earliest = now - duration_to_time(retention);
-        let earliest_day_start = earliest.date().midnight().assume_utc();
-        let mut window_end = day_end;
+        let scan_from = earliest.max(completed_hours_end - duration_to_time(lookback));
+        let earliest_day_start = scan_from.date().midnight().assume_utc();
+        let mut window_end = completed_hours_end;
         let mut total = 0;
         let active_queue_depth = self.active_memory_run_count().await?;
-        let base_runs_enqueued_today = self.base_memory_run_count_created_since(day_end).await?;
+        let base_runs_enqueued_today = self.base_memory_run_count_created_since(day_start).await?;
         if memory_enqueue_remaining_capacity(policy, active_queue_depth, base_runs_enqueued_today)
             .is_none()
         {
             self.record_memory_enqueue_backpressure(
                 earliest_day_start,
-                day_end,
+                completed_hours_end,
                 active_queue_depth,
                 policy,
             )
@@ -5852,7 +5859,12 @@ impl PostgresMemoryStore {
             return Ok(total);
         }
         while window_end > earliest_day_start {
-            let window_start = window_end - time::Duration::days(1);
+            // One rollup bucket per UTC day: today's runs to the last completed
+            // hour, then whole earlier days.
+            let window_start = (window_end - time::Duration::NANOSECOND)
+                .date()
+                .midnight()
+                .assume_utc();
             let Some(limit) = memory_enqueue_remaining_capacity(
                 policy,
                 active_queue_depth.saturating_add(i64::try_from(total).unwrap_or(i64::MAX)),
@@ -5870,7 +5882,7 @@ impl PostgresMemoryStore {
             )
             .await?;
             total += self
-                .ensure_daily_run_window(window_start, window_end, earliest, policy, limit)
+                .ensure_run_window(window_start, window_end, scan_from, policy, limit)
                 .await?;
             window_end = window_start;
         }
@@ -5942,7 +5954,7 @@ impl PostgresMemoryStore {
         Ok(())
     }
 
-    async fn ensure_daily_run_window(
+    async fn ensure_run_window(
         &self,
         window_start: OffsetDateTime,
         window_end: OffsetDateTime,
@@ -5950,7 +5962,7 @@ impl PostgresMemoryStore {
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
         daily_limit: i32,
     ) -> Result<u64, StorageError> {
-        Ok(sqlx::query(SQL_ENSURE_DAILY_MEMORY_RUNS)
+        Ok(sqlx::query(SQL_ENSURE_HOURLY_MEMORY_RUNS)
             .bind(openplotva_memory::PROMPT_VERSION)
             .bind(window_start)
             .bind(window_end)
@@ -11616,18 +11628,18 @@ mod tests {
         assert!(
             super::SQL_LIST_MEMORY_CARDS.contains("($8::timestamptz IS NULL OR (recorded_at <= $8")
         );
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("date_trunc('hour', h.occurred_at)"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("COALESCE(c.is_forum, false)"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("canonical_thread_id"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("HAVING count(*) >= $5"));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("date_trunc('hour', h.occurred_at)"));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("COALESCE(c.is_forum, false)"));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("canonical_thread_id"));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("HAVING count(*) >= $5"));
         assert!(
-            super::SQL_ENSURE_DAILY_MEMORY_RUNS
+            super::SQL_ENSURE_HOURLY_MEMORY_RUNS
                 .contains("ORDER BY range_start_at DESC, message_count DESC")
         );
         assert!(
-            super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("WHERE NOT EXISTS (\n        SELECT 1")
+            super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("WHERE NOT EXISTS (\n        SELECT 1")
         );
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("LIMIT $6"));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("LIMIT $6"));
         assert!(
             super::SQL_SELECT_MEMORY_RUN_MESSAGES
                 .contains("WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0")
@@ -11650,7 +11662,7 @@ mod tests {
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'backpressure'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'min_range_start'"));
         assert!(super::SQL_LIST_MEMORY_ENQUEUE_ROLLUPS.contains("kind = 'consolidation_enqueue'"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("h.bucket_day >="));
+        assert!(super::SQL_ENSURE_HOURLY_MEMORY_RUNS.contains("h.bucket_day >="));
         assert!(super::SQL_SKIP_SUPERSEDED_MEMORY_RUNS.contains("prompt_version <> $1"));
         assert!(
             super::SQL_SELECT_MEMORY_RUN_MESSAGES
@@ -12010,6 +12022,117 @@ mod tests {
         assert_eq!(r#ref.file_size, 123);
         assert_eq!(r#ref.chat_id, -2);
         assert_eq!(r#ref.message_id, 20);
+    }
+
+    #[tokio::test]
+    async fn live_memory_runs_are_enqueued_through_the_last_complete_hour()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        let store = super::PostgresMemoryStore::new(pool.clone());
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as i64;
+        let chat_id = -940_000_000 - (suffix % 1_000_000);
+        // 2030-03-04 10:05 UTC: 09:00-10:00 is complete, 10:00-11:00 is not.
+        let now = time::OffsetDateTime::from_unix_timestamp(1_898_849_100)?;
+        let hour = time::Duration::HOUR;
+        let messages = [
+            now - hour + time::Duration::minutes(5),
+            now - time::Duration::minutes(4),
+            now - 12 * hour + time::Duration::minutes(25),
+        ];
+
+        let result: Result<(), Box<dyn Error>> = async {
+            let mut message_id = 0;
+            for window in messages {
+                sqlx::query("SELECT ensure_chat_history_partition($1::date)")
+                    .bind(window.date())
+                    .execute(&pool)
+                    .await?;
+                for offset in 0..3 {
+                    message_id += 1;
+                    sqlx::query(
+                        "INSERT INTO chat_history_entries \
+                         (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, \
+                          occurred_at, sender_id, payload) \
+                         VALUES ($1::date, $2, 0, $3, $4, 'text', 'user', $5, 1, \
+                                 '{\"text\":\"hourly memory\"}'::jsonb)",
+                    )
+                    .bind(window.date())
+                    .bind(chat_id)
+                    .bind(message_id)
+                    .bind(format!("hourly-{message_id}"))
+                    .bind(window + time::Duration::seconds(offset))
+                    .execute(&pool)
+                    .await?;
+                }
+            }
+
+            let policy = openplotva_memory::MemoryRunEnqueuePolicy {
+                min_messages_per_run: 3,
+                max_queued_runs: 1_000_000,
+                max_daily_enqueued_runs: 1_000_000,
+            };
+            let retention = Duration::from_secs(7 * 24 * 60 * 60);
+            let windows = || async {
+                sqlx::query_as::<_, (time::OffsetDateTime, time::OffsetDateTime)>(
+                    "SELECT range_start_at, range_end_at FROM memory_runs \
+                     WHERE chat_id = $1 ORDER BY range_start_at",
+                )
+                .bind(chat_id)
+                .fetch_all(&pool)
+                .await
+            };
+            let yesterday_evening = now - 12 * hour - time::Duration::minutes(5);
+            let this_morning = now - hour - time::Duration::minutes(5);
+
+            let recent = store
+                .ensure_hourly_runs(now, retention, Duration::from_secs(2 * 60 * 60), policy)
+                .await?;
+            assert!(recent >= 1, "{recent}");
+            assert_eq!(
+                windows().await?,
+                vec![(this_morning, this_morning + hour)],
+                "an hourly tick looks back only over the recent hours"
+            );
+
+            let full = store
+                .ensure_hourly_runs(now, retention, retention, policy)
+                .await?;
+            assert!(full >= 1, "{full}");
+            assert_eq!(
+                windows().await?,
+                vec![
+                    (yesterday_evening, yesterday_evening + hour),
+                    (this_morning, this_morning + hour),
+                ],
+                "a full scan fills the retention window; the current hour waits until it completes"
+            );
+            Ok(())
+        }
+        .await;
+
+        sqlx::query("DELETE FROM memory_runs WHERE chat_id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM chat_history_entries WHERE chat_id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "DELETE FROM telemetry_rollups \
+             WHERE source = 'memory' AND kind = 'consolidation_enqueue' AND bucket_start >= $1",
+        )
+        .bind(now - time::Duration::days(8))
+        .execute(&pool)
+        .await?;
+        result
     }
 
     #[tokio::test]

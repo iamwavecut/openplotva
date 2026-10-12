@@ -4448,8 +4448,9 @@ async fn admin_memory_restart_execute_response(
     let mut queued_runs = 0_i64;
     let result = if run_now {
         store
-            .ensure_daily_runs(
+            .ensure_hourly_runs(
                 OffsetDateTime::now_utc(),
+                routes.memory_retention,
                 routes.memory_retention,
                 routes.memory_enqueue_policy,
             )
@@ -4566,8 +4567,9 @@ async fn admin_memory_restart_override_execute_response(
     let result = if run_now {
         runtime
             .store
-            .ensure_daily_runs(
+            .ensure_hourly_runs(
                 OffsetDateTime::now_utc(),
+                routes.memory_retention,
                 routes.memory_retention,
                 routes.memory_enqueue_policy,
             )

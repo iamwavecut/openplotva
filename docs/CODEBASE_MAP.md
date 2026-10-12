@@ -332,7 +332,7 @@ queueing glue).
 | `runtime_llm.rs` | `RuntimeLlmObserver` (single chokepoint → ring + Postgres recorder + run buffer); provider canonicalization from model name; cleanup/scrub workers |
 | `runtime_llm_runs.rs` | 512-entry run ring for admin "LLM Dialogs" view; 30min stale-run watchdog |
 | `runtime_llm_analytics.rs` | Postgres analytics reader (raw + hourly rollups, percentile reconstruction) |
-| `memory_runtime.rs` (~5.4k) | Memory consolidation wiring: extractor composition, daily-run scheduling, claim/process pipeline, 6-op resolution resolver (`write_memory_extraction_cards`), +2 workers (archival 1h, dup-collapse 6h) |
+| `memory_runtime.rs` (~5.4k) | Memory consolidation wiring: extractor composition, hourly run scheduling, claim/process pipeline, 6-op resolution resolver (`write_memory_extraction_cards`), +2 workers (archival 1h, dup-collapse 6h) |
 | `agent_runtime.rs` (~1.5k) | `Reasoner`/`AgentTools` adapters; image agent optimizer provider; `SongContextGatherer` (history + memory context for the song director) |
 | `history_summary.rs` (~1.7k) | Chat-history summary service (edge pre-summary cascade, AIFarm↔GenKit fallback) |
 | `embedder.rs` | Discovery-routed embedder + process-wide cooling circuit breaker (shared by retrieval/shield/consolidation) |
@@ -633,7 +633,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Sched[Daily scheduler / taskman<br/>MemoryConsolidation job] --> Claim[claim_run<br/>lease 15min]
+    Sched[Hourly scheduler HH:02 / taskman<br/>MemoryConsolidation job] --> Claim[claim_run<br/>lease 15min]
     Claim --> Gate{embedder available?<br/>shared breaker}
     Gate -- no --> Release[release run<br/>no attempt burned]
     Gate -- yes --> Load[load messages<br/>binary-search fit to token budget]

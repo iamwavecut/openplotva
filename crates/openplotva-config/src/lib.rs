@@ -1043,8 +1043,6 @@ pub struct MemoryConfig {
     pub consolidation_provider: String,
     pub consolidation_model: String,
     pub consolidation_timeout_seconds: i32,
-    pub daily_schedule: String,
-    pub daily_window_hours: i32,
     pub worker_concurrency: i32,
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
@@ -1568,10 +1566,6 @@ pub struct RawConfig {
     pub memory_consolidation_model: Option<String>,
     /// `MEMORY_CONSOLIDATION_TIMEOUT_SECONDS`.
     pub memory_consolidation_timeout_seconds: Option<String>,
-    /// `MEMORY_DAILY_SCHEDULE`.
-    pub memory_daily_schedule: Option<String>,
-    /// `MEMORY_DAILY_WINDOW_HOURS`.
-    pub memory_daily_window_hours: Option<String>,
     /// `MEMORY_WORKER_CONCURRENCY`.
     pub memory_worker_concurrency: Option<String>,
     /// `MEMORY_MAX_MESSAGES_PER_RUN`.
@@ -2880,14 +2874,6 @@ impl AppConfig {
                     raw.memory_consolidation_timeout_seconds,
                     600,
                 )?,
-                daily_schedule: raw
-                    .memory_daily_schedule
-                    .unwrap_or_else(|| "03:17".to_owned()),
-                daily_window_hours: parse_i32(
-                    "MEMORY_DAILY_WINDOW_HOURS",
-                    raw.memory_daily_window_hours,
-                    24,
-                )?,
                 worker_concurrency: parse_i32(
                     "MEMORY_WORKER_CONCURRENCY",
                     raw.memory_worker_concurrency,
@@ -3402,8 +3388,6 @@ impl RawConfig {
             memory_consolidation_provider: env("MEMORY_CONSOLIDATION_PROVIDER"),
             memory_consolidation_model: env("MEMORY_CONSOLIDATION_MODEL"),
             memory_consolidation_timeout_seconds: env("MEMORY_CONSOLIDATION_TIMEOUT_SECONDS"),
-            memory_daily_schedule: env("MEMORY_DAILY_SCHEDULE"),
-            memory_daily_window_hours: env("MEMORY_DAILY_WINDOW_HOURS"),
             memory_worker_concurrency: env("MEMORY_WORKER_CONCURRENCY"),
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
@@ -4216,8 +4200,6 @@ mod tests {
             DEFAULT_MEMORY_CONSOLIDATION_MODEL
         );
         assert_eq!(config.memory.consolidation_timeout_seconds, 600);
-        assert_eq!(config.memory.daily_schedule, "03:17");
-        assert_eq!(config.memory.daily_window_hours, 24);
         assert_eq!(config.memory.worker_concurrency, 1);
         assert_eq!(config.memory.max_messages_per_run, 200);
         assert_eq!(
@@ -4937,8 +4919,6 @@ mod tests {
             memory_consolidation_provider: Some("genkit".to_owned()),
             memory_consolidation_model: Some("memory-model".to_owned()),
             memory_consolidation_timeout_seconds: Some("777".to_owned()),
-            memory_daily_schedule: Some("04:05".to_owned()),
-            memory_daily_window_hours: Some("12".to_owned()),
             memory_worker_concurrency: Some("2".to_owned()),
             memory_max_messages_per_run: Some("55".to_owned()),
             memory_min_messages_per_run: Some("20".to_owned()),
@@ -4977,8 +4957,6 @@ mod tests {
         assert_eq!(config.memory.consolidation_provider, "genkit");
         assert_eq!(config.memory.consolidation_model, "memory-model");
         assert_eq!(config.memory.consolidation_timeout_seconds, 777);
-        assert_eq!(config.memory.daily_schedule, "04:05");
-        assert_eq!(config.memory.daily_window_hours, 12);
         assert_eq!(config.memory.worker_concurrency, 2);
         assert_eq!(config.memory.max_messages_per_run, 55);
         assert_eq!(config.memory.min_messages_per_run, 20);
