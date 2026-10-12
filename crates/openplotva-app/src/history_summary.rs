@@ -49,9 +49,6 @@ const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Stage-one chunks summarized at the same time.
 const STAGE_ONE_CONCURRENCY: usize = 3;
-/// Summaries queue for the GPU2 pool they share with memory work this long before
-/// the chain falls back.
-pub const HISTORY_SUMMARY_PRIMARY_SLOT_WAIT: Duration = Duration::from_secs(60);
 
 /// Concrete app history-summary service used by the dialog toolbox runtime.
 pub type AppHistorySummaryService =
@@ -1824,7 +1821,6 @@ mod tests {
             dialog_aifarm_pool_models: Some("pool-a".to_owned()),
             dialog_aifarm_pool_base_urls: Some("http://pool-a.test".to_owned()),
             dialog_aifarm_pool_api_key: Some("pool-token".to_owned()),
-            dialog_aifarm_pool_primary_capacity_wait_ms: Some("250".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");

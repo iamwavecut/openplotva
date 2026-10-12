@@ -5602,7 +5602,6 @@ mod tests {
                 "http://pool-a.test/v1, http://pool-b.test".to_owned(),
             ),
             dialog_aifarm_pool_api_key: Some("pool-token".to_owned()),
-            dialog_aifarm_pool_primary_capacity_wait_ms: Some("250".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");

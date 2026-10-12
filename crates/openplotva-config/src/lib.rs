@@ -76,9 +76,6 @@ pub const DEFAULT_SETTINGS_REQUIRE_INIT_DATA: bool = false;
 pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
-/// Default `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
-/// router waits for a busy primary pool before falling back.
-pub const DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS: i32 = 12_000;
 /// One corrected sample before the dialog router tries the next model.
 /// Repeated invalid samples must leave time for fallback and delivery.
 pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 1;
@@ -901,7 +898,6 @@ pub struct DialogConfig {
     pub aifarm_pool_models: Vec<String>,
     pub aifarm_pool_base_urls: Vec<String>,
     pub aifarm_pool_api_key: String,
-    pub aifarm_pool_primary_capacity_wait_ms: i32,
     /// How many extra samples the same model gets after a validator rejects its
     /// output, before the router walks to another provider, from
     /// `DIALOG_MODEL_OUTPUT_RETRIES`.
@@ -1398,10 +1394,6 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_base_urls: Option<String>,
     /// `DIALOG_AIFARM_POOL_API_KEY`.
     pub dialog_aifarm_pool_api_key: Option<String>,
-    /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
-    /// router waits for a busy primary-role pool slot before it falls back to
-    /// the next candidate. Default 12000.
-    pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
     /// `DIALOG_MODEL_OUTPUT_RETRIES`: extra samples from the same model after a
     /// validator rejects its output, before the router walks the chain. Default 4.
     pub dialog_model_output_retries: Option<String>,
@@ -2645,11 +2637,6 @@ impl AppConfig {
                     aifarm_pool_models: dialog_aifarm_pool_models,
                     aifarm_pool_base_urls: dialog_aifarm_pool_base_urls,
                     aifarm_pool_api_key: raw.dialog_aifarm_pool_api_key.unwrap_or_default(),
-                    aifarm_pool_primary_capacity_wait_ms: parse_i32(
-                        "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
-                        raw.dialog_aifarm_pool_primary_capacity_wait_ms,
-                        DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS,
-                    )?,
                     model_output_retries: parse_i32(
                         "DIALOG_MODEL_OUTPUT_RETRIES",
                         raw.dialog_model_output_retries,
@@ -3312,9 +3299,6 @@ impl RawConfig {
             dialog_aifarm_pool_models: env("DIALOG_AIFARM_POOL_MODELS"),
             dialog_aifarm_pool_base_urls: env("DIALOG_AIFARM_POOL_BASE_URLS"),
             dialog_aifarm_pool_api_key: env("DIALOG_AIFARM_POOL_API_KEY"),
-            dialog_aifarm_pool_primary_capacity_wait_ms: env(
-                "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
-            ),
             dialog_model_output_retries: env("DIALOG_MODEL_OUTPUT_RETRIES"),
             dialog_turn_budget_secs: env("DIALOG_TURN_BUDGET_SECS"),
             dialog_turn_max_queue_age_secs: env("DIALOG_TURN_MAX_QUEUE_AGE_SECS"),
@@ -4121,10 +4105,6 @@ mod tests {
         assert_eq!(config.llm.dialog.task_timeout_seconds, 720);
         assert_eq!(config.llm.dialog.aifarm_capacity_wait_seconds, 60);
         assert_eq!(config.llm.dialog.aifarm_capacity_poll_seconds, 1);
-        assert_eq!(
-            config.llm.dialog.aifarm_pool_primary_capacity_wait_ms,
-            crate::DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS
-        );
         assert_eq!(
             config.llm.dialog.model_output_retries,
             crate::DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES
