@@ -5,17 +5,16 @@ use std::time::{Duration, Instant};
 
 use openplotva_llm::retry::FailureReason;
 use openplotva_llm::router::{
-    Attempt, BreakerLiveness, BreakerSet, InferenceOverrides, PoolId, PoolPermit, PoolRegistry,
-    Role, RouterHandle, TriggerState, WorkflowRoute, select_chain,
+    Attempt, BreakerLiveness, BreakerSet, InferenceOverrides, LanePriority, PoolId, PoolPermit,
+    PoolRegistry, Role, RouterHandle, TriggerState, WorkflowRoute, select_chain,
 };
 use serde_json::{Value, json};
 
-/// Upper bound on how long one walker run waits for a capacity-pool slot when
-/// every candidate's pool is full. Slot waiting deliberately does not count
-/// against the workflow's `retry_wall_ms` (which budgets attempt execution):
-/// pool queueing replaces the server-side queueing some backends did before,
-/// so it is bounded only by the request deadline and this sanity cap.
-const DEFAULT_MAX_SLOT_WAIT: Duration = Duration::from_secs(300);
+/// Admission deadline, from the start of a run, for an interactive or
+/// user-tool request whose caller set no deadline: a lane that stays busy this
+/// long hands the request to the next candidate or to the caller's retry.
+/// Background work without a deadline keeps its place in the queue.
+const NO_DEADLINE_LANE_WAIT: Duration = Duration::from_secs(300);
 
 /// Minimum share of the caller's budget an attempt must have received for a
 /// deadline cut to count against the provider's circuit breaker.
@@ -31,8 +30,6 @@ pub struct RoutedAttemptWalker {
     triggers: Arc<TriggerState>,
     pools: Arc<PoolRegistry>,
     openrouter_free_gate: Option<Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>>,
-    max_slot_wait: Duration,
-    primary_slot_wait: Duration,
     model_output_retries: usize,
     reporter: Option<crate::runtime_routing::RoutingEventReporter>,
 }
@@ -51,8 +48,6 @@ impl RoutedAttemptWalker {
             triggers,
             pools,
             openrouter_free_gate: None,
-            max_slot_wait: DEFAULT_MAX_SLOT_WAIT,
-            primary_slot_wait: Duration::ZERO,
             model_output_retries: 0,
             reporter: None,
         }
@@ -91,27 +86,12 @@ impl RoutedAttemptWalker {
         self
     }
 
-    #[must_use]
-    pub fn with_max_slot_wait(mut self, max_slot_wait: Duration) -> Self {
-        self.max_slot_wait = max_slot_wait;
-        self
-    }
-
     /// How many extra samples the same model gets when a validator rejects what it
     /// wrote, before the chain walks on to another provider. Zero (the default) keeps
     /// the immediate walk.
     #[must_use]
     pub fn with_model_output_retries(mut self, retries: usize) -> Self {
         self.model_output_retries = retries;
-        self
-    }
-
-    /// How long a busy pool of a primary-role candidate is waited for before
-    /// the walker moves on to the fallback tail. Zero (the default) keeps the
-    /// instant skip.
-    #[must_use]
-    pub fn with_primary_slot_wait(mut self, primary_slot_wait: Duration) -> Self {
-        self.primary_slot_wait = primary_slot_wait;
         self
     }
 
@@ -130,51 +110,117 @@ impl RoutedAttemptWalker {
             .map(|model| model.config.clone())
     }
 
-    // The fallback tail serves the request without the primary's tools or
-    // quality, so a bounded queue on a busy primary beats an instant downgrade.
-    // Slot time is charged to the caller's deadline, not to the retry wall.
-    async fn wait_for_primary_slot(
+    /// Admit one candidate through its lane queue. A free lane is taken at once.
+    /// A candidate with an open breaker is never waited for. Otherwise the
+    /// request waits in the lane queue until `admission_deadline - reserve`,
+    /// keeping the workflow's fallback reserve only while another candidate
+    /// follows, and moves on at once when the forecast wait already exceeds that
+    /// budget. Lane time is charged to the deadline, not to the retry wall.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_lane(
         &self,
         pool: Option<PoolId>,
+        live: bool,
+        has_next_candidate: bool,
+        admission_deadline: Option<Instant>,
+        route: &WorkflowRoute,
         context: &RoutedRequestContext,
         attempt: &Attempt,
         total_slot_wait: &mut Duration,
     ) -> Option<PoolPermit> {
-        let started = Instant::now();
-        let budget = match context.deadline {
-            Some(deadline) => deadline
-                .saturating_duration_since(started)
-                .min(self.primary_slot_wait),
-            None => self.primary_slot_wait,
-        };
-        let mut permit = None;
-        while permit.is_none() {
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() || !self.pools.wait_for_release(remaining).await {
-                break;
-            }
-            permit = self.pools.try_acquire(pool);
+        if let Some(permit) = self.pools.try_acquire(pool) {
+            return Some(permit);
         }
+        if !live {
+            return None;
+        }
+        let priority = context.lane_priority.unwrap_or(route.lane_priority);
+        let reserve = if has_next_candidate {
+            route.fallback_reserve
+        } else {
+            Duration::ZERO
+        };
+        let budget = admission_deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(reserve)
+        });
+        if let Some(budget) = budget {
+            let forecast = self.pools.forecast_wait(pool, priority);
+            if budget.is_zero() || forecast.is_some_and(|forecast| forecast > budget) {
+                self.record_event(routing_event_with_severity(
+                    "lane_bypass",
+                    "info",
+                    context,
+                    Some(attempt.provider),
+                    Some(attempt.model),
+                    "lane wait would exceed the request budget; trying the next candidate",
+                    json!({
+                        "priority": priority.as_str(),
+                        "budget_ms": budget.as_millis(),
+                        "forecast_ms": forecast.map(|forecast| forecast.as_millis()),
+                    }),
+                ));
+                return None;
+            }
+        }
+        let started = Instant::now();
+        let permit = self.pools.acquire(pool, priority, budget).await;
         let waited = started.elapsed();
         *total_slot_wait += waited;
         self.record_event(routing_event_with_severity(
-            "primary_slot_wait",
+            "lane_wait",
             "info",
             context,
             Some(attempt.provider),
             Some(attempt.model),
             if permit.is_some() {
-                "primary pool slot acquired after waiting"
+                "lane acquired after waiting in its queue"
             } else {
-                "primary pool stayed busy for the whole wait budget; falling back"
+                "lane wait reached the request budget"
             },
             json!({
+                "priority": priority.as_str(),
                 "waited_ms": waited.as_millis(),
-                "budget_ms": budget.as_millis(),
+                "budget_ms": budget.map(|budget| budget.as_millis()),
                 "acquired": permit.is_some(),
             }),
         ));
         permit
+    }
+
+    /// Among the live weighted head of the chain (primaries and engaged
+    /// overflow), move candidates with a free lane ahead of busy ones. Every
+    /// other position keeps its order.
+    fn prefer_free_lanes(
+        &self,
+        attempts: &mut [Attempt],
+        table: &openplotva_llm::router::RoutingTable,
+        now: Instant,
+    ) {
+        let positions: Vec<usize> = attempts
+            .iter()
+            .enumerate()
+            .filter(|(_, attempt)| {
+                matches!(attempt.role, Role::Primary | Role::Overflow)
+                    && self
+                        .breakers
+                        .is_live_at(attempt.provider, attempt.model, now)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut head: Vec<Attempt> = positions
+            .iter()
+            .map(|index| attempts[*index].clone())
+            .collect();
+        head.sort_by_key(|attempt| {
+            !self
+                .pools
+                .has_free_lane(table.model(attempt.model).and_then(|model| model.pool_id))
+        });
+        for (index, attempt) in positions.into_iter().zip(head) {
+            attempts[index] = attempt;
+        }
     }
 
     pub async fn run<T, E, F, Fut, Retry>(
@@ -206,10 +252,13 @@ impl RoutedAttemptWalker {
         };
 
         let started = Instant::now();
+        let admission_deadline = context.deadline.or_else(|| {
+            (context.lane_priority.unwrap_or(route.lane_priority) != LanePriority::Background)
+                .then(|| started + NO_DEADLINE_LANE_WAIT)
+        });
         let max_hops = route.retry.max_hops.max(1) as usize;
         let mut started_attempts = 0usize;
         let mut total_slot_wait = Duration::ZERO;
-        let mut wait_reported = false;
         let mut first_pass = true;
         let mut last_error = None;
         let mut last_provider_model = None;
@@ -221,11 +270,13 @@ impl RoutedAttemptWalker {
         // first, and whatever is left still covers a fallback that answers badly.
         let mut model_output_retry = 0usize;
 
-        // Selection-pass loop: walk a fresh chain, skipping candidates whose
-        // capacity pool is full. A busy skip touches neither the breaker nor
-        // the hop budget (busy is not dead). When a whole pass is busy, wait
-        // for any slot to free and re-select; only execution time counts
-        // against the wall clock, so pool queueing never eats the retry budget.
+        // Selection-pass loop: walk a fresh chain, admitting each candidate
+        // through its lane queue. A candidate passed over for its lane (open
+        // breaker, budget) touches neither the breaker nor the hop budget.
+        // After an executed attempt fails, re-select so a passed-over
+        // candidate can be tried with the time that is left; only execution
+        // time counts against the wall clock, so lane queueing never eats the
+        // retry budget.
         'passes: loop {
             let selection_now = Instant::now();
             let mut attempts = {
@@ -242,6 +293,9 @@ impl RoutedAttemptWalker {
                     })
                     .collect::<Vec<_>>()
             };
+            self.prefer_free_lanes(&mut attempts, &table, selection_now);
+            // The previous step's target is preferred only while its lane is
+            // free: the preference saves a warm cache, not a queue position.
             if let Some((provider_name, model_name)) = &context.preferred_target
                 && let Some(index) = attempts.iter().position(|attempt| {
                     table
@@ -253,6 +307,9 @@ impl RoutedAttemptWalker {
                         && self
                             .breakers
                             .is_live_at(attempt.provider, attempt.model, selection_now)
+                        && self.pools.has_free_lane(
+                            table.model(attempt.model).and_then(|model| model.pool_id),
+                        )
                 })
             {
                 let preferred = attempts.remove(index);
@@ -296,7 +353,7 @@ impl RoutedAttemptWalker {
             let mut busy_skips = 0usize;
             let mut quota_skips = 0usize;
             let mut executed_this_pass = 0usize;
-            for attempt in attempts {
+            for (index, attempt) in attempts.iter().enumerate() {
                 if attempted_targets.contains(&(attempt.provider, attempt.model)) {
                     continue;
                 }
@@ -315,26 +372,30 @@ impl RoutedAttemptWalker {
                 let provider = table.provider(attempt.provider);
                 let model = table.model(attempt.model);
                 let pool_id = model.and_then(|row| row.pool_id);
+                let live =
+                    self.breakers
+                        .is_live_at(attempt.provider, attempt.model, Instant::now());
+                let has_next_candidate = attempts[index + 1..]
+                    .iter()
+                    .any(|next| !attempted_targets.contains(&(next.provider, next.model)));
                 // A rejected model output is not a sick provider: the same model gets a
                 // bounded number of fresh samples before the chain walks on, so a guard
                 // rejection does not hand a tool-shaped turn to a tool-less fallback.
                 let mut first_execution = true;
                 loop {
-                    let mut permit = self.pools.try_acquire(pool_id);
-                    if permit.is_none()
-                        && attempt.role == Role::Primary
-                        && !self.primary_slot_wait.is_zero()
-                    {
-                        permit = self
-                            .wait_for_primary_slot(
-                                pool_id,
-                                &context,
-                                &attempt,
-                                &mut total_slot_wait,
-                            )
-                            .await;
-                    }
-                    let Some(permit) = permit else {
+                    let Some(permit) = self
+                        .admit_lane(
+                            pool_id,
+                            live,
+                            has_next_candidate,
+                            admission_deadline,
+                            route,
+                            &context,
+                            attempt,
+                            &mut total_slot_wait,
+                        )
+                        .await
+                    else {
                         if first_execution {
                             busy_skips += 1;
                         }
@@ -603,62 +664,34 @@ impl RoutedAttemptWalker {
                 break;
             }
             if executed_this_pass > 0 {
-                // Something ran and failed while other candidates were busy:
-                // re-select immediately, a slot may have freed meanwhile.
+                // Something ran and failed while other candidates were passed
+                // over: re-select, a passed-over candidate may fit now.
                 continue;
             }
+            if last_error.is_some() || deadline_cut {
+                break;
+            }
 
-            // Every candidate in the pass was pool-busy: wait for any slot.
-            let wait_budget = match context.deadline {
-                Some(deadline) => deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO)
-                    .min(self.max_slot_wait),
-                None => self.max_slot_wait,
-            };
-            if !wait_reported {
-                wait_reported = true;
-                self.record_event(routing_event_with_severity(
-                    "capacity_pool_wait",
-                    "info",
-                    &context,
-                    None,
-                    None,
-                    "all candidate capacity pools are busy; waiting for a slot",
-                    json!({
-                        "busy_candidates": busy_skips,
-                        "quota_skips": quota_skips,
-                        "wait_budget_ms": wait_budget.as_millis(),
-                    }),
-                ));
-            }
-            let wait_started = Instant::now();
-            let released = if wait_budget.is_zero() {
-                false
-            } else {
-                self.pools.wait_for_release(wait_budget).await
-            };
-            total_slot_wait += wait_started.elapsed();
-            if !released {
-                self.record_event(routing_event(
-                    "capacity_wait_timeout",
-                    &context,
-                    None,
-                    None,
-                    "workflow capacity unavailable: slot wait timed out",
-                    json!({
-                        "busy_candidates": busy_skips,
-                        "waited_ms": total_slot_wait.as_millis(),
-                    }),
-                ));
-                return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
-                    RoutedRoutingErrorKind::CapacityWaitTimeout,
-                    format!(
-                        "workflow capacity unavailable: all pools busy after {}ms slot wait",
-                        total_slot_wait.as_millis()
-                    ),
-                )));
-            }
+            // No candidate got a lane within the request budget.
+            self.record_event(routing_event(
+                "capacity_wait_timeout",
+                &context,
+                None,
+                None,
+                "workflow capacity unavailable: no candidate lane within the request budget",
+                json!({
+                    "busy_candidates": busy_skips,
+                    "quota_skips": quota_skips,
+                    "waited_ms": total_slot_wait.as_millis(),
+                }),
+            ));
+            return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::CapacityWaitTimeout,
+                format!(
+                    "workflow capacity unavailable: no candidate lane after {}ms lane wait",
+                    total_slot_wait.as_millis()
+                ),
+            )));
         }
 
         let (provider_id, model_id) = last_provider_model.unwrap_or_default();
@@ -729,6 +762,8 @@ pub struct RoutedRequestContext {
     /// The walker will not start an attempt at or past this instant, so one
     /// call cannot overshoot the caller's turn budget by a full attempt.
     pub deadline: Option<Instant>,
+    /// Lane queue priority; `None` takes the workflow's `lane_priority`.
+    pub lane_priority: Option<LanePriority>,
     pub suppress_all_attempts_exhausted_admin_report: bool,
     pub suppressed_all_attempts_exhausted_reason: Option<String>,
 }
@@ -1016,6 +1051,8 @@ mod tests {
                 retry_max_hops: 1,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(assignment_overrides)],
             triggers: vec![],
@@ -1644,6 +1681,8 @@ mod tests {
                 retry_max_hops: max_hops,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![first, second],
             triggers: vec![],
@@ -1672,7 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_pool_skips_to_free_candidate_without_breaker_mutation() {
+    async fn a_free_primary_sibling_is_taken_before_a_busy_one() {
         let snapshot = pooled_snapshot(3);
         let pools = Arc::new(PoolRegistry::new());
         let breakers = Arc::new(BreakerSet::new());
@@ -1686,66 +1725,20 @@ mod tests {
         );
         let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
 
-        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executed_models = Arc::clone(&executed);
-        let output = walker
-            .run(
-                RoutedRequestContext {
-                    workflow_key: "dialog".to_owned(),
-                    ..RoutedRequestContext::default()
-                },
-                move |attempt| {
-                    let executed_models = Arc::clone(&executed_models);
-                    async move {
-                        executed_models
-                            .lock()
-                            .expect("models")
-                            .push(attempt.model_id);
-                        Ok::<_, std::io::Error>("ok")
-                    }
-                },
-                |_error| None,
-            )
-            .await
-            .expect("free candidate output");
-
-        assert_eq!(output, "ok");
-        assert_eq!(*executed.lock().expect("models"), vec![20]);
+        // The 50/50 weighted order puts the busy primary first in about half
+        // of the runs; every run must still go to the free sibling.
+        for _ in 0..16 {
+            let (result, executed) =
+                tokio::time::timeout(Duration::from_secs(2), run_recording(&walker, None, None))
+                    .await
+                    .expect("a free sibling must not wait behind a busy one");
+            assert_eq!(result.expect("free candidate output"), "ok");
+            assert_eq!(executed, vec![20]);
+        }
         assert!(
             breakers.is_live_at(1, 10, std::time::Instant::now()),
-            "a busy skip must not trip the breaker"
+            "a busy lane must not trip the breaker"
         );
-    }
-
-    #[tokio::test]
-    async fn busy_skips_do_not_consume_the_hop_budget() {
-        let snapshot = pooled_snapshot(1);
-        let pools = Arc::new(PoolRegistry::new());
-        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
-        let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let call_count = Arc::clone(&calls);
-        let output = walker
-            .run(
-                RoutedRequestContext {
-                    workflow_key: "dialog".to_owned(),
-                    ..RoutedRequestContext::default()
-                },
-                move |_attempt| {
-                    let call_count = Arc::clone(&call_count);
-                    async move {
-                        call_count.fetch_add(1, Ordering::Relaxed);
-                        Ok::<_, std::io::Error>("ok")
-                    }
-                },
-                |_error| None,
-            )
-            .await
-            .expect("the single hop must go to the free candidate");
-
-        assert_eq!(output, "ok");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1840,7 +1833,7 @@ mod tests {
             .expect("fallback succeeds after the transient events");
 
         let events = reporter.buffer().routing_events(10);
-        for event_type in ["attempt_failed", "capacity_pool_wait"] {
+        for event_type in ["attempt_failed", "lane_wait"] {
             let event = events
                 .iter()
                 .find(|event| event.event_type == event_type)
@@ -1850,7 +1843,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn all_busy_waits_for_release_then_succeeds() {
+    async fn a_busy_lane_is_waited_for_then_serves() {
         let mut snapshot = pooled_snapshot(3);
         snapshot.models.truncate(1);
         snapshot.assignments.truncate(1);
@@ -1891,8 +1884,7 @@ mod tests {
     async fn busy_primary_is_waited_for_before_the_fallback_tail() {
         let snapshot = primary_with_fallback_snapshot();
         let pools = Arc::new(PoolRegistry::new());
-        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
-            .with_primary_slot_wait(std::time::Duration::from_millis(200));
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
         let busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1910,54 +1902,61 @@ mod tests {
                 |_error| None,
             )
             .await
-            .expect("the primary slot frees inside the wait budget");
+            .expect("the primary lane frees while the request waits");
 
         assert_eq!(served_by, 1, "the primary must serve once its slot frees");
         assert_eq!(started.elapsed(), std::time::Duration::from_millis(50));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn busy_primary_falls_back_only_after_the_wait_budget() {
+    async fn busy_primary_falls_back_when_its_lane_wait_reaches_the_budget() {
         let snapshot = primary_with_fallback_snapshot();
         let pools = Arc::new(PoolRegistry::new());
-        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
-            .with_primary_slot_wait(std::time::Duration::from_millis(200));
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
         let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
         let started = tokio::time::Instant::now();
+        // The 30 s fallback reserve leaves 200 ms of lane budget.
+        let deadline = Instant::now() + Duration::from_millis(30_200);
 
         let served_by = walker
             .run(
                 RoutedRequestContext {
                     workflow_key: "dialog".to_owned(),
+                    deadline: Some(deadline),
                     ..RoutedRequestContext::default()
                 },
                 |attempt| async move { Ok::<_, std::io::Error>(attempt.provider_id) },
                 |_error| None,
             )
             .await
-            .expect("the fallback serves after the primary wait budget");
+            .expect("the fallback serves after the primary lane budget");
 
         assert_eq!(
             served_by, 2,
             "the fallback serves a permanently busy primary"
         );
-        assert_eq!(started.elapsed(), std::time::Duration::from_millis(200));
+        let waited = started.elapsed();
+        assert!(
+            waited > Duration::from_millis(150) && waited <= Duration::from_millis(200),
+            "{waited:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slot_wait_timeout_classifies_as_capacity_unavailable() {
+    async fn a_lane_wait_that_reaches_the_deadline_classifies_as_capacity_unavailable() {
         let mut snapshot = pooled_snapshot(3);
         snapshot.models.truncate(1);
         snapshot.assignments.truncate(1);
         let pools = Arc::new(PoolRegistry::new());
-        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
-            .with_max_slot_wait(std::time::Duration::from_millis(50));
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
         let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
 
+        // The only candidate keeps no fallback reserve: it waits until the deadline.
         let result = walker
             .run(
                 RoutedRequestContext {
                     workflow_key: "dialog".to_owned(),
+                    deadline: Some(Instant::now() + Duration::from_millis(50)),
                     ..RoutedRequestContext::default()
                 },
                 |_attempt| async { Ok::<_, std::io::Error>("unreachable") },
@@ -2004,17 +2003,228 @@ mod tests {
             "run must still be executing when the timeout drops it"
         );
 
+        let occupancy = pools.occupancy();
+        assert_eq!(occupancy.len(), 1);
+        assert_eq!(occupancy[0].in_flight, 0);
+        assert_eq!(occupancy[0].queued, [0, 0, 0]);
         assert!(
             pools.try_acquire(Some(1)).is_some(),
-            "cancelling the in-flight attempt must free its slot"
+            "cancelling the in-flight attempt must free its lane"
         );
+    }
+
+    fn lane_reporter() -> crate::runtime_routing::RoutingEventReporter {
+        crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(16),
+            None,
+            None,
+        )
+    }
+
+    async fn run_recording(
+        walker: &RoutedAttemptWalker,
+        deadline: Option<Instant>,
+        lane_priority: Option<LanePriority>,
+    ) -> (
+        Result<&'static str, RoutedAttemptRunError<std::io::Error>>,
+        Vec<i64>,
+    ) {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let models = Arc::clone(&executed);
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline,
+                    lane_priority,
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let models = Arc::clone(&models);
+                    async move {
+                        models.lock().expect("models").push(attempt.model_id);
+                        Ok::<_, std::io::Error>("ok")
+                    }
+                },
+                |_error| None,
+            )
+            .await;
+        let executed = executed.lock().expect("models").clone();
+        (result, executed)
+    }
+
+    #[tokio::test]
+    async fn a_forecast_beyond_the_budget_falls_back_without_waiting() {
+        let snapshot = primary_with_fallback_snapshot();
+        let pools = Arc::new(PoolRegistry::new());
+        let reporter = lane_reporter();
+        let walker =
+            walker_with_pools(&snapshot, Arc::clone(&pools)).with_reporter(reporter.clone());
+        let warmup = pools.try_acquire(Some(1)).expect("lane");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(warmup);
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the primary lane");
+        // The 30 s reserve leaves about 50 ms, below the 200 ms mean hold time.
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(30_050);
+
+        let (result, executed) = run_recording(&walker, Some(deadline), None).await;
+
+        assert_eq!(result.expect("fallback output"), "ok");
+        assert_eq!(executed, vec![20]);
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "no lane wait"
+        );
+        assert!(
+            reporter
+                .buffer()
+                .routing_events(16)
+                .iter()
+                .any(|event| event.event_type == "lane_bypass")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_with_an_open_breaker_is_never_waited_for() {
+        let mut snapshot = primary_with_fallback_snapshot();
+        snapshot.workflows[0].retry_max_hops = 3;
+        let pools = Arc::new(PoolRegistry::new());
+        let breakers = Arc::new(BreakerSet::new());
+        let open = BreakerConfig {
+            fail_threshold: 1,
+            cooldown: Duration::from_secs(60),
+        };
+        breakers.record_failure(1, 10, open);
+        breakers.record_failure(2, 20, open);
+        let table = crate::model_routing::build_routing_table(&snapshot);
+        pools.apply(&table.pool_specs());
+        let walker = RoutedAttemptWalker::new(
+            RouterHandle::new(table),
+            breakers,
+            Arc::new(TriggerState::new()),
+            Arc::clone(&pools),
+        );
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the primary lane");
+
+        // Both candidates are in cooldown, so the chain probes them in order:
+        // the busy primary is passed over instead of waited for.
+        let (result, executed) =
+            tokio::time::timeout(Duration::from_secs(5), run_recording(&walker, None, None))
+                .await
+                .expect("an open breaker must not queue the request");
+
+        assert_eq!(result.expect("probe output"), "ok");
+        assert_eq!(executed, vec![20]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_is_not_queued() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the only lane");
+
+        let (result, executed) = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_recording(&walker, Some(Instant::now()), None),
+        )
+        .await
+        .expect("an expired deadline must not wait in the queue");
+
+        assert!(result.is_err());
+        assert!(executed.is_empty());
+        assert_eq!(pools.occupancy()[0].queued, [0, 0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_without_a_deadline_stops_waiting_at_the_lane_cap() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the only lane");
+        let started = tokio::time::Instant::now();
+
+        let (result, executed) = run_recording(&walker, None, None).await;
+
+        assert!(executed.is_empty());
+        assert!(matches!(
+            result,
+            Err(RoutedAttemptRunError::Routing(error))
+                if error.kind() == RoutedRoutingErrorKind::CapacityWaitTimeout
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited > NO_DEADLINE_LANE_WAIT - Duration::from_secs(1)
+                && waited <= NO_DEADLINE_LANE_WAIT,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_work_without_a_deadline_waits_past_the_lane_cap() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the only lane");
+
+        let waiting = tokio::time::timeout(
+            NO_DEADLINE_LANE_WAIT * 2,
+            run_recording(&walker, None, Some(LanePriority::Background)),
+        )
+        .await;
+
+        assert!(
+            waiting.is_err(),
+            "background work keeps its place in the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interactive_request_goes_ahead_of_queued_background_work() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = Arc::new(walker_with_pools(&snapshot, Arc::clone(&pools)));
+        let running = pools
+            .try_acquire(Some(1))
+            .expect("a running job holds the lane");
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut runs = Vec::new();
+        for (name, priority) in [
+            ("queued draw", LanePriority::UserTool),
+            ("transcription", LanePriority::Interactive),
+        ] {
+            let walker = Arc::clone(&walker);
+            let order = Arc::clone(&order);
+            runs.push(tokio::spawn(async move {
+                let (result, _) = run_recording(&walker, None, Some(priority)).await;
+                order.lock().expect("order").push(name);
+                result.expect("served");
+            }));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pools.occupancy()[0].queued, [1, 1, 0]);
+        assert!(
+            order.lock().expect("order").is_empty(),
+            "the running job is never preempted"
+        );
+        drop(running);
+        for run in runs {
+            run.await.expect("run");
+        }
+
         assert_eq!(
-            pools.occupancy(),
-            vec![openplotva_llm::router::PoolOccupancy {
-                id: 1,
-                max_concurrency: Some(1),
-                in_flight: 0,
-            }]
+            *order.lock().expect("order"),
+            vec!["transcription", "queued draw"]
         );
     }
 }

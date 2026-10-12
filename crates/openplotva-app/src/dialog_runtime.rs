@@ -41,7 +41,6 @@ pub type DialogProviderHandle = Arc<dyn ChatProvider>;
 
 /// Workflow key the dialog worker routes through.
 const DIALOG_WORKFLOW_KEY: &str = "dialog";
-const INTERACTIVE_CAPACITY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Builds and caches per-provider transport clients from DB provider rows, so
 /// a provider added in the admin panel is immediately routable without a
@@ -271,18 +270,10 @@ impl RouterChatProvider {
         factory: Arc<ChatClientFactory>,
     ) -> Self {
         Self {
-            walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools)
-                .with_max_slot_wait(INTERACTIVE_CAPACITY_WAIT_TIMEOUT),
+            walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools),
             factory,
             provider_name: "router".to_owned(),
         }
-    }
-
-    /// Bounded wait for a busy primary pool before the fallback tail is used.
-    #[must_use]
-    pub fn with_primary_slot_wait(mut self, primary_slot_wait: std::time::Duration) -> Self {
-        self.walker = self.walker.with_primary_slot_wait(primary_slot_wait);
-        self
     }
 
     /// Extra samples from the same model after a validator rejects its output.
@@ -505,16 +496,6 @@ pub fn router_dialog_provider(
         aifarm,
         prompt_store,
     ));
-    // Zero disables the wait on purpose; a negative value is a config slip and
-    // keeps the documented default instead of silently disabling it.
-    let configured_wait_ms = config.llm.dialog.aifarm_pool_primary_capacity_wait_ms;
-    let primary_wait_ms = if configured_wait_ms < 0 {
-        openplotva_config::DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS
-    } else {
-        configured_wait_ms
-    };
-    let primary_slot_wait =
-        std::time::Duration::from_millis(u64::try_from(primary_wait_ms).unwrap_or(0));
     // A negative value is a config slip, not a way to disable the re-sampling;
     // zero disables it on purpose.
     let configured_retries = config.llm.dialog.model_output_retries;
@@ -524,7 +505,6 @@ pub fn router_dialog_provider(
         configured_retries
     };
     let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory)
-        .with_primary_slot_wait(primary_slot_wait)
         .with_model_output_retries(usize::try_from(model_output_retries).unwrap_or(0));
     let provider = match routing_events {
         Some(reporter) => provider.with_routing_event_reporter(reporter),
@@ -1018,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn interactive_router_stops_waiting_for_a_busy_gpu_after_one_virtual_second() {
+    async fn interactive_router_waits_for_a_busy_gpu_until_the_turn_deadline() {
         let mut snapshot = routed_dialog_snapshot();
         snapshot.models[0].pool_id = Some(1);
         snapshot.pools.push(PoolRecord {
@@ -1048,14 +1028,23 @@ mod tests {
         )
         .with_routing_event_reporter(reporter.clone());
         let started = tokio::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
 
-        let error = provider
-            .run_chat_step(default_step_request())
+        let error = crate::dialog_turn::TURN_DEADLINE
+            .scope(
+                Some(deadline),
+                provider.run_chat_step(default_step_request()),
+            )
             .await
-            .expect_err("a permanently busy interactive route must fail fast");
+            .expect_err("a permanently busy interactive route fails at the turn deadline");
 
         assert!(error.to_string().contains("capacity unavailable"));
-        assert_eq!(started.elapsed(), INTERACTIVE_CAPACITY_WAIT_TIMEOUT);
+        let waited = started.elapsed();
+        assert!(
+            waited > std::time::Duration::from_millis(150)
+                && waited <= std::time::Duration::from_millis(200),
+            "{waited:?}"
+        );
         assert!(
             reporter
                 .buffer()
@@ -1925,6 +1914,8 @@ mod tests {
                 retry_max_hops: 1,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![AssignmentRecord {
                 id: 100,

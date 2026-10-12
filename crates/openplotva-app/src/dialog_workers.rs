@@ -1,9 +1,9 @@
-//! Dynamic dialog worker supervision.
+//! Dynamic worker supervision for the dialog and memory-consolidation fleets.
 //!
-//! The dialog worker count is derived from the routing table (the summed slot
-//! budgets of the dialog workflow's capacity pools) and can change on any
-//! admin routing edit. The supervisor watches the desired count and spawns or
-//! retires workers to match: a retired worker receives a oneshot signal that
+//! Each fleet's worker count is derived from the routing table (the lanes of
+//! its workflow's primary lane pool) and can change on any admin routing edit.
+//! The supervisor watches the desired count and spawns or retires workers to
+//! match: a retired worker receives a oneshot signal that
 //! resolves its stop future, so it finishes its current job and exits at the
 //! next loop tick — no job is ever abandoned mid-turn. On global runtime stop
 //! the supervisor joins every worker it owns before exiting, preserving the
@@ -20,14 +20,14 @@ use tokio::task::JoinHandle;
 /// the desired count even without a scale change.
 const SUPERVISOR_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Builds one dialog worker task. The worker must exit soon after `retire`
+/// Builds one worker task. The worker must exit soon after `retire`
 /// resolves (fired or dropped) or the global runtime stop flips; the concrete
 /// spawner composes both into the worker loop's stop future.
-pub trait DialogWorkerSpawner: Send + Sync + 'static {
+pub trait WorkerSpawner: Send + Sync + 'static {
     fn spawn(&self, index: usize, retire: oneshot::Receiver<()>) -> JoinHandle<()>;
 }
 
-impl<F> DialogWorkerSpawner for F
+impl<F> WorkerSpawner for F
 where
     F: Fn(usize, oneshot::Receiver<()>) -> JoinHandle<()> + Send + Sync + 'static,
 {
@@ -63,8 +63,8 @@ impl WorkerGauge {
 /// Run the supervisor until the global stop flips (or every signal source
 /// closes). Reconciles the worker set with `desired_rx` on every change and on
 /// a periodic reap tick, then joins all owned workers before returning.
-pub fn spawn_dialog_worker_supervisor(
-    spawner: Arc<dyn DialogWorkerSpawner>,
+pub fn spawn_worker_supervisor(
+    spawner: Arc<dyn WorkerSpawner>,
     mut desired_rx: watch::Receiver<u32>,
     gauge: Arc<WorkerGauge>,
     mut global_stop: watch::Receiver<bool>,
@@ -141,7 +141,7 @@ mod tests {
         indices: Arc<Mutex<Vec<usize>>>,
     }
 
-    impl DialogWorkerSpawner for FakeSpawner {
+    impl WorkerSpawner for FakeSpawner {
         fn spawn(&self, index: usize, retire: oneshot::Receiver<()>) -> JoinHandle<()> {
             self.spawned.fetch_add(1, Ordering::Relaxed);
             self.indices
@@ -180,12 +180,8 @@ mod tests {
             indices: Arc::new(Mutex::new(Vec::new())),
         });
 
-        let supervisor = spawn_dialog_worker_supervisor(
-            spawner,
-            desired_rx,
-            Arc::clone(&gauge),
-            stop_rx.clone(),
-        );
+        let supervisor =
+            spawn_worker_supervisor(spawner, desired_rx, Arc::clone(&gauge), stop_rx.clone());
         settle().await;
         assert_eq!(spawned.load(Ordering::Relaxed), 2);
         assert_eq!(gauge.desired(), 2);
@@ -218,14 +214,14 @@ mod tests {
         struct CrashingSpawner {
             spawned: Arc<AtomicU32>,
         }
-        impl DialogWorkerSpawner for CrashingSpawner {
+        impl WorkerSpawner for CrashingSpawner {
             fn spawn(&self, _index: usize, _retire: oneshot::Receiver<()>) -> JoinHandle<()> {
                 self.spawned.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async {})
             }
         }
 
-        let supervisor = spawn_dialog_worker_supervisor(
+        let supervisor = spawn_worker_supervisor(
             Arc::new(CrashingSpawner {
                 spawned: Arc::clone(&spawned),
             }),

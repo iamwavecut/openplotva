@@ -18,6 +18,7 @@ use openplotva_llm::aifarm::{
     DiscoveryJobResponse,
 };
 use openplotva_llm::retry::FailureReason;
+use openplotva_llm::router::LanePriority;
 use openplotva_storage::pg_embedding_vector;
 
 use crate::memory_runtime::{
@@ -497,6 +498,7 @@ impl EmbeddingProvider for DiscoveryEmbedderClient {
 pub struct RoutedDiscoveryEmbedder {
     walker: RoutedAttemptWalker,
     base_config: DiscoveryEmbedderConfig,
+    lane_priority: Option<LanePriority>,
 }
 
 impl std::fmt::Debug for RoutedDiscoveryEmbedder {
@@ -515,7 +517,15 @@ impl RoutedDiscoveryEmbedder {
         Self {
             walker,
             base_config,
+            lane_priority: None,
         }
+    }
+
+    /// Queue this embedder's requests at `priority` instead of the workflow default.
+    #[must_use]
+    pub fn with_lane_priority(mut self, priority: LanePriority) -> Self {
+        self.lane_priority = Some(priority);
+        self
     }
 }
 
@@ -536,7 +546,7 @@ impl EmbeddingProvider for RoutedDiscoveryEmbedder {
             let result = self
                 .walker
                 .run(
-                    embedding_context(),
+                    embedding_context(self.lane_priority),
                     move |attempt| {
                         let text = text.clone();
                         let task_description = task_description.clone();
@@ -575,7 +585,7 @@ impl EmbeddingProvider for RoutedDiscoveryEmbedder {
             let result = self
                 .walker
                 .run(
-                    embedding_context(),
+                    embedding_context(self.lane_priority),
                     move |attempt| {
                         let texts = texts.clone();
                         let task_description = task_description.clone();
@@ -601,9 +611,10 @@ impl EmbeddingProvider for RoutedDiscoveryEmbedder {
     }
 }
 
-fn embedding_context() -> RoutedRequestContext {
+fn embedding_context(lane_priority: Option<LanePriority>) -> RoutedRequestContext {
     RoutedRequestContext {
         workflow_key: "embedding".to_owned(),
+        lane_priority,
         ..RoutedRequestContext::default()
     }
 }
@@ -774,6 +785,15 @@ fn next_job_id() -> String {
 mod tests {
     use super::*;
     use openplotva_llm::aifarm::{DiscoveryJob, DiscoveryJobResult};
+
+    #[test]
+    fn memory_writes_embed_at_background_priority() {
+        assert_eq!(embedding_context(None).lane_priority, None);
+        assert_eq!(
+            embedding_context(Some(LanePriority::Background)).lane_priority,
+            Some(LanePriority::Background)
+        );
+    }
 
     /// Live round-trip against a reachable Discovery + embedder. Ignored by
     /// default; run with `EMBEDDER_E2E_DISCOVERY_URL=http://127.0.0.1:50051

@@ -41,9 +41,6 @@ const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const YOUTUBE_SUMMARY_TEMPERATURE: f64 = 0.3;
 const YOUTUBE_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(45);
-/// The farm route shares its GPU pool with background memory work, so a summary
-/// waits this long for a slot before it takes a fallback route.
-pub const YOUTUBE_PRIMARY_SLOT_WAIT: Duration = Duration::from_secs(60);
 
 type BoxedError = Box<dyn Error + Send + Sync>;
 

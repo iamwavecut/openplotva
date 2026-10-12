@@ -31,7 +31,7 @@ use openplotva_taskman::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use time::{OffsetDateTime, Time};
+use time::OffsetDateTime;
 
 use crate::embedder::DiscoveryEmbedderClient;
 use crate::routed_attempts::{
@@ -207,11 +207,13 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
 
 /// Storage boundary needed to claim and finalize memory runs.
 pub trait MemoryRunStore: MemoryWriteStore {
-    /// Ensure daily memory runs exist for the configured retention window.
-    fn ensure_daily_runs<'a>(
+    /// Ensure a memory run exists for every completed chat hour that started
+    /// within the last `lookback` of the retention window.
+    fn ensure_hourly_runs<'a>(
         &'a self,
         now: OffsetDateTime,
         retention: Duration,
+        lookback: Duration,
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> MemoryWriteStoreFuture<'a, u64, Self::Error>;
 
@@ -400,14 +402,15 @@ impl MemoryWriteStore for PostgresMemoryStore {
 }
 
 impl MemoryRunStore for PostgresMemoryStore {
-    fn ensure_daily_runs<'a>(
+    fn ensure_hourly_runs<'a>(
         &'a self,
         now: OffsetDateTime,
         retention: Duration,
+        lookback: Duration,
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> MemoryWriteStoreFuture<'a, u64, Self::Error> {
         Box::pin(async move {
-            PostgresMemoryStore::ensure_daily_runs(self, now, retention, policy).await
+            PostgresMemoryStore::ensure_hourly_runs(self, now, retention, lookback, policy).await
         })
     }
 
@@ -564,10 +567,8 @@ pub struct MemoryServiceTickReport {
     pub enabled: bool,
     /// Whether this tick is the startup tick.
     pub startup: bool,
-    /// Whether the configured daily window was active.
-    pub daily_window_active: bool,
-    /// Newly queued daily runs reported by storage.
-    pub queued_daily_runs: u64,
+    /// Newly queued hourly runs reported by storage.
+    pub queued_runs: u64,
     /// Runs completed or skipped without a process error.
     pub processed_runs: i64,
     /// Claimed runs that ended in a process failure and were marked failed.
@@ -585,8 +586,8 @@ pub struct MemoryServiceWorkerReport {
     pub ticks: i64,
     /// Number of runtime API triggered queue-drain ticks.
     pub triggered_ticks: i64,
-    /// Newly queued daily runs across startup and scheduled ticks.
-    pub queued_daily_runs: u64,
+    /// Newly queued hourly runs across startup and scheduled ticks.
+    pub queued_runs: u64,
     /// Runs completed or skipped without a process error.
     pub processed_runs: i64,
     /// Claimed runs that ended in a process failure and were marked failed.
@@ -602,13 +603,11 @@ pub struct MemoryConsolidationQueueScheduleReport {
     pub enabled: bool,
     /// Whether this tick is the startup tick.
     pub startup: bool,
-    /// Whether the configured daily window was active.
-    pub daily_window_active: bool,
-    /// Newly queued daily runs reported by storage.
-    pub queued_daily_runs: u64,
+    /// Newly queued hourly runs reported by storage.
+    pub queued_runs: u64,
     /// Assigned taskman job ID.
     pub assigned_job_id: Option<i64>,
-    /// Daily-run enqueue error, if any.
+    /// Run enqueue error, if any.
     pub store_error: Option<String>,
 }
 
@@ -621,11 +620,11 @@ pub struct MemoryConsolidationQueueSchedulerReport {
     pub ticks: i64,
     /// Number of runtime API trigger ticks.
     pub triggered_ticks: i64,
-    /// Newly queued daily runs across startup and scheduled ticks.
-    pub queued_daily_runs: u64,
+    /// Newly queued hourly runs across startup and scheduled ticks.
+    pub queued_runs: u64,
     /// Number of taskman jobs assigned.
     pub assigned_jobs: i64,
-    /// Daily-run enqueue errors.
+    /// Run enqueue errors.
     pub store_errors: i64,
 }
 
@@ -697,11 +696,8 @@ pub struct MemoryRunProcessConfig {
 pub struct MemoryServiceWorkerConfig {
     /// Whether memory consolidation is enabled.
     pub enabled: bool,
-    /// Retention window used when ensuring daily runs.
+    /// Retention window used when ensuring hourly runs.
     pub retention: Duration,
-    pub daily_schedule: String,
-    pub daily_window: Duration,
-    pub tick_interval: Duration,
     pub enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy,
     /// Per-run processing config.
     pub process: MemoryRunProcessConfig,
@@ -786,9 +782,6 @@ impl Default for MemoryServiceWorkerConfig {
         Self {
             enabled: true,
             retention: Duration::from_secs(7 * 24 * 60 * 60),
-            daily_schedule: "03:17".to_owned(),
-            daily_window: Duration::from_secs(24 * 60 * 60),
-            tick_interval: Duration::from_secs(60 * 60),
             enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy::default(),
             process: MemoryRunProcessConfig::default(),
         }
@@ -815,21 +808,6 @@ impl MemoryServiceWorkerConfig {
                 fallback.retention
             } else {
                 self.retention
-            },
-            daily_schedule: if self.daily_schedule.trim().is_empty() {
-                fallback.daily_schedule
-            } else {
-                self.daily_schedule.trim().to_owned()
-            },
-            daily_window: if self.daily_window.is_zero() {
-                fallback.daily_window
-            } else {
-                self.daily_window
-            },
-            tick_interval: if self.tick_interval.is_zero() {
-                fallback.tick_interval
-            } else {
-                self.tick_interval
             },
             enqueue_policy: self.enqueue_policy.normalized(),
             process: self.process.normalized(),
@@ -1359,7 +1337,7 @@ where
     let stop = stop;
     tokio::pin!(stop);
     loop {
-        let sleep = tokio::time::sleep(cfg.tick_interval);
+        let sleep = tokio::time::sleep(next_memory_enqueue_delay(OffsetDateTime::now_utc()));
         tokio::pin!(sleep);
         let trigger_notified = trigger.notified();
         tokio::pin!(trigger_notified);
@@ -1379,7 +1357,7 @@ where
                 report.add_tick(&tick);
             }
             () = &mut trigger_notified => {
-                let tick = run_memory_service_once_at_with_daily(
+                let tick = run_memory_service_once_at_with_enqueue(
                     extractor,
                     store,
                     embedder,
@@ -1412,17 +1390,18 @@ where
     Store: MemoryRunStore,
     Embedder: EmbeddingProvider,
 {
-    run_memory_service_once_at_with_daily(extractor, store, embedder, cfg, now, startup, true).await
+    run_memory_service_once_at_with_enqueue(extractor, store, embedder, cfg, now, startup, true)
+        .await
 }
 
-async fn run_memory_service_once_at_with_daily<Extractor, Store, Embedder>(
+async fn run_memory_service_once_at_with_enqueue<Extractor, Store, Embedder>(
     extractor: &Extractor,
     store: &Store,
     embedder: Option<&Embedder>,
     cfg: &MemoryServiceWorkerConfig,
     now: OffsetDateTime,
     startup: bool,
-    ensure_daily: bool,
+    enqueue_runs: bool,
 ) -> MemoryServiceTickReport
 where
     Extractor: MemoryExtractor + Send + Sync,
@@ -1434,19 +1413,23 @@ where
     let mut report = MemoryServiceTickReport {
         enabled: cfg.enabled,
         startup,
-        daily_window_active: memory_schedule_active_at(now, &cfg.daily_schedule, cfg.daily_window),
         ..MemoryServiceTickReport::default()
     };
     if !cfg.enabled {
         return report;
     }
 
-    if ensure_daily && (startup || report.daily_window_active) {
+    if enqueue_runs {
         match store
-            .ensure_daily_runs(now, cfg.retention, cfg.enqueue_policy)
+            .ensure_hourly_runs(
+                now,
+                cfg.retention,
+                memory_enqueue_lookback(now, startup, cfg.retention),
+                cfg.enqueue_policy,
+            )
             .await
         {
-            Ok(queued) => report.queued_daily_runs = queued,
+            Ok(queued) => report.queued_runs = queued,
             Err(error) => {
                 report.store_errors += 1;
                 tracing::warn!(%error, "memory run enqueue failed");
@@ -1482,7 +1465,7 @@ pub async fn schedule_memory_consolidation_taskman_once_at<Store>(
     cfg: &MemoryServiceWorkerConfig,
     now: OffsetDateTime,
     startup: bool,
-    ensure_daily: bool,
+    enqueue_runs: bool,
 ) -> MemoryConsolidationQueueScheduleReport
 where
     Store: MemoryRunStore,
@@ -1491,19 +1474,23 @@ where
     let mut report = MemoryConsolidationQueueScheduleReport {
         enabled: cfg.enabled,
         startup,
-        daily_window_active: memory_schedule_active_at(now, &cfg.daily_schedule, cfg.daily_window),
         ..MemoryConsolidationQueueScheduleReport::default()
     };
     if !cfg.enabled {
         return report;
     }
 
-    if ensure_daily && (startup || report.daily_window_active) {
+    if enqueue_runs {
         match store
-            .ensure_daily_runs(now, cfg.retention, cfg.enqueue_policy)
+            .ensure_hourly_runs(
+                now,
+                cfg.retention,
+                memory_enqueue_lookback(now, startup, cfg.retention),
+                cfg.enqueue_policy,
+            )
             .await
         {
-            Ok(queued) => report.queued_daily_runs = queued,
+            Ok(queued) => report.queued_runs = queued,
             Err(error) => {
                 report.store_error = Some(error.to_string());
                 tracing::warn!(%error, "memory run enqueue failed");
@@ -1561,7 +1548,7 @@ where
     let stop = stop;
     tokio::pin!(stop);
     loop {
-        let sleep = tokio::time::sleep(cfg.tick_interval);
+        let sleep = tokio::time::sleep(next_memory_enqueue_delay(OffsetDateTime::now_utc()));
         tokio::pin!(sleep);
         let trigger_notified = trigger.notified();
         tokio::pin!(trigger_notified);
@@ -1746,7 +1733,7 @@ where
 
 impl MemoryServiceWorkerReport {
     fn add_tick(&mut self, tick: &MemoryServiceTickReport) {
-        self.queued_daily_runs += tick.queued_daily_runs;
+        self.queued_runs += tick.queued_runs;
         self.processed_runs += tick.processed_runs;
         self.failed_runs += tick.failed_runs;
         self.store_errors += tick.store_errors;
@@ -1755,7 +1742,7 @@ impl MemoryServiceWorkerReport {
 
 impl MemoryConsolidationQueueSchedulerReport {
     fn add_schedule_tick(&mut self, tick: &MemoryConsolidationQueueScheduleReport) {
-        self.queued_daily_runs += tick.queued_daily_runs;
+        self.queued_runs += tick.queued_runs;
         if tick.assigned_job_id.is_some() {
             self.assigned_jobs += 1;
         }
@@ -2531,44 +2518,42 @@ fn estimate_extraction_tokens(
     )
 }
 
+/// Minutes past the hour at which the scheduler enqueues the hour that just
+/// completed, so history writes that trail the hour boundary are included.
+const MEMORY_ENQUEUE_MINUTE: u8 = 2;
+/// Completed hours an hourly tick looks back over; a tick that ran late or a
+/// short outage still lands its hours.
+pub const MEMORY_RECENT_LOOKBACK: Duration = Duration::from_secs(2 * 60 * 60);
+/// UTC hour whose tick rescans the whole retention window for hours a longer
+/// outage or the daily cap left without a run.
+const MEMORY_FULL_SCAN_HOUR: u8 = 3;
+
+/// History span one enqueue tick scans: the whole retention window on startup
+/// and once a day, otherwise the recent hours.
 #[must_use]
-pub fn memory_schedule_due_at(now: OffsetDateTime, schedule: &str) -> bool {
-    let (hour, minute) = parse_daily_schedule(schedule);
-    now.hour() > hour || (now.hour() == hour && now.minute() >= minute)
+pub fn memory_enqueue_lookback(
+    now: OffsetDateTime,
+    startup: bool,
+    retention: Duration,
+) -> Duration {
+    if startup || now.to_offset(time::UtcOffset::UTC).hour() == MEMORY_FULL_SCAN_HOUR {
+        retention
+    } else {
+        MEMORY_RECENT_LOOKBACK.min(retention)
+    }
 }
 
+/// Time from `now` until the next enqueue tick at `HH:02` UTC.
 #[must_use]
-pub fn memory_schedule_active_at(now: OffsetDateTime, schedule: &str, window: Duration) -> bool {
-    if window.is_zero() || window >= Duration::from_secs(24 * 60 * 60) {
-        return memory_schedule_due_at(now, schedule);
+pub fn next_memory_enqueue_delay(now: OffsetDateTime) -> Duration {
+    let now = now.to_offset(time::UtcOffset::UTC);
+    let hour_start =
+        now.date().midnight().assume_utc() + time::Duration::hours(i64::from(now.hour()));
+    let mut next = hour_start + time::Duration::minutes(i64::from(MEMORY_ENQUEUE_MINUTE));
+    if next <= now {
+        next += time::Duration::HOUR;
     }
-    let (hour, minute) = parse_daily_schedule(schedule);
-    let start_time = Time::from_hms(hour, minute, 0).unwrap_or(Time::MIDNIGHT);
-    let mut start = now.replace_time(start_time);
-    if now < start {
-        start -= time::Duration::days(1);
-    }
-    let window = time::Duration::try_from(window).unwrap_or(time::Duration::MAX);
-    now >= start && now < start + window
-}
-
-fn parse_daily_schedule(schedule: &str) -> (u8, u8) {
-    let Some((hour, minute)) = schedule.trim().split_once(':') else {
-        return (3, 17);
-    };
-    if minute.contains(':') {
-        return (3, 17);
-    }
-    let Ok(hour) = hour.parse::<u8>() else {
-        return (3, 17);
-    };
-    let Ok(minute) = minute.parse::<u8>() else {
-        return (3, 17);
-    };
-    if hour > 23 || minute > 59 {
-        return (3, 17);
-    }
-    (hour, minute)
+    Duration::try_from(next - now).unwrap_or(Duration::from_secs(60 * 60))
 }
 
 /// Config for one extracted memory batch write.
@@ -4052,6 +4037,7 @@ impl TextRedactor for RoutedDiscoveryRedactor {
                     RoutedRequestContext {
                         workflow_key: "redaction".to_owned(),
                         queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                        lane_priority: Some(openplotva_llm::router::LanePriority::Background),
                         suppress_all_attempts_exhausted_admin_report: true,
                         suppressed_all_attempts_exhausted_reason: Some(
                             "redaction_fail_open".to_owned(),
@@ -4686,9 +4672,6 @@ pub fn memory_service_worker_config_from_memory_config(
     MemoryServiceWorkerConfig {
         enabled: config.enabled,
         retention: positive_hours(config.retention_hours, 7 * 24),
-        daily_schedule: config.daily_schedule.clone(),
-        daily_window: positive_hours(config.daily_window_hours, 24),
-        tick_interval: Duration::from_secs(60 * 60),
         enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy {
             min_messages_per_run: config.min_messages_per_run,
             max_queued_runs: config.max_queued_runs,
@@ -4974,10 +4957,11 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeMemoryWriteStore {
         ids: Vec<i64>,
-        ensure_daily_count: u64,
+        ensure_hourly_count: u64,
         ensured: Mutex<
             Vec<(
                 OffsetDateTime,
+                Duration,
                 Duration,
                 openplotva_memory::MemoryRunEnqueuePolicy,
             )>,
@@ -5176,18 +5160,19 @@ mod tests {
     }
 
     impl MemoryRunStore for FakeMemoryWriteStore {
-        fn ensure_daily_runs<'a>(
+        fn ensure_hourly_runs<'a>(
             &'a self,
             now: OffsetDateTime,
             retention: Duration,
+            lookback: Duration,
             policy: openplotva_memory::MemoryRunEnqueuePolicy,
         ) -> MemoryWriteStoreFuture<'a, u64, Self::Error> {
             Box::pin(async move {
                 self.ensured
                     .lock()
                     .expect("ensured")
-                    .push((now, retention, policy));
-                Ok(self.ensure_daily_count)
+                    .push((now, retention, lookback, policy));
+                Ok(self.ensure_hourly_count)
             })
         }
 
@@ -5602,7 +5587,6 @@ mod tests {
                 "http://pool-a.test/v1, http://pool-b.test".to_owned(),
             ),
             dialog_aifarm_pool_api_key: Some("pool-token".to_owned()),
-            dialog_aifarm_pool_primary_capacity_wait_ms: Some("250".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
@@ -6603,29 +6587,79 @@ mod tests {
     }
 
     #[test]
-    fn memory_schedule_matches_go_daily_window_rules() {
-        let before = utc_test_time(3, 16);
-        let after = utc_test_time(3, 17);
-        assert!(!memory_schedule_due_at(before, "03:17"));
-        assert!(memory_schedule_due_at(after, "03:17"));
-        assert!(memory_schedule_due_at(after, "03:17:00"));
-
-        let inside = utc_test_time(5, 0);
-        let outside = utc_test_time(8, 0);
-        assert!(memory_schedule_active_at(
-            inside,
-            "03:17",
-            Duration::from_secs(4 * 60 * 60)
-        ));
-        assert!(!memory_schedule_active_at(
-            outside,
-            "03:17",
-            Duration::from_secs(4 * 60 * 60)
-        ));
+    fn memory_enqueue_ticks_land_shortly_after_each_hour() {
+        assert_eq!(
+            next_memory_enqueue_delay(utc_test_time(3, 1)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_memory_enqueue_delay(utc_test_time(3, 2)),
+            Duration::from_secs(60 * 60)
+        );
+        assert_eq!(
+            next_memory_enqueue_delay(utc_test_time(3, 17)),
+            Duration::from_secs(45 * 60)
+        );
+        assert_eq!(
+            next_memory_enqueue_delay(utc_test_time(23, 30)),
+            Duration::from_secs(32 * 60)
+        );
     }
 
     #[tokio::test]
-    async fn memory_service_startup_ensures_daily_runs_and_drains_queue() {
+    async fn every_scheduler_tick_enqueues_completed_hours() {
+        let store = FakeMemoryWriteStore {
+            ensure_hourly_count: 2,
+            ..FakeMemoryWriteStore::default()
+        };
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        let cfg = MemoryServiceWorkerConfig::default();
+
+        let report = schedule_memory_consolidation_taskman_once_at(
+            &store,
+            &queue,
+            &cfg,
+            utc_test_time(14, 2),
+            false,
+            true,
+        )
+        .await;
+        schedule_memory_consolidation_taskman_once_at(
+            &store,
+            &queue,
+            &cfg,
+            utc_test_time(3, 2),
+            false,
+            true,
+        )
+        .await;
+        schedule_memory_consolidation_taskman_once_at(
+            &store,
+            &queue,
+            &cfg,
+            utc_test_time(14, 2),
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(report.queued_runs, 2);
+        let lookbacks: Vec<Duration> = store
+            .ensured
+            .lock()
+            .expect("ensured")
+            .iter()
+            .map(|(_, _, lookback, _)| *lookback)
+            .collect();
+        assert_eq!(
+            lookbacks,
+            vec![MEMORY_RECENT_LOOKBACK, cfg.retention, cfg.retention],
+            "hourly ticks scan recent hours; the daily tick and startup scan the retention window"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_service_startup_ensures_hourly_runs_and_drains_queue() {
         let now = utc_test_time(3, 17);
         let run = openplotva_memory::Run {
             id: 90,
@@ -6635,7 +6669,7 @@ mod tests {
             ..openplotva_memory::Run::default()
         };
         let store = FakeMemoryWriteStore {
-            ensure_daily_count: 4,
+            ensure_hourly_count: 4,
             ids: vec![901],
             run: Mutex::new(Some(run)),
             messages: Mutex::new(vec![openplotva_memory::Message {
@@ -6671,7 +6705,6 @@ mod tests {
             Option::<&FakeEmbedder>::None,
             &MemoryServiceWorkerConfig {
                 retention: Duration::from_secs(12 * 60 * 60),
-                daily_window: Duration::from_secs(60),
                 ..MemoryServiceWorkerConfig::default()
             },
             now,
@@ -6681,7 +6714,7 @@ mod tests {
 
         assert!(report.enabled);
         assert!(report.startup);
-        assert_eq!(report.queued_daily_runs, 4);
+        assert_eq!(report.queued_runs, 4);
         assert_eq!(report.processed_runs, 1);
         assert_eq!(report.failed_runs, 0);
         assert_eq!(report.store_errors, 0);
@@ -6691,10 +6724,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_taskman_scheduler_ensures_daily_runs_and_assigns_go_job() {
+    async fn memory_taskman_scheduler_ensures_hourly_runs_and_assigns_go_job() {
         let now = utc_test_time(3, 17);
         let store = FakeMemoryWriteStore {
-            ensure_daily_count: 3,
+            ensure_hourly_count: 3,
             ..FakeMemoryWriteStore::default()
         };
         let queue = openplotva_taskman::InMemoryTaskQueue::new();
@@ -6704,7 +6737,6 @@ mod tests {
             &queue,
             &MemoryServiceWorkerConfig {
                 retention: Duration::from_secs(12 * 60 * 60),
-                daily_window: Duration::from_secs(60),
                 ..MemoryServiceWorkerConfig::default()
             },
             now,
@@ -6718,8 +6750,7 @@ mod tests {
             MemoryConsolidationQueueScheduleReport {
                 enabled: true,
                 startup: true,
-                daily_window_active: true,
-                queued_daily_runs: 3,
+                queued_runs: 3,
                 assigned_job_id: Some(1),
                 store_error: None,
             }

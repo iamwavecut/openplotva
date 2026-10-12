@@ -5,10 +5,12 @@
 //! control plane is engine-agnostic policy over abstract provider/model ids.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use super::breaker::BreakerConfig;
+use super::capacity::LanePriority;
 use super::policy::RetryBudget;
 use super::triggers::TriggerSpec;
 
@@ -134,6 +136,10 @@ pub struct WorkflowRoute {
     pub triggers: Vec<TriggerSpec>,
     pub shadow: Vec<Candidate>,
     pub retry: RetryBudget,
+    /// Place of this workflow's requests in their lane queues.
+    pub lane_priority: LanePriority,
+    /// Time kept for the next candidate when a lane wait has a deadline.
+    pub fallback_reserve: Duration,
 }
 
 /// Per-workflow holder of the global default and optional VIP override.
@@ -194,6 +200,7 @@ pub struct RoutingTable {
     providers: HashMap<ProviderId, ProviderRow>,
     models: HashMap<ModelId, ModelRow>,
     pools: HashMap<PoolId, super::capacity::PoolSpec>,
+    pool_names: HashMap<PoolId, String>,
 }
 
 impl RoutingTable {
@@ -207,6 +214,7 @@ impl RoutingTable {
             providers,
             models,
             pools: HashMap::new(),
+            pool_names: HashMap::new(),
         }
     }
 
@@ -218,6 +226,16 @@ impl RoutingTable {
     #[must_use]
     pub fn pool(&self, id: PoolId) -> Option<&super::capacity::PoolSpec> {
         self.pools.get(&id)
+    }
+
+    /// Replace the operator-facing pool names carried by this snapshot.
+    pub fn set_pool_names(&mut self, names: HashMap<PoolId, String>) {
+        self.pool_names = names;
+    }
+
+    #[must_use]
+    pub fn pool_name(&self, id: PoolId) -> Option<&str> {
+        self.pool_names.get(&id).map(String::as_str)
     }
 
     /// The pool specs to reconcile the live registry with after a reload.
@@ -259,5 +277,28 @@ impl RoutingTable {
 
     pub fn workflow_keys(&self) -> impl Iterator<Item = &str> {
         self.routes.keys().map(String::as_str)
+    }
+
+    /// Models any route can reach (primaries, fallbacks, canaries, shadows and
+    /// trigger targets of every workflow and scope), each once, by id.
+    pub fn routed_models(&self) -> impl Iterator<Item = &ModelRow> {
+        let mut ids: Vec<ModelId> = self
+            .routes
+            .values()
+            .flat_map(|scoped| scoped.global.iter().chain(scoped.vip.iter()))
+            .flat_map(|route| {
+                route
+                    .primary
+                    .iter()
+                    .chain(route.fallback_tail.iter())
+                    .chain(route.canary.iter())
+                    .chain(route.shadow.iter())
+                    .chain(route.triggers.iter().map(|trigger| &trigger.engage))
+                    .map(|candidate| candidate.model)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| self.models.get(&id))
     }
 }

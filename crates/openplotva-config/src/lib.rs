@@ -76,9 +76,6 @@ pub const DEFAULT_SETTINGS_REQUIRE_INIT_DATA: bool = false;
 pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
-/// Default `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
-/// router waits for a busy primary pool before falling back.
-pub const DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS: i32 = 12_000;
 /// One corrected sample before the dialog router tries the next model.
 /// Repeated invalid samples must leave time for fallback and delivery.
 pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 1;
@@ -222,9 +219,14 @@ pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS: i32 = 2;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
 
-pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
+/// Dialog workers per lane of the dialog primary's lane pool: one runs its
+/// model round while the other runs the turn's non-model phases.
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE: i32 = 2;
 
-pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 4;
+pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 32;
+/// Memory workers per lane of the memory primary's lane pool: a memory run
+/// spends most of its time outside the model.
+pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE: i32 = 2;
 /// Matches the privacy-filter `max_concurrent_jobs` registered in Discovery.
 pub const DEFAULT_MEMORY_REDACTION_CONCURRENCY: i32 = 4;
 
@@ -680,14 +682,13 @@ pub struct PersistentQueueConfig {
     pub control_workers: i32,
     /// Worker count for the `text` queue.
     pub text_workers: i32,
-    /// Worker count for the `dialog-aifarm` queue. With capacity pools active
-    /// this is only the fallback when the routing table has no dialog route.
+    /// Worker count for the `dialog-aifarm` queue. With lane pools active this
+    /// is only the fallback when the dialog primary has no lane pool.
     pub dialog_aifarm_workers: i32,
-    /// Upper bound for the pool-derived dialog worker count.
+    /// Upper bound for the lane-derived dialog worker count.
     pub dialog_workers_cap: i32,
-    /// Slot contribution of an unpooled/unlimited-pool dialog model when
-    /// deriving the worker count.
-    pub dialog_unpooled_share: i32,
+    /// Dialog workers per lane of the dialog primary's lane pool.
+    pub dialog_workers_per_lane: i32,
     pub dialog_aifarm_fallback_high_watermark: i32,
     pub dialog_aifarm_fallback_low_watermark: i32,
     pub dialog_aifarm_fallback_poll_interval_seconds: i32,
@@ -699,8 +700,10 @@ pub struct PersistentQueueConfig {
     pub music_vip_workers: i32,
     /// Worker count for the `memory-consolidation` queue.
     pub memory_consolidation_workers: i32,
-    /// Upper bound for the pool-derived memory-consolidation worker count.
+    /// Upper bound for the lane-derived memory-consolidation worker count.
     pub memory_workers_cap: i32,
+    /// Memory-consolidation workers per lane of the memory primary's lane pool.
+    pub memory_workers_per_lane: i32,
     /// Placeholder cleanup interval in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub placeholder_cleanup_interval_seconds: i32,
     /// Placeholder max age in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -901,7 +904,6 @@ pub struct DialogConfig {
     pub aifarm_pool_models: Vec<String>,
     pub aifarm_pool_base_urls: Vec<String>,
     pub aifarm_pool_api_key: String,
-    pub aifarm_pool_primary_capacity_wait_ms: i32,
     /// How many extra samples the same model gets after a validator rejects its
     /// output, before the router walks to another provider, from
     /// `DIALOG_MODEL_OUTPUT_RETRIES`.
@@ -1041,8 +1043,6 @@ pub struct MemoryConfig {
     pub consolidation_provider: String,
     pub consolidation_model: String,
     pub consolidation_timeout_seconds: i32,
-    pub daily_schedule: String,
-    pub daily_window_hours: i32,
     pub worker_concurrency: i32,
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
@@ -1268,7 +1268,8 @@ pub struct RawConfig {
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS`.
     pub persistent_queue_dialog_aifarm_workers: Option<String>,
     pub persistent_queue_dialog_workers_cap: Option<String>,
-    pub persistent_queue_dialog_unpooled_share: Option<String>,
+    /// `PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE`.
+    pub persistent_queue_dialog_workers_per_lane: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK`.
     pub persistent_queue_dialog_aifarm_fallback_high_watermark: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK`.
@@ -1284,6 +1285,8 @@ pub struct RawConfig {
     /// `PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS`.
     pub persistent_queue_memory_consolidation_workers: Option<String>,
     pub persistent_queue_memory_workers_cap: Option<String>,
+    /// `PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE`.
+    pub persistent_queue_memory_workers_per_lane: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub persistent_queue_placeholder_cleanup_interval_seconds: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -1398,10 +1401,6 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_base_urls: Option<String>,
     /// `DIALOG_AIFARM_POOL_API_KEY`.
     pub dialog_aifarm_pool_api_key: Option<String>,
-    /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`: how long the dialog
-    /// router waits for a busy primary-role pool slot before it falls back to
-    /// the next candidate. Default 12000.
-    pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
     /// `DIALOG_MODEL_OUTPUT_RETRIES`: extra samples from the same model after a
     /// validator rejects its output, before the router walks the chain. Default 4.
     pub dialog_model_output_retries: Option<String>,
@@ -1567,10 +1566,6 @@ pub struct RawConfig {
     pub memory_consolidation_model: Option<String>,
     /// `MEMORY_CONSOLIDATION_TIMEOUT_SECONDS`.
     pub memory_consolidation_timeout_seconds: Option<String>,
-    /// `MEMORY_DAILY_SCHEDULE`.
-    pub memory_daily_schedule: Option<String>,
-    /// `MEMORY_DAILY_WINDOW_HOURS`.
-    pub memory_daily_window_hours: Option<String>,
     /// `MEMORY_WORKER_CONCURRENCY`.
     pub memory_worker_concurrency: Option<String>,
     /// `MEMORY_MAX_MESSAGES_PER_RUN`.
@@ -1954,10 +1949,10 @@ impl AppConfig {
                 raw.persistent_queue_dialog_workers_cap,
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP,
             )?,
-            dialog_unpooled_share: parse_i32(
-                "PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE",
-                raw.persistent_queue_dialog_unpooled_share,
-                DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE,
+            dialog_workers_per_lane: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE",
+                raw.persistent_queue_dialog_workers_per_lane,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE,
             )?,
             dialog_aifarm_fallback_high_watermark: parse_i32(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
@@ -1998,6 +1993,11 @@ impl AppConfig {
                 "PERSISTENT_QUEUE_MEMORY_WORKERS_CAP",
                 raw.persistent_queue_memory_workers_cap,
                 DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP,
+            )?,
+            memory_workers_per_lane: parse_i32(
+                "PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE",
+                raw.persistent_queue_memory_workers_per_lane,
+                DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE,
             )?,
             placeholder_cleanup_interval_seconds: parse_i32(
                 "PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS",
@@ -2645,11 +2645,6 @@ impl AppConfig {
                     aifarm_pool_models: dialog_aifarm_pool_models,
                     aifarm_pool_base_urls: dialog_aifarm_pool_base_urls,
                     aifarm_pool_api_key: raw.dialog_aifarm_pool_api_key.unwrap_or_default(),
-                    aifarm_pool_primary_capacity_wait_ms: parse_i32(
-                        "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
-                        raw.dialog_aifarm_pool_primary_capacity_wait_ms,
-                        DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS,
-                    )?,
                     model_output_retries: parse_i32(
                         "DIALOG_MODEL_OUTPUT_RETRIES",
                         raw.dialog_model_output_retries,
@@ -2878,14 +2873,6 @@ impl AppConfig {
                     "MEMORY_CONSOLIDATION_TIMEOUT_SECONDS",
                     raw.memory_consolidation_timeout_seconds,
                     600,
-                )?,
-                daily_schedule: raw
-                    .memory_daily_schedule
-                    .unwrap_or_else(|| "03:17".to_owned()),
-                daily_window_hours: parse_i32(
-                    "MEMORY_DAILY_WINDOW_HOURS",
-                    raw.memory_daily_window_hours,
-                    24,
                 )?,
                 worker_concurrency: parse_i32(
                     "MEMORY_WORKER_CONCURRENCY",
@@ -3234,7 +3221,9 @@ impl RawConfig {
             persistent_queue_text_workers: env("PERSISTENT_QUEUE_TEXT_WORKERS"),
             persistent_queue_dialog_aifarm_workers: env("PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS"),
             persistent_queue_dialog_workers_cap: env("PERSISTENT_QUEUE_DIALOG_WORKERS_CAP"),
-            persistent_queue_dialog_unpooled_share: env("PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE"),
+            persistent_queue_dialog_workers_per_lane: env(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE",
+            ),
             persistent_queue_dialog_aifarm_fallback_high_watermark: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
             ),
@@ -3248,6 +3237,9 @@ impl RawConfig {
             persistent_queue_image_vip_workers: env("PERSISTENT_QUEUE_IMAGE_VIP_WORKERS"),
             persistent_queue_music_vip_workers: env("PERSISTENT_QUEUE_MUSIC_VIP_WORKERS"),
             persistent_queue_memory_workers_cap: env("PERSISTENT_QUEUE_MEMORY_WORKERS_CAP"),
+            persistent_queue_memory_workers_per_lane: env(
+                "PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE",
+            ),
             persistent_queue_memory_consolidation_workers: env(
                 "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
             ),
@@ -3312,9 +3304,6 @@ impl RawConfig {
             dialog_aifarm_pool_models: env("DIALOG_AIFARM_POOL_MODELS"),
             dialog_aifarm_pool_base_urls: env("DIALOG_AIFARM_POOL_BASE_URLS"),
             dialog_aifarm_pool_api_key: env("DIALOG_AIFARM_POOL_API_KEY"),
-            dialog_aifarm_pool_primary_capacity_wait_ms: env(
-                "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
-            ),
             dialog_model_output_retries: env("DIALOG_MODEL_OUTPUT_RETRIES"),
             dialog_turn_budget_secs: env("DIALOG_TURN_BUDGET_SECS"),
             dialog_turn_max_queue_age_secs: env("DIALOG_TURN_MAX_QUEUE_AGE_SECS"),
@@ -3399,8 +3388,6 @@ impl RawConfig {
             memory_consolidation_provider: env("MEMORY_CONSOLIDATION_PROVIDER"),
             memory_consolidation_model: env("MEMORY_CONSOLIDATION_MODEL"),
             memory_consolidation_timeout_seconds: env("MEMORY_CONSOLIDATION_TIMEOUT_SECONDS"),
-            memory_daily_schedule: env("MEMORY_DAILY_SCHEDULE"),
-            memory_daily_window_hours: env("MEMORY_DAILY_WINDOW_HOURS"),
             memory_worker_concurrency: env("MEMORY_WORKER_CONCURRENCY"),
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
@@ -4068,6 +4055,8 @@ mod tests {
             config.persistent_queue.memory_workers_cap,
             DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP
         );
+        assert_eq!(config.persistent_queue.memory_workers_per_lane, 2);
+        assert_eq!(config.persistent_queue.dialog_workers_per_lane, 2);
         assert_eq!(
             config.persistent_queue.placeholder_cleanup_interval_seconds,
             DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS
@@ -4121,10 +4110,6 @@ mod tests {
         assert_eq!(config.llm.dialog.task_timeout_seconds, 720);
         assert_eq!(config.llm.dialog.aifarm_capacity_wait_seconds, 60);
         assert_eq!(config.llm.dialog.aifarm_capacity_poll_seconds, 1);
-        assert_eq!(
-            config.llm.dialog.aifarm_pool_primary_capacity_wait_ms,
-            crate::DEFAULT_DIALOG_PRIMARY_CAPACITY_WAIT_MS
-        );
         assert_eq!(
             config.llm.dialog.model_output_retries,
             crate::DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES
@@ -4215,8 +4200,6 @@ mod tests {
             DEFAULT_MEMORY_CONSOLIDATION_MODEL
         );
         assert_eq!(config.memory.consolidation_timeout_seconds, 600);
-        assert_eq!(config.memory.daily_schedule, "03:17");
-        assert_eq!(config.memory.daily_window_hours, 24);
         assert_eq!(config.memory.worker_concurrency, 1);
         assert_eq!(config.memory.max_messages_per_run, 200);
         assert_eq!(
@@ -4936,8 +4919,6 @@ mod tests {
             memory_consolidation_provider: Some("genkit".to_owned()),
             memory_consolidation_model: Some("memory-model".to_owned()),
             memory_consolidation_timeout_seconds: Some("777".to_owned()),
-            memory_daily_schedule: Some("04:05".to_owned()),
-            memory_daily_window_hours: Some("12".to_owned()),
             memory_worker_concurrency: Some("2".to_owned()),
             memory_max_messages_per_run: Some("55".to_owned()),
             memory_min_messages_per_run: Some("20".to_owned()),
@@ -4976,8 +4957,6 @@ mod tests {
         assert_eq!(config.memory.consolidation_provider, "genkit");
         assert_eq!(config.memory.consolidation_model, "memory-model");
         assert_eq!(config.memory.consolidation_timeout_seconds, 777);
-        assert_eq!(config.memory.daily_schedule, "04:05");
-        assert_eq!(config.memory.daily_window_hours, 12);
         assert_eq!(config.memory.worker_concurrency, 2);
         assert_eq!(config.memory.max_messages_per_run, 55);
         assert_eq!(config.memory.min_messages_per_run, 20);

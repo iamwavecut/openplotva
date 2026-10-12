@@ -168,6 +168,11 @@ pub trait RuntimeRoutingEventInspector: Send + Sync {
     ) -> Result<Vec<RuntimeRoutingEventData>, String>;
 }
 
+/// Runtime API lane pool read boundary.
+pub trait RuntimeLaneInspector: Send + Sync {
+    fn lanes(&self) -> Vec<RuntimeLaneData>;
+}
+
 /// Runtime API LLM analytics read boundary.
 pub trait RuntimeLlmAnalyticsReader: Send + Sync {
     fn llm_analytics<'a>(&'a self, range: &'a str) -> RuntimeLlmAnalyticsReaderFuture<'a>;
@@ -366,6 +371,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub llm_run_inspector: Option<Arc<dyn RuntimeLlmRunInspector>>,
     pub turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
+    pub lane_inspector: Option<Arc<dyn RuntimeLaneInspector>>,
     pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     pub gradius_audit_reader: Option<Arc<dyn RuntimeGradiusAuditReader>>,
     pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
@@ -1382,6 +1388,25 @@ pub struct RuntimeRoutingEventsFilter {
     pub limit: i32,
 }
 
+/// Runtime API lane pool state.
+#[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
+#[graphql(name = "Lane")]
+pub struct RuntimeLaneData {
+    #[graphql(derived(owned, name = "id", into = "ID", with = "graphql_id"), skip)]
+    pub id: i64,
+    pub name: String,
+    pub max_concurrency: Option<i32>,
+    pub in_flight: i32,
+    pub queued_interactive: i32,
+    pub queued_user_tool: i32,
+    pub queued_background: i32,
+    pub mean_hold_ms: Option<i32>,
+    #[graphql(name = "waitP50Ms")]
+    pub wait_p50_ms: Option<i32>,
+    #[graphql(name = "waitP95Ms")]
+    pub wait_p95_ms: Option<i32>,
+}
+
 // Runtime API LLM routing event.
 #[derive(Clone, Debug, Default, PartialEq, SimpleObject)]
 #[graphql(name = "RoutingEvent", complex)]
@@ -1967,6 +1992,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             llm_run_inspector: diagnostics.llm_run_inspector,
             turn_outcome_inspector: diagnostics.turn_outcome_inspector,
             routing_event_inspector: diagnostics.routing_event_inspector,
+            lane_inspector: diagnostics.lane_inspector,
             llm_analytics_reader: diagnostics.llm_analytics_reader,
             gradius_audit_reader: diagnostics.gradius_audit_reader,
             log_inspector: diagnostics.log_inspector,
@@ -1999,6 +2025,7 @@ pub struct RuntimeQuery {
     llm_run_inspector: Option<Arc<dyn RuntimeLlmRunInspector>>,
     turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
+    lane_inspector: Option<Arc<dyn RuntimeLaneInspector>>,
     llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     gradius_audit_reader: Option<Arc<dyn RuntimeGradiusAuditReader>>,
     log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
@@ -2280,6 +2307,15 @@ impl RuntimeQuery {
         inspector
             .routing_events(routing_events_filter_from_input(filter))
             .map_err(async_graphql::Error::new)
+    }
+
+    /// Lane pools: width, in-flight requests, queue depth per priority, mean
+    /// lane hold time and recent wait percentiles.
+    async fn llm_lanes(&self) -> Vec<RuntimeLaneData> {
+        self.lane_inspector
+            .as_deref()
+            .map(RuntimeLaneInspector::lanes)
+            .unwrap_or_default()
     }
 
     async fn llm_analytics(

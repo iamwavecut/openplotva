@@ -29,6 +29,7 @@ pub mod history_summary;
 pub mod image_jobs;
 pub mod ingestion_telemetry;
 pub mod inline;
+mod lane_checks;
 mod maintenance_api;
 pub mod media;
 pub mod members;
@@ -4447,8 +4448,9 @@ async fn admin_memory_restart_execute_response(
     let mut queued_runs = 0_i64;
     let result = if run_now {
         store
-            .ensure_daily_runs(
+            .ensure_hourly_runs(
                 OffsetDateTime::now_utc(),
+                routes.memory_retention,
                 routes.memory_retention,
                 routes.memory_enqueue_policy,
             )
@@ -4565,8 +4567,9 @@ async fn admin_memory_restart_override_execute_response(
     let result = if run_now {
         runtime
             .store
-            .ensure_daily_runs(
+            .ensure_hourly_runs(
                 OffsetDateTime::now_utc(),
+                routes.memory_retention,
                 routes.memory_retention,
                 routes.memory_enqueue_policy,
             )
@@ -8837,6 +8840,10 @@ async fn admin_routing_status(
         return admin_auth_failure_response(error);
     }
     let now = std::time::Instant::now();
+    let table = routes
+        .router_handle
+        .as_ref()
+        .map(|handle| handle.snapshot());
     let pools: Vec<serde_json::Value> = routes
         .router_pools
         .as_ref()
@@ -8846,8 +8853,17 @@ async fn admin_routing_status(
         .map(|occupancy| {
             json!({
                 "id": occupancy.id,
+                "name": table.as_ref().and_then(|table| table.pool_name(occupancy.id)),
                 "max_concurrency": occupancy.max_concurrency,
                 "in_flight": occupancy.in_flight,
+                "queued": {
+                    "interactive": occupancy.queued[0],
+                    "user_tool": occupancy.queued[1],
+                    "background": occupancy.queued[2],
+                },
+                "mean_hold_ms": occupancy.mean_hold_ms,
+                "wait_p50_ms": occupancy.wait_p50_ms,
+                "wait_p95_ms": occupancy.wait_p95_ms,
             })
         })
         .collect();
@@ -9531,28 +9547,6 @@ fn shield_history_tail_messages_from_config(config: &openplotva_config::ShieldCo
 
 fn dialog_memory_context_enabled(config: &AppConfig) -> bool {
     config.memory.enabled
-}
-
-/// Memory-consolidation parallelism. Runs are claimed with
-/// `FOR UPDATE SKIP LOCKED` under a lease (one run = one chat window), so
-/// parallel workers safely chew different chats. The effective count follows
-/// the workflow's capacity pools — a pooled route (e.g. the 16-slot
-/// vram.cloud pool) invites parallel workers up to the cap, while an unpooled
-/// route keeps the configured count (historically one). `0` disables workers.
-fn effective_memory_consolidation_workers(
-    configured_workers: i32,
-    pool_derived: Option<u32>,
-    cap: i32,
-) -> i32 {
-    if configured_workers <= 0 {
-        return 0;
-    }
-    let cap = cap.max(1);
-    let derived = pool_derived
-        .and_then(|derived| i32::try_from(derived).ok())
-        .unwrap_or(1)
-        .clamp(1, cap);
-    configured_workers.max(derived)
 }
 
 fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCommandConfig {
@@ -10783,6 +10777,14 @@ async fn start_runtime_workers(
     workers.router_pools = Some(Arc::clone(&router_pools));
     workers.openrouter_free_gate = Some(Arc::clone(&openrouter_free_gate));
     router_pools.apply(&router_handle.snapshot().pool_specs());
+    let lane_check = lane_checks::LaneCheck {
+        discovery_base_url: config.llm.discovery.base_url.clone(),
+        reporter: Some(routing_event_reporter.clone()),
+    };
+    readiness_checks.push(ReadinessCheck::ok(
+        "lane_config",
+        lane_check.run(&router_handle.snapshot()).await.summary(),
+    ));
     {
         let pool = service_clients.postgres.clone();
         let handle = Arc::clone(&router_handle);
@@ -11264,6 +11266,10 @@ async fn start_runtime_workers(
             llm_run_inspector: Some(Arc::new(llm_run_buffer.clone())),
             turn_outcome_inspector: Some(Arc::new(turn_outcome_buffer.clone())),
             routing_event_inspector: Some(Arc::new(routing_event_buffer.clone())),
+            lane_inspector: Some(Arc::new(lane_checks::RuntimeLanes {
+                handle: Arc::clone(&router_handle),
+                pools: Arc::clone(&router_pools),
+            })),
             llm_analytics_reader: Some(Arc::new(
                 runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(
                     service_clients.postgres.clone(),
@@ -11328,25 +11334,28 @@ async fn start_runtime_workers(
     }
 
     if config.memory.enabled && config.bot.key.is_none() {
-        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
+        let memory_write_embedder = Some(
+            embedder::RoutedDiscoveryEmbedder::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                .with_reporter(routing_event_reporter.clone()),
+                embedder::DiscoveryEmbedderConfig {
+                    base_url: config.llm.discovery.base_url.clone(),
+                    service_name: config.memory.embedder_service_name.clone(),
+                    endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                    request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    poll_interval: Duration::from_millis(100),
+                    capacity_wait: Duration::from_secs(2),
+                },
             )
-            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_reporter(routing_event_reporter.clone()),
-            embedder::DiscoveryEmbedderConfig {
-                base_url: config.llm.discovery.base_url.clone(),
-                service_name: config.memory.embedder_service_name.clone(),
-                endpoint_name: config.memory.embedder_endpoint_name.clone(),
-                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                poll_interval: Duration::from_millis(100),
-                capacity_wait: Duration::from_secs(2),
-            },
-        ));
+            .with_lane_priority(openplotva_llm::router::LanePriority::Background),
+        );
         let memory_extractor = memory_runtime::routed_memory_extractor_from_app_config(
             config,
             routed_attempts::RoutedAttemptWalker::new(
@@ -12122,26 +12131,30 @@ async fn start_runtime_workers(
     ));
     let mut shared_taskman_worker_counts = BTreeMap::new();
     shared_taskman_worker_counts.insert(openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(), 1);
+    let mut memory_worker_scale = None;
     if config.memory.enabled {
-        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
+        let memory_write_embedder = Some(
+            embedder::RoutedDiscoveryEmbedder::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                .with_reporter(routing_event_reporter.clone()),
+                embedder::DiscoveryEmbedderConfig {
+                    base_url: config.llm.discovery.base_url.clone(),
+                    service_name: config.memory.embedder_service_name.clone(),
+                    endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                    request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    poll_interval: Duration::from_millis(100),
+                    capacity_wait: Duration::from_secs(2),
+                },
             )
-            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_reporter(routing_event_reporter.clone()),
-            embedder::DiscoveryEmbedderConfig {
-                base_url: config.llm.discovery.base_url.clone(),
-                service_name: config.memory.embedder_service_name.clone(),
-                endpoint_name: config.memory.embedder_endpoint_name.clone(),
-                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                poll_interval: Duration::from_millis(100),
-                capacity_wait: Duration::from_secs(2),
-            },
-        ));
+            .with_lane_priority(openplotva_llm::router::LanePriority::Background),
+        );
         let memory_scheduler_store = memory_store.clone();
         let memory_scheduler_queue = Arc::clone(&task_queue_for_updates);
         let memory_scheduler_config =
@@ -12167,76 +12180,106 @@ async fn start_runtime_workers(
             memory_scheduler,
         );
 
-        let configured_memory_worker_count = config.persistent_queue.memory_consolidation_workers;
-        let memory_workers_cap = config.persistent_queue.memory_workers_cap.max(1);
-        let derived_memory_workers = openplotva_llm::router::derived_worker_count(
-            &router_handle.snapshot(),
-            memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY,
-            1,
-            u32::try_from(memory_workers_cap).unwrap_or(1),
-        );
-        let memory_worker_count = effective_memory_consolidation_workers(
-            configured_memory_worker_count,
-            derived_memory_workers,
-            memory_workers_cap,
-        );
-        if memory_worker_count != configured_memory_worker_count {
+        // Memory workers follow the memory primary's lanes; the configured
+        // count is the floor and `0` disables them.
+        let configured_memory_worker_count =
+            u32::try_from(config.persistent_queue.memory_consolidation_workers.max(0)).unwrap_or(0);
+        let memory_worker_count = if configured_memory_worker_count == 0 {
+            0
+        } else {
+            let (scale, desired) = tokio::sync::watch::channel(configured_memory_worker_count);
+            let lanes = model_routing::LaneWorkerScale {
+                workflow_key: memory_runtime::MEMORY_EXTRACTION_WORKFLOW_KEY,
+                per_lane: u32::try_from(config.persistent_queue.memory_workers_per_lane.max(1))
+                    .unwrap_or(1),
+                floor: configured_memory_worker_count,
+                cap: u32::try_from(config.persistent_queue.memory_workers_cap.max(1)).unwrap_or(1),
+                scale,
+            };
+            let initial = lanes
+                .desired(&router_handle.snapshot())
+                .unwrap_or(configured_memory_worker_count);
+            let _ = lanes.scale.send(initial);
             tracing::info!(
                 configured_workers = configured_memory_worker_count,
-                effective_workers = memory_worker_count,
-                cap = memory_workers_cap,
-                "memory-consolidation worker count derived from capacity pools"
+                initial_workers = initial,
+                cap = lanes.cap,
+                "memory-consolidation worker scale derived from lane pools"
             );
-        }
-        for index in 0..memory_worker_count {
-            let memory_worker_extractor = memory_runtime::routed_memory_extractor_from_app_config(
-                config,
-                routed_attempts::RoutedAttemptWalker::new(
-                    Arc::clone(&router_handle),
-                    Arc::clone(&router_breakers),
-                    Arc::clone(&router_triggers),
-                    Arc::clone(&router_pools),
-                )
-                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-                .with_reporter(routing_event_reporter.clone()),
-            );
-            let memory_worker_store = memory_store.clone();
-            let memory_worker_embedder = memory_write_embedder.clone();
-            let memory_worker_queue = Arc::clone(&task_queue_for_updates);
-            let memory_worker_id = format!(
-                "{}-{index}",
-                memory_runtime::MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX
-            );
-            let memory_worker_config = memory_runtime::MemoryConsolidationQueueWorkerConfig {
-                process: memory_runtime::memory_service_worker_config_from_memory_config(
-                    &config.memory,
-                )
-                .process,
-                worker_id: memory_worker_id.clone(),
-                interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
-                pipeline_target: usize::try_from(memory_worker_count).unwrap_or(1),
-            };
-            let memory_worker_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
-            let memory_worker_name = memory_worker_id.clone();
-            let memory_worker = tokio::spawn(async move {
-                let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
-                    memory_worker_queue.as_ref(),
-                    &memory_worker_extractor,
-                    &memory_worker_store,
-                    memory_worker_embedder.as_ref(),
-                    memory_worker_config,
-                    wait_for_runtime_stop(memory_worker_stop),
-                )
-                .await;
+            memory_worker_scale = Some(lanes);
 
-                tracing::info!(?report, worker_id = %memory_worker_id, "memory-consolidation taskman worker stopped");
-            });
-            worker_registry.register(
-                memory_worker_name,
-                RuntimeWorkerPhase::Processor,
-                memory_worker,
+            let memory_worker_spawner = {
+                let extractor = memory_runtime::routed_memory_extractor_from_app_config(
+                    config,
+                    routed_attempts::RoutedAttemptWalker::new(
+                        Arc::clone(&router_handle),
+                        Arc::clone(&router_breakers),
+                        Arc::clone(&router_triggers),
+                        Arc::clone(&router_pools),
+                    )
+                    .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                    .with_reporter(routing_event_reporter.clone()),
+                );
+                let store = memory_store.clone();
+                let embedder = memory_write_embedder.clone();
+                let queue = Arc::clone(&task_queue_for_updates);
+                let process =
+                    memory_runtime::memory_service_worker_config_from_memory_config(&config.memory)
+                        .process;
+                let desired = desired.clone();
+                let stop_rx = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
+                move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
+                    let worker_extractor = extractor.clone();
+                    let worker_store = store.clone();
+                    let worker_embedder = embedder.clone();
+                    let worker_queue = Arc::clone(&queue);
+                    let worker_id = format!(
+                        "{}-{index}",
+                        memory_runtime::MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX
+                    );
+                    let worker_config = memory_runtime::MemoryConsolidationQueueWorkerConfig {
+                        process: process.clone(),
+                        worker_id: worker_id.clone(),
+                        interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
+                        pipeline_target: usize::try_from(*desired.borrow()).unwrap_or(1),
+                    };
+                    let worker_stop = stop_rx.clone();
+                    tokio::spawn(async move {
+                        // A retired worker finishes its current run and exits
+                        // at the next loop tick, exactly like a runtime stop.
+                        let stop_future = async move {
+                            tokio::select! {
+                                () = wait_for_runtime_stop(worker_stop) => {}
+                                _ = retire => {}
+                            }
+                        };
+                        let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
+                            worker_queue.as_ref(),
+                            &worker_extractor,
+                            &worker_store,
+                            worker_embedder.as_ref(),
+                            worker_config,
+                            stop_future,
+                        )
+                        .await;
+
+                        tracing::info!(?report, %worker_id, "memory-consolidation taskman worker stopped");
+                    })
+                }
+            };
+            let memory_supervisor = dialog_workers::spawn_worker_supervisor(
+                Arc::new(memory_worker_spawner),
+                desired,
+                Arc::new(dialog_workers::WorkerGauge::new()),
+                worker_stops.subscribe(RuntimeWorkerPhase::Processor),
             );
-        }
+            worker_registry.register(
+                "memory-consolidation-worker-supervisor",
+                RuntimeWorkerPhase::Processor,
+                memory_supervisor,
+            );
+            initial
+        };
         if config.memory.subject_merge_enabled {
             let merge_merger = memory_runtime::routed_subject_merger_from_app_config(
                 config,
@@ -12292,7 +12335,7 @@ async fn start_runtime_workers(
         workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
         shared_taskman_worker_counts.insert(
             openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
-            memory_worker_count,
+            i32::try_from(memory_worker_count).unwrap_or(i32::MAX),
         );
     }
     let payment_store_for_updates = Arc::new(payment_store.clone());
@@ -12579,7 +12622,6 @@ async fn start_runtime_workers(
                 Arc::clone(&router_pools),
             )
             .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_primary_slot_wait(history_summary::HISTORY_SUMMARY_PRIMARY_SLOT_WAIT)
             .with_reporter(routing_event_reporter.clone()),
         ),
     ) as Arc<dyn dialog_tools::ChatHistorySummarizer>);
@@ -12596,7 +12638,6 @@ async fn start_runtime_workers(
             Arc::clone(&router_pools),
         )
         .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-        .with_primary_slot_wait(youtube::YOUTUBE_PRIMARY_SLOT_WAIT)
         .with_reporter(routing_event_reporter.clone()),
     ) {
         Ok(Some(summarizer)) => {
@@ -12958,25 +12999,29 @@ async fn start_runtime_workers(
             let dialog_terminal_reaction_emoji = config.llm.dialog.terminal_reaction_emoji.clone();
             let dialog_terminal_signal_max_age_secs =
                 config.llm.dialog.terminal_signal_max_age_secs;
-            // The dialog worker count derives from the capacity pools of the
-            // dialog workflow's models; the semaphores in the walker are the
-            // real limit, so extra workers just wait for a slot. The env knob
-            // is only the fallback when no dialog route exists.
+            // The dialog worker count follows the dialog primary's lanes; the
+            // lane queues in the walker are the real limit, so extra workers
+            // wait in the primary's queue during their model rounds and run
+            // their non-model phases meanwhile. The env knob is only the
+            // fallback when the primary has no lane pool.
             let dialog_worker_fallback =
                 u32::try_from(config.persistent_queue.dialog_aifarm_workers.max(0)).unwrap_or(0);
             let dialog_workers_cap =
                 u32::try_from(config.persistent_queue.dialog_workers_cap.max(1)).unwrap_or(1);
-            let dialog_unpooled_share =
-                u32::try_from(config.persistent_queue.dialog_unpooled_share.max(0)).unwrap_or(0);
-            let initial_dialog_workers = openplotva_llm::router::derived_worker_count(
-                &router_handle.snapshot(),
-                "dialog",
-                dialog_unpooled_share,
-                dialog_workers_cap,
-            )
-            .unwrap_or(dialog_worker_fallback);
             let (dialog_scale_tx, dialog_scale_rx) =
-                tokio::sync::watch::channel(initial_dialog_workers);
+                tokio::sync::watch::channel(dialog_worker_fallback);
+            let dialog_lanes = model_routing::LaneWorkerScale {
+                workflow_key: "dialog",
+                per_lane: u32::try_from(config.persistent_queue.dialog_workers_per_lane.max(1))
+                    .unwrap_or(1),
+                floor: 0,
+                cap: dialog_workers_cap,
+                scale: dialog_scale_tx,
+            };
+            let initial_dialog_workers = dialog_lanes
+                .desired(&router_handle.snapshot())
+                .unwrap_or(dialog_worker_fallback);
+            let _ = dialog_lanes.scale.send(initial_dialog_workers);
             let dialog_worker_gauge = Arc::new(dialog_workers::WorkerGauge::new());
 
             let dialog_worker_spawner = {
@@ -13052,7 +13097,7 @@ async fn start_runtime_workers(
                     })
                 }
             };
-            let dialog_supervisor = dialog_workers::spawn_dialog_worker_supervisor(
+            let dialog_supervisor = dialog_workers::spawn_worker_supervisor(
                 Arc::new(dialog_worker_spawner),
                 dialog_scale_rx,
                 Arc::clone(&dialog_worker_gauge),
@@ -13067,20 +13112,20 @@ async fn start_runtime_workers(
             workers.router_runtime = Some(Arc::new(model_routing::RouterRuntime {
                 handle: Arc::clone(&router_handle),
                 pools: Arc::clone(&router_pools),
-                dialog_scale: Some(dialog_scale_tx),
-                dialog_unpooled_share,
-                dialog_worker_cap: dialog_workers_cap,
+                dialog_workers: Some(dialog_lanes),
+                memory_workers: memory_worker_scale.take(),
+                lane_check: Some(lane_check.clone()),
             }));
             tracing::info!(
                 initial_dialog_workers,
                 cap = dialog_workers_cap,
                 fallback = dialog_worker_fallback,
-                "dialog worker scale derived from capacity pools"
+                "dialog worker scale derived from lane pools"
             );
             readiness_checks.push(ReadinessCheck::ok(
                 "dialog_jobs",
                 format!(
-                    "Started dialog worker supervisor with {initial_dialog_workers} pool-derived workers (cap {dialog_workers_cap})"
+                    "Started dialog worker supervisor with {initial_dialog_workers} lane-derived workers (cap {dialog_workers_cap})"
                 ),
             ));
             if initial_dialog_workers > 0 {
@@ -13116,7 +13161,6 @@ async fn start_runtime_workers(
                 Arc::clone(&router_pools),
             )
             .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_primary_slot_wait(media::MEDIA_OPTIMIZER_PRIMARY_SLOT_WAIT)
             .with_reporter(routing_event_reporter.clone()),
             config,
             Arc::clone(&prompt_store),
@@ -15245,15 +15289,14 @@ mod tests {
         apply_private_chat_response_defaults, authenticate_settings_init_data,
         build_deputy_display_name, chat_list_title, chat_member_can_manage_settings,
         chat_member_record_from_upsert, configure_telegram_bot_commands, current_unix_timestamp,
-        delete_webhook_on_shutdown_if_enabled, dialog_memory_context_enabled,
-        effective_memory_consolidation_workers, found, go_dispatcher_config, new_settings_response,
-        normalize_deputy_ids, parse_admin_non_negative_i32, parse_admin_optional_bool,
-        parse_admin_positive_i32, parse_deputy_candidates_limit, parse_deputy_update_request,
-        parse_memory_limit, parse_optional_i32, parse_settings_get_access,
-        parse_settings_memory_access, parse_settings_update_request, parse_shield_limit,
-        routing_json_config_patch, runtime_api_graphql_snapshot,
-        runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
-        send_dispatcher_work_item_with_transport,
+        delete_webhook_on_shutdown_if_enabled, dialog_memory_context_enabled, found,
+        go_dispatcher_config, new_settings_response, normalize_deputy_ids,
+        parse_admin_non_negative_i32, parse_admin_optional_bool, parse_admin_positive_i32,
+        parse_deputy_candidates_limit, parse_deputy_update_request, parse_memory_limit,
+        parse_optional_i32, parse_settings_get_access, parse_settings_memory_access,
+        parse_settings_update_request, parse_shield_limit, routing_json_config_patch,
+        runtime_api_graphql_snapshot, runtime_redis_prefix_groups_from_keys,
+        runtime_redis_value_from_bytes, send_dispatcher_work_item_with_transport,
         send_dispatcher_work_item_with_transport_and_history, settings_chat_display,
         settings_chat_full_info_type_name, settings_chat_state_from_full_info,
         settings_get_response, settings_reply_flags, shield_history_tail_messages_from_config,
@@ -15372,19 +15415,6 @@ mod tests {
         assert!(!dialog_memory_context_enabled(&disabled));
         assert!(dialog_memory_context_enabled(&enabled));
         Ok(())
-    }
-
-    #[test]
-    fn memory_consolidation_worker_count_follows_pools() {
-        // Explicit zero disables workers regardless of pools.
-        assert_eq!(effective_memory_consolidation_workers(0, Some(16), 8), 0);
-        // Unpooled route (no derivation) keeps the configured count.
-        assert_eq!(effective_memory_consolidation_workers(1, None, 8), 1);
-        // A pooled route scales up to the cap.
-        assert_eq!(effective_memory_consolidation_workers(1, Some(16), 8), 8);
-        assert_eq!(effective_memory_consolidation_workers(1, Some(3), 8), 3);
-        // An explicit operator count above the derivation wins.
-        assert_eq!(effective_memory_consolidation_workers(12, Some(16), 8), 12);
     }
 
     #[test]

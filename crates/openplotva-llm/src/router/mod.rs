@@ -13,7 +13,9 @@ pub mod table;
 pub mod triggers;
 
 pub use breaker::{BreakerConfig, BreakerLiveness, BreakerSet, BreakerStateView};
-pub use capacity::{PoolOccupancy, PoolPermit, PoolRegistry, PoolSpec, derived_worker_count};
+pub use capacity::{
+    LanePriority, PoolOccupancy, PoolPermit, PoolRegistry, PoolSpec, lane_worker_count,
+};
 pub use handle::RouterHandle;
 pub use policy::{Attempt, Liveness, RetryBudget, TriggerView, select, select_chain};
 pub use table::{
@@ -56,6 +58,8 @@ mod tests {
             triggers: Vec::new(),
             shadow: Vec::new(),
             retry: RetryBudget::default(),
+            lane_priority: LanePriority::Interactive,
+            fallback_reserve: std::time::Duration::from_secs(30),
         }
     }
 

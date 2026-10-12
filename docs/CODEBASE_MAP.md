@@ -332,7 +332,7 @@ queueing glue).
 | `runtime_llm.rs` | `RuntimeLlmObserver` (single chokepoint → ring + Postgres recorder + run buffer); provider canonicalization from model name; cleanup/scrub workers |
 | `runtime_llm_runs.rs` | 512-entry run ring for admin "LLM Dialogs" view; 30min stale-run watchdog |
 | `runtime_llm_analytics.rs` | Postgres analytics reader (raw + hourly rollups, percentile reconstruction) |
-| `memory_runtime.rs` (~5.4k) | Memory consolidation wiring: extractor composition, daily-run scheduling, claim/process pipeline, 6-op resolution resolver (`write_memory_extraction_cards`), +2 workers (archival 1h, dup-collapse 6h) |
+| `memory_runtime.rs` (~5.4k) | Memory consolidation wiring: extractor composition, hourly run scheduling, claim/process pipeline, 6-op resolution resolver (`write_memory_extraction_cards`), +2 workers (archival 1h, dup-collapse 6h) |
 | `agent_runtime.rs` (~1.5k) | `Reasoner`/`AgentTools` adapters; image agent optimizer provider; `SongContextGatherer` (history + memory context for the song director) |
 | `history_summary.rs` (~1.7k) | Chat-history summary service (edge pre-summary cascade, AIFarm↔GenKit fallback) |
 | `embedder.rs` | Discovery-routed embedder + process-wide cooling circuit breaker (shared by retrieval/shield/consolidation) |
@@ -391,11 +391,12 @@ classifier (typed-first, ASCII-fold message fallback; mirrors Go rules 1:1).
 **`trace.rs`**: `LlmCallObserver` + process singleton + task-local
 `LlmRunScope`. **`router/`**: `RoutingTable` (immutable snapshot) published
 atomically via `RouterHandle` (ArcSwap); `BreakerSet` (closed/open/half-open +
-windowed error-rate, survives reloads); `PoolRegistry` (resize-tolerant
-concurrency cells — deliberately not a Semaphore); `policy::select_chain`
+windowed error-rate, survives reloads); `PoolRegistry` (lane pools: resize-tolerant
+cells with a per-pool priority queue and direct lane handoff — deliberately not a
+Semaphore); `policy::select_chain`
 (Efraimidis–Spirakis weighted permutation; dead-target share redistributes
-proportionally; returns untruncated chain so executor can skip pool-busy
-without hiding free candidates); `TriggerState` (engaged set + capacity-until).
+proportionally; returns untruncated chain so executor can pass over a candidate
+without hiding the rest); `TriggerState` (engaged set + capacity-until).
 No `sqlx`, no `tracing`, no `futures` — policy is pure/sync. **Reply finalization** *(2026-07-06, PR #17)*: `aifarm::extract_final_answer` and `gemini::gemini_final_answer` both delegate to `openplotva_dialog::finalize_dialog_reply`; suppression variants map to retryable errors (`AifarmDialogError::FinalAnswer{ContextLeak,Pathological,ProtocolOnly}` / gemini `ProviderProtocolError` with a granular reason string). aifarm also keeps a separate `ReasoningBudgetExhausted` (detected on `finish_reason=="length"`); gemini runs a second `sanitize_genkit_final_answer` after finalization that can re-suppress.
 
 #### `openplotva-storage`
@@ -580,14 +581,19 @@ flowchart TB
     Walk --> Budget{budget + deadline ok?}
     Budget -- no --> Exhaust[all_attempts_exhausted<br/>event + admin page]
     Budget -- yes --> Live{breaker live?}
-    Live -- open --> Skip[busy_skip / dead]
-    Live -- live --> Pool{pool try_acquire}
-    Pool -- full --> Wait[wait_for_release<br/>excluded from wall_clock]
+    Live -- open --> Probe{lane free?}
+    Probe -- no --> Skip[pass over]
+    Probe -- yes --> Exec
+    Live -- live --> Pool{lane try_acquire}
+    Pool -- full --> Forecast{forecast within<br/>deadline − reserve?}
+    Forecast -- no --> Skip
+    Forecast -- yes --> Wait[wait in lane queue<br/>excluded from wall_clock]
+    Wait -- lane handed --> Exec
+    Wait -- budget ends --> Skip
     Pool -- acquired --> Exec[execute attempt<br/>under remaining timeout]
     Exec -- Ok --> Succ[breaker.record_success<br/>release permit → return]
     Exec -- retryable Err --> Fail[breaker.record_failure<br/>release permit → loop]
     Exec -- terminal Err --> Surf[surface Attempt error]
-    Wait --> Walk
     Skip --> Walk
 ```
 
@@ -627,7 +633,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Sched[Daily scheduler / taskman<br/>MemoryConsolidation job] --> Claim[claim_run<br/>lease 15min]
+    Sched[Hourly scheduler HH:02 / taskman<br/>MemoryConsolidation job] --> Claim[claim_run<br/>lease 15min]
     Claim --> Gate{embedder available?<br/>shared breaker}
     Gate -- no --> Release[release run<br/>no attempt burned]
     Gate -- yes --> Load[load messages<br/>binary-search fit to token budget]
@@ -693,9 +699,8 @@ cascades, and the audit-preserving Maple cutover). Virtual-message subsystem
 - **`ledger.rs` VALUES bug**: `SQL_INSERT_TURN_OUTCOMES_PREFIX` stops at the column list — `push_values` emits `VALUES`. A previous trailing `VALUES` produced `VALUES VALUES` and silently broke every insert. Regression test pins exactly one `VALUES`.
 - **Provider canonicalization** (`runtime_llm.rs`): the observer overrides the stamped provider from the **model name** (`vram.cloud/*`→`vram-cloud`, `vibethinker-3b`→`aifarm-llamacpp-gpu2`, `maple-preview-2bit-mlx`→`aifarm-maple`) so historical backfill and forward classification cannot drift. Rollback-only legacy ids stay classifiable but are not active route targets.
 - **Maple request compatibility** (`aifarm.rs`): an `mlx` runtime hint strips unsupported DRY controls before Discovery serialization while retaining `repeat_penalty` and float `top_k`; migration 180 keeps Maple and Bonsai as distinct rows so routing-event history remains truthful.
-- **Capacity pools are not semaphores** (`router/capacity.rs`): the custom `PoolCell` survives live resize without losing in-flight counts (tokio Semaphore shrink needs `forget_permits` debt). `apply()` rewrites `max` in place; outstanding permits hold their own `Arc<PoolCell>`.
-- **Capacity-slot waits are excluded from the retry wall**: pool-busy skips don't consume hops or trip breakers; `wait_for_release` is budgeted separately. Without this split, a busy pool would burn the entire retry budget on one candidate.
-- **Busy primary pools are waited for, not skipped** *(2026-09-14)*: a `Role::Primary` candidate whose pool is full is waited for up to `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS` (default 12 s; `RoutedAttemptWalker::with_primary_slot_wait`, capped by the caller deadline, charged to `total_slot_wait`, `primary_slot_wait` routing event) before the fallback tail runs; fallback/overflow candidates still skip instantly. Evidence: with the dialog router's old 1 s all-busy wait and instant primary skips, Gemma sat at 0.45–0.59 slot occupancy while ~750 turns/day were shed to the tool-less genkit path; the isolated 3090 replay showed the GPU is prefill-bound (~25 req/min at 11.5k tokens) and that raising vLLM `max-num-seqs` buys +5–7% throughput for ×4–×9 TPOT, so queueing on the primary is the lever, not more sequences.
+- **Lane pools are not semaphores** (`router/capacity.rs`): the custom `PoolCell` survives live resize without losing in-flight counts (tokio Semaphore shrink needs `forget_permits` debt). `apply()` rewrites `max` in place and serves waiters of a grown pool; outstanding permits hold their own `Arc<PoolCell>`. A released lane is handed to the head waiter (`workflows.lane_priority`, then arrival order) through a oneshot; a permit sent to a waiter that gave up releases itself on drop.
+- **Fallback on failure or budget, not on load** *(2026-10-12, design `docs/superpowers/specs/2026-10-12-backend-lanes-design.md`)*: the walker waits in a busy candidate's lane queue until `deadline − workflows.fallback_reserve_ms` (no reserve for the last candidate; without a caller deadline, background work waits without limit and other priorities get an admission deadline 300 s after the run starts) and passes it over only when its breaker is open or the forecast wait (`waiters ahead / width × mean hold`) exceeds that budget (`lane_bypass` event). Lane waits (`lane_wait` event) don't consume hops, trip breakers or count against the retry wall. Evidence for queueing on the primary: with instant primary skips Gemma sat at 0.45–0.59 slot occupancy while ~750 turns/day were shed to the tool-less fallback; the 3090 replay showed the GPU is prefill-bound, so queueing on the primary is the lever, not more sequences.
 - **Breaker fairness ≥30s slice**: a deadline-cut charges the breaker only if `remaining ≥ 30s` — a fallback handed the last seconds of a turn must not open its circuit in lockstep with a degraded primary.
 - **WhiteCircle wrapper is a mandatory passthrough**: must implement `as_chat_step()→Some(self)` or the session engine silently falls back to the legacy loop. Audit fires once per session on `iteration ≤ 1`.
 - **Two distinct Telegram KDFs** (`openplotva-web`): Login Widget uses `secret = SHA256(bot_token)`; WebApp initData uses `secret = HMAC_SHA256("WebAppData", bot_token)`. Do not confuse.

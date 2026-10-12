@@ -13,8 +13,8 @@ use openplotva_config::AppConfig;
 use openplotva_llm::router::table::Role;
 use openplotva_llm::router::triggers::{TriggerCondition, TriggerSpec};
 use openplotva_llm::router::{
-    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, PoolSpec, ProviderRow,
-    RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
+    BreakerConfig, Candidate, InferenceOverrides, Kind, LanePriority, ModelRow, PoolSpec,
+    ProviderRow, RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
 };
 use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
@@ -1813,7 +1813,7 @@ const MEMORY_SUBJECT_MERGE_CASCADE_KEY: &str = "llm.routing.memory_subject_merge
 const DIALOG_FALLBACK_CASCADE_KEY: &str = "llm.routing.dialog_fallback_cascade_v1";
 const MEMORY_EXTRACTION_WORKFLOW: &str = "memory_extraction";
 const MEMORY_SUBJECT_MERGE_WORKFLOW: &str = "memory_subject_merge";
-const MEMORY_GPU2_POOL: &str = "aifarm-gpu2-qwen27b";
+const MEMORY_GPU2_POOL: &str = "aifarm-gpu2-utility";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MemoryRoutingCascadeTarget {
@@ -1956,11 +1956,14 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
 
     if let Some(targets) = subject_merge.as_ref() {
         sqlx::query(
-            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
-             VALUES ($1, 'chat', FALSE, 2, 900000, TRUE) \
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, \
+             lane_priority, fallback_reserve_ms) \
+             VALUES ($1, 'chat', FALSE, 2, 900000, TRUE, 2, 0) \
              ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
              full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
-             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled, \
+             lane_priority = EXCLUDED.lane_priority, \
+             fallback_reserve_ms = EXCLUDED.fallback_reserve_ms",
         )
         .bind(MEMORY_SUBJECT_MERGE_WORKFLOW)
         .execute(&mut *transaction)
@@ -2016,11 +2019,14 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
 
     if let Some(targets) = extraction.as_ref() {
         sqlx::query(
-            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
-             VALUES ($1, 'chat', FALSE, 4, 900000, TRUE) \
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, \
+             lane_priority, fallback_reserve_ms) \
+             VALUES ($1, 'chat', FALSE, 4, 900000, TRUE, 2, 0) \
              ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
              full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
-             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled, \
+             lane_priority = EXCLUDED.lane_priority, \
+             fallback_reserve_ms = EXCLUDED.fallback_reserve_ms",
         )
         .bind(MEMORY_EXTRACTION_WORKFLOW)
         .execute(&mut *transaction)
@@ -2131,33 +2137,55 @@ async fn mark_app_setting_in_transaction(
     Ok(())
 }
 
+/// A worker fleet whose size follows its workflow's primary lane pool.
+pub struct LaneWorkerScale {
+    pub workflow_key: &'static str,
+    pub per_lane: u32,
+    /// Configured minimum; the lane-derived count never drops below it.
+    pub floor: u32,
+    pub cap: u32,
+    pub scale: tokio::sync::watch::Sender<u32>,
+}
+
+impl LaneWorkerScale {
+    /// Worker count for `table`; `None` when the primary has no lane pool, so
+    /// the running count stays.
+    #[must_use]
+    pub fn desired(&self, table: &RoutingTable) -> Option<u32> {
+        openplotva_llm::router::lane_worker_count(table, self.workflow_key, self.per_lane, self.cap)
+            .map(|workers| workers.max(self.floor))
+    }
+
+    fn apply(&self, table: &RoutingTable) {
+        if let Some(desired) = self.desired(table) {
+            let _ = self.scale.send(desired);
+        }
+    }
+}
+
 /// Everything the runtime rebuilds when the routing configuration changes:
-/// the published table, the capacity-pool registry, and (once wired) the
-/// derived dialog worker scale. Breakers/triggers are deliberately absent —
-/// their state must survive a reload untouched.
+/// the published table, the lane pool registry, the dialog and memory worker
+/// scales, and the lane check against Discovery. Breakers/triggers are
+/// deliberately absent — their state must survive a reload untouched.
 pub struct RouterRuntime {
     pub handle: Arc<RouterHandle>,
     pub pools: Arc<openplotva_llm::router::PoolRegistry>,
-    pub dialog_scale: Option<tokio::sync::watch::Sender<u32>>,
-    pub dialog_unpooled_share: u32,
-    pub dialog_worker_cap: u32,
+    pub dialog_workers: Option<LaneWorkerScale>,
+    pub memory_workers: Option<LaneWorkerScale>,
+    pub(crate) lane_check: Option<crate::lane_checks::LaneCheck>,
 }
 
 impl RouterRuntime {
-    /// Reconcile the live pool registry and worker scale with the currently
+    /// Reconcile the live pool registry and worker scales with the currently
     /// published table.
     pub fn apply_published_table(&self) {
         let table = self.handle.snapshot();
         self.pools.apply(&table.pool_specs());
-        if let Some(scale) = &self.dialog_scale
-            && let Some(desired) = openplotva_llm::router::derived_worker_count(
-                &table,
-                "dialog",
-                self.dialog_unpooled_share,
-                self.dialog_worker_cap,
-            )
+        for workers in [&self.dialog_workers, &self.memory_workers]
+            .into_iter()
+            .flatten()
         {
-            let _ = scale.send(desired);
+            workers.apply(&table);
         }
     }
 }
@@ -2171,6 +2199,12 @@ pub async fn reload_router_runtime(
     let table = load_routing_table(pool).await?;
     runtime.handle.store(table);
     runtime.apply_published_table();
+    if let Some(check) = runtime.lane_check.clone() {
+        let table = runtime.handle.snapshot();
+        tokio::spawn(async move {
+            check.run(&table).await;
+        });
+    }
     Ok(())
 }
 
@@ -2435,6 +2469,13 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
 
     let mut table = RoutingTable::new(providers.clone(), model_rows);
     table.set_pools(pool_specs);
+    table.set_pool_names(
+        snapshot
+            .pools
+            .iter()
+            .map(|pool| (pool.id, pool.name.clone()))
+            .collect(),
+    );
 
     for (&(workflow_key, scope_str), assignments) in &by_key_scope {
         let Some(workflow) = workflows.get(workflow_key) else {
@@ -2532,6 +2573,8 @@ fn build_route(
             max_hops: workflow.retry_max_hops.max(1) as u32,
             wall_clock: Duration::from_millis(workflow.retry_wall_ms.max(0) as u64),
         },
+        lane_priority: LanePriority::from_db(workflow.lane_priority),
+        fallback_reserve: Duration::from_millis(workflow.fallback_reserve_ms.max(0) as u64),
     })
 }
 
@@ -2539,7 +2582,7 @@ fn build_route(
 mod tests {
     use openplotva_llm::router::{BreakerLiveness, BreakerSet, TriggerState, select};
     use openplotva_storage::llm_routing::{
-        AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, TriggerRecord,
+        AssignmentRecord, ModelRecord, PoolRecord, ProviderRecord, RoutingSnapshot, TriggerRecord,
         WorkflowRecord,
     };
     use rand::SeedableRng;
@@ -2699,6 +2742,8 @@ mod tests {
                 retry_max_hops: 3,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![
                 assignment(100, "dialog", "global", "primary", 10, Some(100)),
@@ -2718,6 +2763,86 @@ mod tests {
             }],
             pools: vec![],
         }
+    }
+
+    fn dialog_snapshot_with_gpu0_lanes(width: i32) -> RoutingSnapshot {
+        let mut snapshot = dialog_snapshot();
+        snapshot.models[0].pool_id = Some(1);
+        snapshot.pools.push(PoolRecord {
+            id: 1,
+            name: "aifarm-gpu0-dialog".to_owned(),
+            max_concurrency: Some(width),
+            description: None,
+            config: json!({}),
+        });
+        snapshot
+    }
+
+    fn worker_scale(floor: u32) -> (LaneWorkerScale, tokio::sync::watch::Receiver<u32>) {
+        let (scale, receiver) = tokio::sync::watch::channel(0);
+        (
+            LaneWorkerScale {
+                workflow_key: "dialog",
+                per_lane: 2,
+                floor,
+                cap: 24,
+                scale,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn worker_scales_follow_the_primary_lane_pool_and_keep_their_floor() {
+        let table = build_routing_table(&dialog_snapshot_with_gpu0_lanes(8));
+        assert_eq!(worker_scale(0).0.desired(&table), Some(16));
+        assert_eq!(worker_scale(20).0.desired(&table), Some(20));
+
+        let unpooled = build_routing_table(&dialog_snapshot());
+        assert_eq!(
+            worker_scale(3).0.desired(&unpooled),
+            None,
+            "a primary without lanes keeps the running count"
+        );
+    }
+
+    #[test]
+    fn a_routing_reload_resizes_dialog_and_memory_workers() {
+        let handle = RouterHandle::new(build_routing_table(&dialog_snapshot_with_gpu0_lanes(8)));
+        let (dialog, dialog_rx) = worker_scale(0);
+        let (memory, memory_rx) = worker_scale(3);
+        let runtime = RouterRuntime {
+            handle: Arc::clone(&handle),
+            pools: Arc::new(openplotva_llm::router::PoolRegistry::new()),
+            dialog_workers: Some(dialog),
+            memory_workers: Some(memory),
+            lane_check: None,
+        };
+
+        runtime.apply_published_table();
+        assert_eq!(*dialog_rx.borrow(), 16);
+        assert_eq!(*memory_rx.borrow(), 16);
+
+        handle.store(build_routing_table(&dialog_snapshot_with_gpu0_lanes(1)));
+        runtime.apply_published_table();
+        assert_eq!(*dialog_rx.borrow(), 2);
+        assert_eq!(*memory_rx.borrow(), 3, "the configured floor holds");
+    }
+
+    #[test]
+    fn workflow_lane_settings_reach_the_route() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.workflows[0].lane_priority = 2;
+        snapshot.workflows[0].fallback_reserve_ms = 0;
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+        assert_eq!(route.lane_priority, LanePriority::Background);
+        assert_eq!(route.fallback_reserve, Duration::ZERO);
+
+        let table = build_routing_table(&dialog_snapshot());
+        let route = table.resolve("dialog", false).expect("dialog route");
+        assert_eq!(route.lane_priority, LanePriority::Interactive);
+        assert_eq!(route.fallback_reserve, Duration::from_secs(30));
     }
 
     #[test]
@@ -2952,6 +3077,8 @@ mod tests {
         let mut specs = table.pool_specs();
         specs.sort_by_key(|spec| spec.id);
         assert_eq!(specs.len(), 2);
+        assert_eq!(table.pool_name(7), Some("aifarm-dialog"));
+        assert_eq!(table.pool_name(9), None);
     }
 
     #[test]
@@ -3018,7 +3145,8 @@ mod tests {
              CREATE TEMP TABLE workflows (\
                 key TEXT PRIMARY KEY, kind TEXT NOT NULL, full_routing BOOLEAN NOT NULL, \
                 retry_max_hops INTEGER NOT NULL, retry_wall_ms INTEGER NOT NULL, \
-                enabled BOOLEAN NOT NULL\
+                enabled BOOLEAN NOT NULL, lane_priority SMALLINT NOT NULL DEFAULT 0, \
+                fallback_reserve_ms INTEGER NOT NULL DEFAULT 30000\
              ); \
              CREATE TEMP TABLE llm_providers (\
                 id BIGINT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, protocol TEXT, \
@@ -3042,66 +3170,77 @@ mod tests {
                 role TEXT NOT NULL, provider_model_id BIGINT NOT NULL, weight INTEGER, \
                 fallback_order INTEGER, canary_percent INTEGER, enabled BOOLEAN NOT NULL, \
                 inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL, \
-                CONSTRAINT reject_maple CHECK (provider_model_id <> 21)\
+                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL\
              )",
         )
         .execute(&pool)
         .await?;
-        sqlx::raw_sql(
+        // The reasoner (model 20) is the subject-merge target; Maple (model 21)
+        // serves the route before the backfill and shares the GPU2 pool.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "INSERT INTO workflows VALUES \
                 ('memory_subject_merge', 'chat', FALSE, 3, 60000, TRUE); \
              INSERT INTO llm_capacity_pools \
                 (id, name, max_concurrency, description) VALUES \
-                (7, 'aifarm-gpu2-qwen27b', 1, 'shared test pool'); \
+                (7, '{MEMORY_GPU2_POOL}', 1, 'shared test pool'); \
              INSERT INTO llm_providers \
                 (id, name, kind, protocol, enabled) VALUES \
-                (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE), \
+                (2, '{reasoner_provider}', 'chat', 'openai_compat', TRUE), \
                 (3, 'aifarm-maple', 'chat', 'openai_compat', TRUE); \
              INSERT INTO provider_models \
                 (id, provider_id, model_name, capabilities, pool_id, enabled, config) VALUES \
-                (20, 2, 'vibethinker-3b', ARRAY['chat', 'tools'], NULL, TRUE, '{}'), \
+                (20, 2, '{reasoner_model}', ARRAY['chat', 'tools'], NULL, TRUE, '{{}}'), \
                 (21, 3, 'maple-preview-2bit-mlx', ARRAY['chat', 'tools'], 7, TRUE, \
                  jsonb_build_object('managed_by', 'maple_gpu2_cutover_v1', 'origin', 'fresh')); \
              INSERT INTO workflow_assignments \
                 (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, \
                  enabled, cb_failure_threshold, cb_cooldown_ms) VALUES \
-                (99, 'memory_subject_merge', 'global', 'primary', 20, 100, NULL, \
-                 TRUE, 5, 30000)",
-        )
+                (99, 'memory_subject_merge', 'global', 'primary', 21, 100, NULL, \
+                 TRUE, 5, 30000); \
+             ALTER TABLE workflow_assignments \
+                ADD CONSTRAINT reject_reasoner CHECK (provider_model_id <> 20)",
+            reasoner_provider = crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            reasoner_model = crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
+        )))
         .execute(&pool)
         .await?;
 
         assert!(backfill_memory_routing_cascades(&pool).await.is_err());
-        let surviving_assignment: i64 = sqlx::query_scalar(
-            "SELECT id FROM workflow_assignments WHERE workflow_key = 'memory_subject_merge'",
+        let surviving_assignment: (i64, i64) = sqlx::query_as(
+            "SELECT id, provider_model_id FROM workflow_assignments \
+             WHERE workflow_key = 'memory_subject_merge'",
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(surviving_assignment, 99);
+        assert_eq!(surviving_assignment, (99, 21));
         let guard_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM app_settings \
              WHERE key = 'llm.routing.memory_subject_merge_cascade_v1'",
         )
         .fetch_one(&pool)
         .await?;
-        let pool_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM llm_capacity_pools WHERE name = 'aifarm-gpu2-qwen27b'",
-        )
-        .fetch_one(&pool)
-        .await?;
+        let pool_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM llm_capacity_pools WHERE name = $1")
+                .bind(MEMORY_GPU2_POOL)
+                .fetch_one(&pool)
+                .await?;
+        let reasoner_pool: Option<i64> =
+            sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = 20")
+                .fetch_one(&pool)
+                .await?;
         assert_eq!(guard_count, 0);
         assert_eq!(pool_count, 1);
+        assert_eq!(reasoner_pool, None, "the failed backfill rolled back");
 
-        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_maple")
+        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_reasoner")
             .execute(&pool)
             .await?;
         assert!(backfill_memory_routing_cascades(&pool).await?);
-        let subject_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM workflow_assignments \
-             WHERE workflow_key = 'memory_subject_merge'",
+        let subject_targets: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT role, provider_model_id FROM workflow_assignments \
+             WHERE workflow_key = 'memory_subject_merge' ORDER BY id",
         )
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await?;
         let extraction_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM workflow_assignments \
@@ -3116,8 +3255,11 @@ mod tests {
             sqlx::query_scalar("SELECT pool_id FROM provider_models ORDER BY id")
                 .fetch_all(&pool)
                 .await?;
-        assert_eq!(subject_count, 2);
-        assert_eq!(extraction_count, 0);
+        assert_eq!(subject_targets, vec![("primary".to_owned(), 20)]);
+        assert_eq!(
+            extraction_count, 0,
+            "extraction does not wait for the hosted cascade models"
+        );
         assert_eq!(guards, vec![MEMORY_SUBJECT_MERGE_CASCADE_KEY.to_owned()]);
         assert_eq!(model_pools, vec![Some(7), Some(7)]);
         let maple_config: Value =
@@ -3132,7 +3274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_fresh_migrations_memory_backfill_and_maple_rollback_round_trip()
+    async fn live_fresh_migrations_then_backfill_route_subject_merge_to_the_gpu2_reasoner()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
             return Ok(());
@@ -3141,7 +3283,7 @@ mod tests {
             .max_connections(1)
             .connect(&dsn)
             .await?;
-        let schema = format!("maple_fresh_runtime_{}", std::process::id());
+        let schema = format!("memory_backfill_fresh_{}", std::process::id());
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
         )))
@@ -3156,97 +3298,70 @@ mod tests {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        openplotva_storage::run_migrations_on(&pool).await?;
 
-        let maple: (i64, i64, i64, Value) = sqlx::query_as(
-            "SELECT provider.id, model.id, model.pool_id, model.config              FROM llm_providers AS provider              JOIN provider_models AS model ON model.provider_id = provider.id              WHERE provider.name = 'aifarm-maple'                AND model.model_name = 'maple-preview-2bit-mlx'",
-        )
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(maple.3["origin"], json!("fresh"));
+        let result: Result<(), Box<dyn std::error::Error>> = async {
+            openplotva_storage::run_migrations_on(&pool).await?;
+            let reasoner_model_id: i64 = sqlx::query_scalar(
+                "SELECT model.id FROM llm_providers AS provider \
+                 JOIN provider_models AS model ON model.provider_id = provider.id \
+                 WHERE provider.name = $1 AND model.model_name = $2",
+            )
+            .bind(crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME)
+            .bind(crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL)
+            .fetch_one(&pool)
+            .await?;
+            let gpu2_pool_id: i64 =
+                sqlx::query_scalar("SELECT id FROM llm_capacity_pools WHERE name = $1")
+                    .bind(MEMORY_GPU2_POOL)
+                    .fetch_one(&pool)
+                    .await?;
+            let maple_before: (i64, Value) = sqlx::query_as(
+                "SELECT model.id, model.config FROM llm_providers AS provider \
+                 JOIN provider_models AS model ON model.provider_id = provider.id \
+                 WHERE provider.name = 'aifarm-maple' \
+                   AND model.model_name = 'maple-preview-2bit-mlx'",
+            )
+            .fetch_one(&pool)
+            .await?;
 
-        let vibe_provider_id: i64 = sqlx::query_scalar(
-            "INSERT INTO llm_providers                 (name, kind, protocol, runtime_hint, discovery_service_name,                  discovery_endpoint_name, api_key_ref, enabled, config)              VALUES ('aifarm-llamacpp-gpu2', 'chat', 'openai_compat', 'llama_cpp',                      'llm-openai-qwen27b-gguf', 'chat_completions',                      'DIALOG_API_KEY', TRUE, '{}'::jsonb)              RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await?;
-        let vibe_model_id: i64 = sqlx::query_scalar(
-            "INSERT INTO provider_models                 (provider_id, model_name, display_name, capabilities, enabled, config)              VALUES ($1, 'vibethinker-3b', 'VibeThinker 3B',                      ARRAY['chat', 'tools'], TRUE, '{}'::jsonb)              RETURNING id",
-        )
-        .bind(vibe_provider_id)
-        .fetch_one(&pool)
-        .await?;
-
-        assert!(backfill_memory_routing_cascades(&pool).await?);
-        let maple_config_after_backfill: Value =
-            sqlx::query_scalar("SELECT config FROM provider_models WHERE id = $1")
-                .bind(maple.1)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(maple_config_after_backfill, maple.3);
-        let vibe_pool_id: i64 =
-            sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = $1")
-                .bind(vibe_model_id)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(vibe_pool_id, maple.2);
-
-        let maple_assignment_id: i64 = sqlx::query_scalar(
-            "SELECT assignment.id              FROM workflow_assignments AS assignment              WHERE assignment.workflow_key = 'memory_subject_merge'                AND assignment.provider_model_id = $1",
-        )
-        .bind(maple.1)
-        .fetch_one(&pool)
-        .await?;
-        let maple_event_id: i64 = sqlx::query_scalar(
-            "INSERT INTO llm_routing_events                 (severity, event_type, workflow_key, provider_id, model_id,                  dedupe_key, summary, detail)              VALUES ('info', 'maple_fresh_test', 'memory_subject_merge', $1, $2,                      'maple-fresh-runtime-round-trip', 'Maple fresh runtime test',                      jsonb_build_object('preserve', TRUE))              RETURNING id",
-        )
-        .bind(maple.0)
-        .bind(maple.1)
-        .fetch_one(&pool)
-        .await?;
-
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/180_maple_gpu2_cutover.down.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        let rolled_back_assignment: (i64, bool, bool) = sqlx::query_as(
-            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
-        )
-        .bind(maple_assignment_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(rolled_back_assignment, (maple.1, false, true));
-        let preserved_event: (i64, Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT id, provider_id, model_id FROM llm_routing_events WHERE id = $1",
-        )
-        .bind(maple_event_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(
-            preserved_event,
-            (maple_event_id, Some(maple.0), Some(maple.1))
-        );
-
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/180_maple_gpu2_cutover.up.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        let reapplied_assignment: (i64, bool, bool) = sqlx::query_as(
-            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
-        )
-        .bind(maple_assignment_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(reapplied_assignment, (maple.1, true, false));
+            assert!(backfill_memory_routing_cascades(&pool).await?);
+            let subject_targets: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT role, provider_model_id FROM workflow_assignments \
+                 WHERE workflow_key = 'memory_subject_merge' AND scope = 'global' \
+                 ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await?;
+            assert_eq!(
+                subject_targets,
+                vec![("primary".to_owned(), reasoner_model_id)]
+            );
+            let reasoner_pool: Option<i64> =
+                sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = $1")
+                    .bind(reasoner_model_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(reasoner_pool, Some(gpu2_pool_id));
+            let maple_config_after: Value =
+                sqlx::query_scalar("SELECT config FROM provider_models WHERE id = $1")
+                    .bind(maple_before.0)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(maple_config_after, maple_before.1);
+            assert!(
+                !backfill_memory_routing_cascades(&pool).await?,
+                "the guard makes the backfill run once"
+            );
+            Ok(())
+        }
+        .await;
 
         pool.close().await;
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await?;
         admin.close().await;
-        Ok(())
+        result
     }
 
     #[test]
@@ -3355,6 +3470,8 @@ mod tests {
                 retry_max_hops: 1,
                 retry_wall_ms: 10_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(100, "embedding", "global", "primary", 10, None)],
             triggers: vec![],
@@ -3404,6 +3521,8 @@ mod tests {
                 retry_max_hops: 2,
                 retry_wall_ms: 120_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(
                 100,
@@ -3478,6 +3597,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
@@ -3486,6 +3607,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY.to_owned(),
@@ -3494,6 +3617,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
@@ -3502,6 +3627,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
             ],
             assignments: vec![
