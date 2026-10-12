@@ -672,6 +672,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -727,6 +728,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await
     }
@@ -1445,6 +1447,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -1487,6 +1490,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await
             .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()));
@@ -1744,6 +1748,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await
     }
@@ -2023,6 +2028,7 @@ where
                 url,
                 headers,
                 body,
+                retry_on_connection_drop: false,
             })
             .await
     }

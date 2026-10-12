@@ -10067,6 +10067,25 @@ mod tests {
     }
 
     #[test]
+    fn vision_fallback_joins_the_gpu2_pool_and_is_reversible() {
+        const UP: &str = include_str!("../../../migrations/198_vision_fallback_gpu2_pool.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/198_vision_fallback_gpu2_pool.down.sql");
+
+        for value in [
+            "provider.name = 'aifarm-vision-ninfer'",
+            "model.model_name = 'qwen3.8-27b'",
+            "capacity_pool.name = 'aifarm-gpu2-qwen27b'",
+            "'vision_gpu2_pool_v1_previous_pool_id', model.pool_id",
+        ] {
+            assert!(UP.contains(value), "missing vision pool contract {value}");
+        }
+        assert!(!UP.contains("workflow_assignments"));
+        assert!(!UP.contains("max_concurrency"));
+        assert!(DOWN.contains("WHERE config ? 'vision_gpu2_pool_v1_previous_pool_id'"));
+    }
+
+    #[test]
     fn gpu2_eight_lanes_widen_only_the_gpu2_pool_and_are_reversible() {
         const UP: &str = include_str!("../../../migrations/197_gpu2_eight_lanes.up.sql");
         const DOWN: &str = include_str!("../../../migrations/197_gpu2_eight_lanes.down.sql");

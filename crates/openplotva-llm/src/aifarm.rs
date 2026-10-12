@@ -920,6 +920,9 @@ pub struct AifarmHttpRequest {
     pub headers: BTreeMap<String, String>,
     /// Body.
     pub body: Vec<u8>,
+    /// Whether one fresh attempt is safe after the connection drops before a response:
+    /// Discovery jobs carry an idempotency key, and reads repeat without effect.
+    pub retry_on_connection_drop: bool,
 }
 
 /// AIFarm HTTP response.
@@ -983,14 +986,28 @@ impl AifarmHttpTransport for ReqwestAifarmTransport {
                 AifarmHttpMethod::Get => reqwest::Method::GET,
                 AifarmHttpMethod::Post => reqwest::Method::POST,
             };
-            let mut builder = self.client.request(method, &request.url);
-            for (name, value) in &request.headers {
-                builder = builder.header(name, value);
+            let send = || {
+                let mut builder = self.client.request(method.clone(), &request.url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                if !request.body.is_empty() {
+                    builder = builder.body(request.body.clone());
+                }
+                builder.send()
+            };
+            // A pooled connection the far side already dropped fails before any response.
+            let response = match send().await {
+                Err(err)
+                    if request.retry_on_connection_drop
+                        && (err.is_request() || err.is_connect())
+                        && !err.is_timeout() =>
+                {
+                    send().await
+                }
+                result => result,
             }
-            if !request.body.is_empty() {
-                builder = builder.body(request.body);
-            }
-            let response = builder.send().await.map_err(|err| {
+            .map_err(|err| {
                 Box::new(AifarmClientError::Transport(err.to_string())) as CompletionError
             })?;
             let status = response.status();
@@ -1270,6 +1287,7 @@ where
                     url: self.cfg.direct_url.clone(),
                     headers: direct_completion_headers(&self.cfg, &request),
                     body,
+                    retry_on_connection_drop: false,
                 },
                 self.task_limit(),
                 "direct dialog request",
@@ -1411,6 +1429,7 @@ where
                     url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
+                    retry_on_connection_drop: true,
                 },
                 self.sync_submit_limit(),
                 "discovery sync submit",
@@ -1436,6 +1455,7 @@ where
                     url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
+                    retry_on_connection_drop: true,
                 },
                 self.sync_submit_limit(),
                 "discovery sync submit",
@@ -1550,6 +1570,7 @@ where
                     )),
                     headers: BTreeMap::new(),
                     body: Vec::new(),
+                    retry_on_connection_drop: true,
                 },
                 wait.saturating_add(self.request_limit()),
                 "discovery job status poll",
@@ -1630,6 +1651,7 @@ where
                     url: direct_status_endpoint(&self.cfg.direct_url, request_id),
                     headers: direct_status_headers(&self.cfg),
                     body: Vec::new(),
+                    retry_on_connection_drop: true,
                 },
                 self.request_limit(),
                 "direct dialog status poll",
@@ -3103,11 +3125,11 @@ where
         if request.input.textual_tool_calls
             && matches!(selection, Ok(ToolStepSelection::None(_)))
             && let Some((name, parameters)) = &forced_tool
-            && let Some(step) = forced_tool_markup_step(response, name, parameters)
+            && let Some((step, text)) = forced_tool_markup_step(response, name, parameters)
         {
             selection = Ok(ToolStepSelection::Steps {
                 steps: vec![step],
-                text: String::new(),
+                text,
             });
         }
         match selection {
@@ -5391,12 +5413,13 @@ fn first_choice_tool_steps(
 /// The arguments of a required tool written as bare `<parameter>value</parameter>`
 /// elements, the shape a model without native tool calling falls back to when the
 /// request names one tool; the engine's own call wrapper may enclose them. Every element
-/// must name a parameter of that tool, and nothing else may surround them.
+/// must name a parameter of that tool. Text may only follow a closed call wrapper; it is
+/// returned as the text that accompanies the call.
 fn forced_tool_markup_step(
     response: &Value,
     name: &str,
     parameters: &Value,
-) -> Option<PendingToolStep> {
+) -> Option<(PendingToolStep, String)> {
     let parameters = parameters.as_object()?;
     let content = first_choice_message_value(response)
         .ok()?
@@ -5412,13 +5435,20 @@ fn forced_tool_markup_step(
     ];
     let mut rest = content.trim();
     let mut arguments = serde_json::Map::new();
+    let mut call_closed = false;
+    let mut text = String::new();
     while !rest.is_empty() {
-        if let Some(after) = wrappers
+        if let Some((wrapper, after)) = wrappers
             .iter()
-            .find_map(|wrapper| rest.strip_prefix(wrapper))
+            .find_map(|wrapper| rest.strip_prefix(wrapper).map(|after| (*wrapper, after)))
         {
+            call_closed |= wrapper.starts_with("</");
             rest = after.trim_start();
             continue;
+        }
+        if call_closed && !arguments.is_empty() && !rest.starts_with('<') {
+            text = rest.trim().to_owned();
+            break;
         }
         let tail = rest.strip_prefix('<')?;
         let tag_end = tail.find('>')?;
@@ -5447,16 +5477,19 @@ fn forced_tool_markup_step(
         },
     }])
     .ok()?;
-    Some(PendingToolStep {
-        decision: ToolParseDecision {
-            form: "forced_markup".to_owned(),
-            tool: name.to_owned(),
-            outcome: "detected".to_owned(),
-            reason: String::new(),
+    Some((
+        PendingToolStep {
+            decision: ToolParseDecision {
+                form: "forced_markup".to_owned(),
+                tool: name.to_owned(),
+                outcome: "detected".to_owned(),
+                reason: String::new(),
+            },
+            step,
+            native_ref: None,
         },
-        step,
-        native_ref: None,
-    })
+        text,
+    ))
 }
 
 fn tool_protocol_completion_error(message: impl Into<String>) -> CompletionError {
@@ -11010,6 +11043,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn transport_retries_once_when_the_connection_drops_before_a_response() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut dropped, _) = listener.accept().expect("first connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = dropped.read(&mut buffer);
+            drop(dropped);
+            let (mut served, _) = listener.accept().expect("retried connection");
+            let _ = served.read(&mut buffer);
+            served
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .expect("respond");
+        });
+
+        let response = ReqwestAifarmTransport::default()
+            .send(AifarmHttpRequest {
+                method: AifarmHttpMethod::Post,
+                url: format!("http://{address}/v1/jobs/sync"),
+                headers: BTreeMap::new(),
+                body: b"{}".to_vec(),
+                retry_on_connection_drop: true,
+            })
+            .await
+            .expect("the retried request succeeds");
+        server.join().expect("server thread");
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.body, b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn transport_leaves_requests_without_the_retry_flag_to_the_caller() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut dropped, _) = listener.accept().expect("only connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = dropped.read(&mut buffer);
+        });
+
+        let result = ReqwestAifarmTransport::default()
+            .send(AifarmHttpRequest {
+                method: AifarmHttpMethod::Post,
+                url: format!("http://{address}/v1/chat/completions"),
+                headers: BTreeMap::new(),
+                body: b"{}".to_vec(),
+                retry_on_connection_drop: false,
+            })
+            .await;
+        server.join().expect("server thread");
+
+        assert!(result.is_err(), "a direct completion is not sent twice");
+    }
+
     async fn forced_draw_step(
         content: &str,
         textual_tool_calls: bool,
@@ -11065,6 +11158,16 @@ mod tests {
             wrapped.tool_calls[0].step.file_ids,
             vec!["message_42_image_1".to_owned()]
         );
+
+        let commented = forced_draw_step(
+            "<caption>Кот</caption>\n<prompt>A cat on a roof</prompt></function></tool_call>\nДержи кота на крыше.",
+            true,
+        )
+        .await
+        .expect("text after the closed call accompanies it");
+        assert_eq!(commented.tool_calls.len(), 1);
+        assert_eq!(commented.tool_calls[0].step.prompt, "A cat on a roof");
+        assert_eq!(commented.text, "Держи кота на крыше.");
     }
 
     #[tokio::test]
@@ -11090,6 +11193,15 @@ mod tests {
             .map(|output| output.tool_calls.len())
             .unwrap_or_default();
         assert_eq!(prose, 0);
+
+        let unclosed_prose = forced_draw_step("<prompt>a cat</prompt>\nВот кот", true)
+            .await
+            .map(|output| output.tool_calls.len())
+            .unwrap_or_default();
+        assert_eq!(
+            unclosed_prose, 0,
+            "text after an unclosed call stays ambiguous"
+        );
     }
 
     #[tokio::test]
