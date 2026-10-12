@@ -266,4 +266,27 @@ impl RoutingTable {
     pub fn workflow_keys(&self) -> impl Iterator<Item = &str> {
         self.routes.keys().map(String::as_str)
     }
+
+    /// Models any route can reach (primaries, fallbacks, canaries, shadows and
+    /// trigger targets of every workflow and scope), each once, by id.
+    pub fn routed_models(&self) -> impl Iterator<Item = &ModelRow> {
+        let mut ids: Vec<ModelId> = self
+            .routes
+            .values()
+            .flat_map(|scoped| scoped.global.iter().chain(scoped.vip.iter()))
+            .flat_map(|route| {
+                route
+                    .primary
+                    .iter()
+                    .chain(route.fallback_tail.iter())
+                    .chain(route.canary.iter())
+                    .chain(route.shadow.iter())
+                    .chain(route.triggers.iter().map(|trigger| &trigger.engage))
+                    .map(|candidate| candidate.model)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| self.models.get(&id))
+    }
 }

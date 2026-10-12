@@ -541,14 +541,14 @@ impl PostgresRuntimeLlmAnalyticsReader {
 }
 
 #[derive(Clone)]
-struct DiscoveryCapacityClient {
+pub(crate) struct DiscoveryCapacityClient {
     base_url: String,
     service_name: String,
     http: reqwest::Client,
 }
 
 impl DiscoveryCapacityClient {
-    fn new(base_url: String, service_name: String) -> Self {
+    pub(crate) fn new(base_url: String, service_name: String) -> Self {
         Self {
             base_url,
             service_name,
@@ -556,7 +556,7 @@ impl DiscoveryCapacityClient {
         }
     }
 
-    async fn fetch(&self) -> RuntimeAifarmCapacitySnapshotData {
+    pub(crate) async fn fetch(&self) -> RuntimeAifarmCapacitySnapshotData {
         let mut snapshot = RuntimeAifarmCapacitySnapshotData {
             service: self.service_name.trim().to_owned(),
             observed_at: format_rfc3339(OffsetDateTime::now_utc()),

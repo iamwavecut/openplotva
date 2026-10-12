@@ -2164,14 +2164,15 @@ impl LaneWorkerScale {
 }
 
 /// Everything the runtime rebuilds when the routing configuration changes:
-/// the published table, the lane pool registry, and the dialog and memory
-/// worker scales. Breakers/triggers are deliberately absent — their state must
-/// survive a reload untouched.
+/// the published table, the lane pool registry, the dialog and memory worker
+/// scales, and the lane check against Discovery. Breakers/triggers are
+/// deliberately absent — their state must survive a reload untouched.
 pub struct RouterRuntime {
     pub handle: Arc<RouterHandle>,
     pub pools: Arc<openplotva_llm::router::PoolRegistry>,
     pub dialog_workers: Option<LaneWorkerScale>,
     pub memory_workers: Option<LaneWorkerScale>,
+    pub(crate) lane_check: Option<crate::lane_checks::LaneCheck>,
 }
 
 impl RouterRuntime {
@@ -2198,6 +2199,12 @@ pub async fn reload_router_runtime(
     let table = load_routing_table(pool).await?;
     runtime.handle.store(table);
     runtime.apply_published_table();
+    if let Some(check) = runtime.lane_check.clone() {
+        let table = runtime.handle.snapshot();
+        tokio::spawn(async move {
+            check.run(&table).await;
+        });
+    }
     Ok(())
 }
 
@@ -2802,6 +2809,7 @@ mod tests {
             pools: Arc::new(openplotva_llm::router::PoolRegistry::new()),
             dialog_workers: Some(dialog),
             memory_workers: Some(memory),
+            lane_check: None,
         };
 
         runtime.apply_published_table();

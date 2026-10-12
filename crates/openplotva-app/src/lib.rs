@@ -29,6 +29,7 @@ pub mod history_summary;
 pub mod image_jobs;
 pub mod ingestion_telemetry;
 pub mod inline;
+mod lane_checks;
 mod maintenance_api;
 pub mod media;
 pub mod members;
@@ -10761,6 +10762,14 @@ async fn start_runtime_workers(
     workers.router_pools = Some(Arc::clone(&router_pools));
     workers.openrouter_free_gate = Some(Arc::clone(&openrouter_free_gate));
     router_pools.apply(&router_handle.snapshot().pool_specs());
+    let lane_check = lane_checks::LaneCheck {
+        discovery_base_url: config.llm.discovery.base_url.clone(),
+        reporter: Some(routing_event_reporter.clone()),
+    };
+    readiness_checks.push(ReadinessCheck::ok(
+        "lane_config",
+        lane_check.run(&router_handle.snapshot()).await.summary(),
+    ));
     {
         let pool = service_clients.postgres.clone();
         let handle = Arc::clone(&router_handle);
@@ -13086,6 +13095,7 @@ async fn start_runtime_workers(
                 pools: Arc::clone(&router_pools),
                 dialog_workers: Some(dialog_lanes),
                 memory_workers: memory_worker_scale.take(),
+                lane_check: Some(lane_check.clone()),
             }));
             tracing::info!(
                 initial_dialog_workers,
