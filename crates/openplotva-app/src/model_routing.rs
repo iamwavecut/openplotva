@@ -3170,66 +3170,77 @@ mod tests {
                 role TEXT NOT NULL, provider_model_id BIGINT NOT NULL, weight INTEGER, \
                 fallback_order INTEGER, canary_percent INTEGER, enabled BOOLEAN NOT NULL, \
                 inference_overrides JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL, \
-                CONSTRAINT reject_maple CHECK (provider_model_id <> 21)\
+                cb_failure_threshold INTEGER NOT NULL, cb_cooldown_ms INTEGER NOT NULL\
              )",
         )
         .execute(&pool)
         .await?;
-        sqlx::raw_sql(
+        // The reasoner (model 20) is the subject-merge target; Maple (model 21)
+        // serves the route before the backfill and shares the GPU2 pool.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "INSERT INTO workflows VALUES \
                 ('memory_subject_merge', 'chat', FALSE, 3, 60000, TRUE); \
              INSERT INTO llm_capacity_pools \
                 (id, name, max_concurrency, description) VALUES \
-                (7, 'aifarm-gpu2-utility', 1, 'shared test pool'); \
+                (7, '{MEMORY_GPU2_POOL}', 1, 'shared test pool'); \
              INSERT INTO llm_providers \
                 (id, name, kind, protocol, enabled) VALUES \
-                (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE), \
+                (2, '{reasoner_provider}', 'chat', 'openai_compat', TRUE), \
                 (3, 'aifarm-maple', 'chat', 'openai_compat', TRUE); \
              INSERT INTO provider_models \
                 (id, provider_id, model_name, capabilities, pool_id, enabled, config) VALUES \
-                (20, 2, 'vibethinker-3b', ARRAY['chat', 'tools'], NULL, TRUE, '{}'), \
+                (20, 2, '{reasoner_model}', ARRAY['chat', 'tools'], NULL, TRUE, '{{}}'), \
                 (21, 3, 'maple-preview-2bit-mlx', ARRAY['chat', 'tools'], 7, TRUE, \
                  jsonb_build_object('managed_by', 'maple_gpu2_cutover_v1', 'origin', 'fresh')); \
              INSERT INTO workflow_assignments \
                 (id, workflow_key, scope, role, provider_model_id, weight, fallback_order, \
                  enabled, cb_failure_threshold, cb_cooldown_ms) VALUES \
-                (99, 'memory_subject_merge', 'global', 'primary', 20, 100, NULL, \
-                 TRUE, 5, 30000)",
-        )
+                (99, 'memory_subject_merge', 'global', 'primary', 21, 100, NULL, \
+                 TRUE, 5, 30000); \
+             ALTER TABLE workflow_assignments \
+                ADD CONSTRAINT reject_reasoner CHECK (provider_model_id <> 20)",
+            reasoner_provider = crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME,
+            reasoner_model = crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL,
+        )))
         .execute(&pool)
         .await?;
 
         assert!(backfill_memory_routing_cascades(&pool).await.is_err());
-        let surviving_assignment: i64 = sqlx::query_scalar(
-            "SELECT id FROM workflow_assignments WHERE workflow_key = 'memory_subject_merge'",
+        let surviving_assignment: (i64, i64) = sqlx::query_as(
+            "SELECT id, provider_model_id FROM workflow_assignments \
+             WHERE workflow_key = 'memory_subject_merge'",
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(surviving_assignment, 99);
+        assert_eq!(surviving_assignment, (99, 21));
         let guard_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM app_settings \
              WHERE key = 'llm.routing.memory_subject_merge_cascade_v1'",
         )
         .fetch_one(&pool)
         .await?;
-        let pool_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM llm_capacity_pools WHERE name = 'aifarm-gpu2-utility'",
-        )
-        .fetch_one(&pool)
-        .await?;
+        let pool_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM llm_capacity_pools WHERE name = $1")
+                .bind(MEMORY_GPU2_POOL)
+                .fetch_one(&pool)
+                .await?;
+        let reasoner_pool: Option<i64> =
+            sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = 20")
+                .fetch_one(&pool)
+                .await?;
         assert_eq!(guard_count, 0);
         assert_eq!(pool_count, 1);
+        assert_eq!(reasoner_pool, None, "the failed backfill rolled back");
 
-        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_maple")
+        sqlx::query("ALTER TABLE workflow_assignments DROP CONSTRAINT reject_reasoner")
             .execute(&pool)
             .await?;
         assert!(backfill_memory_routing_cascades(&pool).await?);
-        let subject_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM workflow_assignments \
-             WHERE workflow_key = 'memory_subject_merge'",
+        let subject_targets: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT role, provider_model_id FROM workflow_assignments \
+             WHERE workflow_key = 'memory_subject_merge' ORDER BY id",
         )
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await?;
         let extraction_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM workflow_assignments \
@@ -3244,8 +3255,11 @@ mod tests {
             sqlx::query_scalar("SELECT pool_id FROM provider_models ORDER BY id")
                 .fetch_all(&pool)
                 .await?;
-        assert_eq!(subject_count, 2);
-        assert_eq!(extraction_count, 0);
+        assert_eq!(subject_targets, vec![("primary".to_owned(), 20)]);
+        assert_eq!(
+            extraction_count, 0,
+            "extraction does not wait for the hosted cascade models"
+        );
         assert_eq!(guards, vec![MEMORY_SUBJECT_MERGE_CASCADE_KEY.to_owned()]);
         assert_eq!(model_pools, vec![Some(7), Some(7)]);
         let maple_config: Value =
@@ -3260,7 +3274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_fresh_migrations_memory_backfill_and_maple_rollback_round_trip()
+    async fn live_fresh_migrations_then_backfill_route_subject_merge_to_the_gpu2_reasoner()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
             return Ok(());
@@ -3269,7 +3283,7 @@ mod tests {
             .max_connections(1)
             .connect(&dsn)
             .await?;
-        let schema = format!("maple_fresh_runtime_{}", std::process::id());
+        let schema = format!("memory_backfill_fresh_{}", std::process::id());
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
         )))
@@ -3284,97 +3298,70 @@ mod tests {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        openplotva_storage::run_migrations_on(&pool).await?;
 
-        let maple: (i64, i64, i64, Value) = sqlx::query_as(
-            "SELECT provider.id, model.id, model.pool_id, model.config              FROM llm_providers AS provider              JOIN provider_models AS model ON model.provider_id = provider.id              WHERE provider.name = 'aifarm-maple'                AND model.model_name = 'maple-preview-2bit-mlx'",
-        )
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(maple.3["origin"], json!("fresh"));
+        let result: Result<(), Box<dyn std::error::Error>> = async {
+            openplotva_storage::run_migrations_on(&pool).await?;
+            let reasoner_model_id: i64 = sqlx::query_scalar(
+                "SELECT model.id FROM llm_providers AS provider \
+                 JOIN provider_models AS model ON model.provider_id = provider.id \
+                 WHERE provider.name = $1 AND model.model_name = $2",
+            )
+            .bind(crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME)
+            .bind(crate::agent_runtime::DEFAULT_LOCAL_REASONER_MODEL)
+            .fetch_one(&pool)
+            .await?;
+            let gpu2_pool_id: i64 =
+                sqlx::query_scalar("SELECT id FROM llm_capacity_pools WHERE name = $1")
+                    .bind(MEMORY_GPU2_POOL)
+                    .fetch_one(&pool)
+                    .await?;
+            let maple_before: (i64, Value) = sqlx::query_as(
+                "SELECT model.id, model.config FROM llm_providers AS provider \
+                 JOIN provider_models AS model ON model.provider_id = provider.id \
+                 WHERE provider.name = 'aifarm-maple' \
+                   AND model.model_name = 'maple-preview-2bit-mlx'",
+            )
+            .fetch_one(&pool)
+            .await?;
 
-        let vibe_provider_id: i64 = sqlx::query_scalar(
-            "INSERT INTO llm_providers                 (name, kind, protocol, runtime_hint, discovery_service_name,                  discovery_endpoint_name, api_key_ref, enabled, config)              VALUES ('aifarm-llamacpp-gpu2', 'chat', 'openai_compat', 'llama_cpp',                      'llm-openai-qwen27b-gguf', 'chat_completions',                      'DIALOG_API_KEY', TRUE, '{}'::jsonb)              RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await?;
-        let vibe_model_id: i64 = sqlx::query_scalar(
-            "INSERT INTO provider_models                 (provider_id, model_name, display_name, capabilities, enabled, config)              VALUES ($1, 'vibethinker-3b', 'VibeThinker 3B',                      ARRAY['chat', 'tools'], TRUE, '{}'::jsonb)              RETURNING id",
-        )
-        .bind(vibe_provider_id)
-        .fetch_one(&pool)
-        .await?;
-
-        assert!(backfill_memory_routing_cascades(&pool).await?);
-        let maple_config_after_backfill: Value =
-            sqlx::query_scalar("SELECT config FROM provider_models WHERE id = $1")
-                .bind(maple.1)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(maple_config_after_backfill, maple.3);
-        let vibe_pool_id: i64 =
-            sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = $1")
-                .bind(vibe_model_id)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(vibe_pool_id, maple.2);
-
-        let maple_assignment_id: i64 = sqlx::query_scalar(
-            "SELECT assignment.id              FROM workflow_assignments AS assignment              WHERE assignment.workflow_key = 'memory_subject_merge'                AND assignment.provider_model_id = $1",
-        )
-        .bind(maple.1)
-        .fetch_one(&pool)
-        .await?;
-        let maple_event_id: i64 = sqlx::query_scalar(
-            "INSERT INTO llm_routing_events                 (severity, event_type, workflow_key, provider_id, model_id,                  dedupe_key, summary, detail)              VALUES ('info', 'maple_fresh_test', 'memory_subject_merge', $1, $2,                      'maple-fresh-runtime-round-trip', 'Maple fresh runtime test',                      jsonb_build_object('preserve', TRUE))              RETURNING id",
-        )
-        .bind(maple.0)
-        .bind(maple.1)
-        .fetch_one(&pool)
-        .await?;
-
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/180_maple_gpu2_cutover.down.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        let rolled_back_assignment: (i64, bool, bool) = sqlx::query_as(
-            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
-        )
-        .bind(maple_assignment_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(rolled_back_assignment, (maple.1, false, true));
-        let preserved_event: (i64, Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT id, provider_id, model_id FROM llm_routing_events WHERE id = $1",
-        )
-        .bind(maple_event_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(
-            preserved_event,
-            (maple_event_id, Some(maple.0), Some(maple.1))
-        );
-
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/180_maple_gpu2_cutover.up.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        let reapplied_assignment: (i64, bool, bool) = sqlx::query_as(
-            "SELECT provider_model_id, enabled,                     inference_overrides                         ? 'disabled_by_maple_gpu2_cutover_v1_rollback'              FROM workflow_assignments WHERE id = $1",
-        )
-        .bind(maple_assignment_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(reapplied_assignment, (maple.1, true, false));
+            assert!(backfill_memory_routing_cascades(&pool).await?);
+            let subject_targets: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT role, provider_model_id FROM workflow_assignments \
+                 WHERE workflow_key = 'memory_subject_merge' AND scope = 'global' \
+                 ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await?;
+            assert_eq!(
+                subject_targets,
+                vec![("primary".to_owned(), reasoner_model_id)]
+            );
+            let reasoner_pool: Option<i64> =
+                sqlx::query_scalar("SELECT pool_id FROM provider_models WHERE id = $1")
+                    .bind(reasoner_model_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(reasoner_pool, Some(gpu2_pool_id));
+            let maple_config_after: Value =
+                sqlx::query_scalar("SELECT config FROM provider_models WHERE id = $1")
+                    .bind(maple_before.0)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(maple_config_after, maple_before.1);
+            assert!(
+                !backfill_memory_routing_cascades(&pool).await?,
+                "the guard makes the backfill run once"
+            );
+            Ok(())
+        }
+        .await;
 
         pool.close().await;
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await?;
         admin.close().await;
-        Ok(())
+        result
     }
 
     #[test]
