@@ -2014,8 +2014,17 @@ pub fn reply_has_residual_leak(value: &str) -> bool {
                 && line.contains("scratchpad")
                 && line.contains("shouldn't be seen"))
     });
+    let gemma_call_syntax = GEMMA_PROTOCOL_TOKENS
+        .iter()
+        .any(|token| value.contains(token))
+        || outside_code.lines().any(|line| {
+            line.trim_start()
+                .split_once('{')
+                .is_some_and(|(name, _)| is_known_step(name.trim()))
+        });
     tool_envelope
         || self_instruction
+        || gemma_call_syntax
         || REPLY_LEAK_MARKERS
             .iter()
             .any(|marker| lower.starts_with(marker))
@@ -2631,6 +2640,186 @@ fn parse_assistant_content_at_depth(
     })
 }
 
+/// Gemma's own call protocol: special tokens that never belong in a reply.
+const GEMMA_PROTOCOL_TOKENS: &[&str] = &[
+    GEMMA_STRING_DELIMITER,
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|tool_response>",
+    "<tool_response|>",
+];
+
+/// Delimits a string value inside a Gemma call, on both sides.
+const GEMMA_STRING_DELIMITER: &str = "<|\"|>";
+
+/// Gemma writes a tool call as `call:NAME{key:<|"|>text<|"|>,count:3}` between
+/// `<|tool_call>` and `<tool_call|>`. When the engine does not lift it into native tool
+/// calls, the reply text keeps it, sometimes without the markers and after an empty
+/// thinking block. Returns the prose before the calls and the calls, when everything
+/// from the first call to the end is calls of known tools.
+fn split_gemma_native_calls(raw: &str) -> Option<(String, Vec<ToolStep>)> {
+    let mut content = raw.trim();
+    while let Some(rest) = content.strip_prefix("<think>") {
+        content = rest.split_once("</think>")?.1.trim_start();
+    }
+    let mut line_start = 0;
+    loop {
+        if let Some(steps) = parse_gemma_call_sequence(&content[line_start..]) {
+            return Some((content[..line_start].trim().to_owned(), steps));
+        }
+        line_start += content[line_start..].find('\n')? + 1;
+    }
+}
+
+fn parse_gemma_call_sequence(text: &str) -> Option<Vec<ToolStep>> {
+    let mut rest = text.trim();
+    let mut steps = Vec::new();
+    while !rest.is_empty() {
+        rest = rest
+            .strip_prefix("<|tool_call>")
+            .unwrap_or(rest)
+            .trim_start();
+        rest = rest.strip_prefix("call:").unwrap_or(rest);
+        let (name, body) = rest.split_once('{')?;
+        let name = name.trim();
+        if !is_known_step(name) {
+            return None;
+        }
+        let mut parser = GemmaValueParser {
+            input: body,
+            offset: 0,
+        };
+        let arguments = parser.object_body()?;
+        steps.push(
+            parse_native_tool_step(&[NativeToolCall {
+                id: String::new(),
+                call_type: "function".to_owned(),
+                function: NativeToolFunction {
+                    name: name.to_owned(),
+                    arguments,
+                },
+            }])
+            .ok()?,
+        );
+        rest = body[parser.offset..].trim_start();
+        rest = rest
+            .strip_prefix("<tool_call|>")
+            .unwrap_or(rest)
+            .trim_start();
+    }
+    (!steps.is_empty()).then_some(steps)
+}
+
+/// Reads Gemma's argument notation: bare keys, `<|"|>`-delimited strings, and JSON-like
+/// numbers, booleans, null, arrays and objects.
+struct GemmaValueParser<'a> {
+    input: &'a str,
+    offset: usize,
+}
+
+impl<'a> GemmaValueParser<'a> {
+    fn rest(&self) -> &'a str {
+        &self.input[self.offset..]
+    }
+
+    fn skip_whitespace(&mut self) {
+        self.offset += self.rest().len() - self.rest().trim_start().len();
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        self.skip_whitespace();
+        if self.rest().starts_with(token) {
+            self.offset += token.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Members after an opening `{` (already consumed), through the closing `}`.
+    fn object_body(&mut self) -> Option<Value> {
+        let mut object = serde_json::Map::new();
+        if self.eat("}") {
+            return Some(Value::Object(object));
+        }
+        loop {
+            let key = self.key()?;
+            if !self.eat(":") {
+                return None;
+            }
+            let value = self.value()?;
+            object.insert(key, value);
+            if self.eat("}") {
+                return Some(Value::Object(object));
+            }
+            if !self.eat(",") {
+                return None;
+            }
+        }
+    }
+
+    fn key(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        if self.rest().starts_with(GEMMA_STRING_DELIMITER) {
+            return self.string();
+        }
+        let len = self
+            .rest()
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .unwrap_or(self.rest().len());
+        if len == 0 {
+            return None;
+        }
+        let key = self.rest()[..len].to_owned();
+        self.offset += len;
+        Some(key)
+    }
+
+    fn string(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let body = self.rest().strip_prefix(GEMMA_STRING_DELIMITER)?;
+        let end = body.find(GEMMA_STRING_DELIMITER)?;
+        let value = body[..end].to_owned();
+        self.offset += GEMMA_STRING_DELIMITER.len() * 2 + end;
+        Some(value)
+    }
+
+    fn value(&mut self) -> Option<Value> {
+        self.skip_whitespace();
+        let rest = self.rest();
+        if rest.starts_with(GEMMA_STRING_DELIMITER) {
+            return self.string().map(Value::String);
+        }
+        if self.eat("{") {
+            return self.object_body();
+        }
+        if self.eat("[") {
+            let mut items = Vec::new();
+            if self.eat("]") {
+                return Some(Value::Array(items));
+            }
+            loop {
+                items.push(self.value()?);
+                if self.eat("]") {
+                    return Some(Value::Array(items));
+                }
+                if !self.eat(",") {
+                    return None;
+                }
+            }
+        }
+        let len = rest
+            .find(|ch: char| matches!(ch, ',' | '}' | ']') || ch.is_whitespace())
+            .unwrap_or(rest.len());
+        let value = serde_json::from_str::<Value>(&rest[..len]).ok()?;
+        if value.is_string() || value.is_object() || value.is_array() {
+            return None;
+        }
+        self.offset += len;
+        Some(value)
+    }
+}
+
 fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) -> Option<String> {
     let decoded = unescape_xmlish(raw);
     let content = if decision.form == "xmlish" && !raw.contains('<') && decoded.contains('<') {
@@ -2646,6 +2835,7 @@ fn content_without_pseudo_tool_calls(raw: &str, decision: &ToolParseDecision) ->
         "bare_start" | "bare_block" => remove_bare_tool_protocol(content),
         "fenced" => remove_fenced_tool_protocol(content),
         "json" => Some(String::new()),
+        "gemma_call" => split_gemma_native_calls(content).map(|(prose, _)| prose),
         "tool_prefix" | "function_args" | "colon_args" => {
             remove_tool_protocol_line(content, &decision.tool)
         }
@@ -2990,6 +3180,19 @@ fn extract_content_tool_steps_raw(
     if decoded.trim() != raw_content
         && let Some((steps, decision)) = detect_tool_steps_in(decoded.trim())?
     {
+        return Ok((steps, decision));
+    }
+    if let Some((_, steps)) = split_gemma_native_calls(raw_content) {
+        let decision = ToolParseDecision {
+            form: "gemma_call".to_owned(),
+            tool: steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
         return Ok((steps, decision));
     }
     if let Some(decision) = detect_ignored_tool_call(raw_content) {
@@ -5042,6 +5245,61 @@ fn is_zero_i32(value: &i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemma_native_tool_calls_written_as_text_become_tool_steps() {
+        let parsed = parse_assistant_content(
+            "<think>\n</think>draw_image{caption:<|\"|>Мигающие мельницы<|\"|>,prompt:<|\"|>Surreal landscape with windmills, cinematic.<|\"|>}",
+        )
+        .expect("parsed");
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(parsed.tool_steps[0].caption, "Мигающие мельницы");
+        assert_eq!(
+            parsed.tool_steps[0].prompt,
+            "Surreal landscape with windmills, cinematic."
+        );
+        assert!(!parsed.residual_protocol);
+        assert_eq!(parsed.text, "");
+
+        let reaction =
+            parse_assistant_content("react_to_message{emoji:<|\"|>🤝<|\"|>,message_id:62417}")
+                .expect("reaction");
+        assert_eq!(reaction.tool_steps.len(), 1);
+        assert_eq!(reaction.tool_steps[0].step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(reaction.tool_steps[0].emoji, "🤝");
+        assert_eq!(reaction.tool_steps[0].target_message_id, 62417);
+
+        let wrapped = parse_assistant_content(
+            "<|tool_call>call:web_search{query:<|\"|>погода в Москве<|\"|>}<tool_call|>",
+        )
+        .expect("wrapped");
+        assert_eq!(wrapped.tool_steps.len(), 1);
+        assert_eq!(wrapped.tool_steps[0].step, STEP_WEB_SEARCH);
+        assert_eq!(wrapped.tool_steps[0].query, "погода в Москве");
+    }
+
+    #[test]
+    fn gemma_call_syntax_never_reaches_the_user() {
+        for text in [
+            "Сейчас нарисую!\n\ndraw_image{caption:<|\"|>Кот<|\"|>,prompt:<|\"|>A cat<|\"|>",
+            "draw_image{caption: Яйцо отца короля, сюрреалистичное, prompt: A giant egg}",
+            "Готово <|\"|>",
+            "<|tool_call>call:unknown_tool{x:1}<tool_call|>",
+        ] {
+            assert!(
+                matches!(
+                    finalize_dialog_reply(text),
+                    DialogReplyOutcome::Suppressed { .. }
+                ),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            finalize_dialog_reply("Нарисовать через draw_image можно, просто попроси."),
+            DialogReplyOutcome::Reply(_)
+        ));
+    }
 
     #[test]
     fn final_reply_rejects_self_correction_without_rejecting_quoted_examples() {
