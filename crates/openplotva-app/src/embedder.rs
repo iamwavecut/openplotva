@@ -416,11 +416,7 @@ impl DiscoveryEmbedderClient {
             .await
             .map_err(|error| EmbedderClientError::discovery(format!("{stage} body: {error}")))?;
         if !status.is_success() {
-            return Err(EmbedderClientError::discovery(format!(
-                "{stage} status {}: {}",
-                status.as_u16(),
-                String::from_utf8_lossy(&bytes)
-            )));
+            return Err(envelope_status_error(stage, status.as_u16(), &bytes));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| EmbedderClientError::discovery(format!("decode {stage}: {error}")))
@@ -670,9 +666,19 @@ fn routed_embedder_client(
         .map_err(|error| EmbedderClientError::discovery(format!("build routed embedder: {error}")))
 }
 
+/// Discovery answers 429 when no embedder slot frees up within the capacity wait.
+fn envelope_status_error(stage: &str, status: u16, body: &[u8]) -> EmbedderClientError {
+    let message = format!("{stage} status {status}: {}", String::from_utf8_lossy(body));
+    if status == 429 {
+        EmbedderClientError::Busy { message }
+    } else {
+        EmbedderClientError::discovery(message)
+    }
+}
+
 fn embedder_retryable_reason(error: &EmbedderClientError) -> Option<FailureReason> {
     match error {
-        EmbedderClientError::EmptyPrompts => None,
+        EmbedderClientError::EmptyPrompts | EmbedderClientError::Busy { .. } => None,
         EmbedderClientError::Status { status, .. } if *status >= 500 => {
             Some(FailureReason::ProviderUnavailable)
         }
@@ -972,6 +978,22 @@ mod tests {
             ..DiscoveryJob::default()
         };
         let error = terminal_response(&job).expect_err("failed job is an error");
+        assert!(error.is_availability_failure());
+    }
+
+    #[test]
+    fn capacity_rejection_is_busy_without_charging_either_breaker() {
+        let error = envelope_status_error(
+            "submit",
+            429,
+            br#"{"detail":"service capacity unavailable"}"#,
+        );
+        assert!(matches!(error, EmbedderClientError::Busy { .. }));
+        assert!(!error.is_availability_failure());
+        assert!(error.is_temporarily_unavailable());
+        assert_eq!(embedder_retryable_reason(&error), None);
+
+        let error = envelope_status_error("poll", 502, b"bad gateway");
         assert!(error.is_availability_failure());
     }
 

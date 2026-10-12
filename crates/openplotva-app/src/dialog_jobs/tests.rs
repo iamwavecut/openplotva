@@ -5976,7 +5976,74 @@ async fn session_closes_tools_after_the_model_repeats_a_failed_call() -> Result<
         matches!(requests[2].tools, openplotva_dialog::ToolsMode::FinalOnly),
         "a step made only of repeated failed calls closes the tools"
     );
-    assert!(format!("{:?}", requests[2].transcript).contains("already failed"));
+    assert!(format!("{:?}", requests[2].transcript).contains("You repeated a tool call"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_closes_tools_after_the_model_repeats_a_successful_call()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("класс"), now),
+    );
+    let react = |id: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: "👍".to_owned(),
+                    target_message_id: 100,
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(react("c1")),
+        Ok(react("c2")),
+        Ok(step_text("согласна")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let reactor = Arc::new(ReactorStub::default());
+    let wiring = session_wiring(
+        toolbox,
+        Some(Arc::clone(&reactor) as Arc<dyn crate::dialog_turn::SessionReactor>),
+    );
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer);
+    assert_eq!(
+        reactor.reactions.lock().expect("reactions").len(),
+        1,
+        "the repeated reaction reuses the first result"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        matches!(requests[2].tools, openplotva_dialog::ToolsMode::FinalOnly),
+        "a step made only of reused results closes the tools"
+    );
+    assert!(format!("{:?}", requests[2].transcript).contains("You repeated a tool call"));
     Ok(())
 }
 

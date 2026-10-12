@@ -876,7 +876,7 @@ pub const SQL_GET_CHAT_HISTORY_RESET_AT: &str =
 
 pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($2::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($5::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND occurred_at > $2 AND occurred_at <= $5 AND ($3::integer = 0 OR thread_id <> $3 OR occurred_at > $4) AND (occurred_at < $5 OR (occurred_at = $5 AND message_id <= $6)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $7";
 
-pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($4::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND occurred_at <= $4 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
+pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND bucket_day <= ($4::timestamptz AT TIME ZONE 'UTC')::date AND chat_id = $1 AND thread_id = $2 AND thread_id <> 0 AND occurred_at > $3 AND occurred_at <= $4 AND (occurred_at < $4 OR (occurred_at = $4 AND message_id <= $5)) ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $6";
 
 pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id <> $4 OR occurred_at > $5) ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
 
@@ -10067,6 +10067,33 @@ mod tests {
     }
 
     #[test]
+    fn gpu2_history_summary_routing_is_scoped_and_reversible() {
+        const UP: &str =
+            include_str!("../../../migrations/196_gpu2_history_summary_routing.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/196_gpu2_history_summary_routing.down.sql");
+
+        for value in [
+            "('aifarm-ninfer-gpu2', 'qwen3.8-27b', 'primary', 100, NULL::INTEGER, TRUE)",
+            "('aifarm-vllm-gpu0', 'Gemma 4 26B Heretic', 'fallback', NULL::INTEGER, 0, FALSE)",
+            "assignment.workflow_key = 'history_summary'",
+            "gpu2_history_summary_v1_previous",
+            "WHERE primary_target.role = 'primary'",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing GPU2 history summary contract {value}"
+            );
+        }
+        assert!(!UP.contains("gpt-luna"));
+        assert!(!UP.contains("llm_capacity_pools"));
+        assert!(!UP.contains("DELETE FROM"));
+        assert!(!UP.contains("INSERT INTO"));
+        assert!(DOWN.contains("inference_overrides - 'gpu2_history_summary_v1_previous'"));
+        assert!(DOWN.contains("WHERE inference_overrides ? 'gpu2_history_summary_v1_previous'"));
+    }
+
+    #[test]
     fn gpu0_gemma_routing_widens_the_pool_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/194_gpu0_gemma_parallel_routing.up.sql");
         const DOWN: &str =
@@ -13810,6 +13837,22 @@ mod tests {
                 }
                 assert!(bounded_index, "history scan lacks its causal upper bound: {}", plan.0);
             }
+            // A prepared statement settles on the generic plan, which reaches the partial
+            // thread index only through the literal `thread_id <> 0`.
+            let generic_plan_row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN (FORMAT JSON, GENERIC_PLAN) {}", super::SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS
+            )))
+            .fetch_one(&pool)
+            .await?;
+            let generic_thread_plan =
+                sqlx::Row::try_get::<sqlx::types::Json<serde_json::Value>, _>(&generic_plan_row, 0)?.0;
+            let mut nodes = vec![&generic_thread_plan[0]["Plan"]];
+            let mut thread_index = false;
+            while let Some(node) = nodes.pop() {
+                thread_index |= node["Index Cond"].as_str().is_some_and(|condition| condition.contains("thread_id ="));
+                if let Some(children) = node["Plans"].as_array() { nodes.extend(children); }
+            }
+            assert!(thread_index, "generic thread history plan scans the whole chat: {generic_thread_plan}");
             sqlx::query("SET enable_seqscan = on").execute(&pool).await?;
 
 

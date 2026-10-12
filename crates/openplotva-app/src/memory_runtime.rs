@@ -43,6 +43,8 @@ use crate::runtime_gemini_cache::resolve_google_ai_key;
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a worker waits before the next job after the embedder gate deferred one.
+pub const MEMORY_CONSOLIDATION_EMBEDDER_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 pub const MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX: &str = "memory-consolidation-worker";
 pub const MEMORY_EXTRACTION_WORKFLOW_KEY: &str = "memory_extraction";
 pub const MEMORY_SUBJECT_MERGE_WORKFLOW_KEY: &str = "memory_subject_merge";
@@ -549,6 +551,8 @@ pub struct MemoryRunProcessReport {
     pub filtered_messages: usize,
     /// Whether a continuation run was queued.
     pub continuation_queued: bool,
+    /// The embedder was down, so the run stayed queued for a later tick.
+    pub deferred: bool,
     /// Extraction/write report, when extraction ran.
     pub write: Option<MemoryExtractionWriteReport>,
 }
@@ -634,6 +638,8 @@ pub struct MemoryConsolidationQueueWorkerReport {
     pub job_id: Option<i64>,
     /// Whether a DB memory run was claimed and processed.
     pub processed_run: bool,
+    /// The embedder was down, so the run stayed queued for a later tick.
+    pub deferred: bool,
     /// The taskman job was finalized as completed.
     pub completed: bool,
     /// The taskman job was finalized as failed.
@@ -1243,7 +1249,10 @@ where
     // stays queued (no claim, no attempt consumed) and the cheap breaker check
     // keeps AI Farm untouched until the embedder recovers.
     if embedder.is_some_and(|provider| !provider.is_available()) {
-        return Ok(MemoryRunProcessReport::default());
+        return Ok(MemoryRunProcessReport {
+            deferred: true,
+            ..MemoryRunProcessReport::default()
+        });
     }
     let Some(run) = store
         .claim_run(&cfg.owner, cfg.lease)
@@ -1268,7 +1277,10 @@ where
                 .release_run(run_id)
                 .await
                 .map_err(|source| MemoryRunProcessError::Store { source })?;
-            Ok(MemoryRunProcessReport::default())
+            Ok(MemoryRunProcessReport {
+                deferred: true,
+                ..MemoryRunProcessReport::default()
+            })
         }
         Err(error) => {
             let text = error.to_string();
@@ -1624,9 +1636,19 @@ where
     match process_next_memory_run(extractor, store, embedder, cfg).await {
         Ok(processed) => {
             report.processed_run = processed.processed;
+            report.deferred = processed.deferred;
             match queue.complete(work.id, now) {
                 Ok(()) => report.completed = true,
                 Err(error) => report.status_error = Some(error.to_string()),
+            }
+            // Pipeline jobs exist only while ticks keep scheduling them, so a tick
+            // deferred by an embedder outage keeps one queued for the retry.
+            if processed.deferred {
+                report.scheduled_followup = true;
+                report.followup_job_id = Some(queue.assign(
+                    MEMORY_CONSOLIDATION_QUEUE_NAME,
+                    new_memory_consolidation_job_at(now),
+                ));
             }
             if processed.processed {
                 let followup = queue.assign(
@@ -1693,10 +1715,11 @@ where
     let cfg = cfg.normalized();
     let mut stop = std::pin::pin!(stop);
 
+    let mut pause = cfg.interval;
     loop {
         tokio::select! {
             () = &mut stop => break,
-            () = tokio::time::sleep(cfg.interval) => {
+            () = tokio::time::sleep(pause) => {
                 let tick = process_memory_consolidation_taskman_job_once_at(
                     queue,
                     extractor,
@@ -1708,6 +1731,11 @@ where
                     OffsetDateTime::now_utc(),
                 ).await;
                 tracing::debug!(?tick, "memory-consolidation taskman worker tick");
+                pause = if tick.deferred {
+                    MEMORY_CONSOLIDATION_EMBEDDER_RETRY_INTERVAL
+                } else {
+                    cfg.interval
+                };
                 report.record_worker_tick(&tick);
             }
         }
@@ -3182,7 +3210,7 @@ where
             Some(provider) => {
                 match embed_memory_cards(provider, &cards, cfg.embedding_dimension).await {
                     Ok(embeddings) => embeddings,
-                    Err(error) if error.is_availability_failure() => {
+                    Err(error) if error.is_temporarily_unavailable() => {
                         return Err(MemoryExtractionWriteError::EmbedderUnavailable {
                             source: error,
                         });
@@ -3456,7 +3484,7 @@ where
             .await
         {
             Ok(embedding) => embedding,
-            Err(error) if error.is_availability_failure() => {
+            Err(error) if error.is_temporarily_unavailable() => {
                 return Err(MemoryExtractionWriteError::EmbedderUnavailable { source: error });
             }
             Err(error) => {
@@ -3606,6 +3634,12 @@ pub enum EmbedderClientError {
         /// Failure detail.
         message: String,
     },
+    /// Discovery had no free embedder slot within the capacity wait.
+    #[error("embedder at capacity: {message}")]
+    Busy {
+        /// Failure detail.
+        message: String,
+    },
 }
 
 impl EmbedderClientError {
@@ -3621,11 +3655,18 @@ impl EmbedderClientError {
     #[must_use]
     pub fn is_availability_failure(&self) -> bool {
         match self {
-            Self::EmptyPrompts => false,
+            Self::EmptyPrompts | Self::Busy { .. } => false,
             Self::Unavailable | Self::Discovery { .. } | Self::RetryExhausted { .. } => true,
             Self::Request { .. } => retryable_embedder_error(self),
             Self::Status { status, .. } => *status >= 500,
         }
+    }
+
+    /// Whether a later attempt can succeed: the embedder is down or out of free
+    /// slots. A busy embedder is healthy, so it never charges the breaker.
+    #[must_use]
+    pub fn is_temporarily_unavailable(&self) -> bool {
+        self.is_availability_failure() || matches!(self, Self::Busy { .. })
     }
 }
 
@@ -6799,6 +6840,7 @@ mod tests {
                 dequeued: true,
                 job_id: Some(first_id),
                 processed_run: true,
+                deferred: false,
                 completed: true,
                 failed: false,
                 scheduled_followup: true,
@@ -6810,6 +6852,59 @@ mod tests {
         );
         assert_eq!(store.completed.lock().expect("completed")[0].0, 91);
         assert_eq!(extractor.inputs.lock().expect("inputs").len(), 1);
+        assert_eq!(
+            queue.record(first_id).expect("first job").status,
+            openplotva_taskman::JobStatus::Completed
+        );
+        assert_eq!(
+            queue.record(2).expect("followup job").status,
+            openplotva_taskman::JobStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_taskman_pipeline_survives_an_embedder_outage() {
+        let now = utc_test_time(3, 17);
+        let store = FakeMemoryWriteStore {
+            run: Mutex::new(Some(openplotva_memory::Run {
+                id: 93,
+                chat_id: -100,
+                prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+                message_count: 1,
+                ..openplotva_memory::Run::default()
+            })),
+            ..FakeMemoryWriteStore::default()
+        };
+        let extractor = FakeMemoryExtractor {
+            output: ExtractOutput::default(),
+            inputs: Mutex::new(Vec::new()),
+        };
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        let first_id = queue.assign(
+            openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+            openplotva_taskman::new_memory_consolidation_job_at(now),
+        );
+
+        let report = process_memory_consolidation_taskman_job_once_at(
+            &queue,
+            &extractor,
+            &store,
+            Some(&UnavailableEmbedder),
+            MemoryRunProcessConfig::default(),
+            "memory-consolidation-worker-0",
+            1,
+            now,
+        )
+        .await;
+
+        assert!(!report.processed_run);
+        assert!(report.deferred, "the run waits for the embedder");
+        assert!(
+            report.scheduled_followup,
+            "the pipeline keeps one job queued"
+        );
+        assert!(store.completed.lock().expect("completed").is_empty());
+        assert!(extractor.inputs.lock().expect("inputs").is_empty());
         assert_eq!(
             queue.record(first_id).expect("first job").status,
             openplotva_taskman::JobStatus::Completed
