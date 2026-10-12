@@ -920,6 +920,9 @@ pub struct AifarmHttpRequest {
     pub headers: BTreeMap<String, String>,
     /// Body.
     pub body: Vec<u8>,
+    /// Whether one fresh attempt is safe after the connection drops before a response:
+    /// Discovery jobs carry an idempotency key, and reads repeat without effect.
+    pub retry_on_connection_drop: bool,
 }
 
 /// AIFarm HTTP response.
@@ -994,9 +997,12 @@ impl AifarmHttpTransport for ReqwestAifarmTransport {
                 builder.send()
             };
             // A pooled connection the far side already dropped fails before any response.
-            // Discovery jobs carry an idempotency key, so one fresh attempt is safe.
             let response = match send().await {
-                Err(err) if (err.is_request() || err.is_connect()) && !err.is_timeout() => {
+                Err(err)
+                    if request.retry_on_connection_drop
+                        && (err.is_request() || err.is_connect())
+                        && !err.is_timeout() =>
+                {
                     send().await
                 }
                 result => result,
@@ -1281,6 +1287,7 @@ where
                     url: self.cfg.direct_url.clone(),
                     headers: direct_completion_headers(&self.cfg, &request),
                     body,
+                    retry_on_connection_drop: false,
                 },
                 self.task_limit(),
                 "direct dialog request",
@@ -1422,6 +1429,7 @@ where
                     url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
+                    retry_on_connection_drop: true,
                 },
                 self.sync_submit_limit(),
                 "discovery sync submit",
@@ -1447,6 +1455,7 @@ where
                     url: self.cfg.endpoint("/v1/jobs/sync"),
                     headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
                     body,
+                    retry_on_connection_drop: true,
                 },
                 self.sync_submit_limit(),
                 "discovery sync submit",
@@ -1561,6 +1570,7 @@ where
                     )),
                     headers: BTreeMap::new(),
                     body: Vec::new(),
+                    retry_on_connection_drop: true,
                 },
                 wait.saturating_add(self.request_limit()),
                 "discovery job status poll",
@@ -1641,6 +1651,7 @@ where
                     url: direct_status_endpoint(&self.cfg.direct_url, request_id),
                     headers: direct_status_headers(&self.cfg),
                     body: Vec::new(),
+                    retry_on_connection_drop: true,
                 },
                 self.request_limit(),
                 "direct dialog status poll",
@@ -11056,6 +11067,7 @@ mod tests {
                 url: format!("http://{address}/v1/jobs/sync"),
                 headers: BTreeMap::new(),
                 body: b"{}".to_vec(),
+                retry_on_connection_drop: true,
             })
             .await
             .expect("the retried request succeeds");
@@ -11063,6 +11075,32 @@ mod tests {
 
         assert_eq!(response.status_code, 200);
         assert_eq!(response.body, b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn transport_leaves_requests_without_the_retry_flag_to_the_caller() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut dropped, _) = listener.accept().expect("only connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = dropped.read(&mut buffer);
+        });
+
+        let result = ReqwestAifarmTransport::default()
+            .send(AifarmHttpRequest {
+                method: AifarmHttpMethod::Post,
+                url: format!("http://{address}/v1/chat/completions"),
+                headers: BTreeMap::new(),
+                body: b"{}".to_vec(),
+                retry_on_connection_drop: false,
+            })
+            .await;
+        server.join().expect("server thread");
+
+        assert!(result.is_err(), "a direct completion is not sent twice");
     }
 
     async fn forced_draw_step(
