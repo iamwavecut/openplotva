@@ -16,6 +16,9 @@ use time::OffsetDateTime;
 
 /// Once per day. Long enough that DDL / bulk deletes stay infrequent.
 pub const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// After a failed partition drop (usually a lock timeout behind a long reader) the next
+/// attempt comes this soon instead of a full interval later.
+pub const PARTITION_RETENTION_RETRY_DELAY: Duration = Duration::from_secs(10 * 60);
 pub const RETENTION_DELETE_BATCH_SIZE: i64 = 10_000;
 /// Small pause between batches during a drain so a large initial backlog does
 /// not spike replication lag or autovacuum pressure.
@@ -69,7 +72,11 @@ where
     }
     tokio::pin!(stop);
     loop {
-        match openplotva_storage::drop_expired_chat_history_partitions(&pool, retention_days).await
+        let succeeded = match openplotva_storage::drop_expired_chat_history_partitions(
+            &pool,
+            retention_days,
+        )
+        .await
         {
             Ok(dropped) => {
                 report.dropped_partitions += dropped.len() as u64;
@@ -80,14 +87,16 @@ where
                         "dropped expired chat_history partitions"
                     );
                 }
+                true
             }
             Err(error) => {
                 report.errors += 1;
                 tracing::warn!(%error, retention_days, "failed to drop expired chat_history partitions");
+                false
             }
-        }
+        };
         report.ticks += 1;
-        let sleep = tokio::time::sleep(interval);
+        let sleep = tokio::time::sleep(partition_retention_delay(succeeded, interval));
         tokio::pin!(sleep);
         tokio::select! {
             () = &mut stop => break,
@@ -95,6 +104,14 @@ where
         }
     }
     report
+}
+
+fn partition_retention_delay(succeeded: bool, interval: Duration) -> Duration {
+    if succeeded {
+        interval
+    } else {
+        PARTITION_RETENTION_RETRY_DELAY.min(interval)
+    }
 }
 
 async fn run_batched_retention_worker_until<Stop, F, Fut>(
@@ -300,6 +317,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_partition_drop_is_retried_soon() {
+        assert_eq!(
+            partition_retention_delay(false, RETENTION_CLEANUP_INTERVAL),
+            PARTITION_RETENTION_RETRY_DELAY
+        );
+        assert!(PARTITION_RETENTION_RETRY_DELAY < RETENTION_CLEANUP_INTERVAL);
+        assert_eq!(
+            partition_retention_delay(true, RETENTION_CLEANUP_INTERVAL),
+            RETENTION_CLEANUP_INTERVAL
+        );
+    }
 
     #[tokio::test]
     async fn partition_worker_disabled_returns_immediately() {

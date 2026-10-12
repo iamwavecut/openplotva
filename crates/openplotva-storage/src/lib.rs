@@ -890,6 +890,10 @@ pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
 
 pub const SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS: &str =
     "SELECT drop_expired_chat_history_partitions((current_date - $1::int))";
+/// How long the partition drop waits for its exclusive lock on `chat_history_entries`.
+/// Queued behind a long reader such as a backup's pg_dump, it would hold every history
+/// read and write behind it; giving up lets the retention worker try again later.
+const SQL_CHAT_HISTORY_PARTITION_DROP_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '3s'";
 
 pub const SQL_DELETE_OLD_TELEGRAM_FILES_BATCH: &str = r#"
 WITH doomed AS (
@@ -8847,11 +8851,24 @@ pub async fn drop_expired_chat_history_partitions(
     if retention_days <= 0 {
         return Ok(Vec::new());
     }
-    let dropped: Vec<String> = sqlx::query_scalar(SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS)
-        .bind(retention_days)
-        .fetch_one(pool)
+    let mut transaction = pool.begin().await?;
+    sqlx::query(SQL_CHAT_HISTORY_PARTITION_DROP_LOCK_TIMEOUT)
+        .execute(&mut *transaction)
         .await?;
-    Ok(dropped)
+    let dropped = sqlx::query_scalar::<_, Vec<String>>(SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS)
+        .bind(retention_days)
+        .fetch_one(&mut *transaction)
+        .await;
+    match dropped {
+        Ok(dropped) => {
+            transaction.commit().await?;
+            Ok(dropped)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 /// Delete up to `batch_size` `telegram_files` rows whose `last_seen_at` is older
@@ -9828,7 +9845,7 @@ mod tests {
             return Ok(());
         };
         let pool = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect(&dsn)
             .await?;
         super::run_migrations_on(&pool).await?;
@@ -9848,6 +9865,31 @@ mod tests {
             dropped.contains(&expected),
             "expected {expected} in {dropped:?}"
         );
+
+        // Behind a long reader, like a backup's pg_dump, the drop gives up quickly instead
+        // of queueing all history traffic behind its exclusive lock.
+        sqlx::query("SELECT ensure_chat_history_partition((current_date - 9999))")
+            .execute(&pool)
+            .await?;
+        let mut reader = pool.begin().await?;
+        sqlx::query("SELECT count(*) FROM chat_history_entries")
+            .execute(&mut *reader)
+            .await?;
+        let started = std::time::Instant::now();
+        assert!(
+            super::drop_expired_chat_history_partitions(&pool, 1000)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query("SELECT count(*) FROM chat_history_entries").execute(&pool),
+        )
+        .await??;
+        reader.rollback().await?;
+        let dropped = super::drop_expired_chat_history_partitions(&pool, 1000).await?;
+        assert!(dropped.contains(&expected), "retried drop: {dropped:?}");
         Ok(())
     }
 
