@@ -1774,3 +1774,15 @@ After `deploy-production.yml` succeeds:
 - `_sqlx_migrations` has 199 and 200; `llm_capacity_pools` has the five lane names; the ASR, embedder and privacy filter models point at their pools.
 - The startup log shows dialog workers 16 and memory workers 16; readiness detail for `lane_config` says the pools match Discovery.
 - Over the first hour: dialog requests served by GPU2 and OpenRouter are only failures and budget bypasses (`lane_bypass`), `lane_wait` events show queueing on GPU0, `llmLanes` shows queues per priority.
+
+---
+
+## Implementation Notes
+
+Where the delivered code differs from the task text above:
+
+- Task 1: a `QueuedWaiter` guard removes a waiter from the queue on any exit (budget end or cancellation), so no closed senders linger. The pools also keep the last 128 admission waits for p50/p95 (`PoolOccupancy::wait_p50_ms`, `wait_p95_ms`).
+- Task 3: the previous step's preferred target is moved to the front only while its lane is free. Free-lane reordering touches only live primary and overflow candidates. A request that ran and failed re-selects once more, so a candidate passed over for its budget gets the time that is left. A failed attempt is reported as such, not as a capacity timeout.
+- Task 7: `RouterRuntime` holds two `LaneWorkerScale`s (dialog and memory). Memory workers now run under the same supervisor as dialog workers (`dialog_workers::spawn_worker_supervisor`), so both fleets resize on a routing reload. `PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS` is the floor, and `0` disables memory workers.
+- Task 8: `lane_checks::LaneCheck` reuses the analytics `DiscoveryCapacityClient` and fetches all services at once. Readiness reports the summary, including services whose width Discovery did not return.
+- Task 9: the runtime API type is `Lane` (`llmLanes`), with `waitP50Ms` and `waitP95Ms`. Pool names come from `RoutingTable::pool_name`.
