@@ -10067,6 +10067,35 @@ mod tests {
     }
 
     #[test]
+    fn backend_lane_pools_are_renamed_attached_and_reversible() {
+        const UP: &str = include_str!("../../../migrations/200_backend_lane_pools.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/200_backend_lane_pools.down.sql");
+
+        for value in [
+            "('aifarm-vllm-gpu0', 'aifarm-gpu0-dialog'",
+            "('aifarm-gpu2-qwen27b', 'aifarm-gpu2-utility'",
+            "('aifarm-draw-gpu1', 'aifarm-gpu1-media'",
+            "('aifarm-embedder', 8,",
+            "('aifarm-gpu1-privacy', 4,",
+            "('aifarm-asr', 'aifarm-gpu1-media')",
+            "('aifarm-embed', 'aifarm-embedder')",
+            "('privacy-filter', 'aifarm-gpu1-privacy')",
+            "'backend_lanes_v1_previous_name', pool.name",
+            "'backend_lanes_v1_previous_pool_id', model.pool_id",
+            "created_by_backend_lanes_v1",
+        ] {
+            assert!(UP.contains(value), "missing lane pool contract {value}");
+        }
+        assert!(!UP.contains("max_concurrency ="));
+        assert!(!UP.contains("workflow_assignments"));
+        assert!(DOWN.contains("WHERE config ? 'backend_lanes_v1_previous_pool_id'"));
+        assert!(DOWN.contains(
+            "DELETE FROM llm_capacity_pools WHERE config ? 'created_by_backend_lanes_v1'"
+        ));
+        assert!(DOWN.contains("WHERE config ? 'backend_lanes_v1_previous_name'"));
+    }
+
+    #[test]
     fn workflow_lane_settings_default_and_are_reversible() {
         const UP: &str = include_str!("../../../migrations/199_workflow_lane_settings.up.sql");
         const DOWN: &str = include_str!("../../../migrations/199_workflow_lane_settings.down.sql");

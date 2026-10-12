@@ -1813,7 +1813,7 @@ const MEMORY_SUBJECT_MERGE_CASCADE_KEY: &str = "llm.routing.memory_subject_merge
 const DIALOG_FALLBACK_CASCADE_KEY: &str = "llm.routing.dialog_fallback_cascade_v1";
 const MEMORY_EXTRACTION_WORKFLOW: &str = "memory_extraction";
 const MEMORY_SUBJECT_MERGE_WORKFLOW: &str = "memory_subject_merge";
-const MEMORY_GPU2_POOL: &str = "aifarm-gpu2-qwen27b";
+const MEMORY_GPU2_POOL: &str = "aifarm-gpu2-utility";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MemoryRoutingCascadeTarget {
@@ -3080,7 +3080,7 @@ mod tests {
                 ('memory_subject_merge', 'chat', FALSE, 3, 60000, TRUE); \
              INSERT INTO llm_capacity_pools \
                 (id, name, max_concurrency, description) VALUES \
-                (7, 'aifarm-gpu2-qwen27b', 1, 'shared test pool'); \
+                (7, 'aifarm-gpu2-utility', 1, 'shared test pool'); \
              INSERT INTO llm_providers \
                 (id, name, kind, protocol, enabled) VALUES \
                 (2, 'aifarm-llamacpp-gpu2', 'chat', 'openai_compat', TRUE), \
@@ -3113,7 +3113,7 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         let pool_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM llm_capacity_pools WHERE name = 'aifarm-gpu2-qwen27b'",
+            "SELECT count(*) FROM llm_capacity_pools WHERE name = 'aifarm-gpu2-utility'",
         )
         .fetch_one(&pool)
         .await?;
