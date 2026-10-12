@@ -4052,6 +4052,7 @@ impl TextRedactor for RoutedDiscoveryRedactor {
                     RoutedRequestContext {
                         workflow_key: "redaction".to_owned(),
                         queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                        lane_priority: Some(openplotva_llm::router::LanePriority::Background),
                         suppress_all_attempts_exhausted_admin_report: true,
                         suppressed_all_attempts_exhausted_reason: Some(
                             "redaction_fail_open".to_owned(),

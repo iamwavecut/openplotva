@@ -11328,25 +11328,28 @@ async fn start_runtime_workers(
     }
 
     if config.memory.enabled && config.bot.key.is_none() {
-        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
+        let memory_write_embedder = Some(
+            embedder::RoutedDiscoveryEmbedder::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                .with_reporter(routing_event_reporter.clone()),
+                embedder::DiscoveryEmbedderConfig {
+                    base_url: config.llm.discovery.base_url.clone(),
+                    service_name: config.memory.embedder_service_name.clone(),
+                    endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                    request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    poll_interval: Duration::from_millis(100),
+                    capacity_wait: Duration::from_secs(2),
+                },
             )
-            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_reporter(routing_event_reporter.clone()),
-            embedder::DiscoveryEmbedderConfig {
-                base_url: config.llm.discovery.base_url.clone(),
-                service_name: config.memory.embedder_service_name.clone(),
-                endpoint_name: config.memory.embedder_endpoint_name.clone(),
-                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                poll_interval: Duration::from_millis(100),
-                capacity_wait: Duration::from_secs(2),
-            },
-        ));
+            .with_lane_priority(openplotva_llm::router::LanePriority::Background),
+        );
         let memory_extractor = memory_runtime::routed_memory_extractor_from_app_config(
             config,
             routed_attempts::RoutedAttemptWalker::new(
@@ -12123,25 +12126,28 @@ async fn start_runtime_workers(
     let mut shared_taskman_worker_counts = BTreeMap::new();
     shared_taskman_worker_counts.insert(openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(), 1);
     if config.memory.enabled {
-        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
+        let memory_write_embedder = Some(
+            embedder::RoutedDiscoveryEmbedder::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+                .with_reporter(routing_event_reporter.clone()),
+                embedder::DiscoveryEmbedderConfig {
+                    base_url: config.llm.discovery.base_url.clone(),
+                    service_name: config.memory.embedder_service_name.clone(),
+                    endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                    request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                    poll_interval: Duration::from_millis(100),
+                    capacity_wait: Duration::from_secs(2),
+                },
             )
-            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
-            .with_reporter(routing_event_reporter.clone()),
-            embedder::DiscoveryEmbedderConfig {
-                base_url: config.llm.discovery.base_url.clone(),
-                service_name: config.memory.embedder_service_name.clone(),
-                endpoint_name: config.memory.embedder_endpoint_name.clone(),
-                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
-                poll_interval: Duration::from_millis(100),
-                capacity_wait: Duration::from_secs(2),
-            },
-        ));
+            .with_lane_priority(openplotva_llm::router::LanePriority::Background),
+        );
         let memory_scheduler_store = memory_store.clone();
         let memory_scheduler_queue = Arc::clone(&task_queue_for_updates);
         let memory_scheduler_config =
