@@ -5074,7 +5074,9 @@ fn unescape_inline_arg_char(value: char) -> char {
 
 fn inline_arg_end(value: &str, quoted: bool) -> usize {
     let mut end = value.len();
-    if quoted && let Some(idx) = value.find(r#"<|"|>"#) {
+    // A stray closing delimiter ends an unquoted value; an unclosed one ends like unquoted.
+    let closing_delimiter = value.find(r#"<|"|>"#);
+    if let Some(idx) = closing_delimiter {
         end = end.min(idx);
     }
     for marker in INLINE_ARG_END_MARKERS {
@@ -5082,7 +5084,7 @@ fn inline_arg_end(value: &str, quoted: bool) -> usize {
             end = end.min(idx);
         }
     }
-    if !quoted {
+    if !quoted || closing_delimiter.is_none() {
         if let Some(idx) = value.find('}') {
             end = end.min(idx);
         }
@@ -5277,6 +5279,31 @@ mod tests {
         assert_eq!(wrapped.tool_steps.len(), 1);
         assert_eq!(wrapped.tool_steps[0].step, STEP_WEB_SEARCH);
         assert_eq!(wrapped.tool_steps[0].query, "погода в Москве");
+    }
+
+    #[test]
+    fn gemma_calls_with_unquoted_values_become_tool_steps() {
+        let parsed = parse_assistant_content(
+            "draw_image{caption: Кот в шляпе, акварель, prompt: A cat wearing a hat, watercolor, soft light.<|\"|>}",
+        )
+        .expect("parsed");
+        assert_eq!(parsed.tool_steps.len(), 1);
+        assert_eq!(parsed.tool_steps[0].step, STEP_DRAW_IMAGE);
+        assert_eq!(parsed.tool_steps[0].caption, "Кот в шляпе, акварель");
+        assert_eq!(
+            parsed.tool_steps[0].prompt,
+            "A cat wearing a hat, watercolor, soft light."
+        );
+        assert_eq!(parsed.text, "");
+
+        let unterminated =
+            parse_assistant_content("web_search{query:<|\"|>погода в Москве}").expect("search");
+        assert_eq!(unterminated.tool_steps.len(), 1);
+        assert_eq!(unterminated.tool_steps[0].query, "погода в Москве");
+
+        let numeric_start =
+            parse_assistant_content("web_search{query: 3 кота в коробке}").expect("numeric");
+        assert_eq!(numeric_start.tool_steps[0].query, "3 кота в коробке");
     }
 
     #[test]
