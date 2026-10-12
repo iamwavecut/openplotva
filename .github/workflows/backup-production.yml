@@ -1,8 +1,8 @@
 name: Production Backup
 
-# The nightly run is a host crontab entry (deploy/production/install-backup-schedule.sh,
-# refreshed by every deploy): scheduled workflows start hours late and then overlap
-# daytime traffic. This workflow stays for manual backups.
+# The nightly run is a fixed host crontab entry (see deploy/production/README.md):
+# scheduled workflows start hours late and then overlap daytime traffic. This workflow
+# is for manual backups.
 on:
   workflow_dispatch:
 

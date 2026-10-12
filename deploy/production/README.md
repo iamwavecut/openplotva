@@ -13,12 +13,16 @@ push to `main` and stops unless that run succeeded.
 After a successful deploy, local Docker and GHCR cleanup keep only the current
 main-SHA image; they do not maintain rollback image history.
 
-The nightly backup runs `backup-production.sh` from the deploy user's crontab at 01:00
-UTC (04:00 Moscow), the quietest hour of dialog traffic, under `flock` so two runs never
-overlap; its last output is in `<deploy-root>/backup-cron.log`. Every deploy uploads the
-script and refreshes the entry with `install-backup-schedule.sh`. GitHub's scheduled
-workflows start hours late, so `.github/workflows/backup-production.yml` is for manual
-backups only. The backup is stored under
+The nightly backup runs from the deploy user's crontab on the host at 01:00 UTC (04:00
+Moscow), the quietest hour of dialog traffic:
+
+```
+0 1 * * * flock -n <deploy-root>/.backup.lock <deploy-root>/backup-production.sh > <deploy-root>/backup-cron.log 2>&1
+```
+
+GitHub's scheduled workflows start hours late, so `.github/workflows/backup-production.yml`
+is for manual backups only; it also uploads the current `backup-production.sh`. The backup
+is stored under
 `${OPENPLOTVA_BACKUP_ROOT:-<deploy-root>/backups}` and contains:
 
 - `postgres.dump` — PostgreSQL custom-format logical dump;
