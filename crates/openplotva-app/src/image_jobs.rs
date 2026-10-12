@@ -7647,6 +7647,8 @@ mod tests {
                 retry_max_hops: 3,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![AssignmentRecord {
                 id: 100,

@@ -70,6 +70,8 @@ pub struct WorkflowRecord {
     pub retry_max_hops: i32,
     pub retry_wall_ms: i32,
     pub enabled: bool,
+    pub lane_priority: i16,
+    pub fallback_reserve_ms: i32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -422,7 +424,7 @@ const SQL_GET_POOL_BY_NAME: &str = "SELECT id, name, max_concurrency, descriptio
 const SQL_UPDATE_POOL: &str = "UPDATE llm_capacity_pools SET name = $2, max_concurrency = $3, description = $4, config = $5::jsonb, updated_at = now() WHERE id = $1";
 const SQL_DELETE_POOL: &str = "DELETE FROM llm_capacity_pools WHERE id = $1";
 
-const SQL_LIST_WORKFLOWS: &str = "SELECT key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled FROM workflows ORDER BY key ASC";
+const SQL_LIST_WORKFLOWS: &str = "SELECT key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, lane_priority, fallback_reserve_ms FROM workflows ORDER BY key ASC";
 const SQL_INSERT_WORKFLOW_IF_MISSING: &str = "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (key) DO NOTHING";
 const SQL_UPDATE_WORKFLOW: &str = "UPDATE workflows SET full_routing = $2, retry_max_hops = $3, retry_wall_ms = $4, enabled = $5 WHERE key = $1";
 const SQL_SET_WORKFLOW_ENABLED: &str = "UPDATE workflows SET enabled = $2 WHERE key = $1";
@@ -894,6 +896,8 @@ fn workflow_from_row(row: PgRow) -> Result<WorkflowRecord, StorageError> {
         retry_max_hops: row.try_get("retry_max_hops")?,
         retry_wall_ms: row.try_get("retry_wall_ms")?,
         enabled: row.try_get("enabled")?,
+        lane_priority: row.try_get("lane_priority")?,
+        fallback_reserve_ms: row.try_get("fallback_reserve_ms")?,
     })
 }
 

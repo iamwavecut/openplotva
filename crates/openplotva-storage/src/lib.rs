@@ -10067,6 +10067,27 @@ mod tests {
     }
 
     #[test]
+    fn workflow_lane_settings_default_and_are_reversible() {
+        const UP: &str = include_str!("../../../migrations/199_workflow_lane_settings.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/199_workflow_lane_settings.down.sql");
+
+        for value in [
+            "ADD COLUMN lane_priority SMALLINT NOT NULL DEFAULT 0",
+            "ADD COLUMN fallback_reserve_ms INTEGER NOT NULL DEFAULT 30000",
+            "SET lane_priority = 1",
+            "'history_summary', 'youtube_summary', 'media_prompt_optimizer'",
+            "'image_generation', 'image_generation_flux', 'image_generation_boogu_turbo'",
+            "'image_edit', 'image_edit_flux', 'image_edit_boogu_turbo', 'music'",
+            "SET lane_priority = 2, fallback_reserve_ms = 0",
+            "WHERE key IN ('memory_extraction', 'memory_subject_merge')",
+        ] {
+            assert!(UP.contains(value), "missing lane settings contract {value}");
+        }
+        assert!(DOWN.contains("DROP COLUMN lane_priority"));
+        assert!(DOWN.contains("DROP COLUMN fallback_reserve_ms"));
+    }
+
+    #[test]
     fn vision_fallback_joins_the_gpu2_pool_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/198_vision_fallback_gpu2_pool.up.sql");
         const DOWN: &str =

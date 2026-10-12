@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use openplotva_llm::retry::FailureReason;
 use openplotva_llm::router::{
-    Attempt, BreakerLiveness, BreakerSet, InferenceOverrides, PoolId, PoolPermit, PoolRegistry,
-    Role, RouterHandle, TriggerState, WorkflowRoute, select_chain,
+    Attempt, BreakerLiveness, BreakerSet, InferenceOverrides, LanePriority, PoolId, PoolPermit,
+    PoolRegistry, Role, RouterHandle, TriggerState, WorkflowRoute, select_chain,
 };
 use serde_json::{Value, json};
 
@@ -729,6 +729,8 @@ pub struct RoutedRequestContext {
     /// The walker will not start an attempt at or past this instant, so one
     /// call cannot overshoot the caller's turn budget by a full attempt.
     pub deadline: Option<Instant>,
+    /// Lane queue priority; `None` takes the workflow's `lane_priority`.
+    pub lane_priority: Option<LanePriority>,
     pub suppress_all_attempts_exhausted_admin_report: bool,
     pub suppressed_all_attempts_exhausted_reason: Option<String>,
 }
@@ -1016,6 +1018,8 @@ mod tests {
                 retry_max_hops: 1,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(assignment_overrides)],
             triggers: vec![],
@@ -1644,6 +1648,8 @@ mod tests {
                 retry_max_hops: max_hops,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![first, second],
             triggers: vec![],

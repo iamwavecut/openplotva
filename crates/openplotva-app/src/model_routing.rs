@@ -13,8 +13,8 @@ use openplotva_config::AppConfig;
 use openplotva_llm::router::table::Role;
 use openplotva_llm::router::triggers::{TriggerCondition, TriggerSpec};
 use openplotva_llm::router::{
-    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, PoolSpec, ProviderRow,
-    RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
+    BreakerConfig, Candidate, InferenceOverrides, Kind, LanePriority, ModelRow, PoolSpec,
+    ProviderRow, RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
 };
 use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
@@ -1956,11 +1956,14 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
 
     if let Some(targets) = subject_merge.as_ref() {
         sqlx::query(
-            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
-             VALUES ($1, 'chat', FALSE, 2, 900000, TRUE) \
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, \
+             lane_priority, fallback_reserve_ms) \
+             VALUES ($1, 'chat', FALSE, 2, 900000, TRUE, 2, 0) \
              ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
              full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
-             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled, \
+             lane_priority = EXCLUDED.lane_priority, \
+             fallback_reserve_ms = EXCLUDED.fallback_reserve_ms",
         )
         .bind(MEMORY_SUBJECT_MERGE_WORKFLOW)
         .execute(&mut *transaction)
@@ -2016,11 +2019,14 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
 
     if let Some(targets) = extraction.as_ref() {
         sqlx::query(
-            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) \
-             VALUES ($1, 'chat', FALSE, 4, 900000, TRUE) \
+            "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, \
+             lane_priority, fallback_reserve_ms) \
+             VALUES ($1, 'chat', FALSE, 4, 900000, TRUE, 2, 0) \
              ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, \
              full_routing = EXCLUDED.full_routing, retry_max_hops = EXCLUDED.retry_max_hops, \
-             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled",
+             retry_wall_ms = EXCLUDED.retry_wall_ms, enabled = EXCLUDED.enabled, \
+             lane_priority = EXCLUDED.lane_priority, \
+             fallback_reserve_ms = EXCLUDED.fallback_reserve_ms",
         )
         .bind(MEMORY_EXTRACTION_WORKFLOW)
         .execute(&mut *transaction)
@@ -2532,6 +2538,8 @@ fn build_route(
             max_hops: workflow.retry_max_hops.max(1) as u32,
             wall_clock: Duration::from_millis(workflow.retry_wall_ms.max(0) as u64),
         },
+        lane_priority: LanePriority::from_db(workflow.lane_priority),
+        fallback_reserve: Duration::from_millis(workflow.fallback_reserve_ms.max(0) as u64),
     })
 }
 
@@ -2699,6 +2707,8 @@ mod tests {
                 retry_max_hops: 3,
                 retry_wall_ms: 60_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![
                 assignment(100, "dialog", "global", "primary", 10, Some(100)),
@@ -2718,6 +2728,22 @@ mod tests {
             }],
             pools: vec![],
         }
+    }
+
+    #[test]
+    fn workflow_lane_settings_reach_the_route() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.workflows[0].lane_priority = 2;
+        snapshot.workflows[0].fallback_reserve_ms = 0;
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+        assert_eq!(route.lane_priority, LanePriority::Background);
+        assert_eq!(route.fallback_reserve, Duration::ZERO);
+
+        let table = build_routing_table(&dialog_snapshot());
+        let route = table.resolve("dialog", false).expect("dialog route");
+        assert_eq!(route.lane_priority, LanePriority::Interactive);
+        assert_eq!(route.fallback_reserve, Duration::from_secs(30));
     }
 
     #[test]
@@ -3018,7 +3044,8 @@ mod tests {
              CREATE TEMP TABLE workflows (\
                 key TEXT PRIMARY KEY, kind TEXT NOT NULL, full_routing BOOLEAN NOT NULL, \
                 retry_max_hops INTEGER NOT NULL, retry_wall_ms INTEGER NOT NULL, \
-                enabled BOOLEAN NOT NULL\
+                enabled BOOLEAN NOT NULL, lane_priority SMALLINT NOT NULL DEFAULT 0, \
+                fallback_reserve_ms INTEGER NOT NULL DEFAULT 30000\
              ); \
              CREATE TEMP TABLE llm_providers (\
                 id BIGINT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, protocol TEXT, \
@@ -3355,6 +3382,8 @@ mod tests {
                 retry_max_hops: 1,
                 retry_wall_ms: 10_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(100, "embedding", "global", "primary", 10, None)],
             triggers: vec![],
@@ -3404,6 +3433,8 @@ mod tests {
                 retry_max_hops: 2,
                 retry_wall_ms: 120_000,
                 enabled: true,
+                lane_priority: 0,
+                fallback_reserve_ms: 30_000,
             }],
             assignments: vec![assignment(
                 100,
@@ -3478,6 +3509,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
@@ -3486,6 +3519,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY.to_owned(),
@@ -3494,6 +3529,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
                 WorkflowRecord {
                     key: crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
@@ -3502,6 +3539,8 @@ mod tests {
                     retry_max_hops: 3,
                     retry_wall_ms: 60_000,
                     enabled: true,
+                    lane_priority: 0,
+                    fallback_reserve_ms: 30_000,
                 },
             ],
             assignments: vec![

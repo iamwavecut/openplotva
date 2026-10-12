@@ -5,10 +5,12 @@
 //! control plane is engine-agnostic policy over abstract provider/model ids.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use super::breaker::BreakerConfig;
+use super::capacity::LanePriority;
 use super::policy::RetryBudget;
 use super::triggers::TriggerSpec;
 
@@ -134,6 +136,10 @@ pub struct WorkflowRoute {
     pub triggers: Vec<TriggerSpec>,
     pub shadow: Vec<Candidate>,
     pub retry: RetryBudget,
+    /// Place of this workflow's requests in their lane queues.
+    pub lane_priority: LanePriority,
+    /// Time kept for the next candidate when a lane wait has a deadline.
+    pub fallback_reserve: Duration,
 }
 
 /// Per-workflow holder of the global default and optional VIP override.

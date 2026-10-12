@@ -821,6 +821,8 @@ mod tests {
                 triggers: Vec::new(),
                 shadow: Vec::new(),
                 retry: RetryBudget::default(),
+                lane_priority: LanePriority::Interactive,
+                fallback_reserve: Duration::from_secs(30),
             },
         );
         table
