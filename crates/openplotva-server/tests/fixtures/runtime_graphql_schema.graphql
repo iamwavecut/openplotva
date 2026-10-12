@@ -224,6 +224,22 @@ A scalar that can represent any JSON value.
 """
 scalar JSON
 
+"""
+Runtime API lane pool state.
+"""
+type Lane {
+	id: ID!
+	name: String!
+	maxConcurrency: Int
+	inFlight: Int!
+	queuedInteractive: Int!
+	queuedUserTool: Int!
+	queuedBackground: Int!
+	meanHoldMs: Int
+	waitP50Ms: Int
+	waitP95Ms: Int
+}
+
 type LlmAnalytics {
 	range: String!
 	bucket: String!
@@ -463,6 +479,11 @@ type RuntimeQuery {
 	dialogTurnOutcomes(filter: DialogTurnOutcomesFilterInput): [DialogTurnOutcome!]!
 	dispatcherSendFailures(limit: Int): [DispatcherSendFailure!]!
 	llmRoutingEvents(filter: RoutingEventsFilterInput): [RoutingEvent!]!
+	"""
+	Lane pools: width, in-flight requests, queue depth per priority, mean
+	lane hold time and recent wait percentiles.
+	"""
+	llmLanes: [Lane!]!
 	llmAnalytics(range: String): LlmAnalytics!
 	virtualDialog(sessionID: String!): VirtualDialog
 	updatesRuntime: UpdatesRuntime!
