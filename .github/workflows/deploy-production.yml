@@ -144,12 +144,8 @@ jobs:
           scp deploy/maintenance/compose.maintenance.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.maintenance.yml"
           scp deploy/production/configure-gradius-generation.py "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/configure-gradius-generation.py"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
-          scp deploy/production/backup-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/backup-production.sh"
-          scp deploy/production/install-backup-schedule.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/install-backup-schedule.sh"
           # shellcheck disable=SC2029
-          ssh "$GETA_SSH_TARGET" "chmod 644 '$GETA_DEPLOY_ROOT/compose.maintenance.yml'; chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh' '$GETA_DEPLOY_ROOT/backup-production.sh' '$GETA_DEPLOY_ROOT/install-backup-schedule.sh'"
-          # shellcheck disable=SC2029
-          ssh "$GETA_SSH_TARGET" "'$GETA_DEPLOY_ROOT/install-backup-schedule.sh'"
+          ssh "$GETA_SSH_TARGET" "chmod 644 '$GETA_DEPLOY_ROOT/compose.maintenance.yml'; chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
       - name: Install generation advertising key
         shell: bash
