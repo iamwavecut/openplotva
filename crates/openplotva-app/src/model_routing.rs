@@ -2469,6 +2469,13 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
 
     let mut table = RoutingTable::new(providers.clone(), model_rows);
     table.set_pools(pool_specs);
+    table.set_pool_names(
+        snapshot
+            .pools
+            .iter()
+            .map(|pool| (pool.id, pool.name.clone()))
+            .collect(),
+    );
 
     for (&(workflow_key, scope_str), assignments) in &by_key_scope {
         let Some(workflow) = workflows.get(workflow_key) else {
@@ -3070,6 +3077,8 @@ mod tests {
         let mut specs = table.pool_specs();
         specs.sort_by_key(|spec| spec.id);
         assert_eq!(specs.len(), 2);
+        assert_eq!(table.pool_name(7), Some("aifarm-dialog"));
+        assert_eq!(table.pool_name(9), None);
     }
 
     #[test]

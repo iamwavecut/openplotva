@@ -200,6 +200,7 @@ pub struct RoutingTable {
     providers: HashMap<ProviderId, ProviderRow>,
     models: HashMap<ModelId, ModelRow>,
     pools: HashMap<PoolId, super::capacity::PoolSpec>,
+    pool_names: HashMap<PoolId, String>,
 }
 
 impl RoutingTable {
@@ -213,6 +214,7 @@ impl RoutingTable {
             providers,
             models,
             pools: HashMap::new(),
+            pool_names: HashMap::new(),
         }
     }
 
@@ -224,6 +226,16 @@ impl RoutingTable {
     #[must_use]
     pub fn pool(&self, id: PoolId) -> Option<&super::capacity::PoolSpec> {
         self.pools.get(&id)
+    }
+
+    /// Replace the operator-facing pool names carried by this snapshot.
+    pub fn set_pool_names(&mut self, names: HashMap<PoolId, String>) {
+        self.pool_names = names;
+    }
+
+    #[must_use]
+    pub fn pool_name(&self, id: PoolId) -> Option<&str> {
+        self.pool_names.get(&id).map(String::as_str)
     }
 
     /// The pool specs to reconcile the live registry with after a reload.

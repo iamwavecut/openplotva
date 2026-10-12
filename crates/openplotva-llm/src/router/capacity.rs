@@ -14,7 +14,7 @@
 //! All locks are short synchronous sections; only the RAII permit, never a
 //! guard, crosses `.await`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -68,10 +68,16 @@ pub struct PoolOccupancy {
     /// Waiters per priority: interactive, user tool, background.
     pub queued: [u32; 3],
     pub mean_hold_ms: Option<u64>,
+    /// Median and 95th percentile wait of the recent admissions (zero for a
+    /// request that found a free lane).
+    pub wait_p50_ms: Option<u64>,
+    pub wait_p95_ms: Option<u64>,
 }
 
 /// Weight of the newest sample in the mean lane hold time.
 const HOLD_MEAN_WEIGHT: f64 = 0.2;
+/// Admissions kept per pool for the wait percentiles.
+const RECENT_WAITS: usize = 128;
 
 type WaiterKey = (LanePriority, u64);
 
@@ -82,6 +88,7 @@ struct CellState {
     waiters: BTreeMap<WaiterKey, oneshot::Sender<PoolPermit>>,
     next_seq: u64,
     mean_hold: Option<Duration>,
+    recent_waits: VecDeque<Duration>,
 }
 
 impl CellState {
@@ -92,7 +99,35 @@ impl CellState {
             waiters: BTreeMap::new(),
             next_seq: 0,
             mean_hold: None,
+            recent_waits: VecDeque::with_capacity(RECENT_WAITS),
         }
+    }
+
+    fn admit(&mut self) {
+        self.in_flight = self.in_flight.saturating_add(1);
+        self.record_wait(Duration::ZERO);
+    }
+
+    fn record_wait(&mut self, waited: Duration) {
+        if self.recent_waits.len() == RECENT_WAITS {
+            self.recent_waits.pop_front();
+        }
+        self.recent_waits.push_back(waited);
+    }
+
+    /// Nearest-rank percentiles (50th, 95th) of the recent waits, in ms.
+    fn wait_percentiles_ms(&self) -> (Option<u64>, Option<u64>) {
+        let mut waits: Vec<Duration> = self.recent_waits.iter().copied().collect();
+        if waits.is_empty() {
+            return (None, None);
+        }
+        waits.sort_unstable();
+        let at = |quantile: f64| {
+            let rank = (waits.len() as f64 * quantile).ceil() as usize;
+            let wait = waits[rank.clamp(1, waits.len()) - 1];
+            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
+        };
+        (Some(at(0.5)), Some(at(0.95)))
     }
 
     fn has_free_lane(&self) -> bool {
@@ -249,7 +284,7 @@ impl PoolRegistry {
             if !state.waiters.is_empty() || !state.has_free_lane() {
                 return None;
             }
-            state.in_flight = state.in_flight.saturating_add(1);
+            state.admit();
         }
         Some(PoolPermit::held(cell))
     }
@@ -277,7 +312,7 @@ impl PoolRegistry {
         let (receiver, _queued) = {
             let mut state = cell.lock();
             if state.waiters.is_empty() && state.has_free_lane() {
-                state.in_flight = state.in_flight.saturating_add(1);
+                state.admit();
                 drop(state);
                 return Some(PoolPermit::held(cell));
             }
@@ -293,10 +328,13 @@ impl PoolRegistry {
                 },
             )
         };
-        match budget {
+        let enqueued = Instant::now();
+        let permit = match budget {
             Some(budget) => tokio::time::timeout(budget, receiver).await.ok()?.ok(),
             None => receiver.await.ok(),
-        }
+        }?;
+        cell.lock().record_wait(enqueued.elapsed());
+        Some(permit)
     }
 
     /// Expected wait for a new request of `priority`: the waiters it would
@@ -334,6 +372,7 @@ impl PoolRegistry {
                     let slot = &mut queued[*priority as usize];
                     *slot = slot.saturating_add(1);
                 }
+                let (wait_p50_ms, wait_p95_ms) = state.wait_percentiles_ms();
                 PoolOccupancy {
                     id: *id,
                     max_concurrency: state.max,
@@ -342,6 +381,8 @@ impl PoolRegistry {
                     mean_hold_ms: state
                         .mean_hold
                         .map(|mean| u64::try_from(mean.as_millis()).unwrap_or(u64::MAX)),
+                    wait_p50_ms,
+                    wait_p95_ms,
                 }
             })
             .collect();
@@ -708,6 +749,38 @@ mod tests {
         }
         drop((first, second));
         assert_eq!(pools.forecast_wait(None, LanePriority::Interactive), None);
+    }
+
+    #[tokio::test]
+    async fn wait_percentiles_cover_recent_admissions() {
+        let pools = Arc::new(registry(1));
+        assert_eq!(pools.occupancy()[0].wait_p50_ms, None);
+        for _ in 0..3 {
+            drop(pools.try_acquire(Some(1)).expect("free lane"));
+        }
+        let held = pools.try_acquire(Some(1)).expect("free lane");
+        let waiter = {
+            let pools = Arc::clone(&pools);
+            tokio::spawn(async move {
+                pools
+                    .acquire(Some(1), LanePriority::Interactive, None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(held);
+        drop(waiter.await.expect("task").expect("lane"));
+
+        let occupancy = pools.occupancy()[0];
+        assert_eq!(
+            occupancy.wait_p50_ms,
+            Some(0),
+            "most admissions found a free lane"
+        );
+        assert!(
+            occupancy.wait_p95_ms.is_some_and(|p95| p95 >= 50),
+            "{occupancy:?}"
+        );
     }
 
     #[test]

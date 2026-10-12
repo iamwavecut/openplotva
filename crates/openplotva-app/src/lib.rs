@@ -8838,6 +8838,10 @@ async fn admin_routing_status(
         return admin_auth_failure_response(error);
     }
     let now = std::time::Instant::now();
+    let table = routes
+        .router_handle
+        .as_ref()
+        .map(|handle| handle.snapshot());
     let pools: Vec<serde_json::Value> = routes
         .router_pools
         .as_ref()
@@ -8847,8 +8851,17 @@ async fn admin_routing_status(
         .map(|occupancy| {
             json!({
                 "id": occupancy.id,
+                "name": table.as_ref().and_then(|table| table.pool_name(occupancy.id)),
                 "max_concurrency": occupancy.max_concurrency,
                 "in_flight": occupancy.in_flight,
+                "queued": {
+                    "interactive": occupancy.queued[0],
+                    "user_tool": occupancy.queued[1],
+                    "background": occupancy.queued[2],
+                },
+                "mean_hold_ms": occupancy.mean_hold_ms,
+                "wait_p50_ms": occupancy.wait_p50_ms,
+                "wait_p95_ms": occupancy.wait_p95_ms,
             })
         })
         .collect();
@@ -11251,6 +11264,10 @@ async fn start_runtime_workers(
             llm_run_inspector: Some(Arc::new(llm_run_buffer.clone())),
             turn_outcome_inspector: Some(Arc::new(turn_outcome_buffer.clone())),
             routing_event_inspector: Some(Arc::new(routing_event_buffer.clone())),
+            lane_inspector: Some(Arc::new(lane_checks::RuntimeLanes {
+                handle: Arc::clone(&router_handle),
+                pools: Arc::clone(&router_pools),
+            })),
             llm_analytics_reader: Some(Arc::new(
                 runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(
                     service_clients.postgres.clone(),

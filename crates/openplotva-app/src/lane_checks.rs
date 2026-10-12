@@ -185,6 +185,35 @@ impl LaneCheck {
     }
 }
 
+/// Runtime API view of the live lane pools.
+pub struct RuntimeLanes {
+    pub handle: std::sync::Arc<openplotva_llm::router::RouterHandle>,
+    pub pools: std::sync::Arc<openplotva_llm::router::PoolRegistry>,
+}
+
+impl openplotva_server::RuntimeLaneInspector for RuntimeLanes {
+    fn lanes(&self) -> Vec<openplotva_server::RuntimeLaneData> {
+        let table = self.handle.snapshot();
+        let clamp = |value: u64| i32::try_from(value).unwrap_or(i32::MAX);
+        self.pools
+            .occupancy()
+            .into_iter()
+            .map(|lane| openplotva_server::RuntimeLaneData {
+                id: lane.id,
+                name: table.pool_name(lane.id).unwrap_or_default().to_owned(),
+                max_concurrency: lane.max_concurrency.map(|width| clamp(u64::from(width))),
+                in_flight: clamp(u64::from(lane.in_flight)),
+                queued_interactive: clamp(u64::from(lane.queued[0])),
+                queued_user_tool: clamp(u64::from(lane.queued[1])),
+                queued_background: clamp(u64::from(lane.queued[2])),
+                mean_hold_ms: lane.mean_hold_ms.map(clamp),
+                wait_p50_ms: lane.wait_p50_ms.map(clamp),
+                wait_p95_ms: lane.wait_p95_ms.map(clamp),
+            })
+            .collect()
+    }
+}
+
 fn lane_config_mismatch_event(issue: &LaneConfigIssue) -> crate::runtime_routing::RoutingEvent {
     crate::runtime_routing::RoutingEvent {
         severity: "warn".to_owned(),
@@ -468,6 +497,41 @@ mod tests {
             report.summary(),
             "lane pools match Discovery; widths unchecked for asr-api, draw-api"
         );
+    }
+
+    #[tokio::test]
+    async fn the_runtime_api_reports_lanes_by_name_with_their_queues() {
+        let table = crate::model_routing::build_routing_table(&farm());
+        let pools = std::sync::Arc::new(openplotva_llm::router::PoolRegistry::new());
+        pools.apply(&table.pool_specs());
+        let handle = openplotva_llm::router::RouterHandle::new(table);
+        let _running = pools.try_acquire(Some(3)).expect("GPU1 lane");
+        let queued = {
+            let pools = std::sync::Arc::clone(&pools);
+            tokio::spawn(async move {
+                pools
+                    .acquire(
+                        Some(3),
+                        openplotva_llm::router::LanePriority::UserTool,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let lanes = openplotva_server::RuntimeLaneInspector::lanes(&RuntimeLanes {
+            handle,
+            pools: std::sync::Arc::clone(&pools),
+        });
+
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].name, "aifarm-gpu0-dialog");
+        assert_eq!(lanes[0].max_concurrency, Some(8));
+        assert_eq!(lanes[1].name, "aifarm-gpu1-media");
+        assert_eq!(lanes[1].in_flight, 1);
+        assert_eq!(lanes[1].queued_user_tool, 1);
+        queued.abort();
     }
 
     #[test]

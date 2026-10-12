@@ -41,10 +41,10 @@ pub use runtime_graphql::{
     RuntimeGeminiCachePurger, RuntimeGeminiCachePurgerFuture, RuntimeGradiusAuditReader,
     RuntimeGradiusAuditReaderFuture, RuntimeGradiusOpportunitiesFilter,
     RuntimeGradiusSummaryFilter, RuntimeIngestionGatesData, RuntimeJobAnalyticsStatData,
-    RuntimeLlmAnalyticsData, RuntimeLlmAnalyticsInferenceParamStatData,
-    RuntimeLlmAnalyticsModelSeriesPointData, RuntimeLlmAnalyticsModelStatData,
-    RuntimeLlmAnalyticsProviderStatData, RuntimeLlmAnalyticsReader,
-    RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
+    RuntimeLaneData, RuntimeLaneInspector, RuntimeLlmAnalyticsData,
+    RuntimeLlmAnalyticsInferenceParamStatData, RuntimeLlmAnalyticsModelSeriesPointData,
+    RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
+    RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
     RuntimeLlmAnalyticsStageMetricData, RuntimeLlmAnalyticsTopChatData,
     RuntimeLlmAnalyticsTotalsData, RuntimeLlmGenConfigData, RuntimeLlmRequestChatData,
     RuntimeLlmRequestData, RuntimeLlmRequestMessageData, RuntimeLlmRequestResultData,
@@ -924,7 +924,8 @@ mod tests {
         RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
         RuntimeGeminiCachePurgerFuture, RuntimeGradiusAuditReader, RuntimeGradiusAuditReaderFuture,
         RuntimeGradiusOpportunitiesFilter, RuntimeGradiusSummaryFilter,
-        RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData, RuntimeLlmAnalyticsModelStatData,
+        RuntimeJobAnalyticsStatData, RuntimeLaneData, RuntimeLaneInspector,
+        RuntimeLlmAnalyticsData, RuntimeLlmAnalyticsModelStatData,
         RuntimeLlmAnalyticsProviderStatData, RuntimeLlmAnalyticsReader,
         RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
         RuntimeLlmAnalyticsStageMetricData, RuntimeLlmAnalyticsTopChatData,
@@ -2701,6 +2702,66 @@ mod tests {
         assert_eq!(event["modelID"], "20");
         assert_eq!(event["userID"], "42");
         assert_eq!(event["detail"]["admin_report"]["action"], "sent");
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_serves_llm_lanes() {
+        struct LaneInspector;
+
+        impl RuntimeLaneInspector for LaneInspector {
+            fn lanes(&self) -> Vec<RuntimeLaneData> {
+                vec![RuntimeLaneData {
+                    id: 1,
+                    name: "aifarm-gpu0-dialog".to_owned(),
+                    max_concurrency: Some(8),
+                    in_flight: 8,
+                    queued_interactive: 2,
+                    queued_user_tool: 1,
+                    queued_background: 0,
+                    mean_hold_ms: Some(3400),
+                    wait_p50_ms: Some(0),
+                    wait_p95_ms: Some(2900),
+                }]
+            }
+        }
+
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                lane_inspector: Some(Arc::new(LaneInspector)),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let response = schema
+            .execute(
+                "query { llmLanes { id name maxConcurrency inFlight queuedInteractive queuedUserTool queuedBackground meanHoldMs waitP50Ms waitP95Ms } }",
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "runtime lanes GraphQL returned errors: {:?}",
+            response.errors
+        );
+        let payload = serde_json::to_value(&response)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        let lane = &payload["data"]["llmLanes"][0];
+        assert_eq!(lane["id"], "1");
+        assert_eq!(lane["name"], "aifarm-gpu0-dialog");
+        assert_eq!(lane["maxConcurrency"], 8);
+        assert_eq!(lane["inFlight"], 8);
+        assert_eq!(lane["queuedInteractive"], 2);
+        assert_eq!(lane["queuedUserTool"], 1);
+        assert_eq!(lane["meanHoldMs"], 3400);
+        assert_eq!(lane["waitP95Ms"], 2900);
+
+        let unconfigured = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics::default(),
+        )
+        .execute("query { llmLanes { name } }")
+        .await;
+        assert!(unconfigured.errors.is_empty());
     }
 
     #[tokio::test]
