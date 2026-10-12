@@ -10067,6 +10067,25 @@ mod tests {
     }
 
     #[test]
+    fn gpu2_eight_lanes_widen_only_the_gpu2_pool_and_are_reversible() {
+        const UP: &str = include_str!("../../../migrations/197_gpu2_eight_lanes.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/197_gpu2_eight_lanes.down.sql");
+
+        for value in [
+            "max_concurrency = 8",
+            "WHERE name = 'aifarm-gpu2-qwen27b'",
+            "'gpu2_eight_lanes_v1_previous_max_concurrency', max_concurrency",
+            "'gpu2_eight_lanes_v1_previous_description', description",
+        ] {
+            assert!(UP.contains(value), "missing GPU2 pool contract {value}");
+        }
+        assert!(!UP.contains("workflow_assignments"));
+        assert!(!UP.contains("provider_models"));
+        assert!(DOWN.contains("WHERE config ? 'gpu2_eight_lanes_v1_previous_max_concurrency'"));
+        assert!(DOWN.contains("- 'gpu2_eight_lanes_v1_previous_description'"));
+    }
+
+    #[test]
     fn gpu2_history_summary_routing_is_scoped_and_reversible() {
         const UP: &str =
             include_str!("../../../migrations/196_gpu2_history_summary_routing.up.sql");

@@ -49,7 +49,7 @@ const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Stage-one chunks summarized at the same time.
 const STAGE_ONE_CONCURRENCY: usize = 3;
-/// Summaries queue for the GPU2 slot they share with memory work this long before
+/// Summaries queue for the GPU2 pool they share with memory work this long before
 /// the chain falls back.
 pub const HISTORY_SUMMARY_PRIMARY_SLOT_WAIT: Duration = Duration::from_secs(60);
 
