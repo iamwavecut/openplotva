@@ -45,15 +45,18 @@ by some models" to "the resource's width".
 
 | Lane pool | Backend | Width |
 | --- | --- | ---: |
-| `aifarm-vllm-gpu0` | Gemma on GPU0 (dialog, vision, agents, media optimizer) | 8 |
-| `aifarm-gpu2-qwen27b` | Qwen on GPU2 (memory, history summary, YouTube fallbacks, dialog fallback, vision fallback) | 8 |
+| `aifarm-gpu0-dialog` (was `aifarm-vllm-gpu0`) | dialog model on GPU0 (dialog, vision, agents, media optimizer) | 8 |
+| `aifarm-gpu2-utility` (was `aifarm-gpu2-qwen27b`) | utility model on GPU2 (memory, history summary, YouTube fallbacks, dialog fallback, vision fallback) | 8 |
 | `aifarm-embedder` (new) | embedder (CPU) | 8 |
-| `aifarm-gpu1` (renamed `aifarm-draw-gpu1`) | draw, music and speech recognition on GPU1, one at a time | 1 |
-| `aifarm-privacy-filter` (new) | privacy filter on GPU1, beside the single lane | 4 |
+| `aifarm-gpu1-media` (was `aifarm-draw-gpu1`) | draw, music and speech recognition on GPU1, one at a time | 1 |
+| `aifarm-gpu1-privacy` (new) | privacy filter on GPU1, beside the media lane | 4 |
 | external APIs | OpenRouter and other hosted APIs | unpooled |
 
+Pool names follow `aifarm-<device>-<purpose>`, so they stay true when a model or a serving
+engine changes. The unused `vram-cloud` and `boogu-gpu` pools are left as they are.
+
 GPU1 runs under the VRAM arbiter, which loads and offloads models on demand. Draw, music and
-speech recognition share one sequential lane: while one of them runs, the others wait, so the
+speech recognition share the `aifarm-gpu1-media` lane: while one of them runs, the others wait, so the
 arbiter loads one heavy model set at a time instead of swapping between concurrent jobs. The
 privacy filter keeps its own pool and runs beside that lane; the arbiter already keeps it
 resident or moves it to the CPU.
@@ -92,7 +95,7 @@ Priorities, stored per workflow in a new `workflows.lane_priority` column:
 Embedding and redaction serve both the dialog path and memory writes. The caller passes its
 priority in `RoutedRequestContext`; the workflow column is the default.
 
-On the GPU1 lane, a voice message's transcription goes ahead of queued draws and songs, but a
+On the GPU1 media lane, a voice message's transcription goes ahead of queued draws and songs, but a
 running draw or song is never interrupted: the transcription waits for it to finish.
 
 Each pool also keeps an exponentially weighted mean of lane hold time, used for the forecast
@@ -141,8 +144,11 @@ violations.
 
 ## Migrations
 
-1. Rename `aifarm-draw-gpu1` to `aifarm-gpu1` and attach the speech recognition model to it;
-   add lane pools for the embedder (8) and the privacy filter (4) and attach their model rows.
+1. Rename the pools to `aifarm-gpu0-dialog`, `aifarm-gpu2-utility` and `aifarm-gpu1-media`,
+   attach the speech recognition model to `aifarm-gpu1-media`, and add `aifarm-embedder` (8) and
+   `aifarm-gpu1-privacy` (4) with their model rows. Pool ids do not change, so model rows keep
+   their `pool_id`; the code constant that names the GPU2 pool (`MEMORY_GPU2_POOL`) follows the
+   rename. Previous names are recorded for the down migration.
 2. `workflows.lane_priority SMALLINT NOT NULL DEFAULT 0` and
    `workflows.fallback_reserve_ms INTEGER NOT NULL DEFAULT 30000`, set to the values above.
    The down migration drops both columns and the new pools.
