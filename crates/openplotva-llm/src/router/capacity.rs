@@ -351,61 +351,26 @@ impl PoolRegistry {
     }
 }
 
-/// Derive a worker count for a workflow from the capacity of its candidates:
-/// the slot budgets of the distinct pools its enabled models attach to, plus
-/// `unpooled_share` for every distinct model that is unpooled or in an
-/// unlimited pool. Clamped to `1..=cap`. Returns `None` when the workflow has
-/// no route (callers keep their configured fallback count).
+/// Workers for a workflow: the width of its heaviest primary's lane pool times
+/// `per_lane` (at least one per lane), clamped to `1..=cap`. Fallback capacity
+/// is not throughput, so the rest of the chain does not count. `None` when the
+/// workflow has no route or its primary has no bounded lane pool (callers keep
+/// their configured count).
 #[must_use]
-pub fn derived_worker_count(
+pub fn lane_worker_count(
     table: &RoutingTable,
     workflow_key: &str,
-    unpooled_share: u32,
+    per_lane: u32,
     cap: u32,
 ) -> Option<u32> {
-    let mut model_ids: Vec<super::table::ModelId> = Vec::new();
-    let mut seen_route = false;
-    for vip in [false, true] {
-        let Some(route) = table.resolve(workflow_key, vip) else {
-            continue;
-        };
-        seen_route = true;
-        let candidates = route
-            .primary
-            .iter()
-            .chain(route.fallback_tail.iter())
-            .chain(route.canary.iter())
-            .chain(route.shadow.iter())
-            .chain(route.triggers.iter().map(|trigger| &trigger.engage));
-        for candidate in candidates {
-            if !model_ids.contains(&candidate.model) {
-                model_ids.push(candidate.model);
-            }
-        }
-    }
-    if !seen_route {
-        return None;
-    }
-
-    let mut counted_pools: Vec<PoolId> = Vec::new();
-    let mut total: u32 = 0;
-    for model_id in model_ids {
-        let pool_slots = table
-            .model(model_id)
-            .and_then(|model| model.pool_id)
-            .and_then(|pool_id| table.pool(pool_id).map(|spec| (pool_id, spec)));
-        match pool_slots {
-            Some((pool_id, spec)) => {
-                if counted_pools.contains(&pool_id) {
-                    continue;
-                }
-                counted_pools.push(pool_id);
-                total = total.saturating_add(spec.max_concurrency.unwrap_or(unpooled_share));
-            }
-            None => total = total.saturating_add(unpooled_share),
-        }
-    }
-    Some(total.clamp(1, cap.max(1)))
+    let route = table.resolve(workflow_key, false)?;
+    let primary = route
+        .primary
+        .iter()
+        .max_by_key(|candidate| candidate.weight)?;
+    let pool = table.model(primary.model)?.pool_id?;
+    let width = table.pool(pool)?.max_concurrency?;
+    Some(width.saturating_mul(per_lane.max(1)).clamp(1, cap.max(1)))
 }
 
 #[cfg(test)]
@@ -828,44 +793,87 @@ mod tests {
         table
     }
 
-    #[test]
-    fn derived_worker_count_sums_distinct_pools_and_unpooled_shares() {
-        let table = table_with(
-            vec![
-                model_row(10, Some(1)), // aifarm pool of 2
-                model_row(20, Some(2)), // vram pool of 16
-                model_row(21, Some(2)), // same pool: counted once
-                model_row(30, None),    // unpooled: unpooled_share
-            ],
-            vec![
-                PoolSpec {
-                    id: 1,
-                    max_concurrency: Some(2),
-                },
-                PoolSpec {
-                    id: 2,
-                    max_concurrency: Some(16),
-                },
-            ],
-            vec![10, 20, 21, 30],
-        );
+    fn with_fallbacks(mut table: RoutingTable, fallbacks: Vec<i64>) -> RoutingTable {
+        let mut route = table.resolve("dialog", false).expect("route").clone();
+        route.fallback_tail = fallbacks
+            .into_iter()
+            .map(|model| Candidate {
+                role: Role::Fallback,
+                ..candidate(model)
+            })
+            .collect();
+        table.set_route(Scope::Global, route);
+        table
+    }
 
-        assert_eq!(derived_worker_count(&table, "dialog", 2, 24), Some(20));
+    fn dialog_chain() -> RoutingTable {
+        with_fallbacks(
+            table_with(
+                vec![
+                    model_row(10, Some(1)), // GPU0: eight lanes
+                    model_row(20, Some(2)), // GPU2: eight lanes
+                    model_row(30, None),    // hosted API
+                ],
+                vec![
+                    PoolSpec {
+                        id: 1,
+                        max_concurrency: Some(8),
+                    },
+                    PoolSpec {
+                        id: 2,
+                        max_concurrency: Some(8),
+                    },
+                ],
+                vec![10],
+            ),
+            vec![20, 30],
+        )
+    }
+
+    #[test]
+    fn workers_follow_the_primary_lane_pool_only() {
+        let table = dialog_chain();
+        assert_eq!(lane_worker_count(&table, "dialog", 2, 24), Some(16));
         assert_eq!(
-            derived_worker_count(&table, "dialog", 2, 8),
-            Some(8),
-            "cap clamps the derived count"
+            lane_worker_count(&table, "dialog", 2, 10),
+            Some(10),
+            "cap clamps the count"
         );
         assert_eq!(
-            derived_worker_count(&table, "missing", 2, 24),
+            lane_worker_count(&table, "dialog", 0, 24),
+            Some(8),
+            "at least one worker per lane"
+        );
+        assert_eq!(
+            lane_worker_count(&table, "missing", 2, 24),
             None,
-            "unknown workflow keeps the configured fallback"
+            "unknown workflow keeps the configured count"
         );
     }
 
     #[test]
-    fn derived_worker_count_treats_unlimited_pool_as_unpooled_share() {
-        let table = table_with(
+    fn the_heaviest_primary_decides_the_worker_count() {
+        let mut table = dialog_chain();
+        let mut route = table.resolve("dialog", false).expect("route").clone();
+        route.primary = vec![
+            Candidate {
+                weight: 10,
+                ..candidate(30)
+            },
+            Candidate {
+                weight: 90,
+                ..candidate(10)
+            },
+        ];
+        table.set_route(Scope::Global, route);
+        assert_eq!(lane_worker_count(&table, "dialog", 2, 24), Some(16));
+    }
+
+    #[test]
+    fn an_unpooled_or_unlimited_primary_has_no_lane_count() {
+        let unpooled = table_with(vec![model_row(30, None)], vec![], vec![30]);
+        assert_eq!(lane_worker_count(&unpooled, "dialog", 2, 24), None);
+        let unlimited = table_with(
             vec![model_row(10, Some(1))],
             vec![PoolSpec {
                 id: 1,
@@ -873,12 +881,6 @@ mod tests {
             }],
             vec![10],
         );
-        assert_eq!(derived_worker_count(&table, "dialog", 3, 24), Some(3));
-    }
-
-    #[test]
-    fn derived_worker_count_never_returns_zero() {
-        let table = table_with(vec![], vec![], vec![]);
-        assert_eq!(derived_worker_count(&table, "dialog", 0, 24), Some(1));
+        assert_eq!(lane_worker_count(&unlimited, "dialog", 2, 24), None);
     }
 }

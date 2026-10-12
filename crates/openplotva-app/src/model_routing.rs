@@ -2137,33 +2137,54 @@ async fn mark_app_setting_in_transaction(
     Ok(())
 }
 
+/// A worker fleet whose size follows its workflow's primary lane pool.
+pub struct LaneWorkerScale {
+    pub workflow_key: &'static str,
+    pub per_lane: u32,
+    /// Configured minimum; the lane-derived count never drops below it.
+    pub floor: u32,
+    pub cap: u32,
+    pub scale: tokio::sync::watch::Sender<u32>,
+}
+
+impl LaneWorkerScale {
+    /// Worker count for `table`; `None` when the primary has no lane pool, so
+    /// the running count stays.
+    #[must_use]
+    pub fn desired(&self, table: &RoutingTable) -> Option<u32> {
+        openplotva_llm::router::lane_worker_count(table, self.workflow_key, self.per_lane, self.cap)
+            .map(|workers| workers.max(self.floor))
+    }
+
+    fn apply(&self, table: &RoutingTable) {
+        if let Some(desired) = self.desired(table) {
+            let _ = self.scale.send(desired);
+        }
+    }
+}
+
 /// Everything the runtime rebuilds when the routing configuration changes:
-/// the published table, the capacity-pool registry, and (once wired) the
-/// derived dialog worker scale. Breakers/triggers are deliberately absent —
-/// their state must survive a reload untouched.
+/// the published table, the lane pool registry, and the dialog and memory
+/// worker scales. Breakers/triggers are deliberately absent — their state must
+/// survive a reload untouched.
 pub struct RouterRuntime {
     pub handle: Arc<RouterHandle>,
     pub pools: Arc<openplotva_llm::router::PoolRegistry>,
-    pub dialog_scale: Option<tokio::sync::watch::Sender<u32>>,
-    pub dialog_unpooled_share: u32,
-    pub dialog_worker_cap: u32,
+    pub dialog_workers: Option<LaneWorkerScale>,
+    pub memory_workers: Option<LaneWorkerScale>,
 }
 
 impl RouterRuntime {
-    /// Reconcile the live pool registry and worker scale with the currently
+    /// Reconcile the live pool registry and worker scales with the currently
     /// published table.
     pub fn apply_published_table(&self) {
         let table = self.handle.snapshot();
         self.pools.apply(&table.pool_specs());
-        if let Some(scale) = &self.dialog_scale
-            && let Some(desired) = openplotva_llm::router::derived_worker_count(
-                &table,
-                "dialog",
-                self.dialog_unpooled_share,
-                self.dialog_worker_cap,
-            )
+        for workers in [&self.dialog_workers, &self.memory_workers]
+            .into_iter()
+            .flatten()
         {
-            let _ = scale.send(desired);
+            workers.apply(&table);
         }
     }
 }
@@ -2547,7 +2568,7 @@ fn build_route(
 mod tests {
     use openplotva_llm::router::{BreakerLiveness, BreakerSet, TriggerState, select};
     use openplotva_storage::llm_routing::{
-        AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, TriggerRecord,
+        AssignmentRecord, ModelRecord, PoolRecord, ProviderRecord, RoutingSnapshot, TriggerRecord,
         WorkflowRecord,
     };
     use rand::SeedableRng;
@@ -2728,6 +2749,69 @@ mod tests {
             }],
             pools: vec![],
         }
+    }
+
+    fn dialog_snapshot_with_gpu0_lanes(width: i32) -> RoutingSnapshot {
+        let mut snapshot = dialog_snapshot();
+        snapshot.models[0].pool_id = Some(1);
+        snapshot.pools.push(PoolRecord {
+            id: 1,
+            name: "aifarm-gpu0-dialog".to_owned(),
+            max_concurrency: Some(width),
+            description: None,
+            config: json!({}),
+        });
+        snapshot
+    }
+
+    fn worker_scale(floor: u32) -> (LaneWorkerScale, tokio::sync::watch::Receiver<u32>) {
+        let (scale, receiver) = tokio::sync::watch::channel(0);
+        (
+            LaneWorkerScale {
+                workflow_key: "dialog",
+                per_lane: 2,
+                floor,
+                cap: 24,
+                scale,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn worker_scales_follow_the_primary_lane_pool_and_keep_their_floor() {
+        let table = build_routing_table(&dialog_snapshot_with_gpu0_lanes(8));
+        assert_eq!(worker_scale(0).0.desired(&table), Some(16));
+        assert_eq!(worker_scale(20).0.desired(&table), Some(20));
+
+        let unpooled = build_routing_table(&dialog_snapshot());
+        assert_eq!(
+            worker_scale(3).0.desired(&unpooled),
+            None,
+            "a primary without lanes keeps the running count"
+        );
+    }
+
+    #[test]
+    fn a_routing_reload_resizes_dialog_and_memory_workers() {
+        let handle = RouterHandle::new(build_routing_table(&dialog_snapshot_with_gpu0_lanes(8)));
+        let (dialog, dialog_rx) = worker_scale(0);
+        let (memory, memory_rx) = worker_scale(3);
+        let runtime = RouterRuntime {
+            handle: Arc::clone(&handle),
+            pools: Arc::new(openplotva_llm::router::PoolRegistry::new()),
+            dialog_workers: Some(dialog),
+            memory_workers: Some(memory),
+        };
+
+        runtime.apply_published_table();
+        assert_eq!(*dialog_rx.borrow(), 16);
+        assert_eq!(*memory_rx.borrow(), 16);
+
+        handle.store(build_routing_table(&dialog_snapshot_with_gpu0_lanes(1)));
+        runtime.apply_published_table();
+        assert_eq!(*dialog_rx.borrow(), 2);
+        assert_eq!(*memory_rx.borrow(), 3, "the configured floor holds");
     }
 
     #[test]

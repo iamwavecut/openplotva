@@ -219,9 +219,14 @@ pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS: i32 = 2;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
 
-pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
+/// Dialog workers per lane of the dialog primary's lane pool: one runs its
+/// model round while the other runs the turn's non-model phases.
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE: i32 = 2;
 
-pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 4;
+pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 32;
+/// Memory workers per lane of the memory primary's lane pool: a memory run
+/// spends most of its time outside the model.
+pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE: i32 = 2;
 /// Matches the privacy-filter `max_concurrent_jobs` registered in Discovery.
 pub const DEFAULT_MEMORY_REDACTION_CONCURRENCY: i32 = 4;
 
@@ -677,14 +682,13 @@ pub struct PersistentQueueConfig {
     pub control_workers: i32,
     /// Worker count for the `text` queue.
     pub text_workers: i32,
-    /// Worker count for the `dialog-aifarm` queue. With capacity pools active
-    /// this is only the fallback when the routing table has no dialog route.
+    /// Worker count for the `dialog-aifarm` queue. With lane pools active this
+    /// is only the fallback when the dialog primary has no lane pool.
     pub dialog_aifarm_workers: i32,
-    /// Upper bound for the pool-derived dialog worker count.
+    /// Upper bound for the lane-derived dialog worker count.
     pub dialog_workers_cap: i32,
-    /// Slot contribution of an unpooled/unlimited-pool dialog model when
-    /// deriving the worker count.
-    pub dialog_unpooled_share: i32,
+    /// Dialog workers per lane of the dialog primary's lane pool.
+    pub dialog_workers_per_lane: i32,
     pub dialog_aifarm_fallback_high_watermark: i32,
     pub dialog_aifarm_fallback_low_watermark: i32,
     pub dialog_aifarm_fallback_poll_interval_seconds: i32,
@@ -696,8 +700,10 @@ pub struct PersistentQueueConfig {
     pub music_vip_workers: i32,
     /// Worker count for the `memory-consolidation` queue.
     pub memory_consolidation_workers: i32,
-    /// Upper bound for the pool-derived memory-consolidation worker count.
+    /// Upper bound for the lane-derived memory-consolidation worker count.
     pub memory_workers_cap: i32,
+    /// Memory-consolidation workers per lane of the memory primary's lane pool.
+    pub memory_workers_per_lane: i32,
     /// Placeholder cleanup interval in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub placeholder_cleanup_interval_seconds: i32,
     /// Placeholder max age in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -1264,7 +1270,8 @@ pub struct RawConfig {
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS`.
     pub persistent_queue_dialog_aifarm_workers: Option<String>,
     pub persistent_queue_dialog_workers_cap: Option<String>,
-    pub persistent_queue_dialog_unpooled_share: Option<String>,
+    /// `PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE`.
+    pub persistent_queue_dialog_workers_per_lane: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK`.
     pub persistent_queue_dialog_aifarm_fallback_high_watermark: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK`.
@@ -1280,6 +1287,8 @@ pub struct RawConfig {
     /// `PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS`.
     pub persistent_queue_memory_consolidation_workers: Option<String>,
     pub persistent_queue_memory_workers_cap: Option<String>,
+    /// `PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE`.
+    pub persistent_queue_memory_workers_per_lane: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub persistent_queue_placeholder_cleanup_interval_seconds: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -1946,10 +1955,10 @@ impl AppConfig {
                 raw.persistent_queue_dialog_workers_cap,
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP,
             )?,
-            dialog_unpooled_share: parse_i32(
-                "PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE",
-                raw.persistent_queue_dialog_unpooled_share,
-                DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE,
+            dialog_workers_per_lane: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE",
+                raw.persistent_queue_dialog_workers_per_lane,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE,
             )?,
             dialog_aifarm_fallback_high_watermark: parse_i32(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
@@ -1990,6 +1999,11 @@ impl AppConfig {
                 "PERSISTENT_QUEUE_MEMORY_WORKERS_CAP",
                 raw.persistent_queue_memory_workers_cap,
                 DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP,
+            )?,
+            memory_workers_per_lane: parse_i32(
+                "PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE",
+                raw.persistent_queue_memory_workers_per_lane,
+                DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE,
             )?,
             placeholder_cleanup_interval_seconds: parse_i32(
                 "PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS",
@@ -3221,7 +3235,9 @@ impl RawConfig {
             persistent_queue_text_workers: env("PERSISTENT_QUEUE_TEXT_WORKERS"),
             persistent_queue_dialog_aifarm_workers: env("PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS"),
             persistent_queue_dialog_workers_cap: env("PERSISTENT_QUEUE_DIALOG_WORKERS_CAP"),
-            persistent_queue_dialog_unpooled_share: env("PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE"),
+            persistent_queue_dialog_workers_per_lane: env(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_PER_LANE",
+            ),
             persistent_queue_dialog_aifarm_fallback_high_watermark: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
             ),
@@ -3235,6 +3251,9 @@ impl RawConfig {
             persistent_queue_image_vip_workers: env("PERSISTENT_QUEUE_IMAGE_VIP_WORKERS"),
             persistent_queue_music_vip_workers: env("PERSISTENT_QUEUE_MUSIC_VIP_WORKERS"),
             persistent_queue_memory_workers_cap: env("PERSISTENT_QUEUE_MEMORY_WORKERS_CAP"),
+            persistent_queue_memory_workers_per_lane: env(
+                "PERSISTENT_QUEUE_MEMORY_WORKERS_PER_LANE",
+            ),
             persistent_queue_memory_consolidation_workers: env(
                 "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
             ),
@@ -4052,6 +4071,8 @@ mod tests {
             config.persistent_queue.memory_workers_cap,
             DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP
         );
+        assert_eq!(config.persistent_queue.memory_workers_per_lane, 2);
+        assert_eq!(config.persistent_queue.dialog_workers_per_lane, 2);
         assert_eq!(
             config.persistent_queue.placeholder_cleanup_interval_seconds,
             DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS
