@@ -5410,10 +5410,10 @@ fn first_choice_tool_steps(
     Ok(ToolStepSelection::None(parsed.decision))
 }
 
-/// The arguments of a required tool written as bare `<parameter>value</parameter>`
-/// elements, the shape a model without native tool calling falls back to when the
-/// request names one tool; the engine's own call wrapper may enclose them. Every element
-/// must name a parameter of that tool. Text may only follow a closed call wrapper; it is
+/// The arguments of a required tool written as markup elements (`<parameter>value</parameter>`
+/// or a named `<arg>`/`<parameter>` element), the shape a model without native tool calling
+/// falls back to when the request names one tool; the engine's own call wrapper may enclose
+/// them. Every element must name a parameter of that tool. Text may only follow a closed call wrapper; it is
 /// returned as the text that accompanies the call.
 fn forced_tool_markup_step(
     response: &Value,
@@ -5452,10 +5452,9 @@ fn forced_tool_markup_step(
         }
         let tail = rest.strip_prefix('<')?;
         let tag_end = tail.find('>')?;
-        let tag = &tail[..tag_end];
+        let (tag, close) = markup_argument_tag(&tail[..tag_end])?;
         let schema = parameters.get(tag)?;
         let body = &tail[tag_end + 1..];
-        let close = format!("</{tag}>");
         let value_end = body.find(&close)?;
         let raw = body[..value_end].trim();
         let value = match schema.get("type").and_then(Value::as_str) {
@@ -5490,6 +5489,26 @@ fn forced_tool_markup_step(
         },
         text,
     ))
+}
+
+/// The argument name an opening tag carries and the tag that closes it: `<name>`,
+/// `<arg name="name">`, `<parameter=name>` or `<parameter name="name">`.
+fn markup_argument_tag(tag: &str) -> Option<(&str, String)> {
+    fn quoted_name(attributes: &str) -> Option<&str> {
+        let value = attributes.trim().strip_prefix("name=")?;
+        let quote = value.chars().next().filter(|ch| matches!(ch, '"' | '\''))?;
+        value[1..].strip_suffix(quote)
+    }
+    if let Some(attributes) = tag.strip_prefix("arg ") {
+        return Some((quoted_name(attributes)?, "</arg>".to_owned()));
+    }
+    if let Some(name) = tag.strip_prefix("parameter=") {
+        return Some((name.trim(), "</parameter>".to_owned()));
+    }
+    if let Some(attributes) = tag.strip_prefix("parameter ") {
+        return Some((quoted_name(attributes)?, "</parameter>".to_owned()));
+    }
+    Some((tag, format!("</{tag}>")))
 }
 
 fn tool_protocol_completion_error(message: impl Into<String>) -> CompletionError {
@@ -11168,6 +11187,19 @@ mod tests {
         assert_eq!(commented.tool_calls.len(), 1);
         assert_eq!(commented.tool_calls[0].step.prompt, "A cat on a roof");
         assert_eq!(commented.text, "Держи кота на крыше.");
+
+        for named in [
+            "<arg name=\"caption\">Кот</arg>\n<arg name=\"prompt\">A cat on a roof</arg></function></tool_call>",
+            "<parameter=caption>Кот</parameter>\n<parameter=prompt>A cat on a roof</parameter>",
+            "<parameter name='caption'>Кот</parameter><parameter name='prompt'>A cat on a roof</parameter>",
+        ] {
+            let output = forced_draw_step(named, true)
+                .await
+                .expect("named argument elements are that tool's arguments");
+            assert_eq!(output.tool_calls.len(), 1, "{named}");
+            assert_eq!(output.tool_calls[0].step.caption, "Кот");
+            assert_eq!(output.tool_calls[0].step.prompt, "A cat on a roof");
+        }
     }
 
     #[tokio::test]
