@@ -13,7 +13,9 @@ pub mod table;
 pub mod triggers;
 
 pub use breaker::{BreakerConfig, BreakerLiveness, BreakerSet, BreakerStateView};
-pub use capacity::{PoolOccupancy, PoolPermit, PoolRegistry, PoolSpec, derived_worker_count};
+pub use capacity::{
+    LanePriority, PoolOccupancy, PoolPermit, PoolRegistry, PoolSpec, derived_worker_count,
+};
 pub use handle::RouterHandle;
 pub use policy::{Attempt, Liveness, RetryBudget, TriggerView, select, select_chain};
 pub use table::{
