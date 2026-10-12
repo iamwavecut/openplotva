@@ -11093,6 +11093,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemma_call_syntax_runs_as_a_tool_or_is_resampled_but_never_delivered() {
+        let content = "<think>\n</think>draw_image{caption:<|\"|>Мигающие мельницы<|\"|>,prompt:<|\"|>Surreal windmills flashing like strobe lights.<|\"|>}";
+        let step = |textual_tool_calls: bool, tools: openplotva_dialog::ToolsMode| async move {
+            let (provider, _, _) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": content}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let mut input = base_input();
+            input.textual_tool_calls = textual_tool_calls;
+            crate::ChatStepProvider::run_chat_step(
+                &provider,
+                openplotva_dialog::ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input,
+                    transcript: Vec::new(),
+                    tools,
+                    iteration: 1,
+                },
+            )
+            .await
+        };
+        let native = || {
+            openplotva_dialog::ToolsMode::Native(
+                native_tool_values(&[STEP_WEB_SEARCH, STEP_DRAW_IMAGE]).expect("tool defs"),
+            )
+        };
+
+        let executed = step(true, native()).await.expect("the call runs");
+        assert_eq!(executed.tool_calls.len(), 1);
+        assert_eq!(executed.tool_calls[0].step.step, STEP_DRAW_IMAGE);
+        assert_eq!(executed.text, "");
+
+        for (textual, tools) in [
+            (false, native()),
+            (true, openplotva_dialog::ToolsMode::FinalOnly),
+        ] {
+            let error = step(textual, tools).await.expect_err("never a reply");
+            assert_eq!(
+                crate::retry::retryable_reason(error.as_ref()),
+                Some(FailureReason::ModelOutputRejected)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn chat_step_executes_textual_tool_calls_for_models_that_write_them() {
         for content in [
             "<react_to_message emoji=\"🤣\" message_id=\"42\" />",
