@@ -38,25 +38,34 @@ GPU0 averaged about 2 busy lanes of 8 and peaked at 8.
 
 ### Backends and lanes
 
-A *lane pool* is the width of one physical backend: one server that accepts a fixed number of
-concurrent requests. The existing `llm_capacity_pools` rows become lane pools; their meaning
-changes from "budget shared by some models" to "the server's width".
+A *lane pool* is the width of one physical resource: the number of requests it can run at once.
+Usually that is one server; several services that must not run concurrently share one pool. The
+existing `llm_capacity_pools` rows become lane pools; their meaning changes from "budget shared
+by some models" to "the resource's width".
 
 | Lane pool | Backend | Width |
 | --- | --- | ---: |
 | `aifarm-vllm-gpu0` | Gemma on GPU0 (dialog, vision, agents, media optimizer) | 8 |
 | `aifarm-gpu2-qwen27b` | Qwen on GPU2 (memory, history summary, YouTube fallbacks, dialog fallback, vision fallback) | 8 |
 | `aifarm-embedder` (new) | embedder (CPU) | 8 |
-| `aifarm-privacy-filter` (new) | privacy filter (GPU1, under the arbiter) | 4 |
-| `aifarm-asr` (new) | speech recognition (GPU1, under the arbiter) | 1 |
-| `aifarm-draw-gpu1` | draw and music (GPU1, under the arbiter) | 1 |
+| `aifarm-gpu1` (renamed `aifarm-draw-gpu1`) | draw, music and speech recognition on GPU1, one at a time | 1 |
+| `aifarm-privacy-filter` (new) | privacy filter on GPU1, beside the single lane | 4 |
 | external APIs | OpenRouter and other hosted APIs | unpooled |
+
+GPU1 runs under the VRAM arbiter, which loads and offloads models on demand. Draw, music and
+speech recognition share one sequential lane: while one of them runs, the others wait, so the
+arbiter loads one heavy model set at a time instead of swapping between concurrent jobs. The
+privacy filter keeps its own pool and runs beside that lane; the arbiter already keeps it
+resident or moves it to the CPU.
 
 Invariants, checked whenever the routing table loads:
 
 1. Every enabled model whose provider targets a Discovery service belongs to a lane pool.
-2. All enabled models that target the same Discovery service belong to the same lane pool.
-3. A lane pool's width equals the `max_concurrent_jobs` of its Discovery service.
+2. All enabled models that target the same Discovery service belong to the same lane pool. A
+   pool may span several services when they share one sequential resource (GPU1's draw, music
+   and speech recognition).
+3. A lane pool's width does not exceed the `max_concurrent_jobs` of any Discovery service it
+   spans, and equals it when the pool spans one service.
 
 A violation emits a `lane_config_mismatch` routing event and a readiness warning; routing keeps
 working with the bot's configured width. Invariant 3 is checked against Discovery's
@@ -76,12 +85,15 @@ Priorities, stored per workflow in a new `workflows.lane_priority` column:
 
 | Priority | Workflows |
 | --- | --- |
-| 0 interactive | `dialog`, `agentic_*`, `vision`, `voice_transcription`, image and music workflows, `redaction` and `embedding` on the dialog path |
-| 1 user tool | `history_summary`, `youtube_summary`, `media_prompt_optimizer` |
+| 0 interactive | `dialog`, `agentic_*`, `vision`, `voice_transcription`, `redaction` and `embedding` on the dialog path |
+| 1 user tool | `history_summary`, `youtube_summary`, `media_prompt_optimizer`, image and music workflows |
 | 2 background | `memory_extraction` (including its resolution calls), `memory_subject_merge`, memory-write `embedding` and `redaction` |
 
 Embedding and redaction serve both the dialog path and memory writes. The caller passes its
 priority in `RoutedRequestContext`; the workflow column is the default.
+
+On the GPU1 lane, a voice message's transcription goes ahead of queued draws and songs, but a
+running draw or song is never interrupted: the transcription waits for it to finish.
 
 Each pool also keeps an exponentially weighted mean of lane hold time, used for the forecast
 below and exposed for observability.
@@ -129,7 +141,8 @@ violations.
 
 ## Migrations
 
-1. Lane pools for the embedder (8), privacy filter (4) and ASR (1); attach their model rows.
+1. Rename `aifarm-draw-gpu1` to `aifarm-gpu1` and attach the speech recognition model to it;
+   add lane pools for the embedder (8) and the privacy filter (4) and attach their model rows.
 2. `workflows.lane_priority SMALLINT NOT NULL DEFAULT 0` and
    `workflows.fallback_reserve_ms INTEGER NOT NULL DEFAULT 30000`, set to the values above.
    The down migration drops both columns and the new pools.
@@ -150,7 +163,10 @@ violations.
   at once; a forecast beyond the budget falls back without waiting; a request without a deadline
   waits; unpooled candidates are immediate.
 - Worker sizing tests for dialog and memory.
-- Invariant tests for the routing table loader, including the vision fallback case.
+- Invariant tests for the routing table loader, including the vision fallback case and a pool
+  that spans several services.
+- A GPU1 test: a transcription queued behind a running draw starts only after the draw releases
+  the lane, and ahead of a second queued draw.
 - Production verification after deploy: dialog requests served by GPU2 and Luna drop to
   failures and budget skips only; GPU0 lane occupancy and queue waits are visible; memory runs at
   background priority without delaying dialog fallbacks.
