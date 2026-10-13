@@ -6062,7 +6062,7 @@ impl PostgresMemoryStore {
         match cache.get(&key) {
             Ok(cards) => Ok(cards),
             Err(generation) => {
-                let cards = self.list_visible_cards(scope, limit).await?;
+                let cards = self.list_visible_cards(scope, key.limit).await?;
                 cache.put(key, &cards, generation);
                 Ok(cards)
             }
@@ -6356,6 +6356,16 @@ impl PostgresMemoryStore {
             return Ok(0);
         }
         usage.sort_unstable_by_key(|entry| entry.card_id);
+        // One row per card: a repeated id would join several usage rows and
+        // apply only one of them.
+        usage.dedup_by(|next, kept| {
+            if kept.card_id != next.card_id {
+                return false;
+            }
+            kept.uses += next.uses;
+            kept.last_used_at = kept.last_used_at.max(next.last_used_at);
+            true
+        });
         let ids = usage.iter().map(|entry| entry.card_id).collect::<Vec<_>>();
         let used_at = usage
             .iter()
@@ -12329,7 +12339,7 @@ mod tests {
             assert_eq!(retrieved.episodes[0].id, episode_id);
             let retrieved_card_ids =
                 retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>();
-            let usage = retrieved_card_ids
+            let mut usage = retrieved_card_ids
                 .iter()
                 .map(|card_id| super::MemoryCardUsage {
                     card_id: *card_id,
@@ -12337,15 +12347,31 @@ mod tests {
                     uses: 1,
                 })
                 .collect::<Vec<_>>();
+            usage.push(super::MemoryCardUsage {
+                card_id: retrieved_card_ids[0],
+                last_used_at: observed + time::Duration::minutes(30),
+                uses: 2,
+            });
             store.record_card_usage(&usage).await?;
             let used_cards: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM memory_cards WHERE id = ANY($1::bigint[]) AND use_count = 1 AND last_used_at = $2",
             )
-            .bind(&retrieved_card_ids)
+            .bind(&retrieved_card_ids[1..])
             .bind(observed + time::Duration::hours(1))
             .fetch_one(&pool)
             .await?;
-            assert_eq!(used_cards, retrieved.cards.len() as i64);
+            assert_eq!(used_cards, retrieved.cards.len() as i64 - 1);
+            let repeated: (i32, time::OffsetDateTime) = sqlx::query_as(
+                "SELECT use_count, last_used_at FROM memory_cards WHERE id = $1",
+            )
+            .bind(retrieved_card_ids[0])
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                repeated,
+                (3, observed + time::Duration::hours(1)),
+                "a repeated card sums its uses and keeps its latest use"
+            );
 
             let listed = store
                 .list_cards(&openplotva_memory::CardFilter {

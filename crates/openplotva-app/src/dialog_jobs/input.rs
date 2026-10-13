@@ -170,19 +170,16 @@ impl PostgresDialogInputMaterializer {
         }
     }
 
+    /// Recall memory from `memory` and record recalled cards in `usage`, the
+    /// write-behind journal that applies them to Postgres.
     #[must_use]
-    pub fn with_memory_store(mut self, memory: PostgresMemoryStore) -> Self {
-        self.memory = Some(memory);
-        self
-    }
-
-    /// Record recalled cards in the write-behind journal instead of in Postgres.
-    #[must_use]
-    pub fn with_memory_usage_journal(
+    pub fn with_memory_store(
         mut self,
-        journal: crate::memory_card_usage::MemoryCardUsageJournal,
+        memory: PostgresMemoryStore,
+        usage: crate::memory_card_usage::MemoryCardUsageJournal,
     ) -> Self {
-        self.memory_usage = Some(journal);
+        self.memory = Some(memory);
+        self.memory_usage = Some(usage);
         self
     }
 

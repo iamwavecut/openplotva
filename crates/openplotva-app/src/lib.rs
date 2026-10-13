@@ -12996,8 +12996,7 @@ async fn start_runtime_workers(
             );
             if dialog_memory_context_enabled(config) {
                 dialog_materializer = dialog_materializer
-                    .with_memory_store(memory_store.clone())
-                    .with_memory_usage_journal(memory_card_usage.clone());
+                    .with_memory_store(memory_store.clone(), memory_card_usage.clone());
                 if let Some(embedder) = memory_query_embedder.clone() {
                     dialog_materializer = dialog_materializer
                         .with_memory_embedder(embedder, config.memory.embedding_dim);
