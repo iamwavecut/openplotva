@@ -43,10 +43,15 @@ pub mod gradius_ads;
 pub mod llm_routing;
 pub mod maintenance;
 pub mod maintenance_notifications;
+mod task_queue_listing;
 pub mod telegram_delivery;
 pub mod telegram_outbox;
 pub mod telegram_projection;
 
+pub use task_queue_listing::{
+    TASK_QUEUE_ACTIVE_STATUSES, TaskQueueJobFilter, TaskQueueJobPage, TaskQueueSortColumn,
+    TaskQueueTimeColumn,
+};
 pub use telegram_delivery::{
     ClaimedTelegramUpdate, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
     MaterializedUpdateDisposition, MaterializedUpdateInput, PostgresTelegramDeliveryStore,
@@ -7104,7 +7109,15 @@ impl PostgresTaskQueueStore {
         &self.pool
     }
 
-    pub async fn load_task_queue_snapshot(&self) -> Result<TaskQueueSnapshot, StorageError> {
+    /// Load the jobs the in-memory queue holds: every active job, finished jobs
+    /// that ended at or after `finished_since`, and the newest
+    /// `finished_per_queue` finished jobs of each queue. Older finished jobs stay
+    /// in Postgres only, until the retention purge.
+    pub async fn load_task_queue_snapshot(
+        &self,
+        finished_since: OffsetDateTime,
+        finished_per_queue: i64,
+    ) -> Result<TaskQueueSnapshot, StorageError> {
         // A connection/query failure here is transient and stays fatal (the caller
         // aborts startup and a restart retries the load). But a single undeserializable
         // row (schema drift, partial write) must NOT crash the boot, or one bad row
@@ -7115,9 +7128,31 @@ impl PostgresTaskQueueStore {
             SELECT id, record
             FROM taskman_jobs
             WHERE deleted_at IS NULL
+              AND (
+                  status = ANY($1)
+                  OR COALESCE(completed_at, updated_at, created_at) >= $2
+                  OR id IN (
+                      SELECT id
+                      FROM (
+                          SELECT
+                              id,
+                              row_number() OVER (
+                                  PARTITION BY queue_name
+                                  ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, id DESC
+                              ) AS position
+                          FROM taskman_jobs
+                          WHERE deleted_at IS NULL
+                            AND status <> ALL($1)
+                      ) AS finished
+                      WHERE position <= $3
+                  )
+              )
             ORDER BY id ASC
             "#,
         )
+        .bind(TASK_QUEUE_ACTIVE_STATUSES.map(str::to_owned).to_vec())
+        .bind(finished_since)
+        .bind(finished_per_queue)
         .fetch_all(&self.pool)
         .await?;
         let mut records = Vec::with_capacity(rows.len());
@@ -7224,22 +7259,38 @@ impl PostgresTaskQueueStore {
         Ok((next_job_id.max(1), next_message_id.max(1)))
     }
 
-    /// Hard-delete soft-deleted jobs and history older than the cutoff. Returns the
-    /// number of rows reclaimed. Soft-deleted rows and history are retention-only;
-    /// without this the tables grow without bound.
+    /// Hard-delete finished jobs that ended before `finished_before`, plus
+    /// soft-deleted jobs and history older than `deleted_before`. Returns the
+    /// number of rows reclaimed. The in-memory queue drops finished jobs without
+    /// touching Postgres, so this purge is what bounds the tables.
     pub async fn purge_task_queue_terminal(
         &self,
-        older_than: OffsetDateTime,
+        finished_before: OffsetDateTime,
+        deleted_before: OffsetDateTime,
     ) -> Result<u64, StorageError> {
-        let jobs = sqlx::query(
-            "DELETE FROM taskman_jobs WHERE deleted_at IS NOT NULL AND deleted_at < $1",
+        let finished = sqlx::query(
+            r#"
+            DELETE FROM taskman_jobs
+            WHERE deleted_at IS NULL
+              AND status <> ALL($1)
+              AND COALESCE(completed_at, updated_at, created_at) < $2
+            "#,
         )
-        .bind(older_than)
+        .bind(TASK_QUEUE_ACTIVE_STATUSES.map(str::to_owned).to_vec())
+        .bind(finished_before)
         .execute(&self.pool)
         .await?
         .rows_affected();
+        let deleted = sqlx::query(
+            "DELETE FROM taskman_jobs WHERE deleted_at IS NOT NULL AND deleted_at < $1",
+        )
+        .bind(deleted_before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        let jobs = finished + deleted;
         let history = sqlx::query("DELETE FROM taskman_job_history WHERE at < $1")
-            .bind(older_than)
+            .bind(deleted_before)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -12543,7 +12594,9 @@ mod tests {
         store.apply_task_queue_wal_batch(vec![upsert]).await?;
 
         // The record round-trips through the JSONB column and the generated columns.
-        let snapshot = store.load_task_queue_snapshot().await?;
+        let snapshot = store
+            .load_task_queue_snapshot(time::OffsetDateTime::now_utc(), 0)
+            .await?;
         let loaded = snapshot
             .records
             .iter()
@@ -12582,7 +12635,9 @@ mod tests {
             record: None,
         };
         store.apply_task_queue_wal_batch(vec![delete]).await?;
-        let after_delete = store.load_task_queue_snapshot().await?;
+        let after_delete = store
+            .load_task_queue_snapshot(time::OffsetDateTime::now_utc(), 0)
+            .await?;
         assert!(
             after_delete.records.iter().all(|r| r.id != start_id),
             "a soft-deleted job must not load"
@@ -12590,8 +12645,9 @@ mod tests {
 
         // Purge hard-deletes the soft-deleted row and its history, yet the durable
         // high-water must NOT regress: a restart can never reissue the id (#1).
+        let purge_cutoff = time::OffsetDateTime::now_utc() + time::Duration::days(1);
         let purged = store
-            .purge_task_queue_terminal(time::OffsetDateTime::now_utc() + time::Duration::days(1))
+            .purge_task_queue_terminal(purge_cutoff, purge_cutoff)
             .await?;
         assert!(
             purged >= 1,
@@ -12602,6 +12658,189 @@ mod tests {
             after_purge_id > start_id,
             "the id high-water must survive a hard purge"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_taskman_startup_load_listing_and_purge_follow_finish_time_when_postgres_dsn_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        let store = super::PostgresTaskQueueStore::new(pool.clone());
+        let (start_id, _) = store.reserve_id_high_water().await?;
+        let queue_name = format!("live-retention-{start_id}");
+        let now = time::OffsetDateTime::now_utc();
+        let record = |offset: i64,
+                      status: openplotva_taskman::JobStatus,
+                      finished: Option<time::OffsetDateTime>,
+                      title: &str| {
+            let mut job = openplotva_taskman::new_control_job_at(
+                openplotva_taskman::ControlJobParams {
+                    chat_id: -200,
+                    message_id: 1,
+                    user_id: 9,
+                    user_full_name: "retention test".to_owned(),
+                    thread_id: None,
+                    data: openplotva_taskman::ControlJobData {
+                        text: title.to_owned(),
+                        ..openplotva_taskman::ControlJobData::default()
+                    },
+                },
+                now - time::Duration::days(3),
+            );
+            job.title = title.to_owned();
+            openplotva_taskman::TaskQueueRecord {
+                id: start_id + offset,
+                queue_name: queue_name.clone(),
+                status,
+                job,
+                available_at: None,
+                debounce_key: None,
+                lane_key: None,
+                source_update_ids: Vec::new(),
+                latest_update_id: None,
+                pending_dialog_inputs: Vec::new(),
+                worker_id: None,
+                started_at: None,
+                execution_started_at: None,
+                completed_at: finished,
+                error: None,
+                progress_message_id: None,
+                result_message_id: None,
+                messages: Vec::new(),
+                events: vec![openplotva_taskman::TaskQueueJobEvent {
+                    stage: "trace".to_owned(),
+                    ..openplotva_taskman::TaskQueueJobEvent::default()
+                }],
+                agent_state: None,
+            }
+        };
+        use openplotva_taskman::JobStatus::{Completed, Failed, Pending};
+        let rows = [
+            record(0, Pending, None, "waiting job"),
+            record(1, Completed, Some(now - time::Duration::days(2)), "ancient"),
+            record(2, Failed, Some(now - time::Duration::hours(5)), "older"),
+            record(
+                3,
+                Completed,
+                Some(now - time::Duration::hours(3)),
+                "newest old",
+            ),
+            record(
+                4,
+                Completed,
+                Some(now - time::Duration::minutes(5)),
+                "fresh",
+            ),
+        ];
+        store
+            .apply_task_queue_wal_batch(
+                rows.iter()
+                    .map(|row| openplotva_taskman::TaskQueueWalRecord {
+                        format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),
+                        op: openplotva_taskman::TASK_QUEUE_WAL_UPSERT_JOB.to_owned(),
+                        job_id: row.id,
+                        record: Some(row.clone()),
+                    })
+                    .collect(),
+            )
+            .await?;
+
+        let loaded_ids = |snapshot: openplotva_taskman::TaskQueueSnapshot| {
+            snapshot
+                .records
+                .into_iter()
+                .filter(|loaded| loaded.queue_name == queue_name)
+                .map(|loaded| loaded.id)
+                .collect::<Vec<_>>()
+        };
+        let snapshot = store
+            .load_task_queue_snapshot(now - time::Duration::hours(1), 1)
+            .await?;
+        assert_eq!(
+            loaded_ids(snapshot),
+            vec![start_id, start_id + 4],
+            "startup loads active jobs plus recently finished ones"
+        );
+        let snapshot = store
+            .load_task_queue_snapshot(now - time::Duration::minutes(1), 2)
+            .await?;
+        assert_eq!(
+            loaded_ids(snapshot),
+            vec![start_id, start_id + 3, start_id + 4],
+            "the newest finished jobs of each queue are loaded regardless of age"
+        );
+
+        let filter = super::TaskQueueJobFilter {
+            queues: vec![queue_name.clone()],
+            ..super::TaskQueueJobFilter::default()
+        };
+        let page = store
+            .list_task_queue_jobs(&filter, super::TaskQueueSortColumn::CompletedAt, true, 1, 2)
+            .await?;
+        assert_eq!(page.total, 5);
+        assert_eq!(page.by_status.get("completed"), Some(&3));
+        assert_eq!(page.by_queue.get(&queue_name), Some(&5));
+        assert_eq!(
+            page.records.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![start_id + 3, start_id + 2]
+        );
+        assert!(page.records.iter().all(|row| row.events.is_empty()));
+        let searched = store
+            .list_task_queue_jobs(
+                &super::TaskQueueJobFilter {
+                    search: "newest".to_owned(),
+                    ..filter.clone()
+                },
+                super::TaskQueueSortColumn::Id,
+                false,
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(
+            searched
+                .records
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![start_id + 3]
+        );
+
+        let deleted = store
+            .delete_finished_task_queue_jobs(
+                &super::TaskQueueJobFilter {
+                    statuses: vec!["failed".to_owned(), "pending".to_owned()],
+                    ..filter.clone()
+                },
+                &[],
+            )
+            .await?;
+        assert_eq!(deleted, 1, "only the finished match is deleted in Postgres");
+
+        store
+            .purge_task_queue_terminal(now - time::Duration::days(1), now)
+            .await?;
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM taskman_jobs WHERE queue_name = $1 ORDER BY id")
+                .bind(&queue_name)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            remaining,
+            vec![start_id, start_id + 2, start_id + 3, start_id + 4],
+            "purge drops jobs finished before the cutoff and keeps the rest"
+        );
+        sqlx::query("DELETE FROM taskman_jobs WHERE queue_name = $1")
+            .bind(&queue_name)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

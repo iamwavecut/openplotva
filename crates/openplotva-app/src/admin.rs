@@ -966,7 +966,7 @@ where
 
     match command.name {
         ADMIN_QUEUE_STATUS_COMMAND => {
-            let text = admin_queue_status_text(&runtime);
+            let text = admin_queue_status_text(&runtime).await;
             send_admin_queue_result(
                 runtime.effects,
                 message,
@@ -1835,10 +1835,10 @@ fn admin_queue_disabled_text() -> &'static str {
     "❌ Персистентная система очередей отключена"
 }
 
-fn admin_queue_status_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects>) -> String {
+async fn admin_queue_status_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects>) -> String {
     let queue_names = runtime.config.queue_names();
-    let pending_by_queue = queue_counts_by_status(runtime.taskman, "pending");
-    let processing_by_queue = queue_counts_by_status(runtime.taskman, "processing");
+    let pending_by_queue = queue_counts_by_status(runtime.taskman, "pending").await;
+    let processing_by_queue = queue_counts_by_status(runtime.taskman, "processing").await;
     let eta_by_queue = queue_eta_seconds(runtime.taskman, &queue_names);
     let mut lines = Vec::with_capacity(queue_names.len() + 5);
     lines.push("📊 <b>Статус очередей:</b>\n".to_owned());
@@ -1867,8 +1867,8 @@ fn admin_queue_status_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects>) ->
 
 async fn admin_queue_stats_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects>) -> String {
     let queue_names = runtime.config.queue_names();
-    let pending_by_queue = queue_counts_by_status(runtime.taskman, "pending");
-    let processing_by_queue = queue_counts_by_status(runtime.taskman, "processing");
+    let pending_by_queue = queue_counts_by_status(runtime.taskman, "pending").await;
+    let processing_by_queue = queue_counts_by_status(runtime.taskman, "processing").await;
     let (total_pending, total_processing) =
         queue_stats_totals(&queue_names, &pending_by_queue, &processing_by_queue);
     let mut lines = Vec::new();
@@ -1883,11 +1883,14 @@ async fn admin_queue_stats_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects
         &processing_by_queue,
     ));
     lines.push("\n🕒 <b>Старейшие:</b>".to_owned());
-    lines.extend(queue_stats_oldest_lines(
-        runtime.taskman,
-        &queue_names,
-        runtime.config.default_processing_timeout,
-    ));
+    lines.extend(
+        queue_stats_oldest_lines(
+            runtime.taskman,
+            &queue_names,
+            runtime.config.default_processing_timeout,
+        )
+        .await,
+    );
     lines.push("\n📮 <b>Очередь отправки:</b>".to_owned());
     lines.extend(queue_stats_dispatcher_lines(
         runtime
@@ -1915,18 +1918,20 @@ async fn admin_queue_stats_text<Effects>(runtime: &AdminQueueRuntime<'_, Effects
     lines.join("\n")
 }
 
-fn queue_counts_by_status(
+async fn queue_counts_by_status(
     taskman: Option<&dyn RuntimeTaskmanInspector>,
     status: &str,
 ) -> BTreeMap<String, i32> {
     let Some(taskman) = taskman else {
         return BTreeMap::new();
     };
-    let result = taskman.list_jobs(RuntimeTaskmanJobsFilter {
-        status: vec![status.to_owned()],
-        limit: 1,
-        ..RuntimeTaskmanJobsFilter::default()
-    });
+    let result = taskman
+        .list_jobs(RuntimeTaskmanJobsFilter {
+            status: vec![status.to_owned()],
+            limit: 1,
+            ..RuntimeTaskmanJobsFilter::default()
+        })
+        .await;
     match result {
         Ok(result) => queue_count_map(&result.summary.by_queue),
         Err(error) => {
@@ -2032,44 +2037,46 @@ fn queue_stats_count_lines(
         .collect()
 }
 
-fn queue_stats_oldest_lines(
+async fn queue_stats_oldest_lines(
     taskman: Option<&dyn RuntimeTaskmanInspector>,
     queue_names: &[String],
     timeout: Duration,
 ) -> Vec<String> {
-    queue_names
-        .iter()
-        .map(|queue_name| {
-            let pending_age = queue_oldest_age(taskman, queue_name, "pending", "created_at");
-            let processing_age = queue_oldest_age(taskman, queue_name, "processing", "started_at");
-            let processing_flag = processing_age
-                .map(|age| queue_stats_processing_flag(age, timeout))
-                .unwrap_or_default();
-            format!(
-                "• {queue_name}: pending {}, processing {}{}",
-                format_queue_optional_age(pending_age),
-                format_queue_optional_age(processing_age),
-                processing_flag
-            )
-        })
-        .collect()
+    let mut lines = Vec::with_capacity(queue_names.len());
+    for queue_name in queue_names {
+        let pending_age = queue_oldest_age(taskman, queue_name, "pending", "created_at").await;
+        let processing_age =
+            queue_oldest_age(taskman, queue_name, "processing", "started_at").await;
+        let processing_flag = processing_age
+            .map(|age| queue_stats_processing_flag(age, timeout))
+            .unwrap_or_default();
+        lines.push(format!(
+            "• {queue_name}: pending {}, processing {}{}",
+            format_queue_optional_age(pending_age),
+            format_queue_optional_age(processing_age),
+            processing_flag
+        ));
+    }
+    lines
 }
 
-fn queue_oldest_age(
+async fn queue_oldest_age(
     taskman: Option<&dyn RuntimeTaskmanInspector>,
     queue_name: &str,
     status: &str,
     time_field: &str,
 ) -> Option<Duration> {
     let taskman = taskman?;
-    let result = taskman.list_jobs(RuntimeTaskmanJobsFilter {
-        status: vec![status.to_owned()],
-        queue: vec![queue_name.to_owned()],
-        sort_by: time_field.to_owned(),
-        sort_dir: "asc".to_owned(),
-        limit: 1,
-        ..RuntimeTaskmanJobsFilter::default()
-    });
+    let result = taskman
+        .list_jobs(RuntimeTaskmanJobsFilter {
+            status: vec![status.to_owned()],
+            queue: vec![queue_name.to_owned()],
+            sort_by: time_field.to_owned(),
+            sort_dir: "asc".to_owned(),
+            limit: 1,
+            ..RuntimeTaskmanJobsFilter::default()
+        })
+        .await;
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -2559,7 +2566,7 @@ fn format_go_fraction(value: u64, unit: u64, suffix: &str) -> String {
 mod tests {
     use super::*;
     use openplotva_server::{
-        RuntimeGeminiCachePurgerFuture, RuntimeTaskmanDiagnosticsData,
+        RuntimeGeminiCachePurgerFuture, RuntimeTaskmanDiagnosticsData, RuntimeTaskmanJobListFuture,
         RuntimeTaskmanJobListResultData, RuntimeTaskmanJobSummaryData,
         RuntimeTaskmanQueueDiagnosticsData, RuntimeUpdatesInspectorFuture,
     };
@@ -4320,10 +4327,10 @@ mod tests {
     }
 
     impl RuntimeTaskmanInspector for TaskmanInspectorStub {
-        fn list_jobs(
-            &self,
+        fn list_jobs<'a>(
+            &'a self,
             filter: RuntimeTaskmanJobsFilter,
-        ) -> Result<RuntimeTaskmanJobListResultData, String> {
+        ) -> RuntimeTaskmanJobListFuture<'a> {
             let status = filter.status.first().map(String::as_str).unwrap_or("");
             let by_queue = match status {
                 "pending" => self.pending.clone(),
@@ -4351,7 +4358,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Ok(RuntimeTaskmanJobListResultData {
+            Box::pin(std::future::ready(Ok(RuntimeTaskmanJobListResultData {
                 total: items.len() as i32,
                 offset: 0,
                 limit: filter.limit,
@@ -4360,7 +4367,7 @@ mod tests {
                     by_queue: json!(by_queue),
                 },
                 items,
-            })
+            })))
         }
 
         fn job<'a>(&'a self, _id: i64) -> openplotva_server::RuntimeTaskmanJobFuture<'a> {

@@ -465,6 +465,11 @@ desc → created asc → id asc). Per-(chat,thread) lane lock on `dialog-aifarm`
 Two-tier timeouts (queue-start vs execution-start) so media queue-wait is
 excluded. Agent resumability: `release_orphaned_processing_for_startup`
 requeues non-agents but keeps agent rows in Processing for re-adoption.
+Memory holds active jobs plus a short finished tail (1 h, the newest 32 per
+queue, jobs with an undeleted placeholder); eviction writes no WAL. Startup loads
+the same set, operator listings of finished jobs read `taskman_jobs`, and the
+Postgres purge keeps finished rows for twice the completed-job retention. The
+dialog `agent_checkpoint` event is dropped when a job finishes.
 
 #### `openplotva-updates`
 Redis update queue (list or stream backend) + the `openplotva-enqueue-update`

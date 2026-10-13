@@ -58,9 +58,9 @@ pub use runtime_graphql::{
     RuntimeSafetyChecksFilter, RuntimeSqlReadRequest, RuntimeSqlReadResult, RuntimeSqlReader,
     RuntimeSqlReaderFuture, RuntimeSubscriptionData, RuntimeTaskmanDiagnosticsData,
     RuntimeTaskmanInspector, RuntimeTaskmanJobData, RuntimeTaskmanJobDetailsData,
-    RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListResultData,
-    RuntimeTaskmanJobMessageData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
-    RuntimeTaskmanQueueDiagnosticsData, RuntimeTelegramDeliveryFuture,
+    RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListFuture,
+    RuntimeTaskmanJobListResultData, RuntimeTaskmanJobMessageData, RuntimeTaskmanJobSummaryData,
+    RuntimeTaskmanJobsFilter, RuntimeTaskmanQueueDiagnosticsData, RuntimeTelegramDeliveryFuture,
     RuntimeTelegramDeliveryInspector, RuntimeTelegramDeliveryListFilter,
     RuntimeTelegramOutboxAttemptData, RuntimeTelegramOutboxItemData,
     RuntimeTelegramOutboxMutationResultData, RuntimeTelegramOutboxRetryRequest,
@@ -941,7 +941,7 @@ mod tests {
         RuntimeSqlReadResult, RuntimeSqlReader, RuntimeSqlReaderFuture, RuntimeSubscriptionData,
         RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector, RuntimeTaskmanJobData,
         RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData,
-        RuntimeTaskmanJobListResultData, RuntimeTaskmanJobMessageData,
+        RuntimeTaskmanJobListFuture, RuntimeTaskmanJobListResultData, RuntimeTaskmanJobMessageData,
         RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter, RuntimeTaskmanQueueDiagnosticsData,
         RuntimeTelegramDeliveryFuture, RuntimeTelegramDeliveryInspector,
         RuntimeTelegramDeliveryListFilter, RuntimeTelegramOutboxAttemptData,
@@ -1826,17 +1826,17 @@ mod tests {
         struct MemoryTaskmanInspector;
 
         impl RuntimeTaskmanInspector for MemoryTaskmanInspector {
-            fn list_jobs(
-                &self,
+            fn list_jobs<'a>(
+                &'a self,
                 filter: RuntimeTaskmanJobsFilter,
-            ) -> Result<RuntimeTaskmanJobListResultData, String> {
+            ) -> RuntimeTaskmanJobListFuture<'a> {
                 assert_eq!(filter.q, "pay");
                 assert_eq!(filter.status, vec!["pending"]);
                 assert_eq!(filter.queue, vec!["control"]);
                 assert_eq!(filter.user_id, Some(7));
                 assert_eq!(filter.chat_id, Some(9));
                 assert_eq!(filter.limit, 500);
-                Ok(RuntimeTaskmanJobListResultData {
+                Box::pin(std::future::ready(Ok(RuntimeTaskmanJobListResultData {
                     total: 1,
                     offset: 0,
                     limit: 500,
@@ -1868,7 +1868,7 @@ mod tests {
                         actual_processing_time: None,
                         preview: Some("vip_invoice".to_owned()),
                     }],
-                })
+                })))
             }
 
             fn job<'a>(&'a self, id: i64) -> RuntimeTaskmanJobFuture<'a> {

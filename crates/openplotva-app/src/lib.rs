@@ -1521,7 +1521,7 @@ async fn admin_taskman_jobs(
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
-    admin_taskman_jobs_response(&routes, method, &headers, raw_query.as_deref())
+    admin_taskman_jobs_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_taskman_jobs_clear(
@@ -1530,7 +1530,7 @@ async fn admin_taskman_jobs_clear(
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
-    admin_taskman_jobs_clear_response(&routes, method, &headers, raw_query.as_deref())
+    admin_taskman_jobs_clear_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_taskman_job(
@@ -1557,7 +1557,7 @@ async fn admin_taskman_job_restart(
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
-    admin_taskman_job_restart_response(&routes, method, &headers, raw_query.as_deref())
+    admin_taskman_job_restart_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_redis_list(
@@ -5355,7 +5355,7 @@ fn admin_shield_test_json(
     serde_json::Value::Object(value)
 }
 
-fn admin_taskman_jobs_response(
+async fn admin_taskman_jobs_response(
     routes: &StaticWebRoutes,
     method: Method,
     headers: &HeaderMap,
@@ -5377,7 +5377,9 @@ fn admin_taskman_jobs_response(
         Ok(filter) => filter,
         Err(response) => return *response,
     };
-    match openplotva_server::RuntimeTaskmanInspector::list_jobs(&routes.taskman_inspector, filter) {
+    match openplotva_server::RuntimeTaskmanInspector::list_jobs(&routes.taskman_inspector, filter)
+        .await
+    {
         Ok(result) => {
             admin_json_no_cache_response(StatusCode::OK, admin_taskman_list_json(&result))
         }
@@ -5388,7 +5390,7 @@ fn admin_taskman_jobs_response(
     }
 }
 
-fn admin_taskman_jobs_clear_response(
+async fn admin_taskman_jobs_clear_response(
     routes: &StaticWebRoutes,
     method: Method,
     headers: &HeaderMap,
@@ -5412,7 +5414,7 @@ fn admin_taskman_jobs_clear_response(
     };
     filter.offset = 0;
     filter.limit = 0;
-    match routes.taskman_inspector.delete_jobs(filter) {
+    match routes.taskman_inspector.delete_jobs(filter).await {
         Ok(result) => admin_json_response(
             StatusCode::OK,
             serde_json::json!({
@@ -5495,7 +5497,7 @@ fn admin_taskman_job_cancel_response(
     }
 }
 
-fn admin_taskman_job_restart_response(
+async fn admin_taskman_job_restart_response(
     routes: &StaticWebRoutes,
     method: Method,
     headers: &HeaderMap,
@@ -5517,7 +5519,7 @@ fn admin_taskman_job_restart_response(
         Ok(job_id) => job_id,
         Err(response) => return *response,
     };
-    match routes.taskman_inspector.restart_job(job_id) {
+    match routes.taskman_inspector.restart_job(job_id).await {
         Ok(new_job_id) => admin_json_response(
             StatusCode::OK,
             serde_json::json!({ "ok": true, "new_job_id": new_job_id }),
@@ -10325,7 +10327,7 @@ fn build_shared_task_queue_maintenance_group(
             let report = task_queue::run_shared_task_queue_terminal_cleanup_worker_until(
                 cleanup_runtime,
                 cleanup_interval,
-                completed_retention,
+                task_queue::FINISHED_JOB_MEMORY_RETENTION,
                 wait_for_runtime_stop(cleanup_stop),
             )
             .await;
@@ -10336,9 +10338,9 @@ fn build_shared_task_queue_maintenance_group(
     readiness.push(ReadinessCheck::ok(
         "shared_task_queue_terminal_cleanup",
         format!(
-            "terminal cleanup every {}s, retention {}d",
+            "finished-job eviction from memory every {}s, kept {}m",
             cleanup_interval.as_secs(),
-            completed_retention.whole_days()
+            task_queue::FINISHED_JOB_MEMORY_RETENTION.whole_minutes()
         ),
     ));
 
@@ -10360,8 +10362,9 @@ fn build_shared_task_queue_maintenance_group(
     readiness.push(ReadinessCheck::ok(
         "shared_task_queue_postgres_purge",
         format!(
-            "Postgres purge every {}s, retention {}d",
+            "Postgres purge every {}s, finished jobs kept {}d, deleted jobs {}d",
             cleanup_interval.as_secs(),
+            completed_retention.whole_days() * 2,
             completed_retention.whole_days()
         ),
     ));
@@ -11005,6 +11008,7 @@ async fn start_runtime_workers(
         let llm_event_cleanup_worker = tokio::spawn(async move {
             let report = runtime_llm::run_llm_request_event_cleanup_worker_until(
                 llm_event_cleanup_pool,
+                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY,
                 llm_event_cleanup_interval,
                 llm_request_events_retention_days,
                 runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE,
@@ -11017,8 +11021,9 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "llm_request_events_cleanup",
             format!(
-                "LLM analytics rollup and raw request events cleanup every {}s, retention {}d",
+                "LLM analytics rollup and raw request events cleanup every {}s after a {}s start delay, retention {}d",
                 llm_event_cleanup_interval.as_secs(),
+                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY.as_secs(),
                 llm_request_events_retention_days
             ),
         ));
@@ -16526,7 +16531,8 @@ mod tests {
             Method::GET,
             &headers,
             Some("status=pending&queue=image-vip"),
-        );
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL),
@@ -16569,7 +16575,8 @@ mod tests {
             Method::PUT,
             &headers,
             Some(&format!("job_id={diagnostic_id}")),
-        );
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let value: serde_json::Value = serde_json::from_slice(&body)?;
@@ -16580,7 +16587,8 @@ mod tests {
             Method::DELETE,
             &headers,
             Some("status=cancelled"),
-        );
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let value: serde_json::Value = serde_json::from_slice(&body)?;
@@ -16754,7 +16762,7 @@ mod tests {
             let value = signed.split(';').next().expect("cookie pair");
             headers.insert(header::COOKIE, value.parse()?);
         }
-        let response = admin_taskman_jobs_response(&routes, Method::GET, &headers, None);
+        let response = admin_taskman_jobs_response(&routes, Method::GET, &headers, None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], b"{\"error\":\"task manager not configured\"}\n");
@@ -16762,7 +16770,8 @@ mod tests {
         let response = admin_taskman_job_response(&routes, Method::GET, &headers, None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let response =
-            admin_taskman_jobs_response(&routes, Method::POST, &headers, Some("status=pending"));
+            admin_taskman_jobs_response(&routes, Method::POST, &headers, Some("status=pending"))
+                .await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         Ok(())
     }

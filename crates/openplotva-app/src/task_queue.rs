@@ -11,8 +11,7 @@ use std::{
 
 use openplotva_config::PersistentQueueConfig;
 use openplotva_taskman::{
-    InMemoryTaskQueue, TaskQueueIdAllocator, TaskQueueSnapshot, TaskQueueWalRecord,
-    TaskQueueWalSink,
+    InMemoryTaskQueue, TaskQueueIdAllocator, TaskQueueWalRecord, TaskQueueWalSink,
 };
 use openplotva_telegram::{
     DeleteMessageRequest, TelegramOutboundMethod, build_delete_message_method,
@@ -26,6 +25,11 @@ pub const SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL: Duration = Duration::from_secs(
 pub const SHARED_TASK_QUEUE_STUCK_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 pub const TASK_QUEUE_DB_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 pub const TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD: usize = 1_000;
+/// Finished jobs stay in memory this long for late message updates and update
+/// replay dedupe; Postgres keeps them until the retention purge.
+pub const FINISHED_JOB_MEMORY_RETENTION: TimeDuration = TimeDuration::hours(1);
+/// Newest finished jobs kept in memory per queue for queue-time estimates.
+pub const FINISHED_JOBS_KEPT_PER_QUEUE: usize = 32;
 
 pub type TaskQueueStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type TaskQueueDurabilityFuture<'a> =
@@ -40,10 +44,6 @@ pub trait TaskQueueDurabilityBarrier: Send + Sync {
 pub trait SharedTaskQueueDurableStore: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + Sync + 'static;
 
-    fn load_snapshot<'a>(
-        &'a self,
-    ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>>;
-
     fn apply_wal_batch<'a>(
         &'a self,
         batch: Vec<TaskQueueWalRecord>,
@@ -52,12 +52,6 @@ pub trait SharedTaskQueueDurableStore: Clone + Send + Sync + 'static {
 
 impl SharedTaskQueueDurableStore for openplotva_storage::PostgresTaskQueueStore {
     type Error = openplotva_storage::StorageError;
-
-    fn load_snapshot<'a>(
-        &'a self,
-    ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>> {
-        Box::pin(async move { self.load_task_queue_snapshot().await })
-    }
 
     fn apply_wal_batch<'a>(
         &'a self,
@@ -380,8 +374,8 @@ pub struct SharedTaskQueueRecoveryWorkerReport {
 pub struct SharedTaskQueueTerminalCleanupWorkerReport {
     /// Number of cleanup ticks observed.
     pub ticks: usize,
-    /// Number of terminal jobs deleted.
-    pub deleted: usize,
+    /// Number of finished jobs dropped from memory.
+    pub evicted: usize,
 }
 
 /// Periodic Postgres hard-purge worker report.
@@ -495,7 +489,12 @@ impl SharedTaskQueueRuntime {
         // so issued ids never regress below a value handed out before this restart.
         let (next_job_id, next_message_id) = store.reserve_id_high_water().await?;
         ids.seed_high_water(next_job_id, next_message_id);
-        let snapshot = store.load_task_queue_snapshot().await?;
+        let snapshot = store
+            .load_task_queue_snapshot(
+                OffsetDateTime::now_utc() - FINISHED_JOB_MEMORY_RETENTION,
+                FINISHED_JOBS_KEPT_PER_QUEUE as i64,
+            )
+            .await?;
         let restored_before_requeue = snapshot.records.len();
         let journal = BufferedTaskQueueJournal::new(store);
         let journal_sink: Arc<dyn TaskQueueWalSink> = Arc::new(journal.clone());
@@ -554,8 +553,9 @@ impl SharedTaskQueueRuntime {
         self.queue.fail_stuck_processing(now, stuck_duration)
     }
 
-    pub fn prune_terminal_before(&self, cutoff: OffsetDateTime) -> Vec<i64> {
-        self.queue.prune_terminal_before(cutoff)
+    pub fn evict_finished_before(&self, cutoff: OffsetDateTime) -> usize {
+        self.queue
+            .evict_terminal_before(cutoff, FINISHED_JOBS_KEPT_PER_QUEUE)
     }
 
     #[must_use]
@@ -722,13 +722,12 @@ pub async fn run_shared_task_queue_terminal_cleanup_worker_until(
             () = &mut stop => break,
             _ = ticker.tick() => {
                 report.ticks += 1;
-                let cutoff = OffsetDateTime::now_utc() - retention;
-                let deleted = runtime.prune_terminal_before(cutoff);
-                if deleted.is_empty() {
+                let evicted = runtime.evict_finished_before(OffsetDateTime::now_utc() - retention);
+                if evicted == 0 {
                     continue;
                 }
-                report.deleted += deleted.len();
-                tracing::warn!(deleted = deleted.len(), "deleted old shared taskman terminal jobs");
+                report.evicted += evicted;
+                tracing::debug!(evicted, "dropped finished shared taskman jobs from memory");
             }
         }
     }
@@ -736,9 +735,11 @@ pub async fn run_shared_task_queue_terminal_cleanup_worker_until(
     report
 }
 
-/// Hard-delete soft-deleted jobs and old history from Postgres periodically. The
-/// in-memory prune only soft-deletes rows (via delete WAL); without this purge the
-/// `taskman_jobs` and `taskman_job_history` tables grow without bound.
+/// Hard-delete finished and soft-deleted jobs and old history from Postgres
+/// periodically. The in-memory eviction leaves rows untouched; without this purge
+/// the `taskman_jobs` and `taskman_job_history` tables grow without bound.
+/// Finished jobs stay for twice the retention, the window operator listings and
+/// the analytics dashboard had when the in-memory queue held them for one.
 pub async fn run_shared_task_queue_db_purge_worker_until(
     store: openplotva_storage::PostgresTaskQueueStore,
     interval: Duration,
@@ -755,8 +756,8 @@ pub async fn run_shared_task_queue_db_purge_worker_until(
             () = &mut stop => break,
             _ = ticker.tick() => {
                 report.ticks += 1;
-                let cutoff = OffsetDateTime::now_utc() - retention;
-                match store.purge_task_queue_terminal(cutoff).await {
+                let now = OffsetDateTime::now_utc();
+                match store.purge_task_queue_terminal(now - retention.saturating_mul(2), now - retention).await {
                     Ok(0) => {}
                     Ok(purged) => {
                         report.purged += purged as usize;
@@ -895,8 +896,7 @@ mod tests {
     use super::*;
     use openplotva_taskman::{
         DialogJobParams, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT,
-        TEXT_QUEUE_NAME, TaskQueueJobMessageParams, TaskQueueRecord, empty_task_queue_snapshot,
-        new_dialog_job_at,
+        TEXT_QUEUE_NAME, TaskQueueJobMessageParams, TaskQueueRecord, new_dialog_job_at,
     };
     use std::{
         collections::BTreeMap,
@@ -1150,12 +1150,6 @@ mod tests {
 
     impl SharedTaskQueueDurableStore for TaskQueueDurableStoreStub {
         type Error = String;
-
-        fn load_snapshot<'a>(
-            &'a self,
-        ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>> {
-            Box::pin(async { Ok(empty_task_queue_snapshot()) })
-        }
 
         fn apply_wal_batch<'a>(
             &'a self,

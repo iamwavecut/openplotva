@@ -794,7 +794,7 @@ fn cleanup_runtime_virtual_live_artifacts(
     llm_runs: Option<&crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 ) -> LiveCleanupReport {
     let taskman_deleted = taskman
-        .delete_jobs(RuntimeTaskmanJobsFilter {
+        .delete_in_memory_jobs(RuntimeTaskmanJobsFilter {
             chat_id: Some(record.chat_id),
             user_id: Some(record.user_id),
             limit: 1_000,

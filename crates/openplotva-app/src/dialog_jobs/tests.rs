@@ -13,9 +13,10 @@ use openplotva_llm::{
     retry::{FailureReason, ProviderError},
 };
 use openplotva_taskman::{
-    DEFAULT_LLM_JOB_MAX_ATTEMPTS, DIALOG_AIFARM_QUEUE_NAME, DialogJobParams, HIGH_PRIORITY,
-    InMemoryTaskQueue, JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE, LLM_JOB_RETRY_STAGE, Priority,
-    TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, new_dialog_job_at,
+    AGENT_CHECKPOINT_EVENT_STAGE, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DIALOG_AIFARM_QUEUE_NAME,
+    DialogJobParams, HIGH_PRIORITY, InMemoryTaskQueue, JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE,
+    LLM_JOB_RETRY_STAGE, Priority, TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent,
+    new_dialog_job_at,
 };
 use openplotva_telegram::DispatcherQueue;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -7280,6 +7281,20 @@ async fn agent_retry_restores_context_and_completed_tool_results() -> Result<(),
     )
     .await;
     assert!(first.retry_requeued, "{first:?}");
+    let checkpoints = |queue: &InMemoryTaskQueue| {
+        queue
+            .record(id)
+            .expect("record")
+            .events
+            .iter()
+            .filter(|event| event.stage == AGENT_CHECKPOINT_EVENT_STAGE)
+            .count()
+    };
+    assert_eq!(
+        checkpoints(&queue),
+        1,
+        "a requeued turn keeps one checkpoint"
+    );
     let second = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
         &queue,
         &provider,
@@ -7297,14 +7312,10 @@ async fn agent_retry_restores_context_and_completed_tool_results() -> Result<(),
         message,
         openplotva_dialog::SessionMessage::ToolResult { .. }
     )));
-    let record = queue.record(id).expect("record");
     assert_eq!(
-        record
-            .events
-            .iter()
-            .filter(|event| event.stage == "agent_checkpoint")
-            .count(),
-        1
+        checkpoints(&queue),
+        0,
+        "a finished turn drops its checkpoint"
     );
     Ok(())
 }

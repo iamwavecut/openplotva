@@ -62,6 +62,9 @@ pub const MESSAGE_STATUS_PLACEHOLDER: &str = "placeholder";
 pub const MESSAGE_STATUS_COMPLETED: &str = "completed";
 pub const MESSAGE_STATUS_FAILED: &str = "failed";
 pub const STUCK_JOB_ERROR_MESSAGE: &str = "Job stuck in processing state for too long";
+/// Upserted event that carries a running dialog turn's resumable agent state.
+/// It is only needed while the job is active and is dropped when the job ends.
+pub const AGENT_CHECKPOINT_EVENT_STAGE: &str = "agent_checkpoint";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1474,16 +1477,19 @@ impl InMemoryTaskQueue {
 
     /// Recreate one job with a fresh ID, preserving queue, priority, title, timeout, and payload.
     pub fn restart(&self, job_id: i64, created_at: OffsetDateTime) -> Result<i64, TaskQueueError> {
-        let mut state = self.lock();
-        let source = state
-            .records
-            .iter()
-            .find(|record| record.id == job_id)
+        let source = self
+            .record(job_id)
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        Ok(self.restart_from(&source, created_at))
+    }
+
+    /// Recreate a job from a record that may no longer be held in memory.
+    pub fn restart_from(&self, source: &TaskQueueRecord, created_at: OffsetDateTime) -> i64 {
         let mut job = source.job.clone();
         let queue_name = source.queue_name.clone();
         job.created = created_at;
 
+        let mut state = self.lock();
         let id = self.next_job_id(&mut state);
         let record = TaskQueueRecord {
             id,
@@ -1510,7 +1516,7 @@ impl InMemoryTaskQueue {
         state.records.push(record.clone());
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
-        Ok(id)
+        id
     }
 
     /// Return one queue record by ID.
@@ -1542,9 +1548,12 @@ impl InMemoryTaskQueue {
             if job_chat_id(&record.job) != chat_id {
                 continue;
             }
-            record.status = JobStatus::Cancelled;
-            record.completed_at = Some(completed_at);
-            record.error = Some(reason.clone());
+            mark_terminal(
+                record,
+                JobStatus::Cancelled,
+                Some(reason.clone()),
+                completed_at,
+            );
             cancelled.push(record.id);
             records.push(record.clone());
         }
@@ -1613,19 +1622,40 @@ impl InMemoryTaskQueue {
         ids
     }
 
-    pub fn prune_terminal_before(&self, cutoff: OffsetDateTime) -> Vec<i64> {
+    /// Drop terminal jobs that ended before `cutoff` from memory. Postgres keeps
+    /// them until its own retention purge, so no WAL record is written. The newest
+    /// `keep_per_queue` terminal jobs of every queue stay for queue-time estimates,
+    /// and jobs with an undeleted placeholder stay for the placeholder cleanup.
+    pub fn evict_terminal_before(&self, cutoff: OffsetDateTime, keep_per_queue: usize) -> usize {
         let mut state = self.lock();
-        let mut ids = Vec::new();
+        let mut newest_terminal: BTreeMap<&str, Vec<(OffsetDateTime, i64)>> = BTreeMap::new();
+        for record in state
+            .records
+            .iter()
+            .filter(|record| !record.status.is_active())
+        {
+            newest_terminal
+                .entry(record.queue_name.as_str())
+                .or_default()
+                .push((record.completed_at.unwrap_or(record.job.created), record.id));
+        }
+        let kept: BTreeSet<i64> = newest_terminal
+            .into_values()
+            .flat_map(|mut ended| {
+                ended.sort_unstable_by(|left, right| right.cmp(left));
+                ended.into_iter().take(keep_per_queue).map(|(_, id)| id)
+            })
+            .collect();
+        let before = state.records.len();
         state.records.retain(|record| {
-            let prune = task_queue_record_terminal_before(record, cutoff);
-            if prune {
-                ids.push(record.id);
-            }
-            !prune
+            kept.contains(&record.id)
+                || !task_queue_record_terminal_before(record, cutoff)
+                || record
+                    .messages
+                    .iter()
+                    .any(|message| message.status == MESSAGE_STATUS_PLACEHOLDER)
         });
-        self.append_wal_records(ids.iter().copied().map(task_queue_wal_delete));
-        drop(state);
-        ids
+        before - state.records.len()
     }
 
     /// Update one worker heartbeat timestamp.
@@ -2295,9 +2325,7 @@ impl InMemoryTaskQueue {
         if record.status == JobStatus::Cancelled && status != JobStatus::Cancelled {
             return Err(TaskQueueError::JobCancelled(job_id));
         }
-        record.status = status;
-        record.completed_at = Some(completed_at);
-        record.error = error;
+        mark_terminal(record, status, error, completed_at);
         let record = record.clone();
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
@@ -3576,12 +3604,29 @@ fn fail_stuck_processing_records(
         if !is_stuck {
             continue;
         }
-        record.status = JobStatus::Failed;
-        record.completed_at = Some(now);
-        record.error = Some(STUCK_JOB_ERROR_MESSAGE.to_owned());
+        mark_terminal(
+            record,
+            JobStatus::Failed,
+            Some(STUCK_JOB_ERROR_MESSAGE.to_owned()),
+            now,
+        );
         failed.push(record.id);
     }
     failed
+}
+
+fn mark_terminal(
+    record: &mut TaskQueueRecord,
+    status: JobStatus,
+    error: Option<String>,
+    completed_at: OffsetDateTime,
+) {
+    record.status = status;
+    record.completed_at = Some(completed_at);
+    record.error = error;
+    record
+        .events
+        .retain(|event| event.stage != AGENT_CHECKPOINT_EVENT_STAGE);
 }
 
 fn task_queue_record_terminal_before(record: &TaskQueueRecord, cutoff: OffsetDateTime) -> bool {
@@ -3704,7 +3749,7 @@ fn pending_record_matches_message(record: &TaskQueueRecord, chat_id: i64, messag
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, BTreeSet, HashMap},
         sync::{Arc, Mutex},
     };
 
@@ -3712,14 +3757,14 @@ mod tests {
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     use super::{
-        AGENT_QWEN_QUEUE_NAME, ASR_GPU1_QUEUE_NAME, ASR_PRIORITY, ASR_PROCESSING_TIMEOUT_SECONDS,
-        AgentJobParams, AgentRunStateBlob, AsrJobParams, CONTROL_QUEUE_NAME, ControlJobData,
-        ControlJobParams, ControlJobPayloadError, ControlKind, DEFAULT_PRIORITY,
-        DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams, DialogJobPayloadError,
-        HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
-        ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams, ImageGenJobPayloadError,
-        ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType, LOWEST_PRIORITY,
-        MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
+        AGENT_CHECKPOINT_EVENT_STAGE, AGENT_QWEN_QUEUE_NAME, ASR_GPU1_QUEUE_NAME, ASR_PRIORITY,
+        ASR_PROCESSING_TIMEOUT_SECONDS, AgentJobParams, AgentRunStateBlob, AsrJobParams,
+        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind,
+        DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams,
+        DialogJobPayloadError, HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
+        IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams,
+        ImageGenJobPayloadError, ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType,
+        LOWEST_PRIORITY, MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
         MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
         MusicGenJobPayloadError, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE,
         QUEUE_ESTIMATE_MIN_SAMPLE_SIZE, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
@@ -5665,39 +5710,150 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_task_queue_prunes_old_terminal_records() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let queue = InMemoryTaskQueue::new();
+    fn in_memory_task_queue_evicts_old_terminal_records_without_wal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let journal = Arc::new(WalSinkStub::default());
+        let queue = InMemoryTaskQueue::new_with_journal(journal.clone());
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let old = now - TimeDuration::days(2);
-        let recent = now - TimeDuration::hours(1);
-        let cutoff = now - TimeDuration::days(1);
+        let recent = now - TimeDuration::minutes(10);
+        let cutoff = now - TimeDuration::hours(1);
 
         let old_done = queue.assign(
             TEXT_QUEUE_NAME,
             job_at("old", DEFAULT_PRIORITY, old, 1, 1, 1),
         );
-        let recent_done = queue.assign(
+        let newest_old_done = queue.assign(
             TEXT_QUEUE_NAME,
-            job_at("recent", DEFAULT_PRIORITY, recent, 2, 1, 2),
+            job_at("newest old", DEFAULT_PRIORITY, old, 2, 1, 2),
+        );
+        let recent_done = queue.assign(
+            CONTROL_QUEUE_NAME,
+            job_at("recent", DEFAULT_PRIORITY, recent, 3, 1, 3),
         );
         let active = queue.assign(
             TEXT_QUEUE_NAME,
-            job_at("active", DEFAULT_PRIORITY, old, 3, 1, 3),
+            job_at("active", DEFAULT_PRIORITY, old, 4, 1, 4),
+        );
+        let placeholder_done = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            job_at("placeholder", DEFAULT_PRIORITY, old, 5, 1, 5),
+        );
+        let newest_image_done = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            job_at("newest image", DEFAULT_PRIORITY, old, 6, 1, 6),
+        );
+        let old_image_done = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            job_at("old image", DEFAULT_PRIORITY, old, 7, 1, 7),
         );
 
         queue.complete(old_done, old)?;
+        queue.complete(newest_old_done, old + TimeDuration::minutes(1))?;
         queue.fail(recent_done, "recent failure", recent)?;
+        queue.create_job_message(TaskQueueJobMessageParams {
+            job_id: placeholder_done,
+            message_type: "progress".to_owned(),
+            chat_id: 1,
+            message_id: 50,
+            created_at: old,
+            status: MESSAGE_STATUS_PLACEHOLDER.to_owned(),
+        })?;
+        queue.complete(placeholder_done, old)?;
+        queue.complete(newest_image_done, old + TimeDuration::minutes(5))?;
+        queue.complete(old_image_done, old - TimeDuration::minutes(1))?;
+        let wal_before = journal.records().len();
 
-        assert_eq!(queue.prune_terminal_before(cutoff), vec![old_done]);
-        let statuses: HashMap<i64, JobStatus> = queue
+        assert_eq!(queue.evict_terminal_before(cutoff, 1), 2);
+
+        let remaining: BTreeSet<i64> = queue
             .records()
             .into_iter()
-            .map(|record| (record.id, record.status))
+            .map(|record| record.id)
             .collect();
-        assert_eq!(statuses.get(&old_done), None);
-        assert_eq!(statuses.get(&recent_done), Some(&JobStatus::Failed));
-        assert_eq!(statuses.get(&active), Some(&JobStatus::Pending));
+        assert_eq!(
+            remaining,
+            BTreeSet::from([
+                newest_old_done,
+                recent_done,
+                active,
+                placeholder_done,
+                newest_image_done
+            ])
+        );
+        assert_eq!(journal.records().len(), wal_before);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transitions_drop_the_agent_checkpoint_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let completed = queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("completed", DEFAULT_PRIORITY, now, 1, 1, 1),
+        );
+        let cancelled = queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("cancelled", DEFAULT_PRIORITY, now, 2, 7, 2),
+        );
+        for id in [completed, cancelled] {
+            queue.upsert_job_event(
+                id,
+                TaskQueueJobEvent {
+                    stage: AGENT_CHECKPOINT_EVENT_STAGE.to_owned(),
+                    data: BTreeMap::from([("checkpoint".to_owned(), "{}".to_owned())]),
+                    ..TaskQueueJobEvent::default()
+                },
+                now,
+            )?;
+            queue.append_job_event(
+                id,
+                TaskQueueJobEvent {
+                    stage: "dialog_reply".to_owned(),
+                    ..TaskQueueJobEvent::default()
+                },
+                now,
+            )?;
+        }
+
+        queue.complete(completed, now)?;
+        queue.cancel_user_jobs(2, 7, "reset", now);
+
+        for id in [completed, cancelled] {
+            let stages: Vec<String> = queue
+                .record(id)
+                .expect("terminal record")
+                .events
+                .into_iter()
+                .map(|event| event.stage)
+                .collect();
+            assert_eq!(stages, vec!["dialog_reply".to_owned()]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_from_recreates_a_job_that_is_no_longer_in_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let source_queue = InMemoryTaskQueue::new();
+        let id = source_queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("evicted", DEFAULT_PRIORITY, now, 1, 1, 1),
+        );
+        source_queue.fail(id, "boom", now)?;
+        let source = source_queue.record(id).expect("failed record");
+
+        let queue = InMemoryTaskQueue::new();
+        let restarted = queue.restart_from(&source, now + TimeDuration::minutes(5));
+
+        let record = queue.record(restarted).expect("restarted record");
+        assert_eq!(record.status, JobStatus::Pending);
+        assert_eq!(record.queue_name, TEXT_QUEUE_NAME);
+        assert_eq!(record.job.title, "evicted");
+        assert_eq!(record.job.created, now + TimeDuration::minutes(5));
         Ok(())
     }
 

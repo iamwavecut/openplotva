@@ -33,7 +33,7 @@ use openplotva_dialog::{
     },
 };
 use openplotva_llm::ChatStepProvider;
-use openplotva_taskman::TaskQueueJobEvent;
+use openplotva_taskman::{AGENT_CHECKPOINT_EVENT_STAGE, TaskQueueJobEvent};
 use serde_json::Value;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -466,7 +466,7 @@ where
         .item_events
         .iter()
         .rev()
-        .find(|event| event.stage == "agent_checkpoint")
+        .find(|event| event.stage == AGENT_CHECKPOINT_EVENT_STAGE)
         .and_then(|event| event.data.get("checkpoint"))
         .map(|value| serde_json::from_str::<(DialogInput, SessionState)>(value))
         .transpose();
@@ -603,7 +603,7 @@ where
     let duplicate_guard_history = &duplicate_guard_history;
     let run_id = &run_id;
     openplotva_agent::run((state, report), |(state, report)| async move {
-        if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, "agent_checkpoint", BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
+        if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, AGENT_CHECKPOINT_EVENT_STAGE, BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
             return std::ops::ControlFlow::Break(agent_persistence_failed(error));
         }
         let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs, mut repeated_tool_call } = state;
