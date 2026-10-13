@@ -24,7 +24,7 @@ sha2.workspace = true
 sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "time"] }
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

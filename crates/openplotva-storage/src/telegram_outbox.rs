@@ -1,6 +1,6 @@
 //! Durable Postgres outbox for Telegram operations.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -287,6 +287,16 @@ pub fn deterministic_telegram_operation_id(
 }
 
 /// Postgres-backed Telegram outbox store.
+/// Waits between enqueue attempts that could not get a Postgres connection. A
+/// pool timeout fails before any statement runs, so a retry cannot enqueue the
+/// batch twice; it keeps a finished answer from being lost to a short connection
+/// shortage.
+const ENQUEUE_POOL_TIMEOUT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
 #[derive(Clone, Debug)]
 pub struct PostgresTelegramOutboxStore {
     pool: PgPool,
@@ -308,7 +318,25 @@ impl PostgresTelegramOutboxStore {
         &self,
         batch: &TelegramOutboxBatchInput,
     ) -> Result<QueuedTelegramOutboxBatch, StorageError> {
-        enqueue_telegram_outbox_batch(&self.pool, batch).await
+        let mut retry_delays = ENQUEUE_POOL_TIMEOUT_RETRY_DELAYS.into_iter();
+        loop {
+            match enqueue_telegram_outbox_batch(&self.pool, batch).await {
+                Err(StorageError::Postgres {
+                    source: sqlx::Error::PoolTimedOut,
+                }) => {
+                    let Some(delay) = retry_delays.next() else {
+                        return Err(sqlx::Error::PoolTimedOut.into());
+                    };
+                    tracing::warn!(
+                        batch_id = %batch.batch_id,
+                        retry_in_ms = delay.as_millis(),
+                        "no Postgres connection for Telegram outbox enqueue; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Claim at most one currently-sendable operation per ordering key.
@@ -1659,6 +1687,54 @@ mod tests {
             prepare_blobs(&input.parts),
             Err(StorageError::TelegramOutboxBlobConflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn live_outbox_enqueue_retries_postgres_pool_timeouts() -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let batch_id = format!("outbox-pool-retry-test:{suffix}");
+        let input = batch(&batch_id, 1);
+        let blob_hash = input.parts[0]
+            .blob
+            .as_ref()
+            .expect("test blob")
+            .sha256
+            .clone();
+        let store = PostgresTelegramOutboxStore::new(pool.clone());
+
+        let held = pool.acquire().await?;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(held);
+        });
+        let queued = store.enqueue_batch(&input).await?;
+        release.await?;
+
+        assert_eq!(queued.parts.len(), 1);
+        assert!(queued.parts.iter().all(|part| part.inserted));
+
+        // Other live tests claim any sendable row, so leave none behind.
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+            .bind(&batch_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_outbox_blobs WHERE sha256 = $1")
+            .bind(blob_hash)
+            .execute(&pool)
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]

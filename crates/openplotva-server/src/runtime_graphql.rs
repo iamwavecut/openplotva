@@ -65,6 +65,11 @@ pub type RuntimeVirtualDialogFuture<'a, T> =
 pub type RuntimeTaskmanJobFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<RuntimeTaskmanJobDetailsData>, String>> + Send + 'a>>;
 
+/// Boxed future returned by the taskman job listing, which reads persisted
+/// storage for finished jobs.
+pub type RuntimeTaskmanJobListFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeTaskmanJobListResultData, String>> + Send + 'a>>;
+
 /// Runtime API Redis diagnostics boundary.
 pub trait RuntimeRedisInspector: Send + Sync {
     fn prefix_groups<'a>(
@@ -316,10 +321,8 @@ pub trait RuntimeGeminiCachePurger: Send + Sync {
 
 /// Runtime API taskman diagnostics boundary.
 pub trait RuntimeTaskmanInspector: Send + Sync {
-    fn list_jobs(
-        &self,
-        filter: RuntimeTaskmanJobsFilter,
-    ) -> Result<RuntimeTaskmanJobListResultData, String>;
+    fn list_jobs<'a>(&'a self, filter: RuntimeTaskmanJobsFilter)
+    -> RuntimeTaskmanJobListFuture<'a>;
 
     /// Inspect one taskman job by ID, falling back to persisted storage when
     /// the in-memory queue no longer holds the row.
@@ -2171,6 +2174,7 @@ impl RuntimeQuery {
         let filter = taskman_jobs_filter_from_input(filter)?;
         let result = inspector
             .list_jobs(filter)
+            .await
             .map_err(async_graphql::Error::new)?;
         Ok(result)
     }

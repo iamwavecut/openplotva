@@ -685,17 +685,19 @@ fn first_nonzero_i32<const N: usize>(values: [i32; N]) -> i32 {
 async fn load_runtime_job_details(
     taskman: &dyn RuntimeTaskmanInspector,
 ) -> Result<Vec<RuntimeTaskmanJobDetails>, String> {
-    let result = taskman.list_jobs(RuntimeTaskmanJobsFilter {
-        queue: vec![
-            IMAGE_REGULAR_QUEUE_NAME.to_owned(),
-            IMAGE_VIP_QUEUE_NAME.to_owned(),
-            MUSIC_VIP_QUEUE_NAME.to_owned(),
-        ],
-        sort_by: "id".to_owned(),
-        sort_dir: "asc".to_owned(),
-        limit: 1000,
-        ..RuntimeTaskmanJobsFilter::default()
-    })?;
+    let result = taskman
+        .list_jobs(RuntimeTaskmanJobsFilter {
+            queue: vec![
+                IMAGE_REGULAR_QUEUE_NAME.to_owned(),
+                IMAGE_VIP_QUEUE_NAME.to_owned(),
+                MUSIC_VIP_QUEUE_NAME.to_owned(),
+            ],
+            sort_by: "id".to_owned(),
+            sort_dir: "asc".to_owned(),
+            limit: 1000,
+            ..RuntimeTaskmanJobsFilter::default()
+        })
+        .await?;
     let mut jobs = Vec::with_capacity(result.items.len());
     for item in result.items {
         let job_type = item.job_type;

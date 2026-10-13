@@ -4,8 +4,8 @@
 use std::fmt;
 
 use openplotva_taskman::{
-    InMemoryTaskQueue, JobType, Priority, StatelessJobItem, TaskQueueError, TaskQueueJobEvent,
-    TaskQueueWorkItem,
+    AGENT_CHECKPOINT_EVENT_STAGE, InMemoryTaskQueue, JobType, Priority, StatelessJobItem,
+    TaskQueueError, TaskQueueJobEvent, TaskQueueWorkItem,
 };
 use time::OffsetDateTime;
 
@@ -146,7 +146,7 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
         at: OffsetDateTime,
     ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            if event.stage == "agent_checkpoint" {
+            if event.stage == AGENT_CHECKPOINT_EVENT_STAGE {
                 self.upsert_job_event(job_id, event, at)
             } else {
                 self.append_job_event(job_id, event, at)

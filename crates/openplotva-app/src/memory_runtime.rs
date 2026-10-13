@@ -1424,7 +1424,7 @@ where
             .ensure_hourly_runs(
                 now,
                 cfg.retention,
-                memory_enqueue_lookback(now, startup, cfg.retention),
+                memory_enqueue_lookback(now, cfg.retention),
                 cfg.enqueue_policy,
             )
             .await
@@ -1485,7 +1485,7 @@ where
             .ensure_hourly_runs(
                 now,
                 cfg.retention,
-                memory_enqueue_lookback(now, startup, cfg.retention),
+                memory_enqueue_lookback(now, cfg.retention),
                 cfg.enqueue_policy,
             )
             .await
@@ -2528,15 +2528,13 @@ pub const MEMORY_RECENT_LOOKBACK: Duration = Duration::from_secs(2 * 60 * 60);
 /// outage or a full queue left without a run.
 const MEMORY_FULL_SCAN_HOUR: u8 = 3;
 
-/// History span one enqueue tick scans: the whole retention window on startup
-/// and once a day, otherwise the recent hours.
+/// History span one enqueue tick scans: the whole retention window once a day,
+/// otherwise the recent hours. Startup scans recent hours too, so a deploy does
+/// not refill the queue while the process catches up; the daily scan covers
+/// hours missed while it was down.
 #[must_use]
-pub fn memory_enqueue_lookback(
-    now: OffsetDateTime,
-    startup: bool,
-    retention: Duration,
-) -> Duration {
-    if startup || now.to_offset(time::UtcOffset::UTC).hour() == MEMORY_FULL_SCAN_HOUR {
+pub fn memory_enqueue_lookback(now: OffsetDateTime, retention: Duration) -> Duration {
+    if now.to_offset(time::UtcOffset::UTC).hour() == MEMORY_FULL_SCAN_HOUR {
         retention
     } else {
         MEMORY_RECENT_LOOKBACK.min(retention)
@@ -6650,8 +6648,12 @@ mod tests {
             .collect();
         assert_eq!(
             lookbacks,
-            vec![MEMORY_RECENT_LOOKBACK, cfg.retention, cfg.retention],
-            "hourly ticks scan recent hours; the daily tick and startup scan the retention window"
+            vec![
+                MEMORY_RECENT_LOOKBACK,
+                cfg.retention,
+                MEMORY_RECENT_LOOKBACK
+            ],
+            "hourly ticks and startup scan recent hours; the daily tick scans the retention window"
         );
     }
 

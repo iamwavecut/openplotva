@@ -7,13 +7,15 @@ use std::{
 use openplotva_server::{
     RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector, RuntimeTaskmanJobData,
     RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData,
-    RuntimeTaskmanJobListResultData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
-    RuntimeTaskmanQueueDiagnosticsData,
+    RuntimeTaskmanJobListFuture, RuntimeTaskmanJobListResultData, RuntimeTaskmanJobSummaryData,
+    RuntimeTaskmanJobsFilter, RuntimeTaskmanQueueDiagnosticsData,
 };
-use openplotva_storage::PostgresTaskQueueStore;
+use openplotva_storage::{
+    PostgresTaskQueueStore, TaskQueueJobFilter, TaskQueueSortColumn, TaskQueueTimeColumn,
+};
 use openplotva_taskman::{
-    CONTROL_QUEUE_NAME, InMemoryTaskQueue, JobPayload, JobStatus, JobType, TaskQueueRecord,
-    fallback_queue_time_estimate,
+    CONTROL_QUEUE_NAME, InMemoryTaskQueue, JobPayload, JobStatus, JobType, TaskQueueError,
+    TaskQueueRecord, fallback_queue_time_estimate,
 };
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -79,18 +81,59 @@ impl RuntimeTaskmanInspectorHandle {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn restart_job(&self, id: i64) -> Result<i64, String> {
-        self.shared_queue()?
-            .restart(id, OffsetDateTime::now_utc())
-            .map_err(|error| error.to_string())
+    /// Recreate a job as pending. Finished jobs that already left memory are
+    /// restarted from their persisted record.
+    pub(crate) async fn restart_job(&self, id: i64) -> Result<i64, String> {
+        let queue = self.shared_queue()?;
+        let now = OffsetDateTime::now_utc();
+        if let Some(record) = queue.record(id) {
+            return Ok(queue.restart_from(&record, now));
+        }
+        let not_found = || TaskQueueError::JobNotFound(id).to_string();
+        let store = self.sql_store_handle().ok_or_else(not_found)?;
+        let record = store
+            .load_task_queue_record(id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(not_found)?;
+        Ok(queue.restart_from(&record, now))
     }
 
-    pub(crate) fn delete_jobs(
+    /// Delete matching jobs held in memory. Virtual-dialog cleanup uses this
+    /// directly because session deletion purges the persisted rows itself.
+    pub(crate) fn delete_in_memory_jobs(
         &self,
         filter: RuntimeTaskmanJobsFilter,
     ) -> Result<RuntimeTaskmanDeleteResult, String> {
-        let queue = self.shared_queue()?;
         let filter = NormalizedTaskmanFilter::try_from(filter)?;
+        self.delete_matching_in_memory(&filter)
+            .map(|(result, _)| result)
+    }
+
+    /// Delete matching jobs from memory and their persisted finished rows.
+    pub(crate) async fn delete_jobs(
+        &self,
+        filter: RuntimeTaskmanJobsFilter,
+    ) -> Result<RuntimeTaskmanDeleteResult, String> {
+        let filter = NormalizedTaskmanFilter::try_from(filter)?;
+        let (mut result, deleted_ids) = self.delete_matching_in_memory(&filter)?;
+        if let Some(store) = self.sql_store_handle() {
+            let persisted = store
+                .delete_finished_task_queue_jobs(&filter.storage_filter(), &deleted_ids)
+                .await
+                .map_err(|error| error.to_string())?;
+            let persisted = i32::try_from(persisted).unwrap_or(i32::MAX);
+            result.matched = result.matched.saturating_add(persisted);
+            result.deleted = result.deleted.saturating_add(persisted);
+        }
+        Ok(result)
+    }
+
+    fn delete_matching_in_memory(
+        &self,
+        filter: &NormalizedTaskmanFilter,
+    ) -> Result<(RuntimeTaskmanDeleteResult, Vec<i64>), String> {
+        let queue = self.shared_queue()?;
         let records = queue.inspect_records(|records| {
             records
                 .iter()
@@ -99,6 +142,7 @@ impl RuntimeTaskmanInspectorHandle {
                 .collect::<Vec<_>>()
         });
         let mut result = RuntimeTaskmanDeleteResult::default();
+        let mut deleted_ids = Vec::with_capacity(records.len());
         for (id, active) in records {
             result.matched += 1;
             if active {
@@ -106,8 +150,35 @@ impl RuntimeTaskmanInspectorHandle {
             }
             queue.delete(id).map_err(|error| error.to_string())?;
             result.deleted += 1;
+            deleted_ids.push(id);
         }
-        Ok(result)
+        Ok((result, deleted_ids))
+    }
+
+    fn list_in_memory_jobs(
+        &self,
+        filter: &NormalizedTaskmanFilter,
+    ) -> Option<RuntimeTaskmanJobListResultData> {
+        self.inspect_records(|mut records| {
+            records.retain(|record| filter.matches(record));
+            let total = records.len() as i32;
+            let summary = taskman_summary(&records);
+            sort_taskman_records(&mut records, &filter.sort_by, &filter.sort_dir);
+            let offset = filter.offset.min(total.max(0)) as usize;
+            let items = records
+                .into_iter()
+                .skip(offset)
+                .take(filter.limit as usize)
+                .map(taskman_list_entry_from_record)
+                .collect();
+            RuntimeTaskmanJobListResultData {
+                total,
+                offset: filter.offset,
+                limit: filter.limit,
+                summary,
+                items,
+            }
+        })
     }
 
     fn shared_queue(&self) -> Result<Arc<InMemoryTaskQueue>, String> {
@@ -128,34 +199,21 @@ pub(crate) struct RuntimeTaskmanDeleteResult {
 }
 
 impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
-    fn list_jobs(
-        &self,
+    /// Active jobs always live in memory; listings that can include finished
+    /// jobs read Postgres, which keeps them after the queue drops them.
+    fn list_jobs<'a>(
+        &'a self,
         filter: RuntimeTaskmanJobsFilter,
-    ) -> Result<RuntimeTaskmanJobListResultData, String> {
-        Ok(self
-            .inspect_records(|mut records| {
-                let filter = NormalizedTaskmanFilter::try_from(filter)?;
-                records.retain(|record| filter.matches(record));
-                let total = records.len() as i32;
-                let summary = taskman_summary(&records);
-                sort_taskman_records(&mut records, &filter.sort_by, &filter.sort_dir);
-                let offset = filter.offset.min(total.max(0)) as usize;
-                let items = records
-                    .into_iter()
-                    .skip(offset)
-                    .take(filter.limit as usize)
-                    .map(taskman_list_entry_from_record)
-                    .collect();
-                Ok::<_, String>(RuntimeTaskmanJobListResultData {
-                    total,
-                    offset: filter.offset,
-                    limit: filter.limit,
-                    summary,
-                    items,
-                })
-            })
-            .transpose()?
-            .unwrap_or_else(empty_taskman_job_list))
+    ) -> RuntimeTaskmanJobListFuture<'a> {
+        Box::pin(async move {
+            let filter = NormalizedTaskmanFilter::try_from(filter)?;
+            match self.sql_store_handle() {
+                Some(store) if !filter.active_only() => list_persisted_jobs(&store, &filter).await,
+                _ => Ok(self
+                    .list_in_memory_jobs(&filter)
+                    .unwrap_or_else(empty_taskman_job_list)),
+            }
+        })
     }
 
     fn job<'a>(&'a self, id: i64) -> RuntimeTaskmanJobFuture<'a> {
@@ -319,7 +377,72 @@ impl TryFrom<RuntimeTaskmanJobsFilter> for NormalizedTaskmanFilter {
     }
 }
 
+async fn list_persisted_jobs(
+    store: &PostgresTaskQueueStore,
+    filter: &NormalizedTaskmanFilter,
+) -> Result<RuntimeTaskmanJobListResultData, String> {
+    let page = store
+        .list_task_queue_jobs(
+            &filter.storage_filter(),
+            filter.sort_column(),
+            filter.sort_dir != "asc",
+            i64::from(filter.offset),
+            i64::from(filter.limit),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(RuntimeTaskmanJobListResultData {
+        total: i32::try_from(page.total).unwrap_or(i32::MAX),
+        offset: filter.offset,
+        limit: filter.limit,
+        summary: RuntimeTaskmanJobSummaryData {
+            by_status: json!(page.by_status),
+            by_queue: json!(page.by_queue),
+        },
+        items: page
+            .records
+            .iter()
+            .map(taskman_list_entry_from_record)
+            .collect(),
+    })
+}
+
 impl NormalizedTaskmanFilter {
+    fn active_only(&self) -> bool {
+        !self.status.is_empty()
+            && self
+                .status
+                .iter()
+                .all(|status| matches!(status.as_str(), "pending" | "processing"))
+    }
+
+    fn storage_filter(&self) -> TaskQueueJobFilter {
+        TaskQueueJobFilter {
+            statuses: self.status.iter().cloned().collect(),
+            queues: self.queue.iter().cloned().collect(),
+            user_id: self.user_id,
+            chat_id: self.chat_id,
+            time_column: match self.time_field.as_str() {
+                "started_at" => TaskQueueTimeColumn::StartedAt,
+                "completed_at" => TaskQueueTimeColumn::CompletedAt,
+                _ => TaskQueueTimeColumn::CreatedAt,
+            },
+            from: self.from,
+            to: self.to,
+            search: self.q.clone(),
+        }
+    }
+
+    fn sort_column(&self) -> TaskQueueSortColumn {
+        match self.sort_by.as_str() {
+            "id" => TaskQueueSortColumn::Id,
+            "priority" => TaskQueueSortColumn::Priority,
+            "started_at" => TaskQueueSortColumn::StartedAt,
+            "completed_at" => TaskQueueSortColumn::CompletedAt,
+            _ => TaskQueueSortColumn::CreatedAt,
+        }
+    }
+
     fn matches(&self, record: &TaskQueueRecord) -> bool {
         if !self.status.is_empty() && !self.status.contains(record.status.as_str()) {
             return false;
@@ -870,6 +993,7 @@ mod tests {
                 queue: vec![CONTROL_QUEUE_NAME.to_owned()],
                 ..RuntimeTaskmanJobsFilter::default()
             })
+            .await
             .expect("list jobs");
 
         assert_eq!(result.total, 1);
@@ -990,6 +1114,7 @@ mod tests {
                 sort_dir: "asc".to_owned(),
                 ..RuntimeTaskmanJobsFilter::default()
             })
+            .await
             .expect("list jobs");
         assert_eq!(result.total, 2);
         assert_eq!(result.summary.by_queue[TEXT_QUEUE_NAME], 1);
@@ -1012,6 +1137,7 @@ mod tests {
                 limit: 1,
                 ..RuntimeTaskmanJobsFilter::default()
             })
+            .await
             .expect("second page");
         assert_eq!(page.total, 2);
         assert_eq!(page.summary.by_status["pending"], 2);
@@ -1026,6 +1152,7 @@ mod tests {
                 status: vec!["pending".to_owned()],
                 ..RuntimeTaskmanJobsFilter::default()
             })
+            .await
             .expect("filtered image");
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.summary.by_queue[IMAGE_REGULAR_QUEUE_NAME], 1);
@@ -1036,6 +1163,7 @@ mod tests {
                     status: vec!["not_a_status".to_owned()],
                     ..RuntimeTaskmanJobsFilter::default()
                 })
+                .await
                 .is_err()
         );
 
@@ -1134,6 +1262,7 @@ mod tests {
                 sort_dir: "asc".to_owned(),
                 ..RuntimeTaskmanJobsFilter::default()
             })
+            .await
             .expect("list jobs");
         assert_eq!(
             result.items.iter().map(|item| item.id).collect::<Vec<_>>(),
@@ -1141,7 +1270,10 @@ mod tests {
         );
         assert_eq!(shared_id, 2);
 
-        let restarted = inspector.restart_job(shared_id).expect("restart shared");
+        let restarted = inspector
+            .restart_job(shared_id)
+            .await
+            .expect("restart shared");
         assert_eq!(restarted, 3);
         assert!(inspector.job(restarted).await.expect("lookup").is_some());
     }

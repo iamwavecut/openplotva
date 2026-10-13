@@ -430,7 +430,9 @@ wait_for_http() {
   local url="$1"
   local name="$2"
   local output="${deploy_root}/${name}.json"
-  for _ in $(seq 1 90); do
+  # Startup restores the task queue and catches up the update backlog before
+  # health and readiness pass; allow up to 10 minutes for each.
+  for _ in $(seq 1 300); do
     if curl -fsS "$url" >"$output" 2>/dev/null; then
       log "${name} ok"
       return 0

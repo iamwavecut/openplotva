@@ -31,6 +31,9 @@ const LLM_EVENT_WRITER_INSERT_TIMEOUT: Duration = Duration::from_secs(15);
 const LLM_EVENT_WRITER_FULL_WARNING_INTERVAL_MS: u64 = 60_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// The first archive pass waits until startup catch-up has drained, so its
+/// rollup queries do not compete with the backlog for disk and connections.
+pub const LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY: Duration = Duration::from_secs(30 * 60);
 const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_events (
     created_at,
     provider,
@@ -278,42 +281,6 @@ const SQL_DELETE_OLD_MEMORY_RUNS: &str = r#"
 DELETE FROM memory_runs
 WHERE status IN ('completed','skipped','failed')
   AND range_start_at < $1::timestamptz"#;
-const SQL_ROLLUP_CHAT_HISTORY_INTERESTS: &str = r#"
-WITH grouped AS (
-    SELECT
-        date_trunc($1, e.range_end_at)::timestamptz AS bucket_start,
-        e.chat_id,
-        e.thread_id,
-        topic.topic,
-        count(*)::int AS episode_count,
-        COALESCE(sum(e.message_count), 0)::int AS message_count
-    FROM memory_episodes e
-    CROSS JOIN LATERAL unnest(e.topics) AS topic(topic)
-    WHERE e.range_end_at < $2::timestamptz
-      AND btrim(topic.topic) <> ''
-    GROUP BY 1, e.chat_id, e.thread_id, topic.topic
-),
-prepared AS (
-    SELECT
-        'chat_history'::text AS source,
-        'interest'::text AS kind,
-        $1::text AS granularity,
-        bucket_start,
-        bucket_start + CASE WHEN $1 = 'day' THEN interval '1 day' ELSE interval '1 hour' END AS bucket_end,
-        jsonb_build_object('chat_id', chat_id, 'thread_id', thread_id, 'topic', topic) AS dimensions,
-        jsonb_build_object('episode_count', episode_count, 'message_count', message_count) AS metrics
-    FROM grouped
-)
-INSERT INTO telemetry_rollups (
-    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
-)
-SELECT source, kind, granularity, bucket_start, bucket_end, md5(dimensions::text), dimensions, metrics
-FROM prepared
-ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
-    bucket_end = EXCLUDED.bucket_end,
-    dimensions = EXCLUDED.dimensions,
-    metrics = EXCLUDED.metrics,
-    updated_at = CURRENT_TIMESTAMP"#;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeLlmTraceBuffer {
@@ -943,11 +910,6 @@ async fn archive_old_analytics(
             .bind(cutoff)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(SQL_ROLLUP_CHAT_HISTORY_INTERESTS)
-            .bind(granularity)
-            .bind(cutoff)
-            .execute(&mut *tx)
-            .await?;
     }
     sqlx::query(SQL_DELETE_OLD_MEMORY_RUNS)
         .bind(cutoff)
@@ -972,6 +934,7 @@ async fn delete_old_llm_request_events_batch(
 
 pub async fn run_llm_request_event_cleanup_worker_until<Stop>(
     pool: PgPool,
+    first_pass_delay: Duration,
     interval: Duration,
     retention_days: i32,
     batch_size: i64,
@@ -989,6 +952,11 @@ where
     }
 
     tokio::pin!(stop);
+    tokio::select! {
+        biased;
+        () = &mut stop => return report,
+        () = tokio::time::sleep(first_pass_delay) => {}
+    }
     'passes: loop {
         let archive_result = tokio::select! {
             biased;
@@ -2286,6 +2254,7 @@ mod tests {
 
         let report = run_llm_request_event_cleanup_worker_until(
             pool.clone(),
+            Duration::ZERO,
             Duration::from_secs(3600),
             14,
             2,
@@ -2324,6 +2293,7 @@ mod tests {
 
         let rerun = run_llm_request_event_cleanup_worker_until(
             pool.clone(),
+            Duration::ZERO,
             Duration::from_secs(3600),
             14,
             2,
@@ -2356,6 +2326,7 @@ mod tests {
             .expect("make archive storage unavailable");
         let failed = run_llm_request_event_cleanup_worker_until(
             pool.clone(),
+            Duration::ZERO,
             Duration::from_secs(3600),
             14,
             2,
@@ -2380,6 +2351,7 @@ mod tests {
             .expect("restore archive storage");
         let recovered = run_llm_request_event_cleanup_worker_until(
             pool.clone(),
+            Duration::ZERO,
             Duration::from_secs(3600),
             14,
             2,
@@ -2400,6 +2372,7 @@ mod tests {
             Duration::from_millis(100),
             run_llm_request_event_cleanup_worker_until(
                 pool,
+                Duration::ZERO,
                 Duration::from_secs(3600),
                 14,
                 10_000,
