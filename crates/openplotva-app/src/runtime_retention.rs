@@ -1,5 +1,6 @@
-//! Daily data-retention workers: drop expired `chat_history_entries` partitions
-//! and batch-delete aged Telegram update artifacts, `telegram_files`, and
+//! Daily data-retention workers: drop expired `chat_history_entries` and
+//! Telegram outbox partitions, keep daily partitions created ahead of time, and
+//! batch-delete aged Telegram update artifacts, `telegram_files`, and
 //! `whitecircle_checks` rows. Configurable workers are no-ops when their
 //! `retention_days` is `<= 0` (the knob's "disabled" value).
 //!
@@ -46,6 +47,87 @@ pub struct TelegramUpdateRetentionReport {
     pub quarantine_deleted: u64,
     pub ticks: u64,
     pub errors: u64,
+}
+
+/// Hourly: partitions are created days ahead, so a missed tick costs nothing,
+/// and expired outbox days are freed within the hour.
+pub const PARTITION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DailyPartitionMaintenanceReport {
+    pub ticks: u64,
+    pub dropped_partitions: u64,
+    pub errors: u64,
+}
+
+/// Keep the daily partitions of every partitioned table ready ahead of time and
+/// drop Telegram outbox and attempt days older than `outbox_retention_days`
+/// (`0` keeps them). An outbox day that still has rows in flight is kept.
+pub async fn run_daily_partition_maintenance_worker_until<Stop>(
+    pool: PgPool,
+    interval: Duration,
+    outbox_retention_days: i32,
+    stop: Stop,
+) -> DailyPartitionMaintenanceReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = DailyPartitionMaintenanceReport::default();
+    tokio::pin!(stop);
+    loop {
+        report.ticks += 1;
+        for table in openplotva_storage::DAILY_PARTITIONED_TABLES {
+            if let Err(error) = openplotva_storage::ensure_daily_partitions(
+                &pool,
+                table,
+                openplotva_storage::DAILY_PARTITIONS_AHEAD,
+            )
+            .await
+            {
+                report.errors += 1;
+                tracing::warn!(%error, table, "failed to create upcoming daily partitions");
+            }
+        }
+        if outbox_retention_days > 0 {
+            let cutoff_day = OffsetDateTime::now_utc().date()
+                - time::Duration::days(i64::from(outbox_retention_days));
+            for (table, keep_when) in [
+                (
+                    "telegram_outbox",
+                    Some(openplotva_storage::TELEGRAM_OUTBOX_IN_FLIGHT),
+                ),
+                ("telegram_outbox_attempts", None),
+            ] {
+                match openplotva_storage::drop_daily_partitions_before(
+                    &pool, table, cutoff_day, keep_when,
+                )
+                .await
+                {
+                    Ok(dropped) => {
+                        report.dropped_partitions += dropped.len() as u64;
+                        if !dropped.is_empty() {
+                            tracing::info!(
+                                ?dropped,
+                                outbox_retention_days,
+                                "dropped expired daily partitions"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        report.errors += 1;
+                        tracing::warn!(%error, table, "failed to drop expired daily partitions");
+                    }
+                }
+            }
+        }
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
 }
 
 fn current_utc_day_start(now: OffsetDateTime) -> OffsetDateTime {
