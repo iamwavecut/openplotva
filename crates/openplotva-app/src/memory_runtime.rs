@@ -200,6 +200,10 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         prompt_version: &'a str,
         source_messages: &'a [openplotva_memory::Message],
     ) -> MemoryWriteStoreFuture<'a, (i64, bool), Self::Error>;
+
+    /// Drop cached visible-card lists of a chat and its users after their
+    /// cards were written, so the next batch sees the new cards.
+    fn invalidate_visible_cards(&self, _chat_id: i64, _user_ids: &[i64]) {}
 }
 
 /// Storage boundary needed to claim and finalize memory runs.
@@ -394,6 +398,10 @@ impl MemoryWriteStore for PostgresMemoryStore {
             .await
         })
     }
+
+    fn invalidate_visible_cards(&self, chat_id: i64, user_ids: &[i64]) {
+        self.invalidate_cached_cards(chat_id, user_ids);
+    }
 }
 
 impl MemoryRunStore for PostgresMemoryStore {
@@ -441,7 +449,9 @@ impl MemoryRunStore for PostgresMemoryStore {
         scope: &'a openplotva_memory::RetrievalScope,
         limit: i32,
     ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
-        Box::pin(async move { PostgresMemoryStore::list_visible_cards(self, scope, limit).await })
+        Box::pin(
+            async move { PostgresMemoryStore::list_visible_cards_cached(self, scope, limit).await },
+        )
     }
 
     fn retrieve_related_cards<'a>(
@@ -3079,7 +3089,9 @@ where
         // batch. Log, put the failed group on the cooldown (so a persistently
         // failing group retries at the cooldown cadence instead of burning a model
         // call every tick and starving the others), and move on.
-        match process_one_merge_group(merger, store, embedder, cfg, now, &group).await {
+        let merged = process_one_merge_group(merger, store, embedder, cfg, now, &group).await;
+        store.invalidate_cached_cards(group.chat_id, &[group.user_id]);
+        match merged {
             Ok(Some(counts)) => {
                 tick.cards_superseded += counts.superseded;
                 tick.cards_demoted += counts.demoted;
@@ -3163,6 +3175,31 @@ where
 }
 
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
+    store: &Store,
+    embedder: Option<&Embedder>,
+    input: &ExtractInput,
+    output: &ExtractOutput,
+    cfg: MemoryExtractionBatchConfig<'_>,
+) -> Result<CardExtractionWriteReport, MemoryExtractionWriteError<ExtractorError, Store::Error>>
+where
+    ExtractorError: StdError + Send + Sync + 'static,
+    Store: MemoryWriteStore,
+    Embedder: EmbeddingProvider,
+{
+    let written = write_extraction_cards(store, embedder, input, output, cfg).await;
+    let mut user_ids = input
+        .messages
+        .iter()
+        .map(|message| message.user_id)
+        .filter(|user_id| *user_id != 0)
+        .collect::<Vec<_>>();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    store.invalidate_visible_cards(input.run.chat_id, &user_ids);
+    written
+}
+
+async fn write_extraction_cards<ExtractorError, Store, Embedder>(
     store: &Store,
     embedder: Option<&Embedder>,
     input: &ExtractInput,

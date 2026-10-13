@@ -383,6 +383,9 @@ pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
 
 pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 
+/// Visible-card lists the memory pipeline keeps in RAM; `0` disables the cache.
+pub const DEFAULT_MEMORY_CARD_CACHE_ENTRIES: i32 = 4_096;
+
 pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
 /// Discovery service name the embedder registers under on the AI Farm.
@@ -1045,6 +1048,7 @@ pub struct MemoryConfig {
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
     pub max_queued_runs: i32,
+    pub card_cache_entries: i32,
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
     pub tokenizer_file: String,
@@ -1571,6 +1575,8 @@ pub struct RawConfig {
     pub memory_min_messages_per_run: Option<String>,
     /// `MEMORY_MAX_QUEUED_RUNS`.
     pub memory_max_queued_runs: Option<String>,
+    /// `MEMORY_CARD_CACHE_ENTRIES`.
+    pub memory_card_cache_entries: Option<String>,
     /// `MEMORY_MAX_INPUT_TOKENS`.
     pub memory_max_input_tokens: Option<String>,
     /// `MEMORY_TOKENIZER_MODEL`.
@@ -2895,6 +2901,14 @@ impl AppConfig {
                         DEFAULT_MEMORY_MAX_QUEUED_RUNS,
                     )?,
                 )?,
+                card_cache_entries: validate_non_negative_i32(
+                    "MEMORY_CARD_CACHE_ENTRIES",
+                    parse_i32(
+                        "MEMORY_CARD_CACHE_ENTRIES",
+                        raw.memory_card_cache_entries,
+                        DEFAULT_MEMORY_CARD_CACHE_ENTRIES,
+                    )?,
+                )?,
                 max_input_tokens: parse_i32(
                     "MEMORY_MAX_INPUT_TOKENS",
                     raw.memory_max_input_tokens,
@@ -3379,6 +3393,7 @@ impl RawConfig {
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
             memory_max_queued_runs: env("MEMORY_MAX_QUEUED_RUNS"),
+            memory_card_cache_entries: env("MEMORY_CARD_CACHE_ENTRIES"),
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
@@ -4979,6 +4994,15 @@ mod tests {
         let config = AppConfig::from_raw(RawConfig::default())?;
         assert_eq!(config.memory.min_messages_per_run, 20);
         assert_eq!(config.memory.max_queued_runs, 5000);
+        assert_eq!(
+            config.memory.card_cache_entries,
+            super::DEFAULT_MEMORY_CARD_CACHE_ENTRIES
+        );
+        let disabled = AppConfig::from_raw(RawConfig {
+            memory_card_cache_entries: Some("0".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert_eq!(disabled.memory.card_cache_entries, 0);
 
         let error = AppConfig::from_raw(RawConfig {
             memory_min_messages_per_run: Some("0".to_owned()),

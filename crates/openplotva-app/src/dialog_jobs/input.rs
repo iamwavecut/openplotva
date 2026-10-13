@@ -129,6 +129,7 @@ pub struct PostgresDialogInputMaterializer {
     history: PostgresHistoryStore,
     members: PostgresChatMemberStore,
     memory: Option<PostgresMemoryStore>,
+    memory_usage: Option<crate::memory_card_usage::MemoryCardUsageJournal>,
     memory_embedder: Option<Arc<dyn EmbeddingProvider>>,
     memory_embedding_dim: i32,
     shield: Option<PostgresShieldStore>,
@@ -156,6 +157,7 @@ impl PostgresDialogInputMaterializer {
             history,
             members,
             memory: None,
+            memory_usage: None,
             memory_embedder: None,
             memory_embedding_dim: 0,
             shield: None,
@@ -171,6 +173,16 @@ impl PostgresDialogInputMaterializer {
     #[must_use]
     pub fn with_memory_store(mut self, memory: PostgresMemoryStore) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Record recalled cards in the write-behind journal instead of in Postgres.
+    #[must_use]
+    pub fn with_memory_usage_journal(
+        mut self,
+        journal: crate::memory_card_usage::MemoryCardUsageJournal,
+    ) -> Self {
+        self.memory_usage = Some(journal);
         self
     }
 
@@ -757,19 +769,9 @@ impl PostgresDialogInputMaterializer {
             .await
         {
             Ok(memory) => {
-                let card_ids = memory.cards.iter().map(|card| card.id).collect::<Vec<_>>();
-                if let Some(store) = self.memory.as_ref()
-                    && let Err(error) = store
-                        .record_card_retrieval(&card_ids, OffsetDateTime::now_utc())
-                        .await
-                {
-                    tracing::warn!(
-                        %error,
-                        chat_id = params.chat_id,
-                        user_id = params.user_id,
-                        card_count = card_ids.len(),
-                        "failed to record recalled memory cards"
-                    );
+                if let Some(journal) = self.memory_usage.as_ref() {
+                    let card_ids = memory.cards.iter().map(|card| card.id).collect::<Vec<_>>();
+                    journal.record(&card_ids, OffsetDateTime::now_utc());
                 }
                 let captured = captured_memories_from_retrieval(&memory);
                 (

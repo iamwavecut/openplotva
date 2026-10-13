@@ -43,11 +43,13 @@ pub mod gradius_ads;
 pub mod llm_routing;
 pub mod maintenance;
 pub mod maintenance_notifications;
+mod memory_card_cache;
 mod task_queue_listing;
 pub mod telegram_delivery;
 pub mod telegram_outbox;
 pub mod telegram_projection;
 
+pub use memory_card_cache::{MEMORY_CARD_CACHE_TTL, MemoryCardCache, MemoryCardCacheStats};
 pub use task_queue_listing::{
     TASK_QUEUE_ACTIVE_STATUSES, TaskQueueJobFilter, TaskQueueJobPage, TaskQueueSortColumn,
     TaskQueueTimeColumn,
@@ -963,7 +965,7 @@ pub const SQL_UPDATE_MEMORY_CARD_TEXT: &str = "UPDATE memory_cards SET fact_text
 
 pub const SQL_REINFORCE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = LEAST(1.0, confidence + $2), salience = LEAST(1.0, salience + $3), observation_count = observation_count + 1, last_observed_at = GREATEST(last_observed_at, $4), expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
-pub const SQL_RECORD_MEMORY_CARD_USAGE: &str = "UPDATE memory_cards SET last_used_at = CASE WHEN last_used_at IS NULL THEN $2 ELSE GREATEST(last_used_at, $2) END, use_count = LEAST(use_count::bigint + 1, 2147483647)::integer, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1::bigint[]) AND status IN ('active', 'competing')";
+pub const SQL_RECORD_MEMORY_CARD_USAGE: &str = "UPDATE memory_cards AS card SET last_used_at = CASE WHEN card.last_used_at IS NULL THEN usage.used_at ELSE GREATEST(card.last_used_at, usage.used_at) END, use_count = LEAST(card.use_count::bigint + usage.uses, 2147483647)::integer, updated_at = CURRENT_TIMESTAMP FROM unnest($1::bigint[], $2::timestamptz[], $3::bigint[]) AS usage(id, used_at, uses) WHERE card.id = usage.id AND card.status IN ('active', 'competing')";
 
 pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = GREATEST(0.0, confidence - $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
@@ -5168,6 +5170,15 @@ impl PostgresHistoryStore {
 #[derive(Clone, Debug)]
 pub struct PostgresMemoryStore {
     pool: PgPool,
+    card_cache: Option<Arc<MemoryCardCache>>,
+}
+
+/// Uses of one card collected since the last flush.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryCardUsage {
+    pub card_id: i64,
+    pub last_used_at: OffsetDateTime,
+    pub uses: i64,
 }
 
 async fn merge_memory_card_into_on(
@@ -5202,7 +5213,32 @@ impl PostgresMemoryStore {
     /// Build a memory store over an existing pool.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            card_cache: None,
+        }
+    }
+
+    /// Share one visible-card cache; stores built from the same cache see each
+    /// other's invalidations.
+    #[must_use]
+    pub fn with_card_cache(mut self, cache: Arc<MemoryCardCache>) -> Self {
+        self.card_cache = Some(cache);
+        self
+    }
+
+    /// Drop cached lists for `chat_id` and for lists that include cards of
+    /// `user_ids`; call after writing cards of that scope.
+    pub fn invalidate_cached_cards(&self, chat_id: i64, user_ids: &[i64]) {
+        if let Some(cache) = &self.card_cache {
+            cache.invalidate_scope(chat_id, user_ids);
+        }
+    }
+
+    fn clear_card_cache(&self) {
+        if let Some(cache) = &self.card_cache {
+            cache.clear();
+        }
     }
 
     pub async fn get_dialog_memory_chat_meta(
@@ -5484,11 +5520,15 @@ impl PostgresMemoryStore {
     /// Archive one batch of active cards whose TTL has elapsed (soft, restorable:
     /// status='expired', retracted_at stamped). Returns the number archived.
     pub async fn archive_expired_cards(&self, batch: i64) -> Result<u64, StorageError> {
-        Ok(sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
+        let archived = sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
             .bind(batch.max(1))
             .execute(&self.pool)
             .await?
-            .rows_affected())
+            .rows_affected();
+        if archived > 0 {
+            self.clear_card_cache();
+        }
+        Ok(archived)
     }
 
     /// Give cold episodic cards a grace TTL so forgetting is bounded even when
@@ -5546,6 +5586,9 @@ impl PostgresMemoryStore {
                 .await?;
             tx.commit().await?;
             retired += dup_ids.len() as u64;
+        }
+        if retired > 0 {
+            self.clear_card_cache();
         }
         Ok(retired)
     }
@@ -6000,6 +6043,32 @@ impl PostgresMemoryStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    /// `list_visible_cards` through the RAM cache, when this store has one.
+    pub async fn list_visible_cards_cached(
+        &self,
+        scope: &openplotva_memory::RetrievalScope,
+        limit: i32,
+    ) -> Result<Vec<openplotva_memory::Card>, StorageError> {
+        let Some(cache) = &self.card_cache else {
+            return self.list_visible_cards(scope, limit).await;
+        };
+        let key = memory_card_cache::VisibleCardsKey {
+            chat_id: scope.chat_id,
+            thread_id: scope.thread_id,
+            user_id: scope.user_id,
+            own_dm: openplotva_memory::public_user_in_own_dm(scope),
+            limit: positive_or_default(limit, 100),
+        };
+        match cache.get(&key) {
+            Ok(cards) => Ok(cards),
+            Err(generation) => {
+                let cards = self.list_visible_cards(scope, limit).await?;
+                cache.put(key, &cards, generation);
+                Ok(cards)
+            }
+        }
+    }
+
     pub async fn soft_delete_visible_card(
         &self,
         id: i64,
@@ -6018,6 +6087,7 @@ impl PostgresMemoryStore {
             .bind(openplotva_memory::public_user_in_own_dm(scope))
             .execute(&self.pool)
             .await?;
+        self.invalidate_cached_cards(scope.chat_id, &[scope.user_id]);
         Ok(result.rows_affected() > 0)
     }
 
@@ -6235,6 +6305,7 @@ impl PostgresMemoryStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
@@ -6256,6 +6327,7 @@ impl PostgresMemoryStore {
             .bind(portable)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
@@ -6268,32 +6340,35 @@ impl PostgresMemoryStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
-    /// Record cards that were actually included in a dialog context.
-    pub async fn record_card_retrieval(
-        &self,
-        card_ids: &[i64],
-        used_at: OffsetDateTime,
-    ) -> Result<(), StorageError> {
-        let mut card_ids = card_ids
+    /// Apply collected card uses in one statement. `updated_at` moves with
+    /// usage because deferred reconsolidation selects recently touched cards.
+    pub async fn record_card_usage(&self, usage: &[MemoryCardUsage]) -> Result<u64, StorageError> {
+        let mut usage = usage
             .iter()
+            .filter(|entry| entry.card_id != 0 && entry.uses > 0)
             .copied()
-            .filter(|id| *id != 0)
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect::<Vec<_>>();
-        card_ids.sort_unstable();
-        if card_ids.is_empty() {
-            return Ok(());
+        if usage.is_empty() {
+            return Ok(0);
         }
-        sqlx::query(SQL_RECORD_MEMORY_CARD_USAGE)
-            .bind(&card_ids)
-            .bind(used_at)
+        usage.sort_unstable_by_key(|entry| entry.card_id);
+        let ids = usage.iter().map(|entry| entry.card_id).collect::<Vec<_>>();
+        let used_at = usage
+            .iter()
+            .map(|entry| entry.last_used_at)
+            .collect::<Vec<_>>();
+        let uses = usage.iter().map(|entry| entry.uses).collect::<Vec<_>>();
+        Ok(sqlx::query(SQL_RECORD_MEMORY_CARD_USAGE)
+            .bind(&ids)
+            .bind(&used_at)
+            .bind(&uses)
             .execute(&self.pool)
-            .await?;
-        Ok(())
+            .await?
+            .rows_affected())
     }
 
     pub async fn retrieve_lexical(
@@ -11730,7 +11805,9 @@ mod tests {
         );
         assert!(super::SQL_REINFORCE_MEMORY_CARD.contains("expires_at = NULL"));
         assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("last_used_at = CASE"));
-        assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("use_count::bigint + 1"));
+        assert!(
+            super::SQL_RECORD_MEMORY_CARD_USAGE.contains("card.use_count::bigint + usage.uses")
+        );
         assert!(super::SQL_COPY_MEMORY_CARD_SOURCES.contains("source.card_id = $2"));
         assert!(super::SQL_COPY_MEMORY_CARD_LINKS.contains("ON CONFLICT"));
         assert!(
@@ -12252,12 +12329,15 @@ mod tests {
             assert_eq!(retrieved.episodes[0].id, episode_id);
             let retrieved_card_ids =
                 retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>();
-            store
-                .record_card_retrieval(
-                    &retrieved_card_ids,
-                    observed + time::Duration::hours(1),
-                )
-                .await?;
+            let usage = retrieved_card_ids
+                .iter()
+                .map(|card_id| super::MemoryCardUsage {
+                    card_id: *card_id,
+                    last_used_at: observed + time::Duration::hours(1),
+                    uses: 1,
+                })
+                .collect::<Vec<_>>();
+            store.record_card_usage(&usage).await?;
             let used_cards: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM memory_cards WHERE id = ANY($1::bigint[]) AND use_count = 1 AND last_used_at = $2",
             )
