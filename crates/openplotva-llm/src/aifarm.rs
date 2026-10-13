@@ -3125,12 +3125,19 @@ where
             } else {
                 text
             };
-            if let Some(error) =
-                reply_shape_error(&request.input, &history, &request.transcript, &text, false)
-            {
-                let error = model_output_rejected(self.provider(), &error);
-                return Err(aifarm_step_error_with_trace(error, trace));
-            }
+            let text = match review_reply_shape(
+                &request.input,
+                &history,
+                &request.transcript,
+                text,
+                false,
+            ) {
+                Ok(text) => text,
+                Err(error) => {
+                    let error = model_output_rejected(self.provider(), &error);
+                    return Err(aifarm_step_error_with_trace(error, trace));
+                }
+            };
             return Ok(ChatStepOutput {
                 provider: self.provider().to_owned(),
                 model,
@@ -3159,16 +3166,19 @@ where
                         Ok(text) => text,
                         Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
                     };
-                if let Some(error) = reply_shape_error(
+                let text = match review_reply_shape(
                     &request.input,
                     &history,
                     &request.transcript,
-                    &text,
+                    text,
                     generation_offered,
                 ) {
-                    let error = model_output_rejected(self.provider(), &error);
-                    return Err(aifarm_step_error_with_trace(error, trace));
-                }
+                    Ok(text) => text,
+                    Err(error) => {
+                        let error = model_output_rejected(self.provider(), &error);
+                        return Err(aifarm_step_error_with_trace(error, trace));
+                    }
+                };
                 Ok(ChatStepOutput {
                     provider: self.provider().to_owned(),
                     model,
@@ -5598,20 +5608,21 @@ fn extract_final_answer_for_provider(
 
 const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song"];
 
-/// A final reply that opens like one of the bot's latest replies in `history`, or that
-/// announces a generation no call of this turn started, is re-sampled once per turn: a
-/// re-sample already carries a verdict and is delivered as it is.
-fn reply_shape_error(
+/// Review a final reply against the bot's latest replies in `history` and the current
+/// message: its reaction opener, read-back quotes and an unstarted generation promise are
+/// cut; an opening still copied from a recent reply, or a reply that is only a promise,
+/// is re-sampled once per turn. Custom personas keep their own form.
+fn review_reply_shape(
     input: &DialogInput,
     history: &[HistoryMessage],
     transcript: &[SessionMessage],
-    text: &str,
+    text: String,
     generation_offered: bool,
-) -> Option<AifarmDialogError> {
-    if !input.resample_verdict.trim().is_empty() {
-        return None;
+) -> Result<String, AifarmDialogError> {
+    if !input.persona.custom_persona.trim().is_empty() {
+        return Ok(text);
     }
-    let recent_replies = history
+    let recent_replies: Vec<&str> = history
         .iter()
         .rev()
         .filter(|turn| {
@@ -5619,17 +5630,24 @@ fn reply_shape_error(
         })
         .map(|turn| turn.text.as_str())
         .filter(|text| !text.trim().is_empty())
-        .take(reply_shape::RECENT_REPLY_WINDOW);
-    if reply_shape::repeats_recent_opening(text, recent_replies) {
-        return Some(AifarmDialogError::FinalAnswerRepeatsOpening);
+        .take(reply_shape::RECENT_REPLY_WINDOW)
+        .collect();
+    let context = reply_shape::ReplyContext {
+        recent_replies: &recent_replies,
+        user_text: &input.message.text,
+        generation_pending: generation_offered && !generation_started(transcript),
+        resample_allowed: input.resample_verdict.trim().is_empty(),
+    };
+    match reply_shape::review_reply(&text, &context) {
+        reply_shape::ReplyShape::Keep => Ok(text),
+        reply_shape::ReplyShape::Trimmed(trimmed) => Ok(trimmed),
+        reply_shape::ReplyShape::Resample(reply_shape::ShapeFault::RepeatedOpening) => {
+            Err(AifarmDialogError::FinalAnswerRepeatsOpening)
+        }
+        reply_shape::ReplyShape::Resample(reply_shape::ShapeFault::UnexecutedAction) => {
+            Err(AifarmDialogError::FinalAnswerUnexecutedAction)
+        }
     }
-    if generation_offered
-        && !generation_started(transcript)
-        && reply_shape::announces_generation(text)
-    {
-        return Some(AifarmDialogError::FinalAnswerUnexecutedAction);
-    }
-    None
 }
 
 fn generation_started(transcript: &[SessionMessage]) -> bool {
@@ -9077,7 +9095,7 @@ mod tests {
         assert!(prompt.contains("<base_voice>"));
         assert!(prompt.contains("<persona_layers>"));
         assert!(prompt.contains("не услужливость"));
-        assert!(prompt.contains("Обращайся по имени"));
+        assert!(prompt.contains("Имя собеседника не ставь в начало реплики"));
         assert!(prompt.contains("не больше одной черты"));
         assert!(prompt.contains("custom_persona"));
         assert!(prompt.contains("daily_persona_accent"));
@@ -10895,6 +10913,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn chat_step_cuts_a_reaction_opener_from_the_delivered_reply()
+    -> Result<(), CompletionError> {
+        let (provider, _, _) = direct_dialog_provider(
+            json!({"choices": [{"message": {"role": "assistant", "content": "Моська, ну ты и философ! 😂 Песок там твёрдый, верблюдам нормально."}}]}),
+            AifarmDialogConfig::default(),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            ChatStepRequest {
+                required_tool: None,
+                preferred_target: None,
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: ToolsMode::Native(
+                    native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+        assert_eq!(output.text, "Песок там твёрдый, верблюдам нормально.");
+        Ok(())
     }
 
     #[tokio::test]
