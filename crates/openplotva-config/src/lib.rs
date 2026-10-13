@@ -383,8 +383,6 @@ pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
 
 pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 
-pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
-
 pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
 /// Discovery service name the embedder registers under on the AI Farm.
@@ -1047,7 +1045,6 @@ pub struct MemoryConfig {
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
     pub max_queued_runs: i32,
-    pub max_daily_enqueued_runs: i32,
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
     pub tokenizer_file: String,
@@ -1574,8 +1571,6 @@ pub struct RawConfig {
     pub memory_min_messages_per_run: Option<String>,
     /// `MEMORY_MAX_QUEUED_RUNS`.
     pub memory_max_queued_runs: Option<String>,
-    /// `MEMORY_MAX_DAILY_ENQUEUED_RUNS`.
-    pub memory_max_daily_enqueued_runs: Option<String>,
     /// `MEMORY_MAX_INPUT_TOKENS`.
     pub memory_max_input_tokens: Option<String>,
     /// `MEMORY_TOKENIZER_MODEL`.
@@ -2900,14 +2895,6 @@ impl AppConfig {
                         DEFAULT_MEMORY_MAX_QUEUED_RUNS,
                     )?,
                 )?,
-                max_daily_enqueued_runs: validate_positive_i32(
-                    "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
-                    parse_i32(
-                        "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
-                        raw.memory_max_daily_enqueued_runs,
-                        DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS,
-                    )?,
-                )?,
                 max_input_tokens: parse_i32(
                     "MEMORY_MAX_INPUT_TOKENS",
                     raw.memory_max_input_tokens,
@@ -3392,7 +3379,6 @@ impl RawConfig {
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
             memory_max_queued_runs: env("MEMORY_MAX_QUEUED_RUNS"),
-            memory_max_daily_enqueued_runs: env("MEMORY_MAX_DAILY_ENQUEUED_RUNS"),
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
@@ -4210,10 +4196,6 @@ mod tests {
             config.memory.max_queued_runs,
             super::DEFAULT_MEMORY_MAX_QUEUED_RUNS
         );
-        assert_eq!(
-            config.memory.max_daily_enqueued_runs,
-            super::DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS
-        );
         assert_eq!(config.memory.max_input_tokens, 10_000);
         assert_eq!(config.memory.tokenizer_model, "google/gemma-4-26B-A4B-it");
         assert_eq!(config.memory.embedder_service_name, "embedder");
@@ -4923,7 +4905,6 @@ mod tests {
             memory_max_messages_per_run: Some("55".to_owned()),
             memory_min_messages_per_run: Some("20".to_owned()),
             memory_max_queued_runs: Some("5000".to_owned()),
-            memory_max_daily_enqueued_runs: Some("2000".to_owned()),
             memory_max_input_tokens: Some("6000".to_owned()),
             memory_tokenizer_model: Some("tokenizer".to_owned()),
             memory_tokenizer_file: Some("/tmp/tokenizer.json".to_owned()),
@@ -4961,7 +4942,6 @@ mod tests {
         assert_eq!(config.memory.max_messages_per_run, 55);
         assert_eq!(config.memory.min_messages_per_run, 20);
         assert_eq!(config.memory.max_queued_runs, 5000);
-        assert_eq!(config.memory.max_daily_enqueued_runs, 2000);
         assert_eq!(config.memory.max_input_tokens, 6000);
         assert_eq!(config.memory.tokenizer_model, "tokenizer");
         assert_eq!(config.memory.tokenizer_file, "/tmp/tokenizer.json");
@@ -4999,7 +4979,6 @@ mod tests {
         let config = AppConfig::from_raw(RawConfig::default())?;
         assert_eq!(config.memory.min_messages_per_run, 20);
         assert_eq!(config.memory.max_queued_runs, 5000);
-        assert_eq!(config.memory.max_daily_enqueued_runs, 2000);
 
         let error = AppConfig::from_raw(RawConfig {
             memory_min_messages_per_run: Some("0".to_owned()),
@@ -5024,19 +5003,6 @@ mod tests {
             Some(super::ConfigError::NonPositiveInteger {
                 name: "MEMORY_MAX_QUEUED_RUNS",
                 value: -1,
-            })
-        ));
-
-        let error = AppConfig::from_raw(RawConfig {
-            memory_max_daily_enqueued_runs: Some("0".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-        assert!(matches!(
-            error,
-            Some(super::ConfigError::NonPositiveInteger {
-                name: "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
-                value: 0,
             })
         ));
 

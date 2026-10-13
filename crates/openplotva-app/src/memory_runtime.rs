@@ -2525,7 +2525,7 @@ const MEMORY_ENQUEUE_MINUTE: u8 = 2;
 /// short outage still lands its hours.
 pub const MEMORY_RECENT_LOOKBACK: Duration = Duration::from_secs(2 * 60 * 60);
 /// UTC hour whose tick rescans the whole retention window for hours a longer
-/// outage or the daily cap left without a run.
+/// outage or a full queue left without a run.
 const MEMORY_FULL_SCAN_HOUR: u8 = 3;
 
 /// History span one enqueue tick scans: the whole retention window on startup
@@ -4675,7 +4675,6 @@ pub fn memory_service_worker_config_from_memory_config(
         enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy {
             min_messages_per_run: config.min_messages_per_run,
             max_queued_runs: config.max_queued_runs,
-            max_daily_enqueued_runs: config.max_daily_enqueued_runs,
         },
         process: MemoryRunProcessConfig {
             lease: positive_seconds(config.consolidation_timeout_seconds),
@@ -5667,7 +5666,6 @@ mod tests {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             memory_min_messages_per_run: Some("21".to_owned()),
             memory_max_queued_runs: Some("4321".to_owned()),
-            memory_max_daily_enqueued_runs: Some("1234".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
@@ -5676,7 +5674,6 @@ mod tests {
 
         assert_eq!(cfg.enqueue_policy.min_messages_per_run, 21);
         assert_eq!(cfg.enqueue_policy.max_queued_runs, 4321);
-        assert_eq!(cfg.enqueue_policy.max_daily_enqueued_runs, 1234);
     }
 
     #[test]

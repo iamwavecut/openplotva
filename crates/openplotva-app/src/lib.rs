@@ -4372,7 +4372,6 @@ fn admin_memory_policy_json(routes: &StaticWebRoutes) -> serde_json::Value {
     serde_json::json!({
         "min_messages_per_run": routes.memory_enqueue_policy.min_messages_per_run,
         "max_queued_runs": routes.memory_enqueue_policy.max_queued_runs,
-        "max_daily_enqueued_runs": routes.memory_enqueue_policy.max_daily_enqueued_runs,
         "max_messages_per_run": routes.memory_max_messages_per_run,
         "max_input_tokens": routes.memory_max_input_tokens,
         "token_estimator": routes.memory_token_estimator_source.as_ref(),
@@ -16624,7 +16623,7 @@ mod tests {
         assert!(value["runs"].is_null());
         assert_eq!(value["policy"]["min_messages_per_run"], 20);
         assert_eq!(value["policy"]["max_queued_runs"], 5000);
-        assert_eq!(value["policy"]["max_daily_enqueued_runs"], 2000);
+        assert!(value["policy"].get("max_daily_enqueued_runs").is_none());
         assert_eq!(value["policy"]["token_estimator"], "heuristic");
         assert!(value["enqueue_rollups"].is_null());
 
