@@ -7,6 +7,7 @@ use openplotva_dialog::{
 use openplotva_telegram::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
     ensure_telegram_safe_text, sanitize_rich_html, sanitize_telegram_html,
+    telegram_html_from_stray_markdown,
 };
 
 /// Answer text of one provider round. Queued generation results deliberately
@@ -32,7 +33,8 @@ pub fn prepare_dialog_chat_response(raw: &str) -> String {
         return String::new();
     }
 
-    let decoded = decode_html_entities(&strip_code_fences(trimmed));
+    let decoded =
+        telegram_html_from_stray_markdown(&decode_html_entities(&strip_code_fences(trimmed)));
     if dialog_response_requires_rich(&decoded) {
         let rich = sanitize_rich_html(&decoded).trim().to_owned();
         if dialog_response_requires_rich(&rich) {

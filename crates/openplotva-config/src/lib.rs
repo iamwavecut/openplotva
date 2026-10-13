@@ -76,9 +76,9 @@ pub const DEFAULT_SETTINGS_REQUIRE_INIT_DATA: bool = false;
 pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
-/// One corrected sample before the dialog router tries the next model.
+/// Corrected samples from the same model before the dialog router tries the next one.
 /// Repeated invalid samples must leave time for fallback and delivery.
-pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 1;
+pub const DEFAULT_DIALOG_MODEL_OUTPUT_RETRIES: i32 = 5;
 
 pub const DEFAULT_RUNTIME_API_PORT: u16 = 9091;
 

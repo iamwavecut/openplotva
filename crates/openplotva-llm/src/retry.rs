@@ -193,6 +193,11 @@ const REJECTION_VERDICT_RULES: &[(&str, &[&str])] = &[
         &["only protocol artifacts", "tool protocol error"],
     ),
     ("pathological", &["pathological final text"]),
+    ("repeated_opening", &["repeats a recent reply opening"]),
+    (
+        "unexecuted_action",
+        &["announces a generation without a tool call"],
+    ),
     ("empty", &["empty final text"]),
     ("no_tool_calls", &["no tool calls"]),
     ("budget_exhausted", &["output token budget exhausted"]),
@@ -345,6 +350,14 @@ mod tests {
             (
                 "chat completion returned pathological final text: repeated block",
                 "pathological",
+            ),
+            (
+                "chat completion final text repeats a recent reply opening",
+                "repeated_opening",
+            ),
+            (
+                "chat completion final text announces a generation without a tool call",
+                "unexecuted_action",
             ),
             ("chat completion returned empty final text", "empty"),
             ("dialog step returned no tool calls", "no_tool_calls"),

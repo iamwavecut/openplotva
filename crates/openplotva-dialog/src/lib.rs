@@ -10,6 +10,7 @@ mod history;
 mod json_codec;
 mod leak_guard;
 mod persona;
+pub mod reply_shape;
 pub mod tool_telemetry;
 pub mod transcript;
 pub mod turn;

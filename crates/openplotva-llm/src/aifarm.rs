@@ -26,8 +26,8 @@ use openplotva_dialog::{
     STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolStep, ToolsMode,
     clone_history_messages, decode_plotva_final_response_with_salvage,
     is_dialog_history_noise_tool_call_name, normalize_history_message, parse_assistant_content,
-    parse_native_tool_step, sanitize_tool_text, select_llm_history_messages_for_context,
-    tool_telemetry,
+    parse_native_tool_step, reply_shape, sanitize_tool_text,
+    select_llm_history_messages_for_context, tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, stages::HistoryStage,
@@ -684,6 +684,8 @@ pub fn rejection_verdict_for(error: &(dyn Error + 'static)) -> &'static str {
                 AifarmDialogError::FinalAnswerPromptLeak => "prompt_leak",
                 AifarmDialogError::FinalAnswerProtocolOnly => "protocol_only",
                 AifarmDialogError::FinalAnswerPathological(_) => "pathological",
+                AifarmDialogError::FinalAnswerRepeatsOpening => "repeated_opening",
+                AifarmDialogError::FinalAnswerUnexecutedAction => "unexecuted_action",
                 AifarmDialogError::ReasoningBudgetExhausted { .. } => "reasoning_only",
                 AifarmDialogError::OutputBudgetExhausted { .. } => "budget_exhausted",
                 AifarmDialogError::Response(message) => response_rejection_verdict(message),
@@ -729,6 +731,12 @@ pub enum AifarmDialogError {
     /// Upstream final answer looked pathological.
     #[error("chat completion returned pathological final text: {0}")]
     FinalAnswerPathological(String),
+    /// Upstream final answer opened the way one of the bot's latest replies opened.
+    #[error("chat completion final text repeats a recent reply opening")]
+    FinalAnswerRepeatsOpening,
+    /// Upstream final answer announced a generation that no tool call started.
+    #[error("chat completion final text announces a generation without a tool call")]
+    FinalAnswerUnexecutedAction,
     /// Reasoning model spent the whole token budget thinking and produced no
     /// final content (`finish_reason="length"` with only `reasoning_content`).
     #[error(
@@ -3067,6 +3075,11 @@ where
         }
         let model = completion_request.model.clone();
         let guard = reply_leak_guard(&completion_request.messages, &request.input);
+        let generation_offered = completion_request.tools.iter().any(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .is_some_and(|name| GENERATION_TOOL_NAMES.contains(&name))
+        });
         let traced = self
             .client
             .complete_traced(completion_request, on_status)
@@ -3112,6 +3125,12 @@ where
             } else {
                 text
             };
+            if let Some(error) =
+                reply_shape_error(&request.input, &history, &request.transcript, &text, false)
+            {
+                let error = model_output_rejected(self.provider(), &error);
+                return Err(aifarm_step_error_with_trace(error, trace));
+            }
             return Ok(ChatStepOutput {
                 provider: self.provider().to_owned(),
                 model,
@@ -3140,6 +3159,16 @@ where
                         Ok(text) => text,
                         Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
                     };
+                if let Some(error) = reply_shape_error(
+                    &request.input,
+                    &history,
+                    &request.transcript,
+                    &text,
+                    generation_offered,
+                ) {
+                    let error = model_output_rejected(self.provider(), &error);
+                    return Err(aifarm_step_error_with_trace(error, trace));
+                }
                 Ok(ChatStepOutput {
                     provider: self.provider().to_owned(),
                     model,
@@ -4472,7 +4501,15 @@ fn render_resample_note(
     }
     let data = json!({
         "verdict": verdict,
-        "specialClosing": matches!(verdict, "protocol_only" | "no_tool_calls" | "budget_exhausted" | "reasoning_only"),
+        "specialClosing": matches!(
+            verdict,
+            "protocol_only"
+                | "no_tool_calls"
+                | "budget_exhausted"
+                | "reasoning_only"
+                | "repeated_opening"
+                | "unexecuted_action"
+        ),
     });
     let rendered = match prompts {
         Some(prompts) => prompts.render("aifarm/resample_note", &data)?,
@@ -5559,6 +5596,60 @@ fn extract_final_answer_for_provider(
     }
 }
 
+const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song"];
+
+/// A final reply that opens like one of the bot's latest replies in `history`, or that
+/// announces a generation no call of this turn started, is re-sampled once per turn: a
+/// re-sample already carries a verdict and is delivered as it is.
+fn reply_shape_error(
+    input: &DialogInput,
+    history: &[HistoryMessage],
+    transcript: &[SessionMessage],
+    text: &str,
+    generation_offered: bool,
+) -> Option<AifarmDialogError> {
+    if !input.resample_verdict.trim().is_empty() {
+        return None;
+    }
+    let recent_replies = history
+        .iter()
+        .rev()
+        .filter(|turn| {
+            turn.role == ROLE_MODEL && (turn.kind.is_empty() || turn.kind == MESSAGE_KIND_TEXT)
+        })
+        .map(|turn| turn.text.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .take(reply_shape::RECENT_REPLY_WINDOW);
+    if reply_shape::repeats_recent_opening(text, recent_replies) {
+        return Some(AifarmDialogError::FinalAnswerRepeatsOpening);
+    }
+    if generation_offered
+        && !generation_started(transcript)
+        && reply_shape::announces_generation(text)
+    {
+        return Some(AifarmDialogError::FinalAnswerUnexecutedAction);
+    }
+    None
+}
+
+fn generation_started(transcript: &[SessionMessage]) -> bool {
+    transcript.iter().any(|message| match message {
+        SessionMessage::Assistant { tool_calls, .. } => tool_calls
+            .iter()
+            .any(|call| GENERATION_TOOL_NAMES.contains(&call.name.as_str())),
+        SessionMessage::ToolResult { name, .. } => GENERATION_TOOL_NAMES.contains(&name.as_str()),
+        SessionMessage::InjectedUser { .. } => false,
+    })
+}
+
+fn model_output_rejected(provider: &str, error: &AifarmDialogError) -> CompletionError {
+    Box::new(ProviderError::new(
+        provider,
+        FailureReason::ModelOutputRejected,
+        error.to_string(),
+    ))
+}
+
 fn extract_final_answer(
     response: &Value,
     guard: &ReplyLeakGuard,
@@ -5979,6 +6070,8 @@ fn is_retryable_final_answer_error(err: &AifarmDialogError) -> bool {
             | AifarmDialogError::FinalAnswerPromptLeak
             | AifarmDialogError::FinalAnswerProtocolOnly
             | AifarmDialogError::FinalAnswerPathological(_)
+            | AifarmDialogError::FinalAnswerRepeatsOpening
+            | AifarmDialogError::FinalAnswerUnexecutedAction
             | AifarmDialogError::ReasoningBudgetExhausted { .. }
             | AifarmDialogError::OutputBudgetExhausted { .. }
     )
@@ -10746,6 +10839,113 @@ mod tests {
             "native step carries the tools array"
         );
         Ok(())
+    }
+
+    fn bot_history_reply(message_id: i32, text: &str) -> HistoryMessage {
+        HistoryMessage {
+            role: ROLE_MODEL.to_owned(),
+            kind: MESSAGE_KIND_TEXT.to_owned(),
+            name: "Плотва".to_owned(),
+            text: text.to_owned(),
+            message_id,
+            ..HistoryMessage::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_step_resamples_once_a_reply_that_opens_like_a_recent_one() {
+        let reply = "Ха-ха, Моська, ну ты и философ!";
+        for (resample_verdict, rejected) in [("", true), ("repeated_opening", false)] {
+            let (provider, _, _) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": reply}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let mut input = base_input();
+            input.history.push(bot_history_reply(
+                10,
+                "Моська, ну ты и мастер подколоть! 😂",
+            ));
+            input.resample_verdict = resample_verdict.to_owned();
+            let result = crate::ChatStepProvider::run_chat_step(
+                &provider,
+                ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input,
+                    transcript: Vec::new(),
+                    tools: ToolsMode::Native(
+                        native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+                    ),
+                    iteration: 1,
+                },
+            )
+            .await;
+            match result {
+                Err(error) => {
+                    assert!(rejected, "re-sample {resample_verdict:?} must be delivered");
+                    assert_eq!(
+                        retryable_reason(error.as_ref()),
+                        Some(FailureReason::ModelOutputRejected)
+                    );
+                    assert_eq!(rejection_verdict_for(error.as_ref()), "repeated_opening");
+                }
+                Ok(output) => {
+                    assert!(!rejected, "first sample must be rejected");
+                    assert_eq!(output.text, reply);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_step_resamples_a_generation_announced_without_a_call() {
+        let reply = "Рисую твою радужную пещеру! 🎨";
+        let draw_call = vec![
+            SessionMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![openplotva_dialog::SessionToolCall {
+                    id: "call-1".to_owned(),
+                    name: "draw_image".to_owned(),
+                    arguments: json!({"caption": "Пещера", "prompt": "rainbow cave"}),
+                }],
+            },
+            SessionMessage::ToolResult {
+                tool_call_id: "call-1".to_owned(),
+                name: "draw_image".to_owned(),
+                content: json!({"status": "queued"}).to_string(),
+            },
+        ];
+        for (transcript, rejected) in [(Vec::new(), true), (draw_call, false)] {
+            let (provider, _, _) = direct_dialog_provider(
+                json!({"choices": [{"message": {"role": "assistant", "content": reply}}]}),
+                AifarmDialogConfig::default(),
+            );
+            let iteration = if transcript.is_empty() { 1 } else { 2 };
+            let result = crate::ChatStepProvider::run_chat_step(
+                &provider,
+                ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input: base_input(),
+                    transcript,
+                    tools: ToolsMode::Native(
+                        native_tool_values(&["draw_image"]).expect("draw tool"),
+                    ),
+                    iteration,
+                },
+            )
+            .await;
+            match result {
+                Err(error) => {
+                    assert!(rejected, "a started generation may be announced");
+                    assert_eq!(rejection_verdict_for(error.as_ref()), "unexecuted_action");
+                }
+                Ok(output) => {
+                    assert!(!rejected, "an unstarted generation must be re-sampled");
+                    assert_eq!(output.text, reply);
+                }
+            }
+        }
     }
 
     #[tokio::test]
