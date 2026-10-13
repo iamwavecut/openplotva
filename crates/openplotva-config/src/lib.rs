@@ -103,6 +103,8 @@ pub const DEFAULT_LLM_RAW_BODY_RETENTION_HOURS: i32 = 48;
 pub const DEFAULT_CHAT_HISTORY_RETENTION_DAYS: i32 = 8;
 
 pub const DEFAULT_TELEGRAM_FILES_RETENTION_DAYS: i32 = 7;
+/// Days of Telegram outbox history kept before its daily partitions are dropped.
+pub const DEFAULT_TELEGRAM_OUTBOX_RETENTION_DAYS: i32 = 7;
 
 pub const DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS: i32 = 30;
 
@@ -560,6 +562,8 @@ pub struct UpdateQueueConfig {
     pub projection_flush_max_mutations: usize,
     /// Dirty-row ceiling beyond which offline Stream entries remain unacked.
     pub projection_stage_hard_limit_rows: usize,
+    /// `TELEGRAM_OUTBOX_RETENTION_DAYS` (0 keeps outbox history forever).
+    pub outbox_retention_days: i32,
 }
 
 /// Postgres configuration.
@@ -1208,6 +1212,8 @@ pub struct RawConfig {
     pub update_projection_flush_max_mutations: Option<String>,
     /// `UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS`.
     pub update_projection_stage_hard_limit_rows: Option<String>,
+    /// `TELEGRAM_OUTBOX_RETENTION_DAYS`.
+    pub telegram_outbox_retention_days: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
     /// `BOT_API_BASE_URL`.
@@ -2361,6 +2367,14 @@ impl AppConfig {
                     1,
                     10_000_000,
                 )?,
+                outbox_retention_days: validate_non_negative_i32(
+                    "TELEGRAM_OUTBOX_RETENTION_DAYS",
+                    parse_i32(
+                        "TELEGRAM_OUTBOX_RETENTION_DAYS",
+                        raw.telegram_outbox_retention_days,
+                        DEFAULT_TELEGRAM_OUTBOX_RETENTION_DAYS,
+                    )?,
+                )?,
             },
             bot: BotConfig {
                 key: raw.bot_key.filter(|value| !value.is_empty()),
@@ -3175,6 +3189,7 @@ impl RawConfig {
             update_projection_flush_interval_ms: env("UPDATE_PROJECTION_FLUSH_INTERVAL_MS"),
             update_projection_flush_max_mutations: env("UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS"),
             update_projection_stage_hard_limit_rows: env("UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS"),
+            telegram_outbox_retention_days: env("TELEGRAM_OUTBOX_RETENTION_DAYS"),
             bot_key: env("BOT_KEY"),
             bot_api_base_url: env("BOT_API_BASE_URL"),
             bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),

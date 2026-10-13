@@ -11017,7 +11017,6 @@ async fn start_runtime_workers(
                 runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY,
                 llm_event_cleanup_interval,
                 llm_request_events_retention_days,
-                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE,
                 wait_for_runtime_stop(llm_event_cleanup_stop),
             )
             .await;
@@ -11027,7 +11026,7 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "llm_request_events_cleanup",
             format!(
-                "LLM analytics rollup and raw request events cleanup every {}s after a {}s start delay, retention {}d",
+                "LLM analytics rollup and raw request event partition drop every {}s after a {}s start delay, retention {}d",
                 llm_event_cleanup_interval.as_secs(),
                 runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY.as_secs(),
                 llm_request_events_retention_days
@@ -11132,6 +11131,33 @@ async fn start_runtime_workers(
         "telegram-update-retention",
         RuntimeWorkerPhase::Ancillary,
         telegram_update_retention_worker,
+    );
+    let partition_pool = service_clients.postgres.clone();
+    let partition_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
+    let outbox_retention_days = config.update_queue.outbox_retention_days;
+    let partition_worker = tokio::spawn(async move {
+        let report = runtime_retention::run_daily_partition_maintenance_worker_until(
+            partition_pool,
+            runtime_retention::PARTITION_MAINTENANCE_INTERVAL,
+            outbox_retention_days,
+            wait_for_runtime_stop(partition_stop),
+        )
+        .await;
+        tracing::info!(?report, "daily partition maintenance worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "daily_partition_maintenance",
+        format!(
+            "daily partitions kept {} days ahead every {}s; Telegram outbox retention {}d",
+            openplotva_storage::DAILY_PARTITIONS_AHEAD,
+            runtime_retention::PARTITION_MAINTENANCE_INTERVAL.as_secs(),
+            outbox_retention_days
+        ),
+    ));
+    worker_registry.register(
+        "daily-partition-maintenance",
+        RuntimeWorkerPhase::Ancillary,
+        partition_worker,
     );
     let telegram_files_retention_days = config.vision.telegram_files_retention_days;
     if telegram_files_retention_days > 0 {

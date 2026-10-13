@@ -8971,6 +8971,67 @@ pub async fn drop_expired_chat_history_partitions(
     }
 }
 
+/// Daily-partitioned tables whose partitions the runtime creates ahead of time.
+pub const DAILY_PARTITIONED_TABLES: [&str; 3] = [
+    "llm_request_events_raw",
+    "telegram_outbox",
+    "telegram_outbox_attempts",
+];
+/// Days of partitions kept ready after the current UTC day, so inserts keep
+/// working while partition maintenance cannot run.
+pub const DAILY_PARTITIONS_AHEAD: i32 = 7;
+/// Outbox rows that must outlive their partition's retention.
+pub const TELEGRAM_OUTBOX_IN_FLIGHT: &str = "state IN ('pending', 'leased', 'retry_wait')";
+/// Creating or dropping a partition locks its parent; behind a long reader it
+/// gives up instead of stalling every query on the table, and retries later.
+const SQL_DAILY_PARTITION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '3s'";
+const SQL_ENSURE_DAILY_PARTITIONS: &str = "SELECT ensure_daily_partition($1, day::date) \
+     FROM generate_series((now() AT TIME ZONE 'UTC')::date, \
+                          (now() AT TIME ZONE 'UTC')::date + $2, interval '1 day') AS day";
+const SQL_DROP_DAILY_PARTITIONS_BEFORE: &str =
+    "SELECT drop_daily_partitions_before($1, $2::date, $3)";
+
+/// Create the partitions of `parent` for the current UTC day and the next
+/// `days_ahead` days, when missing.
+pub async fn ensure_daily_partitions(
+    pool: &PgPool,
+    parent: &str,
+    days_ahead: i32,
+) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(SQL_DAILY_PARTITION_LOCK_TIMEOUT)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(SQL_ENSURE_DAILY_PARTITIONS)
+        .bind(parent)
+        .bind(days_ahead.max(0))
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
+}
+
+/// Drop the partitions of `parent` for days before `cutoff_day`, skipping any
+/// partition that still has rows matching `keep_when`. Returns dropped names.
+pub async fn drop_daily_partitions_before(
+    pool: &PgPool,
+    parent: &str,
+    cutoff_day: time::Date,
+    keep_when: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(SQL_DAILY_PARTITION_LOCK_TIMEOUT)
+        .execute(&mut *transaction)
+        .await?;
+    let dropped = sqlx::query_scalar::<_, Vec<String>>(SQL_DROP_DAILY_PARTITIONS_BEFORE)
+        .bind(parent)
+        .bind(cutoff_day)
+        .bind(keep_when)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(dropped)
+}
+
 /// Delete up to `batch_size` `telegram_files` rows whose `last_seen_at` is older
 /// than `retention_days`, returning the number removed. No-op when either
 /// argument is <= 0. A deleted row is transparently re-resolved via Telegram
@@ -12930,6 +12991,92 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_daily_partitions_are_kept_ahead_and_expired_days_keep_in_flight_outbox_rows()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        let today = time::OffsetDateTime::now_utc().date();
+        for table in super::DAILY_PARTITIONED_TABLES {
+            super::ensure_daily_partitions(&pool, table, super::DAILY_PARTITIONS_AHEAD).await?;
+        }
+        let ahead = today + time::Duration::days(i64::from(super::DAILY_PARTITIONS_AHEAD));
+        let ahead_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!(
+                "telegram_outbox_{}",
+                ahead.format(time::macros::format_description!("[year][month][day]"))?
+            ))
+            .fetch_one(&pool)
+            .await?;
+        assert!(ahead_exists, "partitions exist days ahead of today");
+
+        let delivered_day = today - time::Duration::days(40);
+        let in_flight_day = today - time::Duration::days(39);
+        for day in [delivered_day, in_flight_day] {
+            sqlx::query("SELECT ensure_daily_partition('telegram_outbox', $1::date)")
+                .bind(day)
+                .execute(&pool)
+                .await?;
+        }
+        for (day, state, batch) in [
+            (delivered_day, "delivered", "live-partition-delivered"),
+            (in_flight_day, "pending", "live-partition-pending"),
+        ] {
+            sqlx::query(
+                "INSERT INTO telegram_outbox (operation_id, batch_id, part_index, bot_id, ordering_key, \
+                 method_kind, payload_version, original_payload, payload, delivery_policy, state, created_at) \
+                 VALUES ($1, $1, 0, 1, 'live-partition', 'sendMessage', 1, '{}', '{}', 'create', $2, \
+                 ($3::date + time '12:00') AT TIME ZONE 'UTC')",
+            )
+            .bind(batch)
+            .bind(state)
+            .bind(day)
+            .execute(&pool)
+            .await?;
+        }
+
+        let dropped = super::drop_daily_partitions_before(
+            &pool,
+            "telegram_outbox",
+            today - time::Duration::days(30),
+            Some(super::TELEGRAM_OUTBOX_IN_FLIGHT),
+        )
+        .await?;
+
+        let format = time::macros::format_description!("[year][month][day]");
+        assert!(dropped.contains(&format!(
+            "telegram_outbox_{}",
+            delivered_day.format(format)?
+        )));
+        assert!(!dropped.contains(&format!(
+            "telegram_outbox_{}",
+            in_flight_day.format(format)?
+        )));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM telegram_outbox WHERE batch_id = 'live-partition-pending'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(pending, 1, "an in-flight row keeps its day");
+        sqlx::query("DELETE FROM telegram_outbox WHERE ordering_key = 'live-partition'")
+            .execute(&pool)
+            .await?;
+        super::drop_daily_partitions_before(
+            &pool,
+            "telegram_outbox",
+            today - time::Duration::days(30),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     #[test]
     fn redis_connection_info_matches_go_cache_defaults() -> Result<(), redis::RedisError> {
         let config = RedisConfig {
@@ -14531,6 +14678,10 @@ mod tests {
                     sender_id: created.user_id,
                     payload: payload.as_bytes(),
                 })
+                .await?;
+            sqlx::query("SELECT ensure_daily_partition('llm_request_events_raw', ($1 AT TIME ZONE 'UTC')::date)")
+                .bind(now)
+                .execute(&pool)
                 .await?;
             sqlx::query(
                 "INSERT INTO llm_request_events (created_at, source, flow, chat_id, user_id, prompt_chars, prompt_messages, docs_chars, duration_ms, error, is_rollup) VALUES ($1, 'dialog', 'runtime-virtual-dialog', $2, $3, 0, 0, 0, 0, '', FALSE)",
