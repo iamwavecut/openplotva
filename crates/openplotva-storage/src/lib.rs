@@ -945,9 +945,7 @@ pub const SQL_INSERT_MEMORY_SOURCES: &str = "WITH input AS (SELECT * FROM unnest
 
 pub const SQL_INSERT_MEMORY_EPISODE_SOURCES: &str = "WITH input AS (SELECT * FROM unnest($4::text[], $5::integer[], $6::timestamptz[]) AS source(entry_id, message_id, occurred_at)) INSERT INTO memory_sources (episode_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, input.occurred_at, 1.0 FROM input WHERE (input.entry_id <> '' OR input.message_id <> 0) AND NOT EXISTS (SELECT 1 FROM memory_sources WHERE episode_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
 
-pub const SQL_INSERT_MEMORY_EPISODE_LEXICAL: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
-
-pub const SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::vector) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, embedding = COALESCE(EXCLUDED.embedding, memory_episodes.embedding), updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
+pub const SQL_INSERT_MEMORY_EPISODE: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
 pub const SQL_UPSERT_MEMORY_LINKS: &str = "INSERT INTO memory_links (from_card_id, to_card_id, relation, confidence) SELECT unnest($1::bigint[]) AS from_card_id, unnest($2::bigint[]) AS to_card_id, unnest($3::text[]) AS relation, unnest($4::double precision[]) AS confidence ON CONFLICT (from_card_id, to_card_id, relation) DO UPDATE SET confidence = GREATEST(memory_links.confidence, EXCLUDED.confidence)";
 
@@ -5294,23 +5292,12 @@ impl PostgresMemoryStore {
         Ok((stats, ids))
     }
 
-    pub async fn insert_episode_lexical(
-        &self,
-        episode: openplotva_memory::Episode,
-        model: &str,
-        prompt_version: &str,
-    ) -> Result<(i64, bool), StorageError> {
-        self.insert_episode_with_embedding(episode, model, prompt_version, None, &[])
-            .await
-    }
-
-    /// Insert one memory episode with an optional pgvector embedding.
-    pub async fn insert_episode_with_embedding(
+    /// Insert or refresh one memory episode and record its source messages.
+    pub async fn insert_episode(
         &self,
         mut episode: openplotva_memory::Episode,
         model: &str,
         prompt_version: &str,
-        embedding: Option<&PgEmbeddingVector>,
         source_messages: &[openplotva_memory::Message],
     ) -> Result<(i64, bool), StorageError> {
         let summary_text = episode.summary_text.trim().to_owned();
@@ -5323,9 +5310,8 @@ impl PostgresMemoryStore {
                 episode.thread_id,
             );
         }
-        let embedding = pgvector_literal(embedding);
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING)
+        let row = sqlx::query(SQL_INSERT_MEMORY_EPISODE)
             .bind(&episode.visibility)
             .bind(episode.chat_id)
             .bind(episode.thread_id)
@@ -5340,7 +5326,6 @@ impl PostgresMemoryStore {
             .bind(memory_cursor_after_at(episode.cursor_after_at))
             .bind(episode.cursor_message_id)
             .bind(episode.cursor_entry_id.trim())
-            .bind(embedding)
             .fetch_one(&mut *tx)
             .await?;
         let episode_id: i64 = row.try_get("id")?;
@@ -11589,11 +11574,7 @@ mod tests {
             super::SQL_INSERT_MEMORY_EPISODE_SOURCES
                 .contains("INSERT INTO memory_sources (episode_id")
         );
-        assert!(super::SQL_INSERT_MEMORY_EPISODE_LEXICAL.contains("ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id)"));
-        assert!(
-            super::SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING
-                .contains("embedding = COALESCE(EXCLUDED.embedding, memory_episodes.embedding)")
-        );
+        assert!(super::SQL_INSERT_MEMORY_EPISODE.contains("ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id)"));
         assert!(
             super::SQL_UPSERT_MEMORY_LINKS
                 .contains("ON CONFLICT (from_card_id, to_card_id, relation)")
@@ -12225,7 +12206,7 @@ mod tests {
                 },
             ];
             let (episode_id, episode_inserted) = store
-                .insert_episode_with_embedding(
+                .insert_episode(
                     openplotva_memory::Episode {
                         chat_id,
                         range_start_at: observed - time::Duration::hours(1),
@@ -12239,7 +12220,6 @@ mod tests {
                     },
                     "model",
                     "prompt",
-                    None,
                     &episode_sources,
                 )
                 .await?;
