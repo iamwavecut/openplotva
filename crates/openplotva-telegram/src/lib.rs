@@ -11,6 +11,7 @@ mod rate_limit;
 mod rich_api;
 mod rich_html;
 mod stars;
+mod stray_markdown;
 mod transport;
 mod update_startup;
 
@@ -44,6 +45,7 @@ pub use html::{
     split_telegram_text_with_atomic_tail, strip_telegram_html,
 };
 pub use markdown::{MarkdownToTelegramHtmlError, telegram_html_from_markdown};
+pub use stray_markdown::telegram_html_from_stray_markdown;
 mod edit_text;
 #[cfg(test)]
 mod test_api;

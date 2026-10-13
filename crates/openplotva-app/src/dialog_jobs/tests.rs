@@ -2374,6 +2374,20 @@ fn prepare_dialog_chat_response_matches_go_dialog_send_sanitizer() {
 }
 
 #[test]
+fn prepare_dialog_chat_response_turns_stray_markdown_into_telegram_html() {
+    assert_eq!(
+        prepare_dialog_chat_response(
+            "Выбирай:\n1. **Кокетство** — *дразнить*\n2. Запусти `ls -la`"
+        ),
+        "Выбирай:\n1. <b>Кокетство</b> — <i>дразнить</i>\n2. Запусти <code>ls -la</code>"
+    );
+    assert_eq!(
+        prepare_dialog_chat_response("Ну бл**ь, 2*3*4 и <b>так</b>"),
+        "Ну бл**ь, 2*3*4 и <b>так</b>"
+    );
+}
+
+#[test]
 fn dialog_rich_router_keeps_classic_telegram_html_classic() {
     assert!(!dialog_response_requires_rich("<pre>code</pre>"));
     assert!(!dialog_response_requires_rich(
