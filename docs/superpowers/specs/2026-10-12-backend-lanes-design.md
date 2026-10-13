@@ -150,9 +150,11 @@ Memory runs already cover one chat hour each, but they were enqueued once a day 
 UTC day, which put a whole day of memory work into a morning burst. The scheduler now ticks at
 `HH:02` UTC and enqueues every chat hour that completed since the last tick. An hourly tick scans
 the last two completed hours. The startup tick and the `03:02` tick scan the whole retention
-window, for hours that a longer outage or the daily cap left without a run. The daily cap still
-counts runs created since midnight UTC, and the enqueue rollups still describe whole UTC days.
-`MEMORY_DAILY_SCHEDULE` and `MEMORY_DAILY_WINDOW_HOURS` are removed.
+window, for hours that a longer outage or a full queue left without a run. Only
+`MEMORY_MAX_QUEUED_RUNS` bounds the enqueue; the daily cap (`MEMORY_MAX_DAILY_ENQUEUED_RUNS`)
+was removed on 2026-10-13 after it stopped all memory work from about 04:00 UTC for the rest of
+the day. The enqueue rollups still describe whole UTC days. `MEMORY_DAILY_SCHEDULE` and
+`MEMORY_DAILY_WINDOW_HOURS` are removed.
 
 ## Migrations
 

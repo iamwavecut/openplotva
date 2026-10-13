@@ -553,13 +553,8 @@ fn memory_message_count_bucket(message_count: i32) -> &'static str {
 fn memory_enqueue_remaining_capacity(
     policy: openplotva_memory::MemoryRunEnqueuePolicy,
     active_queue_depth: i64,
-    enqueued_today: u64,
 ) -> Option<i32> {
-    let policy = policy.normalized();
-    let enqueued_today = i64::try_from(enqueued_today).unwrap_or(i64::MAX);
-    let queue_capacity = i64::from(policy.max_queued_runs) - active_queue_depth;
-    let daily_capacity = i64::from(policy.max_daily_enqueued_runs) - enqueued_today;
-    let remaining = queue_capacity.min(daily_capacity);
+    let remaining = i64::from(policy.normalized().max_queued_runs) - active_queue_depth;
     (remaining > 0).then(|| i32::try_from(remaining).unwrap_or(i32::MAX))
 }
 
@@ -1216,14 +1211,6 @@ pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 
 
 pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing') AND range_end_at >= CURRENT_TIMESTAMP - make_interval(secs => $2::double precision)";
 
-pub const SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE: &str = r#"SELECT count(*)::bigint
-FROM memory_runs
-WHERE prompt_version = $1
-  AND created_at >= $2
-  AND cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz
-  AND cursor_after_message_id = 0
-  AND cursor_after_entry_id = ''"#;
-
 pub const SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE: &str = r#"WITH dims AS (
     SELECT jsonb_build_object(
         'decision', 'backpressure',
@@ -1250,8 +1237,7 @@ SELECT
         'prompt_version', $1::text,
         'queue_depth', $4::bigint,
         'min_messages_per_run', $5::int,
-        'max_queued_runs', $6::int,
-        'max_daily_enqueued_runs', $7::int
+        'max_queued_runs', $6::int
     )
 FROM dims
 ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
@@ -1318,7 +1304,7 @@ classified AS (
             WHEN message_count < $5 THEN 'below_threshold'
             WHEN already_enqueued THEN 'already_enqueued'
             WHEN enqueue_rank <= $8 THEN 'enqueued'
-            ELSE 'daily_cap'
+            ELSE 'queue_cap'
         END AS decision,
         CASE WHEN canonical_thread_id = 0 THEN 'chat' ELSE 'thread' END AS scope,
         CASE
@@ -1350,8 +1336,7 @@ prepared AS (
             'queue_depth', $6::bigint,
             'min_messages_per_run', $5::int,
             'max_queued_runs', $7::int,
-            'max_daily_enqueued_runs', $9::int,
-            'effective_daily_limit', $8::int
+            'effective_limit', $8::int
         ) AS metrics
     FROM classified
     GROUP BY decision, scope, message_count_bucket
@@ -5820,7 +5805,7 @@ impl PostgresMemoryStore {
 
     /// Enqueue a run for every chat hour that completed before `now`, started
     /// within the last `lookback` (at most `retention`), and has enough
-    /// messages: newest first, within the queue and daily caps. The enqueue
+    /// messages: newest first, while the active queue has room. The enqueue
     /// rollups still describe whole UTC days of the scanned range.
     pub async fn ensure_hourly_runs(
         &self,
@@ -5844,10 +5829,7 @@ impl PostgresMemoryStore {
         let mut window_end = completed_hours_end;
         let mut total = 0;
         let active_queue_depth = self.active_memory_run_count().await?;
-        let base_runs_enqueued_today = self.base_memory_run_count_created_since(day_start).await?;
-        if memory_enqueue_remaining_capacity(policy, active_queue_depth, base_runs_enqueued_today)
-            .is_none()
-        {
+        if memory_enqueue_remaining_capacity(policy, active_queue_depth).is_none() {
             self.record_memory_enqueue_backpressure(
                 earliest_day_start,
                 completed_hours_end,
@@ -5868,7 +5850,6 @@ impl PostgresMemoryStore {
             let Some(limit) = memory_enqueue_remaining_capacity(
                 policy,
                 active_queue_depth.saturating_add(i64::try_from(total).unwrap_or(i64::MAX)),
-                base_runs_enqueued_today.saturating_add(total),
             ) else {
                 break;
             };
@@ -5898,18 +5879,6 @@ impl PostgresMemoryStore {
             .await?)
     }
 
-    async fn base_memory_run_count_created_since(
-        &self,
-        created_since: OffsetDateTime,
-    ) -> Result<u64, StorageError> {
-        let count: i64 = sqlx::query_scalar(SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE)
-            .bind(openplotva_memory::PROMPT_VERSION)
-            .bind(created_since)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(u64::try_from(count).unwrap_or(u64::MAX))
-    }
-
     async fn record_memory_enqueue_backpressure(
         &self,
         window_start: OffsetDateTime,
@@ -5924,7 +5893,6 @@ impl PostgresMemoryStore {
             .bind(active_queue_depth)
             .bind(policy.min_messages_per_run)
             .bind(policy.max_queued_runs)
-            .bind(policy.max_daily_enqueued_runs)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5937,7 +5905,7 @@ impl PostgresMemoryStore {
         earliest: OffsetDateTime,
         active_queue_depth: i64,
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
-        daily_limit: i32,
+        limit: i32,
     ) -> Result<(), StorageError> {
         sqlx::query(SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS)
             .bind(openplotva_memory::PROMPT_VERSION)
@@ -5947,8 +5915,7 @@ impl PostgresMemoryStore {
             .bind(policy.min_messages_per_run)
             .bind(active_queue_depth)
             .bind(policy.max_queued_runs)
-            .bind(daily_limit)
-            .bind(policy.max_daily_enqueued_runs)
+            .bind(limit)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5960,7 +5927,7 @@ impl PostgresMemoryStore {
         window_end: OffsetDateTime,
         earliest: OffsetDateTime,
         policy: openplotva_memory::MemoryRunEnqueuePolicy,
-        daily_limit: i32,
+        limit: i32,
     ) -> Result<u64, StorageError> {
         Ok(sqlx::query(SQL_ENSURE_HOURLY_MEMORY_RUNS)
             .bind(openplotva_memory::PROMPT_VERSION)
@@ -5968,7 +5935,7 @@ impl PostgresMemoryStore {
             .bind(window_end)
             .bind(earliest)
             .bind(policy.min_messages_per_run)
-            .bind(daily_limit)
+            .bind(limit)
             .execute(&self.pool)
             .await?
             .rows_affected())
@@ -11645,18 +11612,10 @@ mod tests {
                 .contains("WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0")
         );
         assert!(super::SQL_COUNT_ACTIVE_MEMORY_RUNS.contains("status IN ('queued', 'processing')"));
-        assert!(super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("created_at >= $2"));
-        assert!(
-            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE
-                .contains("cursor_after_at = '1970-01-01 00:00:00+00'::timestamptz")
-        );
-        assert!(
-            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("cursor_after_message_id = 0")
-        );
-        assert!(
-            super::SQL_COUNT_BASE_MEMORY_RUNS_CREATED_SINCE.contains("cursor_after_entry_id = ''")
-        );
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("message_count_bucket"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'queue_cap'"));
+        assert!(!super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("daily"));
+        assert!(!super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("daily"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'below_threshold'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'already_enqueued'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'backpressure'"));
@@ -11791,26 +11750,18 @@ mod tests {
         let policy = openplotva_memory::MemoryRunEnqueuePolicy {
             min_messages_per_run: 20,
             max_queued_runs: 5000,
-            max_daily_enqueued_runs: 2000,
         };
         assert_eq!(
-            super::memory_enqueue_remaining_capacity(policy, 4_900, 0),
+            super::memory_enqueue_remaining_capacity(policy, 4_900),
             Some(100)
         );
         assert_eq!(
-            super::memory_enqueue_remaining_capacity(policy, 4_900, 100),
-            Some(100)
+            super::memory_enqueue_remaining_capacity(policy, 0),
+            Some(5_000),
+            "only the active queue bounds the enqueue; there is no daily cap"
         );
         assert_eq!(
-            super::memory_enqueue_remaining_capacity(policy, 0, 1_999),
-            Some(1)
-        );
-        assert_eq!(
-            super::memory_enqueue_remaining_capacity(policy, 0, 2_000),
-            None
-        );
-        assert_eq!(
-            super::memory_enqueue_remaining_capacity(policy, 5_000, 0),
+            super::memory_enqueue_remaining_capacity(policy, 5_000),
             None
         );
     }
@@ -12076,7 +12027,6 @@ mod tests {
             let policy = openplotva_memory::MemoryRunEnqueuePolicy {
                 min_messages_per_run: 3,
                 max_queued_runs: 1_000_000,
-                max_daily_enqueued_runs: 1_000_000,
             };
             let retention = Duration::from_secs(7 * 24 * 60 * 60);
             let windows = || async {
