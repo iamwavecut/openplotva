@@ -25,30 +25,52 @@ const SQL_INSERT_BLOBS_SUFFIX: &str = " ON CONFLICT (sha256) DO UPDATE SET \
     WHERE telegram_outbox_blobs.bytes = EXCLUDED.bytes \
     RETURNING id, sha256";
 
-const SQL_INSERT_OPERATIONS_PREFIX: &str = "INSERT INTO telegram_outbox (\
+/// The outbox is partitioned by day, so operation ids cannot be a unique key:
+/// enqueue takes this per-batch advisory lock, reuses parts that already exist
+/// with identical immutable fields and inserts only the missing ones. Parts are
+/// inserted in part order because claiming orders a chat's sends by id.
+const SQL_LOCK_OUTBOX_BATCH: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('telegram_outbox:' || $1, 0))";
+const SQL_ENQUEUE_OPERATIONS_PREFIX: &str = "WITH input (\
     operation_id, batch_id, part_index, bot_id, chat_id, thread_id, ordering_key, \
     causation_update_id, dialog_job_id, trigger_message_id, method_kind, payload_version, \
-    original_payload, payload, blob_id, delivery_policy, protected, priority, available_at, expires_at)";
-const SQL_INSERT_OPERATIONS_SUFFIX: &str = " ON CONFLICT (operation_id) DO UPDATE SET \
-    operation_id = EXCLUDED.operation_id \
-    WHERE telegram_outbox.batch_id = EXCLUDED.batch_id \
-      AND telegram_outbox.part_index = EXCLUDED.part_index \
-      AND telegram_outbox.bot_id = EXCLUDED.bot_id \
-      AND telegram_outbox.chat_id IS NOT DISTINCT FROM EXCLUDED.chat_id \
-      AND telegram_outbox.thread_id IS NOT DISTINCT FROM EXCLUDED.thread_id \
-      AND telegram_outbox.ordering_key = EXCLUDED.ordering_key \
-      AND telegram_outbox.causation_update_id IS NOT DISTINCT FROM EXCLUDED.causation_update_id \
-      AND telegram_outbox.dialog_job_id IS NOT DISTINCT FROM EXCLUDED.dialog_job_id \
-      AND telegram_outbox.trigger_message_id IS NOT DISTINCT FROM EXCLUDED.trigger_message_id \
-      AND telegram_outbox.method_kind = EXCLUDED.method_kind \
-      AND telegram_outbox.payload_version = EXCLUDED.payload_version \
-      AND telegram_outbox.original_payload = EXCLUDED.original_payload \
-      AND telegram_outbox.blob_id IS NOT DISTINCT FROM EXCLUDED.blob_id \
-      AND telegram_outbox.delivery_policy = EXCLUDED.delivery_policy \
-      AND telegram_outbox.protected = EXCLUDED.protected \
-      AND telegram_outbox.priority = EXCLUDED.priority \
-      AND telegram_outbox.expires_at IS NOT DISTINCT FROM EXCLUDED.expires_at \
-    RETURNING id, operation_id, part_index, state, (xmax = 0) AS inserted";
+    original_payload, payload, blob_id, delivery_policy, protected, priority, available_at, expires_at) AS (";
+const SQL_ENQUEUE_OPERATIONS_SUFFIX: &str = "), existing AS ( \
+    SELECT outbox.id, outbox.operation_id, outbox.part_index, outbox.state, \
+      (outbox.batch_id = input.batch_id \
+      AND outbox.part_index = input.part_index \
+      AND outbox.bot_id = input.bot_id \
+      AND outbox.chat_id IS NOT DISTINCT FROM input.chat_id \
+      AND outbox.thread_id IS NOT DISTINCT FROM input.thread_id \
+      AND outbox.ordering_key = input.ordering_key \
+      AND outbox.causation_update_id IS NOT DISTINCT FROM input.causation_update_id \
+      AND outbox.dialog_job_id IS NOT DISTINCT FROM input.dialog_job_id \
+      AND outbox.trigger_message_id IS NOT DISTINCT FROM input.trigger_message_id \
+      AND outbox.method_kind = input.method_kind \
+      AND outbox.payload_version = input.payload_version \
+      AND outbox.original_payload = input.original_payload \
+      AND outbox.blob_id IS NOT DISTINCT FROM input.blob_id \
+      AND outbox.delivery_policy = input.delivery_policy \
+      AND outbox.protected = input.protected \
+      AND outbox.priority = input.priority \
+      AND outbox.expires_at IS NOT DISTINCT FROM input.expires_at) AS same \
+    FROM input JOIN telegram_outbox AS outbox ON outbox.operation_id = input.operation_id \
+), inserted AS ( \
+    INSERT INTO telegram_outbox (\
+      operation_id, batch_id, part_index, bot_id, chat_id, thread_id, ordering_key, \
+      causation_update_id, dialog_job_id, trigger_message_id, method_kind, payload_version, \
+      original_payload, payload, blob_id, delivery_policy, protected, priority, available_at, expires_at) \
+    SELECT operation_id, batch_id, part_index, bot_id, chat_id, thread_id, ordering_key, \
+      causation_update_id, dialog_job_id, trigger_message_id, method_kind, payload_version, \
+      original_payload, payload, blob_id, delivery_policy, protected, priority, available_at, expires_at \
+    FROM input \
+    WHERE NOT EXISTS (SELECT 1 FROM existing WHERE existing.operation_id = input.operation_id) \
+    ORDER BY input.part_index \
+    RETURNING id, operation_id, part_index, state \
+) \
+SELECT id, operation_id, part_index, state, FALSE AS inserted FROM existing WHERE same \
+UNION ALL \
+SELECT id, operation_id, part_index, state, TRUE AS inserted FROM inserted";
 
 const SQL_CLAIM_OPERATIONS: &str = r#"
 WITH candidates AS (
@@ -405,6 +427,10 @@ pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
     }
 
     let parts = prepare_parts(batch, &blob_ids)?;
+    sqlx::query(SQL_LOCK_OUTBOX_BATCH)
+        .bind(&batch.batch_id)
+        .execute(&mut **tx)
+        .await?;
     let mut builder = outbox_operation_insert_builder(batch, &parts);
     let rows = builder.build().fetch_all(&mut **tx).await?;
     if rows.len() != parts.len() {
@@ -508,8 +534,7 @@ fn outbox_operation_insert_builder(
     batch: &TelegramOutboxBatchInput,
     parts: &[PreparedOutboxPart],
 ) -> QueryBuilder<Postgres> {
-    let mut builder = QueryBuilder::new(SQL_INSERT_OPERATIONS_PREFIX);
-    builder.push(" ");
+    let mut builder = QueryBuilder::new(SQL_ENQUEUE_OPERATIONS_PREFIX);
     builder.push_values(parts.iter(), |mut row, prepared| {
         let part = &prepared.part;
         row.push_bind(prepared.operation_id.clone())
@@ -533,7 +558,7 @@ fn outbox_operation_insert_builder(
             .push_bind(part.available_at)
             .push_bind(part.expires_at);
     });
-    builder.push(SQL_INSERT_OPERATIONS_SUFFIX);
+    builder.push(SQL_ENQUEUE_OPERATIONS_SUFFIX);
     builder
 }
 
@@ -1644,7 +1669,9 @@ mod tests {
             3 * OUTBOX_OPERATION_BINDS_PER_ROW
         );
         assert!(operation_sql.contains("original_payload"));
-        assert!(operation_sql.contains("ON CONFLICT (operation_id)"));
+        assert!(operation_sql.contains(
+            "JOIN telegram_outbox AS outbox ON outbox.operation_id = input.operation_id"
+        ));
         Ok(())
     }
 
@@ -1732,6 +1759,82 @@ mod tests {
             .await?;
         sqlx::query("DELETE FROM telegram_outbox_blobs WHERE sha256 = $1")
             .bind(blob_hash)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_outbox_enqueue_of_a_batch_waits_for_an_uncommitted_enqueue_of_it()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let batch_id = format!("outbox-concurrent-test:{suffix}");
+        // Blob upserts would serialize the enqueues on their own; without blobs
+        // only the batch lock does.
+        let mut input = batch(&batch_id, 3);
+        for part in &mut input.parts {
+            part.blob = None;
+        }
+
+        let mut first = pool.begin().await?;
+        let queued_first = enqueue_telegram_outbox_batch_in_transaction(&mut first, &input).await?;
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            let input = input.clone();
+            async move {
+                let mut tx = pool.begin().await?;
+                let queued = enqueue_telegram_outbox_batch_in_transaction(&mut tx, &input).await?;
+                tx.commit().await?;
+                Ok::<_, StorageError>(queued)
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "a second enqueue of the batch must wait for the first to commit"
+        );
+        first.commit().await?;
+        let queued_second = second.await??;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&batch_id)
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(rows, 3);
+        assert!(queued_first.parts.iter().all(|part| part.inserted));
+        assert!(queued_second.parts.iter().all(|part| !part.inserted));
+        let first_ids = queued_first
+            .parts
+            .iter()
+            .map(|part| part.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_ids,
+            queued_second
+                .parts
+                .iter()
+                .map(|part| part.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "ids follow part order"
+        );
+
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+            .bind(&batch_id)
             .execute(&pool)
             .await?;
         Ok(())
@@ -1942,8 +2045,10 @@ mod tests {
             }
             .fetch_all(&mut *connection)
             .await?;
+            // Partitions name their copies of the parent index after themselves,
+            // so check that no partition falls back to a sequential scan.
             assert!(
-                plan.join("\n").contains(index),
+                !plan.join("\n").contains("Seq Scan"),
                 "{index} must support the recovery scan: {plan:?}"
             );
         }

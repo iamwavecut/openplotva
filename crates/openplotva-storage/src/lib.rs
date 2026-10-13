@@ -43,11 +43,13 @@ pub mod gradius_ads;
 pub mod llm_routing;
 pub mod maintenance;
 pub mod maintenance_notifications;
+mod memory_card_cache;
 mod task_queue_listing;
 pub mod telegram_delivery;
 pub mod telegram_outbox;
 pub mod telegram_projection;
 
+pub use memory_card_cache::{MEMORY_CARD_CACHE_TTL, MemoryCardCache, MemoryCardCacheStats};
 pub use task_queue_listing::{
     TASK_QUEUE_ACTIVE_STATUSES, TaskQueueJobFilter, TaskQueueJobPage, TaskQueueSortColumn,
     TaskQueueTimeColumn,
@@ -945,9 +947,7 @@ pub const SQL_INSERT_MEMORY_SOURCES: &str = "WITH input AS (SELECT * FROM unnest
 
 pub const SQL_INSERT_MEMORY_EPISODE_SOURCES: &str = "WITH input AS (SELECT * FROM unnest($4::text[], $5::integer[], $6::timestamptz[]) AS source(entry_id, message_id, occurred_at)) INSERT INTO memory_sources (episode_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, input.occurred_at, 1.0 FROM input WHERE (input.entry_id <> '' OR input.message_id <> 0) AND NOT EXISTS (SELECT 1 FROM memory_sources WHERE episode_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
 
-pub const SQL_INSERT_MEMORY_EPISODE_LEXICAL: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
-
-pub const SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::vector) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, embedding = COALESCE(EXCLUDED.embedding, memory_episodes.embedding), updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
+pub const SQL_INSERT_MEMORY_EPISODE: &str = "INSERT INTO memory_episodes (visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, model, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO UPDATE SET summary_text = EXCLUDED.summary_text, topics = EXCLUDED.topics, participants = EXCLUDED.participants, model = EXCLUDED.model, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
 pub const SQL_UPSERT_MEMORY_LINKS: &str = "INSERT INTO memory_links (from_card_id, to_card_id, relation, confidence) SELECT unnest($1::bigint[]) AS from_card_id, unnest($2::bigint[]) AS to_card_id, unnest($3::text[]) AS relation, unnest($4::double precision[]) AS confidence ON CONFLICT (from_card_id, to_card_id, relation) DO UPDATE SET confidence = GREATEST(memory_links.confidence, EXCLUDED.confidence)";
 
@@ -965,7 +965,7 @@ pub const SQL_UPDATE_MEMORY_CARD_TEXT: &str = "UPDATE memory_cards SET fact_text
 
 pub const SQL_REINFORCE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = LEAST(1.0, confidence + $2), salience = LEAST(1.0, salience + $3), observation_count = observation_count + 1, last_observed_at = GREATEST(last_observed_at, $4), expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
-pub const SQL_RECORD_MEMORY_CARD_USAGE: &str = "UPDATE memory_cards SET last_used_at = CASE WHEN last_used_at IS NULL THEN $2 ELSE GREATEST(last_used_at, $2) END, use_count = LEAST(use_count::bigint + 1, 2147483647)::integer, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1::bigint[]) AND status IN ('active', 'competing')";
+pub const SQL_RECORD_MEMORY_CARD_USAGE: &str = "UPDATE memory_cards AS card SET last_used_at = CASE WHEN card.last_used_at IS NULL THEN usage.used_at ELSE GREATEST(card.last_used_at, usage.used_at) END, use_count = LEAST(card.use_count::bigint + usage.uses, 2147483647)::integer, updated_at = CURRENT_TIMESTAMP FROM unnest($1::bigint[], $2::timestamptz[], $3::bigint[]) AS usage(id, used_at, uses) WHERE card.id = usage.id AND card.status IN ('active', 'competing')";
 
 pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = GREATEST(0.0, confidence - $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
 
@@ -5170,6 +5170,15 @@ impl PostgresHistoryStore {
 #[derive(Clone, Debug)]
 pub struct PostgresMemoryStore {
     pool: PgPool,
+    card_cache: Option<Arc<MemoryCardCache>>,
+}
+
+/// Uses of one card collected since the last flush.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryCardUsage {
+    pub card_id: i64,
+    pub last_used_at: OffsetDateTime,
+    pub uses: i64,
 }
 
 async fn merge_memory_card_into_on(
@@ -5204,7 +5213,32 @@ impl PostgresMemoryStore {
     /// Build a memory store over an existing pool.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            card_cache: None,
+        }
+    }
+
+    /// Share one visible-card cache; stores built from the same cache see each
+    /// other's invalidations.
+    #[must_use]
+    pub fn with_card_cache(mut self, cache: Arc<MemoryCardCache>) -> Self {
+        self.card_cache = Some(cache);
+        self
+    }
+
+    /// Drop cached lists for `chat_id` and for lists that include cards of
+    /// `user_ids`; call after writing cards of that scope.
+    pub fn invalidate_cached_cards(&self, chat_id: i64, user_ids: &[i64]) {
+        if let Some(cache) = &self.card_cache {
+            cache.invalidate_scope(chat_id, user_ids);
+        }
+    }
+
+    fn clear_card_cache(&self) {
+        if let Some(cache) = &self.card_cache {
+            cache.clear();
+        }
     }
 
     pub async fn get_dialog_memory_chat_meta(
@@ -5294,23 +5328,12 @@ impl PostgresMemoryStore {
         Ok((stats, ids))
     }
 
-    pub async fn insert_episode_lexical(
-        &self,
-        episode: openplotva_memory::Episode,
-        model: &str,
-        prompt_version: &str,
-    ) -> Result<(i64, bool), StorageError> {
-        self.insert_episode_with_embedding(episode, model, prompt_version, None, &[])
-            .await
-    }
-
-    /// Insert one memory episode with an optional pgvector embedding.
-    pub async fn insert_episode_with_embedding(
+    /// Insert or refresh one memory episode and record its source messages.
+    pub async fn insert_episode(
         &self,
         mut episode: openplotva_memory::Episode,
         model: &str,
         prompt_version: &str,
-        embedding: Option<&PgEmbeddingVector>,
         source_messages: &[openplotva_memory::Message],
     ) -> Result<(i64, bool), StorageError> {
         let summary_text = episode.summary_text.trim().to_owned();
@@ -5323,9 +5346,8 @@ impl PostgresMemoryStore {
                 episode.thread_id,
             );
         }
-        let embedding = pgvector_literal(embedding);
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING)
+        let row = sqlx::query(SQL_INSERT_MEMORY_EPISODE)
             .bind(&episode.visibility)
             .bind(episode.chat_id)
             .bind(episode.thread_id)
@@ -5340,7 +5362,6 @@ impl PostgresMemoryStore {
             .bind(memory_cursor_after_at(episode.cursor_after_at))
             .bind(episode.cursor_message_id)
             .bind(episode.cursor_entry_id.trim())
-            .bind(embedding)
             .fetch_one(&mut *tx)
             .await?;
         let episode_id: i64 = row.try_get("id")?;
@@ -5499,11 +5520,15 @@ impl PostgresMemoryStore {
     /// Archive one batch of active cards whose TTL has elapsed (soft, restorable:
     /// status='expired', retracted_at stamped). Returns the number archived.
     pub async fn archive_expired_cards(&self, batch: i64) -> Result<u64, StorageError> {
-        Ok(sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
+        let archived = sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
             .bind(batch.max(1))
             .execute(&self.pool)
             .await?
-            .rows_affected())
+            .rows_affected();
+        if archived > 0 {
+            self.clear_card_cache();
+        }
+        Ok(archived)
     }
 
     /// Give cold episodic cards a grace TTL so forgetting is bounded even when
@@ -5561,6 +5586,9 @@ impl PostgresMemoryStore {
                 .await?;
             tx.commit().await?;
             retired += dup_ids.len() as u64;
+        }
+        if retired > 0 {
+            self.clear_card_cache();
         }
         Ok(retired)
     }
@@ -6015,6 +6043,32 @@ impl PostgresMemoryStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    /// `list_visible_cards` through the RAM cache, when this store has one.
+    pub async fn list_visible_cards_cached(
+        &self,
+        scope: &openplotva_memory::RetrievalScope,
+        limit: i32,
+    ) -> Result<Vec<openplotva_memory::Card>, StorageError> {
+        let Some(cache) = &self.card_cache else {
+            return self.list_visible_cards(scope, limit).await;
+        };
+        let key = memory_card_cache::VisibleCardsKey {
+            chat_id: scope.chat_id,
+            thread_id: scope.thread_id,
+            user_id: scope.user_id,
+            own_dm: openplotva_memory::public_user_in_own_dm(scope),
+            limit: positive_or_default(limit, 100),
+        };
+        match cache.get(&key) {
+            Ok(cards) => Ok(cards),
+            Err(generation) => {
+                let cards = self.list_visible_cards(scope, key.limit).await?;
+                cache.put(key, &cards, generation);
+                Ok(cards)
+            }
+        }
+    }
+
     pub async fn soft_delete_visible_card(
         &self,
         id: i64,
@@ -6033,6 +6087,7 @@ impl PostgresMemoryStore {
             .bind(openplotva_memory::public_user_in_own_dm(scope))
             .execute(&self.pool)
             .await?;
+        self.invalidate_cached_cards(scope.chat_id, &[scope.user_id]);
         Ok(result.rows_affected() > 0)
     }
 
@@ -6250,6 +6305,7 @@ impl PostgresMemoryStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
@@ -6271,6 +6327,7 @@ impl PostgresMemoryStore {
             .bind(portable)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
@@ -6283,32 +6340,45 @@ impl PostgresMemoryStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.clear_card_cache();
         Ok(())
     }
 
-    /// Record cards that were actually included in a dialog context.
-    pub async fn record_card_retrieval(
-        &self,
-        card_ids: &[i64],
-        used_at: OffsetDateTime,
-    ) -> Result<(), StorageError> {
-        let mut card_ids = card_ids
+    /// Apply collected card uses in one statement. `updated_at` moves with
+    /// usage because deferred reconsolidation selects recently touched cards.
+    pub async fn record_card_usage(&self, usage: &[MemoryCardUsage]) -> Result<u64, StorageError> {
+        let mut usage = usage
             .iter()
+            .filter(|entry| entry.card_id != 0 && entry.uses > 0)
             .copied()
-            .filter(|id| *id != 0)
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect::<Vec<_>>();
-        card_ids.sort_unstable();
-        if card_ids.is_empty() {
-            return Ok(());
+        if usage.is_empty() {
+            return Ok(0);
         }
-        sqlx::query(SQL_RECORD_MEMORY_CARD_USAGE)
-            .bind(&card_ids)
-            .bind(used_at)
+        usage.sort_unstable_by_key(|entry| entry.card_id);
+        // One row per card: a repeated id would join several usage rows and
+        // apply only one of them.
+        usage.dedup_by(|next, kept| {
+            if kept.card_id != next.card_id {
+                return false;
+            }
+            kept.uses += next.uses;
+            kept.last_used_at = kept.last_used_at.max(next.last_used_at);
+            true
+        });
+        let ids = usage.iter().map(|entry| entry.card_id).collect::<Vec<_>>();
+        let used_at = usage
+            .iter()
+            .map(|entry| entry.last_used_at)
+            .collect::<Vec<_>>();
+        let uses = usage.iter().map(|entry| entry.uses).collect::<Vec<_>>();
+        Ok(sqlx::query(SQL_RECORD_MEMORY_CARD_USAGE)
+            .bind(&ids)
+            .bind(&used_at)
+            .bind(&uses)
             .execute(&self.pool)
-            .await?;
-        Ok(())
+            .await?
+            .rows_affected())
     }
 
     pub async fn retrieve_lexical(
@@ -8899,6 +8969,67 @@ pub async fn drop_expired_chat_history_partitions(
             Err(error)
         }
     }
+}
+
+/// Daily-partitioned tables whose partitions the runtime creates ahead of time.
+pub const DAILY_PARTITIONED_TABLES: [&str; 3] = [
+    "llm_request_events_raw",
+    "telegram_outbox",
+    "telegram_outbox_attempts",
+];
+/// Days of partitions kept ready after the current UTC day, so inserts keep
+/// working while partition maintenance cannot run.
+pub const DAILY_PARTITIONS_AHEAD: i32 = 7;
+/// Outbox rows that must outlive their partition's retention.
+pub const TELEGRAM_OUTBOX_IN_FLIGHT: &str = "state IN ('pending', 'leased', 'retry_wait')";
+/// Creating or dropping a partition locks its parent; behind a long reader it
+/// gives up instead of stalling every query on the table, and retries later.
+const SQL_DAILY_PARTITION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '3s'";
+const SQL_ENSURE_DAILY_PARTITIONS: &str = "SELECT ensure_daily_partition($1, day::date) \
+     FROM generate_series((now() AT TIME ZONE 'UTC')::date, \
+                          (now() AT TIME ZONE 'UTC')::date + $2, interval '1 day') AS day";
+const SQL_DROP_DAILY_PARTITIONS_BEFORE: &str =
+    "SELECT drop_daily_partitions_before($1, $2::date, $3)";
+
+/// Create the partitions of `parent` for the current UTC day and the next
+/// `days_ahead` days, when missing.
+pub async fn ensure_daily_partitions(
+    pool: &PgPool,
+    parent: &str,
+    days_ahead: i32,
+) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(SQL_DAILY_PARTITION_LOCK_TIMEOUT)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(SQL_ENSURE_DAILY_PARTITIONS)
+        .bind(parent)
+        .bind(days_ahead.max(0))
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
+}
+
+/// Drop the partitions of `parent` for days before `cutoff_day`, skipping any
+/// partition that still has rows matching `keep_when`. Returns dropped names.
+pub async fn drop_daily_partitions_before(
+    pool: &PgPool,
+    parent: &str,
+    cutoff_day: time::Date,
+    keep_when: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(SQL_DAILY_PARTITION_LOCK_TIMEOUT)
+        .execute(&mut *transaction)
+        .await?;
+    let dropped = sqlx::query_scalar::<_, Vec<String>>(SQL_DROP_DAILY_PARTITIONS_BEFORE)
+        .bind(parent)
+        .bind(cutoff_day)
+        .bind(keep_when)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(dropped)
 }
 
 /// Delete up to `batch_size` `telegram_files` rows whose `last_seen_at` is older
@@ -11589,11 +11720,7 @@ mod tests {
             super::SQL_INSERT_MEMORY_EPISODE_SOURCES
                 .contains("INSERT INTO memory_sources (episode_id")
         );
-        assert!(super::SQL_INSERT_MEMORY_EPISODE_LEXICAL.contains("ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id)"));
-        assert!(
-            super::SQL_INSERT_MEMORY_EPISODE_WITH_EMBEDDING
-                .contains("embedding = COALESCE(EXCLUDED.embedding, memory_episodes.embedding)")
-        );
+        assert!(super::SQL_INSERT_MEMORY_EPISODE.contains("ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id)"));
         assert!(
             super::SQL_UPSERT_MEMORY_LINKS
                 .contains("ON CONFLICT (from_card_id, to_card_id, relation)")
@@ -11749,7 +11876,9 @@ mod tests {
         );
         assert!(super::SQL_REINFORCE_MEMORY_CARD.contains("expires_at = NULL"));
         assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("last_used_at = CASE"));
-        assert!(super::SQL_RECORD_MEMORY_CARD_USAGE.contains("use_count::bigint + 1"));
+        assert!(
+            super::SQL_RECORD_MEMORY_CARD_USAGE.contains("card.use_count::bigint + usage.uses")
+        );
         assert!(super::SQL_COPY_MEMORY_CARD_SOURCES.contains("source.card_id = $2"));
         assert!(super::SQL_COPY_MEMORY_CARD_LINKS.contains("ON CONFLICT"));
         assert!(
@@ -12225,7 +12354,7 @@ mod tests {
                 },
             ];
             let (episode_id, episode_inserted) = store
-                .insert_episode_with_embedding(
+                .insert_episode(
                     openplotva_memory::Episode {
                         chat_id,
                         range_start_at: observed - time::Duration::hours(1),
@@ -12239,7 +12368,6 @@ mod tests {
                     },
                     "model",
                     "prompt",
-                    None,
                     &episode_sources,
                 )
                 .await?;
@@ -12272,20 +12400,39 @@ mod tests {
             assert_eq!(retrieved.episodes[0].id, episode_id);
             let retrieved_card_ids =
                 retrieved.cards.iter().map(|card| card.id).collect::<Vec<_>>();
-            store
-                .record_card_retrieval(
-                    &retrieved_card_ids,
-                    observed + time::Duration::hours(1),
-                )
-                .await?;
+            let mut usage = retrieved_card_ids
+                .iter()
+                .map(|card_id| super::MemoryCardUsage {
+                    card_id: *card_id,
+                    last_used_at: observed + time::Duration::hours(1),
+                    uses: 1,
+                })
+                .collect::<Vec<_>>();
+            usage.push(super::MemoryCardUsage {
+                card_id: retrieved_card_ids[0],
+                last_used_at: observed + time::Duration::minutes(30),
+                uses: 2,
+            });
+            store.record_card_usage(&usage).await?;
             let used_cards: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM memory_cards WHERE id = ANY($1::bigint[]) AND use_count = 1 AND last_used_at = $2",
             )
-            .bind(&retrieved_card_ids)
+            .bind(&retrieved_card_ids[1..])
             .bind(observed + time::Duration::hours(1))
             .fetch_one(&pool)
             .await?;
-            assert_eq!(used_cards, retrieved.cards.len() as i64);
+            assert_eq!(used_cards, retrieved.cards.len() as i64 - 1);
+            let repeated: (i32, time::OffsetDateTime) = sqlx::query_as(
+                "SELECT use_count, last_used_at FROM memory_cards WHERE id = $1",
+            )
+            .bind(retrieved_card_ids[0])
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                repeated,
+                (3, observed + time::Duration::hours(1)),
+                "a repeated card sums its uses and keeps its latest use"
+            );
 
             let listed = store
                 .list_cards(&openplotva_memory::CardFilter {
@@ -12841,6 +12988,92 @@ mod tests {
             .bind(&queue_name)
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_daily_partitions_are_kept_ahead_and_expired_days_keep_in_flight_outbox_rows()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        let today = time::OffsetDateTime::now_utc().date();
+        for table in super::DAILY_PARTITIONED_TABLES {
+            super::ensure_daily_partitions(&pool, table, super::DAILY_PARTITIONS_AHEAD).await?;
+        }
+        let ahead = today + time::Duration::days(i64::from(super::DAILY_PARTITIONS_AHEAD));
+        let ahead_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!(
+                "telegram_outbox_{}",
+                ahead.format(time::macros::format_description!("[year][month][day]"))?
+            ))
+            .fetch_one(&pool)
+            .await?;
+        assert!(ahead_exists, "partitions exist days ahead of today");
+
+        let delivered_day = today - time::Duration::days(40);
+        let in_flight_day = today - time::Duration::days(39);
+        for day in [delivered_day, in_flight_day] {
+            sqlx::query("SELECT ensure_daily_partition('telegram_outbox', $1::date)")
+                .bind(day)
+                .execute(&pool)
+                .await?;
+        }
+        for (day, state, batch) in [
+            (delivered_day, "delivered", "live-partition-delivered"),
+            (in_flight_day, "pending", "live-partition-pending"),
+        ] {
+            sqlx::query(
+                "INSERT INTO telegram_outbox (operation_id, batch_id, part_index, bot_id, ordering_key, \
+                 method_kind, payload_version, original_payload, payload, delivery_policy, state, created_at) \
+                 VALUES ($1, $1, 0, 1, 'live-partition', 'sendMessage', 1, '{}', '{}', 'create', $2, \
+                 ($3::date + time '12:00') AT TIME ZONE 'UTC')",
+            )
+            .bind(batch)
+            .bind(state)
+            .bind(day)
+            .execute(&pool)
+            .await?;
+        }
+
+        let dropped = super::drop_daily_partitions_before(
+            &pool,
+            "telegram_outbox",
+            today - time::Duration::days(30),
+            Some(super::TELEGRAM_OUTBOX_IN_FLIGHT),
+        )
+        .await?;
+
+        let format = time::macros::format_description!("[year][month][day]");
+        assert!(dropped.contains(&format!(
+            "telegram_outbox_{}",
+            delivered_day.format(format)?
+        )));
+        assert!(!dropped.contains(&format!(
+            "telegram_outbox_{}",
+            in_flight_day.format(format)?
+        )));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM telegram_outbox WHERE batch_id = 'live-partition-pending'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(pending, 1, "an in-flight row keeps its day");
+        sqlx::query("DELETE FROM telegram_outbox WHERE ordering_key = 'live-partition'")
+            .execute(&pool)
+            .await?;
+        super::drop_daily_partitions_before(
+            &pool,
+            "telegram_outbox",
+            today - time::Duration::days(30),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -14445,6 +14678,10 @@ mod tests {
                     sender_id: created.user_id,
                     payload: payload.as_bytes(),
                 })
+                .await?;
+            sqlx::query("SELECT ensure_daily_partition('llm_request_events_raw', ($1 AT TIME ZONE 'UTC')::date)")
+                .bind(now)
+                .execute(&pool)
                 .await?;
             sqlx::query(
                 "INSERT INTO llm_request_events (created_at, source, flow, chat_id, user_id, prompt_chars, prompt_messages, docs_chars, duration_ms, error, is_rollup) VALUES ($1, 'dialog', 'runtime-virtual-dialog', $2, $3, 0, 0, 0, 0, '', FALSE)",

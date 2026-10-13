@@ -33,6 +33,7 @@ mod lane_checks;
 mod maintenance_api;
 pub mod media;
 pub mod members;
+pub mod memory_card_usage;
 pub mod memory_runtime;
 pub mod message_gate;
 pub mod model_routing;
@@ -350,6 +351,7 @@ struct RuntimeWorkers {
     openrouter_free_gate: Option<Arc<openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     router_runtime: Option<Arc<model_routing::RouterRuntime>>,
     dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
+    memory_card_cache: Option<Arc<openplotva_storage::MemoryCardCache>>,
     readiness_probes: Vec<ReadinessProbe>,
 }
 
@@ -796,7 +798,10 @@ fn static_web_routes_from_config(
                 config.vip.chat_id,
             )));
         }
-        let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
+        let mut memory_store = PostgresMemoryStore::new(clients.postgres.clone());
+        if let Some(cache) = &runtime_workers.memory_card_cache {
+            memory_store = memory_store.with_card_cache(Arc::clone(cache));
+        }
         routes.memory_store = Some(memory_store.clone());
         if config.memory.enabled
             && let (
@@ -10535,6 +10540,7 @@ async fn start_runtime_workers(
         openrouter_free_gate: None,
         router_runtime: None,
         dialog_worker_gauge: None,
+        memory_card_cache: None,
         readiness_probes: Vec::new(),
     };
     let readiness_general_postgres = service_clients.postgres.clone();
@@ -11011,7 +11017,6 @@ async fn start_runtime_workers(
                 runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY,
                 llm_event_cleanup_interval,
                 llm_request_events_retention_days,
-                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE,
                 wait_for_runtime_stop(llm_event_cleanup_stop),
             )
             .await;
@@ -11021,7 +11026,7 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "llm_request_events_cleanup",
             format!(
-                "LLM analytics rollup and raw request events cleanup every {}s after a {}s start delay, retention {}d",
+                "LLM analytics rollup and raw request event partition drop every {}s after a {}s start delay, retention {}d",
                 llm_event_cleanup_interval.as_secs(),
                 runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY.as_secs(),
                 llm_request_events_retention_days
@@ -11126,6 +11131,33 @@ async fn start_runtime_workers(
         "telegram-update-retention",
         RuntimeWorkerPhase::Ancillary,
         telegram_update_retention_worker,
+    );
+    let partition_pool = service_clients.postgres.clone();
+    let partition_stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
+    let outbox_retention_days = config.update_queue.outbox_retention_days;
+    let partition_worker = tokio::spawn(async move {
+        let report = runtime_retention::run_daily_partition_maintenance_worker_until(
+            partition_pool,
+            runtime_retention::PARTITION_MAINTENANCE_INTERVAL,
+            outbox_retention_days,
+            wait_for_runtime_stop(partition_stop),
+        )
+        .await;
+        tracing::info!(?report, "daily partition maintenance worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "daily_partition_maintenance",
+        format!(
+            "daily partitions kept {} days ahead every {}s; Telegram outbox retention {}d",
+            openplotva_storage::DAILY_PARTITIONS_AHEAD,
+            runtime_retention::PARTITION_MAINTENANCE_INTERVAL.as_secs(),
+            outbox_retention_days
+        ),
+    ));
+    worker_registry.register(
+        "daily-partition-maintenance",
+        RuntimeWorkerPhase::Ancillary,
+        partition_worker,
     );
     let telegram_files_retention_days = config.vision.telegram_files_retention_days;
     if telegram_files_retention_days > 0 {
@@ -11237,7 +11269,52 @@ async fn start_runtime_workers(
         .with_run_buffer(llm_run_buffer.clone()),
     );
     openplotva_llm::trace::set_observer(llm_observer);
-    let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
+    let memory_card_cache = usize::try_from(config.memory.card_cache_entries)
+        .ok()
+        .filter(|entries| *entries > 0)
+        .map(|entries| {
+            Arc::new(openplotva_storage::MemoryCardCache::new(
+                entries,
+                openplotva_storage::MEMORY_CARD_CACHE_TTL,
+            ))
+        });
+    workers.memory_card_cache = memory_card_cache.clone();
+    let memory_store = match &memory_card_cache {
+        Some(cache) => PostgresMemoryStore::new(service_clients.postgres.clone())
+            .with_card_cache(Arc::clone(cache)),
+        None => PostgresMemoryStore::new(service_clients.postgres.clone()),
+    };
+    let memory_card_usage = memory_card_usage::MemoryCardUsageJournal::new();
+    {
+        let journal = memory_card_usage.clone();
+        let store = memory_store.clone();
+        let cache = memory_card_cache.clone();
+        let stop = worker_stops.subscribe(RuntimeWorkerPhase::Ancillary);
+        let worker = tokio::spawn(async move {
+            let report = memory_card_usage::run_memory_card_usage_flush_worker_until(
+                journal,
+                store,
+                cache,
+                memory_card_usage::MEMORY_CARD_USAGE_FLUSH_INTERVAL,
+                wait_for_runtime_stop(stop),
+            )
+            .await;
+            tracing::info!(?report, "memory card usage flush worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_card_usage_flush",
+            format!(
+                "memory card uses flushed every {}s; visible-card cache {} entries",
+                memory_card_usage::MEMORY_CARD_USAGE_FLUSH_INTERVAL.as_secs(),
+                config.memory.card_cache_entries
+            ),
+        ));
+        worker_registry.register(
+            "memory-card-usage-flush",
+            RuntimeWorkerPhase::Ancillary,
+            worker,
+        );
+    }
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
     let virtual_dialog_store =
         PostgresRuntimeVirtualDialogStore::new(service_clients.postgres.clone());
@@ -12944,7 +13021,8 @@ async fn start_runtime_workers(
                 ),
             );
             if dialog_memory_context_enabled(config) {
-                dialog_materializer = dialog_materializer.with_memory_store(memory_store.clone());
+                dialog_materializer = dialog_materializer
+                    .with_memory_store(memory_store.clone(), memory_card_usage.clone());
                 if let Some(embedder) = memory_query_embedder.clone() {
                     dialog_materializer = dialog_materializer
                         .with_memory_embedder(embedder, config.memory.embedding_dim);
@@ -14099,6 +14177,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         openrouter_free_gate: _,
         router_runtime: _,
         dialog_worker_gauge: _,
+        memory_card_cache: _,
         readiness_probes: _,
     } = workers;
     let started_at = Instant::now();

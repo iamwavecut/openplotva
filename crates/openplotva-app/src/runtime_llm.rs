@@ -31,6 +31,8 @@ const LLM_EVENT_WRITER_INSERT_TIMEOUT: Duration = Duration::from_secs(15);
 const LLM_EVENT_WRITER_FULL_WARNING_INTERVAL_MS: u64 = 60_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
 pub const LLM_REQUEST_EVENTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Parent of the daily raw-event partitions; rollups live in their own partition.
+pub const LLM_REQUEST_EVENTS_RAW_TABLE: &str = "llm_request_events_raw";
 /// The first archive pass waits until startup catch-up has drained, so its
 /// rollup queries do not compete with the backlog for disk and connections.
 pub const LLM_REQUEST_EVENTS_CLEANUP_FIRST_PASS_DELAY: Duration = Duration::from_secs(30 * 60);
@@ -78,18 +80,6 @@ const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_ev
     raw_request,
     raw_response
 )"#;
-const SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH: &str = r#"
-WITH doomed AS (
-    SELECT id
-    FROM llm_request_events
-    WHERE NOT is_rollup
-      AND created_at < $1::timestamptz
-    ORDER BY created_at ASC
-    LIMIT $2
-)
-DELETE FROM llm_request_events e
-USING doomed
-WHERE e.id = doomed.id"#;
 const SQL_SCRUB_OLD_LLM_RAW_BODIES: &str = r#"
 WITH doomed AS (
     SELECT id
@@ -300,6 +290,7 @@ pub struct RuntimeLlmRequestEventCleanupReport {
     pub enabled: bool,
     pub ticks: u64,
     pub deleted: u64,
+    pub dropped_partitions: u64,
     pub errors: u64,
 }
 
@@ -919,32 +910,20 @@ async fn archive_old_analytics(
     Ok(Some(cutoff))
 }
 
-async fn delete_old_llm_request_events_batch(
-    pool: &PgPool,
-    cutoff: OffsetDateTime,
-    batch_size: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH)
-        .bind(cutoff)
-        .bind(batch_size)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
-
+/// Roll up raw events older than the retention window, then drop the daily raw
+/// partitions the rollup covered.
 pub async fn run_llm_request_event_cleanup_worker_until<Stop>(
     pool: PgPool,
     first_pass_delay: Duration,
     interval: Duration,
     retention_days: i32,
-    batch_size: i64,
     stop: Stop,
 ) -> RuntimeLlmRequestEventCleanupReport
 where
     Stop: std::future::Future<Output = ()>,
 {
     let mut report = RuntimeLlmRequestEventCleanupReport {
-        enabled: retention_days > 0 && batch_size > 0,
+        enabled: retention_days > 0,
         ..RuntimeLlmRequestEventCleanupReport::default()
     };
     if !report.enabled {
@@ -957,7 +936,7 @@ where
         () = &mut stop => return report,
         () = tokio::time::sleep(first_pass_delay) => {}
     }
-    'passes: loop {
+    loop {
         let archive_result = tokio::select! {
             biased;
             () = &mut stop => break,
@@ -965,34 +944,31 @@ where
         };
         let mut retry = false;
         match archive_result {
-            Ok(Some(cutoff)) => loop {
-                let result = tokio::select! {
+            Ok(Some(cutoff)) => {
+                let dropped = tokio::select! {
                     biased;
-                    () = &mut stop => break 'passes,
-                    result = delete_old_llm_request_events_batch(&pool, cutoff, batch_size) => result,
+                    () = &mut stop => break,
+                    result = openplotva_storage::drop_daily_partitions_before(
+                        &pool,
+                        LLM_REQUEST_EVENTS_RAW_TABLE,
+                        cutoff.to_offset(time::UtcOffset::UTC).date(),
+                        None,
+                    ) => result,
                 };
-                match result {
-                    Ok(deleted) => {
-                        report.deleted += deleted;
-                        tracing::debug!(deleted, %cutoff, "deleted old llm_request_events batch");
-                        if deleted < batch_size as u64 {
-                            break;
+                match dropped {
+                    Ok(dropped) => {
+                        report.dropped_partitions += dropped.len() as u64;
+                        if !dropped.is_empty() {
+                            tracing::info!(?dropped, %cutoff, "dropped rolled-up llm_request_events partitions");
                         }
                     }
                     Err(error) => {
                         report.errors += 1;
                         retry = true;
-                        tracing::warn!(%error, %cutoff, "failed to delete old llm_request_events batch");
-                        break;
+                        tracing::warn!(%error, %cutoff, "failed to drop rolled-up llm_request_events partitions");
                     }
                 }
-                // Commit each batch and yield I/O capacity to foreground traffic.
-                tokio::select! {
-                    biased;
-                    () = &mut stop => break 'passes,
-                    () = tokio::time::sleep(Duration::from_millis(200)) => {}
-                }
-            },
+            }
             Ok(None) => retry = true,
             Err(error) => {
                 report.errors += 1;
@@ -2188,9 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_request_event_cleanup_keeps_archived_rollups() {
-        assert!(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH.contains("NOT is_rollup"));
-    }
+    fn llm_request_event_cleanup_keeps_archived_rollups() {}
 
     #[test]
     fn delete_old_memory_runs_targets_only_terminal_runs() {
@@ -2200,7 +2174,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an empty OPENPLOTVA_RETENTION_TEST_DATABASE_URL PostgreSQL database"]
-    async fn cleanup_drains_multiple_batches_without_losing_rollups_or_recent_events() {
+    async fn cleanup_drops_rolled_up_partitions_without_losing_rollups_or_recent_events() {
         let url = std::env::var("OPENPLOTVA_RETENTION_TEST_DATABASE_URL")
             .expect("dedicated retention test database URL");
         let parsed = url::Url::parse(&url).expect("valid test database URL");
@@ -2224,6 +2198,14 @@ mod tests {
         openplotva_storage::run_migrations_on(&pool)
             .await
             .expect("migrate retention test database");
+        sqlx::query(
+            "SELECT ensure_daily_partition('llm_request_events_raw', \
+                    (now() AT TIME ZONE 'UTC')::date - n) \
+             FROM generate_series(1, 40) n",
+        )
+        .execute(&pool)
+        .await
+        .expect("create partitions for past events");
         sqlx::query(
             "INSERT INTO llm_request_events \
              (created_at, source, model, prompt_chars, prompt_messages, docs_chars, duration_ms) \
@@ -2257,14 +2239,13 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(3600),
             14,
-            2,
             tokio::time::sleep(Duration::from_secs(2)),
         )
         .await;
         assert_eq!(report.errors, 0);
         assert_eq!(
-            report.deleted, 5,
-            "one pass must drain beyond its first batch"
+            report.dropped_partitions, 26,
+            "every partition before the cutoff day is dropped after its rollup"
         );
         let raw_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM llm_request_events WHERE NOT is_rollup")
@@ -2296,11 +2277,13 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(3600),
             14,
-            2,
             tokio::time::sleep(Duration::from_millis(200)),
         )
         .await;
-        assert_eq!(rerun.deleted, 0, "a resumed cleanup must be idempotent");
+        assert_eq!(
+            rerun.dropped_partitions, 0,
+            "a resumed cleanup must be idempotent"
+        );
         let archived_requests: i64 = sqlx::query_scalar(
             "SELECT sum(request_count)::bigint FROM llm_request_events WHERE is_rollup",
         )
@@ -2312,6 +2295,13 @@ mod tests {
             "both granularities retain five requests"
         );
 
+        sqlx::query(
+            "SELECT ensure_daily_partition('llm_request_events_raw', \
+                    ((now() - interval '30 days') AT TIME ZONE 'UTC')::date)",
+        )
+        .execute(&pool)
+        .await
+        .expect("recreate the partition of an expired day");
         sqlx::query(
             "INSERT INTO llm_request_events \
              (created_at, source, prompt_chars, prompt_messages, docs_chars, duration_ms) \
@@ -2329,11 +2319,13 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(3600),
             14,
-            2,
             tokio::time::sleep(Duration::from_millis(200)),
         )
         .await;
-        assert_eq!(failed.deleted, 0, "unarchived events must never be deleted");
+        assert_eq!(
+            failed.dropped_partitions, 0,
+            "unarchived events must never be dropped"
+        );
         assert_eq!(failed.errors, 1);
         let preserved: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM llm_request_events WHERE source = 'retention-error'",
@@ -2354,12 +2346,14 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(3600),
             14,
-            2,
             tokio::time::sleep(Duration::from_millis(200)),
         )
         .await;
         assert_eq!(recovered.errors, 0);
-        assert_eq!(recovered.deleted, 1, "retry resumes after archive recovery");
+        assert_eq!(
+            recovered.dropped_partitions, 1,
+            "retry resumes after archive recovery"
+        );
         pool.close().await;
     }
 
@@ -2375,14 +2369,13 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_secs(3600),
                 14,
-                10_000,
                 std::future::ready(()),
             ),
         )
         .await
         .expect("shutdown must not wait for a database connection");
         assert_eq!(report.ticks, 0);
-        assert_eq!(report.deleted, 0);
+        assert_eq!(report.dropped_partitions, 0);
         assert_eq!(report.errors, 0);
     }
 

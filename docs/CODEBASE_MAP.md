@@ -667,6 +667,7 @@ Postgres 17 + pgvector (`vector(512)` for memory/shield, `vector(1024)` legacy)
 - **Dialog history**: `chat_history_entries` (RANGE partitioned by day), `chat_history_resets`, `chat_history_summaries` + `_summary_sources` + `_events` (cascade).
 - **Safety**: `shield_documents` (seeded with 6 crisis docs), `whitecircle_checks` (LZ4 TOAST).
 - **Task queue (v2)**: `taskman_jobs` (JSONB record + typed columns), `taskman_job_history`. (Legacy `job_queue` dropped in mig 19/140.)
+- **Daily partitions** (mig 204–206): `llm_request_events` is LIST(`is_rollup`) with rollups in `llm_request_events_rollup` and raw events in daily `llm_request_events_raw_YYYYMMDD`; `telegram_outbox` and `telegram_outbox_attempts` are daily RANGE partitions. Retention drops whole days (`drop_daily_partitions_before`); an hourly worker keeps 7 days ahead. No unique keys on these parents: outbox enqueue serializes each batch with an advisory lock and reuses identical parts.
 - **LLM telemetry & routing**: `llm_request_events` (raw + rollup dual-purpose, `run_id`/`run_seq` correlation, short-lived raw bodies scrubbed), `telemetry_rollups`, `llm_providers`/`provider_models`/`llm_capacity_pools`/`workflows`/`workflow_assignments`/`workflow_triggers`/`llm_routing_events`.
 - **Dialog lifecycle**: `runtime_virtual_dialogs`, `dialog_turn_outcomes`, `dialog_delivery_obligations`.
 - **Files/media cache**: `telegram_files` (vision and ASR pipeline state, including ASR fallback diagnostics).

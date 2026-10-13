@@ -103,6 +103,8 @@ pub const DEFAULT_LLM_RAW_BODY_RETENTION_HOURS: i32 = 48;
 pub const DEFAULT_CHAT_HISTORY_RETENTION_DAYS: i32 = 8;
 
 pub const DEFAULT_TELEGRAM_FILES_RETENTION_DAYS: i32 = 7;
+/// Days of Telegram outbox history kept before its daily partitions are dropped.
+pub const DEFAULT_TELEGRAM_OUTBOX_RETENTION_DAYS: i32 = 7;
 
 pub const DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS: i32 = 30;
 
@@ -383,6 +385,9 @@ pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
 
 pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 
+/// Visible-card lists the memory pipeline keeps in RAM; `0` disables the cache.
+pub const DEFAULT_MEMORY_CARD_CACHE_ENTRIES: i32 = 4_096;
+
 pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
 /// Discovery service name the embedder registers under on the AI Farm.
@@ -557,6 +562,8 @@ pub struct UpdateQueueConfig {
     pub projection_flush_max_mutations: usize,
     /// Dirty-row ceiling beyond which offline Stream entries remain unacked.
     pub projection_stage_hard_limit_rows: usize,
+    /// `TELEGRAM_OUTBOX_RETENTION_DAYS` (0 keeps outbox history forever).
+    pub outbox_retention_days: i32,
 }
 
 /// Postgres configuration.
@@ -1045,6 +1052,7 @@ pub struct MemoryConfig {
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
     pub max_queued_runs: i32,
+    pub card_cache_entries: i32,
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
     pub tokenizer_file: String,
@@ -1204,6 +1212,8 @@ pub struct RawConfig {
     pub update_projection_flush_max_mutations: Option<String>,
     /// `UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS`.
     pub update_projection_stage_hard_limit_rows: Option<String>,
+    /// `TELEGRAM_OUTBOX_RETENTION_DAYS`.
+    pub telegram_outbox_retention_days: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
     /// `BOT_API_BASE_URL`.
@@ -1571,6 +1581,8 @@ pub struct RawConfig {
     pub memory_min_messages_per_run: Option<String>,
     /// `MEMORY_MAX_QUEUED_RUNS`.
     pub memory_max_queued_runs: Option<String>,
+    /// `MEMORY_CARD_CACHE_ENTRIES`.
+    pub memory_card_cache_entries: Option<String>,
     /// `MEMORY_MAX_INPUT_TOKENS`.
     pub memory_max_input_tokens: Option<String>,
     /// `MEMORY_TOKENIZER_MODEL`.
@@ -2355,6 +2367,14 @@ impl AppConfig {
                     1,
                     10_000_000,
                 )?,
+                outbox_retention_days: validate_non_negative_i32(
+                    "TELEGRAM_OUTBOX_RETENTION_DAYS",
+                    parse_i32(
+                        "TELEGRAM_OUTBOX_RETENTION_DAYS",
+                        raw.telegram_outbox_retention_days,
+                        DEFAULT_TELEGRAM_OUTBOX_RETENTION_DAYS,
+                    )?,
+                )?,
             },
             bot: BotConfig {
                 key: raw.bot_key.filter(|value| !value.is_empty()),
@@ -2895,6 +2915,14 @@ impl AppConfig {
                         DEFAULT_MEMORY_MAX_QUEUED_RUNS,
                     )?,
                 )?,
+                card_cache_entries: validate_non_negative_i32(
+                    "MEMORY_CARD_CACHE_ENTRIES",
+                    parse_i32(
+                        "MEMORY_CARD_CACHE_ENTRIES",
+                        raw.memory_card_cache_entries,
+                        DEFAULT_MEMORY_CARD_CACHE_ENTRIES,
+                    )?,
+                )?,
                 max_input_tokens: parse_i32(
                     "MEMORY_MAX_INPUT_TOKENS",
                     raw.memory_max_input_tokens,
@@ -3161,6 +3189,7 @@ impl RawConfig {
             update_projection_flush_interval_ms: env("UPDATE_PROJECTION_FLUSH_INTERVAL_MS"),
             update_projection_flush_max_mutations: env("UPDATE_PROJECTION_FLUSH_MAX_MUTATIONS"),
             update_projection_stage_hard_limit_rows: env("UPDATE_PROJECTION_STAGE_HARD_LIMIT_ROWS"),
+            telegram_outbox_retention_days: env("TELEGRAM_OUTBOX_RETENTION_DAYS"),
             bot_key: env("BOT_KEY"),
             bot_api_base_url: env("BOT_API_BASE_URL"),
             bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),
@@ -3379,6 +3408,7 @@ impl RawConfig {
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
             memory_max_queued_runs: env("MEMORY_MAX_QUEUED_RUNS"),
+            memory_card_cache_entries: env("MEMORY_CARD_CACHE_ENTRIES"),
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
@@ -4979,6 +5009,15 @@ mod tests {
         let config = AppConfig::from_raw(RawConfig::default())?;
         assert_eq!(config.memory.min_messages_per_run, 20);
         assert_eq!(config.memory.max_queued_runs, 5000);
+        assert_eq!(
+            config.memory.card_cache_entries,
+            super::DEFAULT_MEMORY_CARD_CACHE_ENTRIES
+        );
+        let disabled = AppConfig::from_raw(RawConfig {
+            memory_card_cache_entries: Some("0".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert_eq!(disabled.memory.card_cache_entries, 0);
 
         let error = AppConfig::from_raw(RawConfig {
             memory_min_messages_per_run: Some("0".to_owned()),
