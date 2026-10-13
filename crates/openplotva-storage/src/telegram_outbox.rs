@@ -1704,7 +1704,14 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let input = batch(&format!("outbox-pool-retry-test:{suffix}"), 1);
+        let batch_id = format!("outbox-pool-retry-test:{suffix}");
+        let input = batch(&batch_id, 1);
+        let blob_hash = input.parts[0]
+            .blob
+            .as_ref()
+            .expect("test blob")
+            .sha256
+            .clone();
         let store = PostgresTelegramOutboxStore::new(pool.clone());
 
         let held = pool.acquire().await?;
@@ -1717,6 +1724,16 @@ mod tests {
 
         assert_eq!(queued.parts.len(), 1);
         assert!(queued.parts.iter().all(|part| part.inserted));
+
+        // Other live tests claim any sendable row, so leave none behind.
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+            .bind(&batch_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_outbox_blobs WHERE sha256 = $1")
+            .bind(blob_hash)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
