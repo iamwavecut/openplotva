@@ -266,6 +266,27 @@ ensure_service() {
   compose up -d --no-deps --no-recreate "$service"
 }
 
+# Recreate Postgres only when its compose configuration changed (settings,
+# shm size); stop the app first so it does not run against a restarting DB.
+ensure_postgresql() {
+  local container="${project}-postgresql-1"
+  if ! container_running "$container"; then
+    ensure_service postgresql
+    return
+  fi
+  local desired running
+  desired="$(compose config --hash postgresql | awk '{print $2}')"
+  running="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$container")"
+  [[ -n "$desired" ]] || fail "could not compute the postgresql configuration hash"
+  if [[ "$desired" == "$running" ]]; then
+    log "postgresql already running with the current configuration"
+    return
+  fi
+  log "postgresql configuration changed; stopping the app and recreating postgresql"
+  compose stop openplotva
+  compose up -d --no-deps --force-recreate postgresql
+}
+
 container_config_image() {
   docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null || true
 }
@@ -407,7 +428,7 @@ start_dependencies() {
     import_postgres_volume
   fi
 
-  ensure_service postgresql
+  ensure_postgresql
   wait_for_service_health postgresql
 
   if [[ "$postgres_mode" == "dump" ]]; then
