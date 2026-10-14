@@ -1433,7 +1433,7 @@ pub fn detect_translation_source_language(text: &str) -> &'static str {
     "en"
 }
 
-fn translation_target_matches_detected_language(text: &str, target_lang: &str) -> bool {
+pub(crate) fn translation_target_matches_detected_language(text: &str, target_lang: &str) -> bool {
     let source_lang = detect_translation_source_language(text);
     !source_lang.is_empty() && source_lang.eq_ignore_ascii_case(target_lang)
 }

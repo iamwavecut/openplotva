@@ -384,6 +384,7 @@ pub async fn seed_routing_from_env(
         "agentic_song",
         "agentic_image",
         "media_prompt_optimizer",
+        crate::llm_translate::TRANSLATION_WORKFLOW,
     ] {
         seed_primary(pool, workflow, aifarm_model, None).await?;
     }

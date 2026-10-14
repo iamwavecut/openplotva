@@ -710,7 +710,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: "draw_api",
         summary: "Generate and send an image through the direct Draw API.",
-        when_to_use: "Use for an explicit % image shortcut; draw_image handles ordinary generation and edits.",
+        when_to_use: "Use only for the bot owner's explicit % image shortcut; draw_image handles every other generation and edit.",
         result: "Confirmed delivery completes the image request without another text reply. Continue on failure.",
         continuation: ToolContinuation::MayTerminateOnSuccess,
         args: &[
@@ -828,8 +828,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_CURRENCY_RATES,
         summary: "Fetch current fiat and crypto exchange rates.",
         when_to_use: "Use first when the latest user message asks for a current fiat or crypto rate. Add web_search only when the user also needs external context, causes, comparison, or verification that this specialized live tool does not provide.",
-        result: "Returns fresh rate data and may queue a rates side-effect message.",
-        continuation: ToolContinuation::RequiresFollowup,
+        result: "Sends the rates table to the chat as the reply; the turn needs no further text unless the user also asked something else.",
+        continuation: ToolContinuation::MayTerminateOnSuccess,
         args: CURRENCY_RATES_ARGS,
     },
     ToolSpec {

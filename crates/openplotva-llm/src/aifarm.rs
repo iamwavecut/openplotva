@@ -5608,11 +5608,10 @@ fn extract_final_answer_for_provider(
 
 const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song"];
 
-/// Review a final reply against the bot's latest replies in `history` and the current
-/// message: its reaction opener, read-back quotes and an unstarted generation promise are
-/// cut; an opening still copied from a recent reply, or a reply that is only a promise,
-/// is re-sampled once per turn. A custom persona may keep a fixed opening of its own, so
-/// it is never re-sampled for one.
+/// A final reply that opens like one of the bot's latest replies in `history`, or that
+/// announces a generation no call of this turn started, is re-sampled once per turn: a
+/// re-sample already carries a verdict and is delivered as it is. A custom persona may
+/// keep a fixed opening of its own, so it is never re-sampled.
 fn review_reply_shape(
     input: &DialogInput,
     history: &[HistoryMessage],
@@ -5633,13 +5632,11 @@ fn review_reply_shape(
         .collect();
     let context = reply_shape::ReplyContext {
         recent_replies: &recent_replies,
-        user_text: &input.message.text,
         generation_pending: generation_offered && !generation_started(transcript),
         resample_allowed: !custom_persona && input.resample_verdict.trim().is_empty(),
     };
     match reply_shape::review_reply(&text, &context) {
         reply_shape::ReplyShape::Keep => Ok(text),
-        reply_shape::ReplyShape::Trimmed(trimmed) => Ok(trimmed),
         reply_shape::ReplyShape::Resample(reply_shape::ShapeFault::RepeatedOpening) => {
             Err(AifarmDialogError::FinalAnswerRepeatsOpening)
         }
@@ -10915,10 +10912,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_step_cuts_a_reaction_opener_from_the_delivered_reply()
-    -> Result<(), CompletionError> {
+    async fn chat_step_delivers_the_reply_as_the_model_wrote_it() -> Result<(), CompletionError> {
+        let reply = "Моська, ну ты и философ! 😂 Песок там твёрдый, верблюдам нормально.";
         let (provider, _, _) = direct_dialog_provider(
-            json!({"choices": [{"message": {"role": "assistant", "content": "Моська, ну ты и философ! 😂 Песок там твёрдый, верблюдам нормально."}}]}),
+            json!({"choices": [{"message": {"role": "assistant", "content": reply}}]}),
             AifarmDialogConfig::default(),
         );
         let output = crate::ChatStepProvider::run_chat_step(
@@ -10935,48 +10932,37 @@ mod tests {
             },
         )
         .await?;
-        assert_eq!(output.text, "Песок там твёрдый, верблюдам нормально.");
+        assert_eq!(output.text, reply);
         Ok(())
     }
 
     #[tokio::test]
-    async fn chat_step_trims_but_never_resamples_a_custom_persona_reply()
-    -> Result<(), CompletionError> {
-        for (reply, delivered) in [
-            (
-                "Ха-ха, ну ты и гурман! 😂 Смотрю: это сильный вкус.",
-                "Смотрю: это сильный вкус.",
-            ),
-            (
-                "(я чувствую, как дождь стучит по крыше)",
-                "(я чувствую, как дождь стучит по крыше)",
-            ),
-        ] {
-            let (provider, _, _) = direct_dialog_provider(
-                json!({"choices": [{"message": {"role": "assistant", "content": reply}}]}),
-                AifarmDialogConfig::default(),
-            );
-            let mut input = base_input();
-            input.persona.custom_persona = "Ученица и помощник".to_owned();
-            input
-                .history
-                .push(bot_history_reply(10, "(я чувствую, как ветер шумит)"));
-            let output = crate::ChatStepProvider::run_chat_step(
-                &provider,
-                ChatStepRequest {
-                    required_tool: None,
-                    preferred_target: None,
-                    input,
-                    transcript: Vec::new(),
-                    tools: ToolsMode::Native(
-                        native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
-                    ),
-                    iteration: 1,
-                },
-            )
-            .await?;
-            assert_eq!(output.text, delivered);
-        }
+    async fn chat_step_never_resamples_a_custom_persona_reply() -> Result<(), CompletionError> {
+        let reply = "(я чувствую, как дождь стучит по крыше)";
+        let (provider, _, _) = direct_dialog_provider(
+            json!({"choices": [{"message": {"role": "assistant", "content": reply}}]}),
+            AifarmDialogConfig::default(),
+        );
+        let mut input = base_input();
+        input.persona.custom_persona = "Ученица и помощник".to_owned();
+        input
+            .history
+            .push(bot_history_reply(10, "(я чувствую, как ветер шумит)"));
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            ChatStepRequest {
+                required_tool: None,
+                preferred_target: None,
+                input,
+                transcript: Vec::new(),
+                tools: ToolsMode::Native(
+                    native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+        assert_eq!(output.text, reply);
         Ok(())
     }
 

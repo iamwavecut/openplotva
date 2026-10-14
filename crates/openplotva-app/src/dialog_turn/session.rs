@@ -1484,15 +1484,15 @@ where
             SessionBatchDisposition::ContinueForResults
             | SessionBatchDisposition::ContinueWithoutFinal => {}
             SessionBatchDisposition::CompleteWithSideEffect => {
-                let delivered_images = step.tool_calls.iter().zip(&batch_results)
-                    .filter(|(call, result)| direct_draw_delivered(&call.step.step, result))
+                let delivered_replies = step.tool_calls.iter().zip(&batch_results)
+                    .filter(|(call, result)| tool_delivered_its_own_reply(&call.step.step, result))
                     .count();
-                if delivered_images > 0 {
+                if delivered_replies > 0 {
                     report.sent_answer = true;
                     append_session_sent_marker(queue, ctx.item_id, disposition_now).await;
                     return std::ops::ControlFlow::Break(TurnResolution {
                         outcome: TurnOutcome::Sent {
-                            parts: sent.total_count + delivered_images,
+                            parts: sent.total_count + delivered_replies,
                             side_effect_tickets: ticket_ids(&side_effect_tickets),
                         },
                         disposition: JobDisposition::Complete,
@@ -1683,10 +1683,24 @@ fn queued_generation_side_effect(result: &ToolResult) -> Option<QueuedSideEffect
     })
 }
 
-fn direct_draw_delivered(name: &str, result: &ToolResult) -> bool {
-    name == "draw_api"
-        && result.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
-        && result.data.as_ref().and_then(|data| data.get("delivered")) == Some(&Value::Bool(true))
+/// A tool that already delivered its own message to the chat: a direct draw or the
+/// rates table. The turn needs no further text after it.
+fn tool_delivered_its_own_reply(name: &str, result: &ToolResult) -> bool {
+    match name {
+        "draw_api" => {
+            result.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
+                && result.data.as_ref().and_then(|data| data.get("delivered"))
+                    == Some(&Value::Bool(true))
+        }
+        openplotva_dialog::STEP_CURRENCY_RATES => {
+            result.status == openplotva_dialog::TOOL_RESULT_STATUS_EXECUTED
+                && result.side_effect.as_ref().is_some_and(|effect| {
+                    effect.kind == crate::rates::RATES_MESSAGE_KIND
+                        && effect.state.eq_ignore_ascii_case("executed")
+                })
+        }
+        _ => false,
+    }
 }
 
 fn session_batch_disposition(
@@ -1709,7 +1723,7 @@ fn session_batch_disposition(
                     return SessionBatchDisposition::ContinueForResults;
                 };
                 if queued_generation_side_effect(result).is_some()
-                    || direct_draw_delivered(&call.step.step, result)
+                    || tool_delivered_its_own_reply(&call.step.step, result)
                 {
                     completed_generation = true;
                 } else {
@@ -2856,6 +2870,32 @@ mod tests {
             session_batch_disposition(
                 &[call("draw_api"), call(STEP_WEB_SEARCH)],
                 &[delivered(), ok()],
+            ),
+            SessionBatchDisposition::ContinueForResults
+        );
+        let rates_table = |state: &str| ToolResult {
+            status: openplotva_dialog::TOOL_RESULT_STATUS_EXECUTED.to_owned(),
+            side_effect: Some(openplotva_dialog::ToolSideEffect {
+                kind: crate::rates::RATES_MESSAGE_KIND.to_owned(),
+                state: state.to_owned(),
+                ..openplotva_dialog::ToolSideEffect::default()
+            }),
+            ..ToolResult::default()
+        };
+        assert_eq!(
+            session_batch_disposition(
+                &[call(openplotva_dialog::STEP_CURRENCY_RATES)],
+                &[rates_table("executed")],
+            ),
+            SessionBatchDisposition::CompleteWithSideEffect
+        );
+        assert_eq!(
+            session_batch_disposition(
+                &[call(openplotva_dialog::STEP_CURRENCY_RATES)],
+                &[ToolResult::failed(
+                    "currency_rates_failed",
+                    "rates fetch failed"
+                )],
             ),
             SessionBatchDisposition::ContinueForResults
         );
