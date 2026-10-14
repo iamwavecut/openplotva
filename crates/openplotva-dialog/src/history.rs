@@ -264,6 +264,14 @@ pub struct DialogInput {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub textual_tool_calls: bool,
+    /// Sampling the routing config of the serving model sets for this turn; unset
+    /// fields keep the provider's configured value.
+    #[serde(
+        default,
+        rename = "Sampling",
+        skip_serializing_if = "DialogSampling::is_empty"
+    )]
+    pub sampling: DialogSampling,
     /// Verdict that rejected the previous sample of this turn, as a stable code
     /// (`context_leak`, `empty`, …); empty on the first attempt. The message builder
     /// turns it into a short note after the rendered last message, so a re-sample is
@@ -279,6 +287,48 @@ pub struct DialogInput {
     /// onto the in-memory run record for the admin "Context X-ray".
     #[serde(skip)]
     pub context_capture: Option<TurnContextArtifact>,
+}
+
+/// Per-turn sampling chosen by the routing config of the model that serves it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct DialogSampling {
+    #[serde(
+        default,
+        rename = "Temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub temperature: Option<f64>,
+    #[serde(default, rename = "TopP", skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, rename = "TopK", skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<f64>,
+    #[serde(default, rename = "MinP", skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(
+        default,
+        rename = "RepeatPenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repeat_penalty: Option<f64>,
+    #[serde(
+        default,
+        rename = "FrequencyPenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub frequency_penalty: Option<f64>,
+    #[serde(
+        default,
+        rename = "PresencePenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presence_penalty: Option<f64>,
+}
+
+impl DialogSampling {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// One memory card that surfaced during recall for a turn — the scored skeleton

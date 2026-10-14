@@ -374,6 +374,8 @@ impl ChatStepProvider for RouterChatProvider {
                         {
                             step_request.input.enable_thinking = Some(enable_thinking);
                         }
+                        step_request.input.sampling =
+                            dialog_sampling_from_overrides(&attempt.overrides);
                         step_request.input.bad_words = openplotva_llm::aifarm::resolve_bad_words(
                             attempt.overrides.extra.get("bad_words"),
                         );
@@ -572,6 +574,24 @@ fn local_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDia
     cfg.enable_thinking = spec.enable_thinking;
     cfg.include_reasoning = spec.include_reasoning.or(Some(false));
     cfg.with_defaults()
+}
+
+/// Sampling a route sets for its turns, from the merged model and assignment config.
+/// A value outside its valid range is ignored instead of failing the request.
+fn dialog_sampling_from_overrides(
+    overrides: &openplotva_llm::router::InferenceOverrides,
+) -> openplotva_dialog::DialogSampling {
+    let extra = |key: &str| overrides.extra.get(key).and_then(serde_json::Value::as_f64);
+    let within = |value: Option<f64>, valid: fn(f64) -> bool| value.filter(|v| valid(*v));
+    openplotva_dialog::DialogSampling {
+        temperature: within(overrides.temperature, |v| (0.0..=2.0).contains(&v)),
+        top_p: within(extra("top_p"), |v| v > 0.0 && v <= 1.0),
+        top_k: within(extra("top_k"), |v| v >= 0.0),
+        min_p: within(extra("min_p"), |v| (0.0..1.0).contains(&v)),
+        repeat_penalty: within(overrides.repeat_penalty, |v| v > 0.0),
+        frequency_penalty: within(overrides.frequency_penalty, |v| (-2.0..=2.0).contains(&v)),
+        presence_penalty: within(overrides.presence_penalty, |v| (-2.0..=2.0).contains(&v)),
+    }
 }
 
 fn aifarm_discovery_provider_name(service: &str, config: &AppConfig) -> String {
@@ -1251,6 +1271,65 @@ mod tests {
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn route_sampling_reaches_the_turn_and_ignores_invalid_values() {
+        let run = |config: serde_json::Value| async move {
+            let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+            let routed_provider = Arc::new(SequencedProvider::new(
+                "aifarm",
+                vec![Ok(DialogOutput {
+                    provider: "aifarm".to_owned(),
+                    answer: "ok".to_owned(),
+                    ..DialogOutput::default()
+                })],
+            ));
+            let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+            let mut clients = HashMap::new();
+            clients.insert("aifarm".to_owned(), routed_provider_dyn);
+            let mut snapshot = routed_dialog_snapshot();
+            snapshot.models[0].config = config;
+            let provider = router_provider_for_test(
+                snapshot,
+                default_provider,
+                clients,
+                crate::runtime_routing::RoutingEventReporter::new(
+                    crate::runtime_routing::RoutingEventBuffer::new(8),
+                    None,
+                    None,
+                ),
+            );
+            provider
+                .as_chat_step()
+                .expect("step seam")
+                .run_chat_step(default_step_request())
+                .await
+                .expect("dialog output");
+            routed_provider.inputs()[0].sampling.clone()
+        };
+
+        let card = run(json!({
+            "temperature": 0.6, "top_p": 0.9, "top_k": 64, "min_p": 0.05, "repeat_penalty": 1.1
+        }))
+        .await;
+        assert_eq!(
+            card,
+            openplotva_dialog::DialogSampling {
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                top_k: Some(64.0),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.1),
+                ..openplotva_dialog::DialogSampling::default()
+            }
+        );
+        assert!(run(json!({})).await.is_empty());
+        let invalid = run(json!({
+            "temperature": 9.0, "top_p": 0.0, "top_k": -1, "min_p": 1.0, "repeat_penalty": 0.0
+        }))
+        .await;
+        assert!(invalid.is_empty(), "{invalid:?}");
     }
 
     #[tokio::test]

@@ -20,11 +20,11 @@ pub use leak_guard::{DialogLeak, ReplyLeakGuard, ReplyLeakGuardBuilder};
 
 pub use history::{
     CapturedMemory, DEFAULT_CONTEXT_HISTORY_LIMIT, DailyPersona, DialogContext, DialogInput,
-    DialogMessage, DialogOutput, DialogTraceArtifacts, DialogTraceUsage, DialogUser,
-    HistoryMessage, MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE,
-    MessageKind, MultimodalImage, Persona, PersonaSnapshot, ROLE_MODEL, ROLE_TOOL, ROLE_USER,
-    SettingKv, TurnContextArtifact, clone_history_messages, conversation_projection,
-    history_message_has_context_content, history_meta_has_context_content,
+    DialogMessage, DialogOutput, DialogSampling, DialogTraceArtifacts, DialogTraceUsage,
+    DialogUser, HistoryMessage, MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST,
+    MESSAGE_KIND_TOOL_RESPONSE, MessageKind, MultimodalImage, Persona, PersonaSnapshot, ROLE_MODEL,
+    ROLE_TOOL, ROLE_USER, SettingKv, TurnContextArtifact, clone_history_messages,
+    conversation_projection, history_message_has_context_content, history_meta_has_context_content,
     normalize_history_message, normalize_history_message_kind, select_history_messages_for_context,
     select_llm_history_messages_for_context, unique_history_text,
 };

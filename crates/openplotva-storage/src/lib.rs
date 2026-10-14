@@ -10257,6 +10257,44 @@ mod tests {
     }
 
     #[test]
+    fn gemma_card_sampling_is_scoped_to_the_dialog_assignment_and_reversible() {
+        const UP: &str = include_str!("../../../migrations/208_gemma_card_dialog_sampling.up.sql");
+        const DOWN: &str =
+            include_str!("../../../migrations/208_gemma_card_dialog_sampling.down.sql");
+
+        for value in [
+            "UPDATE workflow_assignments AS assignment",
+            "assignment.workflow_key = 'dialog'",
+            "provider.name = 'aifarm-vllm-gpu0'",
+            "model.model_name = 'Gemma 4 26B Heretic'",
+            r#"'{"temperature": 0.6, "top_p": 0.9, "top_k": 64, "min_p": 0.05, "repeat_penalty": 1.1}'::jsonb"#,
+            "NOT assignment.inference_overrides ? 'gemma_card_sampling_v1_previous'",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing Gemma sampling contract {value}"
+            );
+        }
+        assert!(!UP.contains("provider_models SET"));
+        assert!(!UP.contains("INSERT INTO"));
+        assert!(!UP.contains("DELETE FROM"));
+        for key in [
+            "'temperature'",
+            "'top_p'",
+            "'top_k'",
+            "'min_p'",
+            "'repeat_penalty'",
+        ] {
+            assert!(DOWN.contains(key), "down migration must restore {key}");
+        }
+        assert!(
+            DOWN.contains(
+                "WHERE assignment.inference_overrides ? 'gemma_card_sampling_v1_previous'"
+            )
+        );
+    }
+
+    #[test]
     fn translation_workflow_routes_like_dialog_and_is_reversible() {
         const UP: &str = include_str!("../../../migrations/207_translation_workflow.up.sql");
         const DOWN: &str = include_str!("../../../migrations/207_translation_workflow.down.sql");

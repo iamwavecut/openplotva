@@ -20,11 +20,11 @@ use url::Url;
 use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
-    DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
-    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, NativeToolFunction,
-    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard,
-    STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolStep,
-    ToolsMode, clone_history_messages, decode_plotva_final_response_with_salvage,
+    DialogSampling, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage,
+    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
+    NativeToolFunction, PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER,
+    ReplyLeakGuard, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision,
+    ToolStep, ToolsMode, clone_history_messages, decode_plotva_final_response_with_salvage,
     is_dialog_history_noise_tool_call_name, normalize_history_message, parse_assistant_content,
     parse_native_tool_step, reply_shape, sanitize_tool_text,
     select_llm_history_messages_for_context, tool_telemetry,
@@ -206,6 +206,9 @@ pub struct ChatCompletionRequest {
         serialize_with = "serialize_top_k"
     )]
     pub top_k: Option<f64>,
+    /// Minimum token probability relative to the most likely token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
     /// llama.cpp repeat penalty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
@@ -306,6 +309,7 @@ impl Serialize for RedactedChatCompletionRequest<'_> {
         if let Some(top_k) = request.top_k {
             state.serialize_field("top_k", &top_k_wire_value(top_k))?;
         }
+        serialize_optional_field(&mut state, "min_p", request.min_p)?;
         serialize_optional_field(&mut state, "repeat_penalty", request.repeat_penalty)?;
         serialize_optional_field(&mut state, "repetition_penalty", request.repetition_penalty)?;
         serialize_optional_field(&mut state, "frequency_penalty", request.frequency_penalty)?;
@@ -3300,6 +3304,7 @@ where
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
+        apply_dialog_sampling(&mut request, &input.sampling);
         if let ToolsMode::Native(tool_values) = tools
             && !tool_values.is_empty()
         {
@@ -3853,6 +3858,7 @@ fn aifarm_trace_inference_params(request: &ChatCompletionRequest) -> Option<Valu
     insert_opt_f64(&mut map, "temperature", request.temperature);
     insert_opt_f64(&mut map, "top_p", request.top_p);
     insert_opt_f64(&mut map, "top_k", request.top_k);
+    insert_opt_f64(&mut map, "min_p", request.min_p);
     insert_opt_f64(&mut map, "repeat_penalty", request.repeat_penalty);
     insert_opt_f64(&mut map, "repetition_penalty", request.repetition_penalty);
     insert_opt_f64(&mut map, "frequency_penalty", request.frequency_penalty);
@@ -4650,6 +4656,7 @@ pub fn direct_compatible_request(
     out.temperature = Some(DEFAULT_VRAM_CLOUD_TEMPERATURE);
     out.top_p = Some(DEFAULT_VRAM_CLOUD_TOP_P);
     out.top_k = Some(DEFAULT_VRAM_CLOUD_TOP_K);
+    out.min_p = None;
     out.repeat_penalty = None;
     out.repetition_penalty = Some(DEFAULT_VRAM_CLOUD_REPETITION_PENALTY);
     out.dry_multiplier = None;
@@ -5635,6 +5642,18 @@ fn extract_final_answer_for_provider(
 }
 
 const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song"];
+
+/// The turn's own sampling, set by the routing config of the serving model, replaces the
+/// provider's configured value field by field.
+fn apply_dialog_sampling(request: &mut ChatCompletionRequest, sampling: &DialogSampling) {
+    request.temperature = sampling.temperature.or(request.temperature);
+    request.top_p = sampling.top_p.or(request.top_p);
+    request.top_k = sampling.top_k.or(request.top_k);
+    request.min_p = sampling.min_p.or(request.min_p);
+    request.repeat_penalty = sampling.repeat_penalty.or(request.repeat_penalty);
+    request.frequency_penalty = sampling.frequency_penalty.or(request.frequency_penalty);
+    request.presence_penalty = sampling.presence_penalty.or(request.presence_penalty);
+}
 
 /// A final reply that opens like one of the bot's latest replies in `history`, or that
 /// announces a generation no call of this turn started, is re-sampled once per turn: a
@@ -11837,6 +11856,72 @@ mod tests {
             .as_array()
             .expect("bad_words reach the engine");
         assert!(words.iter().any(|word| word == "<message"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_request_takes_the_turn_sampling_field_by_field() -> Result<(), CompletionError>
+    {
+        let cfg = AifarmDialogConfig {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            frequency_penalty: Some(0.3),
+            presence_penalty: Some(0.2),
+            ..AifarmDialogConfig::default()
+        };
+        let mut bodies = Vec::new();
+        for sampling in [
+            DialogSampling::default(),
+            DialogSampling {
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                top_k: Some(64.0),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.1),
+                ..DialogSampling::default()
+            },
+        ] {
+            let (provider, transport, _) = direct_dialog_provider(
+                json!({ "choices": [{ "message": { "role": "assistant", "content": "ага" } }] }),
+                cfg.clone(),
+            );
+            let mut input = base_input();
+            input.sampling = sampling;
+            crate::ChatStepProvider::run_chat_step(
+                &provider,
+                openplotva_dialog::ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input,
+                    transcript: Vec::new(),
+                    tools: openplotva_dialog::ToolsMode::Disabled,
+                    iteration: 1,
+                },
+            )
+            .await
+            .expect("dialog step");
+            let sent = transport.requests();
+            bodies.push(serde_json::from_slice::<Value>(&sent[0].body).expect("wire request"));
+        }
+
+        let [configured, routed] = &bodies[..] else {
+            unreachable!("two requests were sent");
+        };
+        assert_eq!(configured["temperature"], json!(0.2));
+        assert_eq!(configured["top_p"], json!(0.95));
+        assert!(configured.get("min_p").is_none());
+        assert!(configured.get("top_k").is_none());
+        assert_eq!(routed["temperature"], json!(0.6));
+        assert_eq!(routed["top_p"], json!(0.9));
+        assert_eq!(routed["top_k"], json!(64));
+        assert_eq!(routed["min_p"], json!(0.05));
+        assert_eq!(routed["repeat_penalty"], json!(1.1));
+        assert_eq!(
+            routed["frequency_penalty"],
+            json!(0.3),
+            "unset fields keep the configured value"
+        );
+        assert_eq!(routed["presence_penalty"], json!(0.2));
         Ok(())
     }
 
