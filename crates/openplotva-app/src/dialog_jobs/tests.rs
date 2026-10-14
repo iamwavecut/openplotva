@@ -4472,30 +4472,27 @@ async fn session_sends_second_uncited_web_citation_repair_when_exhausted()
 }
 
 #[tokio::test]
-async fn captured_session_reaction_discards_draft_and_returns_final_once()
+async fn captured_session_delivers_the_reply_beside_a_lone_reaction_once()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-    let provider = StepProviderStub::with_steps(vec![
-        Ok(step_tools(
-            "Смешно вышло.",
-            vec![(
-                "reaction-call",
-                openplotva_dialog::ToolStep {
-                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
-                    emoji: "🤣".to_owned(),
-                    target_message_id: 100,
-                    ..openplotva_dialog::ToolStep::default()
-                },
-            )],
-        )),
-        Ok(step_text("Смешно вышло.")),
-    ]);
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "Смешно вышло.",
+        vec![(
+            "reaction-call",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                emoji: "🤣".to_owned(),
+                target_message_id: 100,
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
     let toolbox = SessionToolboxStub::default();
     let input = dialog_input_from_job_params_at(&dialog_params("рассмеши"), now);
 
     let output = crate::dialog_turn::run_captured_session(&provider, &toolbox, input, 8).await?;
 
-    assert_eq!(provider.calls(), 2);
+    assert_eq!(provider.calls(), 1);
     assert_eq!(output.messages, vec!["Смешно вышло."]);
     assert_eq!(output.tool_calls.len(), 1);
     Ok(())
@@ -6149,8 +6146,7 @@ async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Bo
 }
 
 #[tokio::test]
-async fn session_reaction_discards_draft_and_delivers_followup_final() -> Result<(), Box<dyn Error>>
-{
+async fn session_delivers_the_reply_beside_a_lone_reaction() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
@@ -6158,21 +6154,18 @@ async fn session_reaction_discards_draft_and_delivers_followup_final() -> Result
         new_dialog_job_at(dialog_params("покажи юмор"), now),
     );
     let reply = "Ну и юмор, будто из трясины выудили. Почти как наши шутки в чате.";
-    let provider = StepProviderStub::with_steps(vec![
-        Ok(step_tools(
-            reply,
-            vec![(
-                "reaction-call",
-                openplotva_dialog::ToolStep {
-                    step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
-                    emoji: "🤣".to_owned(),
-                    target_message_id: 100,
-                    ..openplotva_dialog::ToolStep::default()
-                },
-            )],
-        )),
-        Ok(step_text(reply)),
-    ]);
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        reply,
+        vec![(
+            "reaction-call",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_REACT_TO_MESSAGE.to_owned(),
+                emoji: "🤣".to_owned(),
+                target_message_id: 100,
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
     let reactor = Arc::new(ReactorStub::default());
     let wiring = session_wiring(
         Arc::new(SessionToolboxStub::default()),
@@ -6194,8 +6187,9 @@ async fn session_reaction_discards_draft_and_delivers_followup_final() -> Result
     )
     .await;
 
-    assert_eq!(provider.calls(), 2);
+    assert_eq!(provider.calls(), 1, "the reply needs no second model call");
     assert!(effects.intermediates().is_empty());
+    assert_eq!(effects.sent().len(), 1);
     assert_eq!(effects.sent()[0].1, reply);
     assert_eq!(
         reactor.reactions.lock().expect("reactions").clone(),

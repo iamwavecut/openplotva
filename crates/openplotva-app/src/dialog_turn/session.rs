@@ -415,6 +415,10 @@ struct SessionState {
     search_citation_repairs: i32,
     #[serde(default, rename = "repeated_failed_tool_call")]
     repeated_tool_call: bool,
+    /// Reply the model wrote beside a lone reaction; the next round delivers it as
+    /// the final answer instead of asking the model again.
+    #[serde(default)]
+    carried_reply: Option<String>,
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -552,6 +556,7 @@ where
         links,
         search_citation_repairs,
         repeated_tool_call,
+        carried_reply: None,
     });
     // A crash after a committed intent has an unknown outcome. Never repeat the effect.
     for event in ctx
@@ -606,8 +611,8 @@ where
         if let Err(error) = persist_agent_event(queue, effects, ctx.item_id, AGENT_CHECKPOINT_EVENT_STAGE, BTreeMap::from([("checkpoint".into(), serde_json::to_string(&(base_input, &state)).expect("serializable agent state"))]), ctx.now).await {
             return std::ops::ControlFlow::Break(agent_persistence_failed(error));
         }
-        let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs, mut repeated_tool_call } = state;
-        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { requested_tool_call_offset, tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs, repeated_tool_call }, report)) }; }
+        let SessionState { mut requested_tool_call_offset, mut tool_context, mut gift_used, mut budget, mut agent, mut sent, mut side_effect_tickets, mut recorded_tool_calls, mut regenerations, mut anti_loop, mut repeated_final_repair, mut requires_novel_final, mut draws_scheduled, mut songs_scheduled, mut reacted_message_ids, mut tool_result_cache, mut media_reference_aliases, mut successful_web_search, mut web_source_urls, mut links, mut search_citation_repairs, mut repeated_tool_call, mut carried_reply } = state;
+        macro_rules! next_step { () => { std::ops::ControlFlow::Continue((SessionState { requested_tool_call_offset, tool_context, gift_used, budget, agent, sent, side_effect_tickets, recorded_tool_calls, regenerations, anti_loop, repeated_final_repair, requires_novel_final, draws_scheduled, songs_scheduled, reacted_message_ids, tool_result_cache, media_reference_aliases, successful_web_search, web_source_urls, links, search_citation_repairs, repeated_tool_call, carried_reply }, report)) }; }
 
         let previously_observed_message_id = agent.observed_message_id;
         if let Ok(Ok(messages)) = tokio::time::timeout(std::time::Duration::from_secs(2), materializer.observe_dialog_messages(active_params, agent.observed_message_id)).await {
@@ -673,11 +678,12 @@ where
             max_iterations,
         );
         let iteration = agent.iteration;
-        if next == openplotva_agent::NextStep::Exhausted {
+        let carried = carried_reply.take();
+        if next == openplotva_agent::NextStep::Exhausted && carried.is_none() {
             return std::ops::ControlFlow::Break( session_exhausted(ctx.item_id, &sent, &side_effect_tickets, &budget, round_now));
         }
 
-        let force_final = next == openplotva_agent::NextStep::Final;
+        let force_final = carried.is_none() && next == openplotva_agent::NextStep::Final;
         let tools = if base_input.disable_tools {
             ToolsMode::Disabled
         } else if force_final
@@ -706,7 +712,10 @@ where
         let provider_deadline = Instant::now()
             + std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default();
         let step_started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default(), TURN_DEADLINE
+        let result = if let Some(text) = carried {
+            let (provider, model) = agent.preferred_target.clone().unwrap_or_default();
+            Ok(openplotva_dialog::ChatStepOutput { provider, model, text, tool_calls: Vec::new(), trace: None })
+        } else { tokio::time::timeout(std::time::Duration::try_from(budget.remaining(round_now)).unwrap_or_default(), TURN_DEADLINE
             .scope(
                 Some(provider_deadline),
                 step_provider.run_chat_step(ChatStepRequest {
@@ -717,7 +726,8 @@ where
                     tools,
                     iteration: usize::try_from(iteration).unwrap_or(1),
                 }),
-            )).await.unwrap_or_else(|_| Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Agent turn deadline reached"))));
+            )).await.unwrap_or_else(|_| Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Agent turn deadline reached"))))
+        };
         let failure_now =
             ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
         let step = match result {
@@ -1481,8 +1491,14 @@ where
         side_effect_tickets.extend(batch_side_effects);
 
         match disposition {
-            SessionBatchDisposition::ContinueForResults
-            | SessionBatchDisposition::ContinueWithoutFinal => {}
+            SessionBatchDisposition::ContinueForResults => {}
+            SessionBatchDisposition::ContinueWithoutFinal => {
+                if step.tool_calls.iter().all(|call| call.step.step == STEP_REACT_TO_MESSAGE)
+                    && !links.prepare_response(&step.text).trim().is_empty()
+                {
+                    carried_reply = Some(step.text.clone());
+                }
+            }
             SessionBatchDisposition::CompleteWithSideEffect => {
                 let delivered_replies = step.tool_calls.iter().zip(&batch_results)
                     .filter(|(call, result)| tool_delivered_its_own_reply(&call.step.step, result))

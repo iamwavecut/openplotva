@@ -800,7 +800,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Create or edit an image from the user's request.",
         when_to_use: "Use when the latest user message asks to draw, generate, create, redraw, or edit an image.",
         result: "Schedules image generation and ENDS your turn; the image arrives asynchronously. \
-                 Anything you want to tell the chat, say it before or together with this call.",
+                 Call it without accompanying text or a promise to draw: text alongside a tool \
+                 call is not published.",
         continuation: ToolContinuation::MayTerminateOnSuccess,
         args: DRAW_IMAGE_ARGS,
     },
@@ -812,7 +813,8 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
                       tales, prose, poems, roleplay, or other text-only creative writing unless \
                       the user explicitly asks to turn that writing into a song.",
         result: "Schedules music generation and ENDS your turn; the song arrives asynchronously. \
-                 Anything you want to tell the chat, say it before or together with this call.",
+                 Call it without accompanying text or a promise to make the song: text alongside a \
+                 tool call is not published.",
         continuation: ToolContinuation::MayTerminateOnSuccess,
         args: GENERATE_SONG_ARGS,
     },
@@ -1146,7 +1148,8 @@ pub const SESSION_REACT_TO_MESSAGE_SPEC: ToolSpec = ToolSpec {
                   🖕 😈 😴 😭 🤓 👻 👨‍💻 🎃 🙈 😇 😨 🤝 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 \
                   🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡",
     result: "Sets the reaction; returns ok, or an error for a disallowed emoji or a message you \
-             already reacted to this turn.",
+             already reacted to this turn. Text you return together with this call is delivered \
+             as your reply.",
     continuation: ToolContinuation::Sidecar,
     args: &[
         ToolArgSpec {
