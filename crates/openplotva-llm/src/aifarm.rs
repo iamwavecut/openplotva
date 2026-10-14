@@ -23,8 +23,8 @@ use openplotva_dialog::{
     DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
     MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, NativeToolFunction,
     PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, ReplyLeakGuard,
-    STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolStep, ToolsMode,
-    clone_history_messages, decode_plotva_final_response_with_salvage,
+    STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, SessionMessage, ToolParseDecision, ToolStep,
+    ToolsMode, clone_history_messages, decode_plotva_final_response_with_salvage,
     is_dialog_history_noise_tool_call_name, normalize_history_message, parse_assistant_content,
     parse_native_tool_step, reply_shape, sanitize_tool_text,
     select_llm_history_messages_for_context, tool_telemetry,
@@ -3194,6 +3194,29 @@ where
                 if let Some(error) = sanitize_tool_step_text(&guard, &mut text, &mut steps) {
                     return Err(aifarm_step_error_with_trace(error, trace));
                 }
+                let reaction_only = steps
+                    .iter()
+                    .all(|pending| pending.step.step == STEP_REACT_TO_MESSAGE);
+                if reaction_only {
+                    if text.trim().is_empty() {
+                        text = reply_beside_native_reaction(response, &guard);
+                    }
+                    if !text.trim().is_empty() {
+                        text = match review_reply_shape(
+                            &request.input,
+                            &history,
+                            &request.transcript,
+                            text,
+                            generation_offered,
+                        ) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                let error = model_output_rejected(self.provider(), &error);
+                                return Err(aifarm_step_error_with_trace(error, trace));
+                            }
+                        };
+                    }
+                }
                 let mut tool_calls = Vec::with_capacity(steps.len());
                 let mut used_ids = steps
                     .iter()
@@ -3223,7 +3246,8 @@ where
                         });
                     tool_calls.push(ChatStepToolCall { id, step, salvaged });
                 }
-                // Content beside native calls is a draft, never a chat delivery.
+                // Text beside a lone reaction is the reply; beside any other call it
+                // is a draft, never a chat delivery.
                 Ok(ChatStepOutput {
                     provider: self.provider().to_owned(),
                     model,
@@ -4452,12 +4476,16 @@ fn build_initial_messages(
         ..ChatMessage::default()
     });
 
+    let recent_openings = recent_reply_openings(input, history);
     for turn in history {
         let is_current =
             turn.role == ROLE_USER && turn.message_id != 0 && turn.message_id == input.message.id;
-        if let Some(mut message) =
-            format_history_message_with_store(turn, is_current, &input.multimodal_images, prompts)?
-        {
+        if let Some(mut message) = format_history_message_with_store(
+            turn,
+            is_current.then_some(recent_openings.as_str()),
+            &input.multimodal_images,
+            prompts,
+        )? {
             if message.role == "assistant" {
                 let mut structured = turn.clone();
                 structured.text = message.content;
@@ -5620,16 +5648,7 @@ fn review_reply_shape(
     generation_offered: bool,
 ) -> Result<String, AifarmDialogError> {
     let custom_persona = !input.persona.custom_persona.trim().is_empty();
-    let recent_replies: Vec<&str> = history
-        .iter()
-        .rev()
-        .filter(|turn| {
-            turn.role == ROLE_MODEL && (turn.kind.is_empty() || turn.kind == MESSAGE_KIND_TEXT)
-        })
-        .map(|turn| turn.text.as_str())
-        .filter(|text| !text.trim().is_empty())
-        .take(reply_shape::RECENT_REPLY_WINDOW)
-        .collect();
+    let recent_replies = recent_bot_replies(history);
     let context = reply_shape::ReplyContext {
         recent_replies: &recent_replies,
         generation_pending: generation_offered && !generation_started(transcript),
@@ -5644,6 +5663,39 @@ fn review_reply_shape(
             Err(AifarmDialogError::FinalAnswerUnexecutedAction)
         }
     }
+}
+
+/// The bot's latest text replies in `history`, newest first.
+fn recent_bot_replies(history: &[HistoryMessage]) -> Vec<&str> {
+    history
+        .iter()
+        .rev()
+        .filter(|turn| {
+            turn.role == ROLE_MODEL && (turn.kind.is_empty() || turn.kind == MESSAGE_KIND_TEXT)
+        })
+        .map(|turn| turn.text.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .take(reply_shape::RECENT_REPLY_WINDOW)
+        .collect()
+}
+
+/// Distinct opening frames of the bot's latest replies, joined for the last-message note
+/// so the model avoids them up front. A custom persona may keep a fixed opening, so it
+/// gets none.
+fn recent_reply_openings(input: &DialogInput, history: &[HistoryMessage]) -> String {
+    if !input.persona.custom_persona.trim().is_empty() {
+        return String::new();
+    }
+    let mut openings: Vec<String> = Vec::new();
+    for frame in recent_bot_replies(history)
+        .into_iter()
+        .filter_map(reply_shape::opening_frame)
+    {
+        if !openings.contains(&frame) {
+            openings.push(frame);
+        }
+    }
+    openings.join("; ")
 }
 
 fn generation_started(transcript: &[SessionMessage]) -> bool {
@@ -5696,6 +5748,23 @@ fn final_answer_error_from_suppression(
 
 // Text that reaches the chat next to tool calls (the announcement and every
 // `send_message` body) is held to the same leak rules as a final answer.
+/// The content a model wrote next to native `react_to_message` calls, finalized like a
+/// reply; empty when nothing deliverable remains.
+fn reply_beside_native_reaction(response: &Value, guard: &ReplyLeakGuard) -> String {
+    let content = first_choice_message_value(response)
+        .ok()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    match openplotva_dialog::finalize_dialog_reply_with_guard(content, guard) {
+        openplotva_dialog::DialogReplyOutcome::Reply(answer) => answer,
+        openplotva_dialog::DialogReplyOutcome::Suppressed(_) => String::new(),
+    }
+}
+
 fn sanitize_tool_step_text(
     guard: &ReplyLeakGuard,
     text: &mut String,
@@ -6356,15 +6425,17 @@ pub fn format_history_message(
     is_current: bool,
     images: &[openplotva_dialog::MultimodalImage],
 ) -> Result<Option<ChatMessage>, AifarmMessageError> {
-    format_history_message_with_store(turn, is_current, images, None)
+    format_history_message_with_store(turn, is_current.then_some(""), images, None)
 }
 
+/// `current` carries the recent reply openings when `turn` is the message being answered.
 fn format_history_message_with_store(
     turn: &HistoryMessage,
-    is_current: bool,
+    current: Option<&str>,
     images: &[openplotva_dialog::MultimodalImage],
     prompts: Option<&openplotva_prompts::PromptStore>,
 ) -> Result<Option<ChatMessage>, AifarmMessageError> {
+    let is_current = current.is_some();
     let normalized = normalize_history_message(turn.clone());
     match normalized.kind.as_str() {
         MESSAGE_KIND_TOOL_REQUEST => Ok(None),
@@ -6396,7 +6467,7 @@ fn format_history_message_with_store(
                     ..ChatMessage::default()
                 }));
             }
-            let content = format_turn(&normalized, is_current, prompts)?;
+            let content = format_turn(&normalized, current, prompts)?;
             let content_parts = if is_current {
                 multimodal_content_parts(&content, images)
             } else {
@@ -6465,17 +6536,17 @@ fn sanitize_assistant_history_turn(mut turn: HistoryMessage) -> Option<HistoryMe
 
 fn format_turn(
     turn: &HistoryMessage,
-    is_current: bool,
+    current: Option<&str>,
     prompts: Option<&openplotva_prompts::PromptStore>,
 ) -> Result<String, AifarmMessageError> {
     let message = format_message_body(turn);
     if message.is_empty() {
         return Ok(String::new());
     }
-    if !is_current {
+    let Some(recent_openings) = current else {
         return Ok(message);
-    }
-    let data = json!({ "message": message });
+    };
+    let data = json!({ "message": message, "recent_openings": recent_openings });
     let rendered = match prompts {
         Some(prompts) => prompts.render("aifarm/last_message_wrapper", &data)?,
         None => openplotva_prompts::render("aifarm/last_message_wrapper", &data)?,
@@ -8690,6 +8761,42 @@ mod tests {
     }
 
     #[test]
+    fn last_message_note_lists_recent_reply_openings_except_for_a_custom_persona() {
+        let mut input = base_input();
+        input.message.id = 11;
+        input.message.text = "ну что там".into();
+        input.history.extend([
+            bot_history_reply(7, "Моська, ну ты и мастер! 😂"),
+            bot_history_reply(9, "Да ты что, серьёзно? Поезд в шесть."),
+            bot_history_reply(10, "Ха-ха, ну ты и выдала!"),
+            HistoryMessage {
+                role: ROLE_USER.into(),
+                kind: MESSAGE_KIND_TEXT.into(),
+                name: input.user.full_name.clone(),
+                text: input.message.text.clone(),
+                message_id: input.message.id,
+                ..Default::default()
+            },
+        ]);
+        let packet = |input: &DialogInput| {
+            build_initial_messages_with_tool_prompt(input, &input.history, ToolPromptMode::Native)
+                .expect("messages")
+                .last()
+                .expect("packet")
+                .content
+                .clone()
+        };
+        assert!(
+            packet(&input)
+                .contains("Не начинай ответ со слов своих недавних реплик: ну ты и; да ты что\"")
+        );
+        input.persona.custom_persona = "Ученица".into();
+        let custom = packet(&input);
+        assert!(custom.contains("короткой вводной отбивки\">"));
+        assert!(!custom.contains("недавних реплик:"));
+    }
+
+    #[test]
     fn reply_leak_guard_allows_one_quote_from_the_current_history_message() {
         let mut input = base_input();
         input.message.id = 11;
@@ -9058,7 +9165,7 @@ mod tests {
     {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
         assert!(prompt.contains("собеседник в живом Telegram-чате"));
-        assert!(prompt.contains("native tool calls по JSON-схемам"));
+        assert!(prompt.contains("native tool_calls по JSON-схемам"));
         assert!(prompt.contains("прочитай именно её через crawl_url"));
         assert!(!prompt.contains("<tools>"));
         assert!(!prompt.contains("<arg name="));
@@ -9091,7 +9198,7 @@ mod tests {
         assert!(prompt.contains("<base_voice>"));
         assert!(prompt.contains("<persona_layers>"));
         assert!(prompt.contains("не услужливость"));
-        assert!(prompt.contains("Имя собеседника не ставь в начало реплики"));
+        assert!(prompt.contains("Не ставь имя или ник собеседника в начало реплики"));
         assert!(prompt.contains("не больше одной черты"));
         assert!(prompt.contains("custom_persona"));
         assert!(prompt.contains("daily_persona_accent"));
@@ -11064,6 +11171,54 @@ mod tests {
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "call-react");
         assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_returns_the_reply_written_beside_a_lone_reaction()
+    -> Result<(), CompletionError> {
+        let react = json!({
+            "id": "call-react",
+            "type": "function",
+            "function": {
+                "name": "react_to_message",
+                "arguments": "{\"emoji\": \"👍\", \"message_id\": 6877}"
+            }
+        });
+        let search = json!({
+            "id": "call-search",
+            "type": "function",
+            "function": {"name": "web_search", "arguments": "{\"query\": \"поезд\"}"}
+        });
+        for (calls, expected) in [
+            (vec![react.clone()], "Поезд в шесть, успеешь."),
+            (vec![react, search], ""),
+        ] {
+            let (provider, _transport, _toolbox) = direct_dialog_provider(
+                json!({"choices": [{"message": {
+                    "role": "assistant",
+                    "content": "Поезд в шесть, успеешь.",
+                    "tool_calls": calls,
+                }}]}),
+                AifarmDialogConfig::default(),
+            );
+            let output = crate::ChatStepProvider::run_chat_step(
+                &provider,
+                ChatStepRequest {
+                    required_tool: None,
+                    preferred_target: None,
+                    input: base_input(),
+                    transcript: Vec::new(),
+                    tools: ToolsMode::Native(
+                        native_tool_values(&[STEP_WEB_SEARCH, STEP_REACT_TO_MESSAGE])
+                            .expect("tool defs"),
+                    ),
+                    iteration: 1,
+                },
+            )
+            .await?;
+            assert_eq!(output.text, expected);
+        }
         Ok(())
     }
 

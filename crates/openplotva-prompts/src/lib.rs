@@ -618,7 +618,7 @@ mod tests {
         assert!(rendered.contains("<system_contract>"));
         assert!(rendered.contains("OpenAI tools доступны"));
         assert!(!rendered.contains("<tools>"));
-        assert!(rendered.contains("native tool calls по JSON-схемам"));
+        assert!(rendered.contains("native tool_calls по JSON-схемам"));
         assert!(rendered.contains("<guest_mode>"));
         assert!(rendered.contains("<locale_policy>"));
         assert!(rendered.contains("Текст рядом с tool call не публикуется"));
