@@ -1252,6 +1252,8 @@ pub struct DialogMessageUpdateConfig {
     pub aifarm_default_max_tokens: i32,
     pub aifarm_long_max_tokens: i32,
     pub processing_timeout_seconds: i32,
+    /// Global admins; only they get the `%` Draw API shortcut.
+    pub admin_ids: Vec<i64>,
 }
 
 impl DialogMessageUpdateConfig {
@@ -1282,6 +1284,7 @@ impl DialogMessageUpdateConfig {
                 .max(300)
                 .max(config.llm.history_summary.timeout_seconds)
                 .max(config.llm.dialog.session_hard_cap_secs.saturating_add(120)),
+            admin_ids: config.admins.admin_ids.clone(),
         }
     }
 }
@@ -1610,7 +1613,6 @@ where
         .map(ToString::to_string)
         .unwrap_or_default();
     if parsed.is_addressed
-        || crate::rates::is_rates_command_message(message, &config.bot_user)
         || is_bang_draw_shortcut(&first_word_lower)
         || is_bang_song_shortcut(&first_word_lower)
         || is_song_command_for_bot(message, &first_word_lower, &bot_username)
@@ -1759,7 +1761,6 @@ where
     {
         parsed.is_addressed = true;
     }
-    parsed.is_addressed |= crate::rates::is_rates_command_message(message, &config.bot_user);
     parsed.is_addressed |= is_bang_draw_shortcut(&first_word_lower)
         || direct_song_shortcut_topic(
             message,
@@ -1799,7 +1800,9 @@ where
         || reply_context
             .as_ref()
             .is_some_and(context_has_editable_image);
-    let intent = if is_direct_draw_api_shortcut(&first_word_lower) {
+    let intent = if is_direct_draw_api_shortcut(&first_word_lower)
+        && config.admin_ids.contains(&context.meta.sender_id)
+    {
         Some((
             "draw_api",
             format!("Requested tool: draw_api. Prompt: {}", parsed.rest_text),
@@ -6527,6 +6530,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draw_api_shortcut_is_only_for_admins() -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = SchedulerStub::default();
+        let config = DialogMessageUpdateConfig {
+            admin_ids: vec![1],
+            ..test_config()
+        };
+        let route = handle_dialog_message_update_or_else(
+            &scheduler,
+            &config,
+            group_message_update("@plotva_bot % red fish")?,
+            |_| async { Err::<(), std::io::Error>(std::io::Error::other("delegated")) },
+        )
+        .await?;
+        assert!(
+            matches!(route, DialogMessageUpdateRoute::Scheduled { .. }),
+            "{route:?}"
+        );
+        let metas = scheduler.metas();
+        assert_eq!(metas[0].requested_tool, "");
+        assert!(!metas[0].annotation.contains("draw_api"), "{metas:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn attachment_shortcuts_keep_media_in_agent_context()
     -> Result<(), Box<dyn std::error::Error>> {
         for update in [
@@ -7683,6 +7710,7 @@ mod tests {
             aifarm_default_max_tokens: 1024,
             aifarm_long_max_tokens: 2048,
             processing_timeout_seconds: 720,
+            admin_ids: vec![99],
         }
     }
 

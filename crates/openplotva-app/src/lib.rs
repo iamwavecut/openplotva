@@ -30,6 +30,7 @@ pub mod image_jobs;
 pub mod ingestion_telemetry;
 pub mod inline;
 mod lane_checks;
+pub mod llm_translate;
 mod maintenance_api;
 pub mod media;
 pub mod members;
@@ -11975,13 +11976,18 @@ async fn start_runtime_workers(
     }
     let taskman_ids = openplotva_taskman::TaskQueueIdAllocator::new();
     let translation_cache = service_clients.redis.translation_cache_store();
-    let translator = match translate::t8_translator_from_app_config(config, translation_cache) {
-        Ok(translator) => RuntimeTranslator::Ready(Box::new(translator)),
-        Err(error) => {
-            tracing::warn!(%error, "translation provider unavailable for unified control jobs");
-            RuntimeTranslator::Unavailable(error.to_string())
-        }
-    };
+    let translator = llm_translate::runtime_llm_translator(
+        config,
+        translation_cache,
+        routed_attempts::RoutedAttemptWalker::new(
+            Arc::clone(&router_handle),
+            Arc::clone(&router_breakers),
+            Arc::clone(&router_triggers),
+            Arc::clone(&router_pools),
+        )
+        .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+        .with_reporter(routing_event_reporter.clone()),
+    );
     let translate_effects =
         translate::TranslateDispatcherEffects::new(Arc::clone(&dispatcher_queue));
     let admin_cache_store = service_clients.redis.chat_admin_cache_store();
@@ -12799,6 +12805,7 @@ async fn start_runtime_workers(
             memory: memory_store.clone(),
             vip: vip_status_for_updates.clone(),
             direct_draw: direct_draw_api_effects.clone(),
+            admin_ids: Arc::from(config.admins.admin_ids.clone()),
         }));
     if let Some(history_summarizer) = history_summarizer {
         app_dialog_toolbox = app_dialog_toolbox.with_history_summarizer(history_summarizer);
@@ -13875,6 +13882,22 @@ async fn start_runtime_workers(
                 )),
                 reset_handler,
             ));
+        let mut rates_effects = rates::RatesUtilityEffects::new(Arc::clone(&rich_sender));
+        if config.gradius.utility_rates_enabled
+            && let Some((ads, outbox)) = &gradius_utility
+        {
+            rates_effects = rates_effects.with_utility_ads(Arc::clone(ads), Arc::clone(outbox));
+        }
+        let rates_command = Arc::new(rates::RatesCommandUpdateHandler::new(
+            rates::RatesBotIdentity {
+                user: bot_user_from_get_me(&bot_identity),
+            },
+            Arc::new(MessageGateCheckedRatesPermission),
+            Some(Arc::clone(&rates_fetcher)),
+            Arc::new(RuntimeRatesHeaderProvider),
+            Arc::new(rates_effects),
+            delete_drawing_command,
+        ));
         let checkin_command = Arc::new(checkin::CheckinCommandUpdateHandler::new(
             Arc::clone(&control_queue_for_updates),
             checkin_game_store_for_updates,
@@ -13884,7 +13907,7 @@ async fn start_runtime_workers(
                 Arc::clone(&rich_sender),
             )),
             bot_identity.username.clone(),
-            delete_drawing_command,
+            rates_command,
         ));
         let post_service_blocked_gate =
             Arc::new(message_gate::PostServiceBlockedChatUpdateHandler::new(
@@ -14782,39 +14805,22 @@ fn go_dispatcher_config() -> openplotva_telegram::DispatcherConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-enum RuntimeTranslator {
-    Ready(Box<translate::RuntimeT8Translator>),
-    Unavailable(String),
+/// The message gate already ran upstream, so the rates command may always answer.
+#[derive(Clone, Copy, Debug)]
+struct MessageGateCheckedRatesPermission;
+
+impl rates::RatesSendPermission for MessageGateCheckedRatesPermission {
+    fn can_send_rates_text(&self, _chat: &carapax::types::Chat) -> bool {
+        true
+    }
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-enum RuntimeTranslatorError {
-    #[error("{0}")]
-    Provider(#[from] translate::T8TranslatorError),
-    #[error("{0}")]
-    Unavailable(String),
-}
+#[derive(Clone, Copy, Debug)]
+struct RuntimeRatesHeaderProvider;
 
-impl translate::TextTranslator for RuntimeTranslator {
-    type Error = RuntimeTranslatorError;
-
-    fn translate_text<'a>(
-        &'a self,
-        text: &'a str,
-        target_lang: &'a str,
-    ) -> translate::TranslateProviderFuture<'a, Self::Error> {
-        Box::pin(async move {
-            match self {
-                Self::Ready(translator) => translator
-                    .translate_text(text, target_lang)
-                    .await
-                    .map_err(RuntimeTranslatorError::Provider),
-                Self::Unavailable(reason) => {
-                    Err(RuntimeTranslatorError::Unavailable(reason.clone()))
-                }
-            }
-        })
+impl rates::RatesHeaderProvider for RuntimeRatesHeaderProvider {
+    fn rates_header(&self, user_full_name: &str) -> String {
+        rates::random_rates_header(user_full_name)
     }
 }
 

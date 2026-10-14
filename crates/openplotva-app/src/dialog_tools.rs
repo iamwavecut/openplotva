@@ -32,7 +32,9 @@ use crate::{
     agent_runtime::HistorySearcher,
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::TaskEnqueueRateLimit,
-    rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
+    rates::{
+        RatesFetcher, RatesSideEffectDispatcher, currency_rates_table_tool, currency_rates_tool,
+    },
     task_queue::TaskQueueDurabilityBarrier,
     translate::{TextTranslator, TranslationResult, translate_text_tool},
 };
@@ -2257,7 +2259,7 @@ fn usize_to_i64(value: usize) -> i64 {
 #[derive(Clone)]
 pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     rates_fetcher: Option<Arc<RatesFetcherT>>,
-    _rates_dispatcher: Option<Arc<RatesDispatcherT>>,
+    rates_dispatcher: Option<Arc<RatesDispatcherT>>,
     translator: Option<Arc<TranslatorT>>,
     queue_status: Option<Arc<dyn QueueStatusProvider>>,
     drawing_canceller: Option<Arc<dyn DrawingJobCanceller>>,
@@ -2283,7 +2285,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     ) -> Self {
         Self {
             rates_fetcher,
-            _rates_dispatcher: rates_dispatcher,
+            rates_dispatcher,
             translator,
             queue_status: None,
             drawing_canceller: None,
@@ -2387,7 +2389,13 @@ where
 {
     fn currency_rates<'a>(&'a self, req: RatesRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
-            Ok(currency_rates_tool(self.rates_fetcher.as_deref(), &req.context, &req.pairs).await)
+            let fetcher = self.rates_fetcher.as_deref();
+            Ok(match self.rates_dispatcher.as_deref() {
+                Some(dispatcher) => {
+                    currency_rates_table_tool(fetcher, dispatcher, &req.context, &req.pairs).await
+                }
+                None => currency_rates_tool(fetcher, &req.context, &req.pairs).await,
+            })
         })
     }
 
@@ -4035,7 +4043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_dialog_toolbox_dispatches_currency_rates_to_llm() -> Result<(), ToolboxError> {
+    async fn app_dialog_toolbox_sends_the_rates_table_as_the_reply() -> Result<(), ToolboxError> {
         let dispatcher = Arc::new(RatesDispatcherStub::default());
         let toolbox = AppDialogToolbox::new(
             Some(Arc::new(RatesFetcherStub)),
@@ -4052,17 +4060,20 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
-        assert!(!result.no_reply);
-        assert!(result.side_effect.is_none());
-        assert!(result.message.contains("💵 USD/RUB=90.00 ₽"));
-        assert!(result.message.contains("₿ BTC/USD=100000 $"));
-        assert!(result.message.contains("🛢 Brent=76.50 $"));
+        assert!(result.no_reply);
         assert_eq!(
-            result.data.as_ref().expect("data")["rates_text"],
-            result.message
+            result
+                .side_effect
+                .as_ref()
+                .map(|effect| effect.kind.as_str()),
+            Some(crate::rates::RATES_MESSAGE_KIND)
         );
-        assert_eq!(dispatcher.calls().len(), 0);
+        assert!(result.message.contains("💵 USD/RUB=90.00 ₽"));
+        let calls = dispatcher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.message_id, 11);
+        assert!(calls[0].1.contains("Alice"), "{}", calls[0].1);
+        assert!(calls[0].1.contains("USD/RUB"), "{}", calls[0].1);
         Ok(())
     }
 

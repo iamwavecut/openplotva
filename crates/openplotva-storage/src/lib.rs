@@ -10257,6 +10257,29 @@ mod tests {
     }
 
     #[test]
+    fn translation_workflow_routes_like_dialog_and_is_reversible() {
+        const UP: &str = include_str!("../../../migrations/207_translation_workflow.up.sql");
+        const DOWN: &str = include_str!("../../../migrations/207_translation_workflow.down.sql");
+
+        for value in [
+            "VALUES ('translation', 'chat', FALSE, 1)",
+            "ON CONFLICT (key) DO NOTHING",
+            "('primary', 'aifarm-vllm-gpu0', 'Gemma 4 26B Heretic', 100, NULL::INTEGER)",
+            "('fallback', 'aifarm-ninfer-gpu2', 'qwen3.8-27b', NULL::INTEGER, 0)",
+            "('fallback', 'openrouter', '~openai/gpt-luna-latest', NULL::INTEGER, 99)",
+            "WHERE EXISTS (SELECT 1 FROM resolved WHERE role = 'primary')",
+            "SELECT 1 FROM workflow_assignments WHERE workflow_key = 'translation'",
+        ] {
+            assert!(
+                UP.contains(value),
+                "missing translation workflow contract {value}"
+            );
+        }
+        assert!(!UP.contains("UPDATE "));
+        assert!(DOWN.contains("DELETE FROM workflows WHERE key = 'translation'"));
+    }
+
+    #[test]
     fn workflow_lane_settings_default_and_are_reversible() {
         const UP: &str = include_str!("../../../migrations/199_workflow_lane_settings.up.sql");
         const DOWN: &str = include_str!("../../../migrations/199_workflow_lane_settings.down.sql");

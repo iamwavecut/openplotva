@@ -10,6 +10,8 @@ use time::OffsetDateTime;
 
 pub struct AgentContextTools {
     pub direct_draw: Arc<dyn crate::dialog_messages::DirectDrawApiEffects>,
+    /// Global admins; the direct Draw API is theirs alone.
+    pub admin_ids: Arc<[i64]>,
     pub history: PostgresHistoryStore,
     pub memory: PostgresMemoryStore,
     pub vip: Arc<dyn crate::payments::VipStatusChecker + Send + Sync>,
@@ -40,6 +42,12 @@ impl DialogToolbox for AgentContextTools {
             };
             match step.step.as_str() {
                 "draw_api" => {
+                    if !self.admin_ids.contains(&ctx.user_id) {
+                        return Ok(ToolResult::failed(
+                            "draw_api_owner_only",
+                            "The direct Draw API is reserved for the bot owner. Use draw_image if this user asked for a picture.",
+                        ));
+                    }
                     let result = self
                         .direct_draw
                         .send_direct_draw_api(crate::dialog_messages::DirectDrawApiRequest {

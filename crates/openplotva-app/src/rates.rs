@@ -1816,6 +1816,39 @@ where
     }
 }
 
+/// Dialog rates through the same rich table the `$` command sends: the table goes to
+/// the chat as a reply, so the turn needs no further text.
+pub async fn currency_rates_table_tool<Fetcher, Dispatcher>(
+    fetcher: Option<&Fetcher>,
+    dispatcher: &Dispatcher,
+    meta: &ToolContext,
+    pairs: &str,
+) -> ToolResult
+where
+    Fetcher: RatesFetcher + Sync,
+    Dispatcher: RatesSideEffectDispatcher + Sync,
+{
+    let Some(fetcher) = fetcher else {
+        return ToolResult::failed("currency_rates_unavailable", "rates service unavailable");
+    };
+
+    let snapshot = fetch_dialog_rates(fetcher, parse_rates_selection(pairs)).await;
+    let errors = dialog_rates_errors(&snapshot);
+    if snapshot.rows.is_empty() && !errors.is_empty() {
+        return dialog_rates_failure_result(&errors);
+    }
+
+    let text = format_dialog_rates_message(&snapshot);
+    let table = format_rates_command_message(&random_rates_header(&meta.user_full_name), &snapshot);
+    match dispatcher
+        .dispatch_rates(dialog_rates_tool_context(meta), table)
+        .await
+    {
+        Ok(dispatch) => dialog_rates_queued_result(&text, &dispatch),
+        Err(error) => dialog_rates_dispatch_failure_result(&text, &error),
+    }
+}
+
 fn dialog_rate_row_json(row: &RateQuote) -> serde_json::Value {
     json!({
         "id": row.id.clone(),
