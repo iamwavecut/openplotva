@@ -166,6 +166,18 @@ pub struct ChatVideoUrlPart {
     pub url: String,
 }
 
+/// Content-free sizes of the dialog inputs selected for one model call.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DialogContextShape {
+    pub history_messages: usize,
+    pub history_text_chars: usize,
+    pub current_text_chars: usize,
+    pub reference_blocks: usize,
+    pub reference_text_chars: usize,
+    pub shield_text_chars: usize,
+    pub transcript_messages: usize,
+}
+
 /// OpenAI-compatible chat completion request subset used by AIFarm routing.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatCompletionRequest {
@@ -260,6 +272,9 @@ pub struct ChatCompletionRequest {
     /// Trace metadata for low-level call observation. Never serialized to the wire.
     #[serde(skip)]
     pub trace: Option<crate::trace::LlmCallTrace>,
+    /// Local diagnostics, excluded from provider payloads.
+    #[serde(skip)]
+    pub dialog_context: Option<DialogContextShape>,
     /// Tool calls written as markup in the text execute instead of rejecting the sample.
     /// Client-side policy, never serialized to the wire.
     #[serde(skip)]
@@ -3291,6 +3306,22 @@ where
         let mut request = ChatCompletionRequest {
             model,
             messages,
+            dialog_context: Some(DialogContextShape {
+                history_messages: history.len(),
+                history_text_chars: history
+                    .iter()
+                    .map(|message| message.text.chars().count())
+                    .sum(),
+                current_text_chars: input.message.text.chars().count(),
+                reference_blocks: input.reference_context.len(),
+                reference_text_chars: input
+                    .reference_context
+                    .iter()
+                    .map(|text| text.chars().count())
+                    .sum(),
+                shield_text_chars: input.shield_context.chars().count(),
+                transcript_messages: transcript.len(),
+            }),
             stream: false,
             max_tokens: self.cfg.max_tokens_for_input(input),
             temperature: self.cfg.temperature,
@@ -3854,6 +3885,9 @@ fn aifarm_trace_transport(result: &CompletionResult) -> Option<Value> {
 
 fn aifarm_trace_inference_params(request: &ChatCompletionRequest) -> Option<Value> {
     let mut map = serde_json::Map::new();
+    if let Some(shape) = &request.dialog_context {
+        map.insert("dialog_context".to_owned(), json!(shape));
+    }
     insert_positive_i32(&mut map, "max_tokens", request.max_tokens);
     insert_opt_f64(&mut map, "temperature", request.temperature);
     insert_opt_f64(&mut map, "top_p", request.top_p);
@@ -11997,6 +12031,51 @@ mod tests {
             Some(FailureReason::ModelOutputRejected)
         );
         assert!(error.to_string().contains("tool protocol error"), "{error}");
+    }
+
+    #[test]
+    fn dialog_context_diagnostics_count_selected_history_without_storing_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = AifarmDialogProvider::with_transport(
+            AifarmDialogConfig::default(),
+            FakeTransport::new(Vec::new()),
+        );
+        let mut input = base_input();
+        input.message.text = "привет".to_owned();
+        input.reference_context = vec!["private-reference".repeat(100)];
+        input.shield_context = "shield".to_owned();
+        input.history = vec![HistoryMessage::default(); 50];
+        let history = vec![
+            HistoryMessage {
+                text: "secret-history".to_owned(),
+                ..HistoryMessage::default()
+            };
+            3
+        ];
+        let request = provider.step_request_with_history(
+            &input,
+            &history,
+            &[],
+            &openplotva_dialog::ToolsMode::FinalOnly,
+            1,
+        )?;
+        let params = super::aifarm_trace_inference_params(&request).expect("inference parameters");
+        let shape = &params["dialog_context"];
+        assert_eq!(shape["history_messages"], 3);
+        assert_eq!(shape["history_text_chars"], 42);
+        assert_eq!(shape["current_text_chars"], 6);
+        assert_eq!(shape["reference_blocks"], 1);
+        assert_eq!(shape["reference_text_chars"], 1700);
+        assert_eq!(shape["shield_text_chars"], 6);
+        assert_eq!(shape["transcript_messages"], 0);
+        assert!(!params.to_string().contains("secret-history"));
+        assert!(!params.to_string().contains("private-reference"));
+        assert!(
+            serde_json::to_value(&request)?
+                .get("dialog_context")
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

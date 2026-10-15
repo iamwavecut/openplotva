@@ -19,7 +19,6 @@ pub const PURPOSE: &str = "memory";
 
 pub const DEFAULT_MEMORY_MAX_OUTPUT_TOKENS: i32 = 4000;
 pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
-pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
 pub const PROMPT_VERSION: &str = "chat_memory_daily_v7";
@@ -177,14 +176,12 @@ pub struct RetrievalScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryRunEnqueuePolicy {
     pub min_messages_per_run: i32,
-    pub max_queued_runs: i32,
 }
 
 impl Default for MemoryRunEnqueuePolicy {
     fn default() -> Self {
         Self {
             min_messages_per_run: DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN,
-            max_queued_runs: DEFAULT_MEMORY_MAX_QUEUED_RUNS,
         }
     }
 }
@@ -198,11 +195,6 @@ impl MemoryRunEnqueuePolicy {
                 fallback.min_messages_per_run
             } else {
                 self.min_messages_per_run
-            },
-            max_queued_runs: if self.max_queued_runs <= 0 {
-                fallback.max_queued_runs
-            } else {
-                self.max_queued_runs
             },
         }
     }

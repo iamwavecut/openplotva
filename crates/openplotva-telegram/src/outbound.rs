@@ -78,6 +78,15 @@ pub struct MessageFingerprint {
     pub debounce_key: Option<String>,
 }
 
+impl MessageFingerprint {
+    pub fn with_direct_messages_topic(mut self, topic_id: Option<i64>) -> Self {
+        if let Some(topic_id) = topic_id.filter(|id| *id != 0) {
+            self.content_hash = hash_content(&format!("dm:{topic_id}:{}", self.content_hash));
+        }
+        self
+    }
+}
+
 impl fmt::Display for MessageFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -95,6 +104,8 @@ impl fmt::Display for MessageFingerprint {
 /// Minimal chat fields needed by the outbound builder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatRef {
+    /// Destination in a channel's direct messages chat, independent of forum threads.
+    pub direct_messages_topic_id: Option<i64>,
     /// Telegram chat ID.
     pub id: i64,
     /// Whether the chat is a forum supergroup.
@@ -309,6 +320,7 @@ pub struct ReplyParametersPlan {
 /// Public sticker payload mirror for asserting form-only `carapax` methods.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StickerMessagePlan {
+    pub direct_messages_topic_id: Option<i64>,
     /// Telegram target chat ID.
     pub chat_id: i64,
     /// Telegram sticker file ID.
@@ -355,6 +367,7 @@ pub struct PhotoMessageRequest {
 /// Public photo payload mirror for asserting form-only `carapax` methods.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhotoMessagePlan {
+    pub direct_messages_topic_id: Option<i64>,
     /// Telegram target chat ID.
     pub chat_id: i64,
     /// Photo file, URL, or upload bytes.
@@ -404,6 +417,7 @@ pub struct AudioMessageRequest {
 /// Public audio payload mirror for asserting form-only `carapax` methods.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioMessagePlan {
+    pub direct_messages_topic_id: Option<i64>,
     /// Telegram target chat ID.
     pub chat_id: i64,
     /// Audio file, URL, or upload bytes.
@@ -445,6 +459,7 @@ pub struct MediaGroupMessageRequest {
 /// Public media-group payload mirror for asserting form-only `carapax` methods.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaGroupMessagePlan {
+    pub direct_messages_topic_id: Option<i64>,
     /// Telegram target chat ID.
     pub chat_id: i64,
     pub message_thread_id: Option<i64>,
@@ -596,6 +611,9 @@ pub fn build_text_message_method(
         text = text.with_format(parse_mode);
     }
     let mut method = SendMessage::new(chat.id, text);
+    if let Some(topic_id) = chat.direct_messages_topic_id {
+        method = method.with_direct_messages_topic_id(topic_id);
+    }
     if req.disable_notification {
         method = method.with_disable_notification(true);
     }
@@ -653,6 +671,7 @@ pub fn build_rich_message_method(
         .transpose()
         .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
     let options = RichSendOptions {
+        direct_messages_topic_id: chat.direct_messages_topic_id,
         message_thread_id: reply_to
             .and_then(reply_thread_id)
             .filter(|thread_id| *thread_id != 0)
@@ -1146,6 +1165,7 @@ pub fn build_sticker_message_plan(
     };
 
     Ok(StickerMessagePlan {
+        direct_messages_topic_id: chat.direct_messages_topic_id,
         chat_id: chat.id,
         file_id: req.file_id.clone(),
         message_thread_id,
@@ -1165,6 +1185,7 @@ pub fn build_photo_message_plan(
     req: &PhotoMessageRequest,
 ) -> Result<PhotoMessagePlan, OutboundBuildError> {
     Ok(PhotoMessagePlan {
+        direct_messages_topic_id: req.chat.direct_messages_topic_id,
         chat_id: req.chat.id,
         photo: req.photo.clone(),
         message_thread_id: (req.message_thread_id != 0).then_some(req.message_thread_id),
@@ -1185,6 +1206,7 @@ pub fn build_audio_message_method(
 
 pub fn build_audio_message_plan(req: &AudioMessageRequest) -> AudioMessagePlan {
     AudioMessagePlan {
+        direct_messages_topic_id: req.chat.direct_messages_topic_id,
         chat_id: req.chat.id,
         audio: req.audio.clone(),
         message_thread_id: (req.message_thread_id != 0).then_some(req.message_thread_id),
@@ -1204,6 +1226,7 @@ pub fn build_media_group_message_method(
 
 pub fn build_media_group_message_plan(req: &MediaGroupMessageRequest) -> MediaGroupMessagePlan {
     MediaGroupMessagePlan {
+        direct_messages_topic_id: req.chat.direct_messages_topic_id,
         chat_id: req.chat.id,
         message_thread_id: (req.message_thread_id != 0).then_some(req.message_thread_id),
         disable_notification: req.disable_notification,
@@ -1282,6 +1305,7 @@ pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFin
         MESSAGE_TYPE_STICKER,
         hash_content(&plan.file_id),
     )
+    .with_direct_messages_topic(plan.direct_messages_topic_id)
 }
 
 pub fn fingerprint_photo_message_plan(plan: &PhotoMessagePlan) -> MessageFingerprint {
@@ -1291,6 +1315,7 @@ pub fn fingerprint_photo_message_plan(plan: &PhotoMessagePlan) -> MessageFingerp
         MESSAGE_TYPE_PHOTO,
         hash_content(content.as_ref()),
     )
+    .with_direct_messages_topic(plan.direct_messages_topic_id)
 }
 
 pub fn fingerprint_audio_message_plan(plan: &AudioMessagePlan) -> MessageFingerprint {
@@ -1300,6 +1325,7 @@ pub fn fingerprint_audio_message_plan(plan: &AudioMessagePlan) -> MessageFingerp
         MESSAGE_TYPE_AUDIO,
         hash_content(content.as_ref()),
     )
+    .with_direct_messages_topic(plan.direct_messages_topic_id)
 }
 
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
@@ -1369,6 +1395,7 @@ impl StickerMessagePlan {
         let mut value = go_base_file_config_json(
             self.chat_id,
             self.message_thread_id,
+            self.direct_messages_topic_id,
             self.disable_notification,
             self.reply_parameters,
             json!(self.file_id),
@@ -1384,6 +1411,9 @@ impl StickerMessagePlan {
         let mut method = SendSticker::new(self.chat_id, InputFile::file_id(self.file_id.clone()));
         if let Some(thread_id) = self.message_thread_id {
             method = method.with_message_thread_id(thread_id);
+        }
+        if let Some(topic_id) = self.direct_messages_topic_id {
+            method = method.with_direct_messages_topic_id(topic_id);
         }
         if self.disable_notification {
             method = method.with_disable_notification(true);
@@ -1412,6 +1442,7 @@ impl PhotoMessagePlan {
         let mut value = go_base_file_config_json(
             self.chat_id,
             self.message_thread_id,
+            self.direct_messages_topic_id,
             self.disable_notification,
             self.reply_parameters,
             self.photo.go_file_value(),
@@ -1432,6 +1463,9 @@ impl PhotoMessagePlan {
         let mut method = SendPhoto::new(self.chat_id, self.photo.to_input_file());
         if let Some(thread_id) = self.message_thread_id {
             method = method.with_message_thread_id(thread_id);
+        }
+        if let Some(topic_id) = self.direct_messages_topic_id {
+            method = method.with_direct_messages_topic_id(topic_id);
         }
         if self.disable_notification {
             method = method.with_disable_notification(true);
@@ -1489,6 +1523,7 @@ impl AudioMessagePlan {
         let mut value = go_base_file_config_json(
             self.chat_id,
             self.message_thread_id,
+            self.direct_messages_topic_id,
             self.disable_notification,
             self.reply_parameters,
             self.audio.go_file_value(),
@@ -1510,6 +1545,9 @@ impl AudioMessagePlan {
         let mut method = SendAudio::new(self.chat_id, self.audio.to_input_file());
         if let Some(thread_id) = self.message_thread_id {
             method = method.with_message_thread_id(thread_id);
+        }
+        if let Some(topic_id) = self.direct_messages_topic_id {
+            method = method.with_direct_messages_topic_id(topic_id);
         }
         if self.disable_notification {
             method = method.with_disable_notification(true);
@@ -1564,6 +1602,7 @@ impl MediaGroupMessagePlan {
         let mut fields = go_base_chat_config_fields(
             self.chat_id,
             self.message_thread_id,
+            self.direct_messages_topic_id,
             self.disable_notification,
             self.reply_parameters,
         );
@@ -1590,6 +1629,9 @@ impl MediaGroupMessagePlan {
         let mut method = SendMediaGroup::new(self.chat_id, group);
         if let Some(thread_id) = self.message_thread_id {
             method = method.with_message_thread_id(thread_id);
+        }
+        if let Some(topic_id) = self.direct_messages_topic_id {
+            method = method.with_direct_messages_topic_id(topic_id);
         }
         if self.disable_notification {
             method = method.with_disable_notification(true);
@@ -1681,6 +1723,7 @@ fn go_persistence_payload(
 fn go_base_file_config_json(
     chat_id: i64,
     message_thread_id: Option<i64>,
+    direct_messages_topic_id: Option<i64>,
     disable_notification: bool,
     reply_parameters: Option<ReplyParametersPlan>,
     file: Value,
@@ -1688,6 +1731,7 @@ fn go_base_file_config_json(
     let mut fields = go_base_chat_config_fields(
         chat_id,
         message_thread_id,
+        direct_messages_topic_id,
         disable_notification,
         reply_parameters,
     );
@@ -1698,6 +1742,7 @@ fn go_base_file_config_json(
 fn go_base_chat_config_fields(
     chat_id: i64,
     message_thread_id: Option<i64>,
+    direct_messages_topic_id: Option<i64>,
     disable_notification: bool,
     reply_parameters: Option<ReplyParametersPlan>,
 ) -> Map<String, Value> {
@@ -1710,7 +1755,10 @@ fn go_base_chat_config_fields(
         "MessageThreadID".to_owned(),
         json!(message_thread_id.unwrap_or_default()),
     );
-    fields.insert("DirectMessagesTopicID".to_owned(), json!(0));
+    fields.insert(
+        "DirectMessagesTopicID".to_owned(),
+        json!(direct_messages_topic_id.unwrap_or_default()),
+    );
     fields.insert("ProtectContent".to_owned(), json!(false));
     fields.insert("ReplyMarkup".to_owned(), Value::Null);
     fields.insert(
@@ -1859,13 +1907,18 @@ mod tests {
 
     fn private_chat(id: i64) -> ChatRef {
         ChatRef {
+            direct_messages_topic_id: None,
             id,
             is_forum: false,
         }
     }
 
     fn forum_chat(id: i64) -> ChatRef {
-        ChatRef { id, is_forum: true }
+        ChatRef {
+            direct_messages_topic_id: None,
+            id,
+            is_forum: true,
+        }
     }
 
     fn base_text_request(text: &str) -> TextMessageRequest {
@@ -1963,6 +2016,7 @@ mod tests {
     #[test]
     fn fingerprint_photo_plan_hashes_reusable_file_id_without_formatting() {
         let plan = PhotoMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             photo: PhotoSource::FileId("photo-file-id".to_owned()),
             message_thread_id: None,
@@ -1984,6 +2038,7 @@ mod tests {
     #[test]
     fn fingerprint_photo_plan_hashes_uploaded_file_like_go_file_bytes() {
         let plan = PhotoMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             photo: PhotoSource::Bytes {
                 file_name: "plotva_image_provider_1.jpg".to_owned(),
@@ -2006,6 +2061,7 @@ mod tests {
     #[test]
     fn fingerprint_media_plans_use_go_message_type_names() {
         let sticker = StickerMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             file_id: "sticker-file".to_owned(),
             message_thread_id: None,
@@ -2013,6 +2069,7 @@ mod tests {
             reply_parameters: None,
         };
         let audio = AudioMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 7,
             audio: AudioSource::FileId("song-file-id".to_owned()),
             message_thread_id: None,
@@ -2351,6 +2408,7 @@ mod tests {
     fn sticker_plan_persistence_payload_matches_go_sticker_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = StickerMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             file_id: "sticker-file".to_owned(),
             message_thread_id: Some(77),
@@ -2466,6 +2524,7 @@ mod tests {
     fn photo_plan_persistence_payload_matches_go_photo_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = PhotoMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             photo: PhotoSource::Url("https://example.test/image.png".to_owned()),
             message_thread_id: Some(77),
@@ -2503,6 +2562,7 @@ mod tests {
     fn photo_plan_persistence_payload_encodes_uploaded_bytes_like_go_file_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = PhotoMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             photo: PhotoSource::Bytes {
                 file_name: "image.png".to_owned(),
@@ -2592,6 +2652,7 @@ mod tests {
     fn media_group_plan_persistence_payload_matches_go_media_group_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = MediaGroupMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             message_thread_id: Some(77),
             disable_notification: true,
@@ -2699,6 +2760,7 @@ mod tests {
     fn audio_plan_persistence_payload_matches_go_audio_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = AudioMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             audio: AudioSource::FileId("song-file-id".to_owned()),
             message_thread_id: Some(77),
@@ -3595,5 +3657,26 @@ mod tests {
             value.get("reaction").is_none(),
             "clear must omit the reaction field, got {value}"
         );
+    }
+    #[test]
+    fn direct_messages_topic_survives_photo_plan_persistence() {
+        let request = PhotoMessageRequest {
+            chat: ChatRef {
+                direct_messages_topic_id: Some(4_294_967_301),
+                id: -100,
+                is_forum: false,
+            },
+            message_thread_id: 0,
+            disable_notification: false,
+            photo: PhotoSource::FileId("photo-file".to_owned()),
+            caption: String::new(),
+            render_as: String::new(),
+            has_spoiler: false,
+            reply_parameters: None,
+        };
+        let plan = build_photo_message_plan(&request).expect("plan");
+        let saved = plan.to_persistence_payload().expect("save");
+        let value: Value = serde_json::from_slice(&saved.message).expect("json");
+        assert_eq!(value["DirectMessagesTopicID"], 4_294_967_301_i64);
     }
 }

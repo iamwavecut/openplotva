@@ -194,6 +194,7 @@ pub fn build_admin_report_dispatch(
     virtual_id: &str,
 ) -> Result<DispatcherMessage, String> {
     let chat = ChatRef {
+        direct_messages_topic_id: None,
         id: admin_id,
         is_forum: false,
     };

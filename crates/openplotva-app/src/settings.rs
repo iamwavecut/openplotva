@@ -712,6 +712,7 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
 
             let queue = DispatcherQueue::new(DispatcherConfig::default());
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: message.chat_id,
                 is_forum: message.thread_id.is_some(),
             };
@@ -1512,6 +1513,10 @@ where
     }
 
     let chat = ChatRef {
+        direct_messages_topic_id: message
+            .direct_messages_topic
+            .as_ref()
+            .map(|topic| topic.topic_id),
         id: message.chat.get_id().into(),
         is_forum: false,
     };
@@ -2368,6 +2373,7 @@ where
     NextId: FnMut() -> String,
 {
     let chat = ChatRef {
+        direct_messages_topic_id: None,
         id: params.chat_id,
         is_forum: false,
     };
@@ -2412,6 +2418,7 @@ where
     NextId: FnMut() -> String,
 {
     let chat = ChatRef {
+        direct_messages_topic_id: None,
         id: params.chat_id,
         is_forum: false,
     };
@@ -3137,6 +3144,10 @@ pub fn admin_chat_member_upsert_from_telegram(
 
 fn message_chat_ref(message: &TelegramMessage) -> ChatRef {
     ChatRef {
+        direct_messages_topic_id: message
+            .direct_messages_topic
+            .as_ref()
+            .map(|topic| topic.topic_id),
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
     }

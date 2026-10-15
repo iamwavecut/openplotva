@@ -383,8 +383,6 @@ pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
 
 pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
 
-pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
-
 /// Visible-card lists the memory pipeline keeps in RAM; `0` disables the cache.
 pub const DEFAULT_MEMORY_CARD_CACHE_ENTRIES: i32 = 4_096;
 
@@ -1051,7 +1049,6 @@ pub struct MemoryConfig {
     pub worker_concurrency: i32,
     pub max_messages_per_run: i32,
     pub min_messages_per_run: i32,
-    pub max_queued_runs: i32,
     pub card_cache_entries: i32,
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
@@ -1579,8 +1576,6 @@ pub struct RawConfig {
     pub memory_max_messages_per_run: Option<String>,
     /// `MEMORY_MIN_MESSAGES_PER_RUN`.
     pub memory_min_messages_per_run: Option<String>,
-    /// `MEMORY_MAX_QUEUED_RUNS`.
-    pub memory_max_queued_runs: Option<String>,
     /// `MEMORY_CARD_CACHE_ENTRIES`.
     pub memory_card_cache_entries: Option<String>,
     /// `MEMORY_MAX_INPUT_TOKENS`.
@@ -2907,14 +2902,6 @@ impl AppConfig {
                         DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN,
                     )?,
                 )?,
-                max_queued_runs: validate_positive_i32(
-                    "MEMORY_MAX_QUEUED_RUNS",
-                    parse_i32(
-                        "MEMORY_MAX_QUEUED_RUNS",
-                        raw.memory_max_queued_runs,
-                        DEFAULT_MEMORY_MAX_QUEUED_RUNS,
-                    )?,
-                )?,
                 card_cache_entries: validate_non_negative_i32(
                     "MEMORY_CARD_CACHE_ENTRIES",
                     parse_i32(
@@ -3407,7 +3394,6 @@ impl RawConfig {
             memory_worker_concurrency: env("MEMORY_WORKER_CONCURRENCY"),
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
             memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
-            memory_max_queued_runs: env("MEMORY_MAX_QUEUED_RUNS"),
             memory_card_cache_entries: env("MEMORY_CARD_CACHE_ENTRIES"),
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
@@ -4222,10 +4208,6 @@ mod tests {
             config.memory.min_messages_per_run,
             super::DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN
         );
-        assert_eq!(
-            config.memory.max_queued_runs,
-            super::DEFAULT_MEMORY_MAX_QUEUED_RUNS
-        );
         assert_eq!(config.memory.max_input_tokens, 10_000);
         assert_eq!(config.memory.tokenizer_model, "google/gemma-4-26B-A4B-it");
         assert_eq!(config.memory.embedder_service_name, "embedder");
@@ -4934,7 +4916,6 @@ mod tests {
             memory_worker_concurrency: Some("2".to_owned()),
             memory_max_messages_per_run: Some("55".to_owned()),
             memory_min_messages_per_run: Some("20".to_owned()),
-            memory_max_queued_runs: Some("5000".to_owned()),
             memory_max_input_tokens: Some("6000".to_owned()),
             memory_tokenizer_model: Some("tokenizer".to_owned()),
             memory_tokenizer_file: Some("/tmp/tokenizer.json".to_owned()),
@@ -4971,7 +4952,6 @@ mod tests {
         assert_eq!(config.memory.worker_concurrency, 2);
         assert_eq!(config.memory.max_messages_per_run, 55);
         assert_eq!(config.memory.min_messages_per_run, 20);
-        assert_eq!(config.memory.max_queued_runs, 5000);
         assert_eq!(config.memory.max_input_tokens, 6000);
         assert_eq!(config.memory.tokenizer_model, "tokenizer");
         assert_eq!(config.memory.tokenizer_file, "/tmp/tokenizer.json");
@@ -5008,7 +4988,6 @@ mod tests {
     fn memory_policy_defaults_and_rejects_non_positive_values() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig::default())?;
         assert_eq!(config.memory.min_messages_per_run, 20);
-        assert_eq!(config.memory.max_queued_runs, 5000);
         assert_eq!(
             config.memory.card_cache_entries,
             super::DEFAULT_MEMORY_CARD_CACHE_ENTRIES
@@ -5029,19 +5008,6 @@ mod tests {
             Some(super::ConfigError::NonPositiveInteger {
                 name: "MEMORY_MIN_MESSAGES_PER_RUN",
                 value: 0,
-            })
-        ));
-
-        let error = AppConfig::from_raw(RawConfig {
-            memory_max_queued_runs: Some("-1".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-        assert!(matches!(
-            error,
-            Some(super::ConfigError::NonPositiveInteger {
-                name: "MEMORY_MAX_QUEUED_RUNS",
-                value: -1,
             })
         ));
 

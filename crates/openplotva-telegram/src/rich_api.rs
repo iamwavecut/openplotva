@@ -37,6 +37,8 @@ impl fmt::Debug for RichApiClient {
 /// Optional parameters shared by rich-message sends.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Serialize)]
 pub struct RichSendOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_messages_topic_id: Option<i64>,
     pub message_thread_id: Option<i64>,
     pub reply_to_message_id: Option<i64>,
     pub allow_sending_without_reply: bool,
@@ -220,6 +222,9 @@ fn build_send_body(chat_id: i64, html: &str, options: &RichSendOptions) -> Value
     let mut body = Map::new();
     body.insert("chat_id".to_owned(), json!(chat_id));
     body.insert("rich_message".to_owned(), json!({ "html": html }));
+    if let Some(topic) = options.direct_messages_topic_id {
+        body.insert("direct_messages_topic_id".to_owned(), json!(topic));
+    }
     if let Some(thread) = options.message_thread_id {
         body.insert("message_thread_id".to_owned(), json!(thread));
     }
@@ -308,6 +313,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_messages_topic_is_in_rich_send_body() {
+        let options = RichSendOptions {
+            direct_messages_topic_id: Some(4_294_967_301),
+            ..RichSendOptions::default()
+        };
+        let body = build_send_body(42, "hello", &options);
+        assert_eq!(body["direct_messages_topic_id"], 4_294_967_301_i64);
+        assert!(body.get("message_thread_id").is_none());
+    }
+
+    #[test]
     fn send_body_minimal() {
         let body = build_send_body(42, "<b>x</b>", &RichSendOptions::default());
         assert_eq!(
@@ -319,6 +335,7 @@ mod tests {
     #[test]
     fn send_body_with_reply_thread_and_markup() {
         let options = RichSendOptions {
+            direct_messages_topic_id: None,
             message_thread_id: Some(7),
             reply_to_message_id: Some(11),
             allow_sending_without_reply: true,

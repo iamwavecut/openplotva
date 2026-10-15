@@ -650,6 +650,12 @@ fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
         text = text.with_format(mode);
     }
     let mut method = SendMessage::new(chat_id, text);
+    if let Some(topic_id) = non_zero_field_i64(
+        value,
+        &["DirectMessagesTopicID", "direct_messages_topic_id"],
+    ) {
+        method = method.with_direct_messages_topic_id(topic_id);
+    }
     if field_bool(value, &["DisableNotification", "disable_notification"]).unwrap_or(false) {
         method = method.with_disable_notification(true);
     }
@@ -748,6 +754,10 @@ fn reaction_emoji(value: &Value) -> Option<String> {
 fn replay_sticker_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let plan = StickerMessagePlan {
+        direct_messages_topic_id: non_zero_field_i64(
+            value,
+            &["DirectMessagesTopicID", "direct_messages_topic_id"],
+        ),
         chat_id,
         file_id: string_file_value(field_value(value, &["File", "sticker"])?)?,
         message_thread_id: non_zero_field_i64(value, &["MessageThreadID", "message_thread_id"]),
@@ -761,6 +771,10 @@ fn replay_sticker_method(value: &Value) -> Option<TelegramOutboundMethod> {
 fn replay_photo_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let plan = PhotoMessagePlan {
+        direct_messages_topic_id: non_zero_field_i64(
+            value,
+            &["DirectMessagesTopicID", "direct_messages_topic_id"],
+        ),
         chat_id,
         photo: photo_source_value(field_value(value, &["File", "photo"])?)?,
         message_thread_id: non_zero_field_i64(value, &["MessageThreadID", "message_thread_id"]),
@@ -777,6 +791,10 @@ fn replay_photo_method(value: &Value) -> Option<TelegramOutboundMethod> {
 fn replay_audio_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let plan = AudioMessagePlan {
+        direct_messages_topic_id: non_zero_field_i64(
+            value,
+            &["DirectMessagesTopicID", "direct_messages_topic_id"],
+        ),
         chat_id,
         audio: audio_source_value(field_value(value, &["File", "audio"])?)?,
         message_thread_id: non_zero_field_i64(value, &["MessageThreadID", "message_thread_id"]),
@@ -793,6 +811,10 @@ fn replay_media_group_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let media = field_value(value, &["Media", "media"])?.as_array()?;
     let plan = MediaGroupMessagePlan {
+        direct_messages_topic_id: non_zero_field_i64(
+            value,
+            &["DirectMessagesTopicID", "direct_messages_topic_id"],
+        ),
         chat_id,
         message_thread_id: non_zero_field_i64(value, &["MessageThreadID", "message_thread_id"]),
         disable_notification: field_bool(value, &["DisableNotification", "disable_notification"])
@@ -835,7 +857,7 @@ fn fingerprint_from_value(
     fallback_chat_id: i64,
 ) -> MessageFingerprint {
     let chat_id = field_i64(value, &["ChatID", "chat_id"]).unwrap_or(fallback_chat_id);
-    match method_kind {
+    let fingerprint = match method_kind {
         TelegramOutboundMethodKind::SendMessage => MessageFingerprint {
             chat_id,
             message_type: "text".to_owned(),
@@ -890,7 +912,13 @@ fn fingerprint_from_value(
             content_hash: hash_content(&value.to_string()),
             debounce_key: None,
         },
-    }
+    };
+    let topic_id = non_zero_field_i64(
+        value,
+        &["DirectMessagesTopicID", "direct_messages_topic_id"],
+    )
+    .or_else(|| non_zero_field_i64(&value["options"], &["direct_messages_topic_id"]));
+    fingerprint.with_direct_messages_topic(topic_id)
 }
 
 fn file_fingerprint(chat_id: i64, message_type: &str, value: Option<&Value>) -> MessageFingerprint {
@@ -1250,6 +1278,7 @@ mod tests {
             chat_id,
             html: html.to_owned(),
             options: RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: Some(77),
                 reply_to_message_id: Some(9),
                 allow_sending_without_reply: true,
@@ -1680,14 +1709,65 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn direct_messages_topic_survives_media_replay_on_the_wire()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = 4_294_967_301_i64;
+        let fixtures = [
+            (
+                TelegramOutboundMethodKind::SendPhoto,
+                json!({"File":"photo"}),
+            ),
+            (
+                TelegramOutboundMethodKind::SendAudio,
+                json!({"File":"audio"}),
+            ),
+            (
+                TelegramOutboundMethodKind::SendSticker,
+                json!({"File":"sticker"}),
+            ),
+            (
+                TelegramOutboundMethodKind::SendMediaGroup,
+                json!({"Media":[{"type":"photo","media":"photo1"},{"type":"photo","media":"photo2"}]}),
+            ),
+        ];
+        for (kind, mut payload) in fixtures {
+            payload["ChatID"] = json!(42);
+            payload["DirectMessagesTopicID"] = json!(topic);
+            payload["MessageThreadID"] = json!(0);
+            let method =
+                replay_outbound_method(kind, &serde_json::to_vec(&payload)?).expect("media replay");
+            let wire = match method {
+                TelegramOutboundMethod::SendPhoto(method) => {
+                    crate::test_api::bot_api_payload(*method).await?
+                }
+                TelegramOutboundMethod::SendAudio(method) => {
+                    crate::test_api::bot_api_payload(*method).await?
+                }
+                TelegramOutboundMethod::SendSticker(method) => {
+                    crate::test_api::bot_api_payload(*method).await?
+                }
+                TelegramOutboundMethod::SendMediaGroup(method) => {
+                    crate::test_api::bot_api_payload(*method).await?
+                }
+                _ => panic!("unexpected method"),
+            };
+            assert_eq!(wire["direct_messages_topic_id"], topic, "{kind:?}");
+            assert!(wire.get("message_thread_id").is_none(), "{kind:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn reply_missing_fallback_replays_create_methods_without_reply_target()
     -> Result<(), Box<dyn std::error::Error>> {
-        let text = carapax::types::SendMessage::new(42, "hello").with_reply_parameters(
-            carapax::types::ReplyParameters::new(9)
-                .with_chat_id(42)
-                .with_allow_sending_without_reply(true),
-        );
+        let text = carapax::types::SendMessage::new(42, "hello")
+            .with_direct_messages_topic_id(4_294_967_301_i64)
+            .with_reply_parameters(
+                carapax::types::ReplyParameters::new(9)
+                    .with_chat_id(42)
+                    .with_allow_sending_without_reply(true),
+            );
         let TelegramOutboundMethod::SendMessage(text) =
             replay_outbound_method_without_reply(&TelegramOutboundMethod::from(text))
                 .expect("text fallback")
@@ -1696,6 +1776,7 @@ mod tests {
         };
         let text_payload = serde_json::to_value(text.as_ref())?;
         assert!(text_payload.get("reply_parameters").is_none());
+        assert_eq!(text_payload["direct_messages_topic_id"], 4_294_967_301_i64);
 
         let TelegramOutboundMethod::SendRichMessage(rich) =
             replay_outbound_method_without_reply(&rich_method(42, "<b>hello</b>"))
@@ -1718,6 +1799,7 @@ mod tests {
                 .with_method(sticker_method(42, "sticker-file-id"))
                 .with_persistence_payload(
                     StickerMessagePlan {
+                        direct_messages_topic_id: None,
                         chat_id: 42,
                         file_id: "sticker-file-id".to_owned(),
                         message_thread_id: None,
@@ -1758,6 +1840,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let command = StickerMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             file_id: "sticker-file-id".to_owned(),
             message_thread_id: None,
@@ -2053,6 +2136,7 @@ mod tests {
     fn replay_reconstructs_current_form_backed_media_methods()
     -> Result<(), Box<dyn std::error::Error>> {
         let photo = PhotoMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             photo: PhotoSource::Url("https://example.test/image.png".to_owned()),
             message_thread_id: Some(77),
@@ -2064,6 +2148,7 @@ mod tests {
         }
         .to_persistence_payload()?;
         let audio = AudioMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             audio: AudioSource::Bytes {
                 file_name: "song.mp3".to_owned(),
@@ -2077,6 +2162,7 @@ mod tests {
         }
         .to_persistence_payload()?;
         let media_group = MediaGroupMessagePlan {
+            direct_messages_topic_id: None,
             chat_id: 42,
             message_thread_id: None,
             disable_notification: false,

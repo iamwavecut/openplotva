@@ -669,11 +669,14 @@ where
                 index + 1 == total_parts,
             )?
         };
-        let mut dispatcher_message =
-            DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
-                .with_method(TelegramOutboundMethod::from(method))
-                .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
-                .with_protected(req.protected);
+        let mut dispatcher_message = DispatcherMessage::new(
+            fingerprint_text_message_part(chat.id, &part)
+                .with_direct_messages_topic(chat.direct_messages_topic_id),
+            &virtual_id,
+        )
+        .with_method(TelegramOutboundMethod::from(method))
+        .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
+        .with_protected(req.protected);
         if let Some(debounce_key) = req.debounce_key {
             dispatcher_message = dispatcher_message.with_debounce_key(debounce_key);
         }
@@ -706,11 +709,14 @@ where
     let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
     let method = build_rich_message_method(req.message, chat, req.reply_to)?;
     let virtual_id = next_virtual_id();
-    let mut dispatcher_message =
-        DispatcherMessage::new(fingerprint_rich_message(chat.id, &method.html), &virtual_id)
-            .with_method(TelegramOutboundMethod::from(method))
-            .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
-            .with_protected(req.protected);
+    let mut dispatcher_message = DispatcherMessage::new(
+        fingerprint_rich_message(chat.id, &method.html)
+            .with_direct_messages_topic(chat.direct_messages_topic_id),
+        &virtual_id,
+    )
+    .with_method(TelegramOutboundMethod::from(method))
+    .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
+    .with_protected(req.protected);
     if let Some(debounce_key) = req.debounce_key {
         dispatcher_message = dispatcher_message.with_debounce_key(debounce_key);
     }
@@ -1260,6 +1266,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_messages_topics_keep_identical_replies_separate_after_replay()
+    -> Result<(), Box<dyn Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            dedupe_config: openplotva_telegram::DebouncerConfig {
+                enabled: true,
+                default_window: Duration::from_secs(30),
+                max_cache_size: 1000,
+                per_chat_settings: Default::default(),
+            },
+            ..DispatcherConfig::default()
+        });
+        for topic in [4_294_967_301_i64, 4_294_967_302_i64] {
+            let mut request = text_request("same reply");
+            request
+                .chat
+                .as_mut()
+                .expect("chat")
+                .direct_messages_topic_id = Some(topic);
+            let result = queue_text_message_parts(
+                &queue,
+                QueueTextRequest {
+                    message: &request,
+                    reply_to: None,
+                    immediate_first: false,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: None,
+                    protected: false,
+                    debounce_key: None,
+                },
+                || format!("topic-{topic}"),
+            )
+            .await?;
+            assert_eq!(result.enqueued_count(), 1, "topic {topic}");
+        }
+        let expected = queue.snapshot();
+        let saved = persistent_queue_from_drain(queue.drain_for_shutdown(), 10)?;
+        let replay = openplotva_telegram::persistent_queue_replay_from_items(saved.items);
+        for (before, after) in expected.regular.iter().zip(&replay.items) {
+            assert_eq!(before.fingerprint_key, after.fingerprint.to_string());
+        }
+        let restored = DispatcherQueue::new(DispatcherConfig::default());
+        for item in replay.items {
+            restored.restore(item);
+        }
+        let actual = restored.snapshot();
+        assert_eq!(actual.regular.len(), 2);
+        for (before, after) in expected.regular.iter().zip(&actual.regular) {
+            assert_eq!(before.fingerprint_key, after.fingerprint_key);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn queue_text_message_parts_inserts_virtual_ids_before_dispatch_enqueue()
     -> Result<(), Box<dyn Error>> {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
@@ -1364,6 +1423,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = openplotva_telegram::StickerMessageRequest {
             chat: Some(ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: true,
             }),
@@ -1415,6 +1475,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = PhotoMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: true,
             },
@@ -1467,6 +1528,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = AudioMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: true,
             },
@@ -1598,6 +1660,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = EditMediaMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: true,
             },
@@ -1654,6 +1717,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = EditTextMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             },
@@ -1924,6 +1988,7 @@ mod tests {
         let method = build_text_message_method(
             &text_request("hello"),
             ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             },
@@ -1970,6 +2035,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = EditTextMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             },
@@ -2032,6 +2098,7 @@ mod tests {
     fn text_request(text: &str) -> TextMessageRequest {
         TextMessageRequest {
             chat: Some(ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             }),
@@ -2047,6 +2114,7 @@ mod tests {
     fn media_group_request() -> MediaGroupMessageRequest {
         MediaGroupMessageRequest {
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: true,
             },
@@ -2079,6 +2147,7 @@ mod tests {
         let method = build_text_message_method(
             &text_request("hello"),
             ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             },
@@ -2106,6 +2175,7 @@ mod tests {
         let method = build_text_message_method(
             &text_request("hello"),
             ChatRef {
+                direct_messages_topic_id: None,
                 id: 42,
                 is_forum: false,
             },

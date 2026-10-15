@@ -1888,6 +1888,7 @@ mod tests {
                 .execute(&pool)
                 .await?;
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: chat_id,
                 is_forum: false,
             };

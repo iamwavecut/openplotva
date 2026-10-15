@@ -1155,6 +1155,7 @@ where
                 footer_html: &footer_html,
             });
             let options = openplotva_telegram::RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: plan.thread_id.map(i64::from),
                 reply_to_message_id: Some(i64::from(plan.message_id)),
                 allow_sending_without_reply: true,

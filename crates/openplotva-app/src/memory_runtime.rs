@@ -1424,12 +1424,7 @@ where
 
     if enqueue_runs {
         match store
-            .ensure_hourly_runs(
-                now,
-                cfg.retention,
-                memory_enqueue_lookback(now, cfg.retention),
-                cfg.enqueue_policy,
-            )
+            .ensure_hourly_runs(now, cfg.retention, cfg.retention, cfg.enqueue_policy)
             .await
         {
             Ok(queued) => report.queued_runs = queued,
@@ -1485,12 +1480,7 @@ where
 
     if enqueue_runs {
         match store
-            .ensure_hourly_runs(
-                now,
-                cfg.retention,
-                memory_enqueue_lookback(now, cfg.retention),
-                cfg.enqueue_policy,
-            )
+            .ensure_hourly_runs(now, cfg.retention, cfg.retention, cfg.enqueue_policy)
             .await
         {
             Ok(queued) => report.queued_runs = queued,
@@ -2523,26 +2513,6 @@ fn estimate_extraction_tokens(
 /// Minutes past the hour at which the scheduler enqueues the hour that just
 /// completed, so history writes that trail the hour boundary are included.
 const MEMORY_ENQUEUE_MINUTE: u8 = 2;
-/// Completed hours an hourly tick looks back over; a tick that ran late or a
-/// short outage still lands its hours.
-pub const MEMORY_RECENT_LOOKBACK: Duration = Duration::from_secs(2 * 60 * 60);
-/// UTC hour whose tick rescans the whole retention window for hours a longer
-/// outage or a full queue left without a run.
-const MEMORY_FULL_SCAN_HOUR: u8 = 3;
-
-/// History span one enqueue tick scans: the whole retention window once a day,
-/// otherwise the recent hours. Startup scans recent hours too, so a deploy does
-/// not refill the queue while the process catches up; the daily scan covers
-/// hours missed while it was down.
-#[must_use]
-pub fn memory_enqueue_lookback(now: OffsetDateTime, retention: Duration) -> Duration {
-    if now.to_offset(time::UtcOffset::UTC).hour() == MEMORY_FULL_SCAN_HOUR {
-        retention
-    } else {
-        MEMORY_RECENT_LOOKBACK.min(retention)
-    }
-}
-
 /// Time from `now` until the next enqueue tick at `HH:02` UTC.
 #[must_use]
 pub fn next_memory_enqueue_delay(now: OffsetDateTime) -> Duration {
@@ -4678,7 +4648,6 @@ pub fn memory_service_worker_config_from_memory_config(
         retention: positive_hours(config.retention_hours, 7 * 24),
         enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy {
             min_messages_per_run: config.min_messages_per_run,
-            max_queued_runs: config.max_queued_runs,
         },
         process: MemoryRunProcessConfig {
             lease: positive_seconds(config.consolidation_timeout_seconds),
@@ -5663,7 +5632,6 @@ mod tests {
     fn memory_service_worker_config_includes_enqueue_policy() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             memory_min_messages_per_run: Some("21".to_owned()),
-            memory_max_queued_runs: Some("4321".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
@@ -5671,7 +5639,6 @@ mod tests {
         let cfg = memory_service_worker_config_from_memory_config(&config.memory);
 
         assert_eq!(cfg.enqueue_policy.min_messages_per_run, 21);
-        assert_eq!(cfg.enqueue_policy.max_queued_runs, 4321);
     }
 
     #[test]
@@ -6600,7 +6567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_scheduler_tick_enqueues_completed_hours() {
+    async fn startup_and_every_scheduler_tick_cover_the_full_retention_window() {
         let store = FakeMemoryWriteStore {
             ensure_hourly_count: 2,
             ..FakeMemoryWriteStore::default()
@@ -6646,12 +6613,8 @@ mod tests {
             .collect();
         assert_eq!(
             lookbacks,
-            vec![
-                MEMORY_RECENT_LOOKBACK,
-                cfg.retention,
-                MEMORY_RECENT_LOOKBACK
-            ],
-            "hourly ticks and startup scan recent hours; the daily tick scans the retention window"
+            vec![cfg.retention; 3],
+            "daytime, nighttime, and startup recover all missed retained hours"
         );
     }
 

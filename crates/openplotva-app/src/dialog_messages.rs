@@ -707,6 +707,7 @@ impl crate::dialog_tools::DrawQueueNoticeSender for DrawQueueNoticeDispatcherSen
             let message_thread_id = i64::from(notice.thread_id.unwrap_or_default());
             let is_topic_message = notice.thread_id.is_some();
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: chat_id,
                 is_forum: is_topic_message,
             };
@@ -2055,6 +2056,7 @@ fn direct_draw_api_photo_request(
         })?;
     Some(PhotoMessageRequest {
         chat: ChatRef {
+            direct_messages_topic_id: None,
             id: request.chat_id,
             is_forum: request.is_forum,
         },

@@ -452,6 +452,7 @@ impl DeliveryObligationNotifier for DispatcherDeliveryObligationNotifier {
                 None
             };
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: target.chat_id,
                 is_forum: target.thread_id.is_some(),
             };

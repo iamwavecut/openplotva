@@ -1574,6 +1574,9 @@ pub fn build_message_meta(
     vision_description: &str,
 ) -> ChatMessageMeta {
     let mut meta = ChatMessageMeta {
+        direct_messages_topic_id: message
+            .and_then(|m| m.direct_messages_topic.as_ref())
+            .map(|topic| topic.topic_id),
         annotation: message.map(forward_annotation).unwrap_or_default(),
         vision_description: vision_description.trim().to_owned(),
         sender_type: sender.sender_type.clone(),
@@ -5692,6 +5695,30 @@ mod tests {
             openplotva_core::MessageSender::system()
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn message_meta_preserves_direct_messages_topic_as_i64() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 140,
+            "message": {
+                "message_id": 72, "date": 1_710_000_000,
+                "chat": sample_private_chat_json(), "from": sample_user_json(),
+                "text": "hello", "direct_messages_topic": {"topic_id": 4_294_967_301_i64}
+            }
+        }))?;
+        let message = update_message(&update)?;
+        let meta = super::build_message_meta(
+            Some(message),
+            super::resolve_message_sender(Some(message)),
+            &[],
+            "",
+        );
+        assert_eq!(
+            serde_json::to_value(meta)?["direct_messages_topic_id"],
+            4_294_967_301_i64
+        );
         Ok(())
     }
 

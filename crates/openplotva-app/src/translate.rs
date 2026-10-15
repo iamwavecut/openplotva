@@ -202,6 +202,7 @@ impl TranslateEffects for TranslateDispatcherEffects {
     ) -> TranslateEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: message.chat_id,
                 is_forum: message.thread_id.is_some(),
             };
@@ -1314,6 +1315,7 @@ pub fn translate_result_plan_from_control_job(
     translated: String,
 ) -> TranslateResultPlan {
     let chat = ChatRef {
+        direct_messages_topic_id: None,
         id: params.chat_id,
         is_forum: params.thread_id.is_some(),
     };
@@ -2195,6 +2197,7 @@ mod tests {
         let effects = TranslateDispatcherEffects::new(Arc::clone(&queue))
             .with_virtual_id_factory(Arc::new(|| "translate-vmsg-1".to_owned()));
         let chat = ChatRef {
+            direct_messages_topic_id: None,
             id: -10042,
             is_forum: true,
         };

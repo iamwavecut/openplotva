@@ -238,6 +238,9 @@ pub fn filter_non_terminator_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatMessageMeta {
+    /// Destination topic in a channel's direct messages chat (up to 52 bits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_messages_topic_id: Option<i64>,
     /// Server-granted permission for one spontaneous gift; never copied from a tool argument.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_gift: bool,

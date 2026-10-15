@@ -415,6 +415,41 @@ async fn dialog_worker_skips_resend_when_answer_sent_marker_present() -> Result<
 }
 
 #[tokio::test]
+async fn dialog_dispatcher_keeps_direct_messages_topic_through_replay() -> Result<(), Box<dyn Error>>
+{
+    let queue = Arc::new(DispatcherQueue::new(
+        openplotva_telegram::DispatcherConfig::default(),
+    ));
+    let effects = DialogDispatcherEffects::new(Arc::clone(&queue));
+    let mut params = dialog_params("hello");
+    params.thread_id = None;
+    params.meta = serde_json::json!({"direct_messages_topic_id": 4_294_967_301_i64});
+    effects
+        .send_dialog_answer(1, None, &params, "pong", DialogAnswerSendOptions::default())
+        .await?;
+    let item = queue.dequeue_immediate().expect("answer");
+    let (_, method) = item.into_parts();
+    let command = openplotva_telegram::OutboundCommand::try_from_method(method.expect("method"))?;
+    let payload = command.payload().expect("durable payload");
+    assert_eq!(payload["direct_messages_topic_id"], 4_294_967_301_i64);
+    assert!(payload.get("message_thread_id").is_none());
+    let replay = openplotva_telegram::OutboundCommand::decode(
+        1,
+        "sendMessage",
+        &serde_json::to_vec(payload)?,
+    )?;
+    let openplotva_telegram::TelegramOutboundMethod::SendMessage(method) = replay.into_method()
+    else {
+        panic!("sendMessage");
+    };
+    assert_eq!(
+        serde_json::to_value(method)?["direct_messages_topic_id"],
+        4_294_967_301_i64
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
 -> Result<(), Box<dyn Error>> {
     let queue = Arc::new(DispatcherQueue::new(
