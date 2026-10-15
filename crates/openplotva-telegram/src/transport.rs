@@ -943,6 +943,7 @@ mod tests {
 
     fn chat(id: i64) -> ChatRef {
         ChatRef {
+            direct_messages_topic_id: None,
             id,
             is_forum: false,
         }

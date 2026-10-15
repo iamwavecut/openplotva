@@ -353,6 +353,7 @@ pub(crate) fn image_ad_message(
         return Err("Ephemeral image advertising requires a group chat".to_owned());
     }
     let chat = ChatRef {
+        direct_messages_topic_id: None,
         id: chat_id,
         is_forum: thread_id.is_some(),
     };
@@ -412,6 +413,7 @@ fn utility_rich_send(
         chat_id,
         html: utility_rich_html(html)?,
         options: RichSendOptions {
+            direct_messages_topic_id: None,
             message_thread_id: thread_id.map(i64::from),
             reply_to_message_id: Some(reply_to),
             ..Default::default()

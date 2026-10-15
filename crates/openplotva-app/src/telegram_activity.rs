@@ -177,6 +177,7 @@ where
 
             let request = ChatActionRequest {
                 chat: ChatRef {
+                    direct_messages_topic_id: None,
                     id: chat_id,
                     is_forum: thread_id.is_some(),
                 },

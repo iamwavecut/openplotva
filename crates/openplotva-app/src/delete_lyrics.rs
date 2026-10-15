@@ -408,6 +408,10 @@ fn delete_lyrics_control_message(
     match query.message.as_ref()? {
         MaybeInaccessibleMessage::Message(message) => Some(DeleteLyricsControlMessage {
             chat: ChatRef {
+                direct_messages_topic_id: message
+                    .direct_messages_topic
+                    .as_ref()
+                    .map(|topic| topic.topic_id),
                 id: message.chat.get_id().into(),
                 is_forum: message.message_thread_id.is_some(),
             },
@@ -416,6 +420,7 @@ fn delete_lyrics_control_message(
         MaybeInaccessibleMessage::InaccessibleMessage(message) => {
             Some(DeleteLyricsControlMessage {
                 chat: ChatRef {
+                    direct_messages_topic_id: None,
                     id: message.chat.get_id().into(),
                     is_forum: false,
                 },

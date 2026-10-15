@@ -1277,6 +1277,63 @@ fn capture_raw_body(value: Option<&Value>, policy: RawBodyPolicy) -> RawBodyCapt
     }
 }
 
+/// Fixed-key counters survive raw-body omission and retention without retaining
+/// message text, URLs, tool arguments, names, or caller-supplied field names.
+fn request_shape(value: &Value) -> Option<Value> {
+    let messages = value.get("messages")?.as_array()?;
+    let mut shape = json!({
+        "version": 1, "messages": messages.len(), "text_chars": 0,
+        "system_chars": 0, "user_chars": 0, "assistant_chars": 0,
+        "tool_chars": 0, "other_chars": 0, "max_message_chars": 0,
+        "image_parts": 0, "audio_parts": 0, "video_parts": 0,
+        "other_parts": 0, "tool_calls": 0,
+        "tool_definitions": value.get("tools").and_then(Value::as_array).map_or(0, Vec::len),
+        "tool_definition_bytes": value.get("tools").and_then(|v| serde_json::to_vec(v).ok()).map_or(0, |v| v.len())
+    });
+    let add = |shape: &mut Value, key: &str, count: usize| {
+        shape[key] = json!(
+            shape[key]
+                .as_u64()
+                .unwrap_or_default()
+                .saturating_add(count as u64)
+        );
+    };
+    for message in messages {
+        let content = &message["content"];
+        let mut chars = content.as_str().map_or(0, |text| text.chars().count());
+        if let Some(parts) = content.as_array() {
+            for part in parts {
+                match part["type"].as_str() {
+                    Some("text") => {
+                        chars += part["text"].as_str().map_or(0, |text| text.chars().count())
+                    }
+                    Some("image_url") => add(&mut shape, "image_parts", 1),
+                    Some("input_audio") => add(&mut shape, "audio_parts", 1),
+                    Some("video_url") => add(&mut shape, "video_parts", 1),
+                    _ => add(&mut shape, "other_parts", 1),
+                }
+            }
+        }
+        let role_key = match message["role"].as_str() {
+            Some("system" | "developer") => "system_chars",
+            Some("user") => "user_chars",
+            Some("assistant") => "assistant_chars",
+            Some("tool") => "tool_chars",
+            _ => "other_chars",
+        };
+        add(&mut shape, role_key, chars);
+        add(&mut shape, "text_chars", chars);
+        let max_chars = shape["max_message_chars"].as_u64().unwrap_or_default();
+        shape["max_message_chars"] = json!(max_chars.max(chars as u64));
+        add(
+            &mut shape,
+            "tool_calls",
+            message["tool_calls"].as_array().map_or(0, Vec::len),
+        );
+    }
+    Some(shape)
+}
+
 impl LlmRequestEvent {
     fn from_trace(trace: &RuntimeLlmRequestData, raw_bodies: RawBodyPolicy) -> Self {
         let mut inference_params = trace
@@ -1287,6 +1344,9 @@ impl LlmRequestEvent {
         let raw_request = capture_raw_body(trace.raw_request.as_ref(), raw_bodies);
         let raw_response = capture_raw_body(trace.raw_response.as_ref(), raw_bodies);
         if let Some(params) = inference_params.as_object_mut() {
+            if let Some(shape) = trace.raw_request.as_ref().and_then(request_shape) {
+                params.insert("request_shape".to_owned(), shape);
+            }
             params.insert(
                 "raw_request_capture".to_owned(),
                 Value::String(raw_request.status.to_owned()),
@@ -2126,6 +2186,47 @@ mod tests {
                 .as_u64()
                 .is_some_and(|bytes| bytes > 8)
         );
+    }
+
+    #[test]
+    fn oversized_request_keeps_content_free_shape_diagnostics() {
+        let trace = RuntimeLlmRequestData {
+            raw_request: Some(json!({
+                "messages": [
+                    {"role": "system", "content": "secret".repeat(12_000)},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "привет"},
+                        {"type": "image_url", "image_url": {"url": "https://private.invalid/image"}}
+                    ]},
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "private-call", "function": {"name": "secret_tool", "arguments": "private args"}}]}
+                ],
+                "tools": [{"type": "function", "function": {"name": "secret_tool"}}]
+            })),
+            ..RuntimeLlmRequestData::default()
+        };
+        for enabled in [true, false] {
+            let event = LlmRequestEvent::from_trace(
+                &trace,
+                RawBodyPolicy {
+                    enabled,
+                    max_bytes: 65_536,
+                },
+            );
+            assert!(event.raw_request.is_none());
+            let shape = &event.inference_params["request_shape"];
+            assert_eq!(shape["messages"], 3);
+            assert_eq!(shape["system_chars"], 72_000);
+            assert_eq!(shape["user_chars"], 6);
+            assert_eq!(shape["text_chars"], 72_006);
+            assert_eq!(shape["max_message_chars"], 72_000);
+            assert_eq!(shape["image_parts"], 1);
+            assert_eq!(shape["tool_calls"], 1);
+            assert_eq!(shape["tool_definitions"], 1);
+            let diagnostic = shape.to_string();
+            for private in ["secret", "private", "привет", "https://"] {
+                assert!(!diagnostic.contains(private), "{diagnostic}");
+            }
+        }
     }
 
     #[test]

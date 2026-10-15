@@ -2147,6 +2147,7 @@ where
     ) -> PaymentEffectsFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = openplotva_telegram::ChatRef {
+                direct_messages_topic_id: None,
                 id: message.chat_id,
                 is_forum: false,
             };
@@ -2390,6 +2391,7 @@ pub fn invoice_button_send_message_method(
 ) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
     openplotva_telegram::validate_text_message_text(&message.text, &message.parse_mode)?;
     let chat = openplotva_telegram::ChatRef {
+        direct_messages_topic_id: None,
         id: message.chat_id,
         is_forum: false,
     };
@@ -2415,6 +2417,7 @@ fn invoice_error_text_send_message_methods(
     parse_mode: &str,
 ) -> Result<Vec<openplotva_telegram::SendMessage>, openplotva_telegram::OutboundBuildError> {
     let chat = openplotva_telegram::ChatRef {
+        direct_messages_topic_id: None,
         id: chat_id,
         is_forum: false,
     };
@@ -2549,6 +2552,7 @@ pub fn payment_redirect_send_message_method(
 ) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
     openplotva_telegram::validate_text_message_text(&message.text, "")?;
     let chat = openplotva_telegram::ChatRef {
+        direct_messages_topic_id: None,
         id: message.chat_id,
         is_forum: message.message_thread_id.is_some(),
     };
@@ -2663,6 +2667,7 @@ impl VipStatusEffects for RichPaymentEffects {
                 })
             });
             let options = openplotva_telegram::RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: message.message_thread_id.map(i64::from),
                 reply_to_message_id: Some(i64::from(message.reply_to_message_id)),
                 allow_sending_without_reply: true,
@@ -2821,6 +2826,7 @@ pub fn vip_status_send_message_method(
         openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
     )?;
     let chat = openplotva_telegram::ChatRef {
+        direct_messages_topic_id: None,
         id: message.chat_id,
         is_forum: message.message_thread_id.is_some(),
     };
@@ -3211,6 +3217,10 @@ fn vip_callback_message(query: &TelegramCallbackQuery) -> Option<VipCallbackMess
     match query.message.as_ref()? {
         MaybeInaccessibleMessage::Message(message) => Some(VipCallbackMessage {
             chat: openplotva_telegram::ChatRef {
+                direct_messages_topic_id: message
+                    .direct_messages_topic
+                    .as_ref()
+                    .map(|topic| topic.topic_id),
                 id: message.chat.get_id().into(),
                 is_forum: message.message_thread_id.is_some(),
             },
@@ -3218,6 +3228,7 @@ fn vip_callback_message(query: &TelegramCallbackQuery) -> Option<VipCallbackMess
         }),
         MaybeInaccessibleMessage::InaccessibleMessage(message) => Some(VipCallbackMessage {
             chat: openplotva_telegram::ChatRef {
+                direct_messages_topic_id: None,
                 id: message.chat.get_id().into(),
                 is_forum: false,
             },
@@ -4876,6 +4887,10 @@ async fn send_admin_command_ephemeral_text(
     text: &str,
 ) -> Result<(), openplotva_telegram::OutboundBuildError> {
     let chat = openplotva_telegram::ChatRef {
+        direct_messages_topic_id: message
+            .direct_messages_topic
+            .as_ref()
+            .map(|topic| topic.topic_id),
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
     };

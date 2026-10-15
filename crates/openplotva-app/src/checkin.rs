@@ -717,6 +717,7 @@ impl CheckinCommandEffects for CheckinCommandDispatcherEffects {
     ) -> CheckinCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let options = openplotva_telegram::RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: reply_to.thread_id.map(i64::from),
                 reply_to_message_id: Some(i64::from(reply_to.message_id)),
                 allow_sending_without_reply: true,
@@ -965,6 +966,7 @@ where
 
 fn checkin_chat_ref(message: CheckinGameMessage) -> ChatRef {
     ChatRef {
+        direct_messages_topic_id: None,
         id: message.chat_id,
         is_forum: message.thread_id.is_some(),
     }
@@ -2142,6 +2144,7 @@ where
     ) -> CheckinThemeEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: message.chat_id,
                 is_forum: message.thread_id.is_some(),
             };

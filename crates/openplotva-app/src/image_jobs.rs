@@ -2689,6 +2689,7 @@ fn nsfw_blocked_message_request(
         ReplyMessageRef {
             message_id: i64::from(message_id),
             chat: ChatRef {
+                direct_messages_topic_id: None,
                 id: chat_id,
                 is_forum: is_topic_message,
             },
@@ -2709,6 +2710,7 @@ fn generated_image_message_request(
     let is_topic_message = message_thread_id != 0;
     PhotoMessageRequest {
         chat: ChatRef {
+            direct_messages_topic_id: None,
             id: chat_id,
             is_forum: is_topic_message,
         },
@@ -2757,6 +2759,7 @@ fn placeholder_image_media_group_request(
     let is_topic_message = message_thread_id != 0;
     MediaGroupMessageRequest {
         chat: ChatRef {
+            direct_messages_topic_id: None,
             id: chat_id,
             is_forum: is_topic_message,
         },
@@ -2795,6 +2798,7 @@ fn replacement_image_message_request(
 ) -> EditMediaMessageRequest {
     EditMediaMessageRequest {
         chat: ChatRef {
+            direct_messages_topic_id: None,
             id: chat_id,
             is_forum: false,
         },

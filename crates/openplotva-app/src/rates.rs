@@ -1291,6 +1291,7 @@ impl RatesEffects for RatesRichEffects {
                 .as_ref()
                 .map_or(plan.reply_to.chat.id, |chat| chat.id);
             let options = openplotva_telegram::RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: if plan.message.message_thread_id != 0 {
                     Some(plan.message.message_thread_id)
                 } else if plan.reply_to.is_topic_message {
@@ -1355,6 +1356,7 @@ impl RatesSideEffectDispatcher for RatesToolRichEffects {
             }
 
             let options = openplotva_telegram::RichSendOptions {
+                direct_messages_topic_id: None,
                 message_thread_id: meta.thread_id.map(i64::from),
                 reply_to_message_id: Some(i64::from(meta.message_id)),
                 allow_sending_without_reply: true,
@@ -1442,6 +1444,7 @@ impl RatesSideEffectDispatcher for RatesToolDispatcherEffects {
             }
 
             let chat = ChatRef {
+                direct_messages_topic_id: None,
                 id: meta.chat_id,
                 is_forum: meta.thread_id.is_some(),
             };
@@ -2055,6 +2058,10 @@ fn unavailable_rates_plan(message: &TelegramMessage) -> RatesTextPlan {
 
 fn rates_text_plan(message: &TelegramMessage, text: String) -> RatesTextPlan {
     let chat = ChatRef {
+        direct_messages_topic_id: message
+            .direct_messages_topic
+            .as_ref()
+            .map(|topic| topic.topic_id),
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
     };

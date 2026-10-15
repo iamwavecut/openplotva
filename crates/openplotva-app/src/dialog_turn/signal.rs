@@ -162,6 +162,7 @@ impl DispatcherTerminalUserSignal {
 
     async fn send_text_fallback(&self, target: &SignalTarget) -> Result<(), String> {
         let chat = ChatRef {
+            direct_messages_topic_id: None,
             id: target.chat_id,
             is_forum: target.thread_id.is_some(),
         };

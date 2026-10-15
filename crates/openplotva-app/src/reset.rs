@@ -359,6 +359,10 @@ where
 
 fn message_chat_ref(message: &TelegramMessage) -> ChatRef {
     ChatRef {
+        direct_messages_topic_id: message
+            .direct_messages_topic
+            .as_ref()
+            .map(|topic| topic.topic_id),
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
     }

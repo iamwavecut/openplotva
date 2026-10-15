@@ -230,6 +230,10 @@ impl DialogJobEffects for DialogDispatcherEffects {
     ) -> DialogJobReceiptFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
+                direct_messages_topic_id: params
+                    .meta
+                    .get("direct_messages_topic_id")
+                    .and_then(serde_json::Value::as_i64),
                 id: params.chat_id,
                 is_forum: params.thread_id.is_some(),
             };
@@ -384,6 +388,10 @@ impl DialogJobEffects for DialogDispatcherEffects {
     ) -> DialogJobEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
+                direct_messages_topic_id: params
+                    .meta
+                    .get("direct_messages_topic_id")
+                    .and_then(serde_json::Value::as_i64),
                 id: params.chat_id,
                 is_forum: params.thread_id.is_some(),
             };
@@ -727,6 +735,7 @@ mod tests {
     #[test]
     fn durable_answer_payload_disables_preview_on_every_text_part() {
         let chat = ChatRef {
+            direct_messages_topic_id: None,
             id: -100,
             is_forum: true,
         };
@@ -785,6 +794,7 @@ mod tests {
     #[test]
     fn advertising_final_text_disables_preview_in_durable_payload() {
         let chat = ChatRef {
+            direct_messages_topic_id: None,
             id: 42,
             is_forum: false,
         };
