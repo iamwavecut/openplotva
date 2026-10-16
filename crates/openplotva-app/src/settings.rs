@@ -3181,10 +3181,32 @@ impl GroupSettingsMemberApi for openplotva_telegram::TelegramClient {
         user_id: i64,
     ) -> GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error> {
         Box::pin(async move {
-            self.execute(openplotva_telegram::build_get_chat_member_method(
-                chat_id, user_id,
-            ))
-            .await
+            match self
+                .execute(openplotva_telegram::build_get_chat_member_method(
+                    chat_id, user_id,
+                ))
+                .await
+            {
+                Ok(member) => Ok(member),
+                Err(error) => {
+                    let admin_required = matches!(
+                        &error,
+                        carapax::api::ExecuteError::Response(response)
+                            if response.error_code() == Some(400)
+                                && response.description() == "Bad Request: CHAT_ADMIN_REQUIRED"
+                    );
+                    if !admin_required {
+                        return Err(error);
+                    }
+                    // Telegram can list admins even when a non-admin bot cannot query members.
+                    let admins =
+                        GroupSettingsAdminsApi::get_chat_administrators(self, chat_id).await?;
+                    admins
+                        .into_iter()
+                        .find(|member| member.get_user().id == user_id)
+                        .ok_or(error)
+                }
+            }
         })
     }
 }
@@ -5679,6 +5701,107 @@ mod tests {
         assert!(store.upserts().is_empty());
         assert!(store.users().is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_membership_falls_back_to_live_administrators() -> Result<(), Box<dyn Error>> {
+        let error = json!({
+            "ok": false, "error_code": 400,
+            "description": "Bad Request: CHAT_ADMIN_REQUIRED"
+        });
+        for member in [promoting_admin_member(42), creator_member(42)] {
+            let (result, calls) = settings_membership_api_probe(
+                error.clone(),
+                json!({"ok": true, "result": [creator_member(43), member]}),
+            )
+            .await?;
+            let member = result?;
+            assert_eq!(member.get_user().id, 42);
+            assert!(openplotva_telegram::telegram_member_can_open_group_settings(&member));
+            assert_eq!(calls, ["getChatMember", "getChatAdministrators"]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_membership_fallback_preserves_access_checks() -> Result<(), Box<dyn Error>> {
+        let error = json!({
+            "ok": false, "error_code": 400,
+            "description": "Bad Request: CHAT_ADMIN_REQUIRED"
+        });
+        let mut admin = promoting_admin_member(42);
+        if let ChatMember::Administrator(admin) = &mut admin {
+            admin.can_promote_members = false;
+        }
+        let (result, _) =
+            settings_membership_api_probe(error.clone(), json!({"ok": true, "result": [admin]}))
+                .await?;
+        assert!(!openplotva_telegram::telegram_member_can_open_group_settings(&result?));
+
+        for admins in [
+            json!({"ok": true, "result": [creator_member(43)]}),
+            json!({"ok": false, "error_code": 403, "description": "Forbidden"}),
+        ] {
+            let (result, calls) = settings_membership_api_probe(error.clone(), admins).await?;
+            assert!(result.is_err());
+            assert_eq!(calls, ["getChatMember", "getChatAdministrators"]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_membership_does_not_replace_other_results() -> Result<(), Box<dyn Error>> {
+        let admins = json!({"ok": true, "result": [creator_member(42)]});
+        for member in [
+            json!({"ok": true, "result": creator_member(42)}),
+            json!({"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}),
+            json!({"ok": false, "error_code": 429, "description": "Too Many Requests"}),
+        ] {
+            let expected_ok = member["ok"] == true;
+            let (result, calls) = settings_membership_api_probe(member, admins.clone()).await?;
+            assert_eq!(result.is_ok(), expected_ok);
+            assert_eq!(calls, ["getChatMember"]);
+        }
+        Ok(())
+    }
+
+    async fn settings_membership_api_probe(
+        member_response: Value,
+        admins_response: Value,
+    ) -> Result<(Result<ChatMember, carapax::api::ExecuteError>, Vec<String>), Box<dyn Error>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let router = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+                let method = uri
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .expect("method path")
+                    .to_owned();
+                captured.lock().expect("calls").push(method.clone());
+                assert_eq!(body["chat_id"], -10042);
+                let response = if method == "getChatMember" {
+                    assert_eq!(body["user_id"], 42);
+                    member_response.clone()
+                } else {
+                    assert_eq!(method, "getChatAdministrators");
+                    admins_response.clone()
+                };
+                async move { axum::Json(response) }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let client = openplotva_telegram::telegram_client_with_base_url(
+            "test-token",
+            format!("http://{}", listener.local_addr()?),
+        )?
+        .with_max_retries(0);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let result = super::GroupSettingsMemberApi::get_chat_member(&client, -10042, 42).await;
+        server.abort();
+        let calls = calls.lock().expect("calls").clone();
+        Ok((result, calls))
     }
 
     #[tokio::test]
