@@ -37,10 +37,12 @@ pub trait MediaPromptOptimizer: Send + Sync {
         options: OptimizePromptOptions,
     ) -> ImagePromptOptimizeFuture<'a>;
 
-    /// Execute image edit-prompt optimization.
+    /// Execute image edit-prompt optimization; `images` are data URLs of the pictures
+    /// being edited, in the order the request numbers them.
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a>;
 }
@@ -159,14 +161,19 @@ where
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a> {
         Box::pin(async move {
-            match self.primary.optimize_image_edit_prompt(text, options).await {
+            match self
+                .primary
+                .optimize_image_edit_prompt(text, images, options)
+                .await
+            {
                 Ok(value) => Ok(value),
                 Err(primary_error) => self
                     .fallback
-                    .optimize_image_edit_prompt(text, options)
+                    .optimize_image_edit_prompt(text, images, options)
                     .await
                     .map_err(|fallback_error| {
                         combined_optimizer_error(
@@ -246,12 +253,14 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a> {
         Box::pin(async move {
             let config = self.config.clone();
             let prompt_store = Arc::clone(&self.prompt_store);
             let text = text.to_owned();
+            let images = images.to_vec();
             let result = self
                 .walker
                 .run(
@@ -260,13 +269,16 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
                         let config = config.clone();
                         let prompt_store = prompt_store.clone();
                         let text = text.clone();
+                        let images = images.clone();
                         async move {
                             let optimizer = media_optimizer_for_attempt_with_prompt_store(
                                 &config,
                                 &attempt,
                                 &prompt_store,
                             )?;
-                            optimizer.optimize_image_edit_prompt(&text, options).await
+                            optimizer
+                                .optimize_image_edit_prompt(&text, &images, options)
+                                .await
                         }
                     },
                     media_optimizer_retryable_reason,
@@ -421,9 +433,11 @@ where
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a> {
-        self.as_ref().optimize_image_edit_prompt(text, options)
+        self.as_ref()
+            .optimize_image_edit_prompt(text, images, options)
     }
 }
 
@@ -483,9 +497,12 @@ where
         }
     }
 
+    /// Optimize an edit request shown with `images`; on failure fall back to the
+    /// original request.
     pub async fn enhance_image_edit_prompt(
         &self,
         original_prompt: &str,
+        images: &[String],
         options: OptimizePromptOptions,
     ) -> MediaPromptOptimization<ImageEditOptimize> {
         let fallback = ImageEditOptimize {
@@ -500,7 +517,7 @@ where
             };
         };
         match optimizer
-            .optimize_image_edit_prompt(original_prompt, options)
+            .optimize_image_edit_prompt(original_prompt, images, options)
             .await
         {
             Ok(value) => MediaPromptOptimization {
@@ -540,6 +557,7 @@ where
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a> {
         Box::pin(async move {
@@ -547,6 +565,7 @@ where
             AifarmStructuredJsonGenerator::optimize_image_edit_prompt(
                 self,
                 text,
+                images,
                 options,
                 &mut ignore_status,
             )
@@ -575,10 +594,11 @@ where
     fn optimize_image_edit_prompt<'a>(
         &'a self,
         text: &'a str,
+        images: &'a [String],
         options: OptimizePromptOptions,
     ) -> ImageEditPromptOptimizeFuture<'a> {
         Box::pin(async move {
-            GeminiMediaPromptOptimizer::optimize_image_edit_prompt(self, text, options)
+            GeminiMediaPromptOptimizer::optimize_image_edit_prompt(self, text, images, options)
                 .await
                 .map_err(|err| MediaPromptOptimizerError::Provider(err.to_string()))
         })
@@ -920,6 +940,7 @@ mod tests {
         fn optimize_image_edit_prompt<'a>(
             &'a self,
             _text: &'a str,
+            _images: &'a [String],
             _options: OptimizePromptOptions,
         ) -> ImageEditPromptOptimizeFuture<'a> {
             Box::pin(async move {
@@ -1214,7 +1235,7 @@ mod tests {
         let service = MediaPromptOptimizerService::new(Some(optimizer));
 
         let got = service
-            .enhance_image_edit_prompt("make it day", options(3))
+            .enhance_image_edit_prompt("make it day", &[], options(3))
             .await;
 
         assert_eq!(got.provider_error.as_deref(), Some("boom"));
@@ -1291,6 +1312,7 @@ mod tests {
         let got = optimizer
             .optimize_image_edit_prompt(
                 "make it day",
+                &[],
                 OptimizePromptOptions {
                     variant_count: 1,
                     ..OptimizePromptOptions::default()

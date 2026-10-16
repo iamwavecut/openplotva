@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
+use crate::image_edit_references::{ImageEditReferenceLoader, upsampler_reference_data_urls};
 use crate::media::{MediaPromptOptimizer, MediaPromptOptimizerService};
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
@@ -72,6 +73,7 @@ pub type ImageJobEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 
 pub const AIFARM_DRAW_API_SERVICE_NAME: &str = "draw-api";
 pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
+pub const AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME: &str = "flux3_generate";
 pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
 pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
@@ -1087,6 +1089,7 @@ fn add_flux_watermark(encoded: &[u8]) -> Result<Vec<u8>, String> {
 
 fn is_flux_generation_endpoint(endpoint_name: &str) -> bool {
     endpoint_name.eq_ignore_ascii_case(AIFARM_DRAW_API_ENDPOINT_NAME)
+        || endpoint_name.eq_ignore_ascii_case(AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME)
 }
 
 fn blend_flux_watermark_channel(source: u8, target: u8) -> u8 {
@@ -1476,7 +1479,7 @@ pub trait ImageGenerator {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::KLEIN
+        openplotva_media::ImageTargets::FLUX3
     }
 
     /// Generate and send an image.
@@ -1511,7 +1514,7 @@ pub trait ImageEditor {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::KLEIN
+        openplotva_media::ImageTargets::FLUX3
     }
 
     /// Edit and send an image.
@@ -1692,8 +1695,8 @@ fn routed_image_targets(
         .primary_model_config(workflow_key)
         .as_ref()
         .and_then(prompt_target_model)
-        .map_or_else(
-            || image_targets_for_workflow(workflow_key),
+        .map_or(
+            openplotva_media::ImageTargets::FLUX3,
             openplotva_media::ImageTargets::single,
         )
 }
@@ -1703,18 +1706,6 @@ fn prompt_target_model(config: &serde_json::Value) -> Option<openplotva_media::I
         .get("prompt_target")
         .and_then(serde_json::Value::as_str)
         .and_then(openplotva_media::ImageModel::from_prompt_target)
-}
-
-/// Without a `prompt_target` on the routed model: Boogu slots get Boogu-Image
-/// prompts; FLUX slots and the generic workflows get the stricter FLUX.2
-/// [klein] ones.
-fn image_targets_for_workflow(workflow_key: &str) -> openplotva_media::ImageTargets {
-    match workflow_key {
-        IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY | IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY => {
-            openplotva_media::ImageTargets::BOOGU
-        }
-        _ => openplotva_media::ImageTargets::KLEIN,
-    }
 }
 
 fn image_edit_context(workflow_key: &str, request: &ImageEditRequest) -> RoutedRequestContext {
@@ -1940,13 +1931,25 @@ where
 pub struct OptimizingImageEditor<Editor, Optimizer> {
     editor: Editor,
     optimizer: MediaPromptOptimizerService<Optimizer>,
+    references: Option<Arc<dyn ImageEditReferenceLoader>>,
 }
 
 impl<Editor, Optimizer> OptimizingImageEditor<Editor, Optimizer> {
     /// Build an optimizing editor around an existing provider.
     #[must_use]
     pub const fn new(editor: Editor, optimizer: MediaPromptOptimizerService<Optimizer>) -> Self {
-        Self { editor, optimizer }
+        Self {
+            editor,
+            optimizer,
+            references: None,
+        }
+    }
+
+    /// Show the optimizer the pictures being edited, loaded by `references`.
+    #[must_use]
+    pub fn with_reference_loader(mut self, references: Arc<dyn ImageEditReferenceLoader>) -> Self {
+        self.references = Some(references);
+        self
     }
 }
 
@@ -1965,11 +1968,46 @@ where
 
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
         Box::pin(async move {
-            let request =
-                optimized_image_edit_request(&self.optimizer, request, self.editor.image_targets())
-                    .await?;
+            let images = match self.references.as_deref() {
+                Some(references) => edit_reference_data_urls(references, &request).await,
+                None => Vec::new(),
+            };
+            let request = optimized_image_edit_request(
+                &self.optimizer,
+                request,
+                &images,
+                self.editor.image_targets(),
+            )
+            .await?;
             self.editor.edit_image(request).await
         })
+    }
+}
+
+/// The edit's pictures as the optimizer should see them, or none when any of them
+/// cannot be loaded: a partial set would renumber the pictures the request names.
+async fn edit_reference_data_urls(
+    references: &dyn ImageEditReferenceLoader,
+    request: &ImageEditRequest,
+) -> Vec<String> {
+    let images = match references.load_edit_references(request).await {
+        Ok(images) if !images.is_empty() => images,
+        Ok(_) => return Vec::new(),
+        Err(error) => {
+            tracing::debug!(%error, "image edit pictures unavailable to the prompt optimizer");
+            return Vec::new();
+        }
+    };
+    match tokio::task::spawn_blocking(move || upsampler_reference_data_urls(&images)).await {
+        Ok(Ok(urls)) => urls,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "image edit pictures unavailable to the prompt optimizer");
+            Vec::new()
+        }
+        Err(error) => {
+            tracing::debug!(%error, "image edit picture preparation stopped");
+            Vec::new()
+        }
     }
 }
 
@@ -2074,6 +2112,7 @@ fn extract_prompt_modifiers(request: &mut ImageGenerationRequest) {
 async fn optimized_image_edit_request<Optimizer>(
     optimizer: &MediaPromptOptimizerService<Optimizer>,
     mut request: ImageEditRequest,
+    images: &[String],
     targets: openplotva_media::ImageTargets,
 ) -> Result<ImageEditRequest, ImageEditError>
 where
@@ -2086,6 +2125,7 @@ where
     let optimized = optimizer
         .enhance_image_edit_prompt(
             &original_prompt,
+            images,
             openplotva_media::OptimizePromptOptions {
                 variant_count: 1,
                 targets,
@@ -6693,6 +6733,101 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct ReferenceLoaderStub(Result<Vec<Vec<u8>>, String>);
+
+    impl crate::image_edit_references::ImageEditReferenceLoader for ReferenceLoaderStub {
+        fn load_edit_references<'a>(
+            &'a self,
+            _request: &'a ImageEditRequest,
+        ) -> crate::image_edit_references::ImageEditReferencesFuture<'a> {
+            let result = self.0.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode png");
+        bytes.into_inner()
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_editor_shows_the_optimizer_every_picture() {
+        let editor = EditorStub::success(vec!["https://img.test/edit.png".to_owned()]);
+        let optimizer =
+            OptimizerStub::default().with_edit_result(openplotva_media::ImageEditOptimize {
+                input: "swap them".to_owned(),
+                outputs: vec!["Create a photograph preserving the first image".to_owned()],
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageEditor::new(
+            editor.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        )
+        .with_reference_loader(Arc::new(ReferenceLoaderStub(Ok(vec![
+            png_bytes(1000, 1000),
+            png_bytes(640, 480),
+        ]))));
+
+        optimizing
+            .edit_image(ImageEditRequest {
+                prompt: "swap them".to_owned(),
+                photo_urls: vec!["a".to_owned(), "b".to_owned()],
+                ..ImageEditRequest::default()
+            })
+            .await
+            .expect("edit");
+
+        let seen = optimizer.edit_images();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 2);
+        assert!(
+            seen[0]
+                .iter()
+                .all(|url| url.starts_with("data:image/jpeg;base64,"))
+        );
+        assert_eq!(
+            editor.requests()[0].photo_urls,
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_editor_optimizes_text_only_when_pictures_fail() {
+        let editor = EditorStub::success(vec!["https://img.test/edit.png".to_owned()]);
+        let optimizer =
+            OptimizerStub::default().with_edit_result(openplotva_media::ImageEditOptimize {
+                input: "make it day".to_owned(),
+                outputs: vec!["make the scene bright daylight".to_owned()],
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageEditor::new(
+            editor.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        )
+        .with_reference_loader(Arc::new(ReferenceLoaderStub(Err(
+            "download telegram file failed".to_owned(),
+        ))));
+
+        optimizing
+            .edit_image(ImageEditRequest {
+                prompt: "make it day".to_owned(),
+                photo_file_id: "photo-file".to_owned(),
+                ..ImageEditRequest::default()
+            })
+            .await
+            .expect("edit");
+
+        assert_eq!(optimizer.edit_images(), vec![Vec::<String>::new()]);
+        assert_eq!(
+            editor.requests()[0].prompt,
+            "make the scene bright daylight"
+        );
+    }
+
     #[tokio::test]
     async fn image_gen_queue_worker_completes_and_stores_generated_url() {
         let queue = InMemoryTaskQueue::new();
@@ -7681,14 +7816,14 @@ mod tests {
 
     #[test]
     fn image_prompt_targets_follow_the_routed_primary_model() {
-        let qwen = image_route_walker(json!({
+        let flux3 = image_route_walker(json!({
             "service_name": AIFARM_DRAW_API_SERVICE_NAME,
-            "endpoint_name": "qwen_image_generate",
-            "prompt_target": "qwen_image",
+            "endpoint_name": "flux3_generate",
+            "prompt_target": "flux3",
         }));
         assert_eq!(
-            routed_image_targets(&qwen, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
-            openplotva_media::ImageTargets::QWEN_IMAGE
+            routed_image_targets(&flux3, IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY),
+            openplotva_media::ImageTargets::FLUX3
         );
 
         let krea2 = image_route_walker(json!({
@@ -7701,17 +7836,20 @@ mod tests {
             openplotva_media::ImageTargets::KREA2
         );
 
-        let untagged = image_route_walker(json!({"endpoint_name": "generate"}));
+        let retired = image_route_walker(json!({
+            "endpoint_name": "qwen_image_generate",
+            "prompt_target": "qwen_image",
+        }));
         assert_eq!(
-            routed_image_targets(&untagged, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
-            openplotva_media::ImageTargets::KLEIN
+            routed_image_targets(&retired, IMAGE_EDIT_WORKFLOW_KEY),
+            openplotva_media::ImageTargets::FLUX3
         );
         assert_eq!(
             routed_image_targets(
                 &empty_routed_attempt_walker(),
                 IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
             ),
-            openplotva_media::ImageTargets::BOOGU
+            openplotva_media::ImageTargets::FLUX3
         );
     }
 
@@ -7743,8 +7881,12 @@ mod tests {
     }
 
     #[test]
-    fn flux_watermark_is_limited_to_the_primary_generation_endpoint() {
+    fn flux_watermark_is_limited_to_the_flux_generation_endpoints() {
         assert!(is_flux_generation_endpoint(AIFARM_DRAW_API_ENDPOINT_NAME));
+        assert!(is_flux_generation_endpoint(
+            AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME
+        ));
+        assert!(!is_flux_generation_endpoint("krea2_generate"));
         assert!(!is_flux_generation_endpoint(
             AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME
         ));
@@ -9650,6 +9792,7 @@ mod tests {
             >,
         >,
         calls: Arc<Mutex<Vec<String>>>,
+        edit_images: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl OptimizerStub {
@@ -9665,6 +9808,13 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("optimizer calls").clone()
+        }
+
+        fn edit_images(&self) -> Vec<Vec<String>> {
+            self.edit_images
+                .lock()
+                .expect("optimizer edit images")
+                .clone()
         }
     }
 
@@ -9694,12 +9844,17 @@ mod tests {
         fn optimize_image_edit_prompt<'a>(
             &'a self,
             text: &'a str,
+            images: &'a [String],
             options: openplotva_media::OptimizePromptOptions,
         ) -> crate::media::ImageEditPromptOptimizeFuture<'a> {
             self.calls
                 .lock()
                 .expect("optimizer calls")
                 .push(format!("edit:{text}:{}", options.variant_count));
+            self.edit_images
+                .lock()
+                .expect("optimizer edit images")
+                .push(images.to_vec());
             let result = self
                 .edit_result
                 .lock()

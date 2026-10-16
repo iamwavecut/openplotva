@@ -26,6 +26,7 @@ pub mod gradius_utility_outbox;
 pub mod guest;
 pub mod help;
 pub mod history_summary;
+pub mod image_edit_references;
 pub mod image_jobs;
 pub mod ingestion_telemetry;
 pub mod inline;
@@ -13335,7 +13336,10 @@ async fn start_runtime_workers(
         )
         .with_workflow_key(VIP_IMAGE_EDITOR_WORKFLOW_KEY),
         media_prompt_optimizer.clone(),
-    );
+    )
+    .with_reference_loader(Arc::new(
+        image_edit_references::TelegramImageEditReferenceLoader::new(telegram.clone()),
+    ));
     let mut vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
