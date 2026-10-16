@@ -63,13 +63,10 @@ pub struct OptimizePromptOptions {
 /// Image model a prompt variant is written for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ImageModel {
-    /// FLUX.2 [klein]: short prompts, subject first, a 512-token text encoder.
+    /// FLUX.3 [klein]: captions and edit instructions in the form of its official prompt
+    /// upsampler, read by a Qwen3-VL encoder.
     #[default]
-    Klein,
-    /// Boogu-Image (Turbo and Edit-Turbo): concise, style first.
-    Boogu,
-    /// Qwen-Image 2.1: long observational descriptions read by a Qwen3-VL encoder.
-    QwenImage,
+    Flux3,
     /// Krea 2 Turbo: one natural-prose paragraph, medium and style first.
     Krea2,
 }
@@ -78,9 +75,7 @@ impl ImageModel {
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::Klein => "FLUX.2 [klein]",
-            Self::Boogu => "Boogu-Image",
-            Self::QwenImage => "Qwen-Image 2.1",
+            Self::Flux3 => "FLUX.3 [klein]",
             Self::Krea2 => "Krea 2 Turbo",
         }
     }
@@ -89,9 +84,7 @@ impl ImageModel {
     #[must_use]
     pub fn from_prompt_target(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "klein" => Some(Self::Klein),
-            "boogu" => Some(Self::Boogu),
-            "qwen_image" => Some(Self::QwenImage),
+            "flux3" => Some(Self::Flux3),
             "krea2" => Some(Self::Krea2),
             _ => None,
         }
@@ -101,8 +94,7 @@ impl ImageModel {
     #[must_use]
     pub const fn prompt_max_chars(self) -> usize {
         match self {
-            Self::Klein | Self::Boogu => IMAGE_PROMPT_MAX_CHARS,
-            Self::QwenImage => QWEN_IMAGE_PROMPT_MAX_CHARS,
+            Self::Flux3 => FLUX3_PROMPT_MAX_CHARS,
             Self::Krea2 => KREA2_PROMPT_MAX_CHARS,
         }
     }
@@ -120,14 +112,12 @@ pub struct ImageTargets {
 
 impl Default for ImageTargets {
     fn default() -> Self {
-        Self::KLEIN
+        Self::FLUX3
     }
 }
 
 impl ImageTargets {
-    pub const KLEIN: Self = Self::single(ImageModel::Klein);
-    pub const BOOGU: Self = Self::single(ImageModel::Boogu);
-    pub const QWEN_IMAGE: Self = Self::single(ImageModel::QwenImage);
+    pub const FLUX3: Self = Self::single(ImageModel::Flux3);
     pub const KREA2: Self = Self::single(ImageModel::Krea2);
 
     #[must_use]
@@ -156,7 +146,7 @@ impl ImageTargets {
             .iter()
             .map(|model| model.prompt_max_chars())
             .max()
-            .unwrap_or(IMAGE_PROMPT_MAX_CHARS)
+            .unwrap_or(FLUX3_PROMPT_MAX_CHARS)
     }
 
     /// Targets for two generators rendered side by side: `own_slots` slots
@@ -361,13 +351,68 @@ pub fn render_image_edit_optimizer_prompt_with(
     )
 }
 
-/// Upper bound for one optimized image prompt or edit instruction, in
-/// characters. The prompts ask for at most 150 words; the bound only makes a
-/// looping model close its string and the JSON instead of running to the token cap.
-pub const IMAGE_PROMPT_MAX_CHARS: usize = 1200;
+/// Line the FLUX.3 prompt upsampler reads between the attached pictures and the request.
+pub const EDIT_REFERENCE_ORDER_LINE: &str =
+    "Reference images follow in order (the first image, the second image, ...).";
 
-/// Qwen-Image rules ask for up to 300 words of description.
-pub const QWEN_IMAGE_PROMPT_MAX_CHARS: usize = 2800;
+/// Most pictures the edit optimizer looks at, as for the FLUX.3 prompt upsampler.
+pub const MAX_EDIT_REFERENCE_IMAGES: usize = 10;
+
+/// Text of the edit optimizer's user turn: the reference order line when pictures are
+/// attached, then the request.
+#[must_use]
+pub fn image_edit_optimizer_text(request: &str, image_count: usize) -> String {
+    if image_count == 0 {
+        request.to_owned()
+    } else {
+        format!("{EDIT_REFERENCE_ORDER_LINE}\n{request}")
+    }
+}
+
+const UPSAMPLER_REFERENCE_MULTIPLE: u32 = 32;
+const UPSAMPLER_MAX_ASPECT_RATIO: u32 = 200;
+
+/// Size the FLUX.3 prompt upsampler gives one of `count` reference pictures: sides on a
+/// multiple of 32 and at most 1024², 724², or 512² pixels for one, two, or more pictures.
+/// `None` for an empty or overly elongated picture.
+#[must_use]
+pub fn upsampler_reference_size(width: u32, height: u32, count: usize) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (long, short) = (width.max(height), width.min(height));
+    if long > short.saturating_mul(UPSAMPLER_MAX_ASPECT_RATIO) {
+        return None;
+    }
+    let multiple = f64::from(UPSAMPLER_REFERENCE_MULTIPLE);
+    let cap = match count {
+        0 | 1 => 1024.0 * 1024.0,
+        2 => 724.0 * 724.0,
+        _ => 512.0 * 512.0,
+    };
+    let floor = |value: f64| ((value / multiple).floor() * multiple).max(multiple);
+    let (width, height) = (f64::from(width), f64::from(height));
+    let mut w = ((width / multiple).round_ties_even() * multiple).max(multiple);
+    let mut h = ((height / multiple).round_ties_even() * multiple).max(multiple);
+    if w * h > cap {
+        let beta = (width * height / cap).sqrt();
+        w = floor(width / beta);
+        h = floor(height / beta);
+    }
+    if w * h > cap {
+        if w == multiple {
+            h = floor(cap / w);
+        } else {
+            w = floor(cap / h);
+        }
+    }
+    Some((w as u32, h as u32))
+}
+
+/// Upper bound for one optimized FLUX.3 caption or edit instruction, in characters.
+/// The rules ask for up to about 350 words; the bound only makes a looping model close
+/// its string and the JSON instead of running to the token cap.
+pub const FLUX3_PROMPT_MAX_CHARS: usize = 4000;
 
 /// Krea 2 rules ask for up to 200 words.
 pub const KREA2_PROMPT_MAX_CHARS: usize = 1600;
@@ -401,9 +446,7 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "variant_count": variant_count,
         "slots": slots,
         "multi": variant_count > 1,
-        "klein": models.contains(&ImageModel::Klein),
-        "boogu": models.contains(&ImageModel::Boogu),
-        "qwen_image": models.contains(&ImageModel::QwenImage),
+        "flux3": models.contains(&ImageModel::Flux3),
         "krea2": models.contains(&ImageModel::Krea2),
     })
 }
@@ -427,7 +470,7 @@ pub fn optimize_edit_prompt_terminator_definition(
     optimizer_terminator_definition(
         variant_count,
         OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME,
-        "Finalize Kontext edit prompt optimization and return the structured payload.",
+        "Finalize image edit prompt optimization and return the structured payload.",
         false,
     )
 }
@@ -806,64 +849,35 @@ mod tests {
     fn optimizer_prompt_renders_rules_for_each_slot_target() {
         let pair = render_image_optimizer_prompt(OptimizePromptOptions {
             variant_count: 2,
-            targets: ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1),
+            targets: ImageTargets::KREA2.followed_by(1, ImageTargets::FLUX3, 1),
         })
         .expect("render pair");
-        assert!(pair.contains("`outputs[0]` is rendered by FLUX.2 [klein]"));
-        assert!(pair.contains("`outputs[1]` is rendered by Boogu-Image"));
-        assert!(pair.contains("**FLUX.2 [klein]**"));
-        assert!(pair.contains("**Boogu-Image**"));
+        assert!(pair.contains("`outputs[0]` is rendered by Krea 2 Turbo"));
+        assert!(pair.contains("`outputs[1]` is rendered by FLUX.3 [klein]"));
+        assert!(pair.contains("**Krea 2 Turbo**"));
+        assert!(pair.contains("**FLUX.3 [klein]**"));
         assert!(pair.contains("All prompts describe the same image idea"));
         assert!(!pair.contains("{{"));
 
-        let boogu = render_image_optimizer_prompt(OptimizePromptOptions {
-            variant_count: 1,
-            targets: ImageTargets::BOOGU,
-        })
-        .expect("render boogu");
-        assert!(boogu.contains("`outputs[0]` is rendered by Boogu-Image"));
-        assert!(boogu.contains("**Boogu-Image**"));
-        assert!(!boogu.contains("**FLUX.2 [klein]**"));
-        assert!(!boogu.contains("All prompts describe the same image idea"));
-
-        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
-            variant_count: 1,
-            targets: ImageTargets::KLEIN,
-        })
-        .expect("render edit");
-        assert!(edit.contains("`outputs[0]` is carried out by FLUX.2 [klein]"));
-        assert!(edit.contains("**FLUX.2 [klein]**"));
-        assert!(!edit.contains("**Boogu-Image Edit**"));
+        let flux3 =
+            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render flux3");
+        assert!(flux3.contains("`outputs[0]` is rendered by FLUX.3 [klein]"));
+        assert!(flux3.contains("**FLUX.3 [klein]**"));
+        assert!(flux3.contains("single FLUX.3 [klein] slot"));
+        assert!(!flux3.contains("Krea 2"));
+        assert!(!flux3.contains("All prompts describe the same image idea"));
+        assert!(!flux3.contains("{{"));
     }
 
     #[test]
-    fn qwen_image_slots_get_their_own_rules_and_examples() {
-        let vip_pair = render_image_optimizer_prompt(OptimizePromptOptions {
-            variant_count: 2,
-            targets: ImageTargets::QWEN_IMAGE.followed_by(1, ImageTargets::BOOGU, 1),
-        })
-        .expect("render qwen pair");
-        assert!(vip_pair.contains("`outputs[0]` is rendered by Qwen-Image 2.1"));
-        assert!(vip_pair.contains("`outputs[1]` is rendered by Boogu-Image"));
-        assert!(vip_pair.contains("**Qwen-Image 2.1**"));
-        assert!(vip_pair.contains("150 to 300 words"));
-        assert!(vip_pair.contains("single Qwen-Image 2.1 slot"));
-        assert!(!vip_pair.contains("**FLUX.2 [klein]**"));
-        assert!(!vip_pair.contains("{{"));
-
-        let klein =
-            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render klein");
-        assert!(!klein.contains("Qwen-Image"));
-
-        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
-            variant_count: 1,
-            targets: ImageTargets::QWEN_IMAGE,
-        })
-        .expect("render qwen edit");
-        assert!(edit.contains("`outputs[0]` is carried out by Qwen-Image 2.1"));
-        assert!(edit.contains("Call the picture being edited <image1>"));
-        assert!(edit.contains("<image2>"));
-        assert!(!edit.contains("**FLUX.2 [klein]**"));
+    fn edit_prompt_uses_the_upsampler_instruction_form() {
+        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions::default())
+            .expect("render edit");
+        assert!(edit.contains("`outputs[0]` is carried out by FLUX.3 [klein]"));
+        assert!(edit.contains("**FLUX.3 [klein]**"));
+        assert!(edit.contains("preserving the first image as the exact canvas"));
+        assert!(edit.contains("the second image"));
+        assert!(!edit.contains("Call the picture being edited <image1>"));
         assert!(!edit.contains("{{"));
     }
 
@@ -878,51 +892,61 @@ mod tests {
         assert!(krea2.contains("**Krea 2 Turbo**"));
         assert!(krea2.contains("60 to 200 words"));
         assert!(krea2.contains("single Krea 2 Turbo slot"));
-        assert!(!krea2.contains("**Qwen-Image 2.1**"));
-        assert!(!krea2.contains("**FLUX.2 [klein]**"));
+        assert!(!krea2.contains("**FLUX.3 [klein]**"));
         assert!(!krea2.contains("{{"));
-
-        let qwen = render_image_optimizer_prompt(OptimizePromptOptions {
-            variant_count: 1,
-            targets: ImageTargets::QWEN_IMAGE,
-        })
-        .expect("render qwen");
-        assert!(!qwen.contains("Krea 2"));
     }
 
     #[test]
     fn prompt_targets_and_length_bounds_follow_the_model() {
         assert_eq!(
-            ImageModel::from_prompt_target(" Qwen_Image "),
-            Some(ImageModel::QwenImage)
-        );
-        assert_eq!(
-            ImageModel::from_prompt_target("klein"),
-            Some(ImageModel::Klein)
-        );
-        assert_eq!(
-            ImageModel::from_prompt_target("boogu"),
-            Some(ImageModel::Boogu)
+            ImageModel::from_prompt_target(" FLUX3 "),
+            Some(ImageModel::Flux3)
         );
         assert_eq!(
             ImageModel::from_prompt_target("krea2"),
             Some(ImageModel::Krea2)
         );
-        assert_eq!(ImageModel::from_prompt_target("dall-e"), None);
+        for retired in ["klein", "boogu", "qwen_image", "dall-e"] {
+            assert_eq!(ImageModel::from_prompt_target(retired), None);
+        }
 
         assert_eq!(
-            ImageTargets::KLEIN.prompt_max_chars(),
-            IMAGE_PROMPT_MAX_CHARS
+            ImageTargets::FLUX3.prompt_max_chars(),
+            FLUX3_PROMPT_MAX_CHARS
         );
         assert_eq!(
-            ImageTargets::QWEN_IMAGE
-                .followed_by(1, ImageTargets::BOOGU, 1)
+            ImageTargets::KREA2
+                .followed_by(1, ImageTargets::FLUX3, 1)
                 .prompt_max_chars(),
-            QWEN_IMAGE_PROMPT_MAX_CHARS
+            FLUX3_PROMPT_MAX_CHARS
         );
         assert_eq!(
             ImageTargets::KREA2.prompt_max_chars(),
             KREA2_PROMPT_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn upsampler_reference_sizes_follow_the_official_policy() {
+        assert_eq!(upsampler_reference_size(1000, 1000, 1), Some((992, 992)));
+        assert_eq!(upsampler_reference_size(1280, 960, 1), Some((1152, 864)));
+        assert_eq!(upsampler_reference_size(1000, 1000, 2), Some((704, 704)));
+        assert_eq!(upsampler_reference_size(896, 1120, 3), Some((448, 544)));
+        assert_eq!(upsampler_reference_size(500, 300, 1), Some((512, 288)));
+        assert_eq!(upsampler_reference_size(20, 3000, 1), Some((32, 3008)));
+        assert_eq!(upsampler_reference_size(1, 300, 1), None);
+        assert_eq!(upsampler_reference_size(0, 300, 1), None);
+    }
+
+    #[test]
+    fn edit_optimizer_text_names_the_reference_order_only_with_pictures() {
+        assert_eq!(
+            image_edit_optimizer_text("make it night", 0),
+            "make it night"
+        );
+        assert_eq!(
+            image_edit_optimizer_text("make it night", 2),
+            "Reference images follow in order (the first image, the second image, ...).\nmake it night"
         );
     }
 
@@ -946,22 +970,22 @@ mod tests {
 
     #[test]
     fn image_targets_follow_each_side_slot_count() {
-        let pair = ImageTargets::KLEIN.followed_by(1, ImageTargets::BOOGU, 1);
-        assert_eq!(pair.models(), [ImageModel::Klein, ImageModel::Boogu]);
+        let pair = ImageTargets::KREA2.followed_by(1, ImageTargets::FLUX3, 1);
+        assert_eq!(pair.models(), [ImageModel::Krea2, ImageModel::Flux3]);
 
-        let wide_first = ImageTargets::KLEIN.followed_by(2, ImageTargets::BOOGU, 1);
+        let wide_first = ImageTargets::KREA2.followed_by(2, ImageTargets::FLUX3, 1);
         assert_eq!(
             wide_first.models(),
-            [ImageModel::Klein, ImageModel::Klein, ImageModel::Boogu]
+            [ImageModel::Krea2, ImageModel::Krea2, ImageModel::Flux3]
         );
-        assert_eq!(wide_first.model_for_slot(1), ImageModel::Klein);
-        assert_eq!(wide_first.model_for_slot(2), ImageModel::Boogu);
+        assert_eq!(wide_first.model_for_slot(1), ImageModel::Krea2);
+        assert_eq!(wide_first.model_for_slot(2), ImageModel::Flux3);
 
-        assert_eq!(ImageTargets::KLEIN.model_for_slot(3), ImageModel::Klein);
-        assert_eq!(ImageTargets::default(), ImageTargets::KLEIN);
+        assert_eq!(ImageTargets::FLUX3.model_for_slot(3), ImageModel::Flux3);
+        assert_eq!(ImageTargets::default(), ImageTargets::FLUX3);
         assert_eq!(
-            ImageTargets::BOOGU
-                .followed_by(3, ImageTargets::KLEIN, 3)
+            ImageTargets::FLUX3
+                .followed_by(3, ImageTargets::KREA2, 3)
                 .models()
                 .len(),
             MAX_IMAGE_SLOTS
@@ -974,7 +998,7 @@ mod tests {
             include_str!("../../../prompts/image/optimizer.prompt"),
             include_str!("../../../prompts/image/edit_optimizer.prompt"),
         ] {
-            assert!(prompt.split_whitespace().count() <= 3_500);
+            assert!(prompt.split_whitespace().count() <= 6_000);
             assert!(!prompt.contains("random visual style"));
             assert!(!prompt.contains("90 to 180 words"));
             assert!(!prompt.contains("Kontext"));

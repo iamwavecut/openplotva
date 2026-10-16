@@ -1914,6 +1914,8 @@ pub struct AifarmStructuredJsonRequest {
     pub max_tokens: i32,
     /// Per-request temperature.
     pub temperature: f64,
+    /// Image data URLs the last user message shows before its text.
+    pub images: Vec<String>,
 }
 
 impl AifarmHistorySummaryConfig {
@@ -2296,9 +2298,12 @@ where
         Ok(optimized)
     }
 
+    /// Optimize an edit request; `images` are data URLs of the pictures being edited,
+    /// in the order the request numbers them.
     pub async fn optimize_image_edit_prompt(
         &self,
         text: &str,
+        images: &[String],
         options: openplotva_media::OptimizePromptOptions,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<openplotva_media::ImageEditOptimize, AifarmMediaOptimizerError> {
@@ -2318,14 +2323,23 @@ where
             None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
+        let images: Vec<String> = images
+            .iter()
+            .map(|image| image.trim())
+            .filter(|image| !image.is_empty())
+            .take(openplotva_media::MAX_EDIT_REFERENCE_IMAGES)
+            .map(str::to_owned)
+            .collect();
+        let user_text = openplotva_media::image_edit_optimizer_text(text, images.len());
         let content = self
             .generate_json(
                 AifarmStructuredJsonRequest {
                     name: "optimize_edit_prompt".to_owned(),
-                    messages: optimizer_messages(&prompt, text),
+                    messages: optimizer_messages(&prompt, &user_text),
                     schema: tool.input_schema,
                     max_tokens: aifarm_optimizer_max_tokens(variant_count),
                     temperature: 0.3,
+                    images,
                     ..AifarmStructuredJsonRequest::default()
                 },
                 on_status,
@@ -2392,18 +2406,26 @@ where
             request.max_tokens
         };
         let (top_p, top_k) = worker_nucleus_for_model(&model);
+        let mut messages: Vec<ChatMessage> = request
+            .messages
+            .into_iter()
+            .map(|message| ChatMessage {
+                role: message.role,
+                content: message.content,
+                content_parts: Vec::new(),
+                ..ChatMessage::default()
+            })
+            .collect();
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role.eq_ignore_ascii_case("user"))
+        {
+            message.content_parts = images_then_text_parts(&request.images, &message.content);
+        }
         ChatCompletionRequest {
             model,
-            messages: request
-                .messages
-                .into_iter()
-                .map(|message| ChatMessage {
-                    role: message.role,
-                    content: message.content,
-                    content_parts: Vec::new(),
-                    ..ChatMessage::default()
-                })
-                .collect(),
+            messages,
             stream: false,
             response_format: Some(json!({
                 "type": "json_schema",
@@ -2475,6 +2497,35 @@ pub fn aifarm_optimizer_max_tokens(variant_count: usize) -> i32 {
     let normalized = openplotva_media::normalize_variant_count(variant_count);
     let budget = normalized.saturating_mul(2048);
     i32::try_from(budget.max(4096)).unwrap_or(i32::MAX)
+}
+
+/// Content parts showing `images` first and `text` after them; empty without images,
+/// so the message keeps its plain string content.
+fn images_then_text_parts(images: &[String], text: &str) -> Vec<ChatContentPart> {
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<ChatContentPart> = images
+        .iter()
+        .map(|url| ChatContentPart {
+            part_type: "image_url".to_owned(),
+            text: String::new(),
+            image_url: Some(ChatImageUrlPart {
+                url: url.clone(),
+                detail: "auto".to_owned(),
+            }),
+            video_url: None,
+            cache_control: None,
+        })
+        .collect();
+    parts.push(ChatContentPart {
+        part_type: "text".to_owned(),
+        text: text.to_owned(),
+        image_url: None,
+        video_url: None,
+        cache_control: None,
+    });
+    parts
 }
 
 fn optimizer_messages(system_prompt: &str, text: &str) -> Vec<AifarmStructuredJsonMessage> {
@@ -8260,7 +8311,7 @@ mod tests {
             .await?;
         assert_eq!(image.outputs[0].chars().count(), limit);
         let edit = generator
-            .optimize_image_edit_prompt("cat", Default::default(), &mut |_| {})
+            .optimize_image_edit_prompt("cat", &[], Default::default(), &mut |_| {})
             .await?;
         assert_eq!(edit.outputs[0].chars().count(), limit);
         Ok(())
@@ -8339,6 +8390,11 @@ mod tests {
         let edit = generator
             .optimize_image_edit_prompt(
                 " edit it ",
+                &[
+                    "data:image/jpeg;base64,AAAA".to_owned(),
+                    " ".to_owned(),
+                    "data:image/jpeg;base64,BBBB".to_owned(),
+                ],
                 openplotva_media::OptimizePromptOptions {
                     variant_count: 2,
                     ..Default::default()
@@ -8397,7 +8453,14 @@ mod tests {
             edit_body["messages"][0]["content"],
             cached_system_content("custom edit variants=2")
         );
-        assert_eq!(edit_body["messages"][1]["content"], "edit it");
+        assert_eq!(
+            edit_body["messages"][1]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA", "detail": "auto"}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB", "detail": "auto"}},
+                {"type": "text", "text": "Reference images follow in order (the first image, the second image, ...).\nedit it"},
+            ])
+        );
         assert_eq!(edit_body["max_tokens"], 4096);
         assert_eq!(edit_body["temperature"], 0.3);
         Ok(())

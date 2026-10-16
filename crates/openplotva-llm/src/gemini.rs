@@ -1273,7 +1273,14 @@ where
         };
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let payload = self
-            .run_optimizer(&text, &prompt, &tool, &self.image_cache, "optimize_prompt")
+            .run_optimizer(
+                &text,
+                Vec::new(),
+                &prompt,
+                &tool,
+                &self.image_cache,
+                "optimize_prompt",
+            )
             .await?;
         let optimized =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
@@ -1284,9 +1291,12 @@ where
         ))
     }
 
+    /// Optimize an edit request; `images` are data URLs of the pictures being edited,
+    /// in the order the request numbers them.
     pub async fn optimize_image_edit_prompt(
         &self,
         text: &str,
+        images: &[String],
         options: openplotva_media::OptimizePromptOptions,
     ) -> Result<openplotva_media::ImageEditOptimize, GeminiMediaPromptOptimizerError> {
         let (text, variant_count) = optimizer_text_and_count(text, options)?;
@@ -1301,9 +1311,16 @@ where
             None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
+        let images: Vec<GeminiInlineData> = images
+            .iter()
+            .filter_map(|image| gemini_inline_data_from_data_url(image.trim()))
+            .take(openplotva_media::MAX_EDIT_REFERENCE_IMAGES)
+            .collect();
+        let user_text = openplotva_media::image_edit_optimizer_text(&text, images.len());
         let payload = self
             .run_optimizer(
-                &text,
+                &user_text,
+                images,
                 &prompt,
                 &tool,
                 &self.edit_cache,
@@ -1351,13 +1368,14 @@ where
     async fn run_optimizer(
         &self,
         text: &str,
+        images: Vec<GeminiInlineData>,
         prompt: &str,
         tool: &openplotva_media::OptimizerTerminatorDefinition,
         cache: &GeminiExplicitCacheStore,
         flow: &str,
     ) -> Result<Value, GeminiMediaPromptOptimizerError> {
         let model = self.cfg.model.clone();
-        let mut request = gemini_optimizer_request(text, prompt, tool, &model);
+        let mut request = gemini_optimizer_request(text, images, prompt, tool, &model);
         self.resolve_and_apply_optimizer_cache(cache, &model, &mut request)
             .await;
         self.send_forced_tool_request(&model, &request, tool.name, flow)
@@ -2104,10 +2122,22 @@ fn optimizer_text_and_count(
 
 fn gemini_optimizer_request(
     text: &str,
+    images: Vec<GeminiInlineData>,
     prompt: &str,
     tool: &openplotva_media::OptimizerTerminatorDefinition,
     model: &str,
 ) -> GeminiGenerateContentRequest {
+    let mut parts: Vec<GeminiPart> = images
+        .into_iter()
+        .map(|inline_data| GeminiPart {
+            inline_data: Some(inline_data),
+            ..GeminiPart::default()
+        })
+        .collect();
+    parts.push(GeminiPart {
+        text: text.to_owned(),
+        ..GeminiPart::default()
+    });
     GeminiGenerateContentRequest {
         cached_content: None,
         system_instruction: Some(GeminiContent {
@@ -2119,10 +2149,7 @@ fn gemini_optimizer_request(
         }),
         contents: vec![GeminiContent {
             role: "user".to_owned(),
-            parts: vec![GeminiPart {
-                text: text.to_owned(),
-                ..GeminiPart::default()
-            }],
+            parts,
         }],
         generation_config: GeminiGenerationConfig {
             max_output_tokens: MEDIA_OPTIMIZER_MAX_OUTPUT_TOKENS,
