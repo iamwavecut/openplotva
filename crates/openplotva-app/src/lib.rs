@@ -13288,10 +13288,18 @@ async fn start_runtime_workers(
         image_jobs::aifarm_draw_api_config_from_app_config(config),
     )
     .with_workflow_key(image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY);
+    let routed_vip_moss_image_generator = image_jobs::RoutedImageGenerator::new(
+        image_attempt_walker.clone(),
+        image_jobs::aifarm_draw_api_config_from_app_config(config),
+    )
+    .with_workflow_key(image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY);
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::ParallelImageGenerator::new(
-            routed_vip_flux_image_generator,
-            routed_vip_boogu_image_generator,
+            image_jobs::ParallelImageGenerator::new(
+                routed_vip_flux_image_generator,
+                routed_vip_boogu_image_generator,
+            ),
+            routed_vip_moss_image_generator,
         ),
         media_prompt_optimizer.clone(),
     )

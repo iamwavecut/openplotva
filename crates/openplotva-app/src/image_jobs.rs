@@ -74,6 +74,7 @@ pub type ImageJobEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 pub const AIFARM_DRAW_API_SERVICE_NAME: &str = "draw-api";
 pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
 pub const AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME: &str = "flux3_generate";
+pub const AIFARM_DRAW_API_MOSS_ENDPOINT_NAME: &str = "moss_generate";
 pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
 pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
@@ -101,6 +102,8 @@ pub const IMAGE_EDIT_WORKFLOW_KEY: &str = "image_edit";
 pub const IMAGE_GENERATION_WORKFLOW_KEY: &str = "image_generation";
 pub const IMAGE_GENERATION_FLUX_WORKFLOW_KEY: &str = "image_generation_flux";
 pub const IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_generation_boogu_turbo";
+/// Third VIP text-to-image slot, routed to MOSS-Image.
+pub const IMAGE_GENERATION_MOSS_WORKFLOW_KEY: &str = "image_generation_moss";
 pub const IMAGE_EDIT_FLUX_WORKFLOW_KEY: &str = "image_edit_flux";
 pub const IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_edit_boogu_turbo";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
@@ -1196,7 +1199,11 @@ where
 
             match self
                 .first
-                .generate_image(image_generation_request_for_prompt_slot(&request, 0))
+                .generate_image(image_generation_request_for_prompt_slots(
+                    &request,
+                    0,
+                    self.first.expected_image_count(),
+                ))
                 .await
             {
                 Ok(result) if image_generation_result_has_images(&result) => {
@@ -1216,9 +1223,10 @@ where
             let second_slot = self.first.expected_image_count().max(1);
             match self
                 .second
-                .generate_image(image_generation_request_for_prompt_slot(
+                .generate_image(image_generation_request_for_prompt_slots(
                     &request,
                     second_slot,
+                    self.second.expected_image_count(),
                 ))
                 .await
             {
@@ -1258,7 +1266,11 @@ where
 
             match self
                 .first
-                .generate_image(image_generation_request_for_prompt_slot(&request, 0))
+                .generate_image(image_generation_request_for_prompt_slots(
+                    &request,
+                    0,
+                    self.first.expected_image_count(),
+                ))
                 .await
             {
                 Ok(result) if image_generation_result_has_images(&result) => {
@@ -1279,9 +1291,10 @@ where
             let second_slot = self.first.expected_image_count().max(1);
             match self
                 .second
-                .generate_image(image_generation_request_for_prompt_slot(
+                .generate_image(image_generation_request_for_prompt_slots(
                     &request,
                     second_slot,
+                    self.second.expected_image_count(),
                 ))
                 .await
             {
@@ -1346,8 +1359,16 @@ where
         Box::pin(async move {
             let first_slot = 0;
             let second_slot = self.first.expected_image_count();
-            let first_request = image_generation_request_for_prompt_slot(&request, first_slot);
-            let second_request = image_generation_request_for_prompt_slot(&request, second_slot);
+            let first_request = image_generation_request_for_prompt_slots(
+                &request,
+                first_slot,
+                self.first.expected_image_count(),
+            );
+            let second_request = image_generation_request_for_prompt_slots(
+                &request,
+                second_slot,
+                self.second.expected_image_count(),
+            );
             let (first, second) = tokio::join!(
                 self.first.generate_image(first_request),
                 self.second.generate_image(second_request)
@@ -1364,8 +1385,16 @@ where
         Box::pin(async move {
             let first_slot = 0;
             let second_slot = self.first.expected_image_count();
-            let first_request = image_generation_request_for_prompt_slot(&request, first_slot);
-            let second_request = image_generation_request_for_prompt_slot(&request, second_slot);
+            let first_request = image_generation_request_for_prompt_slots(
+                &request,
+                first_slot,
+                self.first.expected_image_count(),
+            );
+            let second_request = image_generation_request_for_prompt_slots(
+                &request,
+                second_slot,
+                self.second.expected_image_count(),
+            );
             let first_progress = progress.clone();
             let second_progress = progress;
             let (first, second) = tokio::join!(
@@ -2171,16 +2200,20 @@ fn image_generation_result_has_images(result: &ImageGenerationResult) -> bool {
     result.first_image_url().is_some() || result.image_bytes.iter().any(|image| !image.is_empty())
 }
 
-fn image_generation_request_for_prompt_slot(
+/// The request one side of a combinator sees: the prompt variants of its own slots,
+/// `start..start + count`, so a nested combinator still hands each slot its prompt.
+fn image_generation_request_for_prompt_slots(
     request: &ImageGenerationRequest,
-    slot: usize,
+    start: usize,
+    count: usize,
 ) -> ImageGenerationRequest {
     let mut request = request.clone();
     request.prompt_variants = request
         .prompt_variants
-        .get(slot)
-        .and_then(|variant| non_empty(variant.clone()))
-        .into_iter()
+        .iter()
+        .skip(start)
+        .take(count.max(1))
+        .filter_map(|variant| non_empty(variant.clone()))
         .collect();
     request
 }
@@ -6652,6 +6685,49 @@ mod tests {
 
         assert_eq!(vip.expected_image_count(), 2);
         assert_eq!(regular.expected_image_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_parallel_generators_hand_each_slot_its_own_prompt() {
+        let krea2 = GeneratorStub::success("https://img.test/krea2.png");
+        let flux3 = GeneratorStub::success("https://img.test/flux3.png");
+        let moss = GeneratorStub::success("https://img.test/moss.png");
+        let vip = ParallelImageGenerator::new(
+            ParallelImageGenerator::new(krea2.clone(), flux3.clone()),
+            moss.clone(),
+        );
+        assert_eq!(vip.expected_image_count(), 3);
+
+        let result = vip
+            .generate_image(ImageGenerationRequest {
+                prompt_variants: vec![
+                    "krea2 prompt".to_owned(),
+                    "flux3 prompt".to_owned(),
+                    "moss prompt".to_owned(),
+                ],
+                ..ImageGenerationRequest::default()
+            })
+            .await
+            .expect("vip result");
+
+        assert_eq!(
+            image_generation_urls(&result),
+            vec![
+                "https://img.test/krea2.png".to_owned(),
+                "https://img.test/flux3.png".to_owned(),
+                "https://img.test/moss.png".to_owned(),
+            ]
+        );
+        for (generator, prompt) in [
+            (&krea2, "krea2 prompt"),
+            (&flux3, "flux3 prompt"),
+            (&moss, "moss prompt"),
+        ] {
+            assert_eq!(
+                generator.requests()[0].prompt_variants,
+                vec![prompt.to_owned()]
+            );
+        }
     }
 
     fn empty_routed_attempt_walker() -> RoutedAttemptWalker {

@@ -61,6 +61,15 @@ FLUX.3 learned from captions written by its own prompt upsampler; write in exact
 5.  Fill out the scene with visible detail only; never invent names, brands, logos, or text.
 6.  Put every piece of text in double quotes exactly as written, in its own script, and say where it sits and how it is lettered.
 {{/if}}
+{{#if moss}}
+**MOSS-Image**
+MOSS-Image learned from detailed captions written by a vision-language recaptioner; write in that form.
+1.  Write one cohesive paragraph of English prose in the generative voice, never "this image shows" or "we can see". Typical length is 100 to 300 words; a simple sign or symbol needs only a few sentences. A short request becomes a complete scene, and a long one is reorganized, never cut.
+2.  Open with the medium and the composition, such as "A photograph of ..." or "A watercolour illustration of ...", then the key subjects and their actions, the setting, the colours, the lighting, and the style.
+3.  Place each subject with spatial words (left, right, center, foreground, background, above, behind) and keep one consistent order.
+4.  For every piece of text in the image, give the exact wording in double quotes and its layout: position, line order, alignment, size relative to other text, letterform, and colour.
+5.  Write prose only: no tag lists, quality tags, or score tags.
+{{/if}}
 
 ### CONTEXT
 1.  The input may start with a "Context:" block followed by a "Request:" block.
@@ -157,5 +166,14 @@ The next example shows the answer for a single Krea 2 Turbo slot.
 <example>
 Request: кот-астронавт на луне
 {"input": "кот-астронавт на луне", "outputs": ["A cinematic digital painting of a ginger tabby cat in a white astronaut suit standing on the grey surface of the Moon. The cat faces the viewer in the centre of the frame, its round glass helmet reflecting a small blue Earth that hangs above the horizon in the black sky on the right. Powdery regolith and shallow craters stretch across the foreground, and a trail of small paw prints leads in from the left edge. Hard, low sunlight from the left casts long black shadows and bright rims along the helmet and the suit. Calm, quietly heroic mood in a cold grey palette with warm orange accents."], "nsfw_result": "safe", "aspect_ratio": "16:9"}
+</example>
+{{/if}}
+{{#if moss}}
+
+The next example shows the answer for a single MOSS-Image slot.
+
+<example>
+Request: записка на холодильнике: купить молоко и хлеб
+{"input": "записка на холодильнике: купить молоко и хлеб", "outputs": ["A photograph of a white refrigerator door in a home kitchen, taken at eye level in soft daylight from a window on the left. In the center of the door, a square yellow sticky note is held at its top edge by a round red magnet. The note carries one line of handwritten Cyrillic letters in blue ballpoint ink, \"купить молоко и хлеб\", written slightly uphill from left to right across the middle of the paper, the letters thin and rounded with a small loop on each \"л\". The lower right corner of the note curls away from the door and casts a thin grey shadow on the glossy white enamel. Below the note, a child's crayon drawing of a red house under a yellow sun is pinned by a blue magnet. On the right, the edge of a wooden counter holds a ceramic bowl of green apples, softly out of focus against a pale tiled wall."], "nsfw_result": "safe", "aspect_ratio": "3:4"}
 </example>
 {{/if}}

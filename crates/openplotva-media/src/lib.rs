@@ -69,6 +69,9 @@ pub enum ImageModel {
     Flux3,
     /// Krea 2 Turbo: one natural-prose paragraph, medium and style first.
     Krea2,
+    /// MOSS-Image SFT: a detailed caption in the form of its recaptioner, read by a
+    /// Qwen3.5 encoder.
+    Moss,
 }
 
 impl ImageModel {
@@ -77,6 +80,7 @@ impl ImageModel {
         match self {
             Self::Flux3 => "FLUX.3 [klein]",
             Self::Krea2 => "Krea 2 Turbo",
+            Self::Moss => "MOSS-Image",
         }
     }
 
@@ -86,6 +90,7 @@ impl ImageModel {
         match value.trim().to_ascii_lowercase().as_str() {
             "flux3" => Some(Self::Flux3),
             "krea2" => Some(Self::Krea2),
+            "moss" => Some(Self::Moss),
             _ => None,
         }
     }
@@ -96,6 +101,7 @@ impl ImageModel {
         match self {
             Self::Flux3 => FLUX3_PROMPT_MAX_CHARS,
             Self::Krea2 => KREA2_PROMPT_MAX_CHARS,
+            Self::Moss => MOSS_PROMPT_MAX_CHARS,
         }
     }
 }
@@ -119,6 +125,7 @@ impl Default for ImageTargets {
 impl ImageTargets {
     pub const FLUX3: Self = Self::single(ImageModel::Flux3);
     pub const KREA2: Self = Self::single(ImageModel::Krea2);
+    pub const MOSS: Self = Self::single(ImageModel::Moss);
 
     #[must_use]
     pub const fn single(model: ImageModel) -> Self {
@@ -417,6 +424,9 @@ pub const FLUX3_PROMPT_MAX_CHARS: usize = 4000;
 /// Krea 2 rules ask for up to 200 words.
 pub const KREA2_PROMPT_MAX_CHARS: usize = 1600;
 
+/// MOSS-Image rules ask for up to about 350 words, like FLUX.3.
+pub const MOSS_PROMPT_MAX_CHARS: usize = 4000;
+
 /// Cut every optimized output to at most `max_chars` characters. The bound is applied
 /// after decoding rather than as a schema `maxLength`: a bounded string makes the
 /// structured-output grammar of large-vocabulary engines slow to compile and decode.
@@ -448,6 +458,7 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "multi": variant_count > 1,
         "flux3": models.contains(&ImageModel::Flux3),
         "krea2": models.contains(&ImageModel::Krea2),
+        "moss": models.contains(&ImageModel::Moss),
     })
 }
 
@@ -906,6 +917,10 @@ mod tests {
             ImageModel::from_prompt_target("krea2"),
             Some(ImageModel::Krea2)
         );
+        assert_eq!(
+            ImageModel::from_prompt_target("moss"),
+            Some(ImageModel::Moss)
+        );
         for retired in ["klein", "boogu", "qwen_image", "dall-e"] {
             assert_eq!(ImageModel::from_prompt_target(retired), None);
         }
@@ -924,6 +939,36 @@ mod tests {
             ImageTargets::KREA2.prompt_max_chars(),
             KREA2_PROMPT_MAX_CHARS
         );
+        assert_eq!(ImageTargets::MOSS.prompt_max_chars(), MOSS_PROMPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn moss_slots_get_their_own_rules_and_example() {
+        let moss = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::MOSS,
+        })
+        .expect("render moss");
+        assert!(moss.contains("`outputs[0]` is rendered by MOSS-Image"));
+        assert!(moss.contains("**MOSS-Image**"));
+        assert!(moss.contains("single MOSS-Image slot"));
+        assert!(!moss.contains("**FLUX.3 [klein]**"));
+        assert!(!moss.contains("**Krea 2 Turbo**"));
+        assert!(!moss.contains("{{"));
+
+        let vip = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 3,
+            targets: ImageTargets::KREA2
+                .followed_by(1, ImageTargets::FLUX3, 1)
+                .followed_by(2, ImageTargets::MOSS, 1),
+        })
+        .expect("render vip");
+        assert!(vip.contains("`outputs[0]` is rendered by Krea 2 Turbo"));
+        assert!(vip.contains("`outputs[1]` is rendered by FLUX.3 [klein]"));
+        assert!(vip.contains("`outputs[2]` is rendered by MOSS-Image"));
+        assert!(vip.contains("**Krea 2 Turbo**"));
+        assert!(vip.contains("**FLUX.3 [klein]**"));
+        assert!(vip.contains("**MOSS-Image**"));
     }
 
     #[test]
