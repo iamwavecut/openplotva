@@ -755,7 +755,7 @@ const RUN_PYTHON_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "send_files",
         required: false,
-        description: "Paths in /home to send to the chat when the script succeeds, up to 10. Images are sent as photos, .gif as an animation, .mp4 as a video, .mp3 and .m4a as audio, other files as documents.",
+        description: "Paths in /home to send to the chat when the script succeeds, up to 10, for example [\"chart.png\"]. Only the listed files reach the user, so list every chart or file they asked for. Images are sent as photos, .gif as an animation, .mp4 as a video, .mp3 and .m4a as audio, other files as documents.",
     },
     ToolArgSpec {
         name: "caption",
@@ -3744,7 +3744,7 @@ fn populate_json_map_args(map: &Map<String, Value>, step: &mut ToolStep) {
     }
     populate_tool_args(
         |key| {
-            if matches!(key, "file_ids" | "message_ids")
+            if matches!(key, "file_ids" | "message_ids" | "send_files")
                 && map.get(key).is_some_and(Value::is_array)
             {
                 return map.get(key).map(Value::to_string);
@@ -4116,6 +4116,7 @@ fn primary_tool_arg_key(step: &str) -> Option<&'static str> {
         STEP_TRANSLATE_TEXT | STEP_SEND_MESSAGE => Some("text"),
         STEP_REACT_TO_MESSAGE => Some("emoji"),
         STEP_CURRENCY_RATES => Some("pairs"),
+        STEP_RUN_PYTHON => Some("code"),
         _ => None,
     }
 }
@@ -5049,6 +5050,20 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     if let Some(value) = lookup("seed") {
         step.seed = value;
     }
+    if let Some(value) = lookup("code") {
+        step.code = value;
+    }
+    if let Some(value) = lookup("send_files") {
+        step.send_files = serde_json::from_str(&value)
+            .ok()
+            .or_else(|| xmlish_reference_list(&value))
+            .unwrap_or_else(|| {
+                value
+                    .split(',')
+                    .map(|path| path.trim().to_owned())
+                    .collect()
+            });
+    }
     if let Some(value) = lookup("emoji") {
         step.emoji = value;
     }
@@ -5229,6 +5244,12 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     step.negative_prompt = sanitize_tool_text(&step.negative_prompt);
     step.aspect_ratio = sanitize_tool_text(&step.aspect_ratio);
     step.seed = sanitize_tool_text(&step.seed);
+    step.send_files = step
+        .send_files
+        .iter()
+        .map(|path| sanitize_tool_text(path))
+        .filter(|path| !path.is_empty())
+        .collect();
     step.emoji = step.emoji.trim().to_owned();
 
     if !is_known_step(&step.step) {
@@ -6381,6 +6402,68 @@ Combining the cards."#;
             missing.is_empty(),
             "tool schema args missing from inline/xmlish scanner keys: {missing:?}"
         );
+    }
+
+    #[test]
+    fn every_tool_schema_arg_reaches_the_tool_step_from_json_arguments() {
+        let mut dropped = Vec::new();
+        for spec in alternative_dialog_tools()
+            .into_iter()
+            .chain([SESSION_SEND_MESSAGE_SPEC, SESSION_REACT_TO_MESSAGE_SPEC])
+        {
+            for arg in spec.args {
+                let sample = match tool_argument_schema(arg)["type"].as_str() {
+                    Some("integer") => json!(7),
+                    Some("boolean") => json!(true),
+                    Some("array") if arg.name == "message_ids" => json!([7]),
+                    Some("array") => json!(["a.png"]),
+                    // Some string-typed args (chat_id, thread_id) hold numbers.
+                    _ => json!("7"),
+                };
+                let mut map = Map::new();
+                map.insert(arg.name.to_owned(), sample.clone());
+                let mut step = ToolStep {
+                    step: spec.name.to_owned(),
+                    ..ToolStep::default()
+                };
+                populate_json_map_args(&map, &mut step);
+                let parsed = serde_json::to_value(&step).expect("serialize tool step");
+                let as_text = |value: &Value| match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                if parsed.get(arg.name).map(as_text) != Some(as_text(&sample)) {
+                    dropped.push(format!("{}.{}", spec.name, arg.name));
+                }
+            }
+        }
+
+        assert!(
+            dropped.is_empty(),
+            "tool schema args dropped by the argument decoder: {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn native_run_python_calls_keep_the_script_and_files() -> Result<(), ToolParseError> {
+        let code = "import matplotlib.pyplot as plt\n\nfor i, v in enumerate([1, 2]):\n    plt.text(i, v, str(v))\nplt.savefig('chart.png')";
+        let step = parse_native_tool_step(&[NativeToolCall {
+            id: "call_1".to_owned(),
+            call_type: "function".to_owned(),
+            function: NativeToolFunction {
+                name: STEP_RUN_PYTHON.to_owned(),
+                arguments: Value::String(
+                    json!({"code": code, "send_files": [" chart.png "], "caption": "Продажи"})
+                        .to_string(),
+                ),
+            },
+        }])?;
+
+        assert_eq!(step.step, STEP_RUN_PYTHON);
+        assert_eq!(step.code, code);
+        assert_eq!(step.send_files, vec!["chart.png"]);
+        assert_eq!(step.caption, "Продажи");
+        Ok(())
     }
 
     #[test]
