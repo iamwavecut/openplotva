@@ -447,6 +447,32 @@ start_sandbox() {
   log "starting the Python sandbox"
   compose up -d --no-deps sandbox
   wait_for_service_health sandbox
+  smoke_sandbox
+}
+
+# Health covers only the supervisor's HTTP listener; nsjail itself fails only
+# when a script runs, so run one before the app starts offering the tool.
+smoke_sandbox() {
+  local container
+  container="$(compose ps -q sandbox)"
+  [[ -n "$container" ]] || fail "sandbox container is missing"
+  docker exec "$container" python3 -c '
+import json, urllib.request
+base = "http://127.0.0.1:8090/v1/sessions/deploy-smoke"
+run = urllib.request.Request(
+    base + "/run",
+    data=json.dumps({"code": "print(6 * 7)"}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+result = json.load(urllib.request.urlopen(run, timeout=60))
+urllib.request.urlopen(urllib.request.Request(base, method="DELETE"), timeout=10)
+ok = result["termination"] == "exited" and result.get("exit_code") == 0 and result["stdout"] == "42\n"
+assert ok, result
+' || {
+    docker logs --tail=60 "$container" >&2 || true
+    fail "the Python sandbox cannot run scripts"
+  }
+  log "sandbox ran a smoke script"
 }
 
 start_app() {
