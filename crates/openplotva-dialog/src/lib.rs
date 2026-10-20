@@ -267,7 +267,8 @@ pub struct PythonRunRequest {
     /// Caption for the delivered files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caption: String,
-    /// Run the script but report the files instead of sending them.
+    /// Run the script and report its files as sent without sending them,
+    /// so a test dialog continues the way a real chat would.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub withhold_delivery: bool,
 }

@@ -79,5 +79,5 @@ scripts themselves never see that network.
 - The stored tool result renders the call's `code` next to its output, which
   is how a follow-up turn finds the script to edit.
 - The tool is offered only when `SANDBOX_URL` is set. SAFE runtime virtual
-  dialogs run the script and report the files they would send as
-  `send_withheld`.
+  dialogs run the script and report its files as sent without sending them,
+  next to `tool_mode: "SAFE"`.
