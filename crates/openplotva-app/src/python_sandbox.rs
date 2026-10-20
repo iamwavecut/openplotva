@@ -871,57 +871,78 @@ impl SandboxDelivery for TelegramSandboxIo {
     ) -> SandboxFuture<'a, DeliveryReport> {
         Box::pin(async move {
             let target = UploadTarget::new(context);
-            let mut caption = caption_text(caption);
-            let mut report = DeliveryReport::default();
-            for delivery in plan_deliveries(files) {
-                let result = match self.send(&target, &delivery, &caption).await {
-                    Ok(messages) => Ok(messages),
-                    Err(error) if matches!(delivery, Delivery::Photos(_)) => {
-                        tracing::debug!(%error, "photo send failed; retrying as documents");
-                        self.send_as_documents(&target, &delivery, &caption).await
-                    }
-                    Err(error) => Err(error),
-                };
-                match result {
-                    Ok(messages) => {
-                        self.record_sent(&messages).await;
-                        report
-                            .sent
-                            .extend(delivery.files().into_iter().map(|file| file.path.clone()));
-                        caption.clear();
-                    }
-                    Err(error) => {
-                        report
-                            .errors
-                            .extend(delivery.files().into_iter().map(|file| DeliveryError {
-                                path: file.path.clone(),
-                                error: error.clone(),
-                            }));
-                    }
-                }
-            }
+            let (report, messages) = deliver_planned(
+                plan_deliveries(files),
+                caption_text(caption),
+                |delivery: Delivery, caption: String| async move {
+                    self.send(&target, &delivery, &caption).await
+                },
+            )
+            .await;
+            self.record_sent(&messages).await;
             report
         })
     }
 }
 
-impl TelegramSandboxIo {
-    async fn send_as_documents(
-        &self,
-        target: &UploadTarget,
-        delivery: &Delivery,
-        caption: &str,
-    ) -> Result<Vec<carapax::types::Message>, String> {
-        let mut messages = Vec::new();
-        for (index, file) in delivery.files().into_iter().enumerate() {
-            let caption = if index == 0 { caption } else { "" };
-            messages.extend(
-                self.send(target, &Delivery::Document(file.clone()), caption)
-                    .await?,
-            );
+/// Send each planned delivery and report exactly which paths reached the
+/// chat. A photo group Telegram rejects is retried file by file as
+/// documents; the caption goes on the first message that gets through.
+async fn deliver_planned<M, F, Fut>(
+    deliveries: Vec<Delivery>,
+    mut caption: String,
+    mut send: F,
+) -> (DeliveryReport, Vec<M>)
+where
+    F: FnMut(Delivery, String) -> Fut,
+    Fut: Future<Output = Result<Vec<M>, String>>,
+{
+    let mut report = DeliveryReport::default();
+    let mut sent = Vec::new();
+    for delivery in deliveries {
+        let paths = delivery
+            .files()
+            .into_iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let attempts = match delivery {
+            Delivery::Photos(files) => {
+                match send(Delivery::Photos(files.clone()), caption.clone()).await {
+                    Ok(messages) => vec![(paths, Ok(messages))],
+                    Err(error) => {
+                        tracing::debug!(%error, "photo send failed; retrying as documents");
+                        let mut attempts = Vec::with_capacity(files.len());
+                        for file in files {
+                            let path = file.path.clone();
+                            let result = send(Delivery::Document(file), caption.clone()).await;
+                            if result.is_ok() {
+                                caption.clear();
+                            }
+                            attempts.push((vec![path], result));
+                        }
+                        attempts
+                    }
+                }
+            }
+            other => vec![(paths, send(other, caption.clone()).await)],
+        };
+        for (paths, result) in attempts {
+            match result {
+                Ok(messages) => {
+                    sent.extend(messages);
+                    report.sent.extend(paths);
+                    caption.clear();
+                }
+                Err(error) => report
+                    .errors
+                    .extend(paths.into_iter().map(|path| DeliveryError {
+                        path,
+                        error: error.clone(),
+                    })),
+            }
         }
-        Ok(messages)
     }
+    (report, sent)
 }
 
 /// Where uploads go: the dialog's chat and thread, as a reply to the trigger.
@@ -1284,6 +1305,61 @@ mod tests {
                 "photos:1",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_albums_fall_back_per_file_and_report_partial_delivery() {
+        let calls = Mutex::new(Vec::new());
+        let deliveries = plan_deliveries(vec![
+            output("a.png", 1),
+            output("b.png", 1),
+            output("c.png", 1),
+            output("d.csv", 1),
+        ]);
+
+        let (report, messages) = deliver_planned(
+            deliveries,
+            "Подпись".to_owned(),
+            |delivery: Delivery, caption: String| {
+                let label = match &delivery {
+                    Delivery::Photos(files) => format!("album:{}", files.len()),
+                    Delivery::Document(file) => format!("document:{}", file.path),
+                    _ => "other".to_owned(),
+                };
+                calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("{label}|{caption}"));
+                async move {
+                    match label.as_str() {
+                        "album:3" => Err("PHOTO_INVALID_DIMENSIONS".to_owned()),
+                        "document:a.png" => Err("network".to_owned()),
+                        _ => Ok(vec![label]),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![
+                "album:3|Подпись",
+                "document:a.png|Подпись",
+                "document:b.png|Подпись",
+                "document:c.png|",
+                "document:d.csv|",
+            ]
+        );
+        assert_eq!(report.sent, vec!["b.png", "c.png", "d.csv"]);
+        assert_eq!(
+            report.errors,
+            vec![DeliveryError {
+                path: "a.png".to_owned(),
+                error: "network".to_owned(),
+            }]
+        );
+        assert_eq!(messages.len(), 3);
     }
 
     #[test]
