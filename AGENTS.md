@@ -2,7 +2,7 @@
 
 ## Codebase Overview
 
-OpenPlotva is a Telegram bot + web service runtime in Rust (18-crate workspace, edition 2024), migrated from a Go original (`go-plotva`): agentic AI dialog with tool-calling turns, media generation (image/music/vision/youtube), bitemporal memory, content-safety shield, Telegram Stars payments, a token-driven admin Web UI, and an operator GraphQL runtime API. Single process backed by Postgres 17 + pgvector and Dragonfly (Redis).
+OpenPlotva is a Telegram bot + web service runtime in Rust (19-crate workspace, edition 2024), migrated from a Go original (`go-plotva`): agentic AI dialog with tool-calling turns, media generation (image/music/vision/youtube), bitemporal memory, content-safety shield, Telegram Stars payments, a token-driven admin Web UI, and an operator GraphQL runtime API. Single process backed by Postgres 17 + pgvector and Dragonfly (Redis).
 
 **Stack**: Rust 1.99.0 · tokio · axum · async-graphql · sqlx 0.9 (Postgres-only) · carapax (Telegram) · pgvector · redis · rustls · handlebars (prompts).
 

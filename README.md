@@ -109,6 +109,7 @@ OPENPLOTVA_PRODUCE_UPDATES=false OPENPLOTVA_CONSUME_UPDATES=true cargo run -p op
 - `crates/openplotva-memory`: memory extraction and retrieval.
 - `crates/openplotva-observability`: tracing and log buffering.
 - `crates/openplotva-prompts`: prompt loading and rendering.
+- `crates/openplotva-sandbox`: nsjail Python sandbox supervisor and its client.
 - `crates/openplotva-server`: HTTP, readiness, and runtime API types.
 - `crates/openplotva-shield`: protective retrieval and safety checks.
 - `crates/openplotva-storage`: Postgres, Redis, migrations, and persistence stores.
@@ -116,4 +117,5 @@ OPENPLOTVA_PRODUCE_UPDATES=false OPENPLOTVA_CONSUME_UPDATES=true cargo run -p op
 - `crates/openplotva-telegram`: Telegram Bot API transport and outbound payloads.
 - `crates/openplotva-updates`: update queue codec and helpers.
 - `crates/openplotva-web`: admin/settings WebApp helpers and embedded assets.
+- `sandbox`: Python sandbox image, package set, and nsjail policy.
 - `tools`: local smoke checks and auxiliary service binaries.

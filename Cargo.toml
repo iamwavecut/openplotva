@@ -18,6 +18,7 @@ members = [
     "crates/openplotva-memory",
     "crates/openplotva-shield",
     "crates/openplotva-media",
+    "crates/openplotva-sandbox",
     "crates/openplotva-web",
 ]
 default-members = ["crates/openplotva-app"]

@@ -80,6 +80,7 @@ class DeploymentIntegrationTests(unittest.TestCase):
                 "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
                 "OPENPLOTVA_DEPLOY_ROOT": str(deploy_root),
                 "OPENPLOTVA_DEPLOY_IMAGE": "ghcr.io/example/openplotva:synthetic",
+                "OPENPLOTVA_SANDBOX_IMAGE": "ghcr.io/example/openplotva-sandbox:synthetic",
                 "OPENPLOTVA_MAINTENANCE_ENV_FILE": str(runtime),
             }
             command = [

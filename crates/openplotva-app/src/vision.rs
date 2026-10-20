@@ -1197,7 +1197,7 @@ where
     }
 }
 
-fn telegram_file_seen_in_chat(record: &TelegramFileRecord, chat_id: i64) -> bool {
+pub(crate) fn telegram_file_seen_in_chat(record: &TelegramFileRecord, chat_id: i64) -> bool {
     chat_id != 0
         && (record.first_seen_chat_id == Some(chat_id) || record.last_seen_chat_id == Some(chat_id))
 }

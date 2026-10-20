@@ -43,6 +43,7 @@ pub mod music_jobs;
 pub mod openrouter_free_pool;
 pub mod payments;
 pub mod permissions;
+pub mod python_sandbox;
 pub mod rate_limits;
 pub mod rates;
 pub mod reactions;
@@ -12820,6 +12821,41 @@ async fn start_runtime_workers(
         app_dialog_toolbox = app_dialog_toolbox
             .with_web_searcher(web_searcher)
             .with_url_crawler(url_crawler);
+    }
+    if config.sandbox.url.is_empty() {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "python_sandbox",
+            "SANDBOX_URL is empty; run_python is not offered",
+        ));
+    } else {
+        match openplotva_sandbox::client::SandboxClient::new(
+            &config.sandbox.url,
+            Duration::from_secs(u64::try_from(config.sandbox.timeout_seconds.max(1)).unwrap_or(75)),
+        ) {
+            Ok(client) => {
+                let io = Arc::new(
+                    python_sandbox::TelegramSandboxIo::new(
+                        telegram.clone(),
+                        PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+                    )
+                    .with_history_store(Arc::new(history_store.clone()), bot_identity.id),
+                );
+                app_dialog_toolbox = app_dialog_toolbox.with_python_sandbox(Arc::new(
+                    python_sandbox::PythonSandboxTool::new(Arc::new(client), io.clone(), io),
+                ));
+                readiness_checks.push(ReadinessCheck::ok(
+                    "python_sandbox",
+                    "run_python uses the sandbox supervisor",
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Python sandbox client unavailable");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "python_sandbox",
+                    format!("Python sandbox client unavailable: {error}"),
+                ));
+            }
+        }
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
     let gradius_for_dialog = if !config.gradius.enabled {

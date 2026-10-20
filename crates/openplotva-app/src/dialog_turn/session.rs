@@ -294,11 +294,18 @@ fn inline_link_targets(answer: &str) -> Vec<String> {
 /// serves plus the engine-intercepted tools. `send_message` and
 /// `react_to_message` deliberately never enter the shared catalog constant —
 /// the legacy provider loop must not advertise tools it cannot execute.
-fn session_native_tools(allow_finish: bool) -> Result<Vec<Value>, String> {
+fn session_native_tools(
+    toolbox: &dyn DialogToolbox,
+    allow_finish: bool,
+) -> Result<Vec<Value>, String> {
     let names = openplotva_dialog::alternative_dialog_tool_names();
     let mut specs = openplotva_dialog::alternative_dialog_tools()
         .into_iter()
-        .filter(|spec| names.contains(&spec.name) && (allow_finish || spec.name != "finish_turn"))
+        .filter(|spec| {
+            names.contains(&spec.name)
+                && toolbox.offers_tool(spec.name)
+                && (allow_finish || spec.name != "finish_turn")
+        })
         .collect::<Vec<_>>();
     specs.push(SESSION_SEND_MESSAGE_SPEC);
     specs.push(SESSION_REACT_TO_MESSAGE_SPEC);
@@ -487,6 +494,7 @@ where
     let active_params = crate::dialog_jobs::dialog_job_params_from_input(ctx.params, &base_input);
     let meta = dialog_tool_context(&base_input);
     let native_tools = match session_native_tools(
+        cfg.toolbox,
         active_params
             .meta
             .get("dialog_trigger")
@@ -2949,20 +2957,46 @@ mod tests {
         }
     }
 
+    struct NoPythonToolbox;
+
+    impl DialogToolbox for NoPythonToolbox {
+        fn offers_tool(&self, name: &str) -> bool {
+            name != openplotva_dialog::STEP_RUN_PYTHON
+        }
+    }
+
     #[test]
     fn session_native_tools_exclude_agent_only_tools() {
-        let tools = session_native_tools(true).expect("native tool schemas");
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
+        let tool_names = |toolbox: &dyn DialogToolbox| {
+            session_native_tools(toolbox, true)
+                .expect("native tool schemas")
+                .iter()
+                .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let names = tool_names(&BudgetProbe::default());
 
-        assert!(names.contains(&openplotva_dialog::STEP_MEMORY_SEARCH));
-        assert!(names.contains(&STEP_SEND_MESSAGE));
-        assert!(names.contains(&STEP_REACT_TO_MESSAGE));
-        assert!(names.contains(&"finish_turn"));
         assert!(
-            session_native_tools(false)
+            names
+                .iter()
+                .any(|name| name == openplotva_dialog::STEP_MEMORY_SEARCH)
+        );
+        assert!(names.iter().any(|name| name == STEP_SEND_MESSAGE));
+        assert!(names.iter().any(|name| name == STEP_REACT_TO_MESSAGE));
+        assert!(names.iter().any(|name| name == "finish_turn"));
+        assert!(
+            names
+                .iter()
+                .any(|name| name == openplotva_dialog::STEP_RUN_PYTHON)
+        );
+        assert!(
+            !tool_names(&NoPythonToolbox)
+                .iter()
+                .any(|name| name == openplotva_dialog::STEP_RUN_PYTHON)
+        );
+        assert!(
+            session_native_tools(&BudgetProbe::default(), false)
                 .expect("addressed schemas")
                 .iter()
                 .all(|tool| {

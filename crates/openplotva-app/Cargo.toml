@@ -22,6 +22,7 @@ openplotva-memory = { path = "../openplotva-memory" }
 openplotva-history = { path = "../openplotva-history" }
 openplotva-observability = { path = "../openplotva-observability" }
 openplotva-prompts = { path = "../openplotva-prompts" }
+openplotva-sandbox = { path = "../openplotva-sandbox" }
 openplotva-server = { path = "../openplotva-server" }
 openplotva-shield = { path = "../openplotva-shield" }
 openplotva-storage = { path = "../openplotva-storage" }

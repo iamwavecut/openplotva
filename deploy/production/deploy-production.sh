@@ -8,6 +8,7 @@ maintenance_env_file="${OPENPLOTVA_MAINTENANCE_ENV_FILE:-/etc/openplotva-mainten
 env_file="${deploy_root}/.env.production"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"
 image="${OPENPLOTVA_DEPLOY_IMAGE:?OPENPLOTVA_DEPLOY_IMAGE is required}"
+sandbox_image="${OPENPLOTVA_SANDBOX_IMAGE:?OPENPLOTVA_SANDBOX_IMAGE is required}"
 dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
 update_stream_valkey_image="${UPDATE_STREAM_VALKEY_IMAGE:-${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
@@ -30,7 +31,7 @@ compose() {
   if [[ "$maintenance_overlay_active" == true ]]; then
     compose_args+=(--env-file "$maintenance_env_snapshot" -f "$maintenance_compose_file")
   fi
-  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" DB_POSTGRES_PASSWORD="$db_password" "${compose_args[@]}" "$@"
+  OPENPLOTVA_IMAGE="$image" OPENPLOTVA_SANDBOX_IMAGE="$sandbox_image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_VALKEY_IMAGE="$update_stream_valkey_image" DB_POSTGRES_PASSWORD="$db_password" "${compose_args[@]}" "$@"
 }
 
 env_file_has_key() {
@@ -153,6 +154,7 @@ docker_login_and_pull() {
   [[ -n "${GHCR_USERNAME:-}" ]] || fail "GHCR_USERNAME is required"
   printf '%s' "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin >/dev/null
   docker pull "$image"
+  docker pull "$sandbox_image"
   compose pull dragonfly redis-ingress
 }
 
@@ -441,6 +443,38 @@ start_dependencies() {
   verify_update_stream_persistence
 }
 
+start_sandbox() {
+  log "starting the Python sandbox"
+  compose up -d --no-deps sandbox
+  wait_for_service_health sandbox
+  smoke_sandbox
+}
+
+# Health covers only the supervisor's HTTP listener; nsjail itself fails only
+# when a script runs, so run one before the app starts offering the tool.
+smoke_sandbox() {
+  local container
+  container="$(compose ps -q sandbox)"
+  [[ -n "$container" ]] || fail "sandbox container is missing"
+  docker exec "$container" python3 -c '
+import json, urllib.request
+base = "http://127.0.0.1:8090/v1/sessions/deploy-smoke"
+run = urllib.request.Request(
+    base + "/run",
+    data=json.dumps({"code": "print(6 * 7)"}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+result = json.load(urllib.request.urlopen(run, timeout=60))
+urllib.request.urlopen(urllib.request.Request(base, method="DELETE"), timeout=10)
+ok = result["termination"] == "exited" and result.get("exit_code") == 0 and result["stdout"] == "42\n"
+assert ok, result
+' || {
+    docker logs --tail=60 "$container" >&2 || true
+    fail "the Python sandbox cannot run scripts"
+  }
+  log "sandbox ran a smoke script"
+}
+
 start_app() {
   ensure_state_volume
   log "recreating openplotva app"
@@ -471,12 +505,14 @@ verify_app() {
   compose ps openplotva
 }
 
-remove_non_current_app_images() {
+remove_non_current_images() {
+  local container="$1"
+  local current_image="$2"
   local current_image_id
   local image_id
   local image_repository
-  current_image_id="$(docker inspect -f '{{.Image}}' "${project}-openplotva-1")"
-  image_repository="${image%:*}"
+  current_image_id="$(docker inspect -f '{{.Image}}' "$container")"
+  image_repository="${current_image%:*}"
   while IFS= read -r image_id; do
     [[ -n "$image_id" && "$image_id" != "$current_image_id" ]] || continue
     docker image rm -f "$image_id" >/dev/null
@@ -487,7 +523,7 @@ remove_non_current_app_images() {
       --format '{{.ID}}' |
       sort -u
   )
-  log "removed non-current local application images"
+  log "removed non-current local images of ${image_repository}"
 }
 
 main() {
@@ -507,9 +543,11 @@ main() {
   fi
 
   start_dependencies "$postgres_mode"
+  start_sandbox
   start_app
   verify_app
-  remove_non_current_app_images
+  remove_non_current_images "${project}-openplotva-1" "$image"
+  remove_non_current_images "${project}-sandbox-1" "$sandbox_image"
   log "production deployment applied"
 }
 

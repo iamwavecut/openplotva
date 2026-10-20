@@ -12,11 +12,12 @@ use openplotva_core::{
 };
 use openplotva_dialog::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest,
-    IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE, RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
-    SongRequest, TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
-    TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect,
-    ToolboxError, ToolboxFuture, VisionRequest, is_internal_not_scheduled_instruction,
-    sanitize_tool_text, user_facing_not_scheduled_message,
+    IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE, PythonRunRequest, RatesRequest,
+    SONG_GENERATION_NOT_SCHEDULED_MESSAGE, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
+    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
+    TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
+    VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
+    user_facing_not_scheduled_message,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
@@ -2272,6 +2273,7 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     history_summarizer: Option<Arc<dyn ChatHistorySummarizer>>,
     history_searcher: Option<Arc<dyn HistorySearcher>>,
     agent_tools: Option<Arc<dyn DialogToolbox>>,
+    python_sandbox: Option<Arc<crate::python_sandbox::PythonSandboxTool>>,
 }
 
 impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
@@ -2298,6 +2300,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             history_summarizer: None,
             history_searcher: None,
             agent_tools: None,
+            python_sandbox: None,
         }
     }
 
@@ -2378,6 +2381,15 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
         self.history_searcher = Some(history_searcher);
         self
     }
+
+    #[must_use]
+    pub fn with_python_sandbox(
+        mut self,
+        python_sandbox: Arc<crate::python_sandbox::PythonSandboxTool>,
+    ) -> Self {
+        self.python_sandbox = Some(python_sandbox);
+        self
+    }
 }
 
 impl<RatesFetcherT, RatesDispatcherT, TranslatorT> DialogToolbox
@@ -2387,6 +2399,22 @@ where
     RatesDispatcherT: RatesSideEffectDispatcher + Send + Sync + 'static,
     TranslatorT: TextTranslator + Send + Sync + 'static,
 {
+    fn offers_tool(&self, name: &str) -> bool {
+        name != openplotva_dialog::STEP_RUN_PYTHON || self.python_sandbox.is_some()
+    }
+
+    fn run_python<'a>(&'a self, req: PythonRunRequest) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            Ok(match self.python_sandbox.as_deref() {
+                Some(sandbox) => sandbox.run(req).await,
+                None => ToolResult::failed(
+                    "run_python_unavailable",
+                    "The Python sandbox is not configured",
+                ),
+            })
+        })
+    }
+
     fn currency_rates<'a>(&'a self, req: RatesRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
             let fetcher = self.rates_fetcher.as_deref();
