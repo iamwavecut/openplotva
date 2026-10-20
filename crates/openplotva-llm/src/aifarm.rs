@@ -2271,7 +2271,7 @@ where
             }
             None => openplotva_media::render_image_optimizer_prompt(render_options)?,
         };
-        let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
+        let tool = openplotva_media::optimize_prompt_terminator_definition(render_options);
         let content = self
             .generate_json(
                 AifarmStructuredJsonRequest {

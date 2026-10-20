@@ -4597,6 +4597,7 @@ mod tests {
                 negative_prompt: String::new(),
                 aspect_ratio: String::new(),
                 seed: String::new(),
+                ..crate::image_jobs::ImageGenerationRequest::default()
             }]
         );
         // Album delivery: the classic placeholder photo goes out first, then the

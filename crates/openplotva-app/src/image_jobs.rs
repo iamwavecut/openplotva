@@ -157,11 +157,17 @@ pub struct ImageGenerationRequest {
     pub caption_text: String,
     /// Optimized prompt variants.
     pub prompt_variants: Vec<String>,
+    /// MOSS-Image layouts aligned with `prompt_variants`: compact JSON for a slot
+    /// written for MOSS-Image on a designed image, empty for every other slot.
+    pub prompt_layouts: Vec<String>,
     pub is_nsfw: bool,
-    /// Raw negative prompt. No current image backend takes one (they run without
-    /// classifier-free guidance), so it is never sent to the image model; the
+    /// Raw negative prompt. It is never sent to an image model as typed; the
     /// optimizer sees it as exclusions to express positively.
     pub negative_prompt: String,
+    /// Negative prompt for MOSS-Image, the one backend that runs classifier-free
+    /// guidance: the optimizer's request-specific exclusions, or the `|` text of a
+    /// verbatim `!draw` prompt.
+    pub moss_negative_prompt: String,
     /// Raw aspect ratio.
     pub aspect_ratio: String,
     /// Raw seed.
@@ -783,11 +789,24 @@ where
             return Ok(ImageGenerationResult::default());
         }
         let aspect_ratio = draw_api_aspect_ratio(&request.aspect_ratio);
+        let moss = if self
+            .cfg
+            .endpoint_name
+            .eq_ignore_ascii_case(AIFARM_DRAW_API_MOSS_ENDPOINT_NAME)
+        {
+            DrawApiMossInputs {
+                negative_prompt: &request.moss_negative_prompt,
+                layout: draw_api_moss_layout(&request),
+            }
+        } else {
+            DrawApiMossInputs::default()
+        };
         let payload = draw_api_payload(
             &prompt,
             &[],
             draw_api_dimensions(&request.aspect_ratio),
             aspect_ratio.as_deref(),
+            moss,
         )
         .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let job_id = self
@@ -836,8 +855,14 @@ where
                 "image edit requires image input".to_owned(),
             ));
         }
-        let payload = draw_api_payload(&prompt, &image_inputs, None, None)
-            .map_err(|err| ImageEditError::Provider(err.to_string()))?;
+        let payload = draw_api_payload(
+            &prompt,
+            &image_inputs,
+            None,
+            None,
+            DrawApiMossInputs::default(),
+        )
+        .map_err(|err| ImageEditError::Provider(err.to_string()))?;
         let job_id = self
             .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
             .await
@@ -1715,19 +1740,27 @@ fn image_generation_context(
 /// model's `prompt_target` config names the model, so switching the model in
 /// the database switches the prompt style with it. The prompt is written once,
 /// before the walk, for the heaviest primary; a lighter primary or a fallback
-/// hop renders that same prompt.
+/// hop renders that same prompt. A MOSS-Image model whose config sets
+/// `"prompt_layout": true` also gets a layout for designed pictures.
 fn routed_image_targets(
     walker: &RoutedAttemptWalker,
     workflow_key: &str,
 ) -> openplotva_media::ImageTargets {
-    walker
-        .primary_model_config(workflow_key)
-        .as_ref()
-        .and_then(prompt_target_model)
-        .map_or(
-            openplotva_media::ImageTargets::FLUX3,
-            openplotva_media::ImageTargets::single,
-        )
+    let config = walker.primary_model_config(workflow_key);
+    let Some(config) = config.as_ref() else {
+        return openplotva_media::ImageTargets::FLUX3;
+    };
+    prompt_target_model(config).map_or(openplotva_media::ImageTargets::FLUX3, |model| {
+        openplotva_media::ImageTargets::single(model)
+            .with_moss_layout(prompt_layout_enabled(config))
+    })
+}
+
+fn prompt_layout_enabled(config: &serde_json::Value) -> bool {
+    config
+        .get("prompt_layout")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn prompt_target_model(config: &serde_json::Value) -> Option<openplotva_media::ImageModel> {
@@ -2072,7 +2105,15 @@ where
             tracing::debug!(%error, "image prompt classification failed; treating as adult");
         }
         apply_image_nsfw_result(classified.value.nsfw_result, &mut request)?;
+        request.moss_negative_prompt = request
+            .prompt_variants
+            .iter()
+            .find_map(|variant| {
+                non_empty(openplotva_media::part_image_prompt(variant).negative_prompt)
+            })
+            .unwrap_or_else(|| request.negative_prompt.trim().to_owned());
         request.prompt_variants = preset;
+        request.prompt_layouts = Vec::new();
         return Ok(request);
     }
     let request_text = build_draw_prompt_text(
@@ -2101,11 +2142,27 @@ where
     }
     let optimized = openplotva_media::apply_word_replacements(optimized.value);
     apply_image_nsfw_result(optimized.nsfw_result, &mut request)?;
-    request.prompt_variants = optimized
+    let moss_layout = optimized
+        .moss_layout
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    (request.prompt_variants, request.prompt_layouts) = optimized
         .outputs
         .into_iter()
-        .filter_map(non_empty)
-        .collect();
+        .enumerate()
+        .filter_map(|(slot, output)| {
+            let layout =
+                if options.targets.model_for_slot(slot) == openplotva_media::ImageModel::Moss {
+                    moss_layout.clone()
+                } else {
+                    String::new()
+                };
+            non_empty(output).map(|output| (output, layout))
+        })
+        .unzip();
+    clear_empty_layouts(&mut request.prompt_layouts);
+    request.moss_negative_prompt = optimized.moss_negative;
     if request.aspect_ratio.trim().is_empty() {
         request.aspect_ratio = optimized.aspect_ratio.trim().to_owned();
     }
@@ -2208,14 +2265,31 @@ fn image_generation_request_for_prompt_slots(
     count: usize,
 ) -> ImageGenerationRequest {
     let mut request = request.clone();
-    request.prompt_variants = request
+    let layouts = request
+        .prompt_layouts
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::repeat(""));
+    (request.prompt_variants, request.prompt_layouts) = request
         .prompt_variants
         .iter()
+        .zip(layouts)
         .skip(start)
         .take(count.max(1))
-        .filter_map(|variant| non_empty(variant.clone()))
-        .collect();
+        .filter_map(|(variant, layout)| {
+            non_empty(variant.clone()).map(|variant| (variant, layout.to_owned()))
+        })
+        .unzip();
+    clear_empty_layouts(&mut request.prompt_layouts);
     request
+}
+
+/// A request carries layouts only while some slot has one, so requests without a
+/// designed MOSS-Image slot stay as they were.
+fn clear_empty_layouts(layouts: &mut Vec<String>) {
+    if layouts.iter().all(String::is_empty) {
+        layouts.clear();
+    }
 }
 
 fn append_image_generation_result(
@@ -3309,6 +3383,7 @@ where
         negative_prompt: params.negative_prompt,
         aspect_ratio: params.aspect_ratio,
         seed: params.seed,
+        ..ImageGenerationRequest::default()
     };
 
     // Fill the album progressively: each streamed provider image lands in the
@@ -4816,6 +4891,19 @@ pub fn draw_api_prompt_text(request: &ImageGenerationRequest) -> String {
     request.prompt.trim().to_owned()
 }
 
+/// The MOSS-Image layout of the variant `draw_api_prompt_text` sends, if it has one.
+fn draw_api_moss_layout(request: &ImageGenerationRequest) -> Option<Value> {
+    let slot = request
+        .prompt_variants
+        .iter()
+        .position(|value| !value.trim().is_empty())?;
+    let layout = request.prompt_layouts.get(slot)?.trim();
+    if layout.is_empty() {
+        return None;
+    }
+    serde_json::from_str(layout).ok()
+}
+
 pub fn decode_draw_api_result_payload(payload: &[u8]) -> Result<DrawApiGenerateResult, String> {
     let raw = serde_json::from_slice::<Value>(payload)
         .map_err(|err| format!("failed to decode response: {err}"))?;
@@ -4871,6 +4959,18 @@ struct DrawApiGenerateRequest<'a> {
     image_url: Option<OneOrManyStrings<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_b64: Option<OneOrManyStrings<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    negative_prompt: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout: Option<Value>,
+}
+
+/// What only the MOSS-Image endpoint reads: its negative prompt and a designed
+/// image's layout, which draw-api renders instead of the prose prompt.
+#[derive(Debug, Default)]
+struct DrawApiMossInputs<'a> {
+    negative_prompt: &'a str,
+    layout: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -4927,6 +5027,7 @@ fn draw_api_payload(
     image_inputs: &[String],
     dimensions: Option<(i32, i32)>,
     aspect_ratio: Option<&str>,
+    moss: DrawApiMossInputs<'_>,
 ) -> serde_json::Result<Vec<u8>> {
     let (image_urls, image_b64) = split_draw_api_image_inputs(image_inputs);
     let image_url = one_or_many_strings(&image_urls);
@@ -4942,6 +5043,8 @@ fn draw_api_payload(
         aspect_ratio,
         image_url,
         image_b64,
+        negative_prompt: Some(moss.negative_prompt.trim()).filter(|value| !value.is_empty()),
+        layout: moss.layout,
     })
 }
 
@@ -5427,6 +5530,7 @@ mod tests {
                 negative_prompt: "blur".to_owned(),
                 aspect_ratio: "16:9".to_owned(),
                 seed: "42".to_owned(),
+                ..ImageGenerationRequest::default()
             }]
         );
         let calls = effects.calls();
@@ -6004,6 +6108,7 @@ mod tests {
                 outputs: vec!["plotva swims near a roach".to_owned()],
                 aspect_ratio: "16:9".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6057,6 +6162,7 @@ mod tests {
                 outputs: vec!["a rewritten cat".to_owned()],
                 aspect_ratio: "1:1".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6149,6 +6255,7 @@ mod tests {
                 outputs: vec!["a ginger cat on a windowsill".to_owned()],
                 aspect_ratio: "1:1".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6188,6 +6295,7 @@ mod tests {
                 outputs: vec!["cat portrait variant".to_owned()],
                 aspect_ratio: String::new(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6222,6 +6330,7 @@ mod tests {
                 outputs: vec!["cat variant".to_owned()],
                 aspect_ratio: "2:3".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6250,6 +6359,7 @@ mod tests {
                 outputs: vec!["cat variant".to_owned()],
                 aspect_ratio: "2:3".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6280,6 +6390,7 @@ mod tests {
                 ],
                 aspect_ratio: "16:9".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                ..openplotva_media::ImageOptimize::default()
             });
         let optimizing = OptimizingImageGenerator::new(
             generator.clone(),
@@ -6341,6 +6452,110 @@ mod tests {
             second.requests()[0].prompt_variants,
             vec!["second prompt".to_owned()]
         );
+    }
+
+    fn moss_poster_layout() -> Value {
+        json!({
+            "items": [{"bbox": [70, 120, 330, 880], "caption": "Bold cream letters.", "label": "text", "text": "Джаз\nу моря"}],
+            "summary": {"caption": "A flat vector jazz festival poster."},
+        })
+    }
+
+    #[tokio::test]
+    async fn optimizer_layout_and_negative_reach_only_the_moss_slot() {
+        let flux3 = GeneratorStub::success("https://img.test/flux3.png");
+        let moss = GeneratorStub::success("https://img.test/moss.png")
+            .with_targets(openplotva_media::ImageTargets::MOSS);
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "постер".to_owned(),
+                outputs: vec![
+                    "A flat poster for FLUX.3.".to_owned(),
+                    "A flat poster for MOSS-Image.".to_owned(),
+                ],
+                aspect_ratio: "3:4".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+                moss_design: true,
+                moss_layout: Some(moss_poster_layout()),
+                moss_negative: "people".to_owned(),
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            SequentialImageGenerator::new(flux3.clone(), moss.clone()),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer)),
+        );
+
+        optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "постер".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await
+            .expect("generation");
+
+        let flux3_request = &flux3.requests()[0];
+        assert_eq!(flux3_request.prompt_variants, ["A flat poster for FLUX.3."]);
+        assert!(flux3_request.prompt_layouts.is_empty());
+        let moss_request = &moss.requests()[0];
+        assert_eq!(
+            moss_request.prompt_variants,
+            ["A flat poster for MOSS-Image."]
+        );
+        assert_eq!(
+            moss_request.prompt_layouts,
+            [moss_poster_layout().to_string()]
+        );
+        assert_eq!(moss_request.moss_negative_prompt, "people");
+        assert_eq!(
+            draw_api_moss_layout(moss_request),
+            Some(moss_poster_layout())
+        );
+        assert_eq!(draw_api_moss_layout(flux3_request), None);
+    }
+
+    #[test]
+    fn prompt_slots_keep_each_layout_with_its_variant() {
+        let request = ImageGenerationRequest {
+            prompt_variants: vec!["first".to_owned(), " ".to_owned(), "third".to_owned()],
+            prompt_layouts: vec![String::new(), String::new(), "{\"items\":[]}".to_owned()],
+            ..ImageGenerationRequest::default()
+        };
+        let tail = image_generation_request_for_prompt_slots(&request, 1, 2);
+        assert_eq!(tail.prompt_variants, ["third"]);
+        assert_eq!(tail.prompt_layouts, ["{\"items\":[]}"]);
+
+        // Requests built before layouts existed carry none.
+        let legacy = ImageGenerationRequest {
+            prompt_variants: vec!["first".to_owned(), "second".to_owned()],
+            ..ImageGenerationRequest::default()
+        };
+        let second = image_generation_request_for_prompt_slots(&legacy, 1, 1);
+        assert_eq!(second.prompt_variants, ["second"]);
+        assert!(second.prompt_layouts.is_empty());
+        assert_eq!(draw_api_moss_layout(&second), None);
+    }
+
+    #[tokio::test]
+    async fn verbatim_draw_sends_the_typed_negative_to_moss() {
+        let generator = GeneratorStub::success("https://img.test/moss.png")
+            .with_targets(openplotva_media::ImageTargets::MOSS);
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(OptimizerStub::default())),
+        );
+
+        optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "lake".to_owned(),
+                prompt_variants: vec!["mountain lake | boats, people".to_owned()],
+                ..ImageGenerationRequest::default()
+            })
+            .await
+            .expect("generation");
+
+        let request = &generator.requests()[0];
+        assert_eq!(request.prompt_variants, ["mountain lake"]);
+        assert_eq!(request.moss_negative_prompt, "boats, people");
+        assert!(request.prompt_layouts.is_empty());
     }
 
     #[tokio::test]
@@ -7806,6 +8021,7 @@ mod tests {
                 &[],
                 draw_api_dimensions("16:9"),
                 draw_api_aspect_ratio("16:9").as_deref(),
+                DrawApiMossInputs::default(),
             )
             .expect("generation payload"),
         )
@@ -7815,8 +8031,14 @@ mod tests {
         assert_eq!(generation["height"], 704);
 
         let edit: serde_json::Value = serde_json::from_slice(
-            &draw_api_payload("night", &["https://img.test/a.png".to_owned()], None, None)
-                .expect("edit payload"),
+            &draw_api_payload(
+                "night",
+                &["https://img.test/a.png".to_owned()],
+                None,
+                None,
+                DrawApiMossInputs::default(),
+            )
+            .expect("edit payload"),
         )
         .expect("edit json");
         assert!(edit.get("aspect_ratio").is_none());
@@ -7910,6 +8132,25 @@ mod tests {
         assert_eq!(
             routed_image_targets(&krea2, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
             openplotva_media::ImageTargets::KREA2
+        );
+
+        let moss = image_route_walker(json!({
+            "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": AIFARM_DRAW_API_MOSS_ENDPOINT_NAME,
+            "prompt_target": "moss",
+        }));
+        let targets = routed_image_targets(&moss, IMAGE_GENERATION_FLUX_WORKFLOW_KEY);
+        assert_eq!(targets, openplotva_media::ImageTargets::MOSS);
+        assert!(!targets.moss_layout());
+
+        let moss_layout = image_route_walker(json!({
+            "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": AIFARM_DRAW_API_MOSS_ENDPOINT_NAME,
+            "prompt_target": "moss",
+            "prompt_layout": true,
+        }));
+        assert!(
+            routed_image_targets(&moss_layout, IMAGE_GENERATION_FLUX_WORKFLOW_KEY).moss_layout()
         );
 
         let retired = image_route_walker(json!({
@@ -8132,6 +8373,85 @@ mod tests {
         );
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
         assert_eq!(requests[1].url, "https://draw.example.test/v1/jobs/job-1");
+    }
+
+    async fn submitted_draw_request(endpoint_name: &str, request: ImageGenerationRequest) -> Value {
+        let source_image = encode_solid_png(4, 4, image::Rgba([10, 20, 30, 255]));
+        let draw_payload = serde_json::to_vec(&json!({
+            "image_b64": [general_purpose::STANDARD.encode(source_image)],
+        }))
+        .expect("draw payload");
+        let response_body = general_purpose::STANDARD.encode(draw_payload);
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "job-1", "state": "processing"}),
+            )),
+            Ok(json_response(json!({
+                "job": {
+                    "job_id": "job-1",
+                    "state": "completed",
+                    "result": {"response": {"status_code": 200, "body": response_body}}
+                }
+            }))),
+        ]);
+        let probe = transport.clone();
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: endpoint_name.to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
+            },
+            transport,
+        );
+        generator
+            .generate_image_with_job_id(request, "draw-moss")
+            .await
+            .expect("draw result");
+        let job: DiscoveryJobRequest =
+            serde_json::from_slice(&probe.requests()[0].body).expect("job request");
+        let body = decode_discovery_body(&job.invocation.body).expect("draw body");
+        serde_json::from_slice(&body).expect("draw request")
+    }
+
+    #[tokio::test]
+    async fn only_the_moss_endpoint_receives_the_layout_and_negative_prompt() {
+        let request = ImageGenerationRequest {
+            prompt: "постер".to_owned(),
+            caption_text: "caption".to_owned(),
+            prompt_variants: vec!["A flat jazz poster.".to_owned()],
+            prompt_layouts: vec![moss_poster_layout().to_string()],
+            moss_negative_prompt: " people ".to_owned(),
+            aspect_ratio: "3:4".to_owned(),
+            ..ImageGenerationRequest::default()
+        };
+
+        let moss =
+            submitted_draw_request(AIFARM_DRAW_API_MOSS_ENDPOINT_NAME, request.clone()).await;
+        assert_eq!(moss["prompt"], "A flat jazz poster.");
+        assert_eq!(moss["negative_prompt"], "people");
+        assert_eq!(moss["layout"], moss_poster_layout());
+        assert_eq!(moss["aspect_ratio"], "3:4");
+
+        let flux3 =
+            submitted_draw_request(AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME, request.clone()).await;
+        assert_eq!(flux3["prompt"], "A flat jazz poster.");
+        assert!(flux3.get("negative_prompt").is_none());
+        assert!(flux3.get("layout").is_none());
+
+        let prose_only = submitted_draw_request(
+            AIFARM_DRAW_API_MOSS_ENDPOINT_NAME,
+            ImageGenerationRequest {
+                prompt_layouts: Vec::new(),
+                moss_negative_prompt: String::new(),
+                ..request
+            },
+        )
+        .await;
+        assert!(prose_only.get("negative_prompt").is_none());
+        assert!(prose_only.get("layout").is_none());
     }
 
     fn draw_poll_test_config() -> AifarmDrawApiConfig {
@@ -9385,6 +9705,7 @@ mod tests {
         result: Result<ImageGenerationResult, ImageGenerationError>,
         requests: Arc<Mutex<Vec<ImageGenerationRequest>>>,
         expected_image_count: usize,
+        targets: openplotva_media::ImageTargets,
     }
 
     impl GeneratorStub {
@@ -9396,6 +9717,7 @@ mod tests {
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
+                targets: openplotva_media::ImageTargets::FLUX3,
             }
         }
 
@@ -9407,6 +9729,7 @@ mod tests {
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
+                targets: openplotva_media::ImageTargets::FLUX3,
             }
         }
 
@@ -9415,6 +9738,7 @@ mod tests {
                 result: Err(ImageGenerationError::Forbidden),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
+                targets: openplotva_media::ImageTargets::FLUX3,
             }
         }
 
@@ -9423,11 +9747,17 @@ mod tests {
                 result: Err(ImageGenerationError::Provider(message.into())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
+                targets: openplotva_media::ImageTargets::FLUX3,
             }
         }
 
         fn with_expected_image_count(mut self, expected_image_count: usize) -> Self {
             self.expected_image_count = expected_image_count;
+            self
+        }
+
+        fn with_targets(mut self, targets: openplotva_media::ImageTargets) -> Self {
+            self.targets = targets;
             self
         }
 
@@ -9439,6 +9769,10 @@ mod tests {
     impl ImageGenerator for GeneratorStub {
         fn expected_image_count(&self) -> usize {
             self.expected_image_count
+        }
+
+        fn image_targets(&self) -> openplotva_media::ImageTargets {
+            self.targets
         }
 
         fn generate_image<'a>(
