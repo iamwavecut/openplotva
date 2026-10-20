@@ -66,9 +66,11 @@ scripts themselves never see that network.
   file was seen in the same chat, downloads them (Telegram's 20 MB limit) and
   uploads them into the session under their original or derived names.
 - After a clean exit, each path in `send_files` (up to 10) is read back and
-  sent as a reply to the trigger message: images as photos or albums, `.gif`
-  as an animation, `.mp4` as a video, `.mp3`/`.m4a` as audio, anything else as
-  a document. A photo Telegram rejects is resent as a document. Sent messages
+  sent as a reply to the trigger message. Without `send_files`, the non-empty
+  files the call created or changed are sent; more than 10 such files wait
+  for the model to name them in `send_files`. Images go out as photos or
+  albums, `.gif` as an animation, `.mp4` as a video, `.mp3`/`.m4a` as audio,
+  anything else as a document. A photo Telegram rejects is resent as a document. Sent messages
   go into chat history and the file metadata store.
 - The result carries the termination, exit code, clipped stdout and stderr,
   the file list, input names and the delivery report. Failures map to
@@ -77,4 +79,5 @@ scripts themselves never see that network.
 - The stored tool result renders the call's `code` next to its output, which
   is how a follow-up turn finds the script to edit.
 - The tool is offered only when `SANDBOX_URL` is set. SAFE runtime virtual
-  dialogs run the script but withhold delivery.
+  dialogs run the script and report the files they would send as
+  `send_withheld`.

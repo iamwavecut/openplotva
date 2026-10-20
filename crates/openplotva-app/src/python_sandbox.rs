@@ -1,8 +1,9 @@
 //! The `run_python` dialog tool.
 //!
 //! The model's script runs in the sandbox supervisor next to the bot. Chat
-//! files are copied into the session home before the run, and the files the
-//! model names in `send_files` are uploaded to the chat after a clean exit.
+//! files are copied into the session home before the run. After a clean exit
+//! the files the model names in `send_files`, or else the files the run
+//! created or changed, are uploaded to the chat.
 
 use std::{collections::BTreeSet, future::Future, path::Path, pin::Pin, sync::Arc};
 
@@ -219,36 +220,55 @@ impl PythonSandboxTool {
 
         let succeeded =
             response.termination == Termination::Exited && response.exit_code == Some(0);
-        let mut report = DeliveryReport::default();
-        if succeeded && !send_files.is_empty() {
-            let mut outputs = Vec::new();
-            for path in &send_files {
-                match self.backend.read_file(&session, path).await {
-                    Ok(bytes) if bytes.is_empty() => report.errors.push(DeliveryError {
-                        path: path.clone(),
-                        error: "the file is empty".to_owned(),
-                    }),
-                    Ok(bytes) => outputs.push(OutputFile {
-                        path: path.clone(),
-                        bytes,
-                    }),
-                    Err(error) => report.errors.push(DeliveryError {
-                        path: path.clone(),
-                        error: error.to_string(),
-                    }),
+        let mut outcome = DeliveryOutcome::default();
+        if !succeeded {
+            outcome.skipped = send_files;
+        } else {
+            match delivery_paths(&send_files, &response) {
+                Err(count) => outcome.unselected = count,
+                Ok(paths) if request.withhold_delivery => outcome.withheld = paths,
+                Ok(paths) if paths.is_empty() => {}
+                Ok(paths) => {
+                    outcome.report = self
+                        .deliver_paths(context, &session, &paths, request.caption.trim())
+                        .await;
                 }
             }
-            if !outputs.is_empty() {
-                let delivered = self
-                    .delivery
-                    .deliver(context, request.caption.trim(), outputs)
-                    .await;
-                report.sent = delivered.sent;
-                report.errors.extend(delivered.errors);
+        }
+        run_result(&response, input_names, outcome)
+    }
+
+    async fn deliver_paths(
+        &self,
+        context: &ToolContext,
+        session: &str,
+        paths: &[String],
+        caption: &str,
+    ) -> DeliveryReport {
+        let mut report = DeliveryReport::default();
+        let mut outputs = Vec::new();
+        for path in paths {
+            match self.backend.read_file(session, path).await {
+                Ok(bytes) if bytes.is_empty() => report.errors.push(DeliveryError {
+                    path: path.clone(),
+                    error: "the file is empty".to_owned(),
+                }),
+                Ok(bytes) => outputs.push(OutputFile {
+                    path: path.clone(),
+                    bytes,
+                }),
+                Err(error) => report.errors.push(DeliveryError {
+                    path: path.clone(),
+                    error: error.to_string(),
+                }),
             }
         }
-        let skipped = if succeeded { Vec::new() } else { send_files };
-        run_result(&response, input_names, report, skipped)
+        if !outputs.is_empty() {
+            let delivered = self.delivery.deliver(context, caption, outputs).await;
+            report.sent = delivered.sent;
+            report.errors.extend(delivered.errors);
+        }
+        report
     }
 
     async fn fetch_inputs(
@@ -290,6 +310,37 @@ impl PythonSandboxTool {
         }
         Ok(files)
     }
+}
+
+/// What happened to the run's output files.
+#[derive(Debug, Default)]
+struct DeliveryOutcome {
+    report: DeliveryReport,
+    /// Named files left unsent because the script failed.
+    skipped: Vec<String>,
+    /// Files a run with withheld delivery would have sent.
+    withheld: Vec<String>,
+    /// Changed files left unsent because there were too many to send unasked.
+    unselected: usize,
+}
+
+/// The files a successful run delivers: the ones the model named, or else
+/// every non-empty file the run created or changed. Too many changed files
+/// return their count instead, so the model picks with `send_files`.
+fn delivery_paths(send_files: &[String], response: &RunResponse) -> Result<Vec<String>, usize> {
+    if !send_files.is_empty() {
+        return Ok(send_files.to_vec());
+    }
+    let changed = response
+        .files
+        .iter()
+        .filter(|file| file.changed && file.size > 0)
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if changed.len() > openplotva_dialog::MAX_SEND_FILES {
+        return Err(changed.len());
+    }
+    Ok(changed)
 }
 
 /// One sandbox session per chat thread, so follow-up calls see earlier files.
@@ -381,12 +432,13 @@ fn unique_name(name: String, used: &mut BTreeSet<String>) -> String {
         .unwrap_or(name)
 }
 
-fn run_result(
-    response: &RunResponse,
-    inputs: Vec<String>,
-    report: DeliveryReport,
-    skipped: Vec<String>,
-) -> ToolResult {
+fn run_result(response: &RunResponse, inputs: Vec<String>, outcome: DeliveryOutcome) -> ToolResult {
+    let DeliveryOutcome {
+        report,
+        skipped,
+        withheld,
+        unselected,
+    } = outcome;
     let mut data = Map::new();
     data.insert(
         "session".to_owned(),
@@ -442,17 +494,25 @@ fn run_result(
     if !skipped.is_empty() {
         data.insert("send_skipped".to_owned(), json!(skipped));
     }
+    if !withheld.is_empty() {
+        data.insert("send_withheld".to_owned(), json!(withheld));
+    }
     let data = Some(Value::Object(data));
 
     let (code, reason) = match (response.termination, response.exit_code) {
         (Termination::Exited, Some(0)) if report.errors.is_empty() => {
-            let message = if report.sent.is_empty() {
-                "The script finished.".to_owned()
-            } else {
+            let message = if !report.sent.is_empty() {
                 format!(
                     "The script finished; the chat received {}.",
                     report.sent.join(", ")
                 )
+            } else if unselected > 0 {
+                format!(
+                    "The script finished and changed {unselected} files, too many to send unasked; name up to {} of them in send_files.",
+                    openplotva_dialog::MAX_SEND_FILES
+                )
+            } else {
+                "The script finished.".to_owned()
             };
             return ToolResult {
                 status: TOOL_RESULT_STATUS_OK.to_owned(),
@@ -1154,6 +1214,7 @@ mod tests {
             file_ids: file_ids.iter().map(|id| (*id).to_owned()).collect(),
             send_files: send_files.iter().map(|path| (*path).to_owned()).collect(),
             caption: " График ".to_owned(),
+            withhold_delivery: false,
         }
     }
 
@@ -1191,6 +1252,78 @@ mod tests {
         assert_eq!(data["stdout"], "42\n");
         assert_eq!(data["sent"], json!(["chart.png"]));
         assert_eq!(data["inputs"], json!(["продажи.csv", "photo_2.jpg"]));
+    }
+
+    #[tokio::test]
+    async fn runs_without_send_files_deliver_the_files_they_changed() {
+        let mut response = exited(0);
+        response.files.extend([
+            FileEntry {
+                path: "data.csv".to_owned(),
+                size: 9,
+                changed: false,
+            },
+            FileEntry {
+                path: "empty.txt".to_owned(),
+                size: 0,
+                changed: true,
+            },
+        ]);
+        let (tool, _, delivery) = sandbox_tool(FakeBackend {
+            response: response.clone(),
+            files: vec![("chart.png".to_owned(), vec![1, 2, 3])],
+            ..FakeBackend::default()
+        });
+
+        let result = tool.run(request(&[], &[])).await;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert_eq!(
+            *delivery.delivered.lock().expect("delivered"),
+            vec![("График".to_owned(), vec!["chart.png".to_owned()])]
+        );
+        assert_eq!(result.data.expect("data")["sent"], json!(["chart.png"]));
+
+        let (tool, _, delivery) = sandbox_tool(FakeBackend {
+            response,
+            ..FakeBackend::default()
+        });
+        let mut withheld = request(&[], &[]);
+        withheld.withhold_delivery = true;
+        let result = tool.run(withheld).await;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert!(delivery.delivered.lock().expect("delivered").is_empty());
+        let data = result.data.expect("data");
+        assert_eq!(data["send_withheld"], json!(["chart.png"]));
+        assert!(data.get("sent").is_none());
+    }
+
+    #[tokio::test]
+    async fn too_many_changed_files_wait_for_send_files() {
+        let mut response = exited(0);
+        response.files = (0..=openplotva_dialog::MAX_SEND_FILES)
+            .map(|index| FileEntry {
+                path: format!("frame_{index}.png"),
+                size: 3,
+                changed: true,
+            })
+            .collect();
+        let (tool, _, delivery) = sandbox_tool(FakeBackend {
+            response,
+            ..FakeBackend::default()
+        });
+
+        let result = tool.run(request(&[], &[])).await;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert!(delivery.delivered.lock().expect("delivered").is_empty());
+        assert!(
+            result.message.contains("changed 11 files"),
+            "{}",
+            result.message
+        );
+        assert!(result.message.contains("send_files"));
     }
 
     #[tokio::test]
@@ -1400,7 +1533,7 @@ mod tests {
             stderr: format!("{}tail", "y".repeat(STDERR_MAX_CHARS)),
             ..RunResponse::default()
         };
-        let data = run_result(&response, Vec::new(), DeliveryReport::default(), Vec::new())
+        let data = run_result(&response, Vec::new(), DeliveryOutcome::default())
             .data
             .expect("data");
         assert_eq!(
