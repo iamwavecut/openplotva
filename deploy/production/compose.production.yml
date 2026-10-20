@@ -34,6 +34,7 @@ services:
       OPENPLOTVA_RUN_MIGRATIONS: "true"
       OPENPLOTVA_CONSUME_UPDATES: "true"
       OPENPLOTVA_PRODUCE_UPDATES: "true"
+      SANDBOX_URL: ${SANDBOX_URL-http://sandbox:8090}
     ports:
       - "127.0.0.1:8080:8080"
       - "${OPENPLOTVA_RUNTIME_API_PUBLISH_HOST:?set OPENPLOTVA_RUNTIME_API_PUBLISH_HOST in the production env}:9091:9091"
@@ -48,6 +49,7 @@ services:
         condition: service_healthy
     networks:
       - plotva-net
+      - sandbox-net
     restart: unless-stopped
     stop_grace_period: 60s
     healthcheck:
@@ -56,6 +58,25 @@ services:
       timeout: 3s
       retries: 12
       start_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Runs model-written Python under nsjail. nsjail needs namespaces, mounts
+  # and cgroup v2 delegation, hence privileged; the network is internal, and
+  # every script also runs in its own empty network namespace.
+  sandbox:
+    image: ${OPENPLOTVA_SANDBOX_IMAGE:?OPENPLOTVA_SANDBOX_IMAGE is required}
+    privileged: true
+    cgroup: private
+    mem_limit: 2g
+    cpus: 2
+    networks:
+      - sandbox-net
+    restart: unless-stopped
+    stop_grace_period: 15s
     logging:
       driver: local
       options:
@@ -167,6 +188,9 @@ services:
 networks:
   plotva-net:
     driver: bridge
+  sandbox-net:
+    driver: bridge
+    internal: true
 
 volumes:
   openplotva-state:

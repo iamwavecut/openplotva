@@ -9,8 +9,8 @@ use carapax::types::{
     InlineQueryResultArticle, InputFile, InputFileReader, InputMedia, InputMediaPhoto,
     InputMessageContentText, InputText, InvoiceParameters, LabeledPrice, LinkPreviewOptions,
     MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType, RefundStarPayment,
-    ReplyMarkup, ReplyParameters, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-    SendPhoto, SendSticker, SetMessageReaction, WebAppInfo,
+    ReplyMarkup, ReplyParameters, SendAnimation, SendAudio, SendChatAction, SendDocument,
+    SendMediaGroup, SendMessage, SendPhoto, SendSticker, SendVideo, SetMessageReaction, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -429,6 +429,25 @@ pub struct AudioMessagePlan {
     pub caption: String,
     pub render_as: String,
     /// Reply parameters, when sending as a reply.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
+/// One uploaded file sent with `sendDocument`, `sendVideo` or `sendAnimation`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UploadMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Target topic ID for forum chats.
+    pub message_thread_id: i64,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Multipart file name.
+    pub file_name: String,
+    /// File bytes.
+    pub bytes: Vec<u8>,
+    /// Optional Telegram caption.
+    pub caption: String,
+    pub render_as: String,
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
@@ -1217,6 +1236,62 @@ pub fn build_audio_message_plan(req: &AudioMessageRequest) -> AudioMessagePlan {
     }
 }
 
+/// Apply the options every upload method shares.
+macro_rules! upload_message_method {
+    ($method:expr, $req:expr) => {{
+        let req: &UploadMessageRequest = $req;
+        let mut method = $method;
+        if req.message_thread_id != 0 {
+            method = method.with_message_thread_id(req.message_thread_id);
+        }
+        if let Some(topic_id) = req.chat.direct_messages_topic_id {
+            method = method.with_direct_messages_topic_id(topic_id);
+        }
+        if req.disable_notification {
+            method = method.with_disable_notification(true);
+        }
+        if !req.caption.is_empty() {
+            method = match parse_mode_from_go(&req.render_as)? {
+                Some(parse_mode) => method
+                    .with_caption(InputText::from(req.caption.clone()).with_format(parse_mode)),
+                None => method.with_caption(req.caption.clone()),
+            };
+        }
+        if let Some(reply) = req.reply_parameters {
+            method = method.with_reply_parameters(reply.into_carapax());
+        }
+        Ok(method)
+    }};
+}
+
+fn upload_input_file(req: &UploadMessageRequest) -> InputFileReader {
+    InputFileReader::new(Cursor::new(req.bytes.clone())).with_file_name(req.file_name.clone())
+}
+
+/// Build an outbound `sendDocument` method.
+pub fn build_document_message_method(
+    req: &UploadMessageRequest,
+) -> Result<SendDocument, OutboundBuildError> {
+    upload_message_method!(SendDocument::new(req.chat.id, upload_input_file(req)), req)
+}
+
+/// Build an outbound streamable `sendVideo` method.
+pub fn build_video_message_method(
+    req: &UploadMessageRequest,
+) -> Result<SendVideo, OutboundBuildError> {
+    upload_message_method!(
+        SendVideo::new(req.chat.id, upload_input_file(req)).with_supports_streaming(true),
+        req
+    )
+}
+
+/// Build an outbound `sendAnimation` method.
+pub fn build_animation_message_method(
+    req: &UploadMessageRequest,
+) -> Result<SendAnimation, OutboundBuildError> {
+    upload_message_method!(SendAnimation::new(upload_input_file(req), req.chat.id), req)
+}
+
 /// Build an outbound `sendMediaGroup` method.
 pub fn build_media_group_message_method(
     req: &MediaGroupMessageRequest,
@@ -1872,18 +1947,18 @@ mod tests {
         OutboundBuildError, PaymentPayload, PaymentPayloadKind, PhotoMessagePlan,
         PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, RichMessageRequest,
         StickerMessagePlan, StickerMessageRequest, SubscriptionInvoiceLinkRequest,
-        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-        build_audio_message_plan, build_callback_answer_method,
-        build_cancel_star_subscription_method, build_chat_action_method,
-        build_delete_message_method, build_donation_invoice_link_method,
-        build_edit_caption_message_method, build_edit_media_message_method,
-        build_edit_media_message_plan, build_edit_reply_markup_message_method,
-        build_edit_text_message_method, build_get_chat_administrators_method,
-        build_get_chat_member_method, build_get_chat_method, build_guest_add_to_chat_markup,
-        build_guest_html_answer_method, build_guest_query_answer_method,
-        build_inline_keyboard_button_data, build_inline_keyboard_button_url,
-        build_inline_keyboard_button_web_app, build_inline_keyboard_markup,
-        build_inline_keyboard_row, build_inline_query_answer_method,
+        TextMessageRequest, UploadMessageRequest, allow_sending_without_reply,
+        build_animation_message_method, build_audio_message_method, build_audio_message_plan,
+        build_callback_answer_method, build_cancel_star_subscription_method,
+        build_chat_action_method, build_delete_message_method, build_document_message_method,
+        build_donation_invoice_link_method, build_edit_caption_message_method,
+        build_edit_media_message_method, build_edit_media_message_plan,
+        build_edit_reply_markup_message_method, build_edit_text_message_method,
+        build_get_chat_administrators_method, build_get_chat_member_method, build_get_chat_method,
+        build_guest_add_to_chat_markup, build_guest_html_answer_method,
+        build_guest_query_answer_method, build_inline_keyboard_button_data,
+        build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
+        build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_pre_checkout_error_method, build_pre_checkout_ok_method,
@@ -1892,13 +1967,13 @@ mod tests {
         build_subscription_invoice_link_method, build_text_message_method,
         build_text_message_methods, build_text_message_methods_without_link_previews,
         build_text_message_methods_without_link_previews_with_atomic_tail,
-        classify_payment_payload, donation_invoice_payload, fingerprint_audio_message_plan,
-        fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-        fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
-        guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
-        guest_unsupported_feature_html, hash_content, message_target_chat, parse_payment_payload,
-        prepare_guest_html, subscription_invoice_payload, telegram_member_can_open_group_settings,
-        validate_text_message_text,
+        build_video_message_method, classify_payment_payload, donation_invoice_payload,
+        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
+        guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
+        guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
+        parse_payment_payload, prepare_guest_html, subscription_invoice_payload,
+        telegram_member_can_open_group_settings, validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -2753,6 +2828,38 @@ mod tests {
 
         let _method = build_audio_message_method(&req)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn upload_message_methods_accept_plain_and_html_captions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut req = UploadMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 77,
+            disable_notification: false,
+            file_name: "report.xlsx".to_owned(),
+            bytes: vec![1, 2, 3],
+            caption: "report".to_owned(),
+            render_as: String::new(),
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+        let _method = build_document_message_method(&req)?;
+
+        req.render_as = TELEGRAM_PARSE_MODE_HTML.to_owned();
+        let _method = build_document_message_method(&req)?;
+        let _method = build_video_message_method(&req)?;
+        let _method = build_animation_message_method(&req)?;
+
+        req.render_as = "BBCode".to_owned();
+        assert!(matches!(
+            build_document_message_method(&req),
+            Err(OutboundBuildError::UnsupportedParseMode(_))
+        ));
         Ok(())
     }
 

@@ -666,7 +666,7 @@ impl<Generator, Sender> DirectDrawApiRuntimeEffects<Generator, Sender> {
 
     async fn record_sent_history(&self, message: carapax::types::Message) -> Option<String> {
         let history = self.history.as_ref()?;
-        let entry = direct_draw_api_sent_history_entry(&message, self.bot_id)?;
+        let entry = sent_message_history_entry(&message, self.bot_id)?;
         history.record_direct_draw_api_history(entry).await.err()
     }
 }
@@ -2087,7 +2087,8 @@ fn direct_draw_api_photo_request(
     })
 }
 
-fn direct_draw_api_sent_history_entry(
+/// History entry for a message the bot sent itself, outside the dispatcher.
+pub(crate) fn sent_message_history_entry(
     message: &carapax::types::Message,
     bot_id: i64,
 ) -> Option<HistoryTextEntry> {

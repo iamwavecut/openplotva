@@ -2120,6 +2120,7 @@ dependencies = [
  "openplotva-memory",
  "openplotva-observability",
  "openplotva-prompts",
+ "openplotva-sandbox",
  "openplotva-server",
  "openplotva-shield",
  "openplotva-storage",
@@ -2260,6 +2261,23 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+]
+
+[[package]]
+name = "openplotva-sandbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

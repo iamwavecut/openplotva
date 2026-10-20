@@ -1,0 +1,43 @@
+# Packages preinstalled in the Python sandbox image.
+# Edit this file, then regenerate requirements.txt:
+#   uv pip compile sandbox/requirements.in --universal --python-version 3.14 -o sandbox/requirements.txt
+# pyarrow is left out on purpose: pandas 3 does not need it, and its import
+# alone takes a large part of the per-call memory limit.
+
+# Data and math
+numpy
+pandas
+scipy
+sympy
+statsmodels
+scikit-learn
+networkx
+shapely
+
+# Charts, diagrams and images
+matplotlib
+seaborn
+pillow
+wordcloud
+qrcode
+graphviz
+cairosvg
+
+# Audio and video (calls the system ffmpeg binary)
+ffmpeg-python
+
+# Reading and writing user files
+openpyxl
+xlrd
+python-docx
+pypdf
+fpdf2
+lxml
+beautifulsoup4
+pyyaml
+charset-normalizer
+
+# Text output and dates
+tabulate
+python-dateutil
+tzdata

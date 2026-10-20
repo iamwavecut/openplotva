@@ -154,6 +154,7 @@ graph BT
     llm[openplotva-llm]:::integration
     storage[openplotva-storage]:::integration
     server[openplotva-server]:::integration
+    sandbox[openplotva-sandbox]:::integration
     app[openplotva-app<br/>composition root]:::root
 
     history --> core
@@ -179,7 +180,7 @@ graph BT
     storage --> taskman
     server --> core
     obs --> config
-    app --> telegram & llm & storage & server & dialog & agent & memory & history & media & shield & taskman & updates & config & obs & prompts & web
+    app --> telegram & llm & storage & server & dialog & agent & memory & history & media & shield & taskman & updates & config & obs & prompts & web & sandbox
 
     classDef leaf fill:#1f2937,stroke:#374151,color:#e5e7eb
     classDef domain fill:#0f2a1d,stroke:#15803d,color:#bbf7d0
@@ -198,7 +199,7 @@ implementations together.
 
 ```
 openplotva/
-├── crates/                        # 18-crate Rust workspace (resolver = "3", edition 2024)
+├── crates/                        # 19-crate Rust workspace (resolver = "3", edition 2024)
 │   ├── openplotva-app/            # Composition root: config wiring, runtime startup, handlers, workers, HTTP
 │   │   └── src/
 │   │       ├── main.rs            # 6-line shim around run()
@@ -218,6 +219,7 @@ openplotva/
 │   ├── openplotva-memory/         # Memory extraction pipeline: cards, episodes, links, bitemporal retrieval
 │   ├── openplotva-history/        # Chat-history summary cascade (token fitting, coverage-cursor merge)
 │   ├── openplotva-media/          # Image optimizer, song director contract + farm music client, public uploader
+│   ├── openplotva-sandbox/        # nsjail Python sandbox supervisor binary + the bot's HTTP client
 │   ├── openplotva-shield/         # Content-safety retrieval scoring + XML context injection
 │   ├── openplotva-updates/        # Redis update queue + enqueue-update CLI binary
 │   ├── openplotva-config/         # Typed AppConfig tree + env loader (single source of truth)
@@ -227,6 +229,7 @@ openplotva/
 ├── web/
 │   ├── admin/                     # Token-driven pl-* component library (design system, sha256-guarded)
 │   └── settings/                  # Settings WebApp (Framework7 + Telegram theme, separate boundary)
+├── sandbox/                       # Sandbox image: Dockerfile, pinned requirements, nsjail policy
 ├── migrations/                    # 152 numbered up/down SQL pairs (0_init → 151_retire_taskman_job_rollup)
 ├── prompts/                       # .prompt templates (chat/aifarm/xml/memory/history/agentic/image/music/vision/youtube)
 ├── tools/                         # Smoke scripts, Rust gates, db-reclaim, token-estimator microservice
@@ -235,7 +238,7 @@ openplotva/
 ├── docs/superpowers/{plans,specs}/# Design history (richest architectural context)
 ├── plans/                         # Legacy numbered fix-plans (001-011)
 ├── skills/openplotva-*/           # Agent skills: deploy, design-system-review, runtime-api
-├── Cargo.toml                     # Workspace manifest (18 members, sqlx 0.9, tokio, axum, async-graphql)
+├── Cargo.toml                     # Workspace manifest (19 members, sqlx 0.9, tokio, axum, async-graphql)
 ├── DESIGN.md                      # Admin design-system contract (token tiers, pl-* catalog, guards)
 └── AGENTS.md                      # Operating rules, code style, architecture boundaries, delivery flow
 ```
@@ -423,6 +426,19 @@ canonicalization, instrumental/duration rules) plus the farm music client
 (completion + native release-task modes, `audio_config.max_seconds`, seed and
 duration from `usage`), and the public media uploader
 (Telegram-safe URLs, preserves caller filenames).
+
+#### `openplotva-sandbox`
+Supervisor for the `run_python` dialog tool, deployed as its own privileged
+container on an internal network. Each call runs `/sandbox/main.py` under
+nsjail (no network, uid 65534, 256 MiB cgroup memory, 1 CPU, 30 s) with a
+per-session 100 MiB tmpfs home mounted at `/home`. Sessions are keyed by chat
+and thread, close 60 s after the last call or 5 min after opening, and at most
+4 exist at once. HTTP API: `POST /v1/sessions/{key}/run`,
+`GET /v1/sessions/{key}/files/{path}`, `DELETE /v1/sessions/{key}`. The app's
+`python_sandbox.rs` uploads chat files into the session, calls the
+supervisor, sends the requested output files to the chat, and records them in
+history; stored `run_python` tool results carry the script so a follow-up turn
+edits it instead of starting over.
 
 #### `openplotva-memory`
 Extraction pipeline: `MemoryExtractor` → `ExtractOutput` (episode summary,

@@ -363,6 +363,9 @@ pub const DEFAULT_ACESTEP_MODEL: &str = "acemusic/acestep-v1.5-turbo";
 /// Default media uploader request timeout, `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
 pub const DEFAULT_UPLOADER_TIMEOUT_SECONDS: i32 = 120;
 
+/// Default Python sandbox request timeout, `SANDBOX_TIMEOUT_SECONDS`.
+pub const DEFAULT_SANDBOX_TIMEOUT_SECONDS: i32 = 75;
+
 pub const DEFAULT_DIALOG_NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/chat/completions";
 
 pub const DEFAULT_DIALOG_NVIDIA_MODEL: &str = "google/gemma-4-31b-it";
@@ -451,6 +454,8 @@ pub struct AppConfig {
     pub open_router: OpenRouterConfig,
     /// Media uploader configuration.
     pub uploader: UploaderConfig,
+    /// Python sandbox supervisor configuration.
+    pub sandbox: SandboxConfig,
     /// Telegram Stars payment configuration.
     pub payments: PaymentsConfig,
     pub white_circle: WhiteCircleConfig,
@@ -773,6 +778,15 @@ pub struct UploaderConfig {
     /// Shared upload secret, from `PLOTVA_UPLOADER_SECRET`.
     pub secret: String,
     /// Request timeout, from `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
+    pub timeout_seconds: i32,
+}
+
+/// Python sandbox supervisor configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Supervisor base URL, from `SANDBOX_URL`; empty disables the `run_python` tool.
+    pub url: String,
+    /// Request timeout, from `SANDBOX_TIMEOUT_SECONDS`.
     pub timeout_seconds: i32,
 }
 
@@ -1323,6 +1337,10 @@ pub struct RawConfig {
     pub uploader_secret: Option<String>,
     /// `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
     pub uploader_timeout_seconds: Option<String>,
+    /// `SANDBOX_URL`.
+    pub sandbox_url: Option<String>,
+    /// `SANDBOX_TIMEOUT_SECONDS`.
+    pub sandbox_timeout_seconds: Option<String>,
     /// `PAYMENTS_SUPPORT_URL`.
     pub payments_support_url: Option<String>,
     /// `WHITECIRCLE_ENABLED`.
@@ -2483,6 +2501,17 @@ impl AppConfig {
                     DEFAULT_UPLOADER_TIMEOUT_SECONDS,
                 )?,
             },
+            sandbox: SandboxConfig {
+                url: raw
+                    .sandbox_url
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_default(),
+                timeout_seconds: parse_i32(
+                    "SANDBOX_TIMEOUT_SECONDS",
+                    raw.sandbox_timeout_seconds,
+                    DEFAULT_SANDBOX_TIMEOUT_SECONDS,
+                )?,
+            },
             payments: PaymentsConfig {
                 support_url: raw
                     .payments_support_url
@@ -3266,6 +3295,8 @@ impl RawConfig {
             uploader_url: env("PLOTVA_UPLOADER_URL"),
             uploader_secret: env("PLOTVA_UPLOADER_SECRET"),
             uploader_timeout_seconds: env("PLOTVA_UPLOADER_TIMEOUT_SECONDS"),
+            sandbox_url: env("SANDBOX_URL"),
+            sandbox_timeout_seconds: env("SANDBOX_TIMEOUT_SECONDS"),
             payments_support_url: env("PAYMENTS_SUPPORT_URL"),
             whitecircle_enabled: env("WHITECIRCLE_ENABLED"),
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),

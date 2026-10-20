@@ -7,11 +7,12 @@
 use openplotva_core::ChatMessageMeta;
 
 use crate::{
-    DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest, RatesRequest,
-    STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL, STEP_CURRENCY_RATES,
-    STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH, STEP_QUEUE_STATUS,
-    STEP_TRANSLATE_TEXT, STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
-    ToolContext, ToolResult, ToolStep, ToolboxError, VisionRequest,
+    DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest, PythonRunRequest,
+    RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL,
+    STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
+    STEP_QUEUE_STATUS, STEP_RUN_PYTHON, STEP_TRANSLATE_TEXT, STEP_UNDERSTAND_MEDIA,
+    STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest, ToolContext, ToolResult, ToolStep,
+    ToolboxError, VisionRequest,
 };
 
 /// Dispatch one tool step to the toolbox.
@@ -161,6 +162,33 @@ pub async fn dispatch_dialog_tool(
                 })
                 .await
         }
+        STEP_RUN_PYTHON => {
+            if step.code.trim().is_empty() {
+                return Ok(ToolResult::failed(
+                    "run_python_code_empty",
+                    "run_python code is empty",
+                ));
+            }
+            toolbox
+                .run_python(PythonRunRequest {
+                    context: meta.clone(),
+                    code: step.code.clone(),
+                    file_ids: step
+                        .file_ids
+                        .iter()
+                        .map(|file_id| resolve_reference_id(file_id, meta))
+                        .filter(|file_id| !file_id.is_empty())
+                        .collect(),
+                    send_files: step
+                        .send_files
+                        .iter()
+                        .map(|path| path.trim().to_owned())
+                        .filter(|path| !path.is_empty())
+                        .collect(),
+                    caption: step.caption.trim().to_owned(),
+                })
+                .await
+        }
         other => Ok(ToolResult::failed(
             "unsupported_tool",
             format!("unsupported step {other:?}"),
@@ -168,17 +196,19 @@ pub async fn dispatch_dialog_tool(
     }
 }
 
+/// Map a dialog-scoped media handle to its stored reference.
+fn resolve_reference_id(file_id: &str, meta: &ToolContext) -> String {
+    let normalized = file_id.trim().replace("\\_", "_");
+    meta.image_reference_ids
+        .get(&normalized)
+        .cloned()
+        .unwrap_or(normalized)
+}
+
 /// Resolve an explicit handle, or the single media attachment on the trigger.
 fn vision_tool_file_id(file_id: &str, meta: &ToolContext) -> Option<String> {
-    let file_id = file_id.trim();
-    if !file_id.is_empty() {
-        let normalized = file_id.replace("\\_", "_");
-        return Some(
-            meta.image_reference_ids
-                .get(&normalized)
-                .cloned()
-                .unwrap_or(normalized),
-        );
+    if !file_id.trim().is_empty() {
+        return Some(resolve_reference_id(file_id, meta));
     }
     single_current_media_file_id(&meta.message_meta)
 }

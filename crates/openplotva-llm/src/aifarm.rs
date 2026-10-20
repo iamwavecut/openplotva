@@ -6676,6 +6676,17 @@ fn format_stored_tool_response_message(
             Value::String(tool_call.r#ref.trim().to_owned()),
         );
     }
+    // The script is the artifact the model edits on a follow-up request.
+    if name == openplotva_dialog::STEP_RUN_PYTHON
+        && let Some(code) = tool_call
+            .input
+            .as_ref()
+            .and_then(|input| input.get("code"))
+            .and_then(Value::as_str)
+            .filter(|code| !code.trim().is_empty())
+    {
+        payload.insert("code".to_owned(), Value::String(code.to_owned()));
+    }
     if let Some(output) = tool_call.output.clone() {
         payload.insert("output".to_owned(), output);
     }
@@ -10911,6 +10922,34 @@ mod tests {
         assert!(!rendered.contains("TOOL_REQUEST"));
         assert!(!rendered.contains("tool_calls:"));
         assert!(!history_and_current.contains("translate_text"));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_run_python_results_carry_the_script_for_follow_up_edits()
+    -> Result<(), AifarmMessageError> {
+        let response = |name: &str| HistoryMessage {
+            role: ROLE_TOOL.to_owned(),
+            kind: MESSAGE_KIND_TOOL_RESPONSE.to_owned(),
+            message_id: 9,
+            tool_call: Some(ToolCall {
+                name: name.to_owned(),
+                r#ref: "call-1".to_owned(),
+                input: Some(
+                    json!({"step": name, "code": "plt.bar([1], [2])\nplt.savefig('a.png')"}),
+                ),
+                output: Some(json!({"status": "ok", "data": {"files": ["a.png"]}})),
+                ..ToolCall::default()
+            }),
+            ..HistoryMessage::default()
+        };
+
+        let rendered = format_stored_tool_response_message(&response("run_python"))?;
+        assert!(rendered.contains(r#""code":"plt.bar([1], [2])\nplt.savefig('a.png')""#));
+        assert!(rendered.find("\"code\"") < rendered.find("\"output\""));
+
+        let other = format_stored_tool_response_message(&response("web_search"))?;
+        assert!(!other.contains("plt.bar"));
         Ok(())
     }
 

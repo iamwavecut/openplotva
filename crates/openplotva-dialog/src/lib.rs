@@ -250,6 +250,24 @@ pub struct DrawRequest {
     pub seed: String,
 }
 
+/// Run one Python script in the sandbox session of the current chat.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PythonRunRequest {
+    /// Tool context.
+    pub context: ToolContext,
+    /// Full Python source.
+    pub code: String,
+    /// Chat file references to copy into the session home before the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
+    /// Session-home paths to deliver to the chat after a successful run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub send_files: Vec<String>,
+    /// Caption for the delivered files.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SongRequest {
     /// Tool context.
@@ -337,6 +355,12 @@ pub type ToolboxFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolResult, ToolboxError>> + Send + 'a>>;
 
 pub trait DialogToolbox: Send + Sync {
+    /// Whether this toolbox can run the catalog tool `name`; sessions do not
+    /// advertise a tool whose backend is not configured.
+    fn offers_tool(&self, _name: &str) -> bool {
+        true
+    }
+
     /// Context and memory tools share the same caller-bound execution boundary.
     fn agent_tool<'a>(&'a self, _context: ToolContext, _step: ToolStep) -> ToolboxFuture<'a> {
         unsupported_tool_future("agent_tool")
@@ -401,6 +425,11 @@ pub trait DialogToolbox: Send + Sync {
     fn history_search<'a>(&'a self, _req: HistorySearchRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future(STEP_HISTORY_SEARCH)
     }
+
+    /// Python sandbox tool.
+    fn run_python<'a>(&'a self, _req: PythonRunRequest) -> ToolboxFuture<'a> {
+        unsupported_tool_future(STEP_RUN_PYTHON)
+    }
 }
 
 fn unsupported_tool_future<'a>(tool: &'static str) -> ToolboxFuture<'a> {
@@ -421,6 +450,9 @@ pub const STEP_TRANSLATE_TEXT: &str = "translate_text";
 pub const STEP_CHAT_HISTORY_SUMMARY: &str = "chat_history_summary";
 pub const STEP_HISTORY_SEARCH: &str = "history_search";
 pub const STEP_MEMORY_SEARCH: &str = "memory_search";
+pub const STEP_RUN_PYTHON: &str = "run_python";
+/// Most files one `run_python` call delivers to the chat.
+pub const MAX_SEND_FILES: usize = 10;
 
 /// Session-engine tool: post an intermediate chat message without ending the
 /// turn. Never part of the shared catalog — the legacy provider loop must not
@@ -446,6 +478,7 @@ const ALL_STEPS: &[&str] = &[
     STEP_CHAT_HISTORY_SUMMARY,
     STEP_HISTORY_SEARCH,
     STEP_MEMORY_SEARCH,
+    STEP_RUN_PYTHON,
     "draw_api",
     "get_messages",
     "get_user_status",
@@ -489,6 +522,8 @@ const INLINE_TOOL_ARG_KEYS: &[&str] = &[
     "chat_id",
     "thread_id",
     "message_id",
+    "code",
+    "send_files",
 ];
 
 const INLINE_ARG_END_MARKERS: &[&str] = &[
@@ -706,6 +741,29 @@ const CHAT_HISTORY_SUMMARY_ARGS: &[ToolArgSpec] = &[
     },
 ];
 
+const RUN_PYTHON_ARGS: &[ToolArgSpec] = &[
+    ToolArgSpec {
+        name: "code",
+        required: true,
+        description: "Complete Python 3.14 script. The working directory is /home; save every output file there under a short Latin name, for example chart.png. Preinstalled: numpy, pandas, scipy, sympy, statsmodels, scikit-learn, networkx, shapely, matplotlib (Agg backend), seaborn, pillow, wordcloud, qrcode, graphviz, cairosvg, openpyxl, xlrd, python-docx, pypdf, fpdf2, lxml, beautifulsoup4, pyyaml, tabulate, ffmpeg-python with the ffmpeg binary. There is no network and no pip. Each call may use 256 MiB of memory, one CPU and 30 seconds. DejaVu Sans renders Cyrillic; its file is /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf.",
+    },
+    ToolArgSpec {
+        name: "file_ids",
+        required: false,
+        description: "Chat files to copy into /home before the run. Copy file_id or file_unique_id values from message attachments; the result lists the file names they get.",
+    },
+    ToolArgSpec {
+        name: "send_files",
+        required: false,
+        description: "Paths in /home to send to the chat when the script succeeds, up to 10. Images are sent as photos, .gif as an animation, .mp4 as a video, .mp3 and .m4a as audio, other files as documents.",
+    },
+    ToolArgSpec {
+        name: "caption",
+        required: false,
+        description: "Optional short caption for the sent files, in the user's language.",
+    },
+];
+
 const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: "draw_api",
@@ -905,6 +963,14 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         result: "Returns a saved summary with event bullets and an artistic recap of actors and events.",
         continuation: ToolContinuation::RequiresFollowup,
         args: CHAT_HISTORY_SUMMARY_ARGS,
+    },
+    ToolSpec {
+        name: STEP_RUN_PYTHON,
+        summary: "Run a Python script in a disposable sandbox without network access and send the files it creates to the chat.",
+        when_to_use: "Use for charts, plots, diagrams, floor plans, tables, file conversion, audio and video processing, data analysis and exact calculations, including data from chat files or from web_search and crawl_url results. To change an earlier chart or file, take the code of that earlier run_python call from the history and change only what the user asked for.",
+        result: "Returns the exit status, stdout, stderr and the files in /home. Files stay in /home for 60 seconds after the last call and at most 5 minutes, so the next call can use them. Files in send_files are delivered to the chat only when the script succeeds; after a delivery, reply briefly and do not describe the file again. On an error, fix the code and run it again.",
+        continuation: ToolContinuation::RequiresFollowup,
+        args: RUN_PYTHON_ARGS,
     },
 ];
 
@@ -1236,6 +1302,14 @@ fn tool_argument_schema(arg: &ToolArgSpec) -> Value {
                 "maxItems".to_owned(),
                 Value::from(openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES),
             );
+        }
+        "send_files" => {
+            schema.insert("type".to_owned(), Value::String("array".to_owned()));
+            schema.insert(
+                "items".to_owned(),
+                json!({"type": "string", "minLength": 1}),
+            );
+            schema.insert("maxItems".to_owned(), Value::from(MAX_SEND_FILES));
         }
         "hours" => {
             schema.insert("type".to_owned(), Value::String("integer".to_owned()));
@@ -2508,6 +2582,12 @@ pub struct ToolStep {
     /// Image seed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seed: String,
+    /// Python source (`run_python`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// Session-home paths to deliver (`run_python`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub send_files: Vec<String>,
     /// Reaction emoji (`react_to_message`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub emoji: String,
@@ -5978,6 +6058,7 @@ mod tests {
                 STEP_CANCEL_DRAWING,
                 STEP_TRANSLATE_TEXT,
                 STEP_CHAT_HISTORY_SUMMARY,
+                STEP_RUN_PYTHON,
             ]
         );
 

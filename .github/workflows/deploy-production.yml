@@ -44,6 +44,7 @@ jobs:
           image_name="ghcr.io/${GITHUB_REPOSITORY}"
           image_name="$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')"
           echo "OPENPLOTVA_IMAGE=${image_name}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "OPENPLOTVA_SANDBOX_IMAGE=${image_name}-sandbox:${GITHUB_SHA}" >> "$GITHUB_ENV"
 
       - name: Install Rust
         run: |
@@ -55,8 +56,8 @@ jobs:
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-deploy
 
-      - name: Build release binary
-        run: cargo build --locked --release -p openplotva-app
+      - name: Build release binaries
+        run: cargo build --locked --release -p openplotva-app -p openplotva-sandbox
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -83,6 +84,23 @@ jobs:
           push: true
           cache-from: type=gha,scope=openplotva-runtime-prebuilt
           cache-to: type=gha,mode=min,scope=openplotva-runtime-prebuilt
+
+      - name: Build and push sandbox image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: sandbox/Dockerfile
+          target: runtime-prebuilt
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: ${{ env.OPENPLOTVA_SANDBOX_IMAGE }}
+          push: true
+          # mode=max keeps the nsjail and package layers between deploys.
+          cache-from: type=gha,scope=openplotva-sandbox
+          cache-to: type=gha,mode=max,scope=openplotva-sandbox
 
       - name: Wait for green CI on this commit
         shell: bash
@@ -173,6 +191,7 @@ jobs:
           set -euo pipefail
           test -n "$GHCR_PULL_TOKEN"
           printf -v image_q '%q' "$OPENPLOTVA_IMAGE"
+          printf -v sandbox_image_q '%q' "$OPENPLOTVA_SANDBOX_IMAGE"
           printf -v token_q '%q' "$GHCR_PULL_TOKEN"
           printf -v actor_q '%q' "$GITHUB_ACTOR"
           printf -v env_q '%q' "${OPENPLOTVA_PRODUCTION_ENV_B64:-}"
@@ -180,7 +199,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=20 \
             "$GETA_SSH_TARGET" \
-            "OPENPLOTVA_DEPLOY_IMAGE=$image_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q OPENPLOTVA_PRODUCTION_ENV_B64=$env_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+            "OPENPLOTVA_DEPLOY_IMAGE=$image_q OPENPLOTVA_SANDBOX_IMAGE=$sandbox_image_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q OPENPLOTVA_PRODUCTION_ENV_B64=$env_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
       - name: Remove non-current GHCR images
         shell: bash
@@ -194,27 +213,29 @@ jobs:
           }
 
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          package="${GITHUB_REPOSITORY#*/}"
-          package="${package,,}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          repository="${repository,,}"
           current_tag="${GITHUB_SHA}"
-          versions_file="$(mktemp)"
 
-          echo "Cleaning GHCR package ${owner}/${package}; keeping only current tag ${current_tag}"
-          gh api --paginate --slurp "/users/${owner}/packages/container/${package}/versions?per_page=100" > "$versions_file"
+          for package in "$repository" "${repository}-sandbox"; do
+            versions_file="$(mktemp)"
+            echo "Cleaning GHCR package ${owner}/${package}; keeping only current tag ${current_tag}"
+            gh api --paginate --slurp "/users/${owner}/packages/container/${package}/versions?per_page=100" > "$versions_file"
 
-          deleted=0
-          while IFS= read -r version; do
-            id="$(jq -r '.id' <<<"$version")"
-            created_at="$(jq -r '.created_at' <<<"$version")"
-            tags="$(jq -r '[.metadata.container.tags[]?] | join(",")' <<<"$version")"
+            deleted=0
+            while IFS= read -r version; do
+              id="$(jq -r '.id' <<<"$version")"
+              created_at="$(jq -r '.created_at' <<<"$version")"
+              tags="$(jq -r '[.metadata.container.tags[]?] | join(",")' <<<"$version")"
 
-            if jq -e --arg tag "$current_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
-              continue
-            fi
+              if jq -e --arg tag "$current_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
+                continue
+              fi
 
-            echo "Deleting GHCR version id=${id} created_at=${created_at} tags=${tags:-<none>}"
-            gh api -X DELETE "/users/${owner}/packages/container/${package}/versions/${id}"
-            deleted=$((deleted + 1))
-          done < <(jq -c '.[][]' "$versions_file")
+              echo "Deleting GHCR version id=${id} created_at=${created_at} tags=${tags:-<none>}"
+              gh api -X DELETE "/users/${owner}/packages/container/${package}/versions/${id}"
+              deleted=$((deleted + 1))
+            done < <(jq -c '.[][]' "$versions_file")
 
-          echo "Deleted ${deleted} old GHCR package version(s)"
+            echo "Deleted ${deleted} old version(s) of ${package}"
+          done

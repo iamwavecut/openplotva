@@ -743,6 +743,26 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
     fn history_search<'a>(&'a self, req: HistorySearchRequest) -> ToolboxFuture<'a> {
         self.inner.history_search(req)
     }
+
+    fn offers_tool(&self, name: &str) -> bool {
+        self.inner.offers_tool(name)
+    }
+
+    /// Runs the script for real but keeps its files in the sandbox: a virtual
+    /// dialog has no Telegram chat to deliver them to.
+    fn run_python<'a>(&'a self, mut req: openplotva_dialog::PythonRunRequest) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            let withheld = std::mem::take(&mut req.send_files);
+            let mut result = self.inner.run_python(req).await?;
+            if let Some(Value::Object(data)) = result.data.as_mut() {
+                data.insert("tool_mode".to_owned(), json!("SAFE"));
+                if !withheld.is_empty() {
+                    data.insert("send_withheld".to_owned(), json!(withheld));
+                }
+            }
+            Ok(result)
+        })
+    }
 }
 
 pub(crate) async fn run_runtime_virtual_dialog_cleanup_worker_until(
