@@ -318,7 +318,8 @@ struct DeliveryOutcome {
     report: DeliveryReport,
     /// Named files left unsent because the script failed.
     skipped: Vec<String>,
-    /// Files a run with withheld delivery would have sent.
+    /// Files a run with withheld delivery would have sent. The model reads
+    /// them as received, so a test dialog continues as a real chat would.
     withheld: Vec<String>,
     /// Changed files left unsent because there were too many to send unasked.
     unselected: usize,
@@ -501,10 +502,15 @@ fn run_result(response: &RunResponse, inputs: Vec<String>, outcome: DeliveryOutc
 
     let (code, reason) = match (response.termination, response.exit_code) {
         (Termination::Exited, Some(0)) if report.errors.is_empty() => {
-            let message = if !report.sent.is_empty() {
+            let received = if report.sent.is_empty() {
+                &withheld
+            } else {
+                &report.sent
+            };
+            let message = if !received.is_empty() {
                 format!(
                     "The script finished; the chat received {}.",
-                    report.sent.join(", ")
+                    received.join(", ")
                 )
             } else if unselected > 0 {
                 format!(
@@ -1294,6 +1300,10 @@ mod tests {
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
         assert!(delivery.delivered.lock().expect("delivered").is_empty());
+        assert_eq!(
+            result.message,
+            "The script finished; the chat received chart.png."
+        );
         let data = result.data.expect("data");
         assert_eq!(data["send_withheld"], json!(["chart.png"]));
         assert!(data.get("sent").is_none());
