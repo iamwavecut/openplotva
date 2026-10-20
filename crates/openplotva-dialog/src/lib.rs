@@ -260,12 +260,16 @@ pub struct PythonRunRequest {
     /// Chat file references to copy into the session home before the run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_ids: Vec<String>,
-    /// Session-home paths to deliver to the chat after a successful run.
+    /// Session-home paths to deliver to the chat after a successful run;
+    /// empty delivers the files the run created or changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub send_files: Vec<String>,
     /// Caption for the delivered files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caption: String,
+    /// Run the script but report the files instead of sending them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withhold_delivery: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -745,7 +749,7 @@ const RUN_PYTHON_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "code",
         required: true,
-        description: "Complete Python 3.14 script. The working directory is /home; save every output file there under a short Latin name, for example chart.png. Preinstalled: numpy, pandas, scipy, sympy, statsmodels, scikit-learn, networkx, shapely, matplotlib (Agg backend), seaborn, pillow, wordcloud, qrcode, graphviz, cairosvg, openpyxl, xlrd, python-docx, pypdf, fpdf2, lxml, beautifulsoup4, pyyaml, tabulate, ffmpeg-python with the ffmpeg binary. There is no network and no pip. Each call may use 256 MiB of memory, one CPU and 30 seconds. DejaVu Sans renders Cyrillic; its file is /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf.",
+        description: "Complete Python 3.14 script. The working directory is /home; save every output file there under a short Latin name, for example chart.png. Write titles, labels and text in the user's language. Preinstalled: numpy, pandas, scipy, sympy, statsmodels, scikit-learn, networkx, shapely, matplotlib (Agg backend), seaborn, pillow, wordcloud, qrcode, graphviz, cairosvg, openpyxl, xlrd, python-docx, pypdf, fpdf2, lxml, beautifulsoup4, pyyaml, tabulate, ffmpeg-python with the ffmpeg binary. There is no network and no pip. Each call may use 256 MiB of memory, one CPU and 30 seconds. DejaVu Sans renders Cyrillic; its file is /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf.",
     },
     ToolArgSpec {
         name: "file_ids",
@@ -755,7 +759,7 @@ const RUN_PYTHON_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "send_files",
         required: false,
-        description: "Paths in /home to send to the chat when the script succeeds, up to 10, for example [\"chart.png\"]. Only the listed files reach the user, so list every chart or file they asked for. Images are sent as photos, .gif as an animation, .mp4 as a video, .mp3 and .m4a as audio, other files as documents.",
+        description: "Paths in /home to send to the chat when the script succeeds, up to 10, for example [\"chart.png\"]. Omit it to send every file this call creates or changes. Images are sent as photos, .gif as an animation, .mp4 as a video, .mp3 and .m4a as audio, other files as documents.",
     },
     ToolArgSpec {
         name: "caption",
@@ -968,7 +972,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_RUN_PYTHON,
         summary: "Run a Python script in a disposable sandbox without network access and send the files it creates to the chat.",
         when_to_use: "Use for charts, plots, diagrams, floor plans, tables, file conversion, audio and video processing, data analysis and exact calculations, including data from chat files or from web_search and crawl_url results. To change an earlier chart or file, take the code of that earlier run_python call from the history and change only what the user asked for.",
-        result: "Returns the exit status, stdout, stderr and the files in /home. Files stay in /home for 60 seconds after the last call and at most 5 minutes, so the next call can use them. Files in send_files are delivered to the chat only when the script succeeds; after a delivery, reply briefly and do not describe the file again. On an error, fix the code and run it again.",
+        result: "Returns the exit status, stdout, stderr and the files in /home. Files stay in /home for 60 seconds after the last call and at most 5 minutes, so the next call can use them. When the script succeeds, the files it created or changed (or only the files in send_files) are sent to the chat; after a delivery, reply briefly and do not describe the file again. On an error, fix the code and run it again.",
         continuation: ToolContinuation::RequiresFollowup,
         args: RUN_PYTHON_ARGS,
     },

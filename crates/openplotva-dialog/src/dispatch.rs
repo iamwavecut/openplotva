@@ -186,6 +186,7 @@ pub async fn dispatch_dialog_tool(
                         .filter(|path| !path.is_empty())
                         .collect(),
                     caption: step.caption.trim().to_owned(),
+                    withhold_delivery: false,
                 })
                 .await
         }
