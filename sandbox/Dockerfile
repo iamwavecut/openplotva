@@ -40,7 +40,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
   CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)"
 # The supervisor mounts session tmpfs homes and creates nsjail cgroups, so it
 # runs as root; every script runs as uid 65534 inside nsjail.
-# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
+USER root
 ENTRYPOINT ["openplotva-sandbox"]
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
