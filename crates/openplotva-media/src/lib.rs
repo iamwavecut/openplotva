@@ -24,6 +24,35 @@ pub const IMAGE_ASPECT_RATIOS: [&str; 9] = [
     "1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "1:2", "2:1",
 ];
 
+/// Side of the square whose area every MOSS-Image canvas keeps, as draw-api sizes it.
+const MOSS_CANVAS_SIDE: f64 = 1024.0;
+/// MOSS-Image canvas sides are multiples of its latent grid.
+const MOSS_CANVAS_GRID: f64 = 16.0;
+
+/// MOSS-Image canvas in pixels for an optimizer aspect ratio such as "3:4": the 1 MP
+/// training area on the 16-pixel grid, the same arithmetic as draw-api's `moss_job`.
+#[must_use]
+pub fn moss_canvas(aspect_ratio: &str) -> Option<(u32, u32)> {
+    let (width, height) = aspect_ratio.split_once(':')?;
+    let (width, height) = (
+        width.trim().parse::<f64>().ok()?,
+        height.trim().parse::<f64>().ok()?,
+    );
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let ratio = (width / height).clamp(0.4, 2.5);
+    let width = (MOSS_CANVAS_SIDE * MOSS_CANVAS_SIDE * ratio).sqrt();
+    let height = width / ratio;
+    let snap = |side: f64| {
+        // Sides stay below 2048 px, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let snapped = ((side / MOSS_CANVAS_GRID).round() * MOSS_CANVAS_GRID) as u32;
+        snapped
+    };
+    Some((snap(width), snap(height)))
+}
+
 pub const OPTIMIZE_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_prompt_terminator";
 pub const OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_edit_prompt_terminator";
 pub const IMAGE_OPTIMIZER_PROMPT_NAME: &str = "image/optimizer";
@@ -44,18 +73,52 @@ pub struct ImageOptimize {
     /// empty when the request rules nothing out or no slot targets MOSS-Image.
     #[serde(default, rename = "slot_moss_negative")]
     pub moss_negative: String,
-    /// Whether the request is a designed image (poster, card, menu, meme, ...) that
-    /// MOSS-Image renders from `moss_layout` instead of its prose prompt.
-    #[serde(default, rename = "slot_moss_design")]
-    pub moss_design: bool,
-    /// MOSS-Image layout of a designed image: `summary` plus `items` with `yxyx` boxes
-    /// on a 0-1000 grid. draw-api compiles it to the model's pixel format.
+    /// Whether MOSS-Image renders the request from `moss_layout` instead of its prose
+    /// prompt: the optimizer's `moss_kind` is one of [`MOSS_LAYOUT_KINDS`].
     #[serde(
         default,
-        rename = "slot_moss_layout",
+        rename = "moss_kind",
+        deserialize_with = "deserialize_moss_kind"
+    )]
+    pub moss_design: bool,
+    /// MOSS-Image layout of a designed image: `canvas_width` and `canvas_height`, `summary`,
+    /// and `items` with `[x_min, y_min, x_max, y_max]` pixel boxes, the draft format of the
+    /// official prompt enhancer. draw-api compiles it to the model's centred format.
+    #[serde(
+        default,
+        rename = "moss_layout",
         deserialize_with = "deserialize_moss_layout"
     )]
     pub moss_layout: Option<Value>,
+}
+
+/// Request kinds MOSS-Image draws from a layout, as the official prompt enhancer
+/// advises: placement, a poster, several panels, or a controlled arrangement.
+pub const MOSS_LAYOUT_KINDS: [&str; 5] = ["poster", "comic", "meme", "infographic", "arrangement"];
+
+/// Kinds of `moss_kind`: the model names the request, and code decides the route,
+/// which a model follows better than a boolean rule with exceptions.
+const MOSS_KINDS: [&str; 10] = [
+    "poster",
+    "comic",
+    "meme",
+    "infographic",
+    "arrangement",
+    "card",
+    "cover",
+    "menu",
+    "other_design",
+    "scene",
+];
+
+fn deserialize_moss_kind<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .is_some_and(|kind| MOSS_LAYOUT_KINDS.contains(&kind.trim())))
 }
 
 /// Keep a layout only when it is an object with a non-empty `items` array, so a
@@ -530,6 +593,13 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "krea2": models.contains(&ImageModel::Krea2),
         "moss": models.contains(&ImageModel::Moss),
         "moss_layout": options.targets.moss_layout(),
+        "moss_canvases": IMAGE_ASPECT_RATIOS
+            .iter()
+            .filter_map(|ratio| {
+                moss_canvas(ratio)
+                    .map(|(width, height)| json!({ "ratio": ratio, "width": width, "height": height }))
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -681,10 +751,35 @@ pub fn normalize_image_optimize(
     if !optimized.moss_design {
         optimized.moss_layout = None;
     }
+    if let Some(items) = optimized
+        .moss_layout
+        .as_mut()
+        .and_then(|layout| layout.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    {
+        // A model used to quoting text in prose also quotes a layout `text`, and
+        // MOSS-Image then draws the quotation marks.
+        for text in items.iter_mut().filter_map(|item| item.get_mut("text")) {
+            if let Some(inner) = text.as_str().and_then(unquoted_lettering) {
+                *text = Value::from(inner);
+            }
+        }
+    }
     if optimized.input.is_empty() {
         optimized.input = fallback.trim().to_owned();
     }
     optimized
+}
+
+/// The lettering inside a pair of double quotes that wraps all of it; guillemets stay,
+/// since Russian lettering uses them.
+fn unquoted_lettering(text: &str) -> Option<&str> {
+    let text = text.trim();
+    [('"', '"'), ('“', '”'), ('„', '“')]
+        .iter()
+        .find_map(|&(open, close)| text.strip_prefix(open)?.strip_suffix(close))
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
 }
 
 #[must_use]
@@ -840,24 +935,27 @@ fn optimizer_terminator_definition(
     }
     // Required, so the model decides each one: a grammar-constrained model skips
     // optional fields. Schema keys serialize in alphabetical order, which a
-    // grammar-constrained model writes in: the `slot_` prefix keeps these after the
-    // prompts, and the design decision comes before the layout it gates.
+    // grammar-constrained model writes in. `moss_kind` and `moss_layout` sort before
+    // `outputs`, so the layout is drafted before the prompts, as the official enhancer
+    // drafts it: written after them, the MOSS-Image prompt of a three-slot call ran on
+    // to the token limit in 5 of 25 calls (2026-10-21). `slot_moss_negative` stays after.
     if moss == MossFields::NegativeAndLayout {
         properties.insert(
-            "slot_moss_design".to_owned(),
+            "moss_kind".to_owned(),
             json!({
-                "type": "boolean",
-                "description": "True only for a designed image where placement matters, such as a poster, card, cover, menu, infographic, or meme.",
+                "type": "string",
+                "enum": MOSS_KINDS,
+                "description": "What the request is; scene for a photograph, painting, or illustration, also with a sign in it.",
             }),
         );
         properties.insert(
-            "slot_moss_layout".to_owned(),
+            "moss_layout".to_owned(),
             json!({
                 "anyOf": [moss_layout_schema(), { "type": "null" }],
-                "description": "MOSS-Image layout when slot_moss_design is true, otherwise null.",
+                "description": "MOSS-Image layout for a poster, comic, meme, infographic, or arrangement, otherwise null.",
             }),
         );
-        required.extend(["slot_moss_design", "slot_moss_layout"]);
+        required.extend(["moss_kind", "moss_layout"]);
     }
     if moss != MossFields::None {
         properties.insert(
@@ -881,47 +979,69 @@ fn optimizer_terminator_definition(
     }
 }
 
-/// MOSS-Image layout in the official `summary` / `items` vocabulary, with boxes as
-/// `[y_min, x_min, y_max, x_max]` on a 0-1000 grid instead of pixels: the optimizer
-/// picks the aspect ratio, and draw-api the canvas.
+/// Most items one MOSS-Image layout carries; draw-api compiles at most this many.
+const MOSS_LAYOUT_MAX_ITEMS: usize = 16;
+
+/// MOSS-Image layout as the official prompt enhancer drafts it: the canvas in pixels,
+/// `summary`, and flat `items` with `[x_min, y_min, x_max, y_max]` pixel boxes from the
+/// top-left corner. The prompt lists the canvas of each aspect ratio.
 fn moss_layout_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
+    let side = json!({ "type": "integer", "minimum": 16, "maximum": 2048 });
+    let bbox = json!({
+        "type": "array",
+        "minItems": 4,
+        "maxItems": 4,
+        "items": { "type": "integer", "minimum": 0 },
+    });
+    // Two item shapes, so only a text item can carry wording: a model that may put
+    // `text` on any item folds a caption into its panel, and the compiler drops it there.
+    let text_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "label": { "type": "string", "enum": ["text"] },
+            "caption": { "type": "string" },
+            "text": { "type": "string" },
+            "bbox": bbox.clone(),
+        },
+        "required": ["label", "caption", "text", "bbox"],
+    });
+    let shape_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "label": { "type": "string", "enum": ["object", "character"] },
+            "caption": { "type": "string" },
+            "bbox": bbox,
+        },
+        "required": ["label", "caption", "bbox"],
+    });
+    // `canvas_` names sort before `items`, so the model fixes the canvas before
+    // the boxes; a plain `width` would come after them.
     json!({
         "type": "object",
         "properties": {
+            "canvas_width": side.clone(),
+            "canvas_height": side,
             "summary": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "caption": { "type": "string" },
-                    "meta": strings.clone(),
+                    "meta": strings,
                     "canvas": { "type": "string", "enum": ["single", "multi_panel", "collage"] },
-                    "palette": strings,
                 },
-                "required": ["caption"],
+                "required": ["caption", "meta", "canvas"],
             },
             "items": {
                 "type": "array",
                 "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "label": { "type": "string", "enum": ["text", "object", "character"] },
-                        "caption": { "type": "string" },
-                        "text": { "type": "string" },
-                        "bbox": {
-                            "type": "array",
-                            "minItems": 4,
-                            "maxItems": 4,
-                            "items": { "type": "integer" },
-                        },
-                    },
-                    "required": ["label", "caption", "bbox"],
-                },
+                "maxItems": MOSS_LAYOUT_MAX_ITEMS,
+                "items": { "anyOf": [text_item, shape_item] },
             },
         },
-        "required": ["summary", "items"],
+        "required": ["canvas_width", "canvas_height", "summary", "items"],
         "additionalProperties": false,
     })
 }
@@ -1185,8 +1305,8 @@ mod tests {
         assert!(vip.contains("plus the MOSS-Image field `slot_moss_negative`,"));
         assert!(vip.contains("written as `\\n` in the JSON string"));
         assert!(vip.contains("**MOSS-Image negative prompt**"));
-        assert!(!vip.contains("slot_moss_layout"));
-        assert!(!vip.contains("slot_moss_design"));
+        assert!(!vip.contains("moss_layout"));
+        assert!(!vip.contains("moss_kind"));
         assert!(!vip.contains("{{"));
 
         let layout = render_image_optimizer_prompt(OptimizePromptOptions {
@@ -1194,18 +1314,71 @@ mod tests {
             targets: ImageTargets::MOSS.with_moss_layout(true),
         })
         .expect("render moss layout");
-        assert!(
-            layout.contains("`slot_moss_design`, `slot_moss_layout`, and `slot_moss_negative`")
-        );
+        assert!(layout.contains(
+                "`moss_kind`, `moss_layout`, `nsfw_result`, `outputs`, and `slot_moss_negative`, in that order"
+            ));
         assert!(layout.contains("**MOSS-Image layout**"));
-        assert!(layout.contains("Use the same breaks in `slot_moss_layout`."));
-        assert!(layout.contains("\"slot_moss_design\": true, \"slot_moss_layout\": {"));
+        assert!(layout.contains("Use the same breaks in `moss_layout`."));
+        assert!(layout.contains("\"moss_kind\": \"poster\", \"moss_layout\": {"));
         assert!(!layout.contains("{{"));
 
         let flux3 =
             render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render flux3");
         assert!(!flux3.contains("slot_moss_"));
         assert!(!flux3.contains("one array of"));
+    }
+
+    #[test]
+    fn moss_layouts_use_the_pixel_canvas_draw_api_draws() {
+        // draw-api's area_dimensions(ratio, 1024, 16) for every optimizer aspect ratio.
+        for (ratio, width, height) in [
+            ("1:1", 1024, 1024),
+            ("2:3", 832, 1248),
+            ("3:2", 1248, 832),
+            ("3:4", 880, 1184),
+            ("4:3", 1184, 880),
+            ("9:16", 768, 1360),
+            ("16:9", 1360, 768),
+            ("1:2", 720, 1456),
+            ("2:1", 1456, 720),
+        ] {
+            assert_eq!(moss_canvas(ratio), Some((width, height)), "{ratio}");
+        }
+        assert_eq!(moss_canvas("square"), None);
+        assert_eq!(moss_canvas("0:1"), None);
+
+        let prompt = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::MOSS.with_moss_layout(true),
+        })
+        .expect("render moss layout");
+        assert!(prompt.contains("`aspect_ratio`: 1:1 is 1024 × 1024, 2:3 is 832 × 1248,"));
+        assert!(prompt.contains("1:2 is 720 × 1456, 2:1 is 1456 × 720."));
+        assert!(prompt.contains(
+            "`bbox` is `[x_min, y_min, x_max, y_max]` in pixels from the top-left corner"
+        ));
+        assert!(prompt.contains(
+            "\"canvas_height\": 1184, \"canvas_width\": 880, \"items\": [{\"bbox\": [106, 83, 774, 391]"
+        ));
+
+        let schema = optimize_prompt_terminator_definition(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::MOSS.with_moss_layout(true),
+        })
+        .input_schema;
+        let layout = &schema["properties"]["moss_layout"]["anyOf"][0];
+        assert_eq!(
+            layout["required"],
+            json!(["canvas_width", "canvas_height", "summary", "items"])
+        );
+        assert_eq!(
+            layout["properties"]["items"]["maxItems"],
+            MOSS_LAYOUT_MAX_ITEMS
+        );
+        assert_eq!(
+            layout["properties"]["summary"]["required"],
+            json!(["caption", "meta", "canvas"])
+        );
     }
 
     #[test]
@@ -1225,7 +1398,7 @@ mod tests {
                 "slot_moss_negative"
             ])
         );
-        assert!(prose["properties"]["slot_moss_layout"].is_null());
+        assert!(prose["properties"]["moss_layout"].is_null());
 
         // The layout flag of either side survives joining two generators.
         let vip = optimize_prompt_terminator_definition(OptimizePromptOptions {
@@ -1244,20 +1417,38 @@ mod tests {
                 "outputs",
                 "nsfw_result",
                 "aspect_ratio",
-                "slot_moss_design",
-                "slot_moss_layout",
+                "moss_kind",
+                "moss_layout",
                 "slot_moss_negative"
             ])
         );
-        assert_eq!(vip["properties"]["slot_moss_design"]["type"], "boolean");
-        let layout = &vip["properties"]["slot_moss_layout"]["anyOf"];
+        assert_eq!(vip["properties"]["moss_kind"]["enum"], json!(MOSS_KINDS));
+        assert!(
+            MOSS_LAYOUT_KINDS
+                .iter()
+                .all(|kind| MOSS_KINDS.contains(kind))
+        );
+        let layout = &vip["properties"]["moss_layout"]["anyOf"];
         assert_eq!(layout[1], json!({ "type": "null" }));
         assert_eq!(layout[0]["additionalProperties"], false);
-        let bbox = &layout[0]["properties"]["items"]["items"]["properties"]["bbox"];
+        let shapes = &layout[0]["properties"]["items"]["items"]["anyOf"];
+        let bbox = &shapes[0]["properties"]["bbox"];
         assert_eq!(
             (bbox["minItems"].clone(), bbox["maxItems"].clone()),
             (json!(4), json!(4))
         );
+        // Only a text item carries wording.
+        assert_eq!(shapes[0]["properties"]["label"]["enum"], json!(["text"]));
+        assert_eq!(
+            shapes[0]["required"],
+            json!(["label", "caption", "text", "bbox"])
+        );
+        assert_eq!(
+            shapes[1]["properties"]["label"]["enum"],
+            json!(["object", "character"])
+        );
+        assert!(shapes[1]["properties"]["text"].is_null());
+        assert_eq!(shapes[1]["additionalProperties"], false);
         // The grammar writes keys in serialized order: the prompts before the MOSS fields.
         let keys: Vec<&String> = vip["properties"]
             .as_object()
@@ -1265,15 +1456,16 @@ mod tests {
             .keys()
             .collect();
         let position = |key: &str| keys.iter().position(|k| *k == key).expect("key");
-        assert!(position("outputs") < position("slot_moss_design"));
-        assert!(position("slot_moss_design") < position("slot_moss_layout"));
+        assert!(position("moss_kind") < position("moss_layout"));
+        assert!(position("moss_layout") < position("outputs"));
+        assert!(position("outputs") < position("slot_moss_negative"));
 
         // Without a MOSS-Image slot the layout flag adds nothing.
         let flux3 = optimize_prompt_terminator_definition(OptimizePromptOptions {
             variant_count: 1,
             targets: ImageTargets::FLUX3.with_moss_layout(true),
         });
-        assert!(flux3.input_schema["properties"]["slot_moss_layout"].is_null());
+        assert!(flux3.input_schema["properties"]["moss_layout"].is_null());
         assert!(flux3.input_schema["properties"]["slot_moss_negative"].is_null());
         let edit = optimize_edit_prompt_terminator_definition(1);
         assert!(edit.input_schema["properties"]["slot_moss_negative"].is_null());
@@ -1326,19 +1518,19 @@ mod tests {
             "items": [{"bbox": [70, 120, 330, 880], "caption": "Bold cream letters.", "label": "text", "text": "Джаз\nу моря"}],
             "summary": {"caption": "A flat vector jazz poster."},
         });
-        let payload = |design: bool, layout: &Value| {
+        let payload = |kind: &str, layout: &Value| {
             json!({
                 "input": "постер",
                 "outputs": ["A flat vector illustration poster for a jazz festival."],
                 "nsfw_result": "safe",
                 "aspect_ratio": "3:4",
-                "slot_moss_design": design,
-                "slot_moss_layout": layout,
+                "moss_kind": kind,
+                "moss_layout": layout,
                 "slot_moss_negative": " people ",
             })
             .to_string()
         };
-        let designed = decode_image_optimize_payload(&payload(true, &layout), "постер", 1)
+        let designed = decode_image_optimize_payload(&payload("poster", &layout), "постер", 1)
             .expect("decode designed");
         assert!(designed.moss_design);
         assert_eq!(designed.moss_layout.as_ref(), Some(&layout));
@@ -1351,13 +1543,47 @@ mod tests {
             Some(&json!("Джаз\nу моря"))
         );
 
-        let scene = decode_image_optimize_payload(&payload(false, &layout), "постер", 1)
-            .expect("decode scene");
-        assert_eq!(scene.moss_layout, None);
+        let quoted = json!({
+            "items": [
+                {"bbox": [0, 0, 10, 10], "caption": "c", "label": "text", "text": "\"Кино на крыше\""},
+                {"bbox": [0, 0, 10, 10], "caption": "c", "label": "text", "text": "фильм «Солярис»"},
+                {"bbox": [0, 0, 10, 10], "caption": "c", "label": "text", "text": "\"\""},
+            ],
+            "summary": {"caption": "c"},
+        });
+        let unquoted = decode_image_optimize_payload(&payload("poster", &quoted), "постер", 1)
+            .expect("decode quoted");
+        let texts: Vec<&Value> = unquoted.moss_layout.as_ref().expect("layout")["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| &item["text"])
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                &json!("Кино на крыше"),
+                &json!("фильм «Солярис»"),
+                &json!("\"\"")
+            ]
+        );
+
+        // Only a layout kind keeps the layout, whatever the model wrote.
+        for kind in ["scene", "card", "menu", "unknown"] {
+            let other = decode_image_optimize_payload(&payload(kind, &layout), "постер", 1)
+                .expect("decode other kind");
+            assert!(!other.moss_design, "{kind}");
+            assert_eq!(other.moss_layout, None, "{kind}");
+        }
+        for kind in MOSS_LAYOUT_KINDS {
+            let designed = decode_image_optimize_payload(&payload(kind, &layout), "постер", 1)
+                .expect("decode layout kind");
+            assert!(designed.moss_design, "{kind}");
+        }
 
         // A malformed layout degrades to the prose prompt instead of failing the payload.
         for broken in [json!("layout"), json!({"items": []}), json!(null)] {
-            let decoded = decode_image_optimize_payload(&payload(true, &broken), "постер", 1)
+            let decoded = decode_image_optimize_payload(&payload("poster", &broken), "постер", 1)
                 .expect("decode broken layout");
             assert_eq!(decoded.moss_layout, None);
             assert_eq!(decoded.outputs.len(), 1);
@@ -1424,8 +1650,8 @@ mod tests {
             "input": "x",
             "outputs": ["Blocked: forbidden CSAM request."],
             "nsfw_result": "forbidden",
-            "slot_moss_design": true,
-            "slot_moss_layout": {"items": [{"bbox": [0, 0, 10, 10], "caption": "c", "label": "object"}], "summary": {"caption": "c"}},
+            "moss_kind": "poster",
+            "moss_layout": {"items": [{"bbox": [0, 0, 10, 10], "caption": "c", "label": "object"}], "summary": {"caption": "c"}},
             "slot_moss_negative": "hat",
         })
         .to_string();
