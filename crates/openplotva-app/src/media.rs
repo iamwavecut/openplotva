@@ -470,6 +470,7 @@ where
             outputs: vec![fallback_prompt.to_owned()],
             aspect_ratio: aspect_ratio.to_owned(),
             nsfw_result: openplotva_media::NsfwResult::Adult,
+            ..ImageOptimize::default()
         };
         let Some(optimizer) = &self.optimizer else {
             return MediaPromptOptimization {
@@ -1225,6 +1226,7 @@ mod tests {
                 outputs: vec!["cat".to_owned()],
                 aspect_ratio: "1:1".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Adult,
+                ..ImageOptimize::default()
             }
         );
     }
@@ -1264,6 +1266,7 @@ mod tests {
             outputs: vec!["gemini cat".to_owned()],
             aspect_ratio: "1:1".to_owned(),
             nsfw_result: openplotva_media::NsfwResult::Safe,
+            ..ImageOptimize::default()
         }));
         let optimizer = FallbackMediaPromptOptimizer::new(
             primary,
