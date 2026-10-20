@@ -226,7 +226,7 @@ impl PythonSandboxTool {
         } else {
             match delivery_paths(&send_files, &response) {
                 Err(count) => outcome.unselected = count,
-                Ok(paths) if request.withhold_delivery => outcome.withheld = paths,
+                Ok(paths) if request.withhold_delivery => outcome.report.sent = paths,
                 Ok(paths) if paths.is_empty() => {}
                 Ok(paths) => {
                     outcome.report = self
@@ -318,9 +318,6 @@ struct DeliveryOutcome {
     report: DeliveryReport,
     /// Named files left unsent because the script failed.
     skipped: Vec<String>,
-    /// Files a run with withheld delivery would have sent. The model reads
-    /// them as received, so a test dialog continues as a real chat would.
-    withheld: Vec<String>,
     /// Changed files left unsent because there were too many to send unasked.
     unselected: usize,
 }
@@ -437,7 +434,6 @@ fn run_result(response: &RunResponse, inputs: Vec<String>, outcome: DeliveryOutc
     let DeliveryOutcome {
         report,
         skipped,
-        withheld,
         unselected,
     } = outcome;
     let mut data = Map::new();
@@ -495,22 +491,14 @@ fn run_result(response: &RunResponse, inputs: Vec<String>, outcome: DeliveryOutc
     if !skipped.is_empty() {
         data.insert("send_skipped".to_owned(), json!(skipped));
     }
-    if !withheld.is_empty() {
-        data.insert("send_withheld".to_owned(), json!(withheld));
-    }
     let data = Some(Value::Object(data));
 
     let (code, reason) = match (response.termination, response.exit_code) {
         (Termination::Exited, Some(0)) if report.errors.is_empty() => {
-            let received = if report.sent.is_empty() {
-                &withheld
-            } else {
-                &report.sent
-            };
-            let message = if !received.is_empty() {
+            let message = if !report.sent.is_empty() {
                 format!(
                     "The script finished; the chat received {}.",
-                    received.join(", ")
+                    report.sent.join(", ")
                 )
             } else if unselected > 0 {
                 format!(
@@ -1304,9 +1292,7 @@ mod tests {
             result.message,
             "The script finished; the chat received chart.png."
         );
-        let data = result.data.expect("data");
-        assert_eq!(data["send_withheld"], json!(["chart.png"]));
-        assert!(data.get("sent").is_none());
+        assert_eq!(result.data.expect("data")["sent"], json!(["chart.png"]));
     }
 
     #[tokio::test]
