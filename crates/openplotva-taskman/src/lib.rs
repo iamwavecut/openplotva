@@ -202,6 +202,10 @@ pub struct ImageJobData {
     pub image_file_id: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub image_urls: Vec<String>,
+    /// Telegram file IDs of the pictures an edit works on, in order. They stand in for
+    /// file URLs, which carry the bot token.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub image_file_ids: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub is_image_edit: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -260,6 +264,7 @@ impl Default for ImageJobData {
             seed: 0,
             image_file_id: String::new(),
             image_urls: Vec::new(),
+            image_file_ids: Vec::new(),
             is_image_edit: false,
             prompt_variants: Vec::new(),
             is_nsfw: false,
@@ -470,6 +475,7 @@ pub struct ImageEditJobParams {
     pub prompt: String,
     pub photo_file_id: String,
     pub photo_urls: Vec<String>,
+    pub photo_file_ids: Vec<String>,
     pub thread_id: Option<i32>,
 }
 
@@ -2761,6 +2767,7 @@ pub fn new_image_edit_job_at(
                 prompt: clean_prompt,
                 image_file_id: params.photo_file_id,
                 image_urls: params.photo_urls,
+                image_file_ids: params.photo_file_ids,
                 is_image_edit: true,
                 ..ImageJobData::default()
             }),
@@ -2952,6 +2959,7 @@ pub fn image_edit_job_params_from_payload(
         prompt: image_data.prompt.clone(),
         photo_file_id: image_data.image_file_id.clone(),
         photo_urls: image_data.image_urls.clone(),
+        photo_file_ids: image_data.image_file_ids.clone(),
         thread_id: telegram_data.thread_message_id,
     })
 }
@@ -4052,6 +4060,7 @@ mod tests {
                     "https://telegram.test/a.png".to_owned(),
                     "https://telegram.test/b.png".to_owned(),
                 ],
+                photo_file_ids: Vec::new(),
                 thread_id: Some(40),
             },
             created,
@@ -4106,9 +4115,31 @@ mod tests {
                     "https://telegram.test/a.png".to_owned(),
                     "https://telegram.test/b.png".to_owned(),
                 ],
+                photo_file_ids: Vec::new(),
                 thread_id: Some(40),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn image_edit_job_keeps_file_ids_without_urls() -> Result<(), Box<dyn std::error::Error>> {
+        let params = ImageEditJobParams {
+            chat_id: -100,
+            message_id: 20,
+            user_id: 30,
+            user_full_name: "Alice".to_owned(),
+            prompt: "make it night".to_owned(),
+            photo_file_id: "file-a".to_owned(),
+            photo_file_ids: vec!["file-a".to_owned(), "file-b".to_owned()],
+            ..ImageEditJobParams::default()
+        };
+        let job = new_image_edit_job_at(params.clone(), OffsetDateTime::UNIX_EPOCH);
+
+        let image_data = serde_json::to_value(&job.data)?["image_data"].clone();
+        assert_eq!(image_data["image_file_ids"], json!(["file-a", "file-b"]));
+        assert!(image_data.get("image_urls").is_none());
+        assert_eq!(image_edit_job_params_from_stateless_job(&job)?, params);
         Ok(())
     }
 

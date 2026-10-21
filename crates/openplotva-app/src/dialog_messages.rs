@@ -5694,7 +5694,7 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             crate::dialog_tools::ImageEditFileSelection {
                 photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: vec!["https://files.test/photo.png".to_owned()],
+                photo_file_ids: vec!["latest-photo-file".to_owned()],
             },
         ));
         let image_scheduler =
@@ -5797,10 +5797,8 @@ mod tests {
             assert_eq!(image.original_text, "contrast");
             assert_eq!(image.author, "Ada");
             assert_eq!(image.image_file_id, "latest-photo-file");
-            assert_eq!(
-                image.image_urls,
-                vec!["https://files.test/photo.png".to_owned()]
-            );
+            assert!(image.image_urls.is_empty());
+            assert_eq!(image.image_file_ids, vec!["latest-photo-file".to_owned()]);
             assert!(image.is_image_edit);
             record.id
         };
@@ -5849,7 +5847,8 @@ mod tests {
                 thread_id: None,
                 prompt: "contrast".to_owned(),
                 photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: vec!["https://files.test/photo.png".to_owned()],
+                photo_urls: Vec::new(),
+                photo_file_ids: vec!["latest-photo-file".to_owned()],
             }]
         );
         // Album delivery: one placeholder frame (single editor) filled with the
@@ -5883,14 +5882,14 @@ mod tests {
         Ok(())
     }
 
-    struct AlbumFileUrlStub;
+    struct AlbumFileProbeStub;
 
-    impl crate::dialog_tools::ImageEditFileUrlProvider for AlbumFileUrlStub {
-        fn image_edit_file_url<'a>(
+    impl crate::dialog_tools::ImageEditFileProbe for AlbumFileProbeStub {
+        fn image_edit_file_available<'a>(
             &'a self,
-            file_id: &'a str,
-        ) -> crate::dialog_tools::ImageEditFileUrlFuture<'a> {
-            Box::pin(async move { Ok(Some(format!("https://files.test/{file_id}"))) })
+            _file_id: &'a str,
+        ) -> crate::dialog_tools::ImageEditFileProbeFuture<'a> {
+            Box::pin(async { Ok(true) })
         }
     }
 
@@ -5918,7 +5917,7 @@ mod tests {
             let queue = Arc::new(InMemoryTaskQueue::new());
             let resolver = crate::dialog_tools::TelegramImageEditFileResolver::new(
                 files.clone(),
-                AlbumFileUrlStub,
+                AlbumFileProbeStub,
             )
             .with_media_group_registry(crate::dialog_tools::MediaGroupImageRegistry::new(
                 Duration::ZERO,
@@ -5930,7 +5929,7 @@ mod tests {
                 .with_image_edit_file_resolver(Arc::new(resolver));
             let scheduler = SchedulerStub::default();
             let mut updates = Vec::new();
-            let mut expected_urls = Vec::new();
+            let mut expected_file_ids = Vec::new();
             let mut unique_ids = Vec::new();
             for index in 0..count {
                 let id = format!("serial-file-{bot_id}-{case}-{index}");
@@ -5960,7 +5959,7 @@ mod tests {
                     })
                     .await?;
                 unique_ids.push(id.clone());
-                expected_urls.push(format!("https://files.test/{id}"));
+                expected_file_ids.push(id.clone());
                 updates.push(update);
             }
             for (index, update) in updates.into_iter().enumerate() {
@@ -5989,7 +5988,8 @@ mod tests {
             assert_eq!(records.len(), 1);
             let data = &records[0].job.data;
             let image = data.image_data.as_ref().expect("image edit");
-            assert_eq!(image.image_urls, expected_urls);
+            assert!(image.image_urls.is_empty());
+            assert_eq!(image.image_file_ids, expected_file_ids);
             assert_eq!(image.prompt, prompt);
             assert_eq!(image.original_text, prompt);
             assert_eq!(

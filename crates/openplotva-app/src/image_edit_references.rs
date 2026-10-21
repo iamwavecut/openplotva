@@ -1,7 +1,7 @@
 //! Source pictures of an image edit, prepared for the prompt optimizer the way the
 //! FLUX.3 prompt upsampler sees its references.
 
-use std::{fmt, future::Future, io::Cursor, pin::Pin};
+use std::{fmt, future::Future, io::Cursor, pin::Pin, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
@@ -11,7 +11,7 @@ use image::{
 };
 use openplotva_telegram::TelegramClient;
 
-use crate::image_jobs::ImageEditRequest;
+use crate::image_jobs::{ImageEditError, ImageEditFuture, ImageEditRequest, ImageEditor};
 
 const MAX_REFERENCE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_REFERENCE_SIDE: u32 = 16_384;
@@ -95,12 +95,21 @@ impl ImageEditReferenceLoader for TelegramImageEditReferenceLoader {
                 .filter(|value| !value.is_empty())
                 .collect();
             if inputs.is_empty() {
-                let file_id = request.photo_file_id.trim();
-                if file_id.is_empty() {
-                    return Ok(Vec::new());
+                let mut file_ids: Vec<&str> = request
+                    .photo_file_ids
+                    .iter()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                if file_ids.is_empty() && !request.photo_file_id.trim().is_empty() {
+                    file_ids.push(request.photo_file_id.trim());
                 }
-                let path = self.file_path(file_id).await?;
-                return Ok(vec![self.download(&path).await?]);
+                let mut images = Vec::with_capacity(file_ids.len());
+                for file_id in file_ids {
+                    let path = self.file_path(file_id).await?;
+                    images.push(self.download(&path).await?);
+                }
+                return Ok(images);
             }
             let mut images = Vec::with_capacity(inputs.len());
             for input in inputs {
@@ -110,6 +119,61 @@ impl ImageEditReferenceLoader for TelegramImageEditReferenceLoader {
                 });
             }
             Ok(images)
+        })
+    }
+}
+
+/// Hands the editor the request's Telegram pictures as bytes, loaded once by
+/// `references`, so their file URLs, which carry the bot token, never leave the bot.
+pub struct TelegramPictureBytesEditor<Editor> {
+    editor: Editor,
+    references: Arc<dyn ImageEditReferenceLoader>,
+}
+
+impl<Editor> TelegramPictureBytesEditor<Editor> {
+    #[must_use]
+    pub fn new(editor: Editor, references: Arc<dyn ImageEditReferenceLoader>) -> Self {
+        Self { editor, references }
+    }
+}
+
+impl<Editor> ImageEditor for TelegramPictureBytesEditor<Editor>
+where
+    Editor: ImageEditor + Sync,
+{
+    fn expected_image_count(&self) -> usize {
+        self.editor.expected_image_count()
+    }
+
+    fn image_targets(&self) -> openplotva_media::ImageTargets {
+        self.editor.image_targets()
+    }
+
+    fn edit_image<'a>(&'a self, mut request: ImageEditRequest) -> ImageEditFuture<'a> {
+        Box::pin(async move {
+            let names_telegram_pictures = request
+                .photo_file_ids
+                .iter()
+                .any(|value| !value.trim().is_empty())
+                || request
+                    .photo_urls
+                    .iter()
+                    .any(|value| telegram_file_path(value.trim()).is_some());
+            if names_telegram_pictures {
+                let images = self
+                    .references
+                    .load_edit_references(&request)
+                    .await
+                    .map_err(|error| {
+                        ImageEditError::Provider(format!("load image edit pictures: {error}"))
+                    })?;
+                request.photo_urls = images
+                    .iter()
+                    .map(|image| BASE64_STANDARD.encode(image))
+                    .collect();
+                request.photo_file_ids.clear();
+            }
+            self.editor.edit_image(request).await
         })
     }
 }
@@ -265,8 +329,151 @@ mod tests {
             Some("photos/file_7.jpg")
         );
         assert_eq!(
+            telegram_file_path("https://api.telegram.org/file/bot<redacted>/photos/file_7.jpg"),
+            Some("photos/file_7.jpg")
+        );
+        assert_eq!(
             telegram_file_path("https://example.com/file/bot1/a.jpg"),
             None
+        );
+    }
+
+    #[derive(Debug)]
+    struct LoaderStub {
+        result: Result<Vec<Vec<u8>>, String>,
+        requests: std::sync::Mutex<Vec<ImageEditRequest>>,
+    }
+
+    impl LoaderStub {
+        fn new(result: Result<Vec<Vec<u8>>, String>) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                requests: std::sync::Mutex::default(),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.requests.lock().expect("loader requests").len()
+        }
+    }
+
+    impl ImageEditReferenceLoader for LoaderStub {
+        fn load_edit_references<'a>(
+            &'a self,
+            request: &'a ImageEditRequest,
+        ) -> ImageEditReferencesFuture<'a> {
+            self.requests
+                .lock()
+                .expect("loader requests")
+                .push(request.clone());
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Default)]
+    struct EditorStub {
+        requests: std::sync::Mutex<Vec<ImageEditRequest>>,
+    }
+
+    impl ImageEditor for EditorStub {
+        fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
+            self.requests.lock().expect("editor requests").push(request);
+            Box::pin(async { Ok(crate::image_jobs::ImageEditResult::default()) })
+        }
+    }
+
+    async fn edited_request(
+        loader: Arc<LoaderStub>,
+        request: ImageEditRequest,
+    ) -> Result<ImageEditRequest, ImageEditError> {
+        let editor = TelegramPictureBytesEditor::new(EditorStub::default(), loader);
+        editor.edit_image(request).await?;
+        let requests = editor.editor.requests.lock().expect("editor requests");
+        Ok(requests[0].clone())
+    }
+
+    #[tokio::test]
+    async fn file_ids_reach_the_editor_as_picture_bytes() {
+        let loader = LoaderStub::new(Ok(vec![b"first".to_vec(), b"second".to_vec()]));
+        let request = edited_request(
+            Arc::clone(&loader),
+            ImageEditRequest {
+                prompt: "merge".to_owned(),
+                photo_file_id: "file-a".to_owned(),
+                photo_file_ids: vec!["file-a".to_owned(), "file-b".to_owned()],
+                ..ImageEditRequest::default()
+            },
+        )
+        .await
+        .expect("edit");
+
+        assert_eq!(
+            request.photo_urls,
+            vec![
+                BASE64_STANDARD.encode(b"first"),
+                BASE64_STANDARD.encode(b"second")
+            ]
+        );
+        assert!(request.photo_file_ids.is_empty());
+        assert_eq!(loader.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn telegram_file_urls_of_queued_jobs_reach_the_editor_as_picture_bytes() {
+        let loader = LoaderStub::new(Ok(vec![b"photo".to_vec()]));
+        let request = edited_request(
+            loader,
+            ImageEditRequest {
+                prompt: "brighter".to_owned(),
+                photo_urls: vec![
+                    "https://api.telegram.org/file/bot<redacted>/photos/file_7.jpg".to_owned(),
+                ],
+                ..ImageEditRequest::default()
+            },
+        )
+        .await
+        .expect("edit");
+
+        assert_eq!(request.photo_urls, vec![BASE64_STANDARD.encode(b"photo")]);
+    }
+
+    #[tokio::test]
+    async fn pictures_without_telegram_sources_pass_through() {
+        let loader = LoaderStub::new(Ok(Vec::new()));
+        let original = ImageEditRequest {
+            prompt: "brighter".to_owned(),
+            photo_file_id: "file-a".to_owned(),
+            photo_urls: vec!["https://img.test/a.png".to_owned()],
+            ..ImageEditRequest::default()
+        };
+        let request = edited_request(Arc::clone(&loader), original.clone())
+            .await
+            .expect("edit");
+
+        assert_eq!(request, original);
+        assert_eq!(loader.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn unloadable_pictures_fail_the_edit() {
+        let loader = LoaderStub::new(Err("download telegram file failed".to_owned()));
+        let error = edited_request(
+            loader,
+            ImageEditRequest {
+                prompt: "brighter".to_owned(),
+                photo_file_ids: vec!["file-a".to_owned()],
+                ..ImageEditRequest::default()
+            },
+        )
+        .await
+        .expect_err("pictures are required");
+
+        assert_eq!(
+            error,
+            ImageEditError::Provider(
+                "load image edit pictures: download telegram file failed".to_owned()
+            )
         );
     }
 
