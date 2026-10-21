@@ -149,6 +149,10 @@ const DURABLE_UPDATE_CONSUMER_MAX_WORKERS: usize =
     openplotva_storage::POSTGRES_CRITICAL_MAX_CONNECTIONS as usize * 3;
 const REGULAR_IMAGE_GENERATION_WORKFLOW_KEY: &str =
     image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY;
+const VIP_IMAGE_GENERATION_WORKFLOW_KEYS: [&str; 2] = [
+    image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+    image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY,
+];
 const VIP_IMAGE_EDITOR_WORKFLOW_KEY: &str = image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY;
 
 fn durable_update_consumer_worker_limit(configured: usize) -> usize {
@@ -13314,28 +13318,19 @@ async fn start_runtime_workers(
     )
     .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
     .with_reporter(routing_event_reporter.clone());
-    let routed_vip_flux_image_generator = image_jobs::RoutedImageGenerator::new(
-        image_attempt_walker.clone(),
-        image_jobs::aifarm_draw_api_config_from_app_config(config),
-    )
-    .with_workflow_key(image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY);
-    let routed_vip_boogu_image_generator = image_jobs::RoutedImageGenerator::new(
-        image_attempt_walker.clone(),
-        image_jobs::aifarm_draw_api_config_from_app_config(config),
-    )
-    .with_workflow_key(image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY);
-    let routed_vip_moss_image_generator = image_jobs::RoutedImageGenerator::new(
-        image_attempt_walker.clone(),
-        image_jobs::aifarm_draw_api_config_from_app_config(config),
-    )
-    .with_workflow_key(image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY);
+    let [vip_first_workflow_key, vip_second_workflow_key] = VIP_IMAGE_GENERATION_WORKFLOW_KEYS;
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::ParallelImageGenerator::new(
-            image_jobs::ParallelImageGenerator::new(
-                routed_vip_flux_image_generator,
-                routed_vip_boogu_image_generator,
-            ),
-            routed_vip_moss_image_generator,
+            image_jobs::RoutedImageGenerator::new(
+                image_attempt_walker.clone(),
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            )
+            .with_workflow_key(vip_first_workflow_key),
+            image_jobs::RoutedImageGenerator::new(
+                image_attempt_walker.clone(),
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            )
+            .with_workflow_key(vip_second_workflow_key),
         ),
         media_prompt_optimizer.clone(),
     )
@@ -15166,10 +15161,17 @@ mod tests {
     }
 
     #[test]
-    fn image_worker_workflows_keep_free_generation_on_boogu_and_editor_on_flux() {
+    fn image_worker_workflows_keep_free_vip_and_editor_slots_apart() {
         assert_eq!(
             super::REGULAR_IMAGE_GENERATION_WORKFLOW_KEY,
             super::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
+        );
+        assert_eq!(
+            super::VIP_IMAGE_GENERATION_WORKFLOW_KEYS,
+            [
+                super::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+                super::image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY,
+            ]
         );
         assert_eq!(
             super::VIP_IMAGE_EDITOR_WORKFLOW_KEY,
