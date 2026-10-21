@@ -101,8 +101,9 @@ pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME
 pub const IMAGE_EDIT_WORKFLOW_KEY: &str = "image_edit";
 pub const IMAGE_GENERATION_WORKFLOW_KEY: &str = "image_generation";
 pub const IMAGE_GENERATION_FLUX_WORKFLOW_KEY: &str = "image_generation_flux";
+/// Free users' text-to-image workflow; the key predates its current model.
 pub const IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_generation_boogu_turbo";
-/// Third VIP text-to-image slot, routed to MOSS-Image.
+/// Second VIP text-to-image slot, routed to MOSS-Image.
 pub const IMAGE_GENERATION_MOSS_WORKFLOW_KEY: &str = "image_generation_moss";
 pub const IMAGE_EDIT_FLUX_WORKFLOW_KEY: &str = "image_edit_flux";
 pub const IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_edit_boogu_turbo";
