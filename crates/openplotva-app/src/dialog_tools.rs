@@ -68,9 +68,9 @@ pub type DrawImageFuture<'a> =
 /// Boxed future returned by image-edit file resolvers.
 pub type ImageEditFileResolveFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ImageEditFileSelection, ToolboxError>> + Send + 'a>>;
-/// Boxed future returned by image-edit Telegram file URL providers.
-pub type ImageEditFileUrlFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Option<String>, ToolboxError>> + Send + 'a>>;
+/// Boxed future returned by image-edit Telegram file probes.
+pub type ImageEditFileProbeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<bool, ToolboxError>> + Send + 'a>>;
 
 /// Boxed future returned by VIP status checks for image scheduling.
 pub type DrawImageVipStatusFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
@@ -232,57 +232,48 @@ pub trait ImageEditFileResolver: Send + Sync {
     ) -> ImageEditFileResolveFuture<'a>;
 }
 
-pub trait ImageEditFileUrlProvider: Send + Sync {
-    /// Return a Telegram file URL for the supplied file ID.
-    fn image_edit_file_url<'a>(&'a self, file_id: &'a str) -> ImageEditFileUrlFuture<'a>;
+pub trait ImageEditFileProbe: Send + Sync {
+    /// Whether the bot can download the Telegram file with the supplied file ID.
+    fn image_edit_file_available<'a>(&'a self, file_id: &'a str) -> ImageEditFileProbeFuture<'a>;
 }
 
 #[derive(Clone)]
-pub struct TelegramBotFileUrlProvider {
+pub struct TelegramBotFileProbe {
     client: openplotva_telegram::TelegramClient,
-    bot_key: String,
 }
 
-impl TelegramBotFileUrlProvider {
-    /// Build a Telegram file URL provider from the runtime bot client and token.
+impl TelegramBotFileProbe {
+    /// Build a Telegram file probe from the runtime bot client.
     #[must_use]
-    pub fn new(client: openplotva_telegram::TelegramClient, bot_key: impl Into<String>) -> Self {
-        Self {
-            client,
-            bot_key: bot_key.into(),
-        }
+    pub const fn new(client: openplotva_telegram::TelegramClient) -> Self {
+        Self { client }
     }
 }
 
-impl fmt::Debug for TelegramBotFileUrlProvider {
+impl fmt::Debug for TelegramBotFileProbe {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TelegramBotFileUrlProvider")
+            .debug_struct("TelegramBotFileProbe")
             .finish_non_exhaustive()
     }
 }
 
-impl ImageEditFileUrlProvider for TelegramBotFileUrlProvider {
-    fn image_edit_file_url<'a>(&'a self, file_id: &'a str) -> ImageEditFileUrlFuture<'a> {
+impl ImageEditFileProbe for TelegramBotFileProbe {
+    fn image_edit_file_available<'a>(&'a self, file_id: &'a str) -> ImageEditFileProbeFuture<'a> {
         Box::pin(async move {
             let file_id = file_id.trim();
             if file_id.is_empty() {
-                return Ok(None);
+                return Ok(false);
             }
             let file: carapax::types::File = self
                 .client
                 .execute(carapax::types::GetFile::new(file_id))
                 .await
                 .map_err(|error| Box::new(error) as ToolboxError)?;
-            let Some(file_path) = file
+            Ok(file
                 .file_path
                 .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-            else {
-                return Ok(None);
-            };
-            Ok(Some(telegram_file_url(&self.bot_key, file_path)))
+                .is_some_and(|path| !path.trim().is_empty()))
         })
     }
 }
@@ -388,20 +379,20 @@ impl MediaGroupImageRegistry {
 }
 
 #[derive(Clone, Debug)]
-pub struct TelegramImageEditFileResolver<UrlProvider> {
+pub struct TelegramImageEditFileResolver<Probe> {
     files: openplotva_storage::PostgresTelegramFileStore,
-    urls: UrlProvider,
+    probe: Probe,
     media_groups: MediaGroupImageRegistry,
     pending_albums: Option<(i64, openplotva_storage::PostgresTelegramDeliveryStore)>,
 }
 
-impl<UrlProvider> TelegramImageEditFileResolver<UrlProvider> {
+impl<Probe> TelegramImageEditFileResolver<Probe> {
     /// Build a concrete image-edit file resolver.
     #[must_use]
-    pub fn new(files: openplotva_storage::PostgresTelegramFileStore, urls: UrlProvider) -> Self {
+    pub fn new(files: openplotva_storage::PostgresTelegramFileStore, probe: Probe) -> Self {
         Self {
             files,
-            urls,
+            probe,
             media_groups: MediaGroupImageRegistry::default(),
             pending_albums: None,
         }
@@ -425,9 +416,9 @@ impl<UrlProvider> TelegramImageEditFileResolver<UrlProvider> {
     }
 }
 
-impl<UrlProvider> ImageEditFileResolver for TelegramImageEditFileResolver<UrlProvider>
+impl<Probe> ImageEditFileResolver for TelegramImageEditFileResolver<Probe>
 where
-    UrlProvider: ImageEditFileUrlProvider,
+    Probe: ImageEditFileProbe,
 {
     fn capture_image_attachments(
         &self,
@@ -485,13 +476,13 @@ where
                 &rows,
                 attachments,
             );
-            let mut photo_urls = Vec::new();
-            for latest_file_id in &selection.url_file_ids {
-                if let Ok(Some(url)) = self.urls.image_edit_file_url(latest_file_id).await {
-                    photo_urls.push(url);
+            let mut photo_file_ids = Vec::new();
+            for latest_file_id in selection.source_file_ids {
+                if let Ok(true) = self.probe.image_edit_file_available(&latest_file_id).await {
+                    photo_file_ids.push(latest_file_id);
                 }
             }
-            if requested_ids.len() > 1 && photo_urls.len() != requested_ids.len() {
+            if requested_ids.len() > 1 && photo_file_ids.len() != requested_ids.len() {
                 return Err(Box::new(std::io::Error::other(
                     "an album reference image could not be resolved",
                 )) as ToolboxError);
@@ -499,7 +490,7 @@ where
 
             Ok(ImageEditFileSelection {
                 photo_file_id: selection.photo_file_id,
-                photo_urls,
+                photo_file_ids,
             })
         })
     }
@@ -528,7 +519,7 @@ impl ImageEditFileResolver for openplotva_storage::PostgresTelegramFileStore {
 
             Ok(ImageEditFileSelection {
                 photo_file_id: latest_file_ids.first().cloned().unwrap_or_default(),
-                photo_urls: Vec::new(),
+                photo_file_ids: Vec::new(),
             })
         })
     }
@@ -795,7 +786,7 @@ pub struct DrawImageRateLimitReport {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImageEditFileSelection {
     pub photo_file_id: String,
-    pub photo_urls: Vec<String>,
+    pub photo_file_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1576,7 +1567,7 @@ impl TaskmanDialogToolAdapter {
             .await?;
         let source_count = image_edit_file_unique_ids(&request.attachments).len();
         if files.photo_file_id.trim().is_empty()
-            || (source_count > 1 && files.photo_urls.len() < source_count)
+            || (source_count > 1 && files.photo_file_ids.len() < source_count)
         {
             return Ok(not_scheduled_draw(
                 DrawImageScheduleRejection::EditSourceUnavailable,
@@ -1607,7 +1598,8 @@ impl TaskmanDialogToolAdapter {
                 user_full_name: request.user_full_name,
                 prompt,
                 photo_file_id: files.photo_file_id,
-                photo_urls: files.photo_urls,
+                photo_urls: Vec::new(),
+                photo_file_ids: files.photo_file_ids,
                 thread_id: request.thread_id,
             },
             OffsetDateTime::now_utc(),
@@ -2148,7 +2140,7 @@ fn image_edit_file_unique_ids(attachments: &[ChatAttachment]) -> Vec<String> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ImageEditFileIdSelection {
     photo_file_id: String,
-    url_file_ids: Vec<String>,
+    source_file_ids: Vec<String>,
 }
 
 fn image_edit_file_id_selection(
@@ -2163,7 +2155,7 @@ fn image_edit_file_id_selection(
         latest_file_ids_in_attachment_order(media_group_file_unique_ids, rows, attachments);
     ImageEditFileIdSelection {
         photo_file_id: target_file_ids.first().cloned().unwrap_or_default(),
-        url_file_ids: if media_group_file_ids.is_empty() {
+        source_file_ids: if media_group_file_ids.is_empty() {
             target_file_ids
         } else {
             media_group_file_ids
@@ -2214,14 +2206,6 @@ fn latest_file_ids_in_attachment_order(
         }
     }
     latest_file_ids
-}
-
-fn telegram_file_url(bot_key: &str, file_path: &str) -> String {
-    format!(
-        "https://api.telegram.org/file/bot{}/{}",
-        bot_key.trim(),
-        file_path.trim()
-    )
 }
 
 fn cleanup_old_media_groups(groups: &mut HashMap<String, MediaGroupEntry>, now: OffsetDateTime) {
@@ -4471,7 +4455,7 @@ mod tests {
             let resolver = Arc::new(ImageEditFileResolverStub::successful(
                 ImageEditFileSelection {
                     photo_file_id: "generated-goldfish-file".to_owned(),
-                    photo_urls: vec!["https://files.test/generated-goldfish.png".to_owned()],
+                    photo_file_ids: vec!["generated-goldfish-file".to_owned()],
                 },
             ));
             let scheduler = Arc::new(
@@ -4552,10 +4536,8 @@ mod tests {
             let image = records[0].job.data.image_data.as_ref().expect("image edit");
             assert!(image.is_image_edit);
             assert_eq!(image.image_file_id, "generated-goldfish-file");
-            assert_eq!(
-                image.image_urls,
-                vec!["https://files.test/generated-goldfish.png"]
-            );
+            assert!(image.image_urls.is_empty());
+            assert_eq!(image.image_file_ids, vec!["generated-goldfish-file"]);
             assert_eq!(image.original_text, caption);
             assert_eq!(image.prompt, prompt);
         }
@@ -4606,8 +4588,8 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "file-a".to_owned(),
-                photo_urls: (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
-                    .map(|index| format!("https://files.test/{index}.png"))
+                photo_file_ids: (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+                    .map(|index| format!("file-{index}"))
                     .collect(),
             },
         ));
@@ -4677,8 +4659,8 @@ mod tests {
             .chain((2..MAX_IMAGE_EDIT_SOURCE_IMAGES).map(|index| format!("photo-{index}")))
             .chain(std::iter::once("photo-b".to_owned()))
             .collect();
-        let expected_urls: Vec<_> = (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
-            .map(|index| format!("https://files.test/{index}.png"))
+        let expected_file_ids: Vec<_> = (0..MAX_IMAGE_EDIT_SOURCE_IMAGES)
+            .map(|index| format!("file-{index}"))
             .collect();
         let result = openplotva_dialog::dispatch_dialog_tool(
             &toolbox,
@@ -4712,8 +4694,8 @@ mod tests {
                 .image_data
                 .as_ref()
                 .expect("image edit")
-                .image_urls,
-            expected_urls
+                .image_file_ids,
+            expected_file_ids
         );
         input.history.push(openplotva_dialog::HistoryMessage {
             message_id: input.message.id,
@@ -4754,7 +4736,7 @@ mod tests {
                 .image_data
                 .as_ref()
                 .expect("followup edit")
-                .image_urls
+                .image_file_ids
                 .len(),
             MAX_IMAGE_EDIT_SOURCE_IMAGES
         );
@@ -5866,7 +5848,7 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "edit-file".to_owned(),
-                photo_urls: vec!["https://files.test/photo.png".to_owned()],
+                photo_file_ids: vec!["edit-file".to_owned()],
             },
         ));
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
@@ -6175,7 +6157,7 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: Vec::new(),
+                photo_file_ids: Vec::new(),
             },
         ));
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
@@ -6499,7 +6481,7 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: vec!["https://files.test/photo.png".to_owned()],
+                photo_file_ids: vec!["latest-photo-file".to_owned()],
             },
         ));
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
@@ -6553,10 +6535,8 @@ mod tests {
             .expect("image edit job should carry image data");
         assert_eq!(image.prompt, "make it brighter");
         assert_eq!(image.image_file_id, "latest-photo-file");
-        assert_eq!(
-            image.image_urls,
-            vec!["https://files.test/photo.png".to_owned()]
-        );
+        assert!(image.image_urls.is_empty());
+        assert_eq!(image.image_file_ids, vec!["latest-photo-file".to_owned()]);
         assert!(image.is_image_edit);
         Ok(())
     }
@@ -6593,7 +6573,7 @@ mod tests {
             image_edit_file_id_selection(&ids, &[], &[], &attachments),
             ImageEditFileIdSelection {
                 photo_file_id: "history-second".to_owned(),
-                url_file_ids: vec!["history-second".to_owned(), "history-first".to_owned()],
+                source_file_ids: vec!["history-second".to_owned(), "history-first".to_owned()],
             }
         );
         let rows = vec![telegram_file_record("second", "current-second")];
@@ -6628,10 +6608,6 @@ mod tests {
             latest_file_ids_in_attachment_order(&file_unique_ids, &rows, &[]),
             vec!["file-a".to_owned(), "file-b".to_owned()]
         );
-        assert_eq!(
-            telegram_file_url("123:secret", "photos/file-a.jpg"),
-            "https://api.telegram.org/file/bot123:secret/photos/file-a.jpg"
-        );
     }
 
     #[tokio::test]
@@ -6642,7 +6618,7 @@ mod tests {
             .with_image_edit_file_resolver(Arc::new(ImageEditFileResolverStub::successful(
                 ImageEditFileSelection {
                     photo_file_id: "file-a".to_owned(),
-                    photo_urls: vec!["https://files.test/a.png".to_owned()],
+                    photo_file_ids: vec!["file-a".to_owned()],
                 },
             )));
         let result = adapter
@@ -6676,7 +6652,7 @@ mod tests {
             image_edit_file_id_selection(&target_unique_ids, &media_group_unique_ids, &rows, &[]),
             ImageEditFileIdSelection {
                 photo_file_id: "file-b".to_owned(),
-                url_file_ids: vec!["file-a".to_owned(), "file-b".to_owned()],
+                source_file_ids: vec!["file-a".to_owned(), "file-b".to_owned()],
             }
         );
     }
@@ -6708,7 +6684,7 @@ mod tests {
         let resolver = Arc::new(ImageEditFileResolverStub::successful(
             ImageEditFileSelection {
                 photo_file_id: "latest-photo-file".to_owned(),
-                photo_urls: Vec::new(),
+                photo_file_ids: Vec::new(),
             },
         ));
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))

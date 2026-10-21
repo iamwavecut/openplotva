@@ -12512,10 +12512,7 @@ async fn start_runtime_workers(
             .with_image_edit_file_resolver(Arc::new(
                 dialog_tools::TelegramImageEditFileResolver::new(
                     PostgresTelegramFileStore::new(service_clients.postgres.clone()),
-                    dialog_tools::TelegramBotFileUrlProvider::new(
-                        telegram.clone(),
-                        bot_key.to_owned(),
-                    ),
+                    dialog_tools::TelegramBotFileProbe::new(telegram.clone()),
                 )
                 .with_pending_albums(
                     bot_identity.id,
@@ -13367,18 +13364,21 @@ async fn start_runtime_workers(
     );
 
     let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
-    let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
-        image_jobs::RoutedImageEditor::new(
-            image_attempt_walker.clone(),
-            vision_data_urls.clone(),
-            image_jobs::aifarm_draw_api_config_from_app_config(config),
+    let vip_image_edit_references: Arc<dyn image_edit_references::ImageEditReferenceLoader> =
+        Arc::new(image_edit_references::TelegramImageEditReferenceLoader::new(telegram.clone()));
+    let vip_image_edit_provider = image_edit_references::TelegramPictureBytesEditor::new(
+        image_jobs::OptimizingImageEditor::new(
+            image_jobs::RoutedImageEditor::new(
+                image_attempt_walker.clone(),
+                vision_data_urls.clone(),
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            )
+            .with_workflow_key(VIP_IMAGE_EDITOR_WORKFLOW_KEY),
+            media_prompt_optimizer.clone(),
         )
-        .with_workflow_key(VIP_IMAGE_EDITOR_WORKFLOW_KEY),
-        media_prompt_optimizer.clone(),
-    )
-    .with_reference_loader(Arc::new(
-        image_edit_references::TelegramImageEditReferenceLoader::new(telegram.clone()),
-    ));
+        .with_reference_loader(Arc::clone(&vip_image_edit_references)),
+        vip_image_edit_references,
+    );
     let mut vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
         .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
