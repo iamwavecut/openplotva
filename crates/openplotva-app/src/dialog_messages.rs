@@ -6918,7 +6918,7 @@ mod tests {
             payload["text"]
                 .as_str()
                 .expect("text")
-                .contains("нарисую новое изображение")
+                .contains("попробую нарисовать новое изображение")
         );
         assert_eq!(payload["reply_parameters"]["message_id"], 78);
         assert_eq!(payload["message_thread_id"], 7);
