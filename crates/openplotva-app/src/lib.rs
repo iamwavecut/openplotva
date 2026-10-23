@@ -12797,6 +12797,9 @@ async fn start_runtime_workers(
     .with_drawing_canceller(dialog_tool_adapter.clone())
     .with_image_scheduler(dialog_tool_adapter.clone())
     .with_song_scheduler(dialog_tool_adapter.clone())
+    .with_image_fallback_notice_sender(Arc::new(
+        dialog_messages::DrawQueueNoticeDispatcherSender::new(Arc::clone(&dispatcher_queue)),
+    ))
     .with_vision_describer(dialog_tool_media);
     let dialog_history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
         agent_runtime::PostgresHistorySearch::new(history_store.clone()),
