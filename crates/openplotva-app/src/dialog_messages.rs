@@ -5896,6 +5896,7 @@ mod tests {
                 photo_file_id: "latest-photo-file".to_owned(),
                 photo_urls: Vec::new(),
                 photo_file_ids: vec!["latest-photo-file".to_owned()],
+                caption: String::new(),
             }]
         );
         // Album delivery: one placeholder frame (single editor) filled with the

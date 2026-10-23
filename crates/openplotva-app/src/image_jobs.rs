@@ -73,8 +73,9 @@ pub type ImageJobEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 
 pub const AIFARM_DRAW_API_SERVICE_NAME: &str = "draw-api";
 pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
-pub const AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME: &str = "flux3_generate";
 pub const AIFARM_DRAW_API_MOSS_ENDPOINT_NAME: &str = "moss_generate";
+pub const AIFARM_DRAW_API_FIBO_ENDPOINT_NAME: &str = "fibo_generate";
+pub const AIFARM_DRAW_API_FIBO_EDIT_ENDPOINT_NAME: &str = "fibo_edit";
 pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
 pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
@@ -105,6 +106,8 @@ pub const IMAGE_GENERATION_FLUX_WORKFLOW_KEY: &str = "image_generation_flux";
 pub const IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_generation_boogu_turbo";
 /// Second VIP text-to-image slot, routed to MOSS-Image.
 pub const IMAGE_GENERATION_MOSS_WORKFLOW_KEY: &str = "image_generation_moss";
+/// Third VIP text-to-image slot, routed to Fibo 2.0 Dev.
+pub const IMAGE_GENERATION_FIBO_WORKFLOW_KEY: &str = "image_generation_fibo";
 pub const IMAGE_EDIT_FLUX_WORKFLOW_KEY: &str = "image_edit_flux";
 pub const IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_edit_boogu_turbo";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
@@ -158,8 +161,9 @@ pub struct ImageGenerationRequest {
     pub caption_text: String,
     /// Optimized prompt variants.
     pub prompt_variants: Vec<String>,
-    /// MOSS-Image layouts aligned with `prompt_variants`: compact JSON for a slot
-    /// written for MOSS-Image on a designed image, empty for every other slot.
+    /// Structured prompts aligned with `prompt_variants`, as compact JSON: the layout of
+    /// a slot written for MOSS-Image on a designed image, the caption of a slot written
+    /// for Fibo 2.0, empty for every other slot.
     pub prompt_layouts: Vec<String>,
     pub is_nsfw: bool,
     /// Raw negative prompt. It is never sent to an image model as typed; the
@@ -194,6 +198,9 @@ pub struct ImageEditRequest {
     pub photo_urls: Vec<String>,
     /// Telegram file IDs of the pictures to edit, in order; loaded on the bot side.
     pub photo_file_ids: Vec<String>,
+    /// Fibo 2.0 caption of the edited picture as compact JSON; empty when the optimizer
+    /// wrote none.
+    pub caption: String,
 }
 
 /// Successful provider result.
@@ -792,24 +799,30 @@ where
             return Ok(ImageGenerationResult::default());
         }
         let aspect_ratio = draw_api_aspect_ratio(&request.aspect_ratio);
-        let moss = if self
-            .cfg
-            .endpoint_name
-            .eq_ignore_ascii_case(AIFARM_DRAW_API_MOSS_ENDPOINT_NAME)
-        {
-            DrawApiMossInputs {
+        let endpoint = self.cfg.endpoint_name.as_str();
+        // A fallback hop renders the prompt written for another model, so each endpoint
+        // takes only the structure its own model reads.
+        let structure = draw_api_slot_structure(&request);
+        let inputs = if endpoint.eq_ignore_ascii_case(AIFARM_DRAW_API_MOSS_ENDPOINT_NAME) {
+            DrawApiModelInputs {
                 negative_prompt: &request.moss_negative_prompt,
-                layout: draw_api_moss_layout(&request),
+                layout: structure.filter(is_moss_layout),
+                caption: None,
+            }
+        } else if endpoint.eq_ignore_ascii_case(AIFARM_DRAW_API_FIBO_ENDPOINT_NAME) {
+            DrawApiModelInputs {
+                caption: structure.filter(|value| !is_moss_layout(value)),
+                ..DrawApiModelInputs::default()
             }
         } else {
-            DrawApiMossInputs::default()
+            DrawApiModelInputs::default()
         };
         let payload = draw_api_payload(
             &prompt,
             &[],
             draw_api_dimensions(&request.aspect_ratio),
             aspect_ratio.as_deref(),
-            moss,
+            inputs,
         )
         .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let job_id = self
@@ -858,14 +871,22 @@ where
                 "image edit requires image input".to_owned(),
             ));
         }
-        let payload = draw_api_payload(
-            &prompt,
-            &image_inputs,
-            None,
-            None,
-            DrawApiMossInputs::default(),
-        )
-        .map_err(|err| ImageEditError::Provider(err.to_string()))?;
+        let inputs = if self
+            .cfg
+            .endpoint_name
+            .eq_ignore_ascii_case(AIFARM_DRAW_API_FIBO_EDIT_ENDPOINT_NAME)
+        {
+            DrawApiModelInputs {
+                caption: serde_json::from_str::<Value>(request.caption.trim())
+                    .ok()
+                    .filter(Value::is_object),
+                ..DrawApiModelInputs::default()
+            }
+        } else {
+            DrawApiModelInputs::default()
+        };
+        let payload = draw_api_payload(&prompt, &image_inputs, None, None, inputs)
+            .map_err(|err| ImageEditError::Provider(err.to_string()))?;
         let job_id = self
             .submit_draw_api_job(job_id, payload, self.cfg.submit_deadline(Instant::now()))
             .await
@@ -1120,7 +1141,6 @@ fn add_flux_watermark(encoded: &[u8]) -> Result<Vec<u8>, String> {
 
 fn is_flux_generation_endpoint(endpoint_name: &str) -> bool {
     endpoint_name.eq_ignore_ascii_case(AIFARM_DRAW_API_ENDPOINT_NAME)
-        || endpoint_name.eq_ignore_ascii_case(AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME)
 }
 
 fn blend_flux_watermark_channel(source: u8, target: u8) -> u8 {
@@ -1536,7 +1556,7 @@ pub trait ImageGenerator {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::FLUX3
+        openplotva_media::ImageTargets::KREA2
     }
 
     /// Generate and send an image.
@@ -1571,7 +1591,7 @@ pub trait ImageEditor {
 
     /// Image model each prompt slot is written for, in slot order.
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        openplotva_media::ImageTargets::FLUX3
+        openplotva_media::ImageTargets::FIBO
     }
 
     /// Edit and send an image.
@@ -1616,7 +1636,11 @@ impl ImageGenerator for RoutedImageGenerator {
     }
 
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        routed_image_targets(&self.walker, &self.workflow_key)
+        routed_image_targets(
+            &self.walker,
+            &self.workflow_key,
+            openplotva_media::ImageTargets::KREA2,
+        )
     }
 
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
@@ -1685,7 +1709,11 @@ where
     DataUrl::Error: fmt::Display,
 {
     fn image_targets(&self) -> openplotva_media::ImageTargets {
-        routed_image_targets(&self.walker, &self.workflow_key)
+        routed_image_targets(
+            &self.walker,
+            &self.workflow_key,
+            openplotva_media::ImageTargets::FIBO,
+        )
     }
 
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
@@ -1744,16 +1772,18 @@ fn image_generation_context(
 /// the database switches the prompt style with it. The prompt is written once,
 /// before the walk, for the heaviest primary; a lighter primary or a fallback
 /// hop renders that same prompt. A MOSS-Image model whose config sets
-/// `"prompt_layout": true` also gets a layout for designed pictures.
+/// `"prompt_layout": true` also gets a layout for designed pictures. Without a routed
+/// model the prompt is written for `default`.
 fn routed_image_targets(
     walker: &RoutedAttemptWalker,
     workflow_key: &str,
+    default: openplotva_media::ImageTargets,
 ) -> openplotva_media::ImageTargets {
     let config = walker.primary_model_config(workflow_key);
     let Some(config) = config.as_ref() else {
-        return openplotva_media::ImageTargets::FLUX3;
+        return default;
     };
-    prompt_target_model(config).map_or(openplotva_media::ImageTargets::FLUX3, |model| {
+    prompt_target_model(config).map_or(default, |model| {
         openplotva_media::ImageTargets::single(model)
             .with_moss_layout(prompt_layout_enabled(config))
     })
@@ -2145,22 +2175,21 @@ where
     }
     let optimized = openplotva_media::apply_word_replacements(optimized.value);
     apply_image_nsfw_result(optimized.nsfw_result, &mut request)?;
-    let moss_layout = optimized
-        .moss_layout
-        .as_ref()
-        .map(serde_json::Value::to_string)
-        .unwrap_or_default();
+    let compact = |value: Option<&serde_json::Value>| {
+        value.map(serde_json::Value::to_string).unwrap_or_default()
+    };
+    let moss_layout = compact(optimized.moss_layout.as_ref());
+    let fibo_caption = compact(optimized.fibo_caption.as_ref());
     (request.prompt_variants, request.prompt_layouts) = optimized
         .outputs
         .into_iter()
         .enumerate()
         .filter_map(|(slot, output)| {
-            let layout =
-                if options.targets.model_for_slot(slot) == openplotva_media::ImageModel::Moss {
-                    moss_layout.clone()
-                } else {
-                    String::new()
-                };
+            let layout = match options.targets.model_for_slot(slot) {
+                openplotva_media::ImageModel::Moss => moss_layout.clone(),
+                openplotva_media::ImageModel::Fibo => fibo_caption.clone(),
+                openplotva_media::ImageModel::Krea2 => String::new(),
+            };
             non_empty(output).map(|output| (output, layout))
         })
         .unzip();
@@ -2229,6 +2258,16 @@ where
         openplotva_media::NsfwResult::Safe | openplotva_media::NsfwResult::Adult => {}
     }
     request.prompt = first_prompt_variant(optimized.value.outputs, &original_prompt);
+    request.caption = optimized
+        .value
+        .fibo_caption
+        .filter(|_| {
+            targets
+                .models()
+                .contains(&openplotva_media::ImageModel::Fibo)
+        })
+        .map(|caption| caption.to_string())
+        .unwrap_or_default();
     Ok(request)
 }
 
@@ -3630,6 +3669,7 @@ where
         photo_file_id: params.photo_file_id,
         photo_urls: params.photo_urls,
         photo_file_ids: params.photo_file_ids,
+        caption: String::new(),
     };
 
     let cancelled = std::pin::pin!(cancelled);
@@ -4895,8 +4935,9 @@ pub fn draw_api_prompt_text(request: &ImageGenerationRequest) -> String {
     request.prompt.trim().to_owned()
 }
 
-/// The MOSS-Image layout of the variant `draw_api_prompt_text` sends, if it has one.
-fn draw_api_moss_layout(request: &ImageGenerationRequest) -> Option<Value> {
+/// The structured prompt of the variant `draw_api_prompt_text` sends, if it has one: a
+/// MOSS-Image layout or a Fibo 2.0 caption.
+fn draw_api_slot_structure(request: &ImageGenerationRequest) -> Option<Value> {
     let slot = request
         .prompt_variants
         .iter()
@@ -4905,7 +4946,14 @@ fn draw_api_moss_layout(request: &ImageGenerationRequest) -> Option<Value> {
     if layout.is_empty() {
         return None;
     }
-    serde_json::from_str(layout).ok()
+    serde_json::from_str::<Value>(layout)
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// A MOSS-Image layout has `items`; a Fibo 2.0 caption never does.
+fn is_moss_layout(value: &Value) -> bool {
+    value.get("items").is_some()
 }
 
 pub fn decode_draw_api_result_payload(payload: &[u8]) -> Result<DrawApiGenerateResult, String> {
@@ -4967,14 +5015,18 @@ struct DrawApiGenerateRequest<'a> {
     negative_prompt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<Value>,
 }
 
-/// What only the MOSS-Image endpoint reads: its negative prompt and a designed
-/// image's layout, which draw-api renders instead of the prose prompt.
+/// What only one model's endpoint reads: the MOSS-Image negative prompt and a designed
+/// image's layout, which draw-api renders instead of the prose prompt, or the Fibo 2.0
+/// caption, which draw-api completes with the prose prompt.
 #[derive(Debug, Default)]
-struct DrawApiMossInputs<'a> {
+struct DrawApiModelInputs<'a> {
     negative_prompt: &'a str,
     layout: Option<Value>,
+    caption: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -5031,7 +5083,7 @@ fn draw_api_payload(
     image_inputs: &[String],
     dimensions: Option<(i32, i32)>,
     aspect_ratio: Option<&str>,
-    moss: DrawApiMossInputs<'_>,
+    inputs: DrawApiModelInputs<'_>,
 ) -> serde_json::Result<Vec<u8>> {
     let (image_urls, image_b64) = split_draw_api_image_inputs(image_inputs);
     let image_url = one_or_many_strings(&image_urls);
@@ -5047,8 +5099,9 @@ fn draw_api_payload(
         aspect_ratio,
         image_url,
         image_b64,
-        negative_prompt: Some(moss.negative_prompt.trim()).filter(|value| !value.is_empty()),
-        layout: moss.layout,
+        negative_prompt: Some(inputs.negative_prompt.trim()).filter(|value| !value.is_empty()),
+        layout: inputs.layout,
+        caption: inputs.caption,
     })
 }
 
@@ -5952,6 +6005,7 @@ mod tests {
                 photo_file_id: "photo-file".to_owned(),
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
                 photo_file_ids: Vec::new(),
+                caption: String::new(),
             }]
         );
         let calls = effects.calls();
@@ -6469,26 +6523,40 @@ mod tests {
         })
     }
 
+    fn fibo_poster_caption() -> Value {
+        json!({
+            "style_medium": "flat vector illustration",
+            "text_render": [{"text": "Джаз у моря", "location": "top", "size": "large", "color": "cream", "font": "rounded display"}],
+        })
+    }
+
     #[tokio::test]
-    async fn optimizer_layout_and_negative_reach_only_the_moss_slot() {
-        let flux3 = GeneratorStub::success("https://img.test/flux3.png");
+    async fn optimizer_structures_reach_only_their_own_slots() {
+        let krea2 = GeneratorStub::success("https://img.test/krea2.png");
         let moss = GeneratorStub::success("https://img.test/moss.png")
             .with_targets(openplotva_media::ImageTargets::MOSS);
+        let fibo = GeneratorStub::success("https://img.test/fibo.png")
+            .with_targets(openplotva_media::ImageTargets::FIBO);
         let optimizer =
             OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
                 input: "постер".to_owned(),
                 outputs: vec![
-                    "A flat poster for FLUX.3.".to_owned(),
+                    "A flat poster for Krea 2.".to_owned(),
                     "A flat poster for MOSS-Image.".to_owned(),
+                    "A flat poster for Fibo 2.0.".to_owned(),
                 ],
                 aspect_ratio: "3:4".to_owned(),
                 nsfw_result: openplotva_media::NsfwResult::Safe,
                 moss_design: true,
                 moss_layout: Some(moss_poster_layout()),
                 moss_negative: "people".to_owned(),
+                fibo_caption: Some(fibo_poster_caption()),
             });
         let optimizing = OptimizingImageGenerator::new(
-            SequentialImageGenerator::new(flux3.clone(), moss.clone()),
+            SequentialImageGenerator::new(
+                SequentialImageGenerator::new(krea2.clone(), moss.clone()),
+                fibo.clone(),
+            ),
             crate::media::MediaPromptOptimizerService::new(Some(optimizer)),
         );
 
@@ -6500,9 +6568,9 @@ mod tests {
             .await
             .expect("generation");
 
-        let flux3_request = &flux3.requests()[0];
-        assert_eq!(flux3_request.prompt_variants, ["A flat poster for FLUX.3."]);
-        assert!(flux3_request.prompt_layouts.is_empty());
+        let krea2_request = &krea2.requests()[0];
+        assert_eq!(krea2_request.prompt_variants, ["A flat poster for Krea 2."]);
+        assert!(krea2_request.prompt_layouts.is_empty());
         let moss_request = &moss.requests()[0];
         assert_eq!(
             moss_request.prompt_variants,
@@ -6514,10 +6582,19 @@ mod tests {
         );
         assert_eq!(moss_request.moss_negative_prompt, "people");
         assert_eq!(
-            draw_api_moss_layout(moss_request),
+            draw_api_slot_structure(moss_request),
             Some(moss_poster_layout())
         );
-        assert_eq!(draw_api_moss_layout(flux3_request), None);
+        assert_eq!(draw_api_slot_structure(krea2_request), None);
+        let fibo_request = &fibo.requests()[0];
+        assert_eq!(
+            fibo_request.prompt_variants,
+            ["A flat poster for Fibo 2.0."]
+        );
+        assert_eq!(
+            draw_api_slot_structure(fibo_request),
+            Some(fibo_poster_caption())
+        );
     }
 
     #[test]
@@ -6539,7 +6616,7 @@ mod tests {
         let second = image_generation_request_for_prompt_slots(&legacy, 1, 1);
         assert_eq!(second.prompt_variants, ["second"]);
         assert!(second.prompt_layouts.is_empty());
-        assert_eq!(draw_api_moss_layout(&second), None);
+        assert_eq!(draw_api_slot_structure(&second), None);
     }
 
     #[tokio::test]
@@ -6913,10 +6990,10 @@ mod tests {
     #[tokio::test]
     async fn nested_parallel_generators_hand_each_slot_its_own_prompt() {
         let krea2 = GeneratorStub::success("https://img.test/krea2.png");
-        let flux3 = GeneratorStub::success("https://img.test/flux3.png");
+        let fibo = GeneratorStub::success("https://img.test/fibo.png");
         let moss = GeneratorStub::success("https://img.test/moss.png");
         let vip = ParallelImageGenerator::new(
-            ParallelImageGenerator::new(krea2.clone(), flux3.clone()),
+            ParallelImageGenerator::new(krea2.clone(), fibo.clone()),
             moss.clone(),
         );
         assert_eq!(vip.expected_image_count(), 3);
@@ -6925,7 +7002,7 @@ mod tests {
             .generate_image(ImageGenerationRequest {
                 prompt_variants: vec![
                     "krea2 prompt".to_owned(),
-                    "flux3 prompt".to_owned(),
+                    "fibo prompt".to_owned(),
                     "moss prompt".to_owned(),
                 ],
                 ..ImageGenerationRequest::default()
@@ -6937,13 +7014,13 @@ mod tests {
             image_generation_urls(&result),
             vec![
                 "https://img.test/krea2.png".to_owned(),
-                "https://img.test/flux3.png".to_owned(),
+                "https://img.test/fibo.png".to_owned(),
                 "https://img.test/moss.png".to_owned(),
             ]
         );
         for (generator, prompt) in [
             (&krea2, "krea2 prompt"),
-            (&flux3, "flux3 prompt"),
+            (&fibo, "fibo prompt"),
             (&moss, "moss prompt"),
         ] {
             assert_eq!(
@@ -6996,6 +7073,7 @@ mod tests {
                 input: "make it day".to_owned(),
                 outputs: vec!["make the scene bright daylight".to_owned()],
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                fibo_caption: Some(json!({"lighting": {"conditions": "bright daylight"}})),
             });
         let optimizing = OptimizingImageEditor::new(
             editor.clone(),
@@ -7029,6 +7107,7 @@ mod tests {
                 photo_file_id: "photo-file".to_owned(),
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
                 photo_file_ids: Vec::new(),
+                caption: r#"{"lighting":{"conditions":"bright daylight"}}"#.to_owned(),
                 ..ImageEditRequest::default()
             }]
         );
@@ -7061,8 +7140,9 @@ mod tests {
         let optimizer =
             OptimizerStub::default().with_edit_result(openplotva_media::ImageEditOptimize {
                 input: "swap them".to_owned(),
-                outputs: vec!["Create a photograph preserving the first image".to_owned()],
+                outputs: vec!["Swap the two people between <image_1> and <image_2>.".to_owned()],
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                fibo_caption: None,
             });
         let optimizing = OptimizingImageEditor::new(
             editor.clone(),
@@ -7104,6 +7184,7 @@ mod tests {
                 input: "make it day".to_owned(),
                 outputs: vec!["make the scene bright daylight".to_owned()],
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                fibo_caption: None,
             });
         let optimizing = OptimizingImageEditor::new(
             editor.clone(),
@@ -8035,7 +8116,7 @@ mod tests {
                 &[],
                 draw_api_dimensions("16:9"),
                 draw_api_aspect_ratio("16:9").as_deref(),
-                DrawApiMossInputs::default(),
+                DrawApiModelInputs::default(),
             )
             .expect("generation payload"),
         )
@@ -8050,7 +8131,7 @@ mod tests {
                 &["https://img.test/a.png".to_owned()],
                 None,
                 None,
-                DrawApiMossInputs::default(),
+                DrawApiModelInputs::default(),
             )
             .expect("edit payload"),
         )
@@ -8128,14 +8209,15 @@ mod tests {
 
     #[test]
     fn image_prompt_targets_follow_the_routed_primary_model() {
-        let flux3 = image_route_walker(json!({
+        let krea2_default = openplotva_media::ImageTargets::KREA2;
+        let fibo = image_route_walker(json!({
             "service_name": AIFARM_DRAW_API_SERVICE_NAME,
-            "endpoint_name": "flux3_generate",
-            "prompt_target": "flux3",
+            "endpoint_name": AIFARM_DRAW_API_FIBO_ENDPOINT_NAME,
+            "prompt_target": "fibo",
         }));
         assert_eq!(
-            routed_image_targets(&flux3, IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY),
-            openplotva_media::ImageTargets::FLUX3
+            routed_image_targets(&fibo, IMAGE_GENERATION_FLUX_WORKFLOW_KEY, krea2_default),
+            openplotva_media::ImageTargets::FIBO
         );
 
         let krea2 = image_route_walker(json!({
@@ -8144,7 +8226,11 @@ mod tests {
             "prompt_target": "krea2",
         }));
         assert_eq!(
-            routed_image_targets(&krea2, IMAGE_GENERATION_FLUX_WORKFLOW_KEY),
+            routed_image_targets(
+                &krea2,
+                IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+                openplotva_media::ImageTargets::FIBO
+            ),
             openplotva_media::ImageTargets::KREA2
         );
 
@@ -8153,7 +8239,8 @@ mod tests {
             "endpoint_name": AIFARM_DRAW_API_MOSS_ENDPOINT_NAME,
             "prompt_target": "moss",
         }));
-        let targets = routed_image_targets(&moss, IMAGE_GENERATION_FLUX_WORKFLOW_KEY);
+        let targets =
+            routed_image_targets(&moss, IMAGE_GENERATION_FLUX_WORKFLOW_KEY, krea2_default);
         assert_eq!(targets, openplotva_media::ImageTargets::MOSS);
         assert!(!targets.moss_layout());
 
@@ -8164,23 +8251,34 @@ mod tests {
             "prompt_layout": true,
         }));
         assert!(
-            routed_image_targets(&moss_layout, IMAGE_GENERATION_FLUX_WORKFLOW_KEY).moss_layout()
+            routed_image_targets(
+                &moss_layout,
+                IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+                krea2_default
+            )
+            .moss_layout()
         );
 
+        // A retired or missing model leaves the prompt to the workflow's default target.
         let retired = image_route_walker(json!({
-            "endpoint_name": "qwen_image_generate",
-            "prompt_target": "qwen_image",
+            "endpoint_name": "flux3_generate",
+            "prompt_target": "flux3",
         }));
         assert_eq!(
-            routed_image_targets(&retired, IMAGE_EDIT_WORKFLOW_KEY),
-            openplotva_media::ImageTargets::FLUX3
+            routed_image_targets(
+                &retired,
+                IMAGE_EDIT_WORKFLOW_KEY,
+                openplotva_media::ImageTargets::FIBO
+            ),
+            openplotva_media::ImageTargets::FIBO
         );
         assert_eq!(
             routed_image_targets(
                 &empty_routed_attempt_walker(),
-                IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
+                IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY,
+                krea2_default
             ),
-            openplotva_media::ImageTargets::FLUX3
+            krea2_default
         );
     }
 
@@ -8214,8 +8312,9 @@ mod tests {
     #[test]
     fn flux_watermark_is_limited_to_the_flux_generation_endpoints() {
         assert!(is_flux_generation_endpoint(AIFARM_DRAW_API_ENDPOINT_NAME));
-        assert!(is_flux_generation_endpoint(
-            AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME
+        assert!(!is_flux_generation_endpoint("flux3_generate"));
+        assert!(!is_flux_generation_endpoint(
+            AIFARM_DRAW_API_FIBO_ENDPOINT_NAME
         ));
         assert!(!is_flux_generation_endpoint("krea2_generate"));
         assert!(!is_flux_generation_endpoint(
@@ -8449,11 +8548,21 @@ mod tests {
         assert_eq!(moss["layout"], moss_poster_layout());
         assert_eq!(moss["aspect_ratio"], "3:4");
 
-        let flux3 =
-            submitted_draw_request(AIFARM_DRAW_API_FLUX3_ENDPOINT_NAME, request.clone()).await;
-        assert_eq!(flux3["prompt"], "A flat jazz poster.");
-        assert!(flux3.get("negative_prompt").is_none());
-        assert!(flux3.get("layout").is_none());
+        assert!(moss.get("caption").is_none());
+
+        let krea2 = submitted_draw_request("krea2_generate", request.clone()).await;
+        assert_eq!(krea2["prompt"], "A flat jazz poster.");
+        assert!(krea2.get("negative_prompt").is_none());
+        assert!(krea2.get("layout").is_none());
+        assert!(krea2.get("caption").is_none());
+
+        // A MOSS-Image prompt that falls back to Fibo 2.0 keeps its prose only.
+        let fibo =
+            submitted_draw_request(AIFARM_DRAW_API_FIBO_ENDPOINT_NAME, request.clone()).await;
+        assert_eq!(fibo["prompt"], "A flat jazz poster.");
+        assert!(fibo.get("caption").is_none());
+        assert!(fibo.get("layout").is_none());
+        assert!(fibo.get("negative_prompt").is_none());
 
         let prose_only = submitted_draw_request(
             AIFARM_DRAW_API_MOSS_ENDPOINT_NAME,
@@ -8466,6 +8575,102 @@ mod tests {
         .await;
         assert!(prose_only.get("negative_prompt").is_none());
         assert!(prose_only.get("layout").is_none());
+    }
+
+    #[tokio::test]
+    async fn only_the_fibo_endpoint_receives_the_caption() {
+        let request = ImageGenerationRequest {
+            prompt: "постер".to_owned(),
+            caption_text: "caption".to_owned(),
+            prompt_variants: vec!["A flat jazz poster.".to_owned()],
+            prompt_layouts: vec![fibo_poster_caption().to_string()],
+            aspect_ratio: "3:4".to_owned(),
+            ..ImageGenerationRequest::default()
+        };
+        let fibo =
+            submitted_draw_request(AIFARM_DRAW_API_FIBO_ENDPOINT_NAME, request.clone()).await;
+        assert_eq!(fibo["prompt"], "A flat jazz poster.");
+        assert_eq!(fibo["caption"], fibo_poster_caption());
+        assert_eq!(fibo["aspect_ratio"], "3:4");
+
+        let moss =
+            submitted_draw_request(AIFARM_DRAW_API_MOSS_ENDPOINT_NAME, request.clone()).await;
+        assert!(moss.get("layout").is_none());
+        assert!(moss.get("caption").is_none());
+        let krea2 = submitted_draw_request("krea2_generate", request).await;
+        assert!(krea2.get("caption").is_none());
+    }
+
+    async fn submitted_draw_edit_request(endpoint_name: &str, request: ImageEditRequest) -> Value {
+        let draw_payload = serde_json::to_vec(&json!({
+            "image_b64": [general_purpose::STANDARD.encode(b"edited")],
+        }))
+        .expect("draw payload");
+        let response_body = general_purpose::STANDARD.encode(draw_payload);
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "job-1", "state": "processing"}),
+            )),
+            Ok(json_response(json!({
+                "job": {
+                    "job_id": "job-1",
+                    "state": "completed",
+                    "result": {"response": {"status_code": 200, "body": response_body}}
+                }
+            }))),
+        ]);
+        let probe = transport.clone();
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: endpoint_name.to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
+            },
+            transport,
+        );
+        generator
+            .edit_image_with_job_id(request, "edit-fibo")
+            .await
+            .expect("edit result");
+        let job: DiscoveryJobRequest =
+            serde_json::from_slice(&probe.requests()[0].body).expect("job request");
+        let body = decode_discovery_body(&job.invocation.body).expect("edit body");
+        serde_json::from_slice(&body).expect("edit request")
+    }
+
+    #[tokio::test]
+    async fn only_the_fibo_edit_endpoint_receives_the_result_caption() {
+        let request = ImageEditRequest {
+            prompt: "Change the snowboard's deck color to solid red.".to_owned(),
+            photo_urls: vec!["c291cmNl".to_owned()],
+            caption: fibo_poster_caption().to_string(),
+            ..ImageEditRequest::default()
+        };
+        let fibo =
+            submitted_draw_edit_request(AIFARM_DRAW_API_FIBO_EDIT_ENDPOINT_NAME, request.clone())
+                .await;
+        assert_eq!(
+            fibo["prompt"],
+            "Change the snowboard's deck color to solid red."
+        );
+        assert_eq!(fibo["caption"], fibo_poster_caption());
+        assert_eq!(fibo["image_b64"], "c291cmNl");
+
+        let other = submitted_draw_edit_request("krea2_generate", request.clone()).await;
+        assert!(other.get("caption").is_none());
+
+        let without_caption = submitted_draw_edit_request(
+            AIFARM_DRAW_API_FIBO_EDIT_ENDPOINT_NAME,
+            ImageEditRequest {
+                caption: "not json".to_owned(),
+                ..request
+            },
+        )
+        .await;
+        assert!(without_caption.get("caption").is_none());
     }
 
     fn draw_poll_test_config() -> AifarmDrawApiConfig {
@@ -9732,7 +9937,7 @@ mod tests {
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
-                targets: openplotva_media::ImageTargets::FLUX3,
+                targets: openplotva_media::ImageTargets::KREA2,
             }
         }
 
@@ -9744,7 +9949,7 @@ mod tests {
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
-                targets: openplotva_media::ImageTargets::FLUX3,
+                targets: openplotva_media::ImageTargets::KREA2,
             }
         }
 
@@ -9753,7 +9958,7 @@ mod tests {
                 result: Err(ImageGenerationError::Forbidden),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
-                targets: openplotva_media::ImageTargets::FLUX3,
+                targets: openplotva_media::ImageTargets::KREA2,
             }
         }
 
@@ -9762,7 +9967,7 @@ mod tests {
                 result: Err(ImageGenerationError::Provider(message.into())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 expected_image_count: 1,
-                targets: openplotva_media::ImageTargets::FLUX3,
+                targets: openplotva_media::ImageTargets::KREA2,
             }
         }
 

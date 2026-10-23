@@ -90,6 +90,27 @@ pub struct ImageOptimize {
         deserialize_with = "deserialize_moss_layout"
     )]
     pub moss_layout: Option<Value>,
+    /// Fibo 2.0 caption of the picture: the VGL fields except `short_description`, which is
+    /// the Fibo 2.0 slot's prompt. draw-api orders the fields as Fibo 2.0 was trained on.
+    #[serde(
+        default,
+        rename = "fibo_caption",
+        deserialize_with = "deserialize_fibo_caption"
+    )]
+    pub fibo_caption: Option<Value>,
+}
+
+/// Keep a Fibo 2.0 caption only when it is a non-empty object, so a malformed one degrades
+/// to the prose prompt instead of failing the whole payload.
+fn deserialize_fibo_caption<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_object()
+        .is_some_and(|fields| !fields.is_empty())
+        .then_some(value))
 }
 
 /// Request kinds MOSS-Image draws from a layout, as the official prompt enhancer
@@ -143,6 +164,14 @@ pub struct ImageEditOptimize {
     pub outputs: Vec<String>,
     /// NSFW classifier result.
     pub nsfw_result: NsfwResult,
+    /// Fibo 2.0 caption of the edited picture, without `edit_instruction`, which is the
+    /// slot's prompt.
+    #[serde(
+        default,
+        rename = "fibo_caption",
+        deserialize_with = "deserialize_fibo_caption"
+    )]
+    pub fibo_caption: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -156,12 +185,12 @@ pub struct OptimizePromptOptions {
 /// Image model a prompt variant is written for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ImageModel {
-    /// FLUX.3 [klein]: captions and edit instructions in the form of its official prompt
-    /// upsampler, read by a Qwen3-VL encoder.
-    #[default]
-    Flux3,
     /// Krea 2 Turbo: one natural-prose paragraph, medium and style first.
+    #[default]
     Krea2,
+    /// Fibo 2.0: a structured VGL caption with a prose summary, or an edit instruction
+    /// with the caption of the result, read by a Qwen3-VL encoder.
+    Fibo,
     /// MOSS-Image SFT: a detailed caption in the form of its recaptioner, read by a
     /// Qwen3.5 encoder.
     Moss,
@@ -171,8 +200,8 @@ impl ImageModel {
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::Flux3 => "FLUX.3 [klein]",
             Self::Krea2 => "Krea 2 Turbo",
+            Self::Fibo => "Fibo 2.0",
             Self::Moss => "MOSS-Image",
         }
     }
@@ -181,8 +210,8 @@ impl ImageModel {
     #[must_use]
     pub fn from_prompt_target(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "flux3" => Some(Self::Flux3),
             "krea2" => Some(Self::Krea2),
+            "fibo" => Some(Self::Fibo),
             "moss" => Some(Self::Moss),
             _ => None,
         }
@@ -192,8 +221,8 @@ impl ImageModel {
     #[must_use]
     pub const fn prompt_max_chars(self) -> usize {
         match self {
-            Self::Flux3 => FLUX3_PROMPT_MAX_CHARS,
             Self::Krea2 => KREA2_PROMPT_MAX_CHARS,
+            Self::Fibo => FIBO_PROMPT_MAX_CHARS,
             Self::Moss => MOSS_PROMPT_MAX_CHARS,
         }
     }
@@ -213,13 +242,13 @@ pub struct ImageTargets {
 
 impl Default for ImageTargets {
     fn default() -> Self {
-        Self::FLUX3
+        Self::KREA2
     }
 }
 
 impl ImageTargets {
-    pub const FLUX3: Self = Self::single(ImageModel::Flux3);
     pub const KREA2: Self = Self::single(ImageModel::Krea2);
+    pub const FIBO: Self = Self::single(ImageModel::Fibo);
     pub const MOSS: Self = Self::single(ImageModel::Moss);
 
     #[must_use]
@@ -263,7 +292,7 @@ impl ImageTargets {
             .iter()
             .map(|model| model.prompt_max_chars())
             .max()
-            .unwrap_or(FLUX3_PROMPT_MAX_CHARS)
+            .unwrap_or(KREA2_PROMPT_MAX_CHARS)
     }
 
     /// Targets for two generators rendered side by side: `own_slots` slots
@@ -403,6 +432,9 @@ pub fn apply_word_replacements(mut optimize: ImageOptimize) -> ImageOptimize {
         *output = replace_image_words(output);
     }
     optimize.moss_negative = replace_image_words(&optimize.moss_negative);
+    if let Some(caption) = optimize.fibo_caption.as_mut() {
+        replace_caption_words(caption);
+    }
     if let Some(layout) = optimize.moss_layout.as_mut() {
         // Captions describe the picture; `text` is lettering and stays verbatim.
         if let Some(caption) = layout.pointer_mut("/summary/caption") {
@@ -428,6 +460,23 @@ fn replace_image_words(text: &str) -> String {
 fn replace_image_words_in(value: &mut Value) {
     if let Value::String(text) = value {
         *text = replace_image_words(text);
+    }
+}
+
+/// Word replacements in every description of a Fibo 2.0 caption; the lettering in
+/// `text_render` stays verbatim.
+fn replace_caption_words(value: &mut Value) {
+    match value {
+        Value::String(_) => replace_image_words_in(value),
+        Value::Array(items) => items.iter_mut().for_each(replace_caption_words),
+        Value::Object(fields) => {
+            for (key, field) in fields.iter_mut() {
+                if key != "text" {
+                    replace_caption_words(field);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -493,12 +542,13 @@ pub fn render_image_edit_optimizer_prompt_with(
     )
 }
 
-/// Line the FLUX.3 prompt upsampler reads between the attached pictures and the request.
+/// Line the edit optimizer reads between the attached pictures and the request: the
+/// tokens Fibo 2.0 Edit names several pictures by.
 pub const EDIT_REFERENCE_ORDER_LINE: &str =
-    "Reference images follow in order (the first image, the second image, ...).";
+    "The pictures above are <image_1>, <image_2>, ... in order.";
 
-/// Most pictures the edit optimizer looks at, as for the FLUX.3 prompt upsampler.
-pub const MAX_EDIT_REFERENCE_IMAGES: usize = 10;
+/// Most pictures one edit takes: Fibo 2.0 Edit reads up to four.
+pub const MAX_EDIT_REFERENCE_IMAGES: usize = 4;
 
 /// Text of the edit optimizer's user turn: the reference order line when pictures are
 /// attached, then the request.
@@ -514,7 +564,8 @@ pub fn image_edit_optimizer_text(request: &str, image_count: usize) -> String {
 const UPSAMPLER_REFERENCE_MULTIPLE: u32 = 32;
 const UPSAMPLER_MAX_ASPECT_RATIO: u32 = 200;
 
-/// Size the FLUX.3 prompt upsampler gives one of `count` reference pictures: sides on a
+/// Size the edit optimizer sees one of `count` reference pictures at, the FLUX.3 prompt
+/// upsampler's policy: sides on a
 /// multiple of 32 and at most 1024², 724², or 512² pixels for one, two, or more pictures.
 /// `None` for an empty or overly elongated picture.
 #[must_use]
@@ -551,15 +602,14 @@ pub fn upsampler_reference_size(width: u32, height: u32, count: usize) -> Option
     Some((w as u32, h as u32))
 }
 
-/// Upper bound for one optimized FLUX.3 caption or edit instruction, in characters.
-/// The rules ask for up to about 350 words; the bound only makes a looping model close
-/// its string and the JSON instead of running to the token cap.
-pub const FLUX3_PROMPT_MAX_CHARS: usize = 4000;
-
-/// Krea 2 rules ask for up to 200 words.
+/// Krea 2 rules ask for up to 200 words. Every bound only makes a looping model close its
+/// string and the JSON instead of running to the token cap.
 pub const KREA2_PROMPT_MAX_CHARS: usize = 1600;
 
-/// MOSS-Image rules ask for up to about 350 words, like FLUX.3.
+/// A Fibo 2.0 summary has at most 200 words, and an edit instruction is one command.
+pub const FIBO_PROMPT_MAX_CHARS: usize = 1600;
+
+/// MOSS-Image rules ask for up to about 350 words.
 pub const MOSS_PROMPT_MAX_CHARS: usize = 4000;
 
 /// Cut every optimized output to at most `max_chars` characters. The bound is applied
@@ -589,8 +639,8 @@ fn optimizer_prompt_data(options: OptimizePromptOptions) -> Value {
         "variant_count": variant_count,
         "slots": slots,
         "multi": variant_count > 1,
-        "flux3": models.contains(&ImageModel::Flux3),
         "krea2": models.contains(&ImageModel::Krea2),
+        "fibo": models.contains(&ImageModel::Fibo),
         "moss": models.contains(&ImageModel::Moss),
         "moss_layout": options.targets.moss_layout(),
         "moss_canvases": IMAGE_ASPECT_RATIOS
@@ -611,12 +661,14 @@ fn slot_models(options: OptimizePromptOptions) -> Vec<ImageModel> {
 }
 
 /// The image optimizer's payload schema; a call with a MOSS-Image slot also offers
-/// that model's negative prompt, and its layout when the targets enable it.
+/// that model's negative prompt, and its layout when the targets enable it, and a call
+/// with a Fibo 2.0 slot its caption.
 #[must_use]
 pub fn optimize_prompt_terminator_definition(
     options: OptimizePromptOptions,
 ) -> OptimizerTerminatorDefinition {
-    let moss = if !slot_models(options).contains(&ImageModel::Moss) {
+    let models = slot_models(options);
+    let moss = if !models.contains(&ImageModel::Moss) {
         MossFields::None
     } else if options.targets.moss_layout() {
         MossFields::NegativeAndLayout
@@ -629,6 +681,7 @@ pub fn optimize_prompt_terminator_definition(
         "Finalize image prompt optimization and return the structured payload.",
         true,
         moss,
+        models.contains(&ImageModel::Fibo),
     )
 }
 
@@ -640,16 +693,19 @@ enum MossFields {
     NegativeAndLayout,
 }
 
+/// The edit optimizer's payload schema; a Fibo 2.0 slot also gets the caption of the
+/// edited picture.
 #[must_use]
 pub fn optimize_edit_prompt_terminator_definition(
-    variant_count: usize,
+    options: OptimizePromptOptions,
 ) -> OptimizerTerminatorDefinition {
     optimizer_terminator_definition(
-        variant_count,
+        options.variant_count,
         OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME,
         "Finalize image edit prompt optimization and return the structured payload.",
         false,
         MossFields::None,
+        slot_models(options).contains(&ImageModel::Fibo),
     )
 }
 
@@ -724,6 +780,7 @@ pub fn image_edit_optimize_fallback(text: &str, variant_count: usize) -> ImageEd
         input: text.trim().to_owned(),
         outputs: normalize_outputs(std::iter::empty::<String>(), text, variant_count),
         nsfw_result: NsfwResult::Adult,
+        fibo_caption: None,
     }
 }
 
@@ -747,6 +804,7 @@ pub fn normalize_image_optimize(
     if optimized.nsfw_result == NsfwResult::Forbidden {
         optimized.moss_negative.clear();
         optimized.moss_design = false;
+        optimized.fibo_caption = None;
     }
     if !optimized.moss_design {
         optimized.moss_layout = None;
@@ -790,6 +848,9 @@ pub fn normalize_image_edit_optimize(
 ) -> ImageEditOptimize {
     optimized.input = optimized.input.trim().to_owned();
     optimized.outputs = normalize_outputs(optimized.outputs, fallback, variant_count);
+    if optimized.nsfw_result == NsfwResult::Forbidden {
+        optimized.fibo_caption = None;
+    }
     if optimized.input.is_empty() {
         optimized.input = fallback.trim().to_owned();
     }
@@ -892,6 +953,7 @@ fn optimizer_terminator_definition(
     description: &'static str,
     include_aspect_ratio: bool,
     moss: MossFields,
+    fibo: bool,
 ) -> OptimizerTerminatorDefinition {
     let count = normalize_variant_count(variant_count);
     let mut properties = serde_json::Map::from_iter([
@@ -957,6 +1019,12 @@ fn optimizer_terminator_definition(
         );
         required.extend(["moss_kind", "moss_layout"]);
     }
+    // `fibo_caption` sorts before `outputs`, so the caption is drafted first and the
+    // Fibo 2.0 slot's summary follows it.
+    if fibo {
+        properties.insert("fibo_caption".to_owned(), fibo_caption_schema());
+        required.push("fibo_caption");
+    }
     if moss != MossFields::None {
         properties.insert(
             "slot_moss_negative".to_owned(),
@@ -977,6 +1045,92 @@ fn optimizer_terminator_definition(
             "required": required,
         }),
     }
+}
+
+/// Most objects one Fibo 2.0 caption describes; the rest belong to `background_setting`.
+const FIBO_CAPTION_MAX_OBJECTS: usize = 5;
+
+/// Fibo 2.0 caption in the VGL fields of its training captions, without the
+/// `short_description` and `edit_instruction` that the slot's prompt carries. The fields
+/// a VGL caption may omit are optional; a person's fields are optional on every object.
+fn fibo_caption_schema() -> Value {
+    let text = json!({ "type": "string" });
+    let section = |fields: &[&str]| {
+        json!({
+            "type": "object",
+            "properties": fields.iter().map(|field| ((*field).to_owned(), text.clone())).collect::<serde_json::Map<_, _>>(),
+            "required": fields,
+        })
+    };
+    let mut object_fields: serde_json::Map<String, Value> = [
+        "description",
+        "location",
+        "relationship",
+        "relative_size",
+        "shape_and_color",
+        "texture",
+        "appearance_details",
+        "orientation",
+        "pose",
+        "expression",
+        "clothing",
+        "action",
+    ]
+    .iter()
+    .map(|field| ((*field).to_owned(), text.clone()))
+    .collect();
+    object_fields.insert(
+        "number_of_objects".to_owned(),
+        json!({ "type": "integer", "minimum": 1 }),
+    );
+    json!({
+        "type": "object",
+        "description": "Fibo 2.0 caption of the picture, in the VGL fields.",
+        "properties": {
+            "objects": {
+                "type": "array",
+                "maxItems": FIBO_CAPTION_MAX_OBJECTS,
+                "items": {
+                    "type": "object",
+                    "properties": object_fields,
+                    "required": ["description", "location", "relationship", "relative_size", "shape_and_color", "texture"],
+                },
+            },
+            "background_setting": text,
+            "lighting": section(&["conditions", "direction", "shadows"]),
+            "aesthetics": section(&["composition", "color_scheme", "mood_atmosphere"]),
+            "photographic_characteristics": section(&["depth_of_field", "focus", "camera_angle", "lens_focal_length"]),
+            "style_medium": text,
+            "text_render": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": text,
+                        "location": text,
+                        "size": text,
+                        "color": text,
+                        "font": text,
+                        "appearance_details": text,
+                    },
+                    "required": ["text", "location", "size", "color", "font"],
+                },
+            },
+            "context": text,
+            "artistic_style": text,
+        },
+        "required": [
+            "objects",
+            "background_setting",
+            "lighting",
+            "aesthetics",
+            "photographic_characteristics",
+            "style_medium",
+            "text_render",
+            "context",
+            "artistic_style",
+        ],
+    })
 }
 
 /// Most items one MOSS-Image layout carries; draw-api compiles at most this many.
@@ -1192,36 +1346,66 @@ mod tests {
     fn optimizer_prompt_renders_rules_for_each_slot_target() {
         let pair = render_image_optimizer_prompt(OptimizePromptOptions {
             variant_count: 2,
-            targets: ImageTargets::KREA2.followed_by(1, ImageTargets::FLUX3, 1),
+            targets: ImageTargets::KREA2.followed_by(1, ImageTargets::FIBO, 1),
         })
         .expect("render pair");
         assert!(pair.contains("`outputs[0]` is rendered by Krea 2 Turbo"));
-        assert!(pair.contains("`outputs[1]` is rendered by FLUX.3 [klein]"));
+        assert!(pair.contains("`outputs[1]` is rendered by Fibo 2.0"));
         assert!(pair.contains("**Krea 2 Turbo**"));
-        assert!(pair.contains("**FLUX.3 [klein]**"));
+        assert!(pair.contains("**Fibo 2.0**"));
         assert!(pair.contains("All prompts describe the same image idea"));
         assert!(!pair.contains("{{"));
 
-        let flux3 =
-            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render flux3");
-        assert!(flux3.contains("`outputs[0]` is rendered by FLUX.3 [klein]"));
-        assert!(flux3.contains("**FLUX.3 [klein]**"));
-        assert!(flux3.contains("single FLUX.3 [klein] slot"));
-        assert!(!flux3.contains("Krea 2"));
-        assert!(!flux3.contains("All prompts describe the same image idea"));
-        assert!(!flux3.contains("{{"));
+        let fibo = render_image_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::FIBO,
+        })
+        .expect("render fibo");
+        assert!(fibo.contains("`outputs[0]` is rendered by Fibo 2.0"));
+        assert!(fibo.contains("the fields `aspect_ratio`, `fibo_caption`, `input`, `nsfw_result`, and `outputs`, in that order"));
+        assert!(fibo.contains("single Fibo 2.0 slot"));
+        assert!(!fibo.contains("Krea 2"));
+        assert!(!fibo.contains("FLUX"));
+        assert!(!fibo.contains("All prompts describe the same image idea"));
+        assert!(!fibo.contains("{{"));
     }
 
     #[test]
-    fn edit_prompt_uses_the_upsampler_instruction_form() {
-        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions::default())
-            .expect("render edit");
-        assert!(edit.contains("`outputs[0]` is carried out by FLUX.3 [klein]"));
-        assert!(edit.contains("**FLUX.3 [klein]**"));
-        assert!(edit.contains("preserving the first image as the exact canvas"));
-        assert!(edit.contains("the second image"));
-        assert!(!edit.contains("Call the picture being edited <image1>"));
+    fn edit_prompt_pairs_an_instruction_with_the_caption_of_the_result() {
+        let edit = render_image_edit_optimizer_prompt(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::FIBO,
+        })
+        .expect("render edit");
+        assert!(edit.contains("`outputs[0]` is carried out by Fibo 2.0"));
+        assert!(edit.contains("**Fibo 2.0**"));
+        assert!(edit.contains(
+            "the fields `fibo_caption`, `input`, `nsfw_result`, and `outputs`, in that order"
+        ));
+        assert!(edit.contains("<image_2>"));
+        assert!(!edit.contains("FLUX"));
         assert!(!edit.contains("{{"));
+        let mut examples = 0;
+        for line in edit.lines().filter(|line| line.starts_with("{\"")) {
+            let example: Value = serde_json::from_str(line).expect("edit example parses");
+            let keys: Vec<&String> = example.as_object().expect("example").keys().collect();
+            assert_eq!(
+                keys,
+                ["fibo_caption", "input", "nsfw_result", "outputs"],
+                "{line}"
+            );
+            let positions: Vec<usize> = keys
+                .iter()
+                .map(|key| line.find(&format!("\"{key}\": ")).expect("example key"))
+                .collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{line}");
+            assert!(
+                !example["fibo_caption"].to_string().contains("<image_"),
+                "{line}"
+            );
+            examples += 1;
+        }
+        assert!(examples > 0);
     }
 
     #[test]
@@ -1235,15 +1419,16 @@ mod tests {
         assert!(krea2.contains("**Krea 2 Turbo**"));
         assert!(krea2.contains("60 to 200 words"));
         assert!(krea2.contains("single Krea 2 Turbo slot"));
-        assert!(!krea2.contains("**FLUX.3 [klein]**"));
+        assert!(!krea2.contains("**Fibo 2.0**"));
+        assert!(!krea2.contains("fibo_caption"));
         assert!(!krea2.contains("{{"));
     }
 
     #[test]
     fn prompt_targets_and_length_bounds_follow_the_model() {
         assert_eq!(
-            ImageModel::from_prompt_target(" FLUX3 "),
-            Some(ImageModel::Flux3)
+            ImageModel::from_prompt_target(" FIBO "),
+            Some(ImageModel::Fibo)
         );
         assert_eq!(
             ImageModel::from_prompt_target("krea2"),
@@ -1253,19 +1438,16 @@ mod tests {
             ImageModel::from_prompt_target("moss"),
             Some(ImageModel::Moss)
         );
-        for retired in ["klein", "boogu", "qwen_image", "dall-e"] {
+        for retired in ["flux3", "klein", "boogu", "qwen_image", "dall-e"] {
             assert_eq!(ImageModel::from_prompt_target(retired), None);
         }
 
-        assert_eq!(
-            ImageTargets::FLUX3.prompt_max_chars(),
-            FLUX3_PROMPT_MAX_CHARS
-        );
+        assert_eq!(ImageTargets::FIBO.prompt_max_chars(), FIBO_PROMPT_MAX_CHARS);
         assert_eq!(
             ImageTargets::KREA2
-                .followed_by(1, ImageTargets::FLUX3, 1)
+                .followed_by(1, ImageTargets::MOSS, 1)
                 .prompt_max_chars(),
-            FLUX3_PROMPT_MAX_CHARS
+            MOSS_PROMPT_MAX_CHARS
         );
         assert_eq!(
             ImageTargets::KREA2.prompt_max_chars(),
@@ -1284,25 +1466,25 @@ mod tests {
         assert!(moss.contains("`outputs[0]` is rendered by MOSS-Image"));
         assert!(moss.contains("**MOSS-Image**"));
         assert!(moss.contains("single MOSS-Image slot"));
-        assert!(!moss.contains("**FLUX.3 [klein]**"));
+        assert!(!moss.contains("**Fibo 2.0**"));
         assert!(!moss.contains("**Krea 2 Turbo**"));
         assert!(!moss.contains("{{"));
 
         let vip = render_image_optimizer_prompt(OptimizePromptOptions {
             variant_count: 3,
             targets: ImageTargets::KREA2
-                .followed_by(1, ImageTargets::FLUX3, 1)
-                .followed_by(2, ImageTargets::MOSS, 1),
+                .followed_by(1, ImageTargets::MOSS, 1)
+                .followed_by(2, ImageTargets::FIBO, 1),
         })
         .expect("render vip");
         assert!(vip.contains("`outputs[0]` is rendered by Krea 2 Turbo"));
-        assert!(vip.contains("`outputs[1]` is rendered by FLUX.3 [klein]"));
-        assert!(vip.contains("`outputs[2]` is rendered by MOSS-Image"));
+        assert!(vip.contains("`outputs[1]` is rendered by MOSS-Image"));
+        assert!(vip.contains("`outputs[2]` is rendered by Fibo 2.0"));
         assert!(vip.contains("**Krea 2 Turbo**"));
-        assert!(vip.contains("**FLUX.3 [klein]**"));
         assert!(vip.contains("**MOSS-Image**"));
+        assert!(vip.contains("**Fibo 2.0**"));
         assert!(vip.contains("`outputs` is one array of 3 complete prompts in slot order"));
-        assert!(vip.contains("plus the MOSS-Image field `slot_moss_negative`,"));
+        assert!(vip.contains("`aspect_ratio`, `fibo_caption`, `input`, `nsfw_result`, `outputs`, and `slot_moss_negative`, in that order"));
         assert!(vip.contains("written as `\\n` in the JSON string"));
         assert!(vip.contains("**MOSS-Image negative prompt**"));
         assert!(!vip.contains("moss_layout"));
@@ -1322,10 +1504,10 @@ mod tests {
         assert!(layout.contains("\"moss_kind\": \"poster\", \"moss_layout\": {"));
         assert!(!layout.contains("{{"));
 
-        let flux3 =
-            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render flux3");
-        assert!(!flux3.contains("slot_moss_"));
-        assert!(!flux3.contains("one array of"));
+        let krea2 =
+            render_image_optimizer_prompt(OptimizePromptOptions::default()).expect("render krea2");
+        assert!(!krea2.contains("slot_moss_"));
+        assert!(!krea2.contains("one array of"));
     }
 
     #[test]
@@ -1385,7 +1567,7 @@ mod tests {
     fn moss_fields_join_the_schema_only_with_a_moss_slot() {
         let prose = optimize_prompt_terminator_definition(OptimizePromptOptions {
             variant_count: 2,
-            targets: ImageTargets::FLUX3.followed_by(1, ImageTargets::MOSS, 1),
+            targets: ImageTargets::KREA2.followed_by(1, ImageTargets::MOSS, 1),
         })
         .input_schema;
         assert_eq!(
@@ -1403,7 +1585,7 @@ mod tests {
         // The layout flag of either side survives joining two generators.
         let vip = optimize_prompt_terminator_definition(OptimizePromptOptions {
             variant_count: 2,
-            targets: ImageTargets::FLUX3.followed_by(
+            targets: ImageTargets::KREA2.followed_by(
                 1,
                 ImageTargets::MOSS.with_moss_layout(true),
                 1,
@@ -1461,13 +1643,16 @@ mod tests {
         assert!(position("outputs") < position("slot_moss_negative"));
 
         // Without a MOSS-Image slot the layout flag adds nothing.
-        let flux3 = optimize_prompt_terminator_definition(OptimizePromptOptions {
+        let krea2 = optimize_prompt_terminator_definition(OptimizePromptOptions {
             variant_count: 1,
-            targets: ImageTargets::FLUX3.with_moss_layout(true),
+            targets: ImageTargets::KREA2.with_moss_layout(true),
         });
-        assert!(flux3.input_schema["properties"]["moss_layout"].is_null());
-        assert!(flux3.input_schema["properties"]["slot_moss_negative"].is_null());
-        let edit = optimize_edit_prompt_terminator_definition(1);
+        assert!(krea2.input_schema["properties"]["moss_layout"].is_null());
+        assert!(krea2.input_schema["properties"]["slot_moss_negative"].is_null());
+        let edit = optimize_edit_prompt_terminator_definition(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::FIBO,
+        });
         assert!(edit.input_schema["properties"]["slot_moss_negative"].is_null());
     }
 
@@ -1477,8 +1662,8 @@ mod tests {
         // Examples in another order made it write a field name as the second prompt of a
         // multi-slot call, or loop in it until the token limit.
         for targets in [
-            ImageTargets::FLUX3,
             ImageTargets::KREA2,
+            ImageTargets::FIBO,
             ImageTargets::MOSS,
             ImageTargets::MOSS.with_moss_layout(true),
         ] {
@@ -1708,7 +1893,7 @@ mod tests {
         );
         assert_eq!(
             image_edit_optimizer_text("make it night", 2),
-            "Reference images follow in order (the first image, the second image, ...).\nmake it night"
+            "The pictures above are <image_1>, <image_2>, ... in order.\nmake it night"
         );
     }
 
@@ -1736,21 +1921,21 @@ mod tests {
 
     #[test]
     fn image_targets_follow_each_side_slot_count() {
-        let pair = ImageTargets::KREA2.followed_by(1, ImageTargets::FLUX3, 1);
-        assert_eq!(pair.models(), [ImageModel::Krea2, ImageModel::Flux3]);
+        let pair = ImageTargets::KREA2.followed_by(1, ImageTargets::FIBO, 1);
+        assert_eq!(pair.models(), [ImageModel::Krea2, ImageModel::Fibo]);
 
-        let wide_first = ImageTargets::KREA2.followed_by(2, ImageTargets::FLUX3, 1);
+        let wide_first = ImageTargets::KREA2.followed_by(2, ImageTargets::FIBO, 1);
         assert_eq!(
             wide_first.models(),
-            [ImageModel::Krea2, ImageModel::Krea2, ImageModel::Flux3]
+            [ImageModel::Krea2, ImageModel::Krea2, ImageModel::Fibo]
         );
         assert_eq!(wide_first.model_for_slot(1), ImageModel::Krea2);
-        assert_eq!(wide_first.model_for_slot(2), ImageModel::Flux3);
+        assert_eq!(wide_first.model_for_slot(2), ImageModel::Fibo);
 
-        assert_eq!(ImageTargets::FLUX3.model_for_slot(3), ImageModel::Flux3);
-        assert_eq!(ImageTargets::default(), ImageTargets::FLUX3);
+        assert_eq!(ImageTargets::FIBO.model_for_slot(3), ImageModel::Fibo);
+        assert_eq!(ImageTargets::default(), ImageTargets::KREA2);
         assert_eq!(
-            ImageTargets::FLUX3
+            ImageTargets::FIBO
                 .followed_by(3, ImageTargets::KREA2, 3)
                 .models()
                 .len(),
@@ -1823,7 +2008,8 @@ mod tests {
                 .is_some_and(|description| description.contains("minor sexual content only"))
         );
 
-        let edit_tool = optimize_edit_prompt_terminator_definition(0);
+        let edit_tool =
+            optimize_edit_prompt_terminator_definition(OptimizePromptOptions::default());
         assert_eq!(edit_tool.name, OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME);
         assert_eq!(
             edit_tool.input_schema["properties"]["outputs"]["minItems"],
@@ -1933,8 +2119,132 @@ mod tests {
                 input: "edit".to_owned(),
                 outputs: vec!["edit".to_owned()],
                 nsfw_result: NsfwResult::Adult,
+                fibo_caption: None,
             }
         );
+    }
+
+    #[test]
+    fn fibo_slots_add_a_caption_drafted_before_the_prompts() {
+        let vip = optimize_prompt_terminator_definition(OptimizePromptOptions {
+            variant_count: 3,
+            targets: ImageTargets::KREA2
+                .followed_by(1, ImageTargets::MOSS, 1)
+                .followed_by(2, ImageTargets::FIBO, 1),
+        })
+        .input_schema;
+        assert_eq!(
+            vip["required"],
+            json!([
+                "input",
+                "outputs",
+                "nsfw_result",
+                "aspect_ratio",
+                "fibo_caption",
+                "slot_moss_negative"
+            ])
+        );
+        let keys: Vec<&String> = vip["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .collect();
+        let position = |key: &str| keys.iter().position(|k| *k == key).expect("key");
+        assert!(position("fibo_caption") < position("outputs"));
+        let caption = &vip["properties"]["fibo_caption"];
+        assert!(caption["properties"]["short_description"].is_null());
+        assert!(caption["properties"]["edit_instruction"].is_null());
+        assert_eq!(
+            caption["properties"]["objects"]["maxItems"],
+            FIBO_CAPTION_MAX_OBJECTS
+        );
+        assert_eq!(
+            caption["properties"]["text_render"]["items"]["required"],
+            json!(["text", "location", "size", "color", "font"])
+        );
+        assert_eq!(
+            caption["properties"]["lighting"]["required"],
+            json!(["conditions", "direction", "shadows"])
+        );
+
+        let edit = optimize_edit_prompt_terminator_definition(OptimizePromptOptions {
+            variant_count: 1,
+            targets: ImageTargets::FIBO,
+        })
+        .input_schema;
+        assert_eq!(
+            edit["required"],
+            json!(["input", "outputs", "nsfw_result", "fibo_caption"])
+        );
+        let krea2 = optimize_prompt_terminator_definition(OptimizePromptOptions::default());
+        assert!(krea2.input_schema["properties"]["fibo_caption"].is_null());
+    }
+
+    #[test]
+    fn fibo_captions_decode_only_as_objects_and_never_for_forbidden_requests() {
+        let caption = json!({
+            "objects": [{"description": "Plotva on a plate."}],
+            "text_render": [{"text": "plotva"}],
+        });
+        let payload = |nsfw: &str, caption: &Value| {
+            json!({
+                "aspect_ratio": "1:1",
+                "fibo_caption": caption,
+                "input": "рыба",
+                "nsfw_result": nsfw,
+                "outputs": ["A photograph of a fish on a plate."],
+            })
+            .to_string()
+        };
+        let decoded =
+            decode_image_optimize_payload(&payload("safe", &caption), "рыба", 1).expect("decode");
+        assert_eq!(decoded.fibo_caption.as_ref(), Some(&caption));
+        let replaced = apply_word_replacements(decoded);
+        let replaced = replaced.fibo_caption.expect("caption");
+        assert_eq!(
+            replaced.pointer("/objects/0/description"),
+            Some(&json!("roach-fish on a plate."))
+        );
+        assert_eq!(
+            replaced.pointer("/text_render/0/text"),
+            Some(&json!("plotva"))
+        );
+
+        for broken in [json!("caption"), json!({}), json!(null), json!([1])] {
+            let decoded = decode_image_optimize_payload(&payload("safe", &broken), "рыба", 1)
+                .expect("decode broken caption");
+            assert_eq!(decoded.fibo_caption, None);
+        }
+        let forbidden = decode_image_optimize_payload(&payload("forbidden", &caption), "x", 1)
+            .expect("decode forbidden");
+        assert_eq!(forbidden.fibo_caption, None);
+
+        let edit = decode_image_edit_optimize_payload(
+            &json!({
+                "fibo_caption": caption,
+                "input": "сделай ночь",
+                "nsfw_result": "safe",
+                "outputs": ["Change the time of day to night."],
+            })
+            .to_string(),
+            "сделай ночь",
+            1,
+        )
+        .expect("decode edit");
+        assert_eq!(edit.fibo_caption.as_ref(), Some(&caption));
+        let blocked = decode_image_edit_optimize_payload(
+            &json!({
+                "fibo_caption": caption,
+                "input": "x",
+                "nsfw_result": "forbidden",
+                "outputs": ["Blocked: forbidden request."],
+            })
+            .to_string(),
+            "x",
+            1,
+        )
+        .expect("decode blocked edit");
+        assert_eq!(blocked.fibo_caption, None);
     }
 
     #[test]

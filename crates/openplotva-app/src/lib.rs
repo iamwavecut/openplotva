@@ -149,9 +149,10 @@ const DURABLE_UPDATE_CONSUMER_MAX_WORKERS: usize =
     openplotva_storage::POSTGRES_CRITICAL_MAX_CONNECTIONS as usize * 3;
 const REGULAR_IMAGE_GENERATION_WORKFLOW_KEY: &str =
     image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY;
-const VIP_IMAGE_GENERATION_WORKFLOW_KEYS: [&str; 2] = [
+const VIP_IMAGE_GENERATION_WORKFLOW_KEYS: [&str; 3] = [
     image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
     image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY,
+    image_jobs::IMAGE_GENERATION_FIBO_WORKFLOW_KEY,
 ];
 const VIP_IMAGE_EDITOR_WORKFLOW_KEY: &str = image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY;
 
@@ -13318,19 +13319,25 @@ async fn start_runtime_workers(
     )
     .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
     .with_reporter(routing_event_reporter.clone());
-    let [vip_first_workflow_key, vip_second_workflow_key] = VIP_IMAGE_GENERATION_WORKFLOW_KEYS;
+    let vip_slot = |workflow_key: &str| {
+        image_jobs::RoutedImageGenerator::new(
+            image_attempt_walker.clone(),
+            image_jobs::aifarm_draw_api_config_from_app_config(config),
+        )
+        .with_workflow_key(workflow_key)
+    };
+    let [
+        vip_first_workflow_key,
+        vip_second_workflow_key,
+        vip_third_workflow_key,
+    ] = VIP_IMAGE_GENERATION_WORKFLOW_KEYS;
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::ParallelImageGenerator::new(
-            image_jobs::RoutedImageGenerator::new(
-                image_attempt_walker.clone(),
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
-            )
-            .with_workflow_key(vip_first_workflow_key),
-            image_jobs::RoutedImageGenerator::new(
-                image_attempt_walker.clone(),
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
-            )
-            .with_workflow_key(vip_second_workflow_key),
+            image_jobs::ParallelImageGenerator::new(
+                vip_slot(vip_first_workflow_key),
+                vip_slot(vip_second_workflow_key),
+            ),
+            vip_slot(vip_third_workflow_key),
         ),
         media_prompt_optimizer.clone(),
     )
@@ -15174,6 +15181,7 @@ mod tests {
             [
                 super::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
                 super::image_jobs::IMAGE_GENERATION_MOSS_WORKFLOW_KEY,
+                super::image_jobs::IMAGE_GENERATION_FIBO_WORKFLOW_KEY,
             ]
         );
         assert_eq!(

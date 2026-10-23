@@ -1310,7 +1310,7 @@ where
             }
             None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
-        let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
+        let tool = openplotva_media::optimize_edit_prompt_terminator_definition(render_options);
         let images: Vec<GeminiInlineData> = images
             .iter()
             .filter_map(|image| gemini_inline_data_from_data_url(image.trim()))

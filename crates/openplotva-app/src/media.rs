@@ -510,6 +510,7 @@ where
             input: original_prompt.to_owned(),
             outputs: vec![original_prompt.to_owned()],
             nsfw_result: openplotva_media::NsfwResult::Adult,
+            fibo_caption: None,
         };
         let Some(optimizer) = &self.optimizer else {
             return MediaPromptOptimization {
@@ -1247,6 +1248,7 @@ mod tests {
                 input: "make it day".to_owned(),
                 outputs: vec!["make it day".to_owned()],
                 nsfw_result: openplotva_media::NsfwResult::Adult,
+                fibo_caption: None,
             }
         );
     }
@@ -1302,6 +1304,7 @@ mod tests {
                 input: "make it day".to_owned(),
                 outputs: vec!["gemini edit".to_owned()],
                 nsfw_result: openplotva_media::NsfwResult::Safe,
+                fibo_caption: None,
             }));
         let optimizer = FallbackMediaPromptOptimizer::with_flow_labels(
             primary,
