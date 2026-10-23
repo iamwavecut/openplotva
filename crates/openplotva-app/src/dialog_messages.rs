@@ -747,6 +747,53 @@ impl crate::dialog_tools::DrawQueueNoticeSender for DrawQueueNoticeDispatcherSen
     }
 }
 
+impl crate::dialog_tools::ImageFallbackNoticeSender for DrawQueueNoticeDispatcherSender {
+    fn send_image_fallback_notice<'a>(
+        &'a self,
+        request: &'a crate::dialog_tools::DrawImageScheduleRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), openplotva_dialog::ToolboxError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let message_thread_id = i64::from(request.thread_id.unwrap_or_default());
+            let chat = ChatRef {
+                direct_messages_topic_id: None,
+                id: request.chat_id,
+                is_forum: request.thread_id.is_some(),
+            };
+            let message = TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id,
+                disable_notification: false,
+                allow_sending_without_reply: Some(true),
+                text: crate::dialog_tools::IMAGE_EDIT_FALLBACK_NOTICE.to_owned(),
+                render_as: String::new(),
+                reply_markup: None,
+            };
+            let reply_to = ReplyMessageRef {
+                message_id: i64::from(request.message_id),
+                chat,
+                is_topic_message: request.thread_id.is_some(),
+                message_thread_id,
+            };
+            queue_text_message_parts(
+                &self.queue,
+                QueueTextRequest {
+                    protected: true,
+                    debounce_key: None,
+                    message: &message,
+                    reply_to: Some(&reply_to),
+                    immediate_first: true,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: None,
+                },
+                || (self.next_virtual_id)(),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
 /// Dispatcher-backed random-response effects.
 #[derive(Clone)]
 pub struct RandomDialogDispatcherEffects {
@@ -6837,6 +6884,44 @@ mod tests {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(self.0)
         }
+    }
+
+    #[tokio::test]
+    async fn image_fallback_notice_dispatcher_keeps_explanation_and_reply_context() {
+        let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let sender = DrawQueueNoticeDispatcherSender::new(Arc::clone(&queue));
+        crate::dialog_tools::ImageFallbackNoticeSender::send_image_fallback_notice(
+            &sender,
+            &crate::dialog_tools::DrawImageScheduleRequest {
+                chat_id: -100,
+                thread_id: Some(7),
+                message_id: 78,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("notice queued");
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.immediate.len(), 1);
+        let item = &snapshot.immediate[0];
+        assert_eq!(item.chat_id, -100);
+        assert_eq!(item.ephemeral_delete_after, None);
+        assert!(item.protected);
+        let item = queue.dequeue_immediate().expect("outbound item");
+        let Some(TelegramOutboundMethod::SendMessage(method)) = item.into_method() else {
+            panic!("expected text message");
+        };
+        let payload = serde_json::to_value(method).expect("payload");
+        assert!(payload["text"].as_str().expect("text").contains("VIP"));
+        assert!(
+            payload["text"]
+                .as_str()
+                .expect("text")
+                .contains("нарисую новое изображение")
+        );
+        assert_eq!(payload["reply_parameters"]["message_id"], 78);
+        assert_eq!(payload["message_thread_id"], 7);
     }
 
     #[tokio::test]

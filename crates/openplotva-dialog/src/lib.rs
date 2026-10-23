@@ -861,7 +861,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: STEP_DRAW_IMAGE,
         summary: "Create or edit an image from the user's request.",
-        when_to_use: "Use when the latest user message asks to draw, generate, create, redraw, or edit an image.",
+        when_to_use: "Use when the latest user message asks to draw, generate, create, redraw, or edit an image. Pass selected references even without VIP. The executor checks access. For non-VIP users, it explains the edit restriction and generates a new image using Vision descriptions of the references.",
         result: "Schedules image generation and ENDS your turn; the image arrives asynchronously. \
                  Call it without accompanying text or a promise to draw: text alongside a tool \
                  call is not published.",
