@@ -2322,7 +2322,7 @@ where
             }
             None => openplotva_media::render_image_edit_optimizer_prompt(render_options)?,
         };
-        let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
+        let tool = openplotva_media::optimize_edit_prompt_terminator_definition(render_options);
         let images: Vec<String> = images
             .iter()
             .map(|image| image.trim())
@@ -8469,7 +8469,7 @@ mod tests {
             json!([
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA", "detail": "auto"}},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB", "detail": "auto"}},
-                {"type": "text", "text": "Reference images follow in order (the first image, the second image, ...).\nedit it"},
+                {"type": "text", "text": "The pictures above are <image_1>, <image_2>, ... in order.\nedit it"},
             ])
         );
         assert_eq!(edit_body["max_tokens"], 4096);

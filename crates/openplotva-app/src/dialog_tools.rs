@@ -4820,7 +4820,9 @@ mod tests {
                 step: "draw_image".to_owned(),
                 prompt: input.message.text.clone(),
                 caption: "Combined photos".to_owned(),
-                file_ids: (11..=20)
+                file_ids: (11..)
+                    .take(MAX_IMAGE_EDIT_SOURCE_IMAGES - 1)
+                    .chain(std::iter::once(20))
                     .map(|message_id| format!("message_{message_id}_image_1"))
                     .collect(),
                 ..Default::default()
@@ -4960,7 +4962,7 @@ mod tests {
                     assert!(
                         selected
                             .expect_err("too many sources")
-                            .contains("at most 10")
+                            .contains(&format!("at most {MAX_IMAGE_EDIT_SOURCE_IMAGES}"))
                     );
                 }
             }

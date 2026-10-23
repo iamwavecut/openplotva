@@ -614,7 +614,7 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "file_ids",
         required: false,
-        description: "Required when editing or combining earlier images: list every requested source using its file_id handle or file_unique_id from the dialog attachments. A style change to a previous generation must reference its generated result. Pass up to 10 references together in ONE draw_image call. Describing images in prompt does not attach them. Omit only for a new image or when all sources are attached to or quoted by the current message.",
+        description: "Required when editing or combining earlier images: list every requested source using its file_id handle or file_unique_id from the dialog attachments. A style change to a previous generation must reference its generated result. Pass up to 4 references together in ONE draw_image call. Describing images in prompt does not attach them. Omit only for a new image or when all sources are attached to or quoted by the current message.",
     },
     ToolArgSpec {
         name: "negative_prompt",

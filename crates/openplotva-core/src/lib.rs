@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 /// Public project name used in diagnostics and health responses.
 pub const PROJECT_NAME: &str = "openplotva";
 
-/// Maximum source images supported by the Qwen-Image 2.1 edit model.
-pub const MAX_IMAGE_EDIT_SOURCE_IMAGES: usize = 10;
+/// Maximum source images one edit takes: Fibo 2.0 Edit reads up to four.
+pub const MAX_IMAGE_EDIT_SOURCE_IMAGES: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatState {
