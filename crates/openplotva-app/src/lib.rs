@@ -12903,10 +12903,10 @@ async fn start_runtime_workers(
                     "gradius",
                     "Gradius dialogue advertising is enabled with fail-closed privacy redaction",
                 ));
-                Some(Arc::new(gradius_ads::GradiusAdService::new(
-                    dialogue, privacy, ledger, vip,
-                ))
-                    as Arc<dyn gradius_ads::GradiusAdAppender>)
+                Some(Arc::new(
+                    gradius_ads::GradiusAdService::new(dialogue, privacy, ledger, vip)
+                        .with_banner_delivery(bot_identity.id),
+                ) as Arc<dyn gradius_ads::GradiusAdAppender>)
             }
             Err(error) => {
                 tracing::warn!(%error, "Gradius privacy redactor unavailable");

@@ -4091,6 +4091,8 @@ fn session_options<'a>(
 
 #[derive(Clone, Default)]
 struct GradiusAppenderStub {
+    banner: Option<crate::gradius_ads::GradiusAdBanner>,
+    queued_banners: Arc<Mutex<Vec<crate::gradius_ads::GradiusBannerTarget>>>,
     requests: Arc<Mutex<Vec<crate::gradius_ads::GradiusAdAppendRequest>>>,
     render_errors: Arc<Mutex<Vec<(i64, String)>>>,
     queued: Arc<Mutex<Vec<(i64, String)>>>,
@@ -4104,17 +4106,38 @@ impl crate::gradius_ads::GradiusAdAppender for GradiusAppenderStub {
     fn append<'a>(
         &'a self,
         request: crate::gradius_ads::GradiusAdAppendRequest,
-    ) -> crate::gradius_ads::GradiusServiceFuture<'a, Option<crate::gradius_ads::GradiusAdTail>>
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, Option<crate::gradius_ads::GradiusPreparedAd>>
     {
         Box::pin(async move {
             self.requests
                 .lock()
                 .expect("Gradius requests")
                 .push(request);
-            Ok(Some(crate::gradius_ads::GradiusAdTail {
-                opportunity_id: 91,
-                html: TEST_GRADIUS_TAIL.to_owned(),
-            }))
+            if let Some(banner) = &self.banner {
+                return Ok(Some(crate::gradius_ads::GradiusPreparedAd::Banner(
+                    banner.clone(),
+                )));
+            }
+            Ok(Some(crate::gradius_ads::GradiusPreparedAd::Tail(
+                crate::gradius_ads::GradiusAdTail {
+                    opportunity_id: 91,
+                    html: TEST_GRADIUS_TAIL.to_owned(),
+                },
+            )))
+        })
+    }
+
+    fn queue_banner<'a>(
+        &'a self,
+        banner: &'a crate::gradius_ads::GradiusAdBanner,
+        target: crate::gradius_ads::GradiusBannerTarget,
+    ) -> crate::gradius_ads::GradiusServiceFuture<'a, String> {
+        Box::pin(async move {
+            self.queued_banners
+                .lock()
+                .expect("Gradius queued banners")
+                .push(target);
+            Ok(format!("gradius-banner:v1:test:{}", banner.opportunity_id))
         })
     }
 
@@ -4278,6 +4301,138 @@ async fn session_marks_prepared_gradius_ad_failed_when_answer_enqueue_fails()
             .expect("Gradius failed delivery opportunities")
             .as_slice(),
         &[(91, "send down".to_owned())]
+    );
+    Ok(())
+}
+
+fn gradius_banner_appender() -> GradiusAppenderStub {
+    GradiusAppenderStub {
+        banner: Some(crate::gradius_ads::GradiusAdBanner {
+            opportunity_id: 92,
+            html: "<h2>Баннер</h2><footer>Реклама</footer>".to_owned(),
+            keyboard: Vec::new(),
+        }),
+        ..GradiusAppenderStub::default()
+    }
+}
+
+#[tokio::test]
+async fn session_sends_answer_unchanged_and_queues_gradius_banner_after_it()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("расскажи шутку"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("Базовый ответ &&&banner&&&"))]);
+    let appender = gradius_banner_appender();
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let mut wiring = session_wiring(toolbox, None);
+    wiring.gradius = Some(Arc::new(appender.clone()));
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    let sent = effects.sent();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].1.starts_with("Базовый ответ &amp;&amp;&amp;banner"),
+        "{}",
+        sent[0].1
+    );
+    assert!(!sent[0].1.contains("Реклама"));
+    assert_eq!(
+        effects.answer_options(),
+        vec![DialogAnswerSendOptions::default()]
+    );
+    assert_eq!(
+        appender.requests.lock().expect("Gradius requests")[0].assistant_text,
+        "Базовый ответ &&&banner&&&"
+    );
+    assert_eq!(
+        appender
+            .queued_banners
+            .lock()
+            .expect("Gradius queued banners")
+            .as_slice(),
+        &[crate::gradius_ads::GradiusBannerTarget {
+            dialog_job_id: job_id,
+            chat_id: dialog_params("").chat_id,
+            thread_id: dialog_params("").thread_id,
+        }]
+    );
+    assert!(appender.queued.lock().expect("Gradius queued").is_empty());
+    assert!(
+        appender
+            .failed_delivery_opportunities
+            .lock()
+            .expect("Gradius failed delivery opportunities")
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_closes_gradius_banner_without_queueing_when_answer_enqueue_fails()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("покажи рекламу"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("Базовый ответ"))]);
+    let appender = gradius_banner_appender();
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let mut wiring = session_wiring(toolbox, None);
+    wiring.gradius = Some(Arc::new(appender.clone()));
+    let effects = EffectsStub::failing();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert_eq!(report.send_error.as_deref(), Some("send down"));
+    assert!(
+        appender
+            .queued_banners
+            .lock()
+            .expect("Gradius queued banners")
+            .is_empty()
+    );
+    assert_eq!(
+        appender
+            .failed_delivery_opportunities
+            .lock()
+            .expect("Gradius failed delivery opportunities")
+            .as_slice(),
+        &[(92, "send down".to_owned())]
     );
     Ok(())
 }

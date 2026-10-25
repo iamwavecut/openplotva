@@ -246,7 +246,7 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
         batch_id: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async move {
-            if !batch_id.starts_with("gradius-utility:v1:") {
+            if !is_gradius_standalone_batch(batch_id) {
                 return Ok(());
             }
             self.gradius
@@ -263,7 +263,7 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
         error: &'a str,
     ) -> TelegramOutboxJobFuture<'a, Self::Error> {
         Box::pin(async move {
-            if !batch_id.starts_with("gradius-utility:v1:") {
+            if !is_gradius_standalone_batch(batch_id) {
                 return Ok(());
             }
             self.gradius
@@ -273,6 +273,11 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
                 .map_err(|store_error| store_error.to_string())
         })
     }
+}
+
+fn is_gradius_standalone_batch(batch_id: &str) -> bool {
+    batch_id.starts_with("gradius-utility:v1:")
+        || batch_id.starts_with(crate::gradius_ads::GRADIUS_BANNER_BATCH_PREFIX)
 }
 
 fn is_final_dialog_answer_batch(batch_id: &str, dialog_job_id: i64) -> bool {
@@ -1611,7 +1616,8 @@ async fn reconcile_resolved_taskman_batches<Jobs>(
         "SELECT DISTINCT opportunity.outbox_batch_id \
          FROM gradius_ad_opportunities AS opportunity \
          JOIN telegram_outbox AS operation ON operation.batch_id = opportunity.outbox_batch_id \
-         WHERE opportunity.integration_kind IN ('native_utility', 'native_generation') \
+         WHERE (opportunity.integration_kind IN ('native_utility', 'native_generation') \
+                OR opportunity.outbox_batch_id LIKE 'gradius-banner:v1:%') \
            AND opportunity.delivery_state = 'queued' \
            AND opportunity.outbox_batch_id IS NOT NULL \
            AND NOT EXISTS (SELECT 1 FROM telegram_outbox AS unresolved \
