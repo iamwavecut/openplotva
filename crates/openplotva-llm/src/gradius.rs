@@ -26,6 +26,8 @@ const GRADIUS_REQUEST_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
 const GRADIUS_DIALOGUE_PATH: &str = "/v1/native/dialogue_model/chat";
 const GRADIUS_GENERATION_PATH: &str = "/v1/native/generation_model/chat";
 const GRADIUS_UTILITY_PATH: &str = "/v1/native/utility_service/chat";
+const GRADIUS_NATIVE_TEXT_TYPE: &str = "native-text-ad";
+const GRADIUS_BANNER_TYPE: &str = "banner";
 pub const GRADIUS_RAW_BODY_MAX_BYTES: usize = 65_536;
 const GRADIUS_REDACTION_CATEGORIES: [&str; 8] = [
     "account_number",
@@ -189,10 +191,71 @@ pub struct GradiusDialogueAd {
     pub click_price: Option<f64>,
 }
 
+/// One URL button of a Gradius banner keyboard.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GradiusBannerButton {
+    pub text: String,
+    pub url: String,
+}
+
+/// Standalone dialogue banner delivered as its own Telegram message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradiusBannerAd {
+    pub method: String,
+    pub message_type: String,
+    pub text: String,
+    /// Keyboard rows; a flat provider button list becomes one button per row.
+    pub keyboard: Vec<Vec<GradiusBannerButton>>,
+    pub show_price: Option<f64>,
+    pub click_price: Option<f64>,
+}
+
+impl GradiusBannerAd {
+    /// Decode one provider `banner` entry, or an entry previously produced by
+    /// [`Self::to_placement_json`].
+    pub fn from_placement_json(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let entry = serde_json::from_value::<GradiusBannerEntry>(value)?;
+        Ok(Self {
+            method: entry.content.method,
+            message_type: entry.content.message_type,
+            text: entry.content.text,
+            keyboard: entry
+                .content
+                .inline_keyboard
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| match entry {
+                    GradiusBannerKeyboardEntry::Row(row) => row,
+                    GradiusBannerKeyboardEntry::Button(button) => vec![button],
+                })
+                .filter(|row| !row.is_empty())
+                .collect(),
+            show_price: entry.show_price,
+            click_price: entry.click_price,
+        })
+    }
+
+    #[must_use]
+    pub fn to_placement_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": GRADIUS_BANNER_TYPE,
+            "content": {
+                "method": self.method,
+                "message_type": self.message_type,
+                "text": self.text,
+                "inline_keyboard": self.keyboard,
+            },
+            "show_price": self.show_price,
+            "click_price": self.click_price,
+        })
+    }
+}
+
 /// Typed selected placement while retaining the complete raw provider response separately.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GradiusPlacement {
     NativeDialogue(GradiusDialogueAd),
+    Banner(GradiusBannerAd),
     Standalone {
         source_index: usize,
         markdown: String,
@@ -278,6 +341,7 @@ impl fmt::Debug for GradiusApiResult {
                 "placement_kind",
                 &self.placement.as_ref().map(|placement| match placement {
                     GradiusPlacement::NativeDialogue(_) => "native_dialogue",
+                    GradiusPlacement::Banner(_) => "banner",
                     GradiusPlacement::Standalone { .. } => "standalone",
                 }),
             )
@@ -541,8 +605,8 @@ where
                 Some(exchange),
             ));
         }
-        let ad = match decode_dialogue_ad(&response.body) {
-            Ok(ad) => ad,
+        let placement = match decode_dialogue_placement(&response.body) {
+            Ok(placement) => placement,
             Err(error) => {
                 let exchange = exchange(
                     &turn,
@@ -558,13 +622,13 @@ where
                 return Err(failure(error, Some(exchange)));
             }
         };
-        let outcome = if ad.is_some() {
+        let outcome = if placement.is_some() {
             GradiusCallOutcome::Ad
         } else {
             GradiusCallOutcome::NoAd
         };
         Ok(GradiusApiResult {
-            placement: ad.map(GradiusPlacement::NativeDialogue),
+            placement,
             exchange: exchange(
                 &turn,
                 endpoint,
@@ -888,6 +952,31 @@ struct GradiusNativeTextAdContent {
 }
 
 #[derive(Deserialize)]
+struct GradiusBannerEntry {
+    content: GradiusBannerContent,
+    #[serde(default)]
+    show_price: Option<f64>,
+    #[serde(default)]
+    click_price: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct GradiusBannerContent {
+    method: String,
+    message_type: String,
+    text: String,
+    #[serde(default)]
+    inline_keyboard: Option<Vec<GradiusBannerKeyboardEntry>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GradiusBannerKeyboardEntry {
+    Row(Vec<GradiusBannerButton>),
+    Button(GradiusBannerButton),
+}
+
+#[derive(Deserialize)]
 struct GradiusUtilityAd {
     content: String,
     #[serde(default)]
@@ -1000,22 +1089,32 @@ fn dialogue_endpoint(
     Ok(endpoint.into())
 }
 
-fn decode_dialogue_ad(body: &[u8]) -> Result<Option<GradiusDialogueAd>, GradiusClientError> {
+fn decode_dialogue_placement(body: &[u8]) -> Result<Option<GradiusPlacement>, GradiusClientError> {
     let entries = serde_json::from_slice::<Vec<serde_json::Value>>(body)
         .map_err(GradiusClientError::Decode)?;
-    let Some(entry) = entries.into_iter().find(|entry| {
-        entry.get("type").and_then(serde_json::Value::as_str) == Some("native-text-ad")
+    let Some((kind, entry)) = entries.into_iter().find_map(|entry| {
+        match entry.get("type").and_then(serde_json::Value::as_str) {
+            Some(kind @ (GRADIUS_NATIVE_TEXT_TYPE | GRADIUS_BANNER_TYPE)) => {
+                Some((kind.to_owned(), entry))
+            }
+            _ => None,
+        }
     }) else {
         return Ok(None);
     };
+    if kind == GRADIUS_BANNER_TYPE {
+        return GradiusBannerAd::from_placement_json(entry)
+            .map(|banner| Some(GradiusPlacement::Banner(banner)))
+            .map_err(GradiusClientError::Decode);
+    }
     let ad =
         serde_json::from_value::<GradiusNativeTextAd>(entry).map_err(GradiusClientError::Decode)?;
-    Ok(Some(GradiusDialogueAd {
+    Ok(Some(GradiusPlacement::NativeDialogue(GradiusDialogueAd {
         insert_index: ad.content.insert_index,
         markdown: ad.content.content,
         show_price: ad.show_price,
         click_price: ad.click_price,
-    }))
+    })))
 }
 
 /// Stable one-way identifiers sent to Gradius instead of Telegram IDs.
@@ -1568,6 +1667,99 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn dialogue_client_decodes_rich_banner_with_one_button_per_row() {
+        let transport = FakeGradiusTransport::default();
+        transport
+            .responses
+            .lock()
+            .expect("response lock")
+            .push_back(Ok(GradiusHttpResponse {
+                status: 200,
+                body: r#"[
+                    {"type":"future-ad","content":{"value":1}},
+                    {"type":"banner","content":{
+                        "method":"sendRichMessage",
+                        "message_type":"html",
+                        "text":"<h2>Баннер</h2><tg-collage><img src=\"https://cdn.example/1.png\"/></tg-collage><footer>Реклама</footer>",
+                        "inline_keyboard":[
+                            {"text":"Кнопка 1","url":"https://ads.example/1"},
+                            {"text":"Кнопка 2","url":"https://ads.example/2"}
+                        ]
+                    },"show_price":0,"click_price":0},
+                    {"type":"native-text-ad","content":{"insert_index":3,"content":"later"}}
+                ]"#
+                .as_bytes()
+                .to_vec(),
+            }));
+        let result = enabled_test_client(transport)
+            .dialogue(test_turn(GradiusDialogueRole::Assistant))
+            .await
+            .expect("banner response");
+        let Some(GradiusPlacement::Banner(banner)) = result.placement else {
+            panic!("banner placement expected");
+        };
+
+        assert_eq!(result.exchange.outcome, GradiusCallOutcome::Ad);
+        assert_eq!(banner.method, "sendRichMessage");
+        assert_eq!(banner.message_type, "html");
+        assert!(banner.text.starts_with("<h2>Баннер</h2>"));
+        assert_eq!(
+            banner.keyboard,
+            vec![
+                vec![GradiusBannerButton {
+                    text: "Кнопка 1".to_owned(),
+                    url: "https://ads.example/1".to_owned(),
+                }],
+                vec![GradiusBannerButton {
+                    text: "Кнопка 2".to_owned(),
+                    url: "https://ads.example/2".to_owned(),
+                }],
+            ]
+        );
+        assert_eq!(banner.show_price, Some(0.0));
+        assert_eq!(banner.click_price, Some(0.0));
+        assert_eq!(
+            GradiusBannerAd::from_placement_json(banner.to_placement_json())
+                .expect("stored banner decodes"),
+            banner
+        );
+    }
+
+    #[test]
+    fn banner_keyboard_keeps_provider_rows_and_drops_empty_ones() {
+        let banner = GradiusBannerAd::from_placement_json(serde_json::json!({
+            "type": "banner",
+            "content": {
+                "method": "sendRichMessage",
+                "message_type": "html",
+                "text": "<p>ad</p>",
+                "inline_keyboard": [
+                    [{"text": "A", "url": "https://ads.example/a"}, {"text": "B", "url": "https://ads.example/b"}],
+                    [],
+                ],
+            },
+        }))
+        .expect("row keyboard");
+        assert_eq!(banner.keyboard.len(), 1);
+        assert_eq!(banner.keyboard[0].len(), 2);
+        assert_eq!(banner.show_price, None);
+
+        let without_keyboard = GradiusBannerAd::from_placement_json(serde_json::json!({
+            "type": "banner",
+            "content": {"method": "sendRichMessage", "message_type": "html", "text": "<p>ad</p>", "inline_keyboard": null},
+        }))
+        .expect("banner without keyboard");
+        assert!(without_keyboard.keyboard.is_empty());
+        assert!(
+            GradiusBannerAd::from_placement_json(serde_json::json!({
+                "type": "banner",
+                "content": {"message_type": "html", "text": "<p>ad</p>"},
+            }))
+            .is_err()
         );
     }
 

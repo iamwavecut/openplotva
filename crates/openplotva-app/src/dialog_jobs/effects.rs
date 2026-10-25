@@ -570,11 +570,7 @@ fn dialog_intermediate_outbox_batch(
         bot_id,
         chat_id: Some(params.chat_id),
         thread_id: params.thread_id,
-        ordering_key: format!(
-            "dialog:{bot_id}:{}:{}",
-            params.chat_id,
-            params.thread_id.unwrap_or_default()
-        ),
+        ordering_key: dialog_outbox_ordering_key(bot_id, params.chat_id, params.thread_id),
         causation_update_id,
         dialog_job_id: Some(dialog_job_id),
         trigger_message_id: Some(i64::from(params.message_id)),
@@ -583,6 +579,18 @@ fn dialog_intermediate_outbox_batch(
         priority: 0,
         parts,
     }
+}
+
+/// Per-chat delivery order shared by dialog messages and the banners queued after them.
+pub(crate) fn dialog_outbox_ordering_key(
+    bot_id: i64,
+    chat_id: i64,
+    thread_id: Option<i32>,
+) -> String {
+    format!(
+        "dialog:{bot_id}:{chat_id}:{}",
+        thread_id.unwrap_or_default()
+    )
 }
 
 fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {
@@ -658,12 +666,7 @@ async fn enqueue_durable_dialog_answer(
         bot_id: outbox.bot_id,
         chat_id: Some(params.chat_id),
         thread_id: params.thread_id,
-        ordering_key: format!(
-            "dialog:{}:{}:{}",
-            outbox.bot_id,
-            params.chat_id,
-            params.thread_id.unwrap_or_default()
-        ),
+        ordering_key: dialog_outbox_ordering_key(outbox.bot_id, params.chat_id, params.thread_id),
         causation_update_id,
         dialog_job_id: Some(dialog_job_id),
         trigger_message_id: Some(i64::from(params.message_id)),

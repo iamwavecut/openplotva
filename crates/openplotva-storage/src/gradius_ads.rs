@@ -317,6 +317,7 @@ impl PostgresGradiusAdStore {
                      WHERE outbox.batch_id = opportunity.outbox_batch_id \
                         OR (opportunity.outbox_batch_id IS NULL \
                             AND opportunity.integration_kind = 'native_dialogue' \
+                            AND opportunity.selected_placement->>'type' IS DISTINCT FROM 'banner' \
                             AND opportunity.dialog_job_id IS NOT NULL \
                             AND outbox.dialog_job_id = opportunity.dialog_job_id \
                             AND outbox.batch_id LIKE \
@@ -907,6 +908,69 @@ impl PostgresGradiusAdStore {
         Ok(GradiusUtilityAdEnqueue::Queued)
     }
 
+    /// Commit a dialogue banner message and its queued delivery state together.
+    /// Banners resolve only through their own batch, never through the answer batch.
+    pub async fn enqueue_dialogue_banner(
+        &self,
+        opportunity_id: i64,
+        batch: &crate::TelegramOutboxBatchInput,
+    ) -> Result<(), GradiusAdStoreError> {
+        let invalid = || GradiusAdStoreError::InvalidTransition { opportunity_id };
+        if batch.parts.len() != 1 || batch.dialog_job_id.is_some() {
+            return Err(invalid());
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT chat_id, thread_id, delivery_state, outbox_batch_id \
+             FROM gradius_ad_opportunities \
+             WHERE id = $1 AND integration_kind = 'native_dialogue' AND outcome = 'ad' \
+               AND selected_placement->>'type' = 'banner' FOR UPDATE",
+        )
+        .bind(opportunity_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(invalid)?;
+        if batch.chat_id != Some(row.get::<i64, _>("chat_id"))
+            || batch.thread_id.unwrap_or_default() != row.get::<i32, _>("thread_id")
+        {
+            return Err(invalid());
+        }
+        let state = row.get::<Option<String>, _>("delivery_state");
+        let existing_batch = row.get::<Option<String>, _>("outbox_batch_id");
+        let same_batch = existing_batch.as_deref() == Some(batch.batch_id.as_str());
+        if matches!(state.as_deref(), Some("queued" | "delivered"))
+            && same_batch
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM telegram_outbox WHERE batch_id = $1)",
+            )
+            .bind(&batch.batch_id)
+            .fetch_one(&mut *tx)
+            .await?
+        {
+            tx.commit().await?;
+            return Ok(());
+        }
+        if !matches!(state.as_deref(), Some("prepared" | "failed"))
+            || !(existing_batch.is_none() || same_batch)
+        {
+            return Err(invalid());
+        }
+        crate::telegram_outbox::enqueue_telegram_outbox_batch_in_transaction(&mut tx, batch)
+            .await?;
+        sqlx::query(
+            "UPDATE gradius_ad_opportunities SET delivery_state = 'queued', \
+                 outbox_batch_id = $2, queued_at = now(), \
+                 delivery_failed_at = NULL, delivery_error = NULL, updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(opportunity_id)
+        .bind(&batch.batch_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Avoid provider requests during a group's public-ad cooldown. Enqueue repeats
     /// the check under the group lock because concurrent users can pass this read.
     pub async fn public_image_group_available(
@@ -1044,7 +1108,7 @@ impl PostgresGradiusAdStore {
                  delivered_at = COALESCE(delivered_at, $3), shown_at = COALESCE(shown_at, $3), \
                  delivery_failed_at = NULL, delivery_error = NULL, updated_at = $3 \
              WHERE dialog_job_id = $1 AND integration_kind = 'native_dialogue' \
-               AND outcome = 'ad' \
+               AND outcome = 'ad' AND selected_placement->>'type' IS DISTINCT FROM 'banner' \
                AND ((outbox_batch_id = $2 AND delivery_state IN ('queued', 'delivered')) \
                  OR (outbox_batch_id IS NULL AND delivery_state = 'prepared'))",
         )
@@ -1070,7 +1134,7 @@ impl PostgresGradiusAdStore {
                  delivery_failed_at = COALESCE(delivery_failed_at, $4), \
                  delivery_error = left($3, 2048), updated_at = $4 \
              WHERE dialog_job_id = $1 AND integration_kind = 'native_dialogue' \
-               AND outcome = 'ad' \
+               AND outcome = 'ad' AND selected_placement->>'type' IS DISTINCT FROM 'banner' \
                AND ((outbox_batch_id = $2 AND delivery_state IN ('queued', 'failed')) \
                  OR (outbox_batch_id IS NULL AND delivery_state = 'prepared'))",
         )
@@ -1299,8 +1363,9 @@ mod tests {
 
     use super::{
         GradiusAdEligibilityInput, GradiusAdIneligibility, GradiusAdOpportunityInput,
-        GradiusAdPolicy, GradiusAdReservation, GradiusAdSource, GradiusApiCallRecord,
-        GradiusInteractionState, GradiusStoredAd, GradiusUtilityAdEnqueue, PostgresGradiusAdStore,
+        GradiusAdPolicy, GradiusAdReservation, GradiusAdSource, GradiusAdStoreError,
+        GradiusApiCallRecord, GradiusInteractionState, GradiusStoredAd, GradiusUtilityAdEnqueue,
+        PostgresGradiusAdStore,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -2951,6 +3016,167 @@ mod tests {
         sqlx::query("DELETE FROM telegram_outbox WHERE dialog_job_id BETWEEN $1 AND $2")
             .bind(9_820_825_500_i64)
             .bind(9_820_825_599_i64)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_dialogue_banner_resolves_only_through_its_own_batch()
+    -> Result<(), Box<dyn Error>> {
+        use crate::{TelegramDeliveryPolicy, TelegramOutboxBatchInput, TelegramOutboxPartInput};
+
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let user_id = 9_820_826_601_i64;
+        let banner_job = 9_820_826_603_i64;
+        let banner_batch_id = format!("gradius-banner:v1:7:{banner_job}");
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_outbox WHERE chat_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        let store = PostgresGradiusAdStore::new(pool.clone());
+
+        let mut reservation = None;
+        for answer in 1..=3_i64 {
+            reservation = Some(
+                store
+                    .reserve_opportunity(GradiusAdOpportunityInput {
+                        opportunity_key: format!("dialog-job:{}", 9_820_826_600 + answer),
+                        attempt_key: format!("banner-claim-{answer}"),
+                        dialog_job_id: Some(9_820_826_600 + answer),
+                        integration_kind: "native_dialogue".to_owned(),
+                        user_id,
+                        chat_id: user_id,
+                        thread_id: 0,
+                        model_version: None,
+                        completed_at: at(30_000 + answer),
+                    })
+                    .await?,
+            );
+        }
+        let Some(GradiusAdReservation::Reserved {
+            opportunity_id,
+            attempt_generation,
+            ..
+        }) = reservation
+        else {
+            panic!("expected the third answer to reserve, got {reservation:?}");
+        };
+        store
+            .finish_ad(
+                opportunity_id,
+                attempt_generation,
+                GradiusStoredAd {
+                    markdown: "<p>Banner</p>".to_owned(),
+                    rendered_html: "<p>Banner</p><footer>Реклама</footer>".to_owned(),
+                    selected_placement: json!({"type": "banner", "content": {}}),
+                    insert_index: None,
+                    show_price: Some(0.0),
+                    click_price: Some(0.0),
+                    prepared_at: at(30_003),
+                    shown_at: None,
+                },
+            )
+            .await?;
+
+        assert!(
+            !store
+                .reconcile_dialogue_delivered(
+                    banner_job,
+                    &format!("dialog-answer:v1:7:{banner_job}"),
+                    at(30_004),
+                )
+                .await?
+        );
+
+        let batch = |chat_id: i64| TelegramOutboxBatchInput {
+            batch_id: banner_batch_id.clone(),
+            bot_id: 7,
+            chat_id: Some(chat_id),
+            thread_id: None,
+            ordering_key: format!("dialog:7:{chat_id}:0"),
+            causation_update_id: None,
+            dialog_job_id: None,
+            trigger_message_id: None,
+            delivery_policy: TelegramDeliveryPolicy::Create,
+            protected: true,
+            priority: 0,
+            parts: vec![TelegramOutboxPartInput {
+                method_kind: "sendRichMessage".to_owned(),
+                payload_version: 1,
+                payload: json!({"chat_id": chat_id, "html": "<p>Banner</p>"}),
+                blob: None,
+                available_at: OffsetDateTime::now_utc(),
+                expires_at: None,
+            }],
+        };
+        assert!(matches!(
+            store
+                .enqueue_dialogue_banner(opportunity_id, &batch(user_id + 1))
+                .await,
+            Err(GradiusAdStoreError::InvalidTransition { .. })
+        ));
+        store
+            .enqueue_dialogue_banner(opportunity_id, &batch(user_id))
+            .await?;
+        store
+            .enqueue_dialogue_banner(opportunity_id, &batch(user_id))
+            .await?;
+        let queued: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT delivery_state, outbox_batch_id FROM gradius_ad_opportunities WHERE id = $1",
+        )
+        .bind(opportunity_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(queued.0.as_deref(), Some("queued"));
+        assert_eq!(queued.1.as_deref(), Some(banner_batch_id.as_str()));
+        let outbox_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telegram_outbox WHERE batch_id = $1 AND dialog_job_id IS NULL",
+        )
+        .bind(&banner_batch_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(outbox_rows, 1);
+
+        assert!(
+            !store
+                .reconcile_dialogue_delivery_failed(
+                    banner_job,
+                    &format!("dialog-answer:v1:7:{banner_job}"),
+                    "answer failed",
+                    at(30_005),
+                )
+                .await?
+        );
+        assert!(
+            store
+                .mark_delivered_by_batch(&banner_batch_id, at(30_006))
+                .await?
+        );
+        let shown_at: Option<OffsetDateTime> =
+            sqlx::query_scalar("SELECT shown_at FROM gradius_ad_opportunities WHERE id = $1")
+                .bind(opportunity_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(shown_at, Some(at(30_006)));
+
+        sqlx::query("DELETE FROM telegram_outbox WHERE chat_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await?;
         Ok(())

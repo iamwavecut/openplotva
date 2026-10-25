@@ -2,17 +2,22 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use openplotva_llm::gradius::vip_hint_for_impression;
 use openplotva_llm::gradius::{
-    GradiusApiExchange, GradiusClient, GradiusDialogueRole, GradiusDialogueTurn,
-    GradiusGenerationRequest, GradiusIntegrationKind, GradiusPlacement, GradiusPrivacyRedactor,
-    GradiusSyntheticIds, GradiusUtilityRequest, ReqwestGradiusTransport,
+    GradiusApiExchange, GradiusBannerAd, GradiusBannerButton, GradiusClient, GradiusDialogueRole,
+    GradiusDialogueTurn, GradiusGenerationRequest, GradiusIntegrationKind, GradiusPlacement,
+    GradiusPrivacyRedactor, GradiusSyntheticIds, GradiusUtilityRequest, ReqwestGradiusTransport,
 };
 use openplotva_storage::gradius_ads::{
     GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
     PostgresGradiusAdStore,
 };
+use openplotva_storage::{
+    TelegramDeliveryPolicy, TelegramOutboxBatchInput, TelegramOutboxPartInput,
+};
 use openplotva_telegram::{
-    TELEGRAM_TEXT_MAX_BYTES, escape_telegram_html_text, is_valid_telegram_html,
-    telegram_html_from_markdown,
+    ChatRef, OutboundCommand, ReplyMarkup, RichMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
+    TelegramOutboundMethod, build_inline_keyboard_button_url, build_inline_keyboard_markup,
+    build_rich_message_method, escape_telegram_html_text, format_rich_html, is_valid_telegram_html,
+    rich_message_within_char_limit, sanitize_rich_html, telegram_html_from_markdown,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -21,6 +26,9 @@ use time::OffsetDateTime;
 const VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 const LINKED_VIP: &str = "<a href=\"https://t.me/PlotvoBot?start=vip\">VIP</a>";
 const GRADIUS_AD_LABEL: &str = "📢 ";
+const GRADIUS_BANNER_FOOTER: &str = "<footer>Реклама</footer>";
+const GRADIUS_BANNER_METHOD: &str = "sendRichMessage";
+pub const GRADIUS_BANNER_BATCH_PREFIX: &str = "gradius-banner:v1:";
 
 pub type GradiusServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
@@ -199,6 +207,12 @@ pub trait GradiusAdLedger: Send + Sync {
         &'a self,
         opportunity_id: i64,
         error: &'a str,
+    ) -> GradiusServiceFuture<'a, ()>;
+
+    fn enqueue_banner<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch: TelegramOutboxBatchInput,
     ) -> GradiusServiceFuture<'a, ()>;
 }
 
@@ -403,6 +417,18 @@ impl GradiusAdLedger for PostgresGradiusAdStore {
             .map_err(|store_error| store_error.to_string())
         })
     }
+
+    fn enqueue_banner<'a>(
+        &'a self,
+        opportunity_id: i64,
+        batch: TelegramOutboxBatchInput,
+    ) -> GradiusServiceFuture<'a, ()> {
+        Box::pin(async move {
+            PostgresGradiusAdStore::enqueue_dialogue_banner(self, opportunity_id, &batch)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 pub trait GradiusVipChecker: Send + Sync {
@@ -446,6 +472,29 @@ pub struct GradiusAdAppendRequest {
 pub struct GradiusAdTail {
     pub opportunity_id: i64,
     pub html: String,
+}
+
+/// Rich banner sent as its own message after the dialogue answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GradiusAdBanner {
+    pub opportunity_id: i64,
+    pub html: String,
+    pub keyboard: Vec<Vec<GradiusBannerButton>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GradiusPreparedAd {
+    /// Appended to the final answer text.
+    Tail(GradiusAdTail),
+    /// Queued after the final answer in the same chat order.
+    Banner(GradiusAdBanner),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GradiusBannerTarget {
+    pub dialog_job_id: i64,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -851,7 +900,14 @@ pub trait GradiusAdAppender: Send + Sync {
     fn append<'a>(
         &'a self,
         request: GradiusAdAppendRequest,
-    ) -> GradiusServiceFuture<'a, Option<GradiusAdTail>>;
+    ) -> GradiusServiceFuture<'a, Option<GradiusPreparedAd>>;
+
+    /// Queue a prepared banner and return its outbox batch id.
+    fn queue_banner<'a>(
+        &'a self,
+        banner: &'a GradiusAdBanner,
+        target: GradiusBannerTarget,
+    ) -> GradiusServiceFuture<'a, String>;
 
     fn record_unsupported_surface<'a>(
         &'a self,
@@ -889,6 +945,7 @@ pub struct GradiusAdService {
     redactor: Arc<dyn GradiusTextRedactor>,
     ledger: Arc<dyn GradiusAdLedger>,
     vip: Arc<dyn GradiusVipChecker>,
+    banner_bot_id: Option<i64>,
 }
 
 impl GradiusAdService {
@@ -904,13 +961,21 @@ impl GradiusAdService {
             redactor,
             ledger,
             vip,
+            banner_bot_id: None,
         }
+    }
+
+    /// Enable banner placements, which are queued in the bot's dialogue chat order.
+    #[must_use]
+    pub fn with_banner_delivery(mut self, bot_id: i64) -> Self {
+        self.banner_bot_id = Some(bot_id);
+        self
     }
 
     pub async fn append(
         &self,
         request: GradiusAdAppendRequest,
-    ) -> Result<Option<GradiusAdTail>, String> {
+    ) -> Result<Option<GradiusPreparedAd>, String> {
         if request.chat_id <= 0
             || self
                 .vip
@@ -941,10 +1006,7 @@ impl GradiusAdService {
         let opportunity_id = reservation.opportunity_id();
         let attempt_generation = match reservation {
             GradiusAdReservation::Replay { ad, .. } => {
-                return Ok(Some(GradiusAdTail {
-                    opportunity_id,
-                    html: ad.rendered_html,
-                }));
+                return replayed_ad(opportunity_id, ad).map(Some);
             }
             GradiusAdReservation::Reserved {
                 attempt_generation, ..
@@ -959,6 +1021,12 @@ impl GradiusAdService {
             .await;
         let ad = match result {
             Ok(Some(GradiusPlacement::NativeDialogue(ad))) => ad,
+            Ok(Some(GradiusPlacement::Banner(banner))) => {
+                return self
+                    .prepare_banner(opportunity_id, attempt_generation, &request, banner)
+                    .await
+                    .map(Some);
+            }
             Ok(Some(_)) => {
                 let error = "Gradius returned an unsupported placement for native_dialogue";
                 let _ = self
@@ -1027,7 +1095,95 @@ impl GradiusAdService {
             delivery_state = "prepared",
             "Gradius advertising opportunity prepared"
         );
-        Ok(Some(tail))
+        Ok(Some(GradiusPreparedAd::Tail(tail)))
+    }
+
+    async fn prepare_banner(
+        &self,
+        opportunity_id: i64,
+        attempt_generation: i32,
+        request: &GradiusAdAppendRequest,
+        banner: GradiusBannerAd,
+    ) -> Result<GradiusPreparedAd, String> {
+        let rendered = if self.banner_bot_id.is_some() {
+            render_banner_html(&banner)
+        } else {
+            Err("Gradius banner delivery is not configured".to_owned())
+        };
+        let html = match rendered {
+            Ok(html) => html,
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .finish_render_error(opportunity_id, attempt_generation, &error)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.ledger
+            .finish_ad(
+                opportunity_id,
+                attempt_generation,
+                GradiusStoredAd {
+                    markdown: banner.text.clone(),
+                    rendered_html: html.clone(),
+                    selected_placement: banner.to_placement_json(),
+                    insert_index: None,
+                    show_price: banner.show_price,
+                    click_price: banner.click_price,
+                    prepared_at: request.completed_at,
+                    shown_at: None,
+                },
+            )
+            .await?;
+        tracing::info!(
+            opportunity_id,
+            job_id = request.dialog_job_id,
+            integration_kind = GradiusIntegrationKind::NativeDialogue.as_str(),
+            placement = "banner",
+            outcome = "ad",
+            delivery_state = "prepared",
+            "Gradius advertising opportunity prepared"
+        );
+        Ok(GradiusPreparedAd::Banner(GradiusAdBanner {
+            opportunity_id,
+            html,
+            keyboard: banner.keyboard,
+        }))
+    }
+
+    pub async fn queue_banner(
+        &self,
+        banner: &GradiusAdBanner,
+        target: GradiusBannerTarget,
+    ) -> Result<String, String> {
+        let batch = self
+            .banner_bot_id
+            .ok_or_else(|| "Gradius banner delivery is not configured".to_owned())
+            .and_then(|bot_id| banner_outbox_batch(bot_id, banner, target));
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .mark_delivery_failed(banner.opportunity_id, "outbox_build_failed")
+                    .await;
+                return Err(error);
+            }
+        };
+        let batch_id = batch.batch_id.clone();
+        if let Err(error) = self
+            .ledger
+            .enqueue_banner(banner.opportunity_id, batch)
+            .await
+        {
+            let _ = self
+                .ledger
+                .mark_delivery_failed(banner.opportunity_id, "outbox_enqueue_failed")
+                .await;
+            return Err(error);
+        }
+        Ok(batch_id)
     }
 
     pub async fn record_unsupported_surface(
@@ -1180,6 +1336,7 @@ impl GradiusAdService {
             GradiusPlacement::NativeDialogue(ad) => {
                 ad.insert_index != assistant_text.chars().count()
             }
+            GradiusPlacement::Banner(_) => false,
             GradiusPlacement::Standalone { .. } => true,
         }) {
             let error = "Gradius returned a non-terminal or unsupported placement";
@@ -1246,8 +1403,16 @@ impl GradiusAdAppender for GradiusAdService {
     fn append<'a>(
         &'a self,
         request: GradiusAdAppendRequest,
-    ) -> GradiusServiceFuture<'a, Option<GradiusAdTail>> {
+    ) -> GradiusServiceFuture<'a, Option<GradiusPreparedAd>> {
         Box::pin(async move { GradiusAdService::append(self, request).await })
+    }
+
+    fn queue_banner<'a>(
+        &'a self,
+        banner: &'a GradiusAdBanner,
+        target: GradiusBannerTarget,
+    ) -> GradiusServiceFuture<'a, String> {
+        Box::pin(async move { GradiusAdService::queue_banner(self, banner, target).await })
     }
 
     fn record_unsupported_surface<'a>(
@@ -1288,6 +1453,123 @@ impl GradiusAdAppender for GradiusAdService {
     ) -> GradiusServiceFuture<'a, ()> {
         self.ledger.mark_delivery_failed(opportunity_id, error)
     }
+}
+
+fn replayed_ad(opportunity_id: i64, ad: GradiusStoredAd) -> Result<GradiusPreparedAd, String> {
+    if ad.selected_placement.get("type").and_then(Value::as_str) != Some("banner") {
+        return Ok(GradiusPreparedAd::Tail(GradiusAdTail {
+            opportunity_id,
+            html: ad.rendered_html,
+        }));
+    }
+    let banner = GradiusBannerAd::from_placement_json(ad.selected_placement)
+        .map_err(|error| format!("saved Gradius banner placement is invalid: {error}"))?;
+    Ok(GradiusPreparedAd::Banner(GradiusAdBanner {
+        opportunity_id,
+        html: ad.rendered_html,
+        keyboard: banner.keyboard,
+    }))
+}
+
+/// Keep the provider banner markup except for the rich-HTML allowlist and a fallback
+/// advertising footer.
+fn render_banner_html(banner: &GradiusBannerAd) -> Result<String, String> {
+    if banner.method != GRADIUS_BANNER_METHOD {
+        return Err(format!(
+            "Gradius banner method {:?} is not supported",
+            banner.method
+        ));
+    }
+    if !banner.message_type.eq_ignore_ascii_case("html") {
+        return Err(format!(
+            "Gradius banner message type {:?} is not supported",
+            banner.message_type
+        ));
+    }
+    for button in banner.keyboard.iter().flatten() {
+        if button.text.trim().is_empty() {
+            return Err("Gradius banner button text is empty".to_owned());
+        }
+        let url = reqwest::Url::parse(button.url.trim())
+            .map_err(|_| "Gradius banner button URL is invalid".to_owned())?;
+        if url.scheme() != "https" {
+            return Err("Gradius banner button URL is not HTTPS".to_owned());
+        }
+    }
+    let mut html = sanitize_rich_html(&banner.text);
+    if html.is_empty() {
+        return Err("Gradius banner has no rich content".to_owned());
+    }
+    if !html.contains("<footer>") {
+        html.push_str(GRADIUS_BANNER_FOOTER);
+    }
+    if !rich_message_within_char_limit(&format_rich_html(&html)) {
+        return Err("Gradius banner exceeds the Telegram rich message limit".to_owned());
+    }
+    Ok(html)
+}
+
+fn banner_outbox_batch(
+    bot_id: i64,
+    banner: &GradiusAdBanner,
+    target: GradiusBannerTarget,
+) -> Result<TelegramOutboxBatchInput, String> {
+    let chat = ChatRef {
+        direct_messages_topic_id: None,
+        id: target.chat_id,
+        is_forum: target.thread_id.is_some(),
+    };
+    let reply_markup = (!banner.keyboard.is_empty()).then(|| {
+        ReplyMarkup::InlineKeyboardMarkup(build_inline_keyboard_markup(banner.keyboard.iter().map(
+            |row| {
+                row.iter()
+                    .map(|button| build_inline_keyboard_button_url(&button.text, button.url.trim()))
+                    .collect::<Vec<_>>()
+            },
+        )))
+    });
+    let request = RichMessageRequest {
+        chat: Some(chat),
+        message_thread_id: target.thread_id.map(i64::from).unwrap_or_default(),
+        disable_notification: true,
+        allow_sending_without_reply: None,
+        html: banner.html.clone(),
+        reply_markup,
+    };
+    let method =
+        build_rich_message_method(&request, chat, None).map_err(|error| error.to_string())?;
+    let (method_kind, payload_version, payload) =
+        OutboundCommand::try_from_method(TelegramOutboundMethod::from(method))
+            .and_then(OutboundCommand::into_storage_parts)
+            .map_err(|error| error.to_string())?;
+    Ok(TelegramOutboxBatchInput {
+        batch_id: format!(
+            "{GRADIUS_BANNER_BATCH_PREFIX}{bot_id}:{}",
+            target.dialog_job_id
+        ),
+        bot_id,
+        chat_id: Some(target.chat_id),
+        thread_id: target.thread_id,
+        ordering_key: crate::dialog_jobs::dialog_outbox_ordering_key(
+            bot_id,
+            target.chat_id,
+            target.thread_id,
+        ),
+        causation_update_id: None,
+        dialog_job_id: None,
+        trigger_message_id: None,
+        delivery_policy: TelegramDeliveryPolicy::Create,
+        protected: true,
+        priority: 0,
+        parts: vec![TelegramOutboxPartInput {
+            method_kind: method_kind.to_owned(),
+            payload_version,
+            payload,
+            blob: None,
+            available_at: OffsetDateTime::now_utc(),
+            expires_at: None,
+        }],
+    })
 }
 
 fn render_ad_tail(
@@ -1389,10 +1671,11 @@ mod tests {
     };
 
     use openplotva_llm::gradius::{
-        GradiusApiExchange, GradiusCallOutcome, GradiusDialogueAd, GradiusDialogueRole,
-        GradiusDialogueTurn, GradiusGenerationRequest, GradiusIntegrationKind, GradiusPlacement,
-        GradiusUtilityRequest,
+        GradiusApiExchange, GradiusBannerAd, GradiusBannerButton, GradiusCallOutcome,
+        GradiusDialogueAd, GradiusDialogueRole, GradiusDialogueTurn, GradiusGenerationRequest,
+        GradiusIntegrationKind, GradiusPlacement, GradiusUtilityRequest,
     };
+    use openplotva_storage::TelegramOutboxBatchInput;
     use openplotva_storage::gradius_ads::{
         GradiusAdOpportunityInput, GradiusAdReservation, GradiusApiCallRecord, GradiusStoredAd,
     };
@@ -1400,10 +1683,10 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        GradiusAdAppendRequest, GradiusAdLedger, GradiusAdService, GradiusDialogueCall,
-        GradiusDialogueClient, GradiusTextRedactor, GradiusUtilityAdRequest,
-        GradiusUtilityAdService, GradiusUtilityCall, GradiusUtilityClient, GradiusUtilitySurface,
-        GradiusVipChecker, gradius_privacy_config, render_vip_hint_html,
+        GradiusAdAppendRequest, GradiusAdLedger, GradiusAdService, GradiusBannerTarget,
+        GradiusDialogueCall, GradiusDialogueClient, GradiusPreparedAd, GradiusTextRedactor,
+        GradiusUtilityAdRequest, GradiusUtilityAdService, GradiusUtilityCall, GradiusUtilityClient,
+        GradiusUtilitySurface, GradiusVipChecker, gradius_privacy_config, render_vip_hint_html,
     };
 
     type TestFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -1570,6 +1853,7 @@ mod tests {
         queued: Arc<Mutex<Vec<(i64, String)>>>,
         delivered_batches: Arc<Mutex<Vec<String>>>,
         failed_delivery_opportunities: Arc<Mutex<Vec<(i64, String)>>>,
+        enqueued_banners: Arc<Mutex<Vec<(i64, TelegramOutboxBatchInput)>>>,
     }
 
     impl LedgerStub {
@@ -1759,6 +2043,20 @@ mod tests {
                     .lock()
                     .expect("failed delivery opportunities")
                     .push((opportunity_id, error.to_owned()));
+                Ok(())
+            })
+        }
+
+        fn enqueue_banner<'a>(
+            &'a self,
+            opportunity_id: i64,
+            batch: TelegramOutboxBatchInput,
+        ) -> TestFuture<'a, ()> {
+            Box::pin(async move {
+                self.enqueued_banners
+                    .lock()
+                    .expect("enqueued banners")
+                    .push((opportunity_id, batch));
                 Ok(())
             })
         }
@@ -2531,11 +2829,13 @@ mod tests {
             Arc::new(VipStub(false)),
         );
 
-        let tail = service
+        let Some(GradiusPreparedAd::Tail(tail)) = service
             .append(test_request(75))
             .await
             .expect("saved ad replay")
-            .expect("saved advertising tail");
+        else {
+            panic!("saved advertising tail expected");
+        };
         assert!(tail.html.contains("https://ads.example/saved"));
         assert!(dialogue.calls.lock().expect("dialogue calls").is_empty());
         assert!(redactor.calls.lock().expect("redactor calls").is_empty());
@@ -2582,7 +2882,9 @@ mod tests {
             .await
             .expect("Gradius orchestration");
 
-        let tail = tail.expect("advertising tail");
+        let Some(GradiusPreparedAd::Tail(tail)) = tail else {
+            panic!("advertising tail expected");
+        };
         assert_eq!(tail.opportunity_id, 1);
         assert!(tail.html.starts_with("📢 <b>Реклама</b>"));
         assert!(tail.html.contains("https://ads.example/r/42"));
@@ -2714,5 +3016,294 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+    }
+
+    fn test_banner(text: &str, url: &str) -> GradiusBannerAd {
+        GradiusBannerAd {
+            method: "sendRichMessage".to_owned(),
+            message_type: "html".to_owned(),
+            text: text.to_owned(),
+            keyboard: vec![
+                vec![GradiusBannerButton {
+                    text: "Кнопка 1".to_owned(),
+                    url: url.to_owned(),
+                }],
+                vec![GradiusBannerButton {
+                    text: "Кнопка 2".to_owned(),
+                    url: "https://ads.example/publishers".to_owned(),
+                }],
+            ],
+            show_price: Some(0.0),
+            click_price: Some(0.0),
+        }
+    }
+
+    fn banner_service(
+        dialogue: &DialogueStub,
+        ledger: &LedgerStub,
+        bot_id: Option<i64>,
+    ) -> GradiusAdService {
+        let service = GradiusAdService::new(
+            Arc::new(dialogue.clone()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        match bot_id {
+            Some(bot_id) => service.with_banner_delivery(bot_id),
+            None => service,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_prepares_banner_and_queues_it_after_the_answer_in_chat_order() {
+        let dialogue = DialogueStub::default();
+        {
+            let mut responses = dialogue.responses.lock().expect("dialogue responses");
+            responses.push_back(Ok(None));
+            responses.push_back(Ok(Some(GradiusPlacement::Banner(test_banner(
+                "<h2>Это тестовый баннер <a href=\"https://gradius.pro\">Gradius</a></h2>\
+                 <p><i>Тестовая реклама</i><br>Тестовый баннер.</p>\
+                 <tg-collage><img src=\"https://cdn.example/1.png\"/>\
+                 <img src=\"https://cdn.example/2.jpg\"/></tg-collage>\
+                 <script>alert(1)</script><footer>Реклама</footer>",
+                "https://gradius.pro",
+            )))));
+        }
+        let ledger = LedgerStub::default();
+        let service = banner_service(&dialogue, &ledger, Some(7));
+
+        let Some(GradiusPreparedAd::Banner(banner)) = service
+            .append(test_request(81))
+            .await
+            .expect("banner orchestration")
+        else {
+            panic!("banner expected");
+        };
+        assert_eq!(banner.opportunity_id, 1);
+        assert!(banner.html.starts_with("<h2>Это тестовый баннер"));
+        assert!(
+            banner
+                .html
+                .contains("<tg-collage><img src=\"https://cdn.example/1.png\"/>")
+        );
+        assert!(!banner.html.contains("script"));
+        assert_eq!(banner.html.matches("<footer>").count(), 1);
+        assert!(!banner.html.contains("📢"));
+        assert!(!banner.html.contains("tg-spoiler"));
+        assert_eq!(banner.keyboard.len(), 2);
+        let finished = ledger.finished_ads.lock().expect("finished ads").clone();
+        assert_eq!(finished.len(), 1);
+        let stored = &finished[0].1;
+        assert_eq!(stored.selected_placement["type"], json!("banner"));
+        assert_eq!(stored.insert_index, None);
+        assert_eq!(stored.rendered_html, banner.html);
+
+        let batch_id = service
+            .queue_banner(
+                &banner,
+                GradiusBannerTarget {
+                    dialog_job_id: 81,
+                    chat_id: 42,
+                    thread_id: None,
+                },
+            )
+            .await
+            .expect("banner queued");
+        assert_eq!(batch_id, "gradius-banner:v1:7:81");
+        let enqueued = ledger.enqueued_banners.lock().expect("enqueued banners");
+        assert_eq!(enqueued.len(), 1);
+        let (opportunity_id, batch) = &enqueued[0];
+        assert_eq!(*opportunity_id, 1);
+        assert_eq!(batch.batch_id, batch_id);
+        assert_eq!(batch.ordering_key, "dialog:7:42:0");
+        assert_eq!(batch.dialog_job_id, None);
+        assert_eq!(batch.trigger_message_id, None);
+        assert_eq!(batch.parts.len(), 1);
+        let part = &batch.parts[0];
+        assert_eq!(part.method_kind, "sendRichMessage");
+        assert_eq!(part.payload["chat_id"], json!(42));
+        let options = &part.payload["options"];
+        assert_eq!(options["disable_notification"], json!(true));
+        assert!(options["reply_to_message_id"].is_null());
+        assert_eq!(
+            options["reply_markup"]["inline_keyboard"],
+            json!([
+                [{"text": "Кнопка 1", "url": "https://gradius.pro"}],
+                [{"text": "Кнопка 2", "url": "https://ads.example/publishers"}],
+            ])
+        );
+        let payload = part.payload.to_string();
+        assert!(payload.contains("tg-collage"));
+        assert!(payload.contains("https://gradius.pro"));
+        assert!(payload.contains("https://ads.example/publishers"));
+        assert!(payload.contains("Кнопка 2"));
+    }
+
+    /// Raw `/v1/native/dialogue_model/chat` body for the assistant turn containing the
+    /// `&&&banner&&&` test marker, captured from the live API on 2026-10-25.
+    const LIVE_TEST_BANNER_RESPONSE: &str = r#"[{"type":"banner","content":{"method":"sendRichMessage","message_type":"html","text":"<h2>Это тестовый баннер <a href=\"https://gradius.pro\">Gradius</a></h2><p><i>Тестовая реклама</i><br>Тестовый баннер рекламной сети Градиус.</p><tg-collage><img src=\"https://s3.twcstorage.ru/33cbd282-documents/banner_media_test/test1.png\"/><img src=\"https://s3.twcstorage.ru/33cbd282-documents/banner_media_test/test2.jpg\"/><img src=\"https://s3.twcstorage.ru/33cbd282-documents/test3.jpeg\"/></tg-collage><footer>Реклама</footer>","inline_keyboard":[{"text":"Кнопка 1","url":"https://gradius.pro"},{"text":"Кнопка 2","url":"https://gradius.pro/publishers"}]},"show_price":0.0,"click_price":0.0}]"#;
+
+    #[tokio::test]
+    async fn live_test_banner_keeps_provider_markup_and_url_buttons() {
+        let entries: Vec<Value> =
+            serde_json::from_str(LIVE_TEST_BANNER_RESPONSE).expect("captured response");
+        let provider_text = entries[0]["content"]["text"]
+            .as_str()
+            .expect("banner text")
+            .to_owned();
+        let placement = GradiusBannerAd::from_placement_json(entries[0].clone())
+            .expect("captured banner decodes");
+        let dialogue = DialogueStub::default();
+        {
+            let mut responses = dialogue.responses.lock().expect("dialogue responses");
+            responses.push_back(Ok(None));
+            responses.push_back(Ok(Some(GradiusPlacement::Banner(placement))));
+        }
+        let ledger = LedgerStub::default();
+        let service = banner_service(&dialogue, &ledger, Some(7));
+
+        let Some(GradiusPreparedAd::Banner(banner)) = service
+            .append(test_request(84))
+            .await
+            .expect("banner orchestration")
+        else {
+            panic!("banner expected");
+        };
+        assert_eq!(banner.html, provider_text.replace("<br>", "<br/>"));
+        assert_eq!(banner.html.matches("<img ").count(), 3);
+        assert_eq!(
+            banner.keyboard,
+            vec![
+                vec![GradiusBannerButton {
+                    text: "Кнопка 1".to_owned(),
+                    url: "https://gradius.pro".to_owned(),
+                }],
+                vec![GradiusBannerButton {
+                    text: "Кнопка 2".to_owned(),
+                    url: "https://gradius.pro/publishers".to_owned(),
+                }],
+            ]
+        );
+
+        service
+            .queue_banner(
+                &banner,
+                GradiusBannerTarget {
+                    dialog_job_id: 84,
+                    chat_id: 42,
+                    thread_id: None,
+                },
+            )
+            .await
+            .expect("banner queued");
+        let enqueued = ledger.enqueued_banners.lock().expect("enqueued banners");
+        let payload = &enqueued[0].1.parts[0].payload;
+        let html = payload["html"].as_str().expect("rich html");
+        assert!(html.contains("<tg-collage><img src=\"https://s3.twcstorage.ru/"));
+        assert!(html.ends_with("<footer>Реклама</footer>"));
+        assert_eq!(
+            payload["options"]["reply_markup"]["inline_keyboard"],
+            json!([
+                [{"text": "Кнопка 1", "url": "https://gradius.pro"}],
+                [{"text": "Кнопка 2", "url": "https://gradius.pro/publishers"}],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn banner_without_footer_gets_ad_label_and_replays_from_saved_placement() {
+        let dialogue = DialogueStub::default();
+        {
+            let mut responses = dialogue.responses.lock().expect("dialogue responses");
+            responses.push_back(Ok(None));
+            responses.push_back(Ok(Some(GradiusPlacement::Banner(test_banner(
+                "<p>Без подписи</p>",
+                "https://ads.example/1",
+            )))));
+        }
+        let ledger = LedgerStub::default();
+        let Some(GradiusPreparedAd::Banner(banner)) = banner_service(&dialogue, &ledger, Some(7))
+            .append(test_request(82))
+            .await
+            .expect("banner orchestration")
+        else {
+            panic!("banner expected");
+        };
+        assert_eq!(banner.html, "<p>Без подписи</p><footer>Реклама</footer>");
+
+        let stored = ledger.finished_ads.lock().expect("finished ads")[0]
+            .1
+            .clone();
+        let replay_ledger = LedgerStub::with_reservation(GradiusAdReservation::Replay {
+            opportunity_id: 5,
+            ad: stored,
+        });
+        let replay_dialogue = DialogueStub::default();
+        let Some(GradiusPreparedAd::Banner(replayed)) =
+            banner_service(&replay_dialogue, &replay_ledger, Some(7))
+                .append(test_request(82))
+                .await
+                .expect("banner replay")
+        else {
+            panic!("replayed banner expected");
+        };
+        assert_eq!(replayed.opportunity_id, 5);
+        assert_eq!(replayed.html, banner.html);
+        assert_eq!(replayed.keyboard, banner.keyboard);
+        assert!(
+            replay_dialogue
+                .calls
+                .lock()
+                .expect("dialogue calls")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn banner_render_errors_fail_closed_without_counting_an_ad() {
+        let cases = [
+            (
+                Some(7),
+                test_banner("<p>ad</p>", "http://ads.example/plain"),
+                "HTTPS",
+            ),
+            (
+                Some(7),
+                test_banner("<script>x</script>", "https://ads.example/1"),
+                "no rich content",
+            ),
+            (
+                None,
+                test_banner("<p>ad</p>", "https://ads.example/1"),
+                "not configured",
+            ),
+            (
+                Some(7),
+                GradiusBannerAd {
+                    method: "sendPhoto".to_owned(),
+                    ..test_banner("<p>ad</p>", "https://ads.example/1")
+                },
+                "sendPhoto",
+            ),
+        ];
+        for (bot_id, banner, expected) in cases {
+            let dialogue = DialogueStub::default();
+            {
+                let mut responses = dialogue.responses.lock().expect("dialogue responses");
+                responses.push_back(Ok(None));
+                responses.push_back(Ok(Some(GradiusPlacement::Banner(banner))));
+            }
+            let ledger = LedgerStub::default();
+            let error = banner_service(&dialogue, &ledger, bot_id)
+                .append(test_request(83))
+                .await
+                .expect_err("banner must be rejected");
+            assert!(error.contains(expected), "{error}");
+            assert!(ledger.finished_ads.lock().expect("finished ads").is_empty());
+            let render_errors = ledger.render_errors.lock().expect("render errors");
+            assert_eq!(render_errors.len(), 1);
+            assert!(render_errors[0].1.contains(expected));
+        }
     }
 }

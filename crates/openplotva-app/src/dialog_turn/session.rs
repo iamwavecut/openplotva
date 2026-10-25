@@ -1078,6 +1078,7 @@ where
             let mut contains_advertising = false;
             let mut advertising_tail_bytes = None;
             let mut advertising_opportunity_id = None;
+            let mut advertising_banner = None;
             if let Some(gradius) = cfg.gradius {
                 let request = crate::gradius_ads::GradiusAdAppendRequest {
                     dialog_job_id: ctx.item_id,
@@ -1106,7 +1107,10 @@ where
                     }
                 } else {
                     match gradius.append(request).await {
-                        Ok(Some(tail)) => {
+                        Ok(Some(crate::gradius_ads::GradiusPreparedAd::Banner(banner))) => {
+                            advertising_banner = Some(banner);
+                        }
+                        Ok(Some(crate::gradius_ads::GradiusPreparedAd::Tail(tail))) => {
                             let tail_bytes = tail.html.len();
                             let candidate = format!("{sanitized}\n\n{}", tail.html);
                             if let Err(error) = validate_dialog_answer_deliverable(&candidate) {
@@ -1188,6 +1192,19 @@ where
                         "failed to persist already-complete Gradius delivery state"
                     );
                 }
+            }
+            if let (Some(banner), Some(gradius)) = (advertising_banner.as_ref(), cfg.gradius) {
+                queue_gradius_banner(
+                    gradius,
+                    banner,
+                    send_result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                    crate::gradius_ads::GradiusBannerTarget {
+                        dialog_job_id: ctx.item_id,
+                        chat_id: active_params.chat_id,
+                        thread_id: active_params.thread_id,
+                    },
+                )
+                .await;
             }
             if let (Err(send_error), Some(opportunity_id), Some(gradius)) = (
                 send_result.as_ref(),
@@ -2339,6 +2356,54 @@ where
     };
     if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
         tracing::warn!(%error, job_id, "failed to append intermediate queued marker");
+    }
+}
+
+/// Queue the banner only after the answer was accepted, so it follows the answer
+/// in the chat's outbox order; a failed answer closes the banner without sending it.
+async fn queue_gradius_banner(
+    gradius: &dyn crate::gradius_ads::GradiusAdAppender,
+    banner: &crate::gradius_ads::GradiusAdBanner,
+    answer: Result<(), String>,
+    target: crate::gradius_ads::GradiusBannerTarget,
+) {
+    let opportunity_id = banner.opportunity_id;
+    match answer {
+        Ok(()) => match gradius.queue_banner(banner, target).await {
+            Ok(batch_id) => tracing::info!(
+                opportunity_id,
+                job_id = target.dialog_job_id,
+                integration_kind = "native_dialogue",
+                placement = "banner",
+                delivery_state = "queued",
+                batch_id,
+                "Gradius banner queued after the dialog answer"
+            ),
+            Err(error) => tracing::warn!(
+                opportunity_id,
+                job_id = target.dialog_job_id,
+                integration_kind = "native_dialogue",
+                placement = "banner",
+                %error,
+                "failed to queue Gradius banner"
+            ),
+        },
+        Err(send_error) => {
+            if let Err(error) = gradius
+                .mark_delivery_failed(opportunity_id, &send_error)
+                .await
+            {
+                tracing::warn!(
+                    opportunity_id,
+                    job_id = target.dialog_job_id,
+                    integration_kind = "native_dialogue",
+                    placement = "banner",
+                    delivery_state = "failed",
+                    %error,
+                    "failed to persist Gradius banner enqueue failure"
+                );
+            }
+        }
     }
 }
 
