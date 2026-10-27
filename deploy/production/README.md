@@ -5,8 +5,9 @@ workflow never starts, waits for, or checks a backup. It pulls the selected imag
 recreates the application, and succeeds after `/api/health` and `/api/ready` pass.
 
 Every deploy builds the release binary and runtime image from the exact dispatched
-`main` commit and pushes it to GHCR tagged with that commit SHA. Pull request CI does
-not build images. The release build cache is scoped to `main`, so a deploy with an
+`main` commit and pushes it to GHCR tagged with that commit SHA. The existing
+`ghcr.io/iamwavecut/openplotva` application package is public, so the host pulls it
+without registry credentials. Pull request CI does not build images. The release build cache is scoped to `main`, so a deploy with an
 unchanged `Cargo.lock` recompiles only the workspace crates.
 Before touching the host, the deploy waits for the CI run of the same commit after its
 push to `main` and stops unless that run succeeded.

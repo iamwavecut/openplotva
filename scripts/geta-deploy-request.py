@@ -2,13 +2,13 @@
 """Prepare a bounded deployment request. Credentials go to SSH stdin only."""
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import urllib.parse
-import urllib.request
 
 CONTRACT = 'deploy/geta-deploy.json'
 
@@ -38,15 +38,29 @@ def contract_digest(root):
 
 
 def identity():
-    address = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
-    if urllib.parse.urlsplit(address).scheme != 'https':
-        raise ValueError('identity endpoint must use HTTPS')
-    separator = '&' if '?' in address else '?'
-    request = urllib.request.Request(
-        address + separator + urllib.parse.urlencode({'audience': 'geta-deploy'}),
-        headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        value = json.load(response).get('value')
+    endpoint = urllib.parse.urlsplit(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'])
+    if (endpoint.scheme != 'https' or not endpoint.hostname
+            or not endpoint.hostname.endswith('.actions.githubusercontent.com')
+            or endpoint.username is not None or endpoint.password is not None
+            or endpoint.port not in (None, 443) or endpoint.fragment):
+        raise ValueError('identity endpoint must be a GitHub Actions HTTPS origin')
+    query = [(key, value) for key, value in urllib.parse.parse_qsl(endpoint.query)
+             if key != 'audience']
+    query.append(('audience', 'geta-deploy'))
+    target = endpoint.path + '?' + urllib.parse.urlencode(query)
+    connection = http.client.HTTPSConnection(endpoint.hostname, timeout=15)
+    try:
+        connection.request('GET', target, headers={
+            'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError('GitHub Actions identity request failed')
+        body = response.read(32769)
+        if len(body) > 32768:
+            raise ValueError('GitHub Actions identity response is too large')
+        value = json.loads(body).get('value')
+    finally:
+        connection.close()
     if not isinstance(value, str) or not value or len(value) > 16000:
         raise ValueError('invalid identity')
     return value
@@ -80,7 +94,14 @@ def main():
     args = parser.parse_args()
     if args.check_schema:
         _, contract = contract_digest(args.root)
-        approved = json.loads((args.root / contract['approved_schema']).read_text())
+        approved_name = contract.get('approved_schema')
+        if not isinstance(approved_name, str) or not approved_name:
+            parser.error('--check-schema requires approved_schema in the deployment contract')
+        approved_path = args.root / approved_name
+        if (approved_path.is_symlink() or not approved_path.is_file()
+                or not approved_path.resolve().is_relative_to(args.root.resolve())):
+            parser.error('approved_schema must be a regular file inside the source root')
+        approved = json.loads(approved_path.read_text())
         if not approved or approved != schema_hashes(args.check_schema):
             raise ValueError('database schema changed; coordinated administrator migration required')
         print('Approved database migration set verified')
