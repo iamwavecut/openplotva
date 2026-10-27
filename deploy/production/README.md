@@ -10,30 +10,49 @@ not build images. The release build cache is scoped to `main`, so a deploy with 
 unchanged `Cargo.lock` recompiles only the workspace crates.
 Before touching the host, the deploy waits for the CI run of the same commit after its
 push to `main` and stops unless that run succeeded.
-After a successful deploy, local Docker and GHCR cleanup keep only the current
-main-SHA image; they do not maintain rollback image history.
+The runner sends the immutable application digest and a short-lived GitHub OIDC
+identity to the host's deployment broker. Its SSH key has no arbitrary shell,
+sudo, or Docker socket access. Compose settings, runtime secrets and bind mounts
+are fixed in an administrator-owned profile. CI cannot upload replacement host
+scripts or production environment files.
 
-The nightly backup runs from the deploy user's crontab on the host at 01:00 UTC (04:00
-Moscow), the quietest hour of dialog traffic. The line is installed once by hand;
-deploys never touch it or the backup script:
+The broker preserves the previous pinned application image for rollback. Do not
+delete current/previous registry versions or their OCI child manifests as a
+post-deploy cleanup step. The protected release contract in `deploy/geta-deploy.json`
+includes runtime templates, database migrations and sandbox protocol/code inputs.
+A changed contract requires administrator review before another release.
 
-```
-0 1 * * * flock -n <deploy-root>/.backup.lock <deploy-root>/backup-production.sh > <deploy-root>/backup-cron.log 2>&1
+The privileged Python sandbox is an administrator-managed dependency. Application
+CI does not build, publish or activate its replacement. An administrator must
+review and apply sandbox updates separately, using personal host access. Ordinary
+application releases leave the existing sandbox, databases, Caddy and host
+configuration unchanged.
+
+The nightly backup runs from the administrator's crontab at 01:00 UTC, the quietest
+hour of dialog traffic. The installed command invokes the fixed broker operation:
+
+```cron
+0 1 * * * sudo -n /usr/local/libexec/geta-deploy admin --project openplotva --operation backup >> <deploy-root>/backup-cron.log 2>&1
 ```
 
 GitHub's scheduled workflows start hours late, so `.github/workflows/backup-production.yml`
-is for manual backups only. Each manual run uploads the current `backup-production.sh`,
-which is how a changed script reaches the host. The backup is stored under
-`${OPENPLOTVA_BACKUP_ROOT:-<deploy-root>/backups}` and contains:
+is for manual backups only. It requests `backup` over the restricted SSH identity
+with OIDC from the separately authorized backup workflow. It cannot upload or
+modify the installed backup helper. The broker serializes backup and application
+rollout operations. New backups are root-only under
+`/var/lib/geta-deploy/backups/openplotva` and contain:
 
-- `postgres.dump` — PostgreSQL custom-format logical dump;
-- `dragonfly-snapshot.tar.gz` — native Dragonfly DFS snapshot set;
-- `redis-ingress.rdb` — durable Valkey ingress snapshot;
-- `openplotva-state.tar.gz` — runtime TLS/application state when the volume exists;
-- `SHA256SUMS` — checksums verified before the backup is accepted.
+- `postgres.dump`: PostgreSQL custom-format logical dump;
+- `dragonfly-snapshot.tar.gz`: native Dragonfly DFS snapshot set;
+- `redis-ingress.rdb`: durable Valkey ingress snapshot;
+- `openplotva-state.tar.gz`: runtime TLS/application state;
+- `deployment-control.tar.gz` and `broker-project.json`: this project's protected
+  runtime profile and exact image history;
+- `SHA256SUMS`: checksums verified before the backup is accepted.
 
-Only the newest complete backup directory (`scheduled-*` or `predeploy-*`) is kept by default.
-Override it with `OPENPLOTVA_BACKUP_KEEP`.
+The previous complete backup is retained until its replacement is verified. Only
+the newest verified backup is then kept in the new backup root. Existing legacy
+backups are not deleted during migration.
 
 The uploader's media volume has a separate daily retention job on the production host:
 
@@ -76,11 +95,12 @@ enable AOF with `CONFIG SET appendonly yes` and wait for
 ## Image generation advertising
 
 Create a separate Gradius project of type **Generation model** for `@PlotvoBot`.
-Store its key in the repository Actions secret `GRADIUS_GENERATION_API_KEY`.
-The deployment workflow streams this key over SSH on stdin, installs it into
-`.env.production` with mode 0600, and enables `GRADIUS_UTILITY_IMAGE_ENABLED`.
-It preserves the existing dialogue key and other runtime settings. The Gradius
-master switch (`GRADIUS_ENABLED`) must also be enabled. If the generation key is
+An administrator stores its `GRADIUS_GENERATION_API_KEY` in the protected runtime
+profile and enables `GRADIUS_UTILITY_IMAGE_ENABLED`. Application CI does not
+provision or overwrite these credentials. Changes to a legacy `.env.production`
+do not update an already frozen broker profile. Preserve the existing dialogue
+key and other runtime settings when changing the profile. The Gradius master
+switch (`GRADIUS_ENABLED`) must also be enabled. If the generation key is
 missing, image ads stay disabled; the dialogue key is never used as a fallback.
 
 Images use `POST /v1/native/generation_model/chat` with a redacted prompt and

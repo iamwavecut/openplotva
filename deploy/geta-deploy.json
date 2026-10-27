@@ -1,0 +1,7 @@
+{
+  "data_version": "1",
+  "files": ["deploy/production/compose.production.yml", "deploy/maintenance/compose.maintenance.yml", "sandbox/Dockerfile", "sandbox/nsjail/python.cfg", "sandbox/requirements.txt"],
+  "trees": ["migrations", "crates/openplotva-sandbox/src"],
+  "images": {"openplotva": "OPENPLOTVA_IMAGE_DIGEST"},
+  "registry_auth": false
+}

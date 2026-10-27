@@ -119,15 +119,18 @@ class DeploymentIntegrationTests(unittest.TestCase):
         overlay = OVERLAY.read_text()
         self.assertIn('"127.0.0.1:9092:9092"', overlay)
 
-    def test_workflow_uploads_overlay_without_credentials(self):
+    def test_workflow_keeps_runtime_configuration_on_the_host(self):
         workflow = (ROOT / ".github/workflows/deploy-production.yml").read_text()
         script = SCRIPT.read_text()
-        self.assertIn(
-            'scp deploy/maintenance/compose.maintenance.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.maintenance.yml"',
-            workflow,
-        )
-        self.assertNotIn("MAINTENANCE_TOKEN", workflow)
-        self.assertNotIn("runtime.env", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("environment: production", workflow)
+        self.assertIn("OPENPLOTVA_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}", workflow)
+        self.assertIn('deploy@geta.moe "deploy $DEPLOY_SHA"', workflow)
+        for forbidden in ("scp ", "OPENPLOTVA_PRODUCTION_ENV_B64", "GHCR_PULL_TOKEN", "MAINTENANCE_TOKEN", "runtime.env", "Build and push sandbox image", "Remove non-current GHCR images"):
+            self.assertNotIn(forbidden, workflow)
+        contract = (ROOT / "deploy/geta-deploy.json").read_text()
+        self.assertIn("deploy/maintenance/compose.maintenance.yml", contract)
+        self.assertIn("crates/openplotva-sandbox/src", contract)
         self.assertIn(
             'maintenance_env_file="${OPENPLOTVA_MAINTENANCE_ENV_FILE:-/etc/openplotva-maintenance/runtime.env}"',
             script,

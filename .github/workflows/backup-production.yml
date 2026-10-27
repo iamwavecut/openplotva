@@ -1,8 +1,5 @@
 name: Production Backup
 
-# The nightly run is a fixed host crontab entry (see deploy/production/README.md):
-# scheduled workflows start hours late and then overlap daytime traffic. This workflow
-# is for manual backups.
 on:
   workflow_dispatch:
 
@@ -10,71 +7,47 @@ concurrency:
   group: production-backup
   cancel-in-progress: false
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   backup:
     name: Back up production state
     runs-on: ubuntu-22.04
+    environment: production
     timeout-minutes: 180
-    permissions:
-      contents: read
     steps:
-      - name: Require repository owner for manual runs
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.actor }}" != "iamwavecut" || "${{ github.triggering_actor }}" != "iamwavecut" ]]; then
-            echo "Production backup can only be started or re-run manually by iamwavecut" >&2
-            exit 1
-          fi
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Configure SSH
-        shell: bash
+      - name: Require repository owner and main
         env:
-          GETA_SSH_PRIVATE_KEY: ${{ secrets.GETA_SSH_PRIVATE_KEY }}
-          GETA_SSH_KNOWN_HOSTS: ${{ secrets.GETA_SSH_KNOWN_HOSTS }}
-          GETA_SSH_PORT: ${{ vars.GETA_SSH_PORT || '22022' }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          RELEASE_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          test -n "$GETA_SSH_PRIVATE_KEY"
-          test -n "$GETA_SSH_KNOWN_HOSTS"
-          install -m 700 -d "$HOME/.ssh"
-          printf '%s\n' "$GETA_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
-          printf 'Host geta.moe 207.244.239.212 2605:a140:2260:6080::1\n  Port %s\n' "$GETA_SSH_PORT" > "$HOME/.ssh/config"
-          chmod 600 "$HOME/.ssh/config"
-          eval "$(ssh-agent -s)"
-          printf '%s\n' "$GETA_SSH_PRIVATE_KEY" | ssh-add -
-          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
-          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
-
-      - name: Upload backup script
-        shell: bash
+          [[ "$ACTOR" == iamwavecut && "$TRIGGERING_ACTOR" == iamwavecut ]]
+          [[ "$RELEASE_REF" == refs/heads/main ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Configure pinned SSH identity
         env:
-          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
-          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
+          SSH_KEY: ${{ secrets.GETA_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.GETA_SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.GETA_SSH_PORT || '22022' }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2029
-          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT'"
-          scp deploy/production/backup-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/backup-production.sh"
-          # shellcheck disable=SC2029
-          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/backup-production.sh'"
-
-      - name: Create production backup
-        shell: bash
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/geta_deploy
+          chmod 600 ~/.ssh/geta_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf 'Host geta.moe\n  Port %s\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n' "$SSH_PORT" > ~/.ssh/config
+      - name: Request fixed host backup procedure
         env:
-          GETA_SSH_TARGET: ${{ secrets.GETA_SSH_TARGET }}
-          GETA_DEPLOY_ROOT: ${{ secrets.GETA_DEPLOY_ROOT }}
+          DEPLOY_OPERATION: backup
         run: |
           set -euo pipefail
-          ssh \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=120 \
-            "$GETA_SSH_TARGET" \
-            "'$GETA_DEPLOY_ROOT/backup-production.sh'"
+          python3 scripts/geta-deploy-request.py |
+            ssh -T -i ~/.ssh/geta_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=360 \
+              deploy@geta.moe backup
