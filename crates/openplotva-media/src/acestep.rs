@@ -785,6 +785,24 @@ pub fn normalize_song_prompt_payload(
     requested_topic: &str,
     requested_language: &str,
 ) -> Result<SongPromptResult, AceStepError> {
+    normalize_song_prompt_payload_with_source(payload, requested_topic, requested_language, "")
+}
+
+/// Validate generated material against the listener's original text when supplied.
+pub fn normalize_song_prompt_payload_for_request(
+    payload: SongPromptPayload,
+    request: &SongPromptRequest,
+) -> Result<SongPromptResult, AceStepError> {
+    let (topic, language) = normalize_song_prompt_input(request)?;
+    normalize_song_prompt_payload_with_source(payload, &topic, &language, &request.request_text)
+}
+
+fn normalize_song_prompt_payload_with_source(
+    payload: SongPromptPayload,
+    requested_topic: &str,
+    requested_language: &str,
+    request_text: &str,
+) -> Result<SongPromptResult, AceStepError> {
     let topic = requested_topic.trim();
     if topic.is_empty() {
         return Err(AceStepError::InvalidResponse(
@@ -801,6 +819,7 @@ pub fn normalize_song_prompt_payload(
         ));
     }
     let lyrics = canonicalize_song_lyrics(&payload.lyrics);
+    let supplied_lyrics = lyrics_copied_from_request(&lyrics.text, request_text);
     let vocals_field = payload.vocals.trim().to_ascii_lowercase();
     let instrumental = vocals_field == "instrumental" || lyrics.line_count == 0;
     let vocals = if instrumental {
@@ -811,17 +830,19 @@ pub fn normalize_song_prompt_payload(
         String::new()
     };
     if !instrumental {
-        if lyrics.line_count < SONG_MIN_LYRIC_LINES
-            || lyrics.line_count > SONG_MAX_LYRIC_LINES
-            || lyrics.sections < 2
-            || !lyrics.has_chorus
+        if lyrics.line_count > SONG_MAX_LYRIC_LINES
+            || (!supplied_lyrics
+                && (lyrics.line_count < SONG_MIN_LYRIC_LINES
+                    || lyrics.sections < 2
+                    || !lyrics.has_chorus))
         {
             return Err(AceStepError::InvalidResponse(
                 SONG_LYRICS_STRUCTURE_REJECTION.to_owned(),
             ));
         }
-        if !lyrics_script_matches_language(&lyrics.text, &language)
-            || foreign_script_line_share(&lyrics.text, &language) > SONG_MAX_FOREIGN_LINE_SHARE
+        if !supplied_lyrics
+            && (!lyrics_script_matches_language(&lyrics.text, &language)
+                || foreign_script_line_share(&lyrics.text, &language) > SONG_MAX_FOREIGN_LINE_SHARE)
         {
             return Err(AceStepError::InvalidResponse(
                 SONG_LYRICS_LANGUAGE_REJECTION.to_owned(),
@@ -874,6 +895,21 @@ pub fn normalize_song_prompt_payload(
         duration_seconds,
         brief,
     })
+}
+
+fn lyrics_copied_from_request(lyrics: &str, request_text: &str) -> bool {
+    let words = |text: &str| {
+        text.lines()
+            .filter(|line| section_marker(line.trim()).is_none())
+            .flat_map(str::split_whitespace)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let sung = words(lyrics);
+    !sung.is_empty()
+        && words(request_text)
+            .windows(sung.len())
+            .any(|part| part == sung)
 }
 
 const fn non_zero_or(value: u32, fallback: u32) -> u32 {
@@ -2625,6 +2661,61 @@ mod tests {
         assert_eq!(song_max_audio_seconds(350, false), 360);
         assert_eq!(song_max_audio_seconds(0, false), 60);
         Ok(())
+    }
+
+    #[test]
+    fn supplied_lyrics_keep_short_mixed_language_material() {
+        let mut payload = rap_payload();
+        payload.vocal_language = "ru".to_owned();
+        payload.lyrics = "[Verse]\nMorning. Новый day.\n[Chorus]\nAt home ждёт семья.".to_owned();
+        let request = SongPromptRequest {
+            topic: "garage grime".to_owned(),
+            request_text: "Спой ровно этот текст:\n\nMorning. Новый day. At home ждёт семья."
+                .to_owned(),
+            ..SongPromptRequest::default()
+        };
+        let result = super::normalize_song_prompt_payload_for_request(payload.clone(), &request)
+            .expect("supplied words do not need a generated song structure");
+        assert_eq!(
+            result.lyrics,
+            "[Verse]\nMorning. Новый day.\n\n[Chorus]\nAt home ждёт семья."
+        );
+
+        let unrelated = SongPromptRequest {
+            request_text: "Write a song about city lights".to_owned(),
+            ..request.clone()
+        };
+        assert!(
+            super::normalize_song_prompt_payload_for_request(payload.clone(), &unrelated).is_err()
+        );
+        let missing = SongPromptRequest {
+            request_text: String::new(),
+            topic: request.request_text.clone(),
+            ..request.clone()
+        };
+        assert!(
+            super::normalize_song_prompt_payload_for_request(payload.clone(), &missing).is_err(),
+            "a model-written topic is not the original lyrics"
+        );
+        payload
+            .lyrics
+            .push_str("\nA new line the listener never supplied.");
+        assert!(super::normalize_song_prompt_payload_for_request(payload, &request).is_err());
+    }
+
+    #[test]
+    fn supplied_lyrics_do_not_bypass_the_size_limit() {
+        let mut payload = rap_payload();
+        payload.lyrics = (0..70)
+            .map(|n| format!("Original lyric line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = SongPromptRequest {
+            topic: "song".to_owned(),
+            request_text: payload.lyrics.clone(),
+            ..SongPromptRequest::default()
+        };
+        assert!(super::normalize_song_prompt_payload_for_request(payload, &request).is_err());
     }
 
     #[test]

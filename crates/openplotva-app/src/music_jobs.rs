@@ -474,6 +474,7 @@ fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureR
             // lyrics at 1145 chars). Fall through to the next routed model
             // instead of dying terminally.
             if openplotva_media::acestep::is_invalid_song_material_message(message)
+                || message.contains("song reprompt: decode response:")
                 || openplotva_llm::retry::is_truncated_model_output_message(message)
             {
                 return Some(FailureReason::ProviderProtocolError);
@@ -2113,6 +2114,17 @@ mod tests {
         assert_eq!(song_prompt_retryable_reason(&unrelated), None);
         let provider = MusicGenerationError::Provider("capacity unavailable".to_owned());
         assert_eq!(song_prompt_retryable_reason(&provider), None);
+    }
+
+    #[test]
+    fn song_director_schema_errors_try_the_next_model() {
+        let error = super::MusicGenerationError::Material(
+            "song reprompt failed: song reprompt: decode response: invalid type: string, expected a sequence at line 1 column 697".to_owned(),
+        );
+        assert_eq!(
+            super::song_prompt_retryable_reason(&error),
+            Some(openplotva_llm::retry::FailureReason::ProviderProtocolError)
+        );
     }
 
     use openplotva_taskman::{

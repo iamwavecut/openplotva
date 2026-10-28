@@ -1361,7 +1361,7 @@ where
             .await?;
         let payload: openplotva_media::acestep::SongPromptPayload =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
-        openplotva_media::acestep::normalize_song_prompt_payload(payload, &topic, &language)
+        openplotva_media::acestep::normalize_song_prompt_payload_for_request(payload, &request)
             .map_err(|error| GeminiMediaPromptOptimizerError::Tool(error.to_string()))
     }
 
