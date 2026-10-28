@@ -2393,7 +2393,12 @@ where
                 on_status,
             )
             .await?;
-        openplotva_media::acestep::decode_song_prompt_payload(&content, &topic, &language)
+        let payload = serde_json::from_str(&content).map_err(|source| {
+            AifarmMediaOptimizerError::SongPrompt {
+                source: openplotva_media::acestep::AceStepError::Json(source),
+            }
+        })?;
+        openplotva_media::acestep::normalize_song_prompt_payload_for_request(payload, &request)
             .map_err(|source| AifarmMediaOptimizerError::SongPrompt { source })
     }
 
@@ -10296,6 +10301,85 @@ mod tests {
         assert_eq!(job.wait_for_capacity_ms, 1);
         assert_eq!(job.capacity_poll_ms, 25);
         assert_eq!(job.invocation.timeout_ms, DEFAULT_TIMEOUT_MS);
+    }
+
+    #[tokio::test]
+    async fn song_director_accepts_short_lyrics_copied_from_the_request()
+    -> Result<(), Box<dyn Error>> {
+        let lyrics = "[Verse]\nMorning. Новый day.\nAt home ждёт семья.";
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::to_string(&json!({
+                        "analysis": "Synthwave with clean female vocals.",
+                        "title": "Night City",
+                        "vocal_language": "ru",
+                        "vocals": "female",
+                        "genre": "synthwave",
+                        "bpm": 102,
+                        "key": "",
+                        "sound": ["synth bass", "gated reverb drums", "analog pads", "arpeggiated plucks", "bright lead synth"],
+                        "character": ["neon mood", "nostalgic 80s", "driving"],
+                        "structure": ["synth intro", "verse over a pulsing bass", "big chorus", "outro fades on the hook"],
+                        "vocal_style": "clean vocals with light reverb",
+                        "references": [],
+                        "duration_seconds": 180,
+                        "lyrics": lyrics,
+                    }))?
+                }
+            }]
+        });
+        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
+            status_code: 200,
+            status_text: "OK".to_owned(),
+            body: serde_json::to_vec(&response)?,
+            ..AifarmHttpResponse::default()
+        })]);
+        let generator = AifarmStructuredJsonGenerator::with_transport(
+            AifarmStructuredJsonConfig {
+                client: AifarmClientConfig {
+                    direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                    ..AifarmClientConfig::default()
+                },
+                ..AifarmStructuredJsonConfig::default()
+            },
+            transport.clone(),
+        )
+        .with_prompt_store(prompt_store_with(&[(
+            "music/song_director.prompt",
+            "{{role \"system\"}}custom song system {{topic}}{{role \"user\"}}custom song user {{request}} {{languageHint}}",
+        )]));
+
+        let result = generator
+            .optimize_song_prompt(
+                openplotva_media::acestep::SongPromptRequest {
+                    topic: "night city".to_owned(),
+                    request_text:
+                        "Спой ровно этот текст:\nMorning. Новый day.\nAt home ждёт семья."
+                            .to_owned(),
+                    language_hint: "en-US".to_owned(),
+                    ..openplotva_media::acestep::SongPromptRequest::default()
+                },
+                &mut |_status| {},
+            )
+            .await?;
+
+        assert_eq!(result.title, "Night City");
+        assert_eq!(result.vocal_language, "ru");
+        assert_eq!(result.vocals, "female");
+        assert_eq!(result.duration_seconds, 180);
+        assert!(
+            result
+                .style
+                .starts_with("synthwave, female clean vocals with light reverb, synth bass"),
+            "{}",
+            result.style
+        );
+        assert!(result.style.ends_with(", 102 BPM"), "{}", result.style);
+        assert_eq!(result.lyrics, lyrics);
+
+        Ok(())
     }
 
     #[tokio::test]

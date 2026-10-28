@@ -48,6 +48,7 @@ Every tag is an English phrase of one to eight words that a producer of that gen
 
 ## 4. Write the lyrics (empty string for instrumentals)
 
+- If the listener supplies exact lyrics, preserve every word, punctuation mark, language switch and the order. You may add section markers and line breaks. Do not add verses, ad-libs or repeated choruses unless requested. Supplied lyrics override the length, rhyme, language and chorus rules below. Choose a duration that fits the supplied text.
 - Same language throughout, in that language's natural word order and stress; native idioms, no calques. Names and details from the request appear as they are.
 - The chorus carries the title line and a hook that repeats; verses tell the story in concrete images (objects, places, actions), not abstractions. Every line should be singable in one breath.
 - Rhyme the way the genre does: rap uses internal and multi-syllable rhymes and rhythmic repetition; pop and rock use clean end rhymes with a lift into the chorus; metal and punk favour hard consonants and shouted chants; folk and chanson tell a story with plain exact rhymes; ambient has no lyrics.

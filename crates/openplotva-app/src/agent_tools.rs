@@ -273,7 +273,17 @@ impl MediaFailureExplainer {
             .await
             .ok()?;
         input.disable_tools = true;
-        input.reference_context.push(format!("Media delivery has ended with a problem: {failure}. Explain this once in your usual voice. Do not invent a cause or claim an undelivered result. Do not restart generation."));
+        input.reference_context.push(format!(
+            "The bot supports image and music generation. It accepted this request, but delivery ended with a problem: {failure}. Tools are disabled only for this failure notice. This does not mean the bot lacks the capability."
+        ));
+        input.reference_context.push(format!(
+            "Original request, for context only: {}",
+            input.message.text
+        ));
+        let notice_task = "Briefly report the delivery problem stated above. Preserve the distinction between failed and partial delivery. Do not invent a cause or claim that the bot cannot generate music or images. Do not perform the original request, write lyrics, provide a text substitute, or restart generation. Write in the language of the original request quoted above, in your usual voice.";
+        input.message.text = notice_task.to_owned();
+        input.message.normalized = notice_task.to_owned();
+        input.message.original_text = notice_task.to_owned();
         struct NoTools;
         impl DialogToolbox for NoTools {}
         let result = crate::dialog_turn::run_captured_session(
