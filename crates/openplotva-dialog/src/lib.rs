@@ -1219,8 +1219,9 @@ pub const SESSION_REACT_TO_MESSAGE_SPEC: ToolSpec = ToolSpec {
                   🖕 😈 😴 😭 🤓 👻 👨‍💻 🎃 🙈 😇 😨 🤝 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 \
                   🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡",
     result: "Sets the reaction; returns ok, or an error for a disallowed emoji or a message you \
-             already reacted to this turn. Text you return together with this call is delivered \
-             as your reply.",
+             already reacted to this turn. Accompanying text becomes your final reply only \
+             when every tool call in the batch is react_to_message. Text beside a mixed batch \
+             is not delivered; use send_message for an intermediate message.",
     continuation: ToolContinuation::Sidecar,
     args: &[
         ToolArgSpec {
