@@ -26,7 +26,8 @@ use openplotva_storage::{
     DialogMemoryChatMeta, PgEmbeddingVector, PostgresMemoryStore, StorageError,
 };
 use openplotva_taskman::{
-    InMemoryTaskQueue, JobType, MEMORY_CONSOLIDATION_QUEUE_NAME, new_memory_consolidation_job_at,
+    InMemoryTaskQueue, JobType, MEMORY_CONSOLIDATION_QUEUE_NAME, TaskQueueSchedule,
+    new_memory_consolidation_job_at,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,15 +37,17 @@ use time::OffsetDateTime;
 use crate::embedder::DiscoveryEmbedderClient;
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
-    RoutedRoutingError,
+    RoutedRoutingError, RoutedRoutingErrorKind,
 };
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a worker waits before the next job after the embedder gate deferred one.
-pub const MEMORY_CONSOLIDATION_EMBEDDER_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// How long a deferred pipeline waits before it probes its backends again: the worker
+/// that deferred pauses this long, and the one job the pipeline keeps queued becomes
+/// available only then.
+pub const MEMORY_CONSOLIDATION_BACKEND_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 pub const MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX: &str = "memory-consolidation-worker";
 pub const MEMORY_EXTRACTION_WORKFLOW_KEY: &str = "memory_extraction";
 pub const MEMORY_SUBJECT_MERGE_WORKFLOW_KEY: &str = "memory_subject_merge";
@@ -934,6 +937,39 @@ where
     pub fn is_embedder_unavailable(&self) -> bool {
         matches!(self, Self::EmbedderUnavailable { .. })
     }
+
+    /// Whether the extractor failed because no LLM backend could take the call:
+    /// unreachable, unregistered, out of capacity or behind open breakers. The run
+    /// is not at fault, so it is released without spending an attempt.
+    #[must_use]
+    pub fn is_llm_backend_unavailable(&self) -> bool {
+        match self {
+            Self::Extract { source } => llm_backend_unavailable(source),
+            _ => false,
+        }
+    }
+}
+
+fn llm_backend_unavailable(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(RoutedMemoryExtractorError::Routing(routing)) =
+            error.downcast_ref::<RoutedMemoryExtractorError>()
+        {
+            return matches!(
+                routing.kind(),
+                RoutedRoutingErrorKind::RouteUnavailable
+                    | RoutedRoutingErrorKind::NoCandidates
+                    | RoutedRoutingErrorKind::Exhausted
+                    | RoutedRoutingErrorKind::CapacityWaitTimeout
+            );
+        }
+        current = error.source();
+    }
+    matches!(
+        retryable_reason(error),
+        Some(FailureReason::ProviderUnavailable | FailureReason::CapacityUnavailable)
+    )
 }
 
 /// Memory run processing failure.
@@ -1253,6 +1289,23 @@ where
                 run_id,
                 error = %error,
                 "embedder unavailable mid-run; releasing memory run for retry"
+            );
+            store
+                .release_run(run_id)
+                .await
+                .map_err(|source| MemoryRunProcessError::Store { source })?;
+            Ok(MemoryRunProcessReport {
+                deferred: true,
+                ..MemoryRunProcessReport::default()
+            })
+        }
+        // No LLM backend could take the call. The run is not at fault, and failing it
+        // would spend all its attempts within minutes of an outage.
+        Err(error) if error.is_llm_backend_unavailable() => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "memory LLM backend unavailable; releasing memory run for retry"
             );
             store
                 .release_run(run_id)
@@ -1622,12 +1675,23 @@ where
                 Err(error) => report.status_error = Some(error.to_string()),
             }
             // Pipeline jobs exist only while ticks keep scheduling them, so a tick
-            // deferred by an embedder outage keeps one queued for the retry.
-            if processed.deferred {
+            // deferred by a backend outage keeps exactly one job queued, delayed by the
+            // retry interval: the pipeline probes the backend instead of every worker
+            // spinning on claims. A productive probe ramps it back up.
+            if processed.deferred
+                && queue.queue_depth(
+                    MEMORY_CONSOLIDATION_QUEUE_NAME,
+                    openplotva_taskman::LOWEST_PRIORITY,
+                ) == 0
+            {
                 report.scheduled_followup = true;
-                report.followup_job_id = Some(queue.assign(
+                report.followup_job_id = Some(queue.assign_with_schedule(
                     MEMORY_CONSOLIDATION_QUEUE_NAME,
                     new_memory_consolidation_job_at(now),
+                    TaskQueueSchedule {
+                        available_at: Some(now + MEMORY_CONSOLIDATION_BACKEND_RETRY_INTERVAL),
+                        ..TaskQueueSchedule::default()
+                    },
                 ));
             }
             if processed.processed {
@@ -1712,7 +1776,7 @@ where
                 ).await;
                 tracing::debug!(?tick, "memory-consolidation taskman worker tick");
                 pause = if tick.deferred {
-                    MEMORY_CONSOLIDATION_EMBEDDER_RETRY_INTERVAL
+                    MEMORY_CONSOLIDATION_BACKEND_RETRY_INTERVAL
                 } else {
                     cfg.interval
                 };
@@ -4915,6 +4979,7 @@ mod tests {
         assert_eq!(merger.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    use openplotva_llm::aifarm::AifarmClientError;
     use openplotva_storage::pg_embedding_vector;
     use std::sync::Mutex;
 
@@ -5313,6 +5378,59 @@ mod tests {
                 self.inputs.lock().expect("inputs").push(input.clone());
                 Ok(self.output.clone())
             })
+        }
+    }
+
+    struct FailingExtractor {
+        error: fn() -> RoutedMemoryExtractorError,
+    }
+
+    impl MemoryExtractor for FailingExtractor {
+        type Error = RoutedMemoryExtractorError;
+
+        fn extract<'a>(
+            &'a self,
+            _input: &'a ExtractInput,
+        ) -> MemoryExtractorFuture<'a, Self::Error> {
+            Box::pin(async move { Err((self.error)()) })
+        }
+    }
+
+    fn aifarm_completion_error(error: AifarmClientError) -> RoutedMemoryExtractorError {
+        RoutedMemoryExtractorError::Aifarm(AifarmMemoryExtractorError::Completion {
+            source: Box::new(error),
+        })
+    }
+
+    fn gpu2_unreachable() -> RoutedMemoryExtractorError {
+        aifarm_completion_error(AifarmClientError::BackendUnavailable(
+            "UPSTREAM_ERROR: [Errno -3] Temporary failure in name resolution".to_owned(),
+        ))
+    }
+
+    fn gpu2_timed_out() -> RoutedMemoryExtractorError {
+        aifarm_completion_error(AifarmClientError::Upstream(
+            "UPSTREAM_TIMEOUT: read timed out".to_owned(),
+        ))
+    }
+
+    fn one_message_run_store(run_id: i64) -> FakeMemoryWriteStore {
+        FakeMemoryWriteStore {
+            run: Mutex::new(Some(openplotva_memory::Run {
+                id: run_id,
+                chat_id: 42,
+                prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+                message_count: 1,
+                ..openplotva_memory::Run::default()
+            })),
+            messages: Mutex::new(vec![openplotva_memory::Message {
+                entry_id: "msg:1".to_owned(),
+                message_id: 1,
+                text: "Alice likes Rust".to_owned(),
+                occurred_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+                ..openplotva_memory::Message::default()
+            }]),
+            ..FakeMemoryWriteStore::default()
         }
     }
 
@@ -6378,6 +6496,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn llm_backend_unavailable_covers_unreachable_backends_and_closed_routes() {
+        type WriteError = MemoryExtractionWriteError<RoutedMemoryExtractorError, TestStoreError>;
+        let extract = |source| WriteError::Extract { source };
+
+        for source in [
+            gpu2_unreachable(),
+            aifarm_completion_error(AifarmClientError::Transport(
+                "error sending request for url".to_owned(),
+            )),
+            aifarm_completion_error(AifarmClientError::Upstream(
+                "upstream returned status 503: The model is still loading. Retry shortly."
+                    .to_owned(),
+            )),
+            aifarm_completion_error(AifarmClientError::Upstream(
+                "service capacity unavailable".to_owned(),
+            )),
+            RoutedMemoryExtractorError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::NoCandidates,
+                "workflow route has no eligible candidates",
+            )),
+            RoutedMemoryExtractorError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::Exhausted,
+                "routed attempts exhausted",
+            )),
+        ] {
+            let error = extract(source);
+            assert!(error.is_llm_backend_unavailable(), "{error}");
+        }
+
+        for source in [
+            gpu2_timed_out(),
+            aifarm_completion_error(AifarmClientError::Upstream("dialog job failed".to_owned())),
+            RoutedMemoryExtractorError::Aifarm(AifarmMemoryExtractorError::Response(
+                "memory extractor returned empty content".to_owned(),
+            )),
+            RoutedMemoryExtractorError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::DeadlineExceeded,
+                "routed attempt exceeded the caller deadline",
+            )),
+        ] {
+            let error = extract(source);
+            assert!(!error.is_llm_backend_unavailable(), "{error}");
+        }
+        assert!(
+            !WriteError::StoreCards {
+                source: TestStoreError
+            }
+            .is_llm_backend_unavailable(),
+            "store failures are never an LLM outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_next_memory_run_releases_run_when_llm_backend_is_unreachable() {
+        let store = one_message_run_store(12);
+        let extractor = FailingExtractor {
+            error: gpu2_unreachable,
+        };
+
+        let report = process_next_memory_run(
+            &extractor,
+            &store,
+            Option::<&FakeEmbedder>::None,
+            MemoryRunProcessConfig {
+                max_messages_per_run: 10,
+                episode_model: "model".to_owned(),
+                ..MemoryRunProcessConfig::default()
+            },
+        )
+        .await
+        .expect("an LLM outage is not a run failure");
+
+        assert!(
+            report.deferred,
+            "the pipeline backs off until the backend returns"
+        );
+        assert_eq!(store.released.lock().expect("released").as_slice(), &[12]);
+        assert!(
+            store.failed.lock().expect("failed").is_empty(),
+            "an LLM outage must not burn the run's retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_next_memory_run_spends_an_attempt_when_the_backend_answered_badly() {
+        let store = one_message_run_store(13);
+        let extractor = FailingExtractor {
+            error: gpu2_timed_out,
+        };
+
+        let result = process_next_memory_run(
+            &extractor,
+            &store,
+            Option::<&FakeEmbedder>::None,
+            MemoryRunProcessConfig {
+                max_messages_per_run: 10,
+                episode_model: "model".to_owned(),
+                ..MemoryRunProcessConfig::default()
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MemoryRunProcessError::Process { run_id: 13, .. })
+        ));
+        assert!(store.released.lock().expect("released").is_empty());
+        assert_eq!(
+            store.failed.lock().expect("failed").as_slice(),
+            &[(
+                13,
+                "extract memory batch: generate memory extraction: UPSTREAM_TIMEOUT: read timed out"
+                    .to_owned()
+            )]
+        );
+    }
+
     #[tokio::test]
     async fn process_next_memory_run_selects_by_token_budget_and_adds_context() {
         let run = openplotva_memory::Run {
@@ -6903,6 +7139,80 @@ mod tests {
         assert_eq!(
             queue.record(2).expect("followup job").status,
             openplotva_taskman::JobStatus::Pending
+        );
+        assert!(
+            queue
+                .dequeue(
+                    openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+                    "memory-consolidation-worker-1",
+                    now,
+                )
+                .is_none(),
+            "the followup waits out the retry interval"
+        );
+        assert!(
+            queue
+                .dequeue(
+                    openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+                    "memory-consolidation-worker-1",
+                    now + MEMORY_CONSOLIDATION_BACKEND_RETRY_INTERVAL,
+                )
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_taskman_pipeline_collapses_to_one_probe_during_an_llm_outage() {
+        let now = utc_test_time(3, 17);
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        for _ in 0..3 {
+            queue.assign(
+                openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+                openplotva_taskman::new_memory_consolidation_job_at(now),
+            );
+        }
+        let extractor = FailingExtractor {
+            error: gpu2_unreachable,
+        };
+
+        let mut followups = Vec::new();
+        for worker in 0..3 {
+            let store = one_message_run_store(100 + worker);
+            let report = process_memory_consolidation_taskman_job_once_at(
+                &queue,
+                &extractor,
+                &store,
+                Option::<&FakeEmbedder>::None,
+                MemoryRunProcessConfig {
+                    max_messages_per_run: 10,
+                    episode_model: "model".to_owned(),
+                    ..MemoryRunProcessConfig::default()
+                },
+                &format!("memory-consolidation-worker-{worker}"),
+                4,
+                now,
+            )
+            .await;
+            assert!(report.deferred);
+            assert!(
+                !report.failed,
+                "an outage completes the job, it does not fail it"
+            );
+            assert_eq!(store.released.lock().expect("released").len(), 1);
+            followups.extend(report.followup_job_id);
+        }
+
+        assert_eq!(
+            followups.len(),
+            1,
+            "only the last deferral, with nothing else queued, keeps a probe"
+        );
+        assert_eq!(
+            queue.queue_depth(
+                openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+                openplotva_taskman::LOWEST_PRIORITY,
+            ),
+            1
         );
     }
 

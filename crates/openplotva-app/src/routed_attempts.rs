@@ -842,7 +842,7 @@ pub struct RoutedRoutingError {
 }
 
 impl RoutedRoutingError {
-    fn new(kind: RoutedRoutingErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: RoutedRoutingErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -1648,6 +1648,60 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == "circuit_open_exhaustion")
+        );
+    }
+
+    /// Whether six consecutive failures of the only candidate with `error` open its
+    /// circuit and queue the owner's routing incident report.
+    async fn outage_reaches_admin_report(
+        error: fn() -> openplotva_llm::aifarm::AifarmClientError,
+    ) -> bool {
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(64),
+            None,
+            Some(Arc::new(tokio::sync::Notify::new())),
+        );
+        let walker =
+            walker_with_breakers(snapshot(json!({}), json!({})), Arc::new(BreakerSet::new()))
+                .with_reporter(reporter.clone());
+        for _ in 0..6 {
+            let result = walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "dialog".to_owned(),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |_attempt| async move {
+                        Err::<&str, openplotva_llm::aifarm::CompletionError>(Box::new(error()))
+                    },
+                    |error| openplotva_llm::retry::retryable_reason(&**error),
+                )
+                .await;
+            assert!(result.is_err());
+        }
+        reporter.buffer().routing_events(64).iter().any(|event| {
+            event.event_type == "circuit_open_exhaustion"
+                && event.detail["admin_report"]["action"] == "aggregated"
+        })
+    }
+
+    #[tokio::test]
+    async fn unreachable_discovery_backend_opens_the_circuit_and_reaches_the_owner() {
+        use openplotva_llm::aifarm::AifarmClientError;
+
+        assert!(
+            outage_reaches_admin_report(|| AifarmClientError::BackendUnavailable(
+                "UPSTREAM_ERROR: [Errno -3] Temporary failure in name resolution".to_owned(),
+            ))
+            .await
+        );
+        // What the bot saw for 30 h on 2026-11-05/06: a generic failure is not
+        // retryable, never charges the breaker, and so never reaches the owner.
+        assert!(
+            !outage_reaches_admin_report(|| AifarmClientError::Upstream(
+                "dialog job failed".to_owned()
+            ))
+            .await
         );
     }
 

@@ -123,10 +123,13 @@ pub fn retryable_reason(err: &(dyn Error + 'static)) -> Option<FailureReason> {
     if let Some(provider_error) = find_provider_error(err) {
         return Some(provider_error.reason());
     }
-    // reqwest transport failures (connect, TLS, mid-body disconnects) stringify
-    // in ways the message rules can't enumerate; the typed variant is authoritative.
-    if let Some(crate::aifarm::AifarmClientError::Transport(_)) =
-        find_error::<crate::aifarm::AifarmClientError>(err)
+    // reqwest transport failures (connect, TLS, mid-body disconnects) and Discovery's
+    // unreachable-backend codes stringify in ways the message rules can't enumerate;
+    // the typed variants are authoritative.
+    if let Some(
+        crate::aifarm::AifarmClientError::Transport(_)
+        | crate::aifarm::AifarmClientError::BackendUnavailable(_),
+    ) = find_error::<crate::aifarm::AifarmClientError>(err)
     {
         return Some(FailureReason::ProviderUnavailable);
     }
@@ -450,6 +453,20 @@ mod tests {
         // must classify reqwest transport failures.
         let err =
             crate::aifarm::AifarmClientError::Transport("tls handshake eof mid-frame".to_owned());
+
+        assert_eq!(
+            retryable_reason(&err),
+            Some(FailureReason::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn unreachable_discovery_backend_is_retryable_via_typed_source() {
+        // The DNS failure Discovery reported while ninfer-3090 was down matches no
+        // phrase rule; the typed variant alone must classify it.
+        let err = crate::aifarm::AifarmClientError::BackendUnavailable(
+            "UPSTREAM_ERROR: [Errno -3] Temporary failure in name resolution".to_owned(),
+        );
 
         assert_eq!(
             retryable_reason(&err),
