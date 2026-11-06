@@ -250,6 +250,9 @@ pub struct ChatMessageMeta {
     /// Explicit action recognized by the trusted message router.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_tool: String,
+    /// Verbatim request text of an explicit draw command, recognized by the trusted message router.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draw_request: String,
     /// Optional annotation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub annotation: String,

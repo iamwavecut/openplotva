@@ -929,6 +929,10 @@ pub(crate) fn canonical_dialog_job_params(
         && !requested_tool.is_empty()
     {
         message.meta.requested_tool = requested_tool.to_owned();
+        message.meta.draw_request = scheduled.meta["draw_request"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
     }
     let mut params = scheduled.clone();
     params.message_text = message.text;
@@ -1557,7 +1561,7 @@ mod context_artifact_tests {
                 user_full_name: "User".into(),
                 message_text: "draw a fish".into(),
                 original_text: original.into(),
-                meta: serde_json::json!({"requested_tool":"draw_image"}),
+                meta: serde_json::json!({"requested_tool":"draw_image","draw_request":"a fish"}),
                 max_output_tokens: 321,
                 thread_id: None,
             };
@@ -1571,6 +1575,10 @@ mod context_artifact_tests {
             );
             let input = dialog_input_from_job_params_at(&canonical, OffsetDateTime::UNIX_EPOCH);
             assert_eq!(input.message.meta.requested_tool, expected);
+            assert_eq!(
+                input.message.meta.draw_request,
+                if expected.is_empty() { "" } else { "a fish" }
+            );
             assert_eq!(input.message.text, text);
             assert_eq!(input.user.id, user_id);
         }

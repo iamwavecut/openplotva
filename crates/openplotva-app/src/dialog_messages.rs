@@ -1854,6 +1854,7 @@ where
         Some((
             "draw_api",
             format!("Requested tool: draw_api. Prompt: {}", parsed.rest_text),
+            parsed.rest_text.trim().to_owned(),
         ))
     } else if let Some(topic) = direct_song_shortcut_topic(
         message,
@@ -1868,6 +1869,7 @@ where
                 "Requested tool: generate_song. Topic: {}",
                 resolve_song_topic(message, &topic).unwrap_or_default()
             ),
+            String::new(),
         ))
     } else {
         direct_image_shortcut(
@@ -1881,6 +1883,7 @@ where
             DirectImageShortcut::Draw(prompt) => (
                 "draw_image",
                 format!("Requested tool: draw_image. Prompt: {prompt}"),
+                prompt,
             ),
             DirectImageShortcut::Edit(prompt) => (
                 "draw_image",
@@ -1891,11 +1894,13 @@ where
                         reply_context.as_ref().unwrap_or(&context)
                     )
                 ),
+                String::new(),
             ),
         })
     };
-    if let Some((tool, intent)) = intent {
+    if let Some((tool, intent, draw_request)) = intent {
         context.meta.requested_tool = tool.to_owned();
+        context.meta.draw_request = draw_request;
         context.meta.annotation.push_str(&format!("\n{intent}"));
     }
 
@@ -6542,17 +6547,21 @@ mod tests {
     #[tokio::test]
     async fn content_shortcuts_enter_the_agent_with_explicit_intent()
     -> Result<(), Box<dyn std::error::Error>> {
-        for (text, tool) in [
-            ("!song neon rain", "generate_song"),
-            ("!song", "generate_song"),
-            ("/song@plotva_bot neon rain", "generate_song"),
-            ("@plotva_bot песня про море", "generate_song"),
-            ("!draw red fish", "draw_image"),
-            ("@plotva_bot нарисуй рыбу", "draw_image"),
-            ("@plotva_bot пожалуйста, нарисуй рыбу", "draw_image"),
-            ("@plotva_bot можешь нарисовать рыбу", "draw_image"),
-            ("@plotva_bot сгенерируй картинку рыбы", "draw_image"),
-            ("@plotva_bot % red fish", "draw_api"),
+        for (text, tool, draw_request) in [
+            ("!song neon rain", "generate_song", ""),
+            ("!song", "generate_song", ""),
+            ("/song@plotva_bot neon rain", "generate_song", ""),
+            ("@plotva_bot песня про море", "generate_song", ""),
+            ("!draw red fish", "draw_image", "red fish"),
+            ("@plotva_bot нарисуй рыбу", "draw_image", "рыбу"),
+            ("@plotva_bot пожалуйста, нарисуй рыбу", "draw_image", "рыбу"),
+            ("@plotva_bot можешь нарисовать рыбу", "draw_image", "рыбу"),
+            (
+                "@plotva_bot сгенерируй картинку рыбы",
+                "draw_image",
+                "картинку рыбы",
+            ),
+            ("@plotva_bot % red fish", "draw_api", "red fish"),
         ] {
             let scheduler = SchedulerStub::default();
             let route = handle_dialog_message_update_or_else(
@@ -6572,6 +6581,7 @@ mod tests {
             );
             assert_eq!(scheduler.calls().len(), 1, "{text}");
             assert_eq!(scheduler.metas()[0].requested_tool, tool, "{text}");
+            assert_eq!(scheduler.metas()[0].draw_request, draw_request, "{text}");
             assert!(
                 scheduler.metas()[0].annotation.contains(tool),
                 "{text}: {:?}",
@@ -6601,6 +6611,7 @@ mod tests {
         );
         let metas = scheduler.metas();
         assert_eq!(metas[0].requested_tool, "");
+        assert_eq!(metas[0].draw_request, "");
         assert!(!metas[0].annotation.contains("draw_api"), "{metas:?}");
         Ok(())
     }
