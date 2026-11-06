@@ -627,6 +627,38 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_calls_rule_appears_only_when_tools_are_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let render_mode = |tool_mode: &str, has_tools: bool| {
+            render(
+                "aifarm/system",
+                &serde_json::json!({
+                    "toolMode": tool_mode,
+                    "hasTools": has_tools,
+                    "locale": "ru",
+                }),
+            )
+        };
+        let rules = [
+            "Вызывай их только через native tool_calls, никогда не текстом ответа",
+            "никогда не пиши вызов инструмента текстом ответа",
+            "Tool call существует только как native-вызов",
+            "Ставь реакцию только native-вызовом react_to_message",
+        ];
+
+        let native = render_mode("native", true)?;
+        for rule in rules {
+            assert!(native.contains(rule), "missing: {rule}");
+        }
+        let none = render_mode("none", false)?;
+        for rule in rules {
+            assert!(!none.contains(rule), "tool-less prompt has: {rule}");
+        }
+        assert!(none.contains("OpenAI tools в этом запросе недоступны"));
+        Ok(())
+    }
+
+    #[test]
     fn render_messages_preserves_dotprompt_roles() -> Result<(), Box<dyn std::error::Error>> {
         let messages = render_messages(
             "music/song_director",
