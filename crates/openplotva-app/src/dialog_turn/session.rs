@@ -636,6 +636,7 @@ where
                 ) {
                     tool_context.message_id = message["message_id"].as_i64().and_then(|id| i32::try_from(id).ok()).unwrap_or(tool_context.message_id);
                     tool_context.message_meta.requested_tool = message["meta"]["requested_tool"].as_str().unwrap_or_default().to_owned();
+                    tool_context.message_meta.draw_request = message["meta"]["draw_request"].as_str().unwrap_or_default().to_owned();
                     requested_tool_call_offset = recorded_tool_calls.len();
                     if let Some(text) = message["text"].as_str() { tool_context.message_text = text.to_owned(); }
                 }
@@ -660,6 +661,7 @@ where
                     ) {
                     tool_context.message_id = params.message_id;
                     tool_context.message_meta.requested_tool = params.meta["requested_tool"].as_str().unwrap_or_default().to_owned();
+                    tool_context.message_meta.draw_request = params.meta["draw_request"].as_str().unwrap_or_default().to_owned();
                     requested_tool_call_offset = recorded_tool_calls.len();
                     tool_context.message_text = if params.original_text.trim().is_empty() { params.message_text.clone() } else { params.original_text.clone() };
                 }

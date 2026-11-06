@@ -15,7 +15,7 @@ pub mod tool_telemetry;
 pub mod transcript;
 pub mod turn;
 
-pub use dispatch::dispatch_dialog_tool;
+pub use dispatch::{VERBATIM_DRAW_CAPTION_MAX_WORDS, dispatch_dialog_tool, verbatim_draw_caption};
 pub use leak_guard::{DialogLeak, ReplyLeakGuard, ReplyLeakGuardBuilder};
 
 pub use history::{
