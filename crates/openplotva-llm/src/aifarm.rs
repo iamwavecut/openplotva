@@ -7158,12 +7158,14 @@ mod tests {
     }
 
     fn prompt_store_with(files: &[(&str, &str)]) -> Arc<openplotva_prompts::PromptStore> {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let directory_id = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "openplotva-aifarm-prompts-{}-{nonce}",
+            "openplotva-aifarm-prompts-{}-{nonce}-{directory_id}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create prompt root");

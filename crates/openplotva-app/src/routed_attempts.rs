@@ -425,7 +425,8 @@ impl RoutedAttemptWalker {
                             }
                         }
                     }
-                    let routed = RoutedAttempt {
+                    let mut routed = RoutedAttempt {
+                        protocol: provider.and_then(|row| row.resolved_protocol()),
                         provider_id: attempt.provider,
                         model_id: attempt.model,
                         provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
@@ -457,6 +458,8 @@ impl RoutedAttemptWalker {
                             .unwrap_or_else(|| attempt.overrides.clone()),
                         variant: attempt.variant.clone(),
                     };
+                    routed.model_name =
+                        crate::provider_transport::transport_model_for_attempt(&routed);
                     attempted_targets.insert((routed.provider_id, routed.model_id));
                     last_provider_model = Some((routed.provider_id, routed.model_id));
                     if first_execution {
@@ -770,6 +773,7 @@ pub struct RoutedRequestContext {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutedAttempt {
+    pub protocol: Option<openplotva_llm::provider_schema::Protocol>,
     pub provider_id: i64,
     pub model_id: i64,
     pub provider_name: String,
@@ -789,6 +793,38 @@ pub struct RoutedAttempt {
 }
 
 impl RoutedAttempt {
+    pub(crate) fn endpoint(&self) -> Option<&str> {
+        self.model_base_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(self.provider_endpoint.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub(crate) fn discovery_names(&self) -> (Option<&str>, Option<&str>) {
+        let names = [
+            ("service_name", self.discovery_service_name.as_deref()),
+            ("endpoint_name", self.discovery_endpoint_name.as_deref()),
+        ]
+        .map(|(key, configured)| {
+            let nonempty = |value: &str| !value.trim().is_empty();
+            self.model_config
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| nonempty(value))
+                .or(configured.filter(|value| nonempty(value)))
+                .or_else(|| {
+                    self.provider_config
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .filter(|value| nonempty(value))
+                })
+                .map(str::trim)
+        });
+        (names[0], names[1])
+    }
+
     #[must_use]
     pub fn supports_message_name(&self) -> bool {
         self.provider_config

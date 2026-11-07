@@ -15,6 +15,21 @@ use crate::{
     telegram_projection::apply_projection_batch_in_transaction,
 };
 
+pub async fn delivery_schema_ready(pool: &PgPool) -> Result<bool, StorageError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT to_regclass('public.telegram_update_inbox') IS NOT NULL \
+                AND to_regclass('public.telegram_update_quarantine') IS NOT NULL \
+                AND to_regclass('public.telegram_update_attempts') IS NOT NULL \
+                AND to_regclass('public.telegram_update_lanes') IS NOT NULL \
+                AND to_regclass('public.telegram_update_startup_jobs') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox_attempts') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox_blobs') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Conservative bind budget below PostgreSQL's protocol limit.
 pub const POSTGRES_MATERIALIZATION_BIND_BUDGET: usize = 60_000;
 /// Number of parameters emitted for one inbox row.

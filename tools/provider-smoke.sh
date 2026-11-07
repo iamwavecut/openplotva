@@ -26,7 +26,7 @@ Optional env:
   OPENPLOTVA_PROVIDER_SMOKE_LOOPBACK          auto, 1, or 0; default auto runs selected live-shaped fake provider smokes when live inputs are absent
   SERPER_API_KEY                               Serper API key for live smoke
   GOOGLEAI_KEY                                 Gemini direct/provider smoke key
-  OPENROUTER_KEY                               OpenRouter GenKit-compatible dialog smoke key
+  OPENROUTER_KEY                               OpenRouter dialog smoke key
   OPENPLOTVA_SERPER_SMOKE_QUERY               live Serper search query
   OPENPLOTVA_PROVIDER_SMOKE_TELEGRAM          run Telegram getMe smoke when BOT_KEY is set, default 1
   OPENPLOTVA_PROVIDER_SMOKE_TELEGRAM_MEMBERSHIP
@@ -88,10 +88,6 @@ provider_loopback_enabled() {
       exit 2
       ;;
   esac
-}
-
-google_ai_key_source_present() {
-  [[ -n "${GOOGLEAI_KEY:-}" || -n "${GOOGLEAI_KEY_STATS_FILE:-}" ]]
 }
 
 validate_auto_mode() {
@@ -296,12 +292,11 @@ run_llm_provider_contract_smoke() {
 }
 
 run_genkit_openai_compatible_contract_smoke() {
-  echo "+ offline GenKit OpenRouter compatibility smokes"
-  cargo test -p openplotva-app genkit_openai_compatible -- --nocapture
-  cargo test -p openplotva-app genkit_dialog_provider_factory_builds_openrouter_plugin_route -- --nocapture
-  cargo test -p openplotva-app genkit_dialog_provider_factory_preserves_go_google_key_requirement_for_plugin_routes -- --nocapture
-  cargo test -p openplotva-app provider_media_genkit_fallback_routes -- --nocapture
-  cargo test -p openplotva-app provider_youtube_config_routes -- --nocapture
+  echo "+ offline provider routing contracts"
+  cargo test -p openplotva-app provider_transport::tests:: -- --nocapture
+  cargo test -p openplotva-app factory_respects_explicit_openai_protocol_on_a_google_named_provider -- --nocapture
+  cargo test -p openplotva-app media::tests:: -- --nocapture
+  cargo test -p openplotva-app youtube::tests:: -- --nocapture
 }
 
 run_gemini_live_smoke() {
@@ -339,15 +334,7 @@ run_openrouter_live_smoke() {
     echo "+ skip OpenRouter live smoke: OPENROUTER_KEY not set"
     return
   fi
-  if ! google_ai_key_source_present; then
-    if [[ "$mode" == "1" ]]; then
-      echo "GOOGLEAI_KEY or GOOGLEAI_KEY_STATS_FILE is required by the configured GenKit plugin route" >&2
-      exit 1
-    fi
-    echo "+ skip OpenRouter live smoke: Google AI key source not set"
-    return
-  fi
-  echo "+ live OpenRouter GenKit-compatible dialog smoke"
+  echo "+ live OpenRouter routed dialog smoke"
   cargo test -p openplotva-app live_genkit_openrouter_dialog_smoke_completes_minimal_prompt \
     -- --ignored --nocapture
 }

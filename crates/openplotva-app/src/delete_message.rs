@@ -1,6 +1,15 @@
 //! App-level generic callback message deletion behavior.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+#[cfg(test)]
+use crate::callbacks::DeleteEffectFuture;
+#[cfg(test)]
+use crate::callbacks::DeleteMemberFuture;
+use crate::callbacks::{
+    DeleteCallbackEffects, DeleteMemberApi, telegram_member_can_delete, try_execute_delete_method,
+};
+#[cfg(test)]
+use openplotva_telegram::TelegramOutboundMethod;
+use std::{fmt, future::Future, sync::Arc};
 
 use carapax::types::{
     CallbackQuery as TelegramCallbackQuery, ChatMember as TelegramChatMember,
@@ -8,8 +17,7 @@ use carapax::types::{
 };
 use openplotva_telegram::{
     CallbackActionParse, CallbackAnswerRequest, ChatRef, DeleteMessageRequest,
-    TelegramOutboundMethod, build_callback_answer_method, build_delete_message_method,
-    build_get_chat_member_method, parse_callback_action,
+    build_callback_answer_method, build_delete_message_method, parse_callback_action,
 };
 use thiserror::Error;
 
@@ -17,63 +25,6 @@ use crate::updates::UpdateHandler;
 
 const DELETE_CALLBACK_ACTION: &str = "delete";
 const DELETE_CALLBACK_UNAUTHORIZED_TEXT: &str = "Я подчинюсь только автору или администраторам.";
-
-/// Boxed future returned by Telegram membership APIs.
-pub type DeleteMessageMemberFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<TelegramChatMember, E>> + Send + 'a>>;
-
-pub trait DeleteMessageMemberApi {
-    /// Concrete API error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Fetch one Telegram chat member.
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteMessageMemberFuture<'a, Self::Error>;
-}
-
-impl DeleteMessageMemberApi for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteMessageMemberFuture<'a, Self::Error> {
-        Box::pin(async move {
-            self.execute(build_get_chat_member_method(chat_id, user_id))
-                .await
-        })
-    }
-}
-
-/// Boxed future returned by delete callback effects.
-pub type DeleteMessageEffectFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-pub trait DeleteMessageEffects {
-    /// Concrete effect error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Execute one direct Telegram Bot API method.
-    fn execute_delete_message_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteMessageEffectFuture<'a, Self::Error>;
-}
-
-impl DeleteMessageEffects for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn execute_delete_message_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteMessageEffectFuture<'a, Self::Error> {
-        Box::pin(async move { method.execute_with(self).await.map(|_| ()) })
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeleteMessageCallbackTarget {
@@ -132,8 +83,8 @@ impl<MemberApi, Effects, Next> DeleteMessageCallbackUpdateHandler<MemberApi, Eff
 impl<MemberApi, Effects, Next> UpdateHandler
     for DeleteMessageCallbackUpdateHandler<MemberApi, Effects, Next>
 where
-    MemberApi: DeleteMessageMemberApi + Send + Sync,
-    Effects: DeleteMessageEffects + Send + Sync,
+    MemberApi: DeleteMemberApi + Send + Sync,
+    Effects: DeleteCallbackEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = DeleteMessageCallbackError;
@@ -163,8 +114,8 @@ pub async fn handle_delete_message_callback_update_or_else<
     handle_other: HandleFn,
 ) -> Result<DeleteMessageCallbackOutcome, DeleteMessageCallbackError>
 where
-    MemberApi: DeleteMessageMemberApi + Sync,
-    Effects: DeleteMessageEffects + Sync,
+    MemberApi: DeleteMemberApi + Sync,
+    Effects: DeleteCallbackEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
@@ -196,8 +147,8 @@ pub async fn handle_delete_message_callback<MemberApi, Effects>(
     query: &TelegramCallbackQuery,
 ) -> DeleteMessageCallbackOutcome
 where
-    MemberApi: DeleteMessageMemberApi + Sync,
-    Effects: DeleteMessageEffects + Sync,
+    MemberApi: DeleteMemberApi + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let Some(target) = delete_message_callback_target(query) else {
         try_answer_callback(
@@ -268,20 +219,7 @@ fn delete_callback_allows_delete(
     member: &TelegramChatMember,
 ) -> bool {
     target.reply_chat_id == target.message_chat.id
-        && (target.reply_author_user_id == Some(requester_id)
-            || telegram_member_can_delete_message(member))
-}
-
-#[must_use]
-pub fn telegram_member_can_delete_message(member: &TelegramChatMember) -> bool {
-    match member {
-        TelegramChatMember::Creator(_) => true,
-        TelegramChatMember::Administrator(admin) => admin.can_delete_messages,
-        TelegramChatMember::Kicked(_)
-        | TelegramChatMember::Left(_)
-        | TelegramChatMember::Member { .. }
-        | TelegramChatMember::Restricted(_) => false,
-    }
+        && (target.reply_author_user_id == Some(requester_id) || telegram_member_can_delete(member))
 }
 
 fn is_delete_message_callback(query: &TelegramCallbackQuery) -> bool {
@@ -326,7 +264,7 @@ async fn try_answer_callback<Effects>(
     cache_time: i64,
     context: &'static str,
 ) where
-    Effects: DeleteMessageEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let request = CallbackAnswerRequest {
         callback_query_id: query_id.to_owned(),
@@ -335,7 +273,7 @@ async fn try_answer_callback<Effects>(
         url: String::new(),
         cache_time,
     };
-    try_execute_delete_message_method(
+    try_execute_delete_method(
         effects,
         build_callback_answer_method(&request).into(),
         context,
@@ -349,32 +287,14 @@ async fn try_delete_message<Effects>(
     message_id: i64,
     context: &'static str,
 ) where
-    Effects: DeleteMessageEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_delete_message_method(&DeleteMessageRequest {
         chat_id,
         message_id,
     }) {
-        Ok(method) => try_execute_delete_message_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete callback method"),
-    }
-}
-
-async fn try_execute_delete_message_method<Effects>(
-    effects: &Effects,
-    method: TelegramOutboundMethod,
-    context: &'static str,
-) where
-    Effects: DeleteMessageEffects + Sync,
-{
-    let method_name = method.method_name();
-    if let Err(error) = effects.execute_delete_message_method(method).await {
-        tracing::warn!(
-            message = %error,
-            method = method_name,
-            context,
-            "generic delete callback Telegram side effect failed"
-        );
     }
 }
 
@@ -671,9 +591,9 @@ mod tests {
 
     #[test]
     fn delete_message_member_permission_matches_go_rights() {
-        assert!(telegram_member_can_delete_message(&creator(1)));
-        assert!(telegram_member_can_delete_message(&deleting_admin(2)));
-        assert!(!telegram_member_can_delete_message(&member(3)));
+        assert!(telegram_member_can_delete(&creator(1)));
+        assert!(telegram_member_can_delete(&deleting_admin(2)));
+        assert!(!telegram_member_can_delete(&member(3)));
     }
 
     #[derive(Default)]
@@ -695,14 +615,14 @@ mod tests {
         }
     }
 
-    impl DeleteMessageMemberApi for MemberApiStub {
+    impl DeleteMemberApi for MemberApiStub {
         type Error = io::Error;
 
         fn get_chat_member<'a>(
             &'a self,
             chat_id: i64,
             user_id: i64,
-        ) -> DeleteMessageMemberFuture<'a, Self::Error> {
+        ) -> DeleteMemberFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.calls
                     .lock()
@@ -732,13 +652,13 @@ mod tests {
         }
     }
 
-    impl DeleteMessageEffects for EffectsStub {
+    impl DeleteCallbackEffects for EffectsStub {
         type Error = io::Error;
 
-        fn execute_delete_message_method<'a>(
+        fn execute_delete_method<'a>(
             &'a self,
             method: TelegramOutboundMethod,
-        ) -> DeleteMessageEffectFuture<'a, Self::Error> {
+        ) -> DeleteEffectFuture<'a, Self::Error> {
             Box::pin(async move {
                 let name = method.method_name().to_owned();
                 let payload = method_payload(method)?;

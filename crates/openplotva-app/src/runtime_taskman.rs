@@ -929,7 +929,8 @@ fn count_processing(records: &[&TaskQueueRecord], queue_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payments::{PaymentControlJobQueue, PersistentPaymentControlJobQueue};
+
+    use crate::control_jobs::{ControlJobQueue, PersistentControlJobQueue};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, DialogJobParams,
         HIGH_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, ImageGenJobParams, InMemoryTaskQueue,
@@ -962,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_taskman_inspector_lists_live_persistent_control_queue() {
         let shared = Arc::new(InMemoryTaskQueue::new());
-        let queue = PersistentPaymentControlJobQueue::from_task_queue((*shared).clone());
+        let queue = PersistentControlJobQueue::from_task_queue((*shared).clone());
         let created = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("created");
         let job = new_control_job_at(
             ControlJobParams {
@@ -981,7 +982,7 @@ mod tests {
         .with_name("vip invoice")
         .with_priority(HIGH_PRIORITY);
         queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+            .assign_control_job(CONTROL_QUEUE_NAME, job)
             .await
             .expect("assign job");
 
@@ -1207,8 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_taskman_inspector_uses_one_manager_id_namespace() {
         let shared_queue = Arc::new(InMemoryTaskQueue::new());
-        let control_queue =
-            PersistentPaymentControlJobQueue::from_task_queue((*shared_queue).clone());
+        let control_queue = PersistentControlJobQueue::from_task_queue((*shared_queue).clone());
         let created = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("created");
         let control_job = new_control_job_at(
             ControlJobParams {
@@ -1225,7 +1225,7 @@ mod tests {
             created,
         );
         control_queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, control_job)
+            .assign_control_job(CONTROL_QUEUE_NAME, control_job)
             .await
             .expect("assign control job");
 

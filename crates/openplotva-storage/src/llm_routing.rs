@@ -976,9 +976,20 @@ fn routing_admin_report_state_from_row(
     })
 }
 
-/// Read the whole routing configuration in one REPEATABLE READ transaction so the
-/// five tables are seen at a single consistent snapshot, even while an admin write
-/// is committing concurrently.
+/// Serialize startup routing updates and keep their data and marker atomic.
+pub async fn begin_bootstrap_update(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'_, Postgres>, StorageError> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('openplotva:llm-routing-bootstrap', 0))",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    Ok(transaction)
+}
+
+/// Read routing tables from one REPEATABLE READ snapshot during concurrent admin writes.
 pub async fn load_snapshot(pool: &PgPool) -> Result<RoutingSnapshot, StorageError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -1037,7 +1048,9 @@ fn json_text(value: &Value) -> String {
     value.to_string()
 }
 
-pub async fn list_providers(pool: &PgPool) -> Result<Vec<ProviderRecord>, StorageError> {
+pub async fn list_providers(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+) -> Result<Vec<ProviderRecord>, StorageError> {
     sqlx::query(SQL_LIST_PROVIDERS)
         .fetch_all(pool)
         .await?
@@ -1055,7 +1068,10 @@ pub async fn get_provider(pool: &PgPool, id: i64) -> Result<Option<ProviderRecor
         .transpose()
 }
 
-pub async fn insert_provider(pool: &PgPool, input: &ProviderInput) -> Result<i64, StorageError> {
+pub async fn insert_provider(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+    input: &ProviderInput,
+) -> Result<i64, StorageError> {
     let row = sqlx::query(SQL_INSERT_PROVIDER)
         .bind(&input.name)
         .bind(&input.kind)
@@ -1074,7 +1090,7 @@ pub async fn insert_provider(pool: &PgPool, input: &ProviderInput) -> Result<i64
 }
 
 pub async fn update_provider(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     id: i64,
     input: &ProviderInput,
 ) -> Result<(), StorageError> {
@@ -1130,7 +1146,9 @@ pub async fn delete_provider(pool: &PgPool, id: i64) -> Result<(), StorageError>
     Ok(())
 }
 
-pub async fn list_models(pool: &PgPool) -> Result<Vec<ModelRecord>, StorageError> {
+pub async fn list_models(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+) -> Result<Vec<ModelRecord>, StorageError> {
     sqlx::query(SQL_LIST_MODELS)
         .fetch_all(pool)
         .await?
@@ -1139,7 +1157,10 @@ pub async fn list_models(pool: &PgPool) -> Result<Vec<ModelRecord>, StorageError
         .collect()
 }
 
-pub async fn insert_model(pool: &PgPool, input: &ModelInput) -> Result<i64, StorageError> {
+pub async fn insert_model(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+    input: &ModelInput,
+) -> Result<i64, StorageError> {
     let row = sqlx::query(SQL_INSERT_MODEL)
         .bind(input.provider_id)
         .bind(&input.model_name)
@@ -1155,7 +1176,11 @@ pub async fn insert_model(pool: &PgPool, input: &ModelInput) -> Result<i64, Stor
     Ok(row.try_get::<i64, _>("id")?)
 }
 
-pub async fn update_model(pool: &PgPool, id: i64, input: &ModelInput) -> Result<(), StorageError> {
+pub async fn update_model(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+    id: i64,
+    input: &ModelInput,
+) -> Result<(), StorageError> {
     sqlx::query(SQL_UPDATE_MODEL)
         .bind(id)
         .bind(input.provider_id)
@@ -1173,7 +1198,7 @@ pub async fn update_model(pool: &PgPool, id: i64, input: &ModelInput) -> Result<
 }
 
 pub async fn set_model_pool(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     id: i64,
     pool_id: Option<i64>,
 ) -> Result<(), StorageError> {
@@ -1188,7 +1213,7 @@ pub async fn set_model_pool(
 /// Attach every still-unpooled model of a provider to a pool. Backfill helper:
 /// never overwrites an operator-set pool.
 pub async fn attach_provider_models_to_pool_if_unpooled(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     provider_id: i64,
     pool_id: i64,
 ) -> Result<u64, StorageError> {
@@ -1203,7 +1228,7 @@ pub async fn attach_provider_models_to_pool_if_unpooled(
 /// Fill a provider's protocol only when unset. Backfill helper: never
 /// overwrites an operator-set protocol.
 pub async fn set_provider_protocol_if_null(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     id: i64,
     protocol: &str,
 ) -> Result<(), StorageError> {
@@ -1215,7 +1240,9 @@ pub async fn set_provider_protocol_if_null(
     Ok(())
 }
 
-pub async fn list_pools(pool: &PgPool) -> Result<Vec<PoolRecord>, StorageError> {
+pub async fn list_pools(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+) -> Result<Vec<PoolRecord>, StorageError> {
     sqlx::query(SQL_LIST_POOLS)
         .fetch_all(pool)
         .await?
@@ -1237,22 +1264,30 @@ pub async fn insert_pool(pool: &PgPool, input: &PoolInput) -> Result<i64, Storag
 
 /// Idempotent pool creation for seeds/backfills; returns the pool id whether it
 /// was just created or already existed.
-pub async fn insert_pool_if_missing(pool: &PgPool, input: &PoolInput) -> Result<i64, StorageError> {
+pub async fn insert_pool_if_missing<'a>(
+    pool: impl sqlx::Acquire<'a, Database = Postgres>,
+    input: &PoolInput,
+) -> Result<i64, StorageError> {
+    let mut connection = pool.acquire().await?;
     sqlx::query(SQL_INSERT_POOL_IF_MISSING)
         .bind(&input.name)
         .bind(input.max_concurrency)
         .bind(input.description.as_deref())
         .bind(input.config.to_string())
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
     let row = sqlx::query(SQL_GET_POOL_BY_NAME)
         .bind(&input.name)
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await?;
     Ok(row.try_get::<i64, _>("id")?)
 }
 
-pub async fn update_pool(pool: &PgPool, id: i64, input: &PoolInput) -> Result<(), StorageError> {
+pub async fn update_pool(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+    id: i64,
+    input: &PoolInput,
+) -> Result<(), StorageError> {
     sqlx::query(SQL_UPDATE_POOL)
         .bind(id)
         .bind(&input.name)
@@ -1302,7 +1337,7 @@ pub async fn list_workflows(pool: &PgPool) -> Result<Vec<WorkflowRecord>, Storag
 }
 
 pub async fn insert_workflow_if_missing(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     key: &str,
     kind: &str,
     full_routing: bool,
@@ -1354,7 +1389,9 @@ pub async fn set_workflow_enabled(
     Ok(())
 }
 
-pub async fn list_assignments(pool: &PgPool) -> Result<Vec<AssignmentRecord>, StorageError> {
+pub async fn list_assignments(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+) -> Result<Vec<AssignmentRecord>, StorageError> {
     sqlx::query(SQL_LIST_ASSIGNMENTS)
         .fetch_all(pool)
         .await?
@@ -1364,7 +1401,7 @@ pub async fn list_assignments(pool: &PgPool) -> Result<Vec<AssignmentRecord>, St
 }
 
 pub async fn insert_assignment(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     input: &AssignmentInput,
 ) -> Result<i64, StorageError> {
     let row = sqlx::query(SQL_INSERT_ASSIGNMENT)
@@ -1385,7 +1422,7 @@ pub async fn insert_assignment(
 }
 
 pub async fn update_assignment(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
     id: i64,
     input: &AssignmentInput,
 ) -> Result<(), StorageError> {
@@ -1503,7 +1540,9 @@ pub async fn insert_trigger_with_assignment(
     Ok((assignment_id, trigger_id))
 }
 
-pub async fn list_triggers(pool: &PgPool) -> Result<Vec<TriggerRecord>, StorageError> {
+pub async fn list_triggers(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+) -> Result<Vec<TriggerRecord>, StorageError> {
     sqlx::query(SQL_LIST_TRIGGERS)
         .fetch_all(pool)
         .await?
@@ -1512,7 +1551,10 @@ pub async fn list_triggers(pool: &PgPool) -> Result<Vec<TriggerRecord>, StorageE
         .collect()
 }
 
-pub async fn insert_trigger(pool: &PgPool, input: &TriggerInput) -> Result<i64, StorageError> {
+pub async fn insert_trigger(
+    pool: impl sqlx::Executor<'_, Database = Postgres>,
+    input: &TriggerInput,
+) -> Result<i64, StorageError> {
     let row = sqlx::query(SQL_INSERT_TRIGGER)
         .bind(&input.workflow_key)
         .bind(&input.trigger_type)

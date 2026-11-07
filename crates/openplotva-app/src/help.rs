@@ -146,21 +146,21 @@ pub type HelpVirtualIdFactory = VirtualIdFactory;
 pub struct HelpDispatcherEffects<Next> {
     telegram: TelegramClient,
     delegated_next: Arc<Next>,
-    rich: Arc<dyn crate::rich::RichSender>,
+    delivery: Arc<crate::rich::RichOutbox>,
 }
 
 impl<Next> HelpDispatcherEffects<Next> {
-    /// Build help effects: rich private help + classic direct group redirect + delegation.
+    /// Build queued private help, group redirects, and private-start delegation.
     #[must_use]
     pub fn new(
         telegram: TelegramClient,
         delegated_next: Arc<Next>,
-        rich: Arc<dyn crate::rich::RichSender>,
+        delivery: Arc<crate::rich::RichOutbox>,
     ) -> Self {
         Self {
             telegram,
             delegated_next,
-            rich,
+            delivery,
         }
     }
 }
@@ -212,8 +212,17 @@ where
                     .as_ref()
                     .and_then(|markup| serde_json::to_value(markup).ok()),
             };
-            self.rich
-                .send_rich(chat_id, &plan.message.text, &options)
+            self.delivery
+                .enqueue(
+                    &format!("help:{chat_id}:{}", plan.reply_to.message_id),
+                    options.message_thread_id,
+                    openplotva_telegram::SendRichMessage {
+                        chat_id,
+                        html: plan.message.text,
+                        options,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|error| HelpDispatchEffectError::RichSend(error.to_string()))?;
             Ok(())
@@ -743,6 +752,99 @@ mod tests {
             json!(true)
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_help_and_vip_status_queue_prepared_payloads_by_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::payments::VipStatusEffects;
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let delivery = Arc::new(crate::rich::RichOutbox::new(
+            openplotva_storage::PostgresTelegramOutboxStore::new(pool.clone()),
+            7,
+        ));
+        let telegram =
+            openplotva_telegram::telegram_client_with_base_url("123:test", "http://127.0.0.1:1")?;
+        let help = HelpDispatcherEffects::new(
+            telegram.clone(),
+            Arc::new(UpdateHandlerStub::default()),
+            delivery.clone(),
+        );
+        let plan = private_help_plan(&bot(), &private_command("/help", 5)?);
+        help.send_help_text(plan.clone()).await?;
+        let mut replay = plan.clone();
+        replay.message.text = "changed help".into();
+        help.send_help_text(replay).await?;
+        let source = format!(
+            "help:{}:{}",
+            plan.reply_to.chat.id, plan.reply_to.message_id
+        );
+        let help_receipt = delivery.queued(&source, None).await?.expect("queued help");
+        assert!(!help_receipt.delivery_complete());
+        let saved: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&help_receipt.batch_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            saved["html"],
+            openplotva_telegram::format_rich_html(&plan.message.text)
+        );
+        assert_eq!(
+            saved["options"]["reply_to_message_id"],
+            plan.reply_to.message_id
+        );
+        let vip = crate::payments::RichPaymentEffects::new(telegram, delivery.clone());
+        let mut status = crate::payments::VipStatusMessage {
+            chat_id: 42,
+            reply_to_message_id: 101,
+            message_thread_id: None,
+            text: "✅ VIP active\n\n<b>Until tomorrow</b>".into(),
+            show_cancel_button: true,
+        };
+        vip.send_vip_status_message(status.clone()).await?;
+        status.text = "a newer status".into();
+        vip.send_vip_status_message(status.clone()).await?;
+        status.reply_to_message_id = 102;
+        vip.send_vip_status_message(status).await?;
+        let first = delivery
+            .queued("vip-status:42:101", None)
+            .await?
+            .expect("first command");
+        let next = delivery
+            .queued("vip-status:42:102", None)
+            .await?
+            .expect("next command");
+        assert_ne!(first.operation_ids, next.operation_ids);
+        let saved: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&first.batch_id)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            saved["html"]
+                .as_str()
+                .expect("VIP HTML")
+                .contains("VIP active")
+        );
+        assert_eq!(saved["options"]["reply_to_message_id"], 101);
+        assert_eq!(
+            saved["options"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            r#"{"action":"cancel_vip"}"#
+        );
+        let ids = vec![help_receipt.batch_id, first.batch_id, next.batch_id];
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = ANY($1)")
+            .bind(ids)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

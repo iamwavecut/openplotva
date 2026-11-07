@@ -380,8 +380,6 @@ pub const DEFAULT_HISTORY_SUMMARY_PROVIDER: &str = "aifarm";
 
 pub const DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS: i32 = 600;
 
-pub const DEFAULT_MEMORY_CONSOLIDATION_PROVIDER: &str = "aifarm";
-
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
 
 pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
@@ -1072,7 +1070,6 @@ pub struct AceStepConfig {
 pub struct MemoryConfig {
     pub enabled: bool,
     pub retention_hours: i32,
-    pub consolidation_provider: String,
     pub consolidation_model: String,
     pub consolidation_timeout_seconds: i32,
     pub worker_concurrency: i32,
@@ -1603,8 +1600,6 @@ pub struct RawConfig {
     pub memory_enabled: Option<String>,
     /// `MEMORY_RETENTION_HOURS`.
     pub memory_retention_hours: Option<String>,
-    /// `MEMORY_CONSOLIDATION_PROVIDER`.
-    pub memory_consolidation_provider: Option<String>,
     /// `MEMORY_CONSOLIDATION_MODEL`.
     pub memory_consolidation_model: Option<String>,
     /// `MEMORY_CONSOLIDATION_TIMEOUT_SECONDS`.
@@ -2948,9 +2943,6 @@ impl AppConfig {
                     raw.memory_retention_hours,
                     168,
                 )?,
-                consolidation_provider: raw
-                    .memory_consolidation_provider
-                    .unwrap_or_else(|| DEFAULT_MEMORY_CONSOLIDATION_PROVIDER.to_owned()),
                 consolidation_model: raw
                     .memory_consolidation_model
                     .unwrap_or_else(|| DEFAULT_MEMORY_CONSOLIDATION_MODEL.to_owned()),
@@ -3468,7 +3460,6 @@ impl RawConfig {
             acestep_model: env("ACESTEP_MODEL"),
             memory_enabled: env("MEMORY_ENABLED"),
             memory_retention_hours: env("MEMORY_RETENTION_HOURS"),
-            memory_consolidation_provider: env("MEMORY_CONSOLIDATION_PROVIDER"),
             memory_consolidation_model: env("MEMORY_CONSOLIDATION_MODEL"),
             memory_consolidation_timeout_seconds: env("MEMORY_CONSOLIDATION_TIMEOUT_SECONDS"),
             memory_worker_concurrency: env("MEMORY_WORKER_CONCURRENCY"),
@@ -4276,7 +4267,6 @@ mod tests {
         assert_eq!(config.llm.history_summary.chat_history_retention_days, 8);
         assert_eq!(config.vision.telegram_files_retention_days, 7);
         assert_eq!(config.white_circle.whitecircle_checks_retention_days, 30);
-        assert_eq!(config.memory.consolidation_provider, "aifarm");
         assert_eq!(
             config.memory.consolidation_model,
             DEFAULT_MEMORY_CONSOLIDATION_MODEL
@@ -5029,7 +5019,6 @@ mod tests {
         let config = AppConfig::from_raw(RawConfig {
             memory_enabled: Some("false".to_owned()),
             memory_retention_hours: Some("240".to_owned()),
-            memory_consolidation_provider: Some("genkit".to_owned()),
             memory_consolidation_model: Some("memory-model".to_owned()),
             memory_consolidation_timeout_seconds: Some("777".to_owned()),
             memory_worker_concurrency: Some("2".to_owned()),
@@ -5065,7 +5054,6 @@ mod tests {
 
         assert!(!config.memory.enabled);
         assert_eq!(config.memory.retention_hours, 240);
-        assert_eq!(config.memory.consolidation_provider, "genkit");
         assert_eq!(config.memory.consolidation_model, "memory-model");
         assert_eq!(config.memory.consolidation_timeout_seconds, 777);
         assert_eq!(config.memory.worker_concurrency, 2);

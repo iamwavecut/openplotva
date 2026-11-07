@@ -26,6 +26,7 @@ tracing.workspace = true
 x509-parser = "0.18.1"
 
 [dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
 hex.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

@@ -1543,6 +1543,7 @@ fn banner_outbox_batch(
             .and_then(OutboundCommand::into_storage_parts)
             .map_err(|error| error.to_string())?;
     Ok(TelegramOutboxBatchInput {
+        content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
         batch_id: format!(
             "{GRADIUS_BANNER_BATCH_PREFIX}{bot_id}:{}",
             target.dialog_job_id
@@ -1550,7 +1551,7 @@ fn banner_outbox_batch(
         bot_id,
         chat_id: Some(target.chat_id),
         thread_id: target.thread_id,
-        ordering_key: crate::dialog_jobs::dialog_outbox_ordering_key(
+        ordering_key: crate::telegram_outbox::telegram_outbox_ordering_key(
             bot_id,
             target.chat_id,
             target.thread_id,
@@ -1596,9 +1597,9 @@ fn render_ad_tail(
 #[must_use]
 pub fn gradius_privacy_config(
     config: &openplotva_config::AppConfig,
-) -> openplotva_memory::DiscoveryRedactorConfig {
+) -> openplotva_llm::redaction::DiscoveryRedactorConfig {
     let memory = &config.memory;
-    openplotva_memory::DiscoveryRedactorConfig {
+    openplotva_llm::redaction::DiscoveryRedactorConfig {
         base_url: config.llm.discovery.base_url.clone(),
         service_name: memory.redaction_service_name.clone(),
         endpoint_name: memory.redaction_endpoint_name.clone(),
@@ -2146,7 +2147,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_rates_ads_keep_rich_table_and_separator_in_durable_outbox()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::rates::{RatesEffects, RatesTextPlan, RatesUtilityEffects};
+        use crate::rates::{RatesDelivery, RatesEffects, RatesTextPlan};
         use openplotva_storage::{
             PostgresTelegramOutboxStore, gradius_ads::PostgresGradiusAdStore,
         };
@@ -2167,8 +2168,11 @@ mod tests {
             Arc::new(PostgresGradiusAdStore::new(pool.clone())),
             Arc::new(VipStub(false)),
         ));
-        let rich = Arc::new(crate::rich::MockRichSender::default());
-        let effects = RatesUtilityEffects::new(rich.clone()).with_utility_ads(
+        let rich = Arc::new(crate::rich::RichOutbox::new(
+            PostgresTelegramOutboxStore::new(pool.clone()),
+            7,
+        ));
+        let effects = RatesDelivery::new(rich.clone()).with_utility_ads(
             ads,
             Arc::new(crate::gradius_utility_outbox::GradiusUtilityOutbox::new(
                 PostgresTelegramOutboxStore::new(pool.clone()),
@@ -2235,7 +2239,6 @@ mod tests {
                 .await?;
         }
         assert_eq!(client.calls.lock().expect("provider calls").len(), 2);
-        assert!(rich.sent.lock().expect("fallback calls").is_empty());
         Ok(())
     }
 

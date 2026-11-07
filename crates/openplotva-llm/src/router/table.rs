@@ -51,9 +51,105 @@ impl Kind {
     }
 }
 
+/// Interpret rows written before explicit protocols. Discovery-backed chat uses OpenAI payloads.
+#[must_use]
+pub fn legacy_provider_protocol(
+    kind: Kind,
+    name: &str,
+    has_discovery: bool,
+) -> crate::provider_schema::Protocol {
+    use crate::provider_schema::Protocol;
+    match kind {
+        Kind::Chat | Kind::Vision
+            if !has_discovery
+                && (name.eq_ignore_ascii_case("genkit") || name.eq_ignore_ascii_case("gemini")) =>
+        {
+            Protocol::Genkit
+        }
+        Kind::Chat | Kind::Vision => Protocol::OpenAiCompat,
+        Kind::Embedding => Protocol::DiscoveryJobs,
+        Kind::Image => Protocol::DiscoveryDraw,
+        Kind::Music => Protocol::AceStep,
+        Kind::PrivacyFilter => Protocol::PrivacyFilter,
+        Kind::Asr => Protocol::DiscoveryAsr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Kind;
+
+    #[test]
+    fn explicit_protocol_wins_over_provider_names_and_unknown_values_fail_closed() {
+        use super::ProviderRow;
+        use crate::provider_schema::Protocol;
+        let mut row = ProviderRow {
+            id: 1,
+            name: "genkit".into(),
+            kind: Kind::Chat,
+            protocol: None,
+            runtime_hint: None,
+            endpoint: None,
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            api_key_ref: None,
+            api_key_encrypted: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        assert_eq!(row.resolved_protocol(), Some(Protocol::Genkit));
+        row.protocol = Some("openai_compat".into());
+        assert_eq!(row.resolved_protocol(), Some(Protocol::OpenAiCompat));
+        row.name = "renamed-provider".into();
+        row.protocol = Some("genkit".into());
+        assert_eq!(row.resolved_protocol(), Some(Protocol::Genkit));
+        row.discovery_service_name = Some("llm-openai".into());
+        assert_eq!(row.resolved_protocol(), Some(Protocol::Genkit));
+        row.protocol = None;
+        assert_eq!(row.resolved_protocol(), Some(Protocol::OpenAiCompat));
+        row.protocol = Some("unknown".into());
+        assert_eq!(row.resolved_protocol(), None);
+        row.protocol = None;
+        row.kind = Kind::Asr;
+        assert_eq!(row.resolved_protocol(), Some(Protocol::DiscoveryAsr));
+    }
+
+    #[test]
+    fn legacy_protocol_classifies_seeded_providers() {
+        // (kind, name, has_discovery) -> protocol, over the exact seeded rows.
+        let cases = [
+            ("chat", "aifarm", true, "openai_compat"),
+            ("chat", "genkit", false, "genkit"),
+            ("chat", "GENKIT", false, "genkit"),
+            ("chat", "genkit", true, "openai_compat"),
+            ("vision", "gemini", true, "openai_compat"),
+            ("chat", "gemini", false, "genkit"),
+            ("chat", "vram-cloud", false, "openai_compat"),
+            ("chat", "openrouter", false, "openai_compat"),
+            ("chat", "nvidia", false, "openai_compat"),
+            ("chat", "vmlx", false, "openai_compat"),
+            ("chat", "aifarm-llamacpp-gpu2", true, "openai_compat"),
+            ("chat", "aifarm-maple", true, "openai_compat"),
+            ("vision", "aifarm-vision", true, "openai_compat"),
+            ("embedding", "aifarm-embed", true, "discovery_jobs"),
+            ("image", "aifarm-draw", true, "discovery_draw"),
+            ("music", "acestep", false, "acestep"),
+            ("privacy_filter", "privacy-filter", true, "privacy_filter"),
+            ("asr", "aifarm-asr", true, "discovery_asr"),
+        ];
+        for (kind, name, has_discovery, expected) in cases {
+            assert_eq!(
+                super::legacy_provider_protocol(
+                    Kind::from_db(kind).expect("kind"),
+                    name,
+                    has_discovery
+                )
+                .as_str(),
+                expected,
+                "provider {name} (kind {kind})"
+            );
+        }
+    }
 
     #[test]
     fn parses_asr_kind_from_database_value() {
@@ -169,6 +265,22 @@ pub struct ProviderRow {
     pub api_key_encrypted: Option<Vec<u8>>,
     pub enabled: bool,
     pub config: Value,
+}
+
+impl ProviderRow {
+    /// Explicit protocols win. Name inference exists only for rows written before protocols.
+    #[must_use]
+    pub fn resolved_protocol(&self) -> Option<crate::provider_schema::Protocol> {
+        use crate::provider_schema::Protocol;
+        if let Some(protocol) = &self.protocol {
+            return Protocol::from_db(protocol);
+        }
+        Some(legacy_provider_protocol(
+            self.kind,
+            &self.name,
+            self.discovery_service_name.is_some(),
+        ))
+    }
 }
 
 /// A model offered by a provider, with its (possibly per-endpoint) base url.

@@ -177,6 +177,7 @@ impl GradiusUtilityOutbox {
             reply_to_message_id,
             TelegramDeliveryPolicy::Create,
             TelegramOutboundMethod::from(method),
+            None,
         )
         .await
     }
@@ -211,6 +212,7 @@ impl GradiusUtilityOutbox {
             reply_to_message_id,
             TelegramDeliveryPolicy::Create,
             method,
+            None,
         )
         .await
     }
@@ -225,6 +227,7 @@ impl GradiusUtilityOutbox {
         thread_id: Option<i32>,
         message_id: i64,
         html: String,
+        job_id: i64,
     ) -> Result<Option<String>, String> {
         let method = match utility_rich_edit(chat_id, message_id, &html) {
             Ok(method) => method,
@@ -244,6 +247,7 @@ impl GradiusUtilityOutbox {
             message_id,
             TelegramDeliveryPolicy::TargetIdempotent,
             method,
+            Some(job_id),
         )
         .await
     }
@@ -259,6 +263,7 @@ impl GradiusUtilityOutbox {
         trigger_message_id: i64,
         policy: TelegramDeliveryPolicy,
         method: TelegramOutboundMethod,
+        job_id: Option<i64>,
     ) -> Result<Option<String>, String> {
         let command = match OutboundCommand::try_from_method(method) {
             Ok(command) => command,
@@ -281,17 +286,26 @@ impl GradiusUtilityOutbox {
         let batch_id = format!("gradius-utility:v1:{}:{source_key}", self.bot_id);
         let now = OffsetDateTime::now_utc();
         let batch = TelegramOutboxBatchInput {
+            content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
             batch_id: batch_id.clone(),
             bot_id: self.bot_id,
             chat_id: Some(chat_id),
             thread_id,
-            ordering_key: format!(
-                "gradius-utility:{}:{chat_id}:{}",
-                self.bot_id,
-                thread_id.unwrap_or_default()
-            ),
+            ordering_key: if method_kind == "sendRichMessage" || job_id.is_some() {
+                crate::telegram_outbox::telegram_outbox_ordering_key(
+                    self.bot_id,
+                    chat_id,
+                    thread_id,
+                )
+            } else {
+                format!(
+                    "gradius-utility:{}:{chat_id}:{}",
+                    self.bot_id,
+                    thread_id.unwrap_or_default()
+                )
+            },
             causation_update_id: None,
-            dialog_job_id: None,
+            dialog_job_id: job_id,
             trigger_message_id: Some(trigger_message_id),
             delivery_policy: policy,
             protected: true,

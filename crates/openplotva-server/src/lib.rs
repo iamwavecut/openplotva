@@ -2,19 +2,12 @@
 
 mod runtime_graphql;
 
-use std::{
-    env,
-    future::Future,
-    net::SocketAddr,
-    pin::Pin,
-    sync::{Arc, LazyLock},
-    time::Instant as StdInstant,
-};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -123,31 +116,6 @@ pub const RUNTIME_API_TOKEN_PREFIX: &str = "prt";
 pub const RUNTIME_API_TOKEN_ID_BYTES: usize = 8;
 
 pub const RUNTIME_API_TOKEN_SECRET_SIZE: usize = 32;
-
-pub const RUNTIME_API_PPROF_PROFILES: [&str; 9] = [
-    "allocs",
-    "block",
-    "cmdline",
-    "goroutine",
-    "heap",
-    "mutex",
-    "profile",
-    "symbol",
-    "trace",
-];
-
-pub const RUNTIME_API_PPROF_SUBTREE_PROFILES: [&str; 10] = [
-    "allocs",
-    "block",
-    "cmdline",
-    "goroutine",
-    "heap",
-    "mutex",
-    "profile",
-    "symbol",
-    "threadcreate",
-    "trace",
-];
 
 pub const ACTION_SEND_TEXT: &str = "send_text";
 pub const ACTION_SEND_IMAGE: &str = "send_image";
@@ -282,8 +250,6 @@ struct RuntimeApiState<Validator> {
     validator: Arc<Validator>,
     graphql: RuntimeApiSchema,
 }
-
-static RUNTIME_API_DIAGNOSTICS_STARTED: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
 
 pub fn runtime_api_tls_acceptor_from_pem(
     cert_pem: &[u8],
@@ -498,11 +464,6 @@ where
     });
     Router::new()
         .route("/graphql", any(runtime_api_graphql::<Validator>))
-        .route("/debug/pprof/", any(runtime_api_pprof_index::<Validator>))
-        .route(
-            "/debug/pprof/{*path}",
-            any(runtime_api_pprof_path::<Validator>),
-        )
         .fallback(runtime_api_not_found::<Validator>)
         .with_state(state)
 }
@@ -533,33 +494,6 @@ where
         }
     };
     Json(state.graphql.execute(request).await).into_response()
-}
-
-async fn runtime_api_pprof_index<Validator>(
-    State(state): State<Arc<RuntimeApiState<Validator>>>,
-    headers: HeaderMap,
-) -> Response
-where
-    Validator: RuntimeTokenValidator + Send + Sync,
-{
-    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
-        return runtime_api_unauthorized_response();
-    }
-    runtime_api_pprof_response("")
-}
-
-async fn runtime_api_pprof_path<Validator>(
-    State(state): State<Arc<RuntimeApiState<Validator>>>,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-) -> Response
-where
-    Validator: RuntimeTokenValidator + Send + Sync,
-{
-    if !runtime_api_is_authorized(state.as_ref(), &headers).await {
-        return runtime_api_unauthorized_response();
-    }
-    runtime_api_pprof_response(&path)
 }
 
 async fn runtime_api_not_found<Validator>(
@@ -609,123 +543,6 @@ pub fn runtime_api_method_not_allowed_response() -> Response {
         "{\"error\":\"method not allowed\"}\n",
     )
         .into_response()
-}
-
-#[must_use]
-pub fn runtime_api_pprof_response(path: &str) -> Response {
-    let profile = path.trim_matches('/');
-    if profile.is_empty() {
-        return runtime_api_pprof_index_response();
-    }
-    match profile {
-        "cmdline" => runtime_api_pprof_cmdline_response(),
-        "profile" => runtime_api_pprof_cpu_profile_response(),
-        "trace" => runtime_api_pprof_text_response(
-            "trace",
-            "scheduler tracing is not collected by the Rust runtime shell yet",
-        ),
-        "symbol" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "num_symbols: 0\n",
-        )
-            .into_response(),
-        "goroutine" => runtime_api_pprof_text_response(
-            "goroutine",
-            "Rust exposes OS threads/tasks differently; current process/thread metadata follows",
-        ),
-        "heap" | "allocs" => runtime_api_pprof_text_response(
-            profile,
-            "allocator profile capture is not enabled; process metadata follows",
-        ),
-        "mutex" | "block" => runtime_api_pprof_text_response(
-            profile,
-            "contention profile capture is not enabled; process metadata follows",
-        ),
-        "threadcreate" => runtime_api_pprof_text_response(
-            "threadcreate",
-            "Rust thread creation profiling is not enabled; process metadata follows",
-        ),
-        _ => (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("unknown profile: {profile}\n"),
-        )
-            .into_response(),
-    }
-}
-
-fn runtime_api_pprof_index_response() -> Response {
-    let links = RUNTIME_API_PPROF_SUBTREE_PROFILES
-        .iter()
-        .map(|profile| format!("<li><a href=\"{profile}\">{profile}</a></li>"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        format!(
-            "<html><head><title>/debug/pprof/</title></head><body>\
-             <h1>OpenPlotva runtime diagnostics</h1>\
-             <p>Runtime process diagnostics endpoint.</p>\
-             <ul>{links}</ul>\
-             </body></html>\n"
-        ),
-    )
-        .into_response()
-}
-
-fn runtime_api_pprof_cmdline_response() -> Response {
-    let mut body = env::args().collect::<Vec<_>>().join("\0");
-    body.push('\0');
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        body,
-    )
-        .into_response()
-}
-
-fn runtime_api_pprof_cpu_profile_response() -> Response {
-    runtime_api_pprof_text_response(
-        "profile",
-        "CPU profile capture is intentionally unavailable; process metadata follows",
-    )
-}
-
-fn runtime_api_pprof_text_response(profile: &str, note: &str) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        runtime_api_pprof_text(profile, note),
-    )
-        .into_response()
-}
-
-fn runtime_api_pprof_text(profile: &str, note: &str) -> String {
-    let uptime = RUNTIME_API_DIAGNOSTICS_STARTED.elapsed();
-    let parallelism = std::thread::available_parallelism().map_or(0, usize::from);
-    let executable = env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".to_owned());
-    let current_dir = env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".to_owned());
-    format!(
-        "openplotva runtime profile analogue\n\
-         profile: {profile}\n\
-         note: {note}\n\
-         pid: {}\n\
-         uptime_seconds: {}\n\
-         available_parallelism: {parallelism}\n\
-         executable: {executable}\n\
-         current_dir: {current_dir}\n\
-         target: {}-{}\n",
-        std::process::id(),
-        uptime.as_secs(),
-        env::consts::OS,
-        env::consts::ARCH
-    )
 }
 
 #[derive(Clone)]
@@ -961,9 +778,9 @@ mod tests {
         rate_limit_key, rate_limited_chat_key, runtime_api_graphql_schema,
         runtime_api_graphql_schema_with_diagnostics,
         runtime_api_graphql_schema_with_live_diagnostics, runtime_api_graphql_schema_with_redis,
-        runtime_api_method_not_allowed_response, runtime_api_pprof_response,
-        runtime_api_tls_config_from_pem, runtime_api_unauthorized_response,
-        runtime_token_expired_at, runtime_token_secret_hash_matches, vip_cache_key,
+        runtime_api_method_not_allowed_response, runtime_api_tls_config_from_pem,
+        runtime_api_unauthorized_response, runtime_token_expired_at,
+        runtime_token_secret_hash_matches, vip_cache_key,
     };
     use axum::{body::to_bytes, http::header};
     use std::sync::Arc;
@@ -3200,72 +3017,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_api_pprof_routes_return_rust_diagnostic_analogues() {
-        let index = runtime_api_pprof_response("");
-        assert_eq!(index.status(), axum::http::StatusCode::OK);
-        let body = to_bytes(index.into_body(), 4096)
-            .await
-            .unwrap_or_else(|error| panic!("read pprof index body: {error}"));
-        let body = String::from_utf8(body.to_vec())
-            .unwrap_or_else(|error| panic!("pprof index utf8: {error}"));
-        for profile in super::RUNTIME_API_PPROF_SUBTREE_PROFILES {
-            assert!(body.contains(&format!("href=\"{profile}\"")));
+    async fn removed_profiles_use_authenticated_not_found_fallback() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        struct Validator;
+        impl super::RuntimeTokenValidator for Validator {
+            fn validate_runtime_token<'a>(
+                &'a self,
+                token: &'a str,
+            ) -> super::RuntimeTokenValidationFuture<'a> {
+                Box::pin(async move { token == "test-token" })
+            }
         }
-
-        let cmdline = runtime_api_pprof_response("cmdline");
-        assert_eq!(cmdline.status(), axum::http::StatusCode::OK);
-        let body = to_bytes(cmdline.into_body(), 16 * 1024)
-            .await
-            .unwrap_or_else(|error| panic!("read cmdline body: {error}"));
-        assert!(body.ends_with(b"\0"));
-
-        let profile = runtime_api_pprof_response("profile");
-        assert_eq!(profile.status(), axum::http::StatusCode::OK);
-        let content_type = profile
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        assert!(content_type.starts_with("text/plain"));
-        let body = to_bytes(profile.into_body(), 1024 * 1024)
-            .await
-            .unwrap_or_else(|error| panic!("read profile body: {error}"));
-        let body = String::from_utf8(body.to_vec())
-            .unwrap_or_else(|error| panic!("profile fallback utf8: {error}"));
-        assert!(body.contains("profile: profile"));
-        assert!(body.contains("intentionally unavailable"));
-
-        let heap = runtime_api_pprof_response("heap");
-        assert_eq!(heap.status(), axum::http::StatusCode::OK);
-        let body = to_bytes(heap.into_body(), 4096)
-            .await
-            .unwrap_or_else(|error| panic!("read heap body: {error}"));
-        let body =
-            String::from_utf8(body.to_vec()).unwrap_or_else(|error| panic!("heap utf8: {error}"));
-        assert!(body.contains("profile: heap"));
-        assert!(body.contains("pid:"));
-        assert!(body.contains("target:"));
-
-        let threadcreate = runtime_api_pprof_response("threadcreate");
-        assert_eq!(threadcreate.status(), axum::http::StatusCode::OK);
-        let body = to_bytes(threadcreate.into_body(), 4096)
-            .await
-            .unwrap_or_else(|error| panic!("read threadcreate body: {error}"));
-        let body = String::from_utf8(body.to_vec())
-            .unwrap_or_else(|error| panic!("threadcreate utf8: {error}"));
-        assert!(body.contains("profile: threadcreate"));
-
-        let symbol = runtime_api_pprof_response("symbol");
-        let body = to_bytes(symbol.into_body(), 1024)
-            .await
-            .unwrap_or_else(|error| panic!("read symbol body: {error}"));
-        assert_eq!(&body[..], b"num_symbols: 0\n");
-
-        assert_eq!(
-            runtime_api_pprof_response("unknown").status(),
-            axum::http::StatusCode::NOT_FOUND
+        let router = super::runtime_api_router_with_graphql_live_diagnostics(
+            Validator,
+            Default::default(),
+            Default::default(),
         );
+        for path in [
+            "/debug/pprof/",
+            "/debug/pprof/heap",
+            "/debug/pprof/profile",
+            "/missing",
+        ] {
+            for (token, expected) in [
+                ("test-token", StatusCode::NOT_FOUND),
+                ("invalid", StatusCode::UNAUTHORIZED),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), expected, "{path}");
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/graphql")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(r#"{"query":"{ __typename }"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("graphql response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("graphql body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("graphql json");
+        assert!(value.get("errors").is_none(), "{value}");
     }
 
     #[test]

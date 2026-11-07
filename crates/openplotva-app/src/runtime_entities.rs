@@ -1,7 +1,5 @@
 //! Runtime API entity readers backed by Postgres.
 
-use std::collections::HashMap;
-
 use openplotva_server::{
     RuntimeChatConnectionData, RuntimeChatData, RuntimeChatMemberData,
     RuntimeChatMemberWithUserData, RuntimeChatsFilter, RuntimeEntityReader,
@@ -9,94 +7,20 @@ use openplotva_server::{
     RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter, RuntimeVipCacheData,
     RuntimeVipEventData, RuntimeVipSummaryData,
 };
+use openplotva_storage::entities::{
+    ChatMemberProfile, PostgresEntityStore, TelegramChatProfile, TelegramUserProfile,
+};
 use openplotva_storage::{
     PostgresPaymentStore, PostgresVipStore, SubscriptionRecord, VipCacheRecord, VipEventListRecord,
     VipSummaryRecord,
 };
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-const SQL_COUNT_USERS_FILTERED: &str = r#"
-SELECT COUNT(*)::int
-FROM telegram_users_effective
-WHERE (
-    $1::text IS NULL
-    OR username ILIKE '%' || $1::text || '%'
-    OR first_name ILIKE '%' || $1::text || '%'
-    OR last_name ILIKE '%' || $1::text || '%'
-)"#;
-
-const SQL_LIST_USERS_FILTERED: &str = r#"
-SELECT *
-FROM telegram_users_effective
-WHERE (
-    $1::text IS NULL
-    OR username ILIKE '%' || $1::text || '%'
-    OR first_name ILIKE '%' || $1::text || '%'
-    OR last_name ILIKE '%' || $1::text || '%'
-)
-ORDER BY id
-LIMIT $2
-OFFSET $3"#;
-
-const SQL_GET_RUNTIME_USER: &str = "SELECT * FROM telegram_users_effective WHERE id = $1";
-const SQL_GET_RUNTIME_USER_BY_USERNAME: &str =
-    "SELECT * FROM telegram_users_effective WHERE username = $1 LIMIT 1";
-const SQL_GET_RUNTIME_USER_ID_BY_USERNAME: &str =
-    "SELECT id FROM telegram_users_effective WHERE lower(username) = lower($1) LIMIT 1";
-const SQL_LIST_RUNTIME_USERS_BY_IDS: &str =
-    "SELECT * FROM telegram_users_effective WHERE id = ANY($1::bigint[])";
-
-const SQL_COUNT_CHATS_FILTERED: &str = r#"
-SELECT COUNT(*)::int
-FROM telegram_chats_effective
-WHERE (
-    $1::text IS NULL
-    OR CAST(id AS text) LIKE '%' || $1::text || '%'
-    OR title ILIKE '%' || $1::text || '%'
-    OR username ILIKE '%' || $1::text || '%'
-    OR first_name ILIKE '%' || $1::text || '%'
-    OR last_name ILIKE '%' || $1::text || '%'
-)"#;
-
-const SQL_LIST_CHATS_FILTERED: &str = r#"
-SELECT *
-FROM telegram_chats_effective
-WHERE (
-    $1::text IS NULL
-    OR CAST(id AS text) LIKE '%' || $1::text || '%'
-    OR title ILIKE '%' || $1::text || '%'
-    OR username ILIKE '%' || $1::text || '%'
-    OR first_name ILIKE '%' || $1::text || '%'
-    OR last_name ILIKE '%' || $1::text || '%'
-)
-ORDER BY id
-LIMIT $2
-OFFSET $3"#;
-
-const SQL_COUNT_CHATS_BY_MEMBER: &str = r#"
-SELECT COUNT(DISTINCT c.id)::int
-FROM telegram_chats_effective c
-JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id
-WHERE cm.user_id = $1"#;
-
-const SQL_LIST_CHATS_BY_MEMBER: &str = r#"
-SELECT DISTINCT c.*
-FROM telegram_chats_effective c
-JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id
-WHERE cm.user_id = $1
-ORDER BY c.id
-LIMIT $2
-OFFSET $3"#;
-
-const SQL_GET_RUNTIME_CHAT: &str = "SELECT * FROM telegram_chats_effective WHERE id = $1";
-const SQL_LIST_RUNTIME_CHAT_MEMBERS: &str =
-    "SELECT * FROM telegram_chat_members_effective WHERE chat_id = $1";
 
 /// SQLx-backed runtime API core entity reader.
 #[derive(Clone, Debug)]
 pub struct PostgresRuntimeEntityReader {
-    pool: PgPool,
+    entities: PostgresEntityStore,
     payments: PostgresPaymentStore,
     vip: PostgresVipStore,
 }
@@ -105,9 +29,9 @@ impl PostgresRuntimeEntityReader {
     /// Build a reader over an existing Postgres pool.
     pub fn new(pool: PgPool) -> Self {
         Self {
+            entities: PostgresEntityStore::new(pool.clone()),
             payments: PostgresPaymentStore::new(pool.clone()),
             vip: PostgresVipStore::new(pool.clone()),
-            pool,
         }
     }
 }
@@ -150,51 +74,39 @@ impl PostgresRuntimeEntityReader {
     async fn list_users(
         &self,
         filter: RuntimeUsersFilter,
-    ) -> Result<RuntimeUserConnectionData, sqlx::Error> {
+    ) -> Result<RuntimeUserConnectionData, openplotva_storage::StorageError> {
         let search = optional_search(&filter.q);
-        let count = sqlx::query_scalar::<_, i32>(SQL_COUNT_USERS_FILTERED)
-            .bind(search.as_deref())
-            .fetch_one(&self.pool)
-            .await?;
-        let rows = sqlx::query(SQL_LIST_USERS_FILTERED)
-            .bind(search.as_deref())
-            .bind(filter.limit)
-            .bind(filter.offset)
-            .fetch_all(&self.pool)
+        let count = self.entities.count_users(search.as_deref()).await?;
+        let rows = self
+            .entities
+            .users(
+                search.as_deref(),
+                i64::from(filter.limit),
+                i64::from(filter.offset),
+            )
             .await?;
         Ok(RuntimeUserConnectionData {
             count,
             offset: filter.offset,
             limit: filter.limit,
-            items: rows
-                .into_iter()
-                .map(runtime_user_from_row)
-                .collect::<Result<Vec<_>, _>>()?,
+            items: rows.into_iter().map(runtime_user_from_record).collect(),
         })
     }
 
     async fn get_user_details(
         &self,
         lookup: RuntimeUserLookup,
-    ) -> Result<Option<RuntimeUserDetailsData>, sqlx::Error> {
+    ) -> Result<Option<RuntimeUserDetailsData>, openplotva_storage::StorageError> {
         let row = match lookup {
-            RuntimeUserLookup::Id(id) => {
-                sqlx::query(SQL_GET_RUNTIME_USER)
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await?
-            }
+            RuntimeUserLookup::Id(id) => self.entities.user(id).await?,
             RuntimeUserLookup::Username(username) => {
-                sqlx::query(SQL_GET_RUNTIME_USER_BY_USERNAME)
-                    .bind(username)
-                    .fetch_optional(&self.pool)
-                    .await?
+                self.entities.user_by_username(&username).await?
             }
         };
         let Some(row) = row else {
             return Ok(None);
         };
-        let user = runtime_user_from_row(row)?;
+        let user = runtime_user_from_record(row);
         let subscription = self
             .payments
             .get_active_subscription(user.id)
@@ -245,36 +157,32 @@ impl PostgresRuntimeEntityReader {
     async fn list_chats(
         &self,
         filter: RuntimeChatsFilter,
-    ) -> Result<RuntimeChatConnectionData, sqlx::Error> {
+    ) -> Result<RuntimeChatConnectionData, openplotva_storage::StorageError> {
         if filter.member_username.is_some() || filter.member_user_id.is_some() {
             return self.list_chats_by_member(filter).await;
         }
         let search = optional_search(&filter.q);
-        let count = sqlx::query_scalar::<_, i32>(SQL_COUNT_CHATS_FILTERED)
-            .bind(search.as_deref())
-            .fetch_one(&self.pool)
-            .await?;
-        let rows = sqlx::query(SQL_LIST_CHATS_FILTERED)
-            .bind(search.as_deref())
-            .bind(filter.limit)
-            .bind(filter.offset)
-            .fetch_all(&self.pool)
+        let count = self.entities.count_chats(search.as_deref()).await?;
+        let rows = self
+            .entities
+            .chats(
+                search.as_deref(),
+                i64::from(filter.limit),
+                i64::from(filter.offset),
+            )
             .await?;
         Ok(RuntimeChatConnectionData {
             count,
             offset: filter.offset,
             limit: filter.limit,
-            items: rows
-                .into_iter()
-                .map(runtime_chat_from_row)
-                .collect::<Result<Vec<_>, _>>()?,
+            items: rows.into_iter().map(runtime_chat_from_record).collect(),
         })
     }
 
     async fn list_chats_by_member(
         &self,
         filter: RuntimeChatsFilter,
-    ) -> Result<RuntimeChatConnectionData, sqlx::Error> {
+    ) -> Result<RuntimeChatConnectionData, openplotva_storage::StorageError> {
         let Some(member_user_id) = self.chat_member_filter_user_id(&filter).await? else {
             return Ok(RuntimeChatConnectionData {
                 count: 0,
@@ -283,31 +191,27 @@ impl PostgresRuntimeEntityReader {
                 items: Vec::new(),
             });
         };
-        let count = sqlx::query_scalar::<_, i32>(SQL_COUNT_CHATS_BY_MEMBER)
-            .bind(member_user_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let rows = sqlx::query(SQL_LIST_CHATS_BY_MEMBER)
-            .bind(member_user_id)
-            .bind(filter.limit)
-            .bind(filter.offset)
-            .fetch_all(&self.pool)
+        let count = self.entities.count_chats_by_member(member_user_id).await?;
+        let rows = self
+            .entities
+            .chats_by_member(
+                member_user_id,
+                i64::from(filter.limit),
+                i64::from(filter.offset),
+            )
             .await?;
         Ok(RuntimeChatConnectionData {
             count,
             offset: filter.offset,
             limit: filter.limit,
-            items: rows
-                .into_iter()
-                .map(runtime_chat_from_row)
-                .collect::<Result<Vec<_>, _>>()?,
+            items: rows.into_iter().map(runtime_chat_from_record).collect(),
         })
     }
 
     async fn chat_member_filter_user_id(
         &self,
         filter: &RuntimeChatsFilter,
-    ) -> Result<Option<i64>, sqlx::Error> {
+    ) -> Result<Option<i64>, openplotva_storage::StorageError> {
         let username = filter
             .member_username
             .as_deref()
@@ -315,12 +219,7 @@ impl PostgresRuntimeEntityReader {
             .filter(|value| !value.is_empty());
         let username_was_requested = username.is_some();
         let username_user_id = match username {
-            Some(username) => {
-                sqlx::query_scalar::<_, i64>(SQL_GET_RUNTIME_USER_ID_BY_USERNAME)
-                    .bind(username)
-                    .fetch_optional(&self.pool)
-                    .await?
-            }
+            Some(username) => self.entities.user_id_by_username(username).await?,
             None => None,
         };
         match (filter.member_user_id, username_user_id) {
@@ -337,115 +236,83 @@ impl PostgresRuntimeEntityReader {
         }
     }
 
-    async fn get_chat(&self, id: i64) -> Result<Option<RuntimeChatData>, sqlx::Error> {
-        let row = sqlx::query(SQL_GET_RUNTIME_CHAT)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(runtime_chat_from_row).transpose()
+    async fn get_chat(
+        &self,
+        id: i64,
+    ) -> Result<Option<RuntimeChatData>, openplotva_storage::StorageError> {
+        Ok(self.entities.chat(id).await?.map(runtime_chat_from_record))
     }
 
     async fn list_chat_members(
         &self,
         chat_id: i64,
-    ) -> Result<Vec<RuntimeChatMemberWithUserData>, sqlx::Error> {
-        let rows = sqlx::query(SQL_LIST_RUNTIME_CHAT_MEMBERS)
-            .bind(chat_id)
-            .fetch_all(&self.pool)
-            .await?;
-        let members = rows
+    ) -> Result<Vec<RuntimeChatMemberWithUserData>, openplotva_storage::StorageError> {
+        Ok(self
+            .entities
+            .members_with_users(chat_id)
+            .await?
             .into_iter()
-            .map(runtime_chat_member_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let users = self.users_by_id(&members).await?;
-        Ok(members
-            .into_iter()
-            .map(|member| {
-                let user = users.get(&member.user_id).cloned();
-                RuntimeChatMemberWithUserData { member, user }
+            .map(|(member, user)| RuntimeChatMemberWithUserData {
+                member: runtime_chat_member_from_record(member),
+                user: user.map(runtime_user_from_record),
             })
             .collect())
     }
+}
 
-    async fn users_by_id(
-        &self,
-        members: &[RuntimeChatMemberData],
-    ) -> Result<HashMap<i64, RuntimeUserData>, sqlx::Error> {
-        let mut ids = members
-            .iter()
-            .map(|member| member.user_id)
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let rows = sqlx::query(SQL_LIST_RUNTIME_USERS_BY_IDS)
-            .bind(&ids)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(runtime_user_from_row)
-            .map(|result| result.map(|user| (user.id, user)))
-            .collect()
+fn runtime_user_from_record(record: TelegramUserProfile) -> RuntimeUserData {
+    RuntimeUserData {
+        id: record.id,
+        is_premium: record.is_premium,
+        first_name: record.first_name,
+        last_name: record.last_name,
+        username: record.username,
+        language_code: record.language_code,
+        is_vip: record.is_vip,
+        discovered_at: format_ts(record.discovered),
+        updated_at: format_ts(record.updated),
     }
 }
 
-fn runtime_user_from_row(row: sqlx::postgres::PgRow) -> Result<RuntimeUserData, sqlx::Error> {
-    Ok(RuntimeUserData {
-        id: row.try_get("id")?,
-        is_premium: row.try_get("is_premium")?,
-        first_name: row.try_get("first_name")?,
-        last_name: row.try_get("last_name")?,
-        username: row.try_get("username")?,
-        language_code: row.try_get("language_code")?,
-        is_vip: row.try_get("is_vip")?,
-        discovered_at: format_ts(row.try_get("discovered")?),
-        updated_at: format_ts(row.try_get("updated")?),
-    })
+fn runtime_chat_from_record(record: TelegramChatProfile) -> RuntimeChatData {
+    RuntimeChatData {
+        id: record.id,
+        chat_type: record.chat_type,
+        title: record.title,
+        username: record.username,
+        first_name: record.first_name,
+        last_name: record.last_name,
+        is_forum: record.is_forum,
+        description: record.description,
+        invite_link: record.invite_link,
+        discovered_at: format_ts(record.discovered),
+        updated_at: format_ts(record.updated),
+    }
 }
 
-fn runtime_chat_from_row(row: sqlx::postgres::PgRow) -> Result<RuntimeChatData, sqlx::Error> {
-    Ok(RuntimeChatData {
-        id: row.try_get("id")?,
-        chat_type: row.try_get("type")?,
-        title: row.try_get("title")?,
-        username: row.try_get("username")?,
-        first_name: row.try_get("first_name")?,
-        last_name: row.try_get("last_name")?,
-        is_forum: row.try_get("is_forum")?,
-        description: row.try_get("description")?,
-        invite_link: row.try_get("invite_link")?,
-        discovered_at: format_ts(row.try_get("discovered")?),
-        updated_at: format_ts(row.try_get("updated")?),
-    })
-}
-
-fn runtime_chat_member_from_row(
-    row: sqlx::postgres::PgRow,
-) -> Result<RuntimeChatMemberData, sqlx::Error> {
-    Ok(RuntimeChatMemberData {
-        chat_id: row.try_get("chat_id")?,
-        user_id: row.try_get("user_id")?,
-        status: row.try_get("status")?,
-        is_anonymous: row.try_get("is_anonymous")?,
-        custom_title: row.try_get("custom_title")?,
-        can_be_edited: row.try_get("can_be_edited")?,
-        can_manage_chat: row.try_get("can_manage_chat")?,
-        can_delete_messages: row.try_get("can_delete_messages")?,
-        can_manage_video_chats: row.try_get("can_manage_video_chats")?,
-        can_restrict_members: row.try_get("can_restrict_members")?,
-        can_promote_members: row.try_get("can_promote_members")?,
-        can_change_info: row.try_get("can_change_info")?,
-        can_invite_users: row.try_get("can_invite_users")?,
-        can_post_messages: row.try_get("can_post_messages")?,
-        can_edit_messages: row.try_get("can_edit_messages")?,
-        can_pin_messages: row.try_get("can_pin_messages")?,
-        can_manage_topics: row.try_get("can_manage_topics")?,
-        created_at: format_ts(row.try_get("created_at")?),
-        updated_at: format_ts(row.try_get("updated_at")?),
-        last_message_at: format_ts(row.try_get("last_message_at")?),
-    })
+fn runtime_chat_member_from_record(record: ChatMemberProfile) -> RuntimeChatMemberData {
+    RuntimeChatMemberData {
+        chat_id: record.membership.chat_id,
+        user_id: record.membership.user_id,
+        status: record.membership.status,
+        is_anonymous: record.membership.is_anonymous,
+        custom_title: record.membership.custom_title,
+        can_be_edited: record.membership.can_be_edited,
+        can_manage_chat: record.membership.can_manage_chat,
+        can_delete_messages: record.membership.can_delete_messages,
+        can_manage_video_chats: record.membership.can_manage_video_chats,
+        can_restrict_members: record.membership.can_restrict_members,
+        can_promote_members: record.membership.can_promote_members,
+        can_change_info: record.membership.can_change_info,
+        can_invite_users: record.membership.can_invite_users,
+        can_post_messages: record.membership.can_post_messages,
+        can_edit_messages: record.membership.can_edit_messages,
+        can_pin_messages: record.membership.can_pin_messages,
+        can_manage_topics: record.membership.can_manage_topics,
+        created_at: format_ts(record.created_at),
+        updated_at: format_ts(record.updated_at),
+        last_message_at: format_ts(record.last_message_at),
+    }
 }
 
 fn runtime_subscription_from_record(subscription: SubscriptionRecord) -> RuntimeSubscriptionData {
@@ -582,8 +449,11 @@ fn vip_display_days_left_at(expires_at: OffsetDateTime, now: OffsetDateTime) -> 
         .max(0.0) as i32
 }
 
-fn error_text(error: impl std::fmt::Display) -> String {
-    error.to_string()
+fn error_text(error: openplotva_storage::StorageError) -> String {
+    match error {
+        openplotva_storage::StorageError::Postgres { source } => source.to_string(),
+        error => error.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -639,11 +509,96 @@ mod tests {
         assert_eq!(runtime_actor_label(&event).as_deref(), Some("42"));
     }
 
-    #[test]
-    fn chat_member_filter_sql_uses_resolved_user_id_path() {
-        assert!(SQL_COUNT_CHATS_BY_MEMBER.contains("cm.user_id = $1"));
-        assert!(SQL_LIST_CHATS_BY_MEMBER.contains("cm.user_id = $1"));
-        assert!(!SQL_COUNT_CHATS_BY_MEMBER.contains("LOWER(u.username)"));
-        assert!(!SQL_LIST_CHATS_BY_MEMBER.contains("LOWER(u.username)"));
+    #[tokio::test]
+    async fn postgres_entity_profiles_preserve_member_filters_and_username_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let first = OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+        let second = first + 1;
+        let username = format!("Lookup{first}");
+        sqlx::query("INSERT INTO users (id,first_name,username,is_premium) VALUES ($1,'Alice',$2,TRUE),($3,'Bob',NULL,FALSE)")
+            .bind(first).bind(&username).bind(second).execute(&pool).await?;
+        sqlx::query("INSERT INTO chats (id,type,title,is_forum) VALUES ($1,'supergroup','A',TRUE),($2,'group','B',FALSE)")
+            .bind(-first).bind(-second).execute(&pool).await?;
+        sqlx::query("INSERT INTO chat_members (chat_id,user_id,status) VALUES ($1,$2,'member'),($3,$4,'member')")
+            .bind(-first).bind(first).bind(-second).bind(second).execute(&pool).await?;
+        let reader = PostgresRuntimeEntityReader::new(pool.clone());
+        let by_id = reader
+            .chats(RuntimeChatsFilter {
+                member_user_id: Some(second),
+                limit: 20,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(by_id.count, 1);
+        assert_eq!(by_id.items[0].id, -second);
+        let by_name = reader
+            .chats(RuntimeChatsFilter {
+                member_username: Some(username.to_uppercase()),
+                limit: 20,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(by_name.count, 1);
+        assert_eq!(by_name.items[0].id, -first);
+        let mismatch = reader
+            .chats(RuntimeChatsFilter {
+                member_user_id: Some(second),
+                member_username: Some(username.clone()),
+                limit: 20,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(mismatch.count, 0);
+        assert!(mismatch.items.is_empty());
+        let exact = reader
+            .user(RuntimeUserLookup::Username(username.clone()))
+            .await?
+            .expect("exact username");
+        assert_eq!(exact.user.id, first);
+        assert_eq!(exact.user.is_premium, Some(true));
+        assert!(
+            reader
+                .user(RuntimeUserLookup::Username(username.to_uppercase()))
+                .await?
+                .is_none()
+        );
+        let users = reader
+            .users(RuntimeUsersFilter {
+                q: username.to_lowercase(),
+                limit: 20,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(users.count, 1);
+        assert_eq!(users.items[0].id, first);
+        assert_eq!(
+            reader.chat(-first).await?.expect("chat").is_forum,
+            Some(true)
+        );
+        let members = reader.chat_members(-first).await?;
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].member.user_id, first);
+        assert_eq!(members[0].user.as_ref().expect("member profile").id, first);
+        sqlx::query("DELETE FROM chat_members WHERE user_id = ANY($1)")
+            .bind(vec![first, second])
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind(vec![first, second])
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM chats WHERE id = ANY($1)")
+            .bind(vec![-first, -second])
+            .execute(&pool)
+            .await?;
+        Ok(())
     }
 }

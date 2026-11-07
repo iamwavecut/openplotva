@@ -18,21 +18,18 @@ use openplotva_history::{
     build_ordered_summary_input_assembly, build_summary_input,
     decode_summary_message_entry_payloads, estimate_summary_tokens,
     filter_summary_entries_with_content, fit_summary_input_to_token_limit, hash_text,
-    history_summary_generate_error_retryable, history_summary_model, history_summary_provider,
-    history_summary_scope, history_summary_timeout_seconds, merge_edge_summary_input,
-    normalize_generated_summary_content, normalize_summary_request, normalized_summary_window,
-    parse_history_summary_since, render_history_summary_html, select_reusable_summary_spans,
-    stamp_summary_input_metadata, summary_message_entry_timestamp, summary_requested_range,
-    summary_reset_at,
+    history_summary_model, history_summary_scope, history_summary_timeout_seconds,
+    merge_edge_summary_input, normalize_generated_summary_content, normalize_summary_request,
+    normalized_summary_window, parse_history_summary_since, render_history_summary_html,
+    select_reusable_summary_spans, stamp_summary_input_metadata, summary_message_entry_timestamp,
+    summary_requested_range, summary_reset_at,
 };
 use openplotva_llm::aifarm::{
-    AifarmClientConfig, AifarmHistorySummaryConfig, AifarmHistorySummaryError,
-    AifarmHistorySummaryGenerator, GenkitOpenAiCompatibleHistorySummaryConfig,
-    GenkitOpenAiCompatibleHistorySummaryError, GenkitOpenAiCompatibleHistorySummaryGenerator,
-    ReqwestAifarmTransport,
+    AifarmClientConfig, AifarmHistorySummaryConfig, AifarmHistorySummaryGenerator,
+    GenkitOpenAiCompatibleHistorySummaryConfig, GenkitOpenAiCompatibleHistorySummaryGenerator,
 };
 use openplotva_llm::gemini::{GeminiHistorySummaryConfig, GeminiHistorySummaryGenerator};
-use openplotva_llm::retry::{FailureReason, retryable_reason, retryable_reason_from_message};
+use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_storage::{PostgresHistoryStore, StorageError};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -43,16 +40,9 @@ use crate::dialog_tools::{
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
-use crate::runtime_gemini_cache::resolve_google_ai_key;
 
-const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Stage-one chunks summarized at the same time.
 const STAGE_ONE_CONCURRENCY: usize = 3;
-
-/// Concrete app history-summary service used by the dialog toolbox runtime.
-pub type AppHistorySummaryService =
-    ChatHistorySummaryService<PostgresHistoryStore, RuntimeHistorySummaryGenerator>;
 
 /// Boxed future returned by history reset stores.
 pub type HistoryResetFuture<'a> = Pin<
@@ -179,57 +169,6 @@ pub enum HistorySummaryServiceError {
         /// Timeout in whole seconds.
         seconds: u64,
     },
-}
-
-/// Error returned while building a concrete history-summary runtime.
-#[derive(Debug, Error)]
-pub enum HistorySummaryRuntimeBuildError {
-    #[error("google ai key is required for genkit history summary provider")]
-    GoogleAiKeyRequired,
-    /// GenKit OpenAI-compatible provider was requested without its API key.
-    #[error("{provider} api key is required for genkit history summary provider")]
-    ProviderApiKeyRequired {
-        /// Provider name.
-        provider: &'static str,
-    },
-    #[error("unsupported history summary provider {provider:?}")]
-    UnsupportedProvider {
-        /// Canonical provider name.
-        provider: String,
-    },
-}
-
-#[derive(Clone)]
-pub enum RuntimeHistorySummaryGenerator {
-    /// AIFarm history-summary path.
-    Aifarm {
-        /// Primary AIFarm generator.
-        primary: Box<AifarmHistorySummaryGenerator>,
-        primary_model: String,
-        /// Runtime GenKit fallback branch, present only when a concrete runtime provider resolves.
-        fallback: Option<Box<AppGenkitHistorySummaryGenerator>>,
-    },
-    Genkit(Box<AppGenkitHistorySummaryGenerator>),
-}
-
-/// App-owned GenKit history-summary branch.
-#[derive(Clone)]
-pub enum AppGenkitHistorySummaryGenerator {
-    /// Direct Gemini implementation.
-    Gemini(GeminiHistorySummaryGenerator<ReqwestAifarmTransport>),
-    /// OpenAI-compatible GenKit plugin implementation.
-    OpenAiCompatible(Box<GenkitOpenAiCompatibleHistorySummaryGenerator<ReqwestAifarmTransport>>),
-}
-
-/// App-owned GenKit history-summary error.
-#[derive(Debug, Error)]
-pub enum AppGenkitHistorySummaryError {
-    /// Direct Gemini implementation failed.
-    #[error(transparent)]
-    Gemini(#[from] openplotva_llm::gemini::GeminiHistorySummaryError),
-    /// OpenAI-compatible plugin implementation failed.
-    #[error(transparent)]
-    OpenAiCompatible(#[from] GenkitOpenAiCompatibleHistorySummaryError),
 }
 
 #[derive(Clone)]
@@ -571,134 +510,6 @@ pub fn aifarm_history_summary_config_from_app_config(
     .with_defaults()
 }
 
-#[must_use]
-pub fn gemini_history_summary_config_from_app_config(
-    config: &AppConfig,
-) -> GeminiHistorySummaryConfig {
-    let history = &config.llm.history_summary;
-    GeminiHistorySummaryConfig {
-        api_key: resolve_google_ai_key(&config.google_ai),
-        model: history_summary_model(
-            &history.model,
-            &history.provider,
-            &config.memory.consolidation_model,
-            Some(&crate::memory_runtime::genkit_runtime_default_model(config)),
-        ),
-        request_timeout: positive_seconds(history.timeout_seconds),
-        ..GeminiHistorySummaryConfig::default()
-    }
-    .with_defaults()
-}
-
-#[must_use]
-pub fn gemini_history_summary_fallback_config_from_app_config(
-    config: &AppConfig,
-) -> GeminiHistorySummaryConfig {
-    GeminiHistorySummaryConfig {
-        api_key: resolve_google_ai_key(&config.google_ai),
-        model: crate::memory_runtime::genkit_runtime_default_model(config),
-        request_timeout: positive_seconds(config.llm.history_summary.timeout_seconds),
-        ..GeminiHistorySummaryConfig::default()
-    }
-    .with_defaults()
-}
-
-fn genkit_history_summary_generator_from_app_config(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> Result<AppGenkitHistorySummaryGenerator, HistorySummaryRuntimeBuildError> {
-    let history = &config.llm.history_summary;
-    let model = model_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || {
-                history_summary_model(
-                    &history.model,
-                    &history.provider,
-                    &config.memory.consolidation_model,
-                    Some(&crate::memory_runtime::genkit_runtime_default_model(config)),
-                )
-            },
-            ToOwned::to_owned,
-        );
-    if let Some(cfg) =
-        genkit_openai_compatible_history_summary_config_from_app_config(config, &model)?
-    {
-        return Ok(AppGenkitHistorySummaryGenerator::OpenAiCompatible(
-            Box::new(GenkitOpenAiCompatibleHistorySummaryGenerator::new(cfg)),
-        ));
-    }
-    let cfg = GeminiHistorySummaryConfig {
-        api_key: resolve_google_ai_key(&config.google_ai),
-        model,
-        request_timeout: positive_seconds(history.timeout_seconds),
-        ..GeminiHistorySummaryConfig::default()
-    }
-    .with_defaults();
-    if cfg.api_key.trim().is_empty() {
-        return Err(HistorySummaryRuntimeBuildError::GoogleAiKeyRequired);
-    }
-    Ok(AppGenkitHistorySummaryGenerator::Gemini(
-        GeminiHistorySummaryGenerator::new(cfg),
-    ))
-}
-
-fn genkit_openai_compatible_history_summary_config_from_app_config(
-    config: &AppConfig,
-    model: &str,
-) -> Result<Option<GenkitOpenAiCompatibleHistorySummaryConfig>, HistorySummaryRuntimeBuildError> {
-    let model = model.trim();
-    let (direct_url, api_key, model, request_timeout_seconds, provider) =
-        if let Some(model) = strip_provider_prefix_fold(model, OPENROUTER_MODEL_PREFIX) {
-            (
-                OPENROUTER_CHAT_COMPLETIONS_URL,
-                config.open_router.key.trim().to_owned(),
-                model.trim().to_owned(),
-                config.open_router.request_timeout_seconds,
-                "openrouter",
-            )
-        } else {
-            return Ok(None);
-        };
-    if model.is_empty() {
-        return Ok(None);
-    }
-    if api_key.trim().is_empty() {
-        return Err(HistorySummaryRuntimeBuildError::ProviderApiKeyRequired { provider });
-    }
-    Ok(Some(GenkitOpenAiCompatibleHistorySummaryConfig {
-        direct_url: direct_url.to_owned(),
-        api_key,
-        model,
-        request_timeout: positive_seconds(request_timeout_seconds),
-        ..GenkitOpenAiCompatibleHistorySummaryConfig::default()
-    }))
-}
-
-fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        .then(|| &value[prefix.len()..])
-}
-
-/// Build the concrete history-summary service for dialog toolbox wiring.
-pub fn history_summary_service_from_app_config(
-    config: &AppConfig,
-    store: Arc<PostgresHistoryStore>,
-) -> Result<AppHistorySummaryService, HistorySummaryRuntimeBuildError> {
-    let generator = history_summary_generator_from_app_config(config)?;
-    let options = HistorySummaryServiceOptions::default()
-        .with_max_input_tokens(config.memory.max_input_tokens)
-        .with_timeout_seconds(config.llm.history_summary.timeout_seconds);
-    Ok(ChatHistorySummaryService::new_with_options(
-        store,
-        Arc::new(generator),
-        options,
-    ))
-}
-
 pub fn routed_history_summary_service_from_app_config(
     config: &AppConfig,
     store: Arc<PostgresHistoryStore>,
@@ -709,38 +520,6 @@ pub fn routed_history_summary_service_from_app_config(
         .with_max_input_tokens(config.memory.max_input_tokens)
         .with_timeout_seconds(config.llm.history_summary.timeout_seconds);
     ChatHistorySummaryService::new_with_options(store, Arc::new(generator), options)
-}
-
-/// Build the concrete provider generator without binding storage.
-pub fn history_summary_generator_from_app_config(
-    config: &AppConfig,
-) -> Result<RuntimeHistorySummaryGenerator, HistorySummaryRuntimeBuildError> {
-    let provider = history_summary_provider(&config.llm.history_summary.provider);
-    let generator = match provider {
-        "aifarm" => {
-            let cfg = aifarm_history_summary_config_from_app_config(config);
-            let fallback = genkit_history_summary_generator_from_app_config(
-                config,
-                Some(&crate::memory_runtime::genkit_runtime_default_model(config)),
-            )
-            .ok()
-            .map(Box::new);
-            RuntimeHistorySummaryGenerator::Aifarm {
-                primary_model: cfg.model.clone(),
-                primary: Box::new(AifarmHistorySummaryGenerator::new(cfg)),
-                fallback,
-            }
-        }
-        "genkit" => RuntimeHistorySummaryGenerator::Genkit(Box::new(
-            genkit_history_summary_generator_from_app_config(config, None)?,
-        )),
-        provider => {
-            return Err(HistorySummaryRuntimeBuildError::UnsupportedProvider {
-                provider: provider.to_owned(),
-            });
-        }
-    };
-    Ok(generator)
 }
 
 fn positive_seconds(seconds: i32) -> Duration {
@@ -1021,30 +800,6 @@ where
     }
 }
 
-impl HistorySummaryGenerator for AppGenkitHistorySummaryGenerator {
-    fn generate_history_stage<'a>(
-        &'a self,
-        input: &'a SummaryInput,
-        stage: HistoryStage,
-        payload: &'a str,
-    ) -> HistoryStageFuture<'a> {
-        Box::pin(async move {
-            match self {
-                Self::Gemini(generator) => {
-                    generator
-                        .generate_history_stage(input, stage, payload)
-                        .await
-                }
-                Self::OpenAiCompatible(generator) => {
-                    generator
-                        .generate_history_stage(input, stage, payload)
-                        .await
-                }
-            }
-        })
-    }
-}
-
 impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
     fn generate_history_stage<'a>(
         &'a self,
@@ -1098,72 +853,63 @@ async fn generate_history_stage_with_attempt(
     stage: HistoryStage,
     payload: &str,
 ) -> Result<HistoryStageReply, HistorySummaryServiceError> {
-    if routed_attempt_is_genkit(&attempt) {
-        let model = genkit_model_for_attempt(&attempt);
-        let generator = genkit_history_summary_generator_from_app_config(config, Some(&model))
-            .map_err(|error| HistorySummaryServiceError::Generate {
-                message: error.to_string(),
-            })?;
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit) {
+        let (api_key, base_url) = crate::provider_transport::gemini_endpoint_for_attempt(
+            config, &attempt,
+        )
+        .map_err(|error| HistorySummaryServiceError::Generate {
+            message: error.to_string(),
+        })?;
+        let generator = GeminiHistorySummaryGenerator::new(GeminiHistorySummaryConfig {
+            api_key,
+            base_url,
+            model: attempt.model_name.clone(),
+            request_timeout: positive_seconds(config.llm.history_summary.timeout_seconds),
+            ..GeminiHistorySummaryConfig::default()
+        });
+        return generator
+            .generate_history_stage(input, stage, payload)
+            .await;
+    }
+    if crate::provider_transport::is_openrouter(&attempt) {
+        let client = crate::provider_transport::openai_client_for_attempt(
+            config,
+            &attempt,
+            AifarmClientConfig::default(),
+        )
+        .map_err(|error| HistorySummaryServiceError::Generate {
+            message: error.to_string(),
+        })?;
+        let generator = GenkitOpenAiCompatibleHistorySummaryGenerator::new(
+            GenkitOpenAiCompatibleHistorySummaryConfig {
+                direct_url: client.direct_url,
+                api_key: client.api_key,
+                model: client.default_model,
+                request_timeout: client.request_timeout,
+                ..GenkitOpenAiCompatibleHistorySummaryConfig::default()
+            },
+        );
         return generator
             .generate_history_stage(input, stage, payload)
             .await;
     }
     let generator =
-        AifarmHistorySummaryGenerator::new(aifarm_history_config_for_attempt(config, &attempt));
+        AifarmHistorySummaryGenerator::new(aifarm_history_config_for_attempt(config, &attempt)?);
     generator
         .generate_history_stage(input, stage, payload)
         .await
 }
 
-fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
-    attempt.provider_name.eq_ignore_ascii_case("genkit")
-        || attempt.provider_name.eq_ignore_ascii_case("gemini")
-        || attempt.provider_name.eq_ignore_ascii_case("openrouter")
-}
-
-fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
-    if attempt.provider_name.eq_ignore_ascii_case("openrouter")
-        && !attempt
-            .model_name
-            .get(..OPENROUTER_MODEL_PREFIX.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
-    {
-        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
-    } else {
-        attempt.model_name.clone()
-    }
-}
-
 fn aifarm_history_config_for_attempt(
     config: &AppConfig,
     attempt: &RoutedAttempt,
-) -> AifarmHistorySummaryConfig {
+) -> Result<AifarmHistorySummaryConfig, HistorySummaryServiceError> {
     let mut cfg = aifarm_history_summary_config_from_app_config(config);
-    cfg.model = attempt.model_name.clone();
-    cfg.client.default_model = attempt.model_name.clone();
-    if let Some(endpoint) = routed_attempt_endpoint(attempt) {
-        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
-            cfg.client.base_url = endpoint;
-        } else {
-            cfg.client.direct_url =
-                openplotva_llm::aifarm::normalize_chat_completions_url(&endpoint);
-            if attempt
-                .provider_name
-                .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
-            {
-                cfg.client.api_key = config.llm.dialog.aifarm_pool_api_key.clone();
-            }
-        }
-    }
-    if let Some(service) = attempt.discovery_service_name.as_deref() {
-        cfg.client.service_name = service.to_owned();
-    }
-    cfg.client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
-    cfg.client.supports_message_name = attempt.supports_message_name();
-    cfg.client.supports_cache_control = attempt.supports_cache_control();
-    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
-        cfg.client.endpoint_name = endpoint.to_owned();
-    }
+    cfg.client = crate::provider_transport::openai_client_for_attempt(config, attempt, cfg.client)
+        .map_err(|error| HistorySummaryServiceError::Generate {
+            message: error.to_string(),
+        })?;
+    cfg.model.clone_from(&cfg.client.default_model);
     if let Some(max_tokens) = attempt.overrides.max_tokens
         && max_tokens > 0
     {
@@ -1188,17 +934,7 @@ fn aifarm_history_config_for_attempt(
     {
         cfg.include_reasoning = Some(include_reasoning);
     }
-    cfg.with_defaults()
-}
-
-fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
-    attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    Ok(cfg.with_defaults())
 }
 
 fn history_summary_service_retryable_reason(
@@ -1208,63 +944,6 @@ fn history_summary_service_retryable_reason(
         HistorySummaryServiceError::Generate { message } => retryable_reason_from_message(message),
         _ => None,
     }
-}
-
-impl HistorySummaryGenerator for RuntimeHistorySummaryGenerator {
-    fn generate_history_stage<'a>(
-        &'a self,
-        input: &'a SummaryInput,
-        stage: HistoryStage,
-        payload: &'a str,
-    ) -> HistoryStageFuture<'a> {
-        match self {
-            Self::Aifarm {
-                primary,
-                primary_model,
-                fallback,
-            } => Box::pin(async move {
-                let mut ignore_status = |_status: openplotva_llm::aifarm::StatusUpdate| {};
-                match primary
-                    .complete_stage(stage, payload, &mut ignore_status)
-                    .await
-                {
-                    Ok(text) => Ok(HistoryStageReply {
-                        text,
-                        model: primary_model.trim().to_owned(),
-                    }),
-                    Err(err) => {
-                        if !aifarm_history_summary_error_retryable(&err) {
-                            return Err(HistorySummaryServiceError::Generate {
-                                message: err.to_string(),
-                            });
-                        }
-                        let Some(fallback) = fallback.as_ref() else {
-                            return Err(HistorySummaryServiceError::Generate {
-                                message: err.to_string(),
-                            });
-                        };
-                        match fallback.generate_history_stage(input, stage, payload).await {
-                            Ok(mut reply) => {
-                                reply.model = primary_model.trim().to_owned();
-                                Ok(reply)
-                            }
-                            Err(fallback_err) => Err(HistorySummaryServiceError::Generate {
-                                message: format!(
-                                    "aifarm chat history summary failed: {err}; genkit fallback failed: {fallback_err}"
-                                ),
-                            }),
-                        }
-                    }
-                }
-            }),
-            Self::Genkit(generator) => generator.generate_history_stage(input, stage, payload),
-        }
-    }
-}
-
-fn aifarm_history_summary_error_retryable(err: &AifarmHistorySummaryError) -> bool {
-    let retry_reason = retryable_reason(err).map(|reason| reason.as_str());
-    history_summary_generate_error_retryable(&err.to_string(), false, false, retry_reason)
 }
 
 fn go_zero_time() -> OffsetDateTime {
@@ -1284,7 +963,6 @@ mod tests {
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
-    use openplotva_llm::gemini::MODEL_GEMINI_FLASH_LITE;
 
     #[derive(Clone, Debug, PartialEq)]
     struct PayloadCall {
@@ -1576,6 +1254,7 @@ mod tests {
         let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     chat_id: 100,
                     thread_id: Some(9),
                     user_id: 55,
@@ -1639,6 +1318,7 @@ mod tests {
         let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     chat_id: 100,
                     thread_id: Some(9),
                     user_id: 55,
@@ -1699,6 +1379,7 @@ mod tests {
         let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     chat_id: 100,
                     user_id: 55,
                     ..ToolContext::default()
@@ -1744,6 +1425,7 @@ mod tests {
         let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     chat_id: 100,
                     user_id: 55,
                     ..ToolContext::default()
@@ -1782,6 +1464,7 @@ mod tests {
         let result = service
             .summarize(HistorySummaryRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     chat_id: 100,
                     user_id: 55,
                     ..ToolContext::default()
@@ -1869,105 +1552,10 @@ mod tests {
     }
 
     #[test]
-    fn gemini_history_summary_config_maps_go_genkit_branch() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some(" gemini-key ".to_owned()),
-            genkit_history_summary_provider: Some(" genkit ".to_owned()),
-            genkit_history_summary_model: Some(" summary-model ".to_owned()),
-            genkit_history_summary_timeout_seconds: Some("333".to_owned()),
-            memory_consolidation_model: Some("memory-model".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let cfg = gemini_history_summary_config_from_app_config(&config);
-
-        assert_eq!(cfg.api_key, "gemini-key");
-        assert_eq!(cfg.model, "summary-model");
-        assert_eq!(cfg.request_timeout, Duration::from_secs(333));
-        assert_eq!(cfg.max_output_tokens, 1024);
-        assert_eq!(cfg.temperature, 0.45);
-        assert_eq!(cfg.top_p, 0.9);
-    }
-
-    #[test]
-    fn gemini_history_summary_config_uses_runtime_fallback_model() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some("gemini-key".to_owned()),
-            genkit_history_summary_provider: Some("genkit".to_owned()),
-            genkit_history_summary_model: Some(" ".to_owned()),
-            memory_consolidation_model: Some("memory-model".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let cfg = gemini_history_summary_config_from_app_config(&config);
-
-        assert_eq!(cfg.model, MODEL_GEMINI_FLASH_LITE);
-    }
-
-    #[test]
-    fn history_summary_generator_builds_genkit_openai_compatible_default_model() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            genkit_history_summary_provider: Some("genkit".to_owned()),
-            genkit_history_summary_model: Some(" ".to_owned()),
-            genkit_default_model: Some(" openrouter/summary-model ".to_owned()),
-            openrouter_key: Some(" openrouter-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let generator = history_summary_generator_from_app_config(&config).expect("generator");
-
-        let RuntimeHistorySummaryGenerator::Genkit(generator) = generator else {
-            panic!("expected genkit generator");
-        };
-        assert!(matches!(
-            *generator,
-            AppGenkitHistorySummaryGenerator::OpenAiCompatible(_)
-        ));
-    }
-
-    #[test]
-    fn aifarm_history_summary_generator_attaches_gemini_fallback_when_key_resolves() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some("gemini-key".to_owned()),
-            genkit_history_summary_provider: Some("aifarm".to_owned()),
-            memory_consolidation_model: Some("memory-model".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let generator = history_summary_generator_from_app_config(&config).expect("generator");
-
-        let RuntimeHistorySummaryGenerator::Aifarm {
-            primary_model,
-            fallback,
-            ..
-        } = generator
-        else {
-            panic!("expected aifarm generator");
-        };
-        assert_eq!(primary_model, "memory-model");
-        assert!(fallback.is_some());
-    }
-
-    #[test]
-    fn aifarm_history_summary_generator_skips_gemini_fallback_without_key() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
-
-        let generator = history_summary_generator_from_app_config(&config).expect("generator");
-
-        let RuntimeHistorySummaryGenerator::Aifarm { fallback, .. } = generator else {
-            panic!("expected aifarm generator");
-        };
-        assert!(fallback.is_none());
-    }
-
-    #[test]
     fn summary_request_from_dialog_tool_matches_go_scope_and_since_parse() {
         let got = summary_request_from_dialog_tool(&HistorySummaryRequest {
             context: ToolContext {
+                invocation_id: None,
                 chat_id: 100,
                 thread_id: Some(7),
                 user_id: 55,

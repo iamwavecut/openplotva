@@ -619,41 +619,19 @@ fn routed_asr_client(
     mut config: DiscoveryAsrConfig,
     attempt: &RoutedAttempt,
 ) -> Result<DiscoveryAsrClient, AsrClientError> {
-    if let Some(endpoint) = attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if attempt.protocol != Some(openplotva_llm::provider_schema::Protocol::DiscoveryAsr) {
+        return Err(AsrClientError::Discovery(
+            "selected protocol does not support this Discovery adapter".to_owned(),
+        ));
+    }
+    if let Some(endpoint) = attempt.endpoint() {
         config.base_url = endpoint.to_owned();
     }
-    if let Some(service_name) = attempt
-        .discovery_service_name
-        .as_deref()
-        .or_else(|| {
-            attempt
-                .provider_config
-                .get("service_name")
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let (service_name, endpoint_name) = attempt.discovery_names();
+    if let Some(service_name) = service_name {
         config.service_name = service_name.to_owned();
     }
-    if let Some(endpoint_name) = attempt
-        .discovery_endpoint_name
-        .as_deref()
-        .or_else(|| {
-            attempt
-                .provider_config
-                .get("endpoint_name")
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(endpoint_name) = endpoint_name {
         config.endpoint_name = endpoint_name.to_owned();
     }
     if attempt.model_name.trim().is_empty() {

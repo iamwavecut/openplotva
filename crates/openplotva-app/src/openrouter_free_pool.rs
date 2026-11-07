@@ -621,10 +621,13 @@ async fn openrouter_key_status_error(
     http: &reqwest::Client,
     context: &OpenRouterFreeContext,
 ) -> Option<String> {
-    let api_key = resolve_provider_api_key(
+    let api_key = match crate::provider_transport::resolve_provider_api_key(
         context.provider_api_key_ref.as_deref(),
         context.provider_api_key_encrypted.as_deref(),
-    )?;
+    ) {
+        Ok(key) => key?,
+        Err(error) => return Some(error.to_string()),
+    };
     let url = context
         .provider_config
         .get("key_status_url")
@@ -636,18 +639,6 @@ async fn openrouter_key_status_error(
         Ok(response) => Some(format!("key status request returned {}", response.status())),
         Err(error) => Some(error.to_string()),
     }
-}
-
-fn resolve_provider_api_key(
-    api_key_ref: Option<&str>,
-    api_key_encrypted: Option<&[u8]>,
-) -> Option<String> {
-    if let Some(reference) = api_key_ref.filter(|reference| !reference.trim().is_empty()) {
-        return std::env::var(reference.trim()).ok();
-    }
-    let sealed = api_key_encrypted?;
-    let master = std::env::var("MASTER_KEY").unwrap_or_default();
-    openplotva_storage::llm_routing::open_key(&master, sealed).ok()
 }
 
 fn json_string(value: &Value, key: &str) -> Option<String> {

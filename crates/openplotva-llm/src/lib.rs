@@ -10,6 +10,7 @@ pub mod gradius;
 mod gradius_vip_hints;
 pub mod model_listing;
 pub mod provider_schema;
+pub mod redaction;
 pub mod retry;
 pub mod router;
 pub mod trace;

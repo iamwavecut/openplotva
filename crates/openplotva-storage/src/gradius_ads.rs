@@ -828,9 +828,16 @@ impl PostgresGradiusAdStore {
         if batch.chat_id != Some(chat_id)
             || batch.thread_id.unwrap_or_default() != identity.get::<i32, _>("thread_id")
             || batch.parts.len() != 1
-            || batch.dialog_job_id.is_some()
         {
             return Err(invalid());
+        }
+        if let Some(job_id) = batch.dialog_job_id {
+            let owned_checkin = identity.get::<String, _>("source_kind") == "checkin-final"
+                && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM taskman_jobs WHERE id = $1 AND chat_id = $2 AND user_id = $3 AND job_type = 'control')")
+                    .bind(job_id).bind(chat_id).bind(user_id).fetch_one(&self.pool).await?;
+            if !owned_checkin {
+                return Err(invalid());
+            }
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -1674,6 +1681,7 @@ mod tests {
             Ok((
                 opportunity_id,
                 TelegramOutboxBatchInput {
+                    content_policy: crate::TelegramOutboxContentPolicy::Immutable,
                     batch_id: format!("public-image-group-test:{sequence}"),
                     bot_id: 7,
                     chat_id: Some(chat_id),
@@ -2088,6 +2096,7 @@ mod tests {
             ));
             store.finish_ad(current.opportunity_id(), 1, ad()).await?;
             let mut batch = crate::TelegramOutboxBatchInput {
+                content_policy: crate::TelegramOutboxContentPolicy::Immutable,
                 batch_id: batch_id.clone(),
                 bot_id: 9820825950,
                 chat_id: Some(chat_id),
@@ -2700,6 +2709,10 @@ mod tests {
             .connect(&dsn)
             .await?;
         crate::run_migrations_on(&pool).await?;
+        sqlx::query("SELECT ensure_daily_partition('telegram_outbox', $1::date)")
+            .bind(at(20_906).date())
+            .execute(&pool)
+            .await?;
         let user_id = 9_820_825_501_i64;
         sqlx::query("DELETE FROM gradius_ad_opportunities WHERE user_id = $1")
             .bind(user_id)
@@ -3101,6 +3114,7 @@ mod tests {
         );
 
         let batch = |chat_id: i64| TelegramOutboxBatchInput {
+            content_policy: crate::TelegramOutboxContentPolicy::Immutable,
             batch_id: banner_batch_id.clone(),
             bot_id: 7,
             chat_id: Some(chat_id),

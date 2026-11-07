@@ -2230,15 +2230,12 @@ dependencies = [
 name = "openplotva-memory"
 version = "0.1.0"
 dependencies = [
- "base64",
  "futures-util",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "time",
  "tokio",
- "url",
 ]
 
 [[package]]
@@ -2299,6 +2296,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tower",
  "tracing",
  "x509-parser",
 ]

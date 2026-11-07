@@ -1,5 +1,8 @@
 //! App-level fetcher translation command and control-job behavior.
 
+#[cfg(test)]
+use crate::control_jobs::ControlJobEnqueueFuture;
+use crate::control_jobs::ControlJobQueue;
 use std::{convert::Infallible, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
@@ -8,8 +11,8 @@ use carapax::types::{
     User as TelegramUser,
 };
 use openplotva_taskman::{
-    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-    StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
+    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
+    StatelessJobItem, new_control_job_at,
 };
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, RichMessageRequest,
@@ -31,14 +34,6 @@ const UNKNOWN_LANGUAGE_NOTICE_DELETE_AFTER: Duration = Duration::from_secs(120);
 const QUEUE_ERROR_NOTICE_DELETE_AFTER: Duration = Duration::from_secs(60);
 const QUEUE_ERROR_TEXT: &str = "❌ Не удалось поставить задачу в очередь.";
 
-/// Boxed future returned by translation control-job queue calls.
-pub type TranslateControlJobQueueFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-/// Boxed future returned by translation control-job worker queue calls.
-pub type TranslateControlJobWorkerFuture<'a, T, E> =
-    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
-
 /// Boxed future returned by translation side effects.
 pub type TranslateEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
@@ -54,97 +49,6 @@ pub type TranslateClientFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T,
 
 pub trait TranslateSendPermission {
     fn can_send_translate_text(&self, chat: &TelegramChat) -> bool;
-}
-
-pub trait TranslateControlJobQueue {
-    /// Error returned by the concrete queue implementation.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn assign_translate_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> TranslateControlJobQueueFuture<'a, Self::Error>;
-}
-
-impl<T> TranslateControlJobQueue for T
-where
-    T: crate::payments::PaymentControlJobQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn assign_translate_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> TranslateControlJobQueueFuture<'a, Self::Error> {
-        self.assign_payment_control_job(queue_name, job)
-    }
-}
-
-/// Queue/status boundary for translation-owned taskman control-job workers.
-pub trait TranslateControlJobWorkerQueue {
-    /// Error returned by the concrete queue implementation.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn dequeue_translate_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> TranslateControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    >;
-
-    /// Finalize one translation control job as completed.
-    fn complete_translate_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> TranslateControlJobWorkerFuture<'a, (), Self::Error>;
-
-    /// Finalize one translation control job as failed.
-    fn fail_translate_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> TranslateControlJobWorkerFuture<'a, (), Self::Error>;
-}
-
-impl<T> TranslateControlJobWorkerQueue for T
-where
-    T: crate::payments::SharedControlJobWorkerQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn dequeue_translate_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> TranslateControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    > {
-        self.dequeue_shared_control_job_matching(
-            queue_name,
-            "translate-control",
-            is_translate_control_job,
-        )
-    }
-
-    fn complete_translate_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> TranslateControlJobWorkerFuture<'a, (), Self::Error> {
-        self.complete_shared_control_job(job_id)
-    }
-
-    fn fail_translate_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> TranslateControlJobWorkerFuture<'a, (), Self::Error> {
-        self.fail_shared_control_job(job_id, error)
-    }
 }
 
 pub trait TranslateEffects {
@@ -930,28 +834,6 @@ pub enum TranslateControlJobOutcome {
     },
 }
 
-/// Result of one translation-owned taskman worker tick.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TranslateControlJobWorkerReport {
-    /// Whether a job was dequeued.
-    pub dequeued: bool,
-    /// Dequeued taskman job ID.
-    pub job_id: Option<i64>,
-    /// Translation executor result, when payload decoding succeeded.
-    pub execution: Option<TranslateControlJobOutcome>,
-    /// The job was finalized as completed.
-    pub completed: bool,
-    /// The job was finalized as failed.
-    pub failed: bool,
-    /// Queue dequeue failed.
-    pub dequeue_error: Option<String>,
-    pub decode_error: Option<String>,
-    /// Translation provider or executor error.
-    pub execution_error: Option<String>,
-    /// Completion/failure status write failed.
-    pub status_error: Option<String>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslationResult {
     /// Trimmed source text.
@@ -1019,7 +901,7 @@ impl<Permission, Queue, Effects, Next> UpdateHandler
     for TranslateCommandUpdateHandler<Permission, Queue, Effects, Next>
 where
     Permission: TranslateSendPermission + Send + Sync,
-    Queue: TranslateControlJobQueue + Send + Sync,
+    Queue: ControlJobQueue + Send + Sync,
     Effects: TranslateEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -1058,7 +940,7 @@ pub async fn handle_translate_command_update_or_else_at<
 ) -> Result<TranslateCommandOutcome, TranslateCommandError>
 where
     Permission: TranslateSendPermission + Sync,
-    Queue: TranslateControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Effects: TranslateEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -1111,10 +993,7 @@ where
         }
     };
 
-    if let Err(error) = queue
-        .assign_translate_control_job(CONTROL_QUEUE_NAME, job)
-        .await
-    {
+    if let Err(error) = queue.assign_control_job(CONTROL_QUEUE_NAME, job).await {
         tracing::warn!(message = %error, "failed to assign translation control job");
         try_send_translate_notice(
             effects,
@@ -1219,94 +1098,6 @@ where
             message: error.to_string(),
         }),
     }
-}
-
-/// Process one translation-owned taskman control job, if available.
-pub async fn process_translate_control_job_once_at<Queue, Translator, Effects>(
-    queue: &Queue,
-    translator: &Translator,
-    effects: &Effects,
-) -> TranslateControlJobWorkerReport
-where
-    Queue: TranslateControlJobWorkerQueue + Sync,
-    Translator: TextTranslator + Sync,
-    Effects: TranslateEffects + Sync,
-{
-    let mut report = TranslateControlJobWorkerReport::default();
-    let item = match queue
-        .dequeue_translate_control_job(CONTROL_QUEUE_NAME)
-        .await
-    {
-        Ok(item) => item,
-        Err(error) => {
-            report.dequeue_error = Some(error.to_string());
-            return report;
-        }
-    };
-
-    let Some(item) = item else {
-        return report;
-    };
-    report.dequeued = true;
-    report.job_id = Some(item.id);
-
-    let params = match control_job_params_from_stateless_job(&item.job) {
-        Ok(params) => params,
-        Err(error) => {
-            let error = error.to_string();
-            report.decode_error = Some(error.clone());
-            mark_translate_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    if params.data.kind != ControlKind::Translate {
-        let error = format!(
-            "unsupported translate control job kind: {:?}",
-            params.data.kind
-        );
-        report.execution_error = Some(error.clone());
-        mark_translate_control_job_failed(queue, item.id, &error, &mut report).await;
-        return report;
-    }
-
-    match execute_translate_control_job(translator, effects, &params).await {
-        Ok(execution) => {
-            match queue.complete_translate_control_job(item.id).await {
-                Ok(()) => report.completed = true,
-                Err(error) => report.status_error = Some(error.to_string()),
-            }
-            report.execution = Some(execution);
-        }
-        Err(error) => {
-            let error = error.to_string();
-            report.execution_error = Some(error.clone());
-            mark_translate_control_job_failed(queue, item.id, &error, &mut report).await;
-        }
-    }
-    report
-}
-
-async fn mark_translate_control_job_failed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    error: &str,
-    report: &mut TranslateControlJobWorkerReport,
-) where
-    Queue: TranslateControlJobWorkerQueue + Sync,
-{
-    match queue.fail_translate_control_job(job_id, error).await {
-        Ok(()) => report.failed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
-}
-
-fn is_translate_control_job(job: &StatelessJobItem) -> bool {
-    job.data.job_type == JobType::Control
-        && matches!(
-            job.data.control_data.as_ref().map(|data| data.kind),
-            Some(ControlKind::Translate)
-        )
 }
 
 #[must_use]
@@ -1552,8 +1343,42 @@ async fn try_send_translate_notice<Effects>(
 
 #[cfg(test)]
 mod tests {
+    async fn run_translation_on_shared_worker<
+        Translator: TextTranslator + Sync,
+        Effects: TranslateEffects + Sync,
+    >(
+        queue: &crate::control_jobs::InMemoryControlJobQueue,
+        translator: &Translator,
+        effects: &Effects,
+    ) -> crate::control_jobs::ControlJobWorkerReport {
+        use crate::control_jobs::test_support::UnusedControlPorts;
+        let ports = UnusedControlPorts;
+        let dispatcher = openplotva_telegram::DispatcherQueue::new(Default::default());
+        let next_id = || "unused-translation-id".to_owned();
+        let registry = crate::control_jobs::AppControlJobExecutors {
+            payment_store: &ports,
+            payment_effects: &ports,
+            dispatcher_queue: &dispatcher,
+            group_settings_effects: &ports,
+            new_members_effects: &ports,
+            bot_username: "PlotvaBot",
+            next_virtual_id: &next_id,
+            translator,
+            translation_effects: effects,
+            member_effects: &ports,
+            checkin_effects: &ports,
+        };
+        crate::control_jobs::process_control_job_once_at(
+            queue,
+            &registry,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
     use super::*;
-    use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
+
+    use crate::control_jobs::{InMemoryControlJobQueue, InMemoryControlJobStatus};
     use crate::updates::{
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
         process_update_with_state_store_at,
@@ -1838,26 +1663,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn translate_control_worker_skips_settings_job_and_completes_translate_job()
+    async fn shared_control_worker_completes_translate_job()
     -> Result<(), Box<dyn std::error::Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
+        let queue = InMemoryControlJobQueue::new();
         let effects = EffectsStub::default();
         let translator = TranslatorStub::default();
-        let settings_job =
-            translate_test_control_job(ControlKind::GroupSettings, "group settings")?;
         let translate_job = sample_translate_job()?;
         queue
-            .assign_translate_control_job(CONTROL_QUEUE_NAME, settings_job)
-            .await?;
-        queue
-            .assign_translate_control_job(CONTROL_QUEUE_NAME, translate_job.clone())
+            .assign_control_job(CONTROL_QUEUE_NAME, translate_job.clone())
             .await?;
 
-        let report = process_translate_control_job_once_at(&queue, &translator, &effects).await;
+        let report = run_translation_on_shared_worker(&queue, &translator, &effects).await;
 
         assert!(report.dequeued);
-        assert_eq!(report.job_id, Some(2));
-        assert_eq!(report.execution, Some(TranslateControlJobOutcome::Sent));
+        assert_eq!(report.job_id, Some(1));
+        assert_eq!(
+            report.execution,
+            Some(crate::control_jobs::ControlJobExecution::Translate(
+                TranslateControlJobOutcome::Sent
+            ))
+        );
         assert!(report.completed);
         assert!(!report.failed);
         assert_eq!(
@@ -1866,12 +1691,8 @@ mod tests {
         );
         assert_eq!(effects.results().len(), 1);
         let snapshot = queue.snapshot();
-        assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
-        assert_eq!(
-            snapshot[1].status,
-            InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(snapshot[1].job, translate_job);
+        assert_eq!(snapshot[0].status, InMemoryControlJobStatus::Completed);
+        assert_eq!(snapshot[0].job, translate_job);
         Ok(())
     }
 
@@ -1890,7 +1711,7 @@ mod tests {
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
 
         let state_store = UpdateStateStoreStub::default();
-        let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let control_queue = Arc::new(InMemoryControlJobQueue::new());
         let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let effects = TranslateDispatcherEffects::new(Arc::clone(&dispatcher_queue))
             .with_virtual_id_factory(Arc::new(|| "translate-live-redis-vmsg-1".to_owned()));
@@ -1958,17 +1779,16 @@ mod tests {
         assert_eq!(data.target_lang, "en");
 
         let translator = TranslatorStub::default();
-        let worker_report = process_translate_control_job_once_at(
-            control_queue.as_ref(),
-            &translator,
-            effects.as_ref(),
-        )
-        .await;
+        let worker_report =
+            run_translation_on_shared_worker(control_queue.as_ref(), &translator, effects.as_ref())
+                .await;
         assert!(worker_report.dequeued);
         assert_eq!(worker_report.job_id, Some(1));
         assert_eq!(
             worker_report.execution,
-            Some(TranslateControlJobOutcome::Sent)
+            Some(crate::control_jobs::ControlJobExecution::Translate(
+                TranslateControlJobOutcome::Sent
+            ))
         );
         assert!(worker_report.completed);
         assert!(!worker_report.failed);
@@ -1978,7 +1798,7 @@ mod tests {
         );
         assert_eq!(
             control_queue.snapshot()[0].status,
-            InMemoryPaymentControlJobStatus::Completed
+            InMemoryControlJobStatus::Completed
         );
         let item = dispatcher_queue
             .dequeue_regular()
@@ -2412,18 +2232,6 @@ mod tests {
         Ok(*job)
     }
 
-    fn translate_test_control_job(
-        kind: ControlKind,
-        title: &str,
-    ) -> Result<StatelessJobItem, serde_json::Error> {
-        let mut job = sample_translate_job()?;
-        job.title = title.to_owned();
-        if let Some(data) = job.data.control_data.as_mut() {
-            data.kind = kind;
-        }
-        Ok(job)
-    }
-
     #[derive(Clone, Copy)]
     struct PermissionStub {
         allowed: bool,
@@ -2540,14 +2348,14 @@ mod tests {
         }
     }
 
-    impl TranslateControlJobQueue for QueueStub {
+    impl ControlJobQueue for QueueStub {
         type Error = io::Error;
 
-        fn assign_translate_control_job<'a>(
+        fn assign_control_job<'a>(
             &'a self,
             queue_name: &'static str,
             job: StatelessJobItem,
-        ) -> TranslateControlJobQueueFuture<'a, Self::Error> {
+        ) -> ControlJobEnqueueFuture<'a, Self::Error> {
             Box::pin(async move {
                 let mut state = self.lock();
                 state.assigned.push((queue_name, job));

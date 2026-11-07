@@ -1,28 +1,36 @@
 //! App-level fetcher `/delete_drawing` command behavior.
 
+#[cfg(test)]
+use crate::callbacks::DeleteMemberFuture;
+use crate::callbacks::{
+    DeleteCallbackEffects, DeleteMemberApi, can_delete_owned_content, try_execute_delete_method,
+};
+#[cfg(test)]
+use carapax::types::ChatMember as TelegramChatMember;
+#[cfg(test)]
+use openplotva_telegram::TelegramOutboundMethod;
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
-    CallbackQuery as TelegramCallbackQuery, ChatMember as TelegramChatMember,
-    MaybeInaccessibleMessage, Message as TelegramMessage, Update as TelegramUpdate,
-    UpdateType as TelegramUpdateType,
+    CallbackQuery as TelegramCallbackQuery, MaybeInaccessibleMessage, Message as TelegramMessage,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{
     CallbackActionParse, CallbackAnswerRequest, ChatRef, DeleteMessageRequest, DispatcherQueue,
     EditCaptionMessageRequest, EditReplyMarkupMessageRequest, EditTextMessageRequest,
-    OutboundBuildError, ReplyMarkup, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
-    TelegramOutboundMethod, TextMessageRequest, build_callback_answer_method,
-    build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
-    build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
-    build_delete_message_method, build_edit_caption_message_method,
-    build_edit_reply_markup_message_method, build_edit_text_message_method,
-    build_get_chat_member_method, parse_callback_action, parse_callback_i64,
+    OutboundBuildError, ReplyMarkup, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
+    build_callback_answer_method, build_delete_drawing_confirm_keyboard,
+    build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
+    build_delete_drawing_initial_keyboard, build_delete_message_method,
+    build_edit_caption_message_method, build_edit_reply_markup_message_method,
+    build_edit_text_message_method, parse_callback_action, parse_callback_i64,
 };
 use openplotva_updates::parse_leading_bot_command;
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::updates::UpdateHandler;
+
 use crate::virtual_messages::{
     QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
@@ -162,37 +170,6 @@ impl DeleteDrawingCallbackStore for openplotva_storage::RedisLastGenerationStore
     }
 }
 
-/// Boxed future returned by Telegram membership APIs.
-pub type DeleteDrawingMemberFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<TelegramChatMember, E>> + Send + 'a>>;
-
-pub trait DeleteDrawingMemberApi {
-    /// Concrete API error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Fetch one Telegram chat member.
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteDrawingMemberFuture<'a, Self::Error>;
-}
-
-impl DeleteDrawingMemberApi for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteDrawingMemberFuture<'a, Self::Error> {
-        Box::pin(async move {
-            self.execute(build_get_chat_member_method(chat_id, user_id))
-                .await
-        })
-    }
-}
-
 /// Boxed future returned by VIP status lookups.
 pub type DeleteDrawingVipFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
@@ -272,28 +249,6 @@ impl DeleteDrawingCommandEffects for DeleteDrawingCommandDispatcherEffects {
             .await?;
             Ok(())
         })
-    }
-}
-
-pub trait DeleteDrawingCallbackEffects {
-    /// Concrete effect error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Execute one direct Telegram Bot API method.
-    fn execute_delete_drawing_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteDrawingEffectFuture<'a, Self::Error>;
-}
-
-impl DeleteDrawingCallbackEffects for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn execute_delete_drawing_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteDrawingEffectFuture<'a, Self::Error> {
-        Box::pin(async move { method.execute_with(self).await.map(|_| ()) })
     }
 }
 
@@ -432,9 +387,9 @@ impl<Store, MemberApi, Vip, Effects, Next> UpdateHandler
     for DeleteDrawingCallbackUpdateHandler<Store, MemberApi, Vip, Effects, Next>
 where
     Store: DeleteDrawingCallbackStore + Send + Sync,
-    MemberApi: DeleteDrawingMemberApi + Send + Sync,
+    MemberApi: DeleteMemberApi + Send + Sync,
     Vip: DeleteDrawingVipStatus + Send + Sync,
-    Effects: DeleteDrawingCallbackEffects + Send + Sync,
+    Effects: DeleteCallbackEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = DeleteDrawingCallbackError;
@@ -509,9 +464,9 @@ pub async fn handle_delete_drawing_callback_update_or_else<
 ) -> Result<DeleteDrawingCallbackOutcome, DeleteDrawingCallbackError>
 where
     Store: DeleteDrawingCallbackStore + Sync,
-    MemberApi: DeleteDrawingMemberApi + Sync,
+    MemberApi: DeleteMemberApi + Sync,
     Vip: DeleteDrawingVipStatus + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
@@ -558,11 +513,11 @@ pub async fn handle_delete_drawing_callback<Store, MemberApi, Vip, Effects>(
 ) -> DeleteDrawingCallbackOutcome
 where
     Store: DeleteDrawingCallbackStore + Sync,
-    MemberApi: DeleteDrawingMemberApi + Sync,
+    MemberApi: DeleteMemberApi + Sync,
     Vip: DeleteDrawingVipStatus + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
-    if !is_authorized_for_delete_drawing(member_api, query, data.user_id, data.chat_id).await {
+    if !can_delete_owned_content(member_api, query, data.user_id, data.chat_id).await {
         try_answer_callback(
             effects,
             &query.id,
@@ -706,7 +661,7 @@ async fn handle_delete_drawing_init<Store, Vip, Effects>(
 where
     Store: DeleteDrawingCallbackStore + Sync,
     Vip: DeleteDrawingVipStatus + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let Some(generation) = load_callback_generation(store, data, true).await else {
         try_answer_callback(
@@ -755,7 +710,7 @@ async fn handle_delete_drawing_confirm<Store, Effects>(
 ) -> DeleteDrawingCallbackOutcome
 where
     Store: DeleteDrawingCallbackStore + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let Some(generation) = load_callback_generation(store, data, false).await else {
         try_answer_callback(
@@ -800,7 +755,7 @@ async fn handle_delete_drawing_frame_pick<Vip, Effects>(
 ) -> DeleteDrawingCallbackOutcome
 where
     Vip: DeleteDrawingVipStatus + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     if !vip.is_delete_drawing_vip(i64::from(query.from.id)).await {
         try_answer_callback(
@@ -843,7 +798,7 @@ async fn handle_delete_drawing_frame_confirm<Store, Vip, Effects>(
 where
     Store: DeleteDrawingCallbackStore + Sync,
     Vip: DeleteDrawingVipStatus + Sync,
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     if !vip.is_delete_drawing_vip(i64::from(query.from.id)).await {
         try_answer_callback(
@@ -970,7 +925,7 @@ async fn handle_delete_drawing_close<Effects>(
     control_message: DeleteDrawingControlMessage,
 ) -> DeleteDrawingCallbackOutcome
 where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     try_delete_message(
         effects,
@@ -1045,7 +1000,7 @@ async fn try_answer_callback<Effects>(
     show_alert: bool,
     context: &'static str,
 ) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let request = CallbackAnswerRequest {
         callback_query_id: query_id.to_owned(),
@@ -1054,7 +1009,7 @@ async fn try_answer_callback<Effects>(
         url: String::new(),
         cache_time: 0,
     };
-    try_execute_delete_drawing_method(
+    try_execute_delete_method(
         effects,
         build_callback_answer_method(&request).into(),
         context,
@@ -1067,10 +1022,10 @@ async fn try_edit_reply_markup<Effects>(
     request: EditReplyMarkupMessageRequest,
     context: &'static str,
 ) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_edit_reply_markup_message_method(&request) {
-        Ok(method) => try_execute_delete_drawing_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete drawing method"),
     }
 }
@@ -1080,10 +1035,10 @@ async fn try_edit_text<Effects>(
     request: EditTextMessageRequest,
     context: &'static str,
 ) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_edit_text_message_method(&request) {
-        Ok(method) => try_execute_delete_drawing_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete drawing method"),
     }
 }
@@ -1093,10 +1048,10 @@ async fn try_edit_caption<Effects>(
     request: EditCaptionMessageRequest,
     context: &'static str,
 ) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_edit_caption_message_method(&request) {
-        Ok(method) => try_execute_delete_drawing_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete drawing method"),
     }
 }
@@ -1107,72 +1062,14 @@ async fn try_delete_message<Effects>(
     message_id: i64,
     context: &'static str,
 ) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_delete_message_method(&DeleteMessageRequest {
         chat_id,
         message_id,
     }) {
-        Ok(method) => try_execute_delete_drawing_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete drawing method"),
-    }
-}
-
-async fn try_execute_delete_drawing_method<Effects>(
-    effects: &Effects,
-    method: TelegramOutboundMethod,
-    context: &'static str,
-) where
-    Effects: DeleteDrawingCallbackEffects + Sync,
-{
-    let method_name = method.method_name();
-    if let Err(error) = effects.execute_delete_drawing_method(method).await {
-        tracing::warn!(
-            message = %error,
-            method = method_name,
-            context,
-            "delete drawing callback Telegram side effect failed"
-        );
-    }
-}
-
-async fn is_authorized_for_delete_drawing<MemberApi>(
-    member_api: &MemberApi,
-    query: &TelegramCallbackQuery,
-    data_user_id: i64,
-    data_chat_id: i64,
-) -> bool
-where
-    MemberApi: DeleteDrawingMemberApi + Sync,
-{
-    let requester_id = i64::from(query.from.id);
-    if requester_id == data_user_id {
-        return true;
-    }
-
-    match member_api.get_chat_member(data_chat_id, requester_id).await {
-        Ok(member) => telegram_member_can_delete_drawing(&member),
-        Err(error) => {
-            tracing::warn!(
-                message = %error,
-                chat_id = data_chat_id,
-                user_id = requester_id,
-                "failed to authorize delete drawing callback"
-            );
-            false
-        }
-    }
-}
-
-#[must_use]
-pub fn telegram_member_can_delete_drawing(member: &TelegramChatMember) -> bool {
-    match member {
-        TelegramChatMember::Creator(_) => true,
-        TelegramChatMember::Administrator(admin) => admin.can_delete_messages,
-        TelegramChatMember::Kicked(_)
-        | TelegramChatMember::Left(_)
-        | TelegramChatMember::Member { .. }
-        | TelegramChatMember::Restricted(_) => false,
     }
 }
 
@@ -2277,10 +2174,10 @@ mod tests {
         }
     }
 
-    impl DeleteDrawingCallbackEffects for EffectsStub {
+    impl DeleteCallbackEffects for EffectsStub {
         type Error = io::Error;
 
-        fn execute_delete_drawing_method<'a>(
+        fn execute_delete_method<'a>(
             &'a self,
             method: TelegramOutboundMethod,
         ) -> DeleteDrawingEffectFuture<'a, Self::Error> {
@@ -2361,14 +2258,14 @@ mod tests {
         }
     }
 
-    impl DeleteDrawingMemberApi for MemberApiStub {
+    impl DeleteMemberApi for MemberApiStub {
         type Error = io::Error;
 
         fn get_chat_member<'a>(
             &'a self,
             chat_id: i64,
             user_id: i64,
-        ) -> DeleteDrawingMemberFuture<'a, Self::Error> {
+        ) -> DeleteMemberFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.calls
                     .lock()

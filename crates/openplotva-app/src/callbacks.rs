@@ -3,12 +3,12 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use carapax::types::{
-    CallbackQuery as TelegramCallbackQuery, MaybeInaccessibleMessage, Update as TelegramUpdate,
-    UpdateType,
+    CallbackQuery as TelegramCallbackQuery, ChatMember as TelegramChatMember,
+    MaybeInaccessibleMessage, Update as TelegramUpdate, UpdateType,
 };
 use openplotva_telegram::{
-    CallbackHandlerKind, CallbackQueryRoute, TelegramOutboundMethod, callback_query_ack_method,
-    callback_query_route, settings_callback_ack_method,
+    CallbackHandlerKind, CallbackQueryRoute, TelegramOutboundMethod, build_get_chat_member_method,
+    callback_query_ack_method, callback_query_route, settings_callback_ack_method,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -17,6 +17,120 @@ use crate::{
     rate_limits::{ChatRateLimitPolicy, RateLimitStore},
     updates::UpdateHandler,
 };
+
+/// Boxed future returned by Telegram membership APIs.
+pub type DeleteMemberFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<TelegramChatMember, E>> + Send + 'a>>;
+
+pub trait DeleteMemberApi {
+    /// Concrete API error.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Fetch one Telegram chat member.
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> DeleteMemberFuture<'a, Self::Error>;
+}
+
+impl DeleteMemberApi for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> DeleteMemberFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(build_get_chat_member_method(chat_id, user_id))
+                .await
+        })
+    }
+}
+
+/// Boxed future returned by delete callback effects.
+pub type DeleteEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+pub trait DeleteCallbackEffects {
+    /// Concrete effect error.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Execute one direct Telegram Bot API method.
+    fn execute_delete_method<'a>(
+        &'a self,
+        method: TelegramOutboundMethod,
+    ) -> DeleteEffectFuture<'a, Self::Error>;
+}
+
+impl DeleteCallbackEffects for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn execute_delete_method<'a>(
+        &'a self,
+        method: TelegramOutboundMethod,
+    ) -> DeleteEffectFuture<'a, Self::Error> {
+        Box::pin(async move { method.execute_with(self).await.map(|_| ()) })
+    }
+}
+
+#[must_use]
+pub fn telegram_member_can_delete(member: &TelegramChatMember) -> bool {
+    match member {
+        TelegramChatMember::Creator(_) => true,
+        TelegramChatMember::Administrator(admin) => admin.can_delete_messages,
+        TelegramChatMember::Kicked(_)
+        | TelegramChatMember::Left(_)
+        | TelegramChatMember::Member { .. }
+        | TelegramChatMember::Restricted(_) => false,
+    }
+}
+
+pub(crate) async fn try_execute_delete_method<Effects>(
+    effects: &Effects,
+    method: TelegramOutboundMethod,
+    context: &'static str,
+) where
+    Effects: DeleteCallbackEffects + Sync,
+{
+    let method_name = method.method_name();
+    if let Err(error) = effects.execute_delete_method(method).await {
+        tracing::warn!(
+            message = %error,
+            method = method_name,
+            context,
+            "generic delete callback Telegram side effect failed"
+        );
+    }
+}
+
+pub(crate) async fn can_delete_owned_content<MemberApi>(
+    member_api: &MemberApi,
+    query: &TelegramCallbackQuery,
+    data_user_id: i64,
+    data_chat_id: i64,
+) -> bool
+where
+    MemberApi: DeleteMemberApi + Sync,
+{
+    let requester_id = i64::from(query.from.id);
+    if requester_id == data_user_id {
+        return true;
+    }
+
+    match member_api.get_chat_member(data_chat_id, requester_id).await {
+        Ok(member) => telegram_member_can_delete(&member),
+        Err(error) => {
+            tracing::warn!(
+                message = %error,
+                chat_id = data_chat_id,
+                user_id = requester_id,
+                "failed to authorize delete callback"
+            );
+            false
+        }
+    }
+}
 
 /// Boxed future returned by callback-query side effects.
 pub type CallbackQueryFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;

@@ -98,6 +98,9 @@ impl Error for DialogTraceError {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ToolContext {
+    /// Stable operation identity assigned by the tool execution owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     /// Telegram chat ID.
     #[serde(default)]
     pub chat_id: i64,

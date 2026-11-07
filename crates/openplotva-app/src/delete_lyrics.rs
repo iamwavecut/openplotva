@@ -1,17 +1,27 @@
 //! App-level generated-lyrics delete callback behavior.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+#[cfg(test)]
+use crate::callbacks::DeleteEffectFuture;
+#[cfg(test)]
+use crate::callbacks::DeleteMemberFuture;
+use crate::callbacks::{
+    DeleteCallbackEffects, DeleteMemberApi, can_delete_owned_content, try_execute_delete_method,
+};
+#[cfg(test)]
+use carapax::types::ChatMember as TelegramChatMember;
+#[cfg(test)]
+use openplotva_telegram::TelegramOutboundMethod;
+use std::{fmt, future::Future, sync::Arc};
 
 use carapax::types::{
-    CallbackQuery as TelegramCallbackQuery, ChatMember as TelegramChatMember,
-    MaybeInaccessibleMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    CallbackQuery as TelegramCallbackQuery, MaybeInaccessibleMessage, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{
     CallbackActionParse, CallbackAnswerRequest, ChatRef, DeleteMessageRequest,
-    EditReplyMarkupMessageRequest, TelegramOutboundMethod, build_callback_answer_method,
-    build_delete_message_method, build_edit_reply_markup_message_method,
-    build_get_chat_member_method, build_lyrics_delete_confirm_keyboard, parse_callback_action,
-    parse_callback_i64,
+    EditReplyMarkupMessageRequest, build_callback_answer_method, build_delete_message_method,
+    build_edit_reply_markup_message_method, build_lyrics_delete_confirm_keyboard,
+    parse_callback_action, parse_callback_i64,
 };
 use thiserror::Error;
 
@@ -19,62 +29,6 @@ use crate::updates::UpdateHandler;
 
 const DELETE_LYRICS_AUTH_ALERT_TEXT: &str = "Удаление доступно только автору или администраторам.";
 const DELETE_LYRICS_DELETED_TEXT: &str = "✅ Текст удалён";
-
-/// Boxed future returned by Telegram membership APIs.
-pub type DeleteLyricsMemberFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<TelegramChatMember, E>> + Send + 'a>>;
-
-pub trait DeleteLyricsMemberApi {
-    /// Concrete API error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Fetch one Telegram chat member.
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteLyricsMemberFuture<'a, Self::Error>;
-}
-
-impl DeleteLyricsMemberApi for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn get_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> DeleteLyricsMemberFuture<'a, Self::Error> {
-        Box::pin(async move {
-            self.execute(build_get_chat_member_method(chat_id, user_id))
-                .await
-        })
-    }
-}
-
-/// Boxed future returned by delete-lyrics effects.
-pub type DeleteLyricsEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-pub trait DeleteLyricsEffects {
-    /// Concrete effect error.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Execute one direct Telegram Bot API method.
-    fn execute_delete_lyrics_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteLyricsEffectFuture<'a, Self::Error>;
-}
-
-impl DeleteLyricsEffects for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
-
-    fn execute_delete_lyrics_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> DeleteLyricsEffectFuture<'a, Self::Error> {
-        Box::pin(async move { method.execute_with(self).await.map(|_| ()) })
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteLyricsCallbackData {
@@ -138,8 +92,8 @@ impl<MemberApi, Effects, Next> DeleteLyricsCallbackUpdateHandler<MemberApi, Effe
 impl<MemberApi, Effects, Next> UpdateHandler
     for DeleteLyricsCallbackUpdateHandler<MemberApi, Effects, Next>
 where
-    MemberApi: DeleteLyricsMemberApi + Send + Sync,
-    Effects: DeleteLyricsEffects + Send + Sync,
+    MemberApi: DeleteMemberApi + Send + Sync,
+    Effects: DeleteCallbackEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = DeleteLyricsCallbackError;
@@ -169,8 +123,8 @@ pub async fn handle_delete_lyrics_callback_update_or_else<
     handle_other: HandleFn,
 ) -> Result<DeleteLyricsCallbackOutcome, DeleteLyricsCallbackError>
 where
-    MemberApi: DeleteLyricsMemberApi + Sync,
-    Effects: DeleteLyricsEffects + Sync,
+    MemberApi: DeleteMemberApi + Sync,
+    Effects: DeleteCallbackEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
@@ -206,15 +160,15 @@ pub async fn handle_delete_lyrics_callback<MemberApi, Effects>(
     data: DeleteLyricsCallbackData,
 ) -> DeleteLyricsCallbackOutcome
 where
-    MemberApi: DeleteLyricsMemberApi + Sync,
-    Effects: DeleteLyricsEffects + Sync,
+    MemberApi: DeleteMemberApi + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     if data.user_id == 0 || data.chat_id == 0 {
         try_answer_callback(effects, &query.id, "", false, "bad lyrics data ack").await;
         return DeleteLyricsCallbackOutcome::BadDataAck;
     }
 
-    if !is_authorized_for_delete_lyrics(member_api, query, data.user_id, data.chat_id).await {
+    if !can_delete_owned_content(member_api, query, data.user_id, data.chat_id).await {
         try_answer_callback(
             effects,
             &query.id,
@@ -270,7 +224,7 @@ async fn try_answer_callback<Effects>(
     show_alert: bool,
     context: &'static str,
 ) where
-    Effects: DeleteLyricsEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     let request = CallbackAnswerRequest {
         callback_query_id: query_id.to_owned(),
@@ -279,7 +233,7 @@ async fn try_answer_callback<Effects>(
         url: String::new(),
         cache_time: 0,
     };
-    try_execute_delete_lyrics_method(
+    try_execute_delete_method(
         effects,
         build_callback_answer_method(&request).into(),
         context,
@@ -292,10 +246,10 @@ async fn try_edit_reply_markup<Effects>(
     request: EditReplyMarkupMessageRequest,
     context: &'static str,
 ) where
-    Effects: DeleteLyricsEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_edit_reply_markup_message_method(&request) {
-        Ok(method) => try_execute_delete_lyrics_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete lyrics method"),
     }
 }
@@ -306,72 +260,14 @@ async fn try_delete_message<Effects>(
     message_id: i64,
     context: &'static str,
 ) where
-    Effects: DeleteLyricsEffects + Sync,
+    Effects: DeleteCallbackEffects + Sync,
 {
     match build_delete_message_method(&DeleteMessageRequest {
         chat_id,
         message_id,
     }) {
-        Ok(method) => try_execute_delete_lyrics_method(effects, method.into(), context).await,
+        Ok(method) => try_execute_delete_method(effects, method.into(), context).await,
         Err(error) => tracing::warn!(message = %error, "failed to build delete lyrics method"),
-    }
-}
-
-async fn try_execute_delete_lyrics_method<Effects>(
-    effects: &Effects,
-    method: TelegramOutboundMethod,
-    context: &'static str,
-) where
-    Effects: DeleteLyricsEffects + Sync,
-{
-    let method_name = method.method_name();
-    if let Err(error) = effects.execute_delete_lyrics_method(method).await {
-        tracing::warn!(
-            message = %error,
-            method = method_name,
-            context,
-            "delete lyrics callback Telegram side effect failed"
-        );
-    }
-}
-
-async fn is_authorized_for_delete_lyrics<MemberApi>(
-    member_api: &MemberApi,
-    query: &TelegramCallbackQuery,
-    data_user_id: i64,
-    data_chat_id: i64,
-) -> bool
-where
-    MemberApi: DeleteLyricsMemberApi + Sync,
-{
-    let requester_id = i64::from(query.from.id);
-    if requester_id == data_user_id {
-        return true;
-    }
-
-    match member_api.get_chat_member(data_chat_id, requester_id).await {
-        Ok(member) => telegram_member_can_delete_lyrics(&member),
-        Err(error) => {
-            tracing::warn!(
-                message = %error,
-                chat_id = data_chat_id,
-                user_id = requester_id,
-                "failed to authorize delete lyrics callback"
-            );
-            false
-        }
-    }
-}
-
-#[must_use]
-pub fn telegram_member_can_delete_lyrics(member: &TelegramChatMember) -> bool {
-    match member {
-        TelegramChatMember::Creator(_) => true,
-        TelegramChatMember::Administrator(admin) => admin.can_delete_messages,
-        TelegramChatMember::Kicked(_)
-        | TelegramChatMember::Left(_)
-        | TelegramChatMember::Member { .. }
-        | TelegramChatMember::Restricted(_) => false,
     }
 }
 
@@ -767,14 +663,14 @@ mod tests {
         }
     }
 
-    impl DeleteLyricsMemberApi for MemberApiStub {
+    impl DeleteMemberApi for MemberApiStub {
         type Error = io::Error;
 
         fn get_chat_member<'a>(
             &'a self,
             chat_id: i64,
             user_id: i64,
-        ) -> DeleteLyricsMemberFuture<'a, Self::Error> {
+        ) -> DeleteMemberFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.calls
                     .lock()
@@ -804,13 +700,13 @@ mod tests {
         }
     }
 
-    impl DeleteLyricsEffects for EffectsStub {
+    impl DeleteCallbackEffects for EffectsStub {
         type Error = io::Error;
 
-        fn execute_delete_lyrics_method<'a>(
+        fn execute_delete_method<'a>(
             &'a self,
             method: TelegramOutboundMethod,
-        ) -> DeleteLyricsEffectFuture<'a, Self::Error> {
+        ) -> DeleteEffectFuture<'a, Self::Error> {
             Box::pin(async move {
                 let name = method.method_name().to_owned();
                 let payload = method_payload(method)?;

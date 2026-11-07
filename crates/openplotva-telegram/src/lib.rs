@@ -128,7 +128,7 @@ pub use transport::{
     telegram_execute_error_is_reply_missing,
 };
 pub use update_startup::{
-    GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture,
+    GetUpdatesExecutor, GetUpdatesFuture, LONG_POLL_RETRY_DELAY, LONG_POLL_TIMEOUT,
     LongPollStreamRunReport, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
     TELEGRAM_WEBHOOK_SECRET_HEADER, WEBHOOK_STREAM_APPEND_TIMEOUT, WebhookCertificate,
     WebhookIngressSnapshot, WebhookSetup, WebhookUpdateRequestError, WebhookUpdateSendError,
@@ -273,7 +273,7 @@ pub fn empty_context() -> CarapaxContext {
 }
 
 /// Total per-request bound for Bot API HTTP calls. Must stay above the 60s
-/// `getUpdates` long-poll hold (`GO_LONG_POLL_TIMEOUT`) plus network slack;
+/// `getUpdates` long-poll hold (`LONG_POLL_TIMEOUT`) plus network slack;
 /// without it a half-open socket stalls outbound sends indefinitely.
 const TELEGRAM_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 

@@ -213,9 +213,17 @@ pub struct PendingTelegramHistoryReceipt {
     pub receipt: Value,
 }
 
+/// Whether a replay must match content or reuse the first prepared payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelegramOutboxContentPolicy {
+    Immutable,
+    ReusePrepared,
+}
+
 /// Immutable batch metadata plus ordered parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TelegramOutboxBatchInput {
+    pub content_policy: TelegramOutboxContentPolicy,
     pub batch_id: String,
     pub bot_id: i64,
     pub chat_id: Option<i64>,
@@ -342,7 +350,14 @@ impl PostgresTelegramOutboxStore {
     ) -> Result<QueuedTelegramOutboxBatch, StorageError> {
         let mut retry_delays = ENQUEUE_POOL_TIMEOUT_RETRY_DELAYS.into_iter();
         loop {
-            match enqueue_telegram_outbox_batch(&self.pool, batch).await {
+            let result = async {
+                let mut tx = self.pool.begin().await?;
+                let queued = enqueue_telegram_outbox_batch_in_transaction(&mut tx, batch).await?;
+                tx.commit().await?;
+                Ok(queued)
+            }
+            .await;
+            match result {
                 Err(StorageError::Postgres {
                     source: sqlx::Error::PoolTimedOut,
                 }) => {
@@ -361,6 +376,21 @@ impl PostgresTelegramOutboxStore {
         }
     }
 
+    /// Look up an already committed delivery before preparing content again.
+    pub async fn queued_batch(
+        &self,
+        bot_id: i64,
+        batch_id: &str,
+        job_id: Option<i64>,
+    ) -> Result<Option<QueuedTelegramOutboxBatch>, StorageError> {
+        let rows = sqlx::query("SELECT id, operation_id, part_index, state, FALSE AS inserted FROM telegram_outbox WHERE bot_id = $1 AND batch_id = $2 AND dialog_job_id IS NOT DISTINCT FROM $3 ORDER BY part_index")
+            .bind(bot_id).bind(batch_id).bind(job_id).fetch_all(&self.pool).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(queued_batch_from_rows(batch_id, rows)?))
+    }
+
     /// Claim at most one currently-sendable operation per ordering key.
     pub async fn claim_operations(
         &self,
@@ -375,17 +405,6 @@ impl PostgresTelegramOutboxStore {
             .await?;
         rows.into_iter().map(claimed_operation_from_row).collect()
     }
-}
-
-/// Atomically enqueue one immutable outbound batch.
-pub async fn enqueue_telegram_outbox_batch(
-    pool: &PgPool,
-    batch: &TelegramOutboxBatchInput,
-) -> Result<QueuedTelegramOutboxBatch, StorageError> {
-    let mut tx = pool.begin().await?;
-    let queued = enqueue_telegram_outbox_batch_in_transaction(&mut tx, batch).await?;
-    tx.commit().await?;
-    Ok(queued)
 }
 
 pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
@@ -411,6 +430,41 @@ pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
         });
     }
 
+    sqlx::query(SQL_LOCK_OUTBOX_BATCH)
+        .bind(&batch.batch_id)
+        .execute(&mut **tx)
+        .await?;
+    if batch.content_policy == TelegramOutboxContentPolicy::ReusePrepared {
+        let rows = sqlx::query("SELECT *, FALSE AS inserted FROM telegram_outbox WHERE batch_id = $1 ORDER BY part_index")
+            .bind(&batch.batch_id).fetch_all(&mut **tx).await?;
+        if !rows.is_empty() {
+            let mut matches = rows.len() == batch.parts.len();
+            for (row, part) in rows.iter().zip(&batch.parts) {
+                matches &= row.try_get::<i64, _>("bot_id")? == batch.bot_id
+                    && row.try_get::<Option<i64>, _>("chat_id")? == batch.chat_id
+                    && row.try_get::<Option<i32>, _>("thread_id")? == batch.thread_id
+                    && row.try_get::<String, _>("ordering_key")? == batch.ordering_key
+                    && row.try_get::<Option<i64>, _>("causation_update_id")?
+                        == batch.causation_update_id
+                    && row.try_get::<Option<i64>, _>("dialog_job_id")? == batch.dialog_job_id
+                    && row.try_get::<Option<i64>, _>("trigger_message_id")?
+                        == batch.trigger_message_id
+                    && row.try_get::<String, _>("method_kind")? == part.method_kind
+                    && row.try_get::<String, _>("delivery_policy")?
+                        == batch.delivery_policy.as_str()
+                    && row.try_get::<bool, _>("protected")? == batch.protected
+                    && row.try_get::<i32, _>("priority")? == batch.priority
+                    && row.try_get::<Option<OffsetDateTime>, _>("expires_at")? == part.expires_at;
+            }
+            if !matches {
+                return Err(StorageError::TelegramOutboxIdempotencyConflict {
+                    batch_id: batch.batch_id.clone(),
+                });
+            }
+            return queued_batch_from_rows(&batch.batch_id, rows);
+        }
+    }
+
     let mut blob_ids = HashMap::with_capacity(blobs.len());
     if !blobs.is_empty() {
         let mut builder = outbox_blob_insert_builder(&blobs);
@@ -427,10 +481,6 @@ pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
     }
 
     let parts = prepare_parts(batch, &blob_ids)?;
-    sqlx::query(SQL_LOCK_OUTBOX_BATCH)
-        .bind(&batch.batch_id)
-        .execute(&mut **tx)
-        .await?;
     let mut builder = outbox_operation_insert_builder(batch, &parts);
     let rows = builder.build().fetch_all(&mut **tx).await?;
     if rows.len() != parts.len() {
@@ -438,6 +488,13 @@ pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
             batch_id: batch.batch_id.clone(),
         });
     }
+    queued_batch_from_rows(&batch.batch_id, rows)
+}
+
+fn queued_batch_from_rows(
+    batch_id: &str,
+    rows: Vec<PgRow>,
+) -> Result<QueuedTelegramOutboxBatch, StorageError> {
     let mut queued = rows
         .into_iter()
         .map(|row| {
@@ -452,7 +509,7 @@ pub(crate) async fn enqueue_telegram_outbox_batch_in_transaction(
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
     queued.sort_by_key(|part| part.part_index);
     Ok(QueuedTelegramOutboxBatch {
-        batch_id: batch.batch_id.clone(),
+        batch_id: batch_id.to_owned(),
         parts: queued,
     })
 }
@@ -891,6 +948,17 @@ impl PostgresTelegramOutboxStore {
         self.commit_pending_history(outbox_id, history_entries)
             .await?;
         Ok(true)
+    }
+
+    /// Read a real send receipt or the confirmed target of an idempotent edit.
+    pub async fn confirmed_message_id(
+        &self,
+        batch_id: &str,
+        job_id: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT COALESCE(telegram_message_ids[1], CASE WHEN delivery_policy = 'target_idempotent' THEN (payload->>'message_id')::bigint END) FROM telegram_outbox WHERE batch_id = $1 AND dialog_job_id = $2 AND part_index = 0 AND state = 'delivered'")
+            .bind(batch_id).bind(job_id).fetch_optional(&self.pool).await?.flatten();
+        Ok(id.filter(|id| *id > 0))
     }
 
     pub async fn pending_history_receipts(
@@ -1597,6 +1665,7 @@ mod tests {
             serde_json::json!({"test": true}),
         );
         TelegramOutboxBatchInput {
+            content_policy: crate::TelegramOutboxContentPolicy::Immutable,
             batch_id: batch_id.to_owned(),
             bot_id: 77,
             chat_id: Some(42),
@@ -1835,6 +1904,85 @@ mod tests {
 
         sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
             .bind(&batch_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_prepared_outbox_reuses_content_and_rejects_changed_ownership()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let mut input = batch(&format!("prepared:{suffix}"), 1);
+        input.content_policy = TelegramOutboxContentPolicy::ReusePrepared;
+        let store = PostgresTelegramOutboxStore::new(pool.clone());
+        let mut changed = input.clone();
+        changed.parts[0].payload = serde_json::json!({"text":"a newer market snapshot"});
+        let (first, second) =
+            tokio::join!(store.enqueue_batch(&input), store.enqueue_batch(&changed));
+        let first = first?;
+        let second = second?;
+        assert_eq!(first.parts[0].operation_id, second.parts[0].operation_id);
+        assert_ne!(first.parts[0].inserted, second.parts[0].inserted);
+        let persisted: serde_json::Value =
+            sqlx::query_scalar("SELECT original_payload FROM telegram_outbox WHERE batch_id = $1")
+                .bind(&input.batch_id)
+                .fetch_one(&pool)
+                .await?;
+        let expected = if first.parts[0].inserted {
+            &input.parts[0].payload
+        } else {
+            &changed.parts[0].payload
+        };
+        assert_eq!(&persisted, expected);
+        let replay = store
+            .queued_batch(input.bot_id, &input.batch_id, input.dialog_job_id)
+            .await?
+            .expect("committed batch");
+        assert_eq!(replay.parts[0].id, first.parts[0].id);
+        assert!(
+            store
+                .queued_batch(input.bot_id + 1, &input.batch_id, input.dialog_job_id)
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .queued_batch(input.bot_id, &input.batch_id, None)
+                .await?
+                .is_none()
+        );
+        sqlx::query("UPDATE telegram_outbox SET state = 'ambiguous' WHERE batch_id = $1")
+            .bind(&input.batch_id)
+            .execute(&pool)
+            .await?;
+        let uncertain = store.enqueue_batch(&input).await?;
+        assert_eq!(uncertain.parts[0].state, "ambiguous");
+        assert!(!uncertain.parts[0].inserted);
+        changed.chat_id = Some(999);
+        assert!(matches!(
+            store.enqueue_batch(&changed).await,
+            Err(StorageError::TelegramOutboxIdempotencyConflict { .. })
+        ));
+        changed = input.clone();
+        changed.content_policy = TelegramOutboxContentPolicy::Immutable;
+        changed.parts[0].payload = serde_json::json!({"text":"different strict payload"});
+        assert!(matches!(
+            store.enqueue_batch(&changed).await,
+            Err(StorageError::TelegramOutboxIdempotencyConflict { .. })
+        ));
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+            .bind(&input.batch_id)
             .execute(&pool)
             .await?;
         Ok(())

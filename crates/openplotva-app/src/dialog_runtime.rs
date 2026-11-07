@@ -6,35 +6,19 @@ use std::{
 };
 
 use openplotva_config::AppConfig;
-use openplotva_dialog::{
-    ChatStepRequest, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
-    PROVIDER_VMLX, ToolsMode,
-};
+use openplotva_dialog::{ChatStepRequest, PROVIDER_AIFARM, PROVIDER_GENKIT, ToolsMode};
 use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatStepFuture, ChatStepProvider,
-    aifarm::{
-        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, GatewayRequestFields,
-        ReqwestAifarmTransport, normalize_chat_completions_url, rejection_verdict_for,
-    },
-    gemini::{
-        GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
-        is_gemini_provider_model,
-    },
+    aifarm::{AifarmDialogConfig, AifarmDialogProvider, rejection_verdict_for},
+    gemini::{GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig},
     retry::{FailureReason, retryable_reason},
     router::{BreakerSet, PoolRegistry, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
 };
-use thiserror::Error;
 
-use crate::media::{
-    agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config,
-    nvidia_dialog_config_from_app_config, vmlx_dialog_config_from_app_config,
-};
+use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
+use crate::provider_transport::aifarm_discovery_provider_name;
 use crate::routed_attempts::{RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext};
-use crate::runtime_gemini_cache::resolve_google_ai_key;
-
-const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// Shared dialog provider handle.
 pub type DialogProviderHandle = Arc<dyn ChatProvider>;
@@ -42,211 +26,103 @@ pub type DialogProviderHandle = Arc<dyn ChatProvider>;
 /// Workflow key the dialog worker routes through.
 const DIALOG_WORKFLOW_KEY: &str = "dialog";
 
-/// Builds and caches per-provider transport clients from DB provider rows, so
-/// a provider added in the admin panel is immediately routable without a
-/// restart. Env-built clients (aifarm, genkit, vram-cloud, the GPU reasoner)
-/// seed the static map and keep their toolbox wiring; everything else is
-/// constructed from the row's protocol + endpoint + key and cached under a
-/// fingerprint that invalidates when the row changes.
+#[derive(Clone, PartialEq)]
+enum DialogClientConfig {
+    OpenAi(Box<AifarmDialogConfig>),
+    Gemini(GeminiDialogConfig),
+}
+
+/// Caches adapters for the selected route, including resolved credentials.
 pub struct ChatClientFactory {
-    handle: Arc<RouterHandle>,
+    config: AppConfig,
     template: AifarmDialogConfig,
-    static_clients: HashMap<String, DialogProviderHandle>,
-    default_client: DialogProviderHandle,
-    cache: std::sync::Mutex<HashMap<(i64, i64), (u64, DialogProviderHandle)>>,
+    injected_clients: HashMap<String, DialogProviderHandle>,
+    cache: Mutex<HashMap<(i64, i64), (DialogClientConfig, DialogProviderHandle)>>,
     prompt_store: Arc<openplotva_prompts::PromptStore>,
 }
 
 impl ChatClientFactory {
     #[must_use]
     pub fn new(
-        handle: Arc<RouterHandle>,
+        config: &AppConfig,
         template: AifarmDialogConfig,
-        static_clients: HashMap<String, DialogProviderHandle>,
-        default_client: DialogProviderHandle,
+        injected_clients: HashMap<String, DialogProviderHandle>,
         prompt_store: Arc<openplotva_prompts::PromptStore>,
     ) -> Self {
         Self {
-            handle,
+            config: config.clone(),
             template,
-            static_clients,
-            default_client,
-            cache: std::sync::Mutex::new(HashMap::new()),
+            injected_clients,
+            cache: Mutex::new(HashMap::new()),
             prompt_store,
         }
     }
 
-    /// Resolve the transport client for one routed attempt. Static (env-built)
-    /// clients win by provider name; unknown providers are built from their
-    /// row when the protocol allows it. `Err` carries a retryable
-    /// `ProviderUnavailable`, so the walker moves on to the next candidate
-    /// instead of failing the whole run.
     fn resolve(
         &self,
         attempt: &crate::routed_attempts::RoutedAttempt,
     ) -> Result<DialogProviderHandle, openplotva_llm::retry::ProviderError> {
-        if let Some(client) = self.static_clients.get(&attempt.provider_name) {
+        if let Some(client) = self.injected_clients.get(&attempt.provider_name) {
             return Ok(Arc::clone(client));
         }
-        let table = self.handle.snapshot();
-        let Some(row) = table.provider(attempt.provider_id) else {
-            // The row vanished between selection and execution; the seeded
-            // default keeps legacy behavior for the built-in providers.
-            return Ok(Arc::clone(&self.default_client));
-        };
-        let gateway = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
-        let fingerprint = provider_row_fingerprint(row, &gateway);
-        let key = (row.id, attempt.model_id);
-        {
-            let cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((cached_fingerprint, client)) = cache.get(&key)
-                && *cached_fingerprint == fingerprint
-            {
-                return Ok(Arc::clone(client));
-            }
-        }
-        let client = self.build_client(row, gateway)?;
+        let config = self.client_config(attempt)?;
+        let key = (attempt.provider_id, attempt.model_id);
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.insert(key, (fingerprint, Arc::clone(&client)));
+        if let Some((cached, client)) = cache.get(&key)
+            && *cached == config
+        {
+            return Ok(Arc::clone(client));
+        }
+        let client: DialogProviderHandle = match &config {
+            DialogClientConfig::OpenAi(config) => Arc::new(
+                AifarmDialogProvider::new(*config.clone())
+                    .with_prompt_store(Arc::clone(&self.prompt_store)),
+            ),
+            DialogClientConfig::Gemini(config) => Arc::new(
+                GeminiDialogProvider::new(config.clone())
+                    .with_prompt_store(Arc::clone(&self.prompt_store)),
+            ),
+        };
+        cache.insert(key, (config, Arc::clone(&client)));
         Ok(client)
     }
 
-    fn build_client(
+    fn client_config(
         &self,
-        row: &openplotva_llm::router::ProviderRow,
-        gateway: GatewayRequestFields,
-    ) -> Result<DialogProviderHandle, openplotva_llm::retry::ProviderError> {
-        let cfg = self.dynamic_dialog_config(row, gateway)?;
-        let provider =
-            AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(&self.prompt_store));
-        Ok(Arc::new(provider))
-    }
-
-    /// Dialog config for a provider row without an env-built client: the shared
-    /// template pointed at the row's endpoint or Discovery service, carrying the
-    /// route's gateway fields (OpenRouter `reasoning` and `provider`).
-    fn dynamic_dialog_config(
-        &self,
-        row: &openplotva_llm::router::ProviderRow,
-        gateway: GatewayRequestFields,
-    ) -> Result<AifarmDialogConfig, openplotva_llm::retry::ProviderError> {
-        let protocol = row.protocol.as_deref().unwrap_or(
-            // Legacy rows without a protocol: chat-kind non-genkit rows are
-            // OpenAI-compatible in this deployment.
-            "openai_compat",
-        );
-        if protocol != "openai_compat" {
-            return Err(openplotva_llm::retry::ProviderError::new(
-                row.name.clone(),
-                openplotva_llm::retry::FailureReason::ProviderUnavailable,
-                format!(
-                    "no transport client for provider {} (protocol {protocol} has no dynamic dialog adapter)",
-                    row.name
-                ),
-            ));
+        attempt: &crate::routed_attempts::RoutedAttempt,
+    ) -> Result<DialogClientConfig, openplotva_llm::retry::ProviderError> {
+        if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit) {
+            let (api_key, base_url) =
+                crate::provider_transport::gemini_endpoint_for_attempt(&self.config, attempt)?;
+            return Ok(DialogClientConfig::Gemini(GeminiDialogConfig {
+                api_key,
+                base_url,
+                model: attempt.model_name.clone(),
+                request_timeout: positive_seconds(self.config.llm.dialog.request_timeout_seconds),
+                cache: GeminiExplicitCacheConfig::chat_core_multi_turn(),
+                ..GeminiDialogConfig::default()
+            }));
         }
-        let mut cfg = self.template.clone();
-        cfg.client.gateway_fields = gateway;
-        cfg.provider_name = row.name.clone();
-        cfg.model = String::new();
-        cfg.client.default_model = String::new();
-        cfg.client.api_key =
-            resolve_provider_api_key(row.api_key_ref.as_deref(), row.api_key_encrypted.as_deref())
-                .unwrap_or_default();
-        cfg.client.runtime_hint = row.runtime_hint.clone().unwrap_or_default();
-        cfg.client.supports_message_name = row
-            .config
-            .get("supports_message_name")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        cfg.client.supports_cache_control =
-            crate::routed_attempts::provider_supports_cache_control(&row.config);
-        match (&row.discovery_service_name, &row.endpoint) {
-            (Some(service), _) => {
-                cfg.client.service_name = service.clone();
-                cfg.client.endpoint_name = row
-                    .discovery_endpoint_name
-                    .clone()
-                    .unwrap_or_else(|| cfg.client.endpoint_name.clone());
-                cfg.client.direct_url = String::new();
-                if let Some(endpoint) = &row.endpoint
-                    && !endpoint.trim().is_empty()
-                {
-                    cfg.client.base_url = endpoint.clone();
-                }
-            }
-            (None, Some(endpoint)) if !endpoint.trim().is_empty() => {
-                cfg.client.direct_url = normalize_chat_completions_url(endpoint);
-            }
-            _ => {
-                return Err(openplotva_llm::retry::ProviderError::new(
-                    row.name.clone(),
-                    openplotva_llm::retry::FailureReason::ProviderUnavailable,
-                    format!(
-                        "provider {} has neither an endpoint nor a discovery service",
-                        row.name
-                    ),
-                ));
-            }
-        }
-        Ok(cfg)
+        let local = local_reasoner_dialog_config_from_app_config(&self.config);
+        let mut cfg = if attempt.provider_name == local.provider_name
+            && local.provider_name != PROVIDER_AIFARM
+        {
+            local
+        } else {
+            self.template.clone()
+        };
+        cfg.client = crate::provider_transport::openai_client_for_attempt(
+            &self.config,
+            attempt,
+            cfg.client,
+        )?;
+        cfg.provider_name.clone_from(&attempt.provider_name);
+        cfg.model.clone_from(&cfg.client.default_model);
+        Ok(DialogClientConfig::OpenAi(Box::new(cfg)))
     }
-}
-
-/// Resolve a provider row's API key: an env-var reference wins, otherwise the
-/// AES-GCM sealed blob is opened under the operator's `MASTER_KEY`.
-pub(crate) fn resolve_provider_api_key(
-    api_key_ref: Option<&str>,
-    api_key_encrypted: Option<&[u8]>,
-) -> Option<String> {
-    if let Some(reference) = api_key_ref.filter(|reference| !reference.trim().is_empty()) {
-        return std::env::var(reference.trim()).ok();
-    }
-    let sealed = api_key_encrypted?;
-    let master = std::env::var("MASTER_KEY").unwrap_or_default();
-    match openplotva_storage::llm_routing::open_key(&master, sealed) {
-        Ok(key) => Some(key),
-        Err(error) => {
-            tracing::warn!(%error, "failed to open sealed provider api key");
-            None
-        }
-    }
-}
-
-/// Change-detection fingerprint over the client-relevant provider row fields
-/// and the route's gateway fields.
-fn provider_row_fingerprint(
-    row: &openplotva_llm::router::ProviderRow,
-    gateway: &GatewayRequestFields,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    row.name.hash(&mut hasher);
-    row.protocol.hash(&mut hasher);
-    row.runtime_hint.hash(&mut hasher);
-    row.endpoint.hash(&mut hasher);
-    row.discovery_service_name.hash(&mut hasher);
-    row.discovery_endpoint_name.hash(&mut hasher);
-    row.api_key_ref.hash(&mut hasher);
-    row.api_key_encrypted.hash(&mut hasher);
-    row.config.to_string().hash(&mut hasher);
-    gateway
-        .provider
-        .as_ref()
-        .map(ToString::to_string)
-        .hash(&mut hasher);
-    gateway
-        .reasoning
-        .as_ref()
-        .map(ToString::to_string)
-        .hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Dialog provider that selects its concrete backend per request from the
@@ -446,56 +322,20 @@ impl ChatStepProvider for RouterChatProvider {
     }
 }
 
-/// Build the DB-backed dialog provider. The env-built aifarm and genkit
-/// transport clients seed the factory's static map by provider name (`gemini`
-/// overflow shares the Google AI / genkit client); providers created in the
-/// admin panel are built on demand from their rows. Falls back to the aifarm
-/// primary when a selected row vanishes mid-request.
-#[allow(clippy::too_many_arguments)]
+/// Build the dialog executor from the shared routing policy.
 pub fn router_dialog_provider(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
     handle: Arc<RouterHandle>,
     breakers: Arc<BreakerSet>,
     triggers: Arc<TriggerState>,
     pools: Arc<PoolRegistry>,
-    genkit_fallback: Option<DialogProviderHandle>,
     routing_events: Option<crate::runtime_routing::RoutingEventReporter>,
     prompt_store: Arc<openplotva_prompts::PromptStore>,
 ) -> DialogProviderHandle {
-    // Env pool secondaries are first-class DB models routed through their own
-    // `vram-cloud` client below, so admin weights control them without a hidden pool.
-    let aifarm_cfg = aifarm_dialog_config_from_app_config(config);
-    let aifarm =
-        AifarmDialogProvider::new(aifarm_cfg.clone()).with_prompt_store(Arc::clone(&prompt_store));
-    let aifarm: DialogProviderHandle = Arc::new(aifarm);
-
-    let genkit = genkit_fallback.or_else(|| {
-        genkit_dialog_provider_from_app_config_with_prompt_store(config, Arc::clone(&prompt_store))
-    });
-
-    let mut clients: HashMap<String, DialogProviderHandle> = HashMap::new();
-    clients.insert(PROVIDER_AIFARM.to_owned(), Arc::clone(&aifarm));
-    if let Some(genkit) = genkit {
-        clients.insert(PROVIDER_GENKIT.to_owned(), Arc::clone(&genkit));
-        clients.insert("gemini".to_owned(), genkit);
-    }
-    if let Some(vram_cloud) =
-        vram_cloud_dialog_provider(config, Arc::clone(&toolbox), &prompt_store)
-    {
-        clients.insert(VRAM_CLOUD_PROVIDER_NAME.to_owned(), vram_cloud);
-    }
-    if let Some(local_reasoner) =
-        local_reasoner_dialog_provider(config, Arc::clone(&toolbox), &prompt_store)
-    {
-        clients.insert(local_reasoner.provider_name().to_owned(), local_reasoner);
-    }
-
     let factory = Arc::new(ChatClientFactory::new(
-        Arc::clone(&handle),
-        aifarm_cfg,
-        clients,
-        aifarm,
+        config,
+        aifarm_dialog_config_from_app_config(config),
+        HashMap::new(),
         prompt_store,
     ));
     // A negative value is a config slip, not a way to disable the re-sampling;
@@ -517,48 +357,6 @@ pub fn router_dialog_provider(
 
 /// Provider name for the direct OpenAI-compatible VRAM Cloud endpoint.
 pub const VRAM_CLOUD_PROVIDER_NAME: &str = "vram-cloud";
-
-/// Build a single-backend, direct OpenAI-compatible client for the configured
-/// VRAM Cloud endpoint. Each DB model selects itself via the per-attempt model
-/// override, so one client serves every model on that endpoint.
-fn vram_cloud_dialog_provider(
-    config: &AppConfig,
-    _toolbox: Arc<dyn DialogToolbox>,
-    prompt_store: &Arc<openplotva_prompts::PromptStore>,
-) -> Option<DialogProviderHandle> {
-    let cfg = vram_cloud_dialog_config(config)?;
-    let provider = AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(prompt_store));
-    Some(Arc::new(provider))
-}
-
-fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
-    let dialog = &config.llm.dialog;
-    let model = dialog.aifarm_pool_models.first()?;
-    let base = dialog.aifarm_pool_base_urls.first()?;
-    if model.trim().is_empty() || base.trim().is_empty() {
-        return None;
-    }
-    let mut cfg = aifarm_dialog_config_from_app_config(config);
-    cfg.provider_name = VRAM_CLOUD_PROVIDER_NAME.to_owned();
-    cfg.client.direct_url = normalize_chat_completions_url(base);
-    cfg.client.api_key = dialog.aifarm_pool_api_key.clone();
-    cfg.client.default_model = model.clone();
-    cfg.model = model.clone();
-    Some(cfg)
-}
-
-fn local_reasoner_dialog_provider(
-    config: &AppConfig,
-    _toolbox: Arc<dyn DialogToolbox>,
-    prompt_store: &Arc<openplotva_prompts::PromptStore>,
-) -> Option<DialogProviderHandle> {
-    let cfg = local_reasoner_dialog_config_from_app_config(config);
-    if cfg.provider_name.eq_ignore_ascii_case(PROVIDER_AIFARM) {
-        return None;
-    }
-    let provider = AifarmDialogProvider::new(cfg).with_prompt_store(Arc::clone(prompt_store));
-    Some(Arc::new(provider))
-}
 
 fn local_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogConfig {
     let spec = crate::agent_runtime::local_reasoner_named_provider_config(config);
@@ -592,203 +390,6 @@ fn dialog_sampling_from_overrides(
         frequency_penalty: within(overrides.frequency_penalty, |v| (-2.0..=2.0).contains(&v)),
         presence_penalty: within(overrides.presence_penalty, |v| (-2.0..=2.0).contains(&v)),
     }
-}
-
-fn aifarm_discovery_provider_name(service: &str, config: &AppConfig) -> String {
-    let service = service.trim();
-    if service.is_empty() || service == config.llm.dialog.discovery_service_name {
-        return PROVIDER_AIFARM.to_owned();
-    }
-    if service.eq_ignore_ascii_case(crate::agent_runtime::DEFAULT_LOCAL_REASONER_SERVICE_NAME) {
-        return crate::agent_runtime::LOCAL_REASONER_PROVIDER_NAME.to_owned();
-    }
-    if service.eq_ignore_ascii_case(crate::agent_runtime::VIBETHINKER_SERVICE_NAME) {
-        return crate::agent_runtime::VIBETHINKER_PROVIDER_NAME.to_owned();
-    }
-    format!(
-        "aifarm-{}",
-        service
-            .trim_start_matches("llm-openai-")
-            .trim_start_matches("llm-")
-    )
-}
-
-/// Error returned while building the configured dialog provider.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum DialogProviderBuildError {
-    #[error("google ai key is required for genkit dialog provider")]
-    GenkitGoogleAiKeyRequired,
-    /// A GenKit OpenAI-compatible plugin route was selected without its provider key.
-    #[error("{provider} api key is required for genkit dialog provider")]
-    GenkitProviderApiKeyRequired {
-        /// Provider name used in the model prefix.
-        provider: &'static str,
-    },
-    /// A GenKit OpenAI-compatible plugin route was selected without a concrete model suffix.
-    #[error("{provider} model is required for genkit dialog provider")]
-    GenkitProviderModelRequired {
-        /// Provider name used in the model prefix.
-        provider: &'static str,
-    },
-    #[error("unsupported dialog provider {provider:?}")]
-    Unsupported {
-        /// Raw provider name after trimming/lowercasing.
-        provider: String,
-    },
-}
-
-/// Build the env-configured dialog provider directly, bypassing the DB router.
-/// Off the production path (dialog runs through [`router_dialog_provider`]);
-/// kept for provider-construction tests and the live provider smokes.
-pub fn dialog_provider_from_app_config(
-    config: &AppConfig,
-) -> Result<DialogProviderHandle, DialogProviderBuildError> {
-    primary_dialog_provider_from_app_config(config)
-}
-
-pub fn genkit_dialog_provider_from_app_config(config: &AppConfig) -> Option<DialogProviderHandle> {
-    genkit_dialog_provider_result_from_app_config(config, None).ok()
-}
-
-pub fn genkit_dialog_provider_from_app_config_with_prompt_store(
-    config: &AppConfig,
-    prompt_store: Arc<openplotva_prompts::PromptStore>,
-) -> Option<DialogProviderHandle> {
-    genkit_dialog_provider_result_from_app_config(config, Some(prompt_store)).ok()
-}
-
-fn genkit_dialog_provider_result_from_app_config(
-    config: &AppConfig,
-    prompt_store: Option<Arc<openplotva_prompts::PromptStore>>,
-) -> Result<DialogProviderHandle, DialogProviderBuildError> {
-    let api_key = resolve_google_ai_key(&config.google_ai);
-    if api_key.trim().is_empty() {
-        return Err(DialogProviderBuildError::GenkitGoogleAiKeyRequired);
-    }
-    if let Some(cfg) = genkit_openai_compatible_dialog_config_result_from_app_config(config)? {
-        let provider = AifarmDialogProvider::new(cfg);
-        let provider = match prompt_store {
-            Some(prompts) => provider.with_prompt_store(prompts),
-            None => provider,
-        };
-        return Ok(Arc::new(provider));
-    }
-    let model = genkit_dialog_model_from_app_config(config);
-    let provider = GeminiDialogProvider::new(GeminiDialogConfig {
-        api_key,
-        model: if is_gemini_provider_model(&model) {
-            model
-        } else {
-            String::new()
-        },
-        request_timeout: std::time::Duration::from_secs(
-            config.llm.dialog.request_timeout_seconds.max(1) as u64,
-        ),
-        cache: GeminiExplicitCacheConfig::chat_core_multi_turn(),
-        ..GeminiDialogConfig::default()
-    });
-    let provider = match prompt_store {
-        Some(prompts) => provider.with_prompt_store(prompts),
-        None => provider,
-    };
-    Ok(Arc::new(provider))
-}
-
-#[must_use]
-pub fn genkit_openai_compatible_dialog_config_from_app_config(
-    config: &AppConfig,
-) -> Option<AifarmDialogConfig> {
-    genkit_openai_compatible_dialog_config_result_from_app_config(config)
-        .ok()
-        .flatten()
-}
-
-fn genkit_openai_compatible_dialog_config_result_from_app_config(
-    config: &AppConfig,
-) -> Result<Option<AifarmDialogConfig>, DialogProviderBuildError> {
-    let raw_model = genkit_dialog_model_from_app_config(config);
-    let raw_model = raw_model.trim();
-    let (provider, direct_url, api_key, model, request_timeout_seconds) =
-        if let Some(model) = strip_provider_prefix_fold(raw_model, OPENROUTER_MODEL_PREFIX) {
-            (
-                "openrouter",
-                OPENROUTER_CHAT_COMPLETIONS_URL,
-                config.open_router.key.trim().to_owned(),
-                model.trim().to_owned(),
-                config.open_router.request_timeout_seconds,
-            )
-        } else {
-            return Ok(None);
-        };
-    if api_key.is_empty() {
-        return Err(DialogProviderBuildError::GenkitProviderApiKeyRequired { provider });
-    }
-    if model.is_empty() {
-        return Err(DialogProviderBuildError::GenkitProviderModelRequired { provider });
-    }
-    Ok(Some(AifarmDialogConfig {
-        provider_name: PROVIDER_GENKIT.to_owned(),
-        client: AifarmClientConfig {
-            direct_url: direct_url.to_owned(),
-            api_key,
-            request_timeout: positive_seconds(request_timeout_seconds),
-            default_model: model.clone(),
-            ..AifarmClientConfig::default()
-        },
-        model,
-        max_tokens: 8192,
-        temperature: Some(0.9),
-        top_p: Some(0.97),
-        include_reasoning: Some(false),
-        ..AifarmDialogConfig::default()
-    }))
-}
-
-fn genkit_dialog_model_from_app_config(config: &AppConfig) -> String {
-    let model = config.llm.dialog.model.trim();
-    if model.is_empty() {
-        crate::memory_runtime::genkit_runtime_default_model(config)
-    } else {
-        model.to_owned()
-    }
-}
-
-fn primary_dialog_provider_from_app_config(
-    config: &AppConfig,
-) -> Result<DialogProviderHandle, DialogProviderBuildError> {
-    match configured_dialog_provider_name(config).as_str() {
-        PROVIDER_AIFARM => Ok(Arc::new(aifarm_dialog_provider_from_app_config(config))),
-        PROVIDER_NVIDIA => Ok(Arc::new(nvidia_dialog_provider_from_app_config(config))),
-        PROVIDER_VMLX => Ok(Arc::new(vmlx_dialog_provider_from_app_config(config))),
-        PROVIDER_GENKIT => genkit_dialog_provider_result_from_app_config(config, None),
-        provider => Err(DialogProviderBuildError::Unsupported {
-            provider: provider.to_owned(),
-        }),
-    }
-}
-
-/// Build the reqwest-backed AIFarm provider.
-#[must_use]
-pub fn aifarm_dialog_provider_from_app_config(
-    config: &AppConfig,
-) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(aifarm_dialog_config_from_app_config(config))
-}
-
-/// Build the reqwest-backed NVIDIA provider.
-#[must_use]
-pub fn nvidia_dialog_provider_from_app_config(
-    config: &AppConfig,
-) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(nvidia_dialog_config_from_app_config(config))
-}
-
-/// Build the reqwest-backed VMLX provider.
-#[must_use]
-pub fn vmlx_dialog_provider_from_app_config(
-    config: &AppConfig,
-) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(vmlx_dialog_config_from_app_config(config))
 }
 
 #[must_use]
@@ -828,13 +429,6 @@ pub fn white_circle_pre_tool_config_from_app_config(
     }
 }
 
-fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        .then(|| &value[prefix.len()..])
-}
-
 fn positive_seconds(seconds: i32) -> std::time::Duration {
     if seconds <= 0 {
         std::time::Duration::ZERO
@@ -847,7 +441,7 @@ fn positive_seconds(seconds: i32) -> std::time::Duration {
 mod tests {
     use std::sync::Mutex;
 
-    use openplotva_dialog::{DialogInput, DialogOutput, DialogToolbox};
+    use openplotva_dialog::{DialogInput, DialogOutput};
     use openplotva_llm::{
         ChatProviderError,
         retry::{FailureReason, ProviderError},
@@ -859,27 +453,16 @@ mod tests {
 
     use super::*;
 
-    #[derive(Default)]
-    struct EmptyToolbox;
-
-    impl DialogToolbox for EmptyToolbox {}
-
     #[test]
     fn chat_client_factory_keeps_application_prompt_store() {
         let prompts = Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store"));
-        let default_provider: DialogProviderHandle = Arc::new(SequencedProvider::new(
-            "aifarm",
-            vec![Ok(DialogOutput::default())],
-        ));
-
+        let config = AppConfig::from_raw(Default::default()).expect("config");
         let factory = ChatClientFactory::new(
-            RouterHandle::new(openplotva_llm::router::RoutingTable::default()),
+            &config,
             AifarmDialogConfig::default(),
             HashMap::new(),
-            default_provider,
             Arc::clone(&prompts),
         );
-
         assert!(Arc::ptr_eq(&factory.prompt_store, &prompts));
     }
 
@@ -892,56 +475,6 @@ mod tests {
         .expect("config");
 
         assert_eq!(configured_dialog_provider_name(&config), PROVIDER_GENKIT);
-    }
-
-    #[test]
-    fn dialog_provider_factory_builds_aifarm_provider_from_default_config() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let provider = dialog_provider_from_app_config(&config).expect("provider");
-
-        assert_eq!(provider.provider_name(), PROVIDER_AIFARM);
-    }
-
-    #[test]
-    fn dialog_provider_factory_builds_nvidia_and_vmlx_providers() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some(" NVIDIA ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let provider = dialog_provider_from_app_config(&config).expect("nvidia provider");
-
-        assert_eq!(provider.provider_name(), PROVIDER_NVIDIA);
-
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some(" VMLX ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let provider = dialog_provider_from_app_config(&config).expect("vmlx provider");
-
-        assert_eq!(provider.provider_name(), PROVIDER_VMLX);
-    }
-
-    #[test]
-    fn dialog_provider_factory_builds_genkit_primary_when_key_is_available() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let provider = dialog_provider_from_app_config(&config).expect("provider");
-
-        assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
     }
 
     #[test]
@@ -958,23 +491,6 @@ mod tests {
         assert_eq!(cfg.client.default_model, "qwen3.8-27b");
         assert_eq!(cfg.include_reasoning, Some(false));
         assert_eq!(cfg.enable_thinking, Some(false));
-    }
-
-    #[test]
-    fn dialog_provider_factory_reports_unavailable_genkit_without_google_key() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let error = dialog_provider_from_app_config(&config).err();
-
-        assert_eq!(
-            error,
-            Some(DialogProviderBuildError::GenkitGoogleAiKeyRequired)
-        );
     }
 
     #[tokio::test]
@@ -1033,7 +549,6 @@ mod tests {
         let pools = Arc::new(PoolRegistry::new());
         pools.apply(&table.pool_specs());
         let _busy = pools.try_acquire(Some(1)).expect("occupy the GPU pool");
-        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
         let reporter = crate::runtime_routing::RoutingEventReporter::new(
             crate::runtime_routing::RoutingEventBuffer::new(8),
             None,
@@ -1044,7 +559,7 @@ mod tests {
             Arc::new(BreakerSet::new()),
             Arc::new(TriggerState::new()),
             pools,
-            test_factory(handle, HashMap::new(), default_provider),
+            test_factory(HashMap::new()),
         )
         .with_routing_event_reporter(reporter.clone());
         let started = tokio::time::Instant::now();
@@ -1155,7 +670,6 @@ mod tests {
 
     #[tokio::test]
     async fn router_chat_provider_marks_provider_capacity_cooldown() {
-        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
         let routed_provider = Arc::new(SequencedProvider::new(
             "aifarm",
             vec![Err(Box::new(ProviderError::new(
@@ -1211,7 +725,7 @@ mod tests {
             Arc::new(BreakerSet::new()),
             Arc::clone(&triggers),
             Arc::new(PoolRegistry::new()),
-            test_factory(handle, clients, default_provider),
+            test_factory(clients),
         )
         .with_routing_event_reporter(reporter.clone());
 
@@ -1565,136 +1079,48 @@ mod tests {
         })
         .expect("config");
 
-        let cfg = vram_cloud_dialog_config(&config).expect("pool config");
+        let factory = ChatClientFactory::new(
+            &config,
+            aifarm_dialog_config_from_app_config(&config),
+            HashMap::new(),
+            Arc::new(openplotva_prompts::PromptStore::load().expect("prompts")),
+        );
+        let mut attempt = attempt_for(1, VRAM_CLOUD_PROVIDER_NAME);
+        attempt.provider_endpoint = Some("https://pool.test/v1".into());
+        let DialogClientConfig::OpenAi(cfg) = factory.client_config(&attempt).expect("config")
+        else {
+            panic!("openai")
+        };
 
         assert_eq!(cfg.provider_name, VRAM_CLOUD_PROVIDER_NAME);
         assert_eq!(cfg.max_tokens, 1024);
         assert_eq!(cfg.enable_thinking, Some(false));
     }
 
-    #[test]
-    fn genkit_dialog_provider_factory_builds_direct_gemini_when_key_is_available() {
-        let missing = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
-        assert!(genkit_dialog_provider_from_app_config(&missing).is_none());
-
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some(" gemini-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let provider = genkit_dialog_provider_from_app_config(&config).expect("provider");
-
-        assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
-    }
-
-    #[test]
-    fn genkit_dialog_provider_factory_builds_openrouter_plugin_route() {
-        let openrouter = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some("openrouter/x-ai/grok-4.1-fast".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            openrouter_key: Some(" openrouter-key ".to_owned()),
-            openrouter_request_timeout_seconds: Some("321".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("openrouter config");
-
-        let cfg = genkit_openai_compatible_dialog_config_from_app_config(&openrouter)
-            .expect("openrouter config");
-
-        assert_eq!(cfg.provider_name, PROVIDER_GENKIT);
-        assert_eq!(cfg.model, "x-ai/grok-4.1-fast");
-        assert_eq!(
-            cfg.client.direct_url,
-            "https://openrouter.ai/api/v1/chat/completions"
-        );
-        assert_eq!(cfg.client.api_key, "openrouter-key");
-        assert_eq!(cfg.client.request_timeout.as_secs(), 321);
-        assert_eq!(cfg.max_tokens, 8192);
-        assert_eq!(cfg.temperature, Some(0.9));
-        assert_eq!(cfg.top_p, Some(0.97));
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let provider = dialog_provider_from_app_config(&openrouter).expect("provider");
-        assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
-
-        let openrouter_default = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some(" ".to_owned()),
-            genkit_default_model: Some("openrouter/default-model".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            openrouter_key: Some(" openrouter-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("openrouter default config");
-        let cfg = genkit_openai_compatible_dialog_config_from_app_config(&openrouter_default)
-            .expect("openrouter default config");
-        assert_eq!(cfg.model, "default-model");
-    }
-
-    #[test]
-    fn genkit_dialog_provider_factory_preserves_go_google_key_requirement_for_plugin_routes() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some("openrouter/x-ai/grok-4.1-fast".to_owned()),
-            openrouter_key: Some("openrouter-key".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let error = dialog_provider_from_app_config(&config).err();
-
-        assert_eq!(
-            error,
-            Some(DialogProviderBuildError::GenkitGoogleAiKeyRequired)
-        );
-    }
-
-    #[test]
-    fn genkit_dialog_provider_factory_reports_prefixed_missing_keys_without_gemini_fallthrough() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some("openrouter/x-ai/grok-4.1-fast".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let error = dialog_provider_from_app_config(&config).err();
-
-        assert_eq!(
-            error,
-            Some(DialogProviderBuildError::GenkitProviderApiKeyRequired {
-                provider: "openrouter",
-            })
-        );
-    }
-
     #[tokio::test]
-    #[ignore = "live OpenRouter GenKit-compatible dialog smoke"]
+    #[ignore = "live OpenRouter routed dialog smoke"]
     async fn live_genkit_openrouter_dialog_smoke_completes_minimal_prompt()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let openrouter_key = required_env("OPENROUTER_KEY")?;
-        let googleai_key = optional_env("GOOGLEAI_KEY");
-        let googleai_key_stats_file = optional_env("GOOGLEAI_KEY_STATS_FILE");
-        if googleai_key.is_none() && googleai_key_stats_file.is_none() {
-            return Err("GOOGLEAI_KEY or GOOGLEAI_KEY_STATS_FILE is required by the configured GenKit plugin route".into());
-        }
         let model = std::env::var("OPENPLOTVA_OPENROUTER_SMOKE_MODEL")
             .unwrap_or_else(|_| "openai/gpt-4o-mini".to_owned());
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             dialog_provider: Some("genkit".to_owned()),
             dialog_model: Some(format!("openrouter/{model}")),
-            googleai_key,
-            googleai_key_stats_file,
             openrouter_key: Some(openrouter_key),
             dialog_request_timeout_seconds: Some("60".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
-        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let provider = dialog_provider_from_app_config(&config)?;
+        let prompts = Arc::new(openplotva_prompts::PromptStore::load()?);
+        let factory = ChatClientFactory::new(
+            &config,
+            aifarm_dialog_config_from_app_config(&config),
+            HashMap::new(),
+            prompts,
+        );
+        let mut attempt = attempt_for(1, "openrouter");
+        attempt.model_name = model;
+        let provider = factory.resolve(&attempt)?;
 
         let output = provider
             .as_chat_step()
@@ -1748,7 +1174,7 @@ mod tests {
 
     fn router_provider_for_test(
         snapshot: RoutingSnapshot,
-        default_provider: Arc<SequencedProvider>,
+        _default_provider: Arc<SequencedProvider>,
         clients: HashMap<String, DialogProviderHandle>,
         reporter: crate::runtime_routing::RoutingEventReporter,
     ) -> RouterChatProvider {
@@ -1758,38 +1184,23 @@ mod tests {
             Arc::new(BreakerSet::new()),
             Arc::new(TriggerState::new()),
             Arc::new(PoolRegistry::new()),
-            test_factory(handle, clients, default_provider),
+            test_factory(clients),
         )
         .with_routing_event_reporter(reporter)
     }
 
-    fn test_factory(
-        handle: Arc<RouterHandle>,
-        clients: HashMap<String, DialogProviderHandle>,
-        default_provider: DialogProviderHandle,
-    ) -> Arc<ChatClientFactory> {
+    fn test_factory(clients: HashMap<String, DialogProviderHandle>) -> Arc<ChatClientFactory> {
         Arc::new(ChatClientFactory::new(
-            handle,
+            &AppConfig::from_raw(Default::default()).expect("config"),
             AifarmDialogConfig::default(),
             clients,
-            default_provider,
             Arc::new(openplotva_prompts::PromptStore::load().expect("prompt store")),
         ))
     }
 
-    fn admin_created_provider_snapshot(protocol: &str, endpoint: &str) -> RoutingSnapshot {
-        let mut snapshot = routed_dialog_snapshot();
-        snapshot.providers[0].id = 5;
-        snapshot.providers[0].name = "my-sglang".to_owned();
-        snapshot.providers[0].protocol = Some(protocol.to_owned());
-        snapshot.providers[0].endpoint = Some(endpoint.to_owned());
-        snapshot.providers[0].api_key_ref = None;
-        snapshot.models[0].provider_id = 5;
-        snapshot
-    }
-
     fn attempt_for(provider_id: i64, provider_name: &str) -> crate::routed_attempts::RoutedAttempt {
         crate::routed_attempts::RoutedAttempt {
+            protocol: Some(openplotva_llm::provider_schema::Protocol::OpenAiCompat),
             provider_id,
             model_id: 10,
             provider_name: provider_name.to_owned(),
@@ -1810,152 +1221,56 @@ mod tests {
     }
 
     #[test]
-    fn factory_builds_client_for_admin_created_openai_provider() {
-        let snapshot = admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let factory = test_factory(handle, HashMap::new(), default_provider);
-
-        let client = factory
-            .resolve(&attempt_for(5, "my-sglang"))
-            .expect("dynamic client for an admin-created provider");
-        assert_eq!(
-            client.provider_name(),
-            "my-sglang",
-            "the request must go to the new provider, never the default"
-        );
-    }
-
-    #[test]
-    fn factory_reuses_cache_until_the_row_changes() {
-        let snapshot = admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
-
-        let first = factory
-            .resolve(&attempt_for(5, "my-sglang"))
-            .expect("first");
-        let second = factory
-            .resolve(&attempt_for(5, "my-sglang"))
-            .expect("second");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "an unchanged row must reuse the cached client"
-        );
-
-        let mut changed =
-            admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
-        changed.providers[0].runtime_hint = Some("mlx".to_owned());
-        handle.store(crate::model_routing::build_routing_table(&changed));
-        let third = factory
-            .resolve(&attempt_for(5, "my-sglang"))
-            .expect("third");
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "a runtime-hint-only change must invalidate the cached client"
-        );
-    }
-
-    #[test]
-    fn factory_config_follows_the_provider_cache_control_switch() {
-        let mut snapshot =
-            admin_created_provider_snapshot("openai_compat", "https://gateway.local/v1");
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
-        let config_for = |handle: &RouterHandle| {
-            let table = handle.snapshot();
-            let row = table.provider(5).expect("provider row");
-            factory
-                .dynamic_dialog_config(row, GatewayRequestFields::default())
-                .expect("dynamic config")
+    fn factory_caches_the_captured_route_and_refreshes_when_it_changes() {
+        let factory = test_factory(HashMap::new());
+        let mut attempt = attempt_for(5, "custom");
+        attempt.provider_endpoint = Some("https://gateway.test/v1".into());
+        let first = factory.resolve(&attempt).expect("first");
+        assert!(Arc::ptr_eq(
+            &first,
+            &factory.resolve(&attempt).expect("cached")
+        ));
+        attempt.provider_runtime_hint = Some("mlx".into());
+        assert!(!Arc::ptr_eq(
+            &first,
+            &factory.resolve(&attempt).expect("changed")
+        ));
+        attempt.provider_config = json!({"supports_cache_control": false});
+        let DialogClientConfig::OpenAi(cfg) = factory.client_config(&attempt).expect("config")
+        else {
+            panic!("openai")
         };
-
-        assert!(config_for(&handle).client.supports_cache_control);
-
-        snapshot.providers[0].config = json!({ "supports_cache_control": false });
-        handle.store(crate::model_routing::build_routing_table(&snapshot));
-        assert!(!config_for(&handle).client.supports_cache_control);
-    }
-
-    #[test]
-    fn factory_client_carries_the_route_gateway_fields() {
-        let snapshot = admin_created_provider_snapshot("openai_compat", "https://gateway.local/v1");
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
-        let table = handle.snapshot();
-        let row = table.provider(5).expect("provider row");
-        let overrides = json!({ "reasoning": { "effort": "none" } });
-
-        let cfg = factory
-            .dynamic_dialog_config(row, GatewayRequestFields::from_overrides(&overrides))
-            .expect("dynamic config");
-
-        assert_eq!(
-            cfg.client.gateway_fields.reasoning,
-            Some(json!({ "effort": "none" }))
-        );
+        assert!(!cfg.client.supports_cache_control);
         assert_eq!(
             cfg.client.direct_url,
-            "https://gateway.local/v1/chat/completions"
-        );
-
-        let plain = factory
-            .resolve(&attempt_for(5, "my-sglang"))
-            .expect("plain");
-        let mut quiet = attempt_for(5, "my-sglang");
-        quiet.overrides.extra = overrides;
-        let quiet_client = factory.resolve(&quiet).expect("reasoning off");
-        assert!(
-            !Arc::ptr_eq(&plain, &quiet_client),
-            "different gateway fields must not share a cached client"
-        );
-        let mut other_model = attempt_for(5, "my-sglang");
-        other_model.model_id = 11;
-        let other_client = factory.resolve(&other_model).expect("second model");
-        assert!(
-            !Arc::ptr_eq(&plain, &other_client),
-            "each model of a provider gets its own cached client"
+            "https://gateway.test/v1/chat/completions"
         );
     }
 
     #[test]
-    fn factory_rejects_protocols_without_a_dynamic_adapter_as_retryable() {
-        let snapshot = admin_created_provider_snapshot("acestep", "https://music.local");
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let factory = test_factory(handle, HashMap::new(), default_provider);
+    fn factory_rejects_unsupported_protocols_before_using_a_transport() {
+        let factory = test_factory(HashMap::new());
+        let mut attempt = attempt_for(5, "custom");
+        attempt.protocol = Some(openplotva_llm::provider_schema::Protocol::AceStep);
+        assert_eq!(
+            retryable_reason(&factory.resolve(&attempt).err().expect("unsupported")),
+            Some(FailureReason::ProviderUnavailable)
+        );
+    }
 
-        let Err(error) = factory.resolve(&attempt_for(5, "my-sglang")) else {
-            panic!("acestep must have no dynamic dialog adapter");
+    #[test]
+    fn factory_respects_explicit_openai_protocol_on_a_google_named_provider() {
+        let factory = test_factory(HashMap::new());
+        let mut attempt = attempt_for(5, "genkit");
+        attempt.provider_endpoint = Some("https://custom.test/v1".into());
+        let DialogClientConfig::OpenAi(cfg) = factory.client_config(&attempt).expect("config")
+        else {
+            panic!("openai")
         };
         assert_eq!(
-            openplotva_llm::retry::retryable_reason(&error),
-            Some(openplotva_llm::retry::FailureReason::ProviderUnavailable),
-            "the walker must skip to the next candidate, not fail the run"
+            cfg.client.direct_url,
+            "https://custom.test/v1/chat/completions"
         );
-    }
-
-    #[test]
-    fn factory_prefers_static_clients_by_name() {
-        let snapshot = routed_dialog_snapshot();
-        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
-        let aifarm: DialogProviderHandle = Arc::new(SequencedProvider::new("aifarm", vec![]));
-        let default_provider: DialogProviderHandle =
-            Arc::new(SequencedProvider::new("default", vec![]));
-        let mut clients = HashMap::new();
-        clients.insert("aifarm".to_owned(), Arc::clone(&aifarm));
-        let factory = test_factory(handle, clients, default_provider);
-
-        let resolved = factory.resolve(&attempt_for(1, "aifarm")).expect("static");
-        assert!(Arc::ptr_eq(&resolved, &aifarm));
     }
 
     fn routed_dialog_snapshot() -> RoutingSnapshot {
