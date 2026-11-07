@@ -825,6 +825,7 @@ mod tests {
         DiscoveryJob {
             state: "JOB_STATE_SUCCEEDED".to_owned(),
             result: Some(DiscoveryJobResult {
+                error: None,
                 response: Some(DiscoveryJobResponse {
                     status_code,
                     body: general_purpose::STANDARD.encode(body_json),

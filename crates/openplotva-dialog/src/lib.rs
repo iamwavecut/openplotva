@@ -15,7 +15,7 @@ pub mod tool_telemetry;
 pub mod transcript;
 pub mod turn;
 
-pub use dispatch::dispatch_dialog_tool;
+pub use dispatch::{VERBATIM_DRAW_CAPTION_MAX_WORDS, dispatch_dialog_tool, verbatim_draw_caption};
 pub use leak_guard::{DialogLeak, ReplyLeakGuard, ReplyLeakGuardBuilder};
 
 pub use history::{
@@ -5086,11 +5086,14 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
 
 fn extract_inline_tool_arg(args: &str, key: &str) -> Option<String> {
     let value_start = inline_tool_arg_value_start(args, key)?;
-    let mut value = args[value_start..].trim();
-    const QUOTE_MARKER: &str = r#"<|"|>"#;
-    if let Some(rest) = value.strip_prefix(QUOTE_MARKER) {
-        value = rest;
-        return Some(value[..inline_arg_end(value, true)].trim().to_owned());
+    let value = args[value_start..].trim();
+    if let Some(rest) = value.strip_prefix(GEMMA_STRING_DELIMITER) {
+        let end = inline_arg_end(rest, true);
+        let text = rest[..end].trim();
+        if rest[end..].starts_with(GEMMA_STRING_DELIMITER) {
+            return Some(text.to_owned());
+        }
+        return Some(without_stray_closing_quote(text).to_owned());
     }
     if let Some(parsed) = parse_regular_quoted_inline_arg(value) {
         return Some(parsed);
@@ -5180,7 +5183,10 @@ fn unescape_inline_arg_char(value: char) -> char {
 fn inline_arg_end(value: &str, quoted: bool) -> usize {
     let mut end = value.len();
     // A stray closing delimiter ends an unquoted value; an unclosed one ends like unquoted.
-    let closing_delimiter = value.find(r#"<|"|>"#);
+    // A delimiter right after `,key:` opens the next argument instead of closing this one.
+    let closing_delimiter = value
+        .find(GEMMA_STRING_DELIMITER)
+        .filter(|&idx| !opens_next_inline_arg(&value[..idx]));
     if let Some(idx) = closing_delimiter {
         end = end.min(idx);
     }
@@ -5198,6 +5204,27 @@ fn inline_arg_end(value: &str, quoted: bool) -> usize {
         }
     }
     end
+}
+
+fn opens_next_inline_arg(before_delimiter: &str) -> bool {
+    before_delimiter.rfind(',').is_some_and(|pos| {
+        before_delimiter[pos + 1..]
+            .trim()
+            .strip_suffix(':')
+            .is_some_and(|key| INLINE_TOOL_ARG_KEYS.contains(&key.trim_matches(['"', '\''])))
+    })
+}
+
+/// Drops the plain quote a model wrote where the closing `<|"|>` belonged.
+fn without_stray_closing_quote(text: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(stripped) = text.strip_suffix(quote)
+            && stripped.matches(quote).count() % 2 == 0
+        {
+            return stripped.trim_end();
+        }
+    }
+    text
 }
 
 fn inline_arg_separator_index(value: &str) -> Option<usize> {
@@ -5415,6 +5442,36 @@ mod tests {
         let numeric_start =
             parse_assistant_content("web_search{query: 3 кота в коробке}").expect("numeric");
         assert_eq!(numeric_start.tool_steps[0].query, "3 кота в коробке");
+    }
+
+    #[test]
+    fn gemma_string_closed_with_a_plain_quote_ends_before_the_next_argument() {
+        for (content, caption) in [
+            (
+                "draw_image{caption:<|\"|>Прекрасная девушка в короне в человеческом обличье\",prompt:<|\"|>A beautiful young woman wearing a silver crown.<|\"|>}",
+                "Прекрасная девушка в короне в человеческом обличье",
+            ),
+            (
+                "draw_image{caption:<|\"|>Кот на крыше,prompt:<|\"|>A beautiful young woman wearing a silver crown.<|\"|>}",
+                "Кот на крыше",
+            ),
+            (
+                "draw_image{caption:<|\"|>Кот на крыше\",prompt:\"A beautiful young woman wearing a silver crown.\"}",
+                "Кот на крыше",
+            ),
+            (
+                "draw_image{caption:<|\"|>Кот сказал \"мяу\", и ушёл<|\"|>,prompt:<|\"|>A beautiful young woman wearing a silver crown.<|\"|>}",
+                "Кот сказал \"мяу\", и ушёл",
+            ),
+        ] {
+            let parsed = parse_assistant_content(content).expect("parsed");
+            assert_eq!(parsed.tool_steps.len(), 1, "{content}");
+            assert_eq!(parsed.tool_steps[0].caption, caption, "{content}");
+            assert_eq!(
+                parsed.tool_steps[0].prompt, "A beautiful young woman wearing a silver crown.",
+                "{content}"
+            );
+        }
     }
 
     #[test]

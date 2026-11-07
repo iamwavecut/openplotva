@@ -17,7 +17,7 @@ use openplotva_dialog::{
     TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
     TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
     VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
-    user_facing_not_scheduled_message,
+    user_facing_not_scheduled_message, verbatim_draw_caption,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
@@ -2535,7 +2535,6 @@ where
                 Ok(attachments) => attachments,
                 Err(reason) => return Ok(ToolResult::failed("draw_image_source_invalid", reason)),
             };
-            let original_prompt = sanitize_tool_text(&req.caption);
             let mut request = DrawImageScheduleRequest {
                 agent_gift: req.context.message_meta.agent_gift,
                 chat_id: req.context.chat_id,
@@ -2551,8 +2550,13 @@ where
                 negative_prompt: sanitize_tool_text(&req.negative_prompt),
                 aspect_ratio: sanitize_tool_text(&req.aspect_ratio),
                 seed: sanitize_tool_text(&req.seed),
-                original_prompt,
+                original_prompt: sanitize_tool_text(&req.caption),
             };
+            if let Some(caption) = verbatim_draw_caption(&req.context.message_meta)
+                && (!request_has_image_attachment(&request) || request.original_prompt.is_empty())
+            {
+                request.original_prompt = caption;
+            }
             if request_has_image_attachment(&request)
                 && !request.agent_gift
                 && scheduler
@@ -4540,6 +4544,66 @@ mod tests {
             );
             assert_eq!(calls[0].original_prompt, caption);
             assert_eq!(calls[0].message_text, request);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_explicit_text_to_image_request_keeps_the_users_words_as_caption()
+    -> Result<(), ToolboxError> {
+        let long_request =
+            "огромный рыжий кот в сапогах скачет на ракете над ночной Москвой под салютом";
+        for (draw_request, attachments, caption, expected) in [
+            ("собаквака", Vec::new(), "Собака-квака", "собаквака"),
+            (
+                "кот, который съел всю сметану",
+                Vec::new(),
+                "",
+                "кот, который съел всю сметану",
+            ),
+            (
+                long_request,
+                Vec::new(),
+                "Рыжий кот на ракете",
+                "Рыжий кот на ракете",
+            ),
+            ("", Vec::new(), "Собака-квака", "Собака-квака"),
+            (
+                "в стиле аниме",
+                vec![image_attachment("source-photo")],
+                "Портрет в стиле аниме",
+                "Портрет в стиле аниме",
+            ),
+        ] {
+            let scheduler = Arc::new(ImageSchedulerStub::successful(DrawImageScheduleResult {
+                status: "scheduled".to_owned(),
+                ..Default::default()
+            }));
+            let tools = toolbox(None).with_image_scheduler(scheduler.clone());
+            let result = tools
+                .draw_image(DrawRequest {
+                    context: ToolContext {
+                        message_text: format!("Плотва, нарисуй {draw_request}"),
+                        message_meta: ChatMessageMeta {
+                            requested_tool: "draw_image".to_owned(),
+                            draw_request: draw_request.to_owned(),
+                            attachments,
+                            ..Default::default()
+                        },
+                        ..context()
+                    },
+                    prompt: "Enriched visual instructions, cinematic lighting".into(),
+                    caption: caption.into(),
+                    ..Default::default()
+                })
+                .await?;
+            assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED, "{draw_request}");
+            let calls = scheduler.calls();
+            assert_eq!(
+                calls[0].prompt,
+                "Enriched visual instructions, cinematic lighting"
+            );
+            assert_eq!(calls[0].original_prompt, expected, "{draw_request}");
         }
         Ok(())
     }

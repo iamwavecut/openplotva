@@ -601,6 +601,9 @@ pub enum AifarmClientError {
     /// Upstream non-2xx discovery result.
     #[error("{0}")]
     Upstream(String),
+    /// Discovery could not reach or route to the backend service.
+    #[error("{0}")]
+    BackendUnavailable(String),
     /// Unknown Discovery status.
     #[error("unknown dialog job status {0:?}")]
     UnknownStatus(String),
@@ -4235,6 +4238,9 @@ pub struct DiscoveryJobResult {
     /// HTTP response payload.
     #[serde(default)]
     pub response: Option<DiscoveryJobResponse>,
+    /// Discovery's own failure, `{code, message}`, when the backend call produced no response.
+    #[serde(default)]
+    pub error: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -4258,6 +4264,8 @@ pub struct DiscoveryJobStatus {
     pub status: String,
     /// Message.
     pub message: String,
+    /// Discovery failure code from `result.error`, such as `UPSTREAM_ERROR`.
+    pub error_code: String,
     /// Upstream status code.
     pub status_code: u16,
     /// Raw decoded body.
@@ -5330,10 +5338,18 @@ pub fn discovery_status_from_envelope(
     envelope: &DiscoveryJobEnvelope,
 ) -> Result<DiscoveryJobStatus, AifarmDecodeError> {
     let job = envelope.resolve_job();
+    let (error_code, result_error) =
+        parse_discovery_result_error(job.result.as_ref().and_then(|result| result.error.as_ref()));
+    let job_error = parse_job_error(job.error.as_ref());
     let mut status = DiscoveryJobStatus {
         job_id: fallback_string(&job.resolved_id(), fallback_job_id),
         status: job.resolved_status(),
-        message: parse_job_error(job.error.as_ref()).trim().to_owned(),
+        message: if job_error.is_empty() {
+            result_error
+        } else {
+            job_error
+        },
+        error_code,
         ..DiscoveryJobStatus::default()
     };
 
@@ -5345,6 +5361,38 @@ pub fn discovery_status_from_envelope(
         status.message = parse_response_error(&status.raw_body);
     }
     Ok(status)
+}
+
+/// Discovery failure codes meaning the backend was never reached: a connection or DNS
+/// error (`UPSTREAM_ERROR`) or a service/endpoint that is not registered or is disabled.
+/// `UPSTREAM_TIMEOUT` is not one of them: the backend accepted the call and may be busy.
+const DISCOVERY_BACKEND_UNAVAILABLE_CODES: &[&str] = &[
+    "UPSTREAM_ERROR",
+    "SERVICE_NOT_FOUND",
+    "SERVICE_DISABLED",
+    "ENDPOINT_NOT_FOUND",
+];
+
+/// Discovery's `result.error` as its code and a `CODE: message` description.
+fn parse_discovery_result_error(raw: Option<&Value>) -> (String, String) {
+    let Some(raw) = raw else {
+        return (String::new(), String::new());
+    };
+    let field = |key: &str| {
+        raw.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (code, message) = (field("code"), field("message"));
+    let description = match (code.is_empty(), message.is_empty()) {
+        (false, false) => format!("{code}: {message}"),
+        (false, true) => code.clone(),
+        (true, false) => message,
+        (true, true) => parse_job_error(Some(raw)),
+    };
+    (code, description)
 }
 
 fn choose_string(primary: &str, fallback: &str) -> String {
@@ -5377,9 +5425,11 @@ fn discovery_result_from_status(
         return Ok(Some(status.completion_result()));
     }
     if is_failure_status(normalized) {
-        return Err(Box::new(AifarmClientError::Upstream(
-            failed_discovery_status_error(status),
-        )));
+        let message = failed_discovery_status_error(status);
+        if DISCOVERY_BACKEND_UNAVAILABLE_CODES.contains(&status.error_code.as_str()) {
+            return Err(Box::new(AifarmClientError::BackendUnavailable(message)));
+        }
+        return Err(Box::new(AifarmClientError::Upstream(message)));
     }
     if status.response.is_some() && (200..300).contains(&status.status_code) {
         return Ok(Some(status.completion_result()));
@@ -10696,6 +10746,7 @@ mod tests {
             state: "top-state".to_owned(),
             error: Some(json!(" top-error ")),
             result: Some(DiscoveryJobResult {
+                error: None,
                 response: Some(DiscoveryJobResponse {
                     status_code: 202,
                     ..DiscoveryJobResponse::default()
@@ -10763,6 +10814,7 @@ mod tests {
         let body = general_purpose::STANDARD.encode(payload);
 
         let result = decode_chat_completion_response(Some(&DiscoveryJobResult {
+            error: None,
             response: Some(DiscoveryJobResponse {
                 status_code: 200,
                 body,
@@ -10789,6 +10841,7 @@ mod tests {
         let body = general_purpose::URL_SAFE.encode(payload);
 
         let result = decode_chat_completion_response(Some(&DiscoveryJobResult {
+            error: None,
             response: Some(DiscoveryJobResponse {
                 status_code: 200,
                 body,
@@ -10814,6 +10867,7 @@ mod tests {
         let body = general_purpose::STANDARD.encode(payload);
 
         let result = decode_chat_completion_response(Some(&DiscoveryJobResult {
+            error: None,
             response: Some(DiscoveryJobResponse {
                 status_code: 503,
                 body,
@@ -10836,6 +10890,7 @@ mod tests {
                 job_id: "job-1".to_owned(),
                 state: "JOB_STATE_FAILED".to_owned(),
                 result: Some(DiscoveryJobResult {
+                    error: None,
                     response: Some(DiscoveryJobResponse {
                         status_code: 503,
                         body,
@@ -10853,6 +10908,93 @@ mod tests {
         assert_eq!(status.status, STATUS_FAILED);
         assert_eq!(status.http_status, 503);
         assert_eq!(status.message, "upstream unavailable");
+        Ok(())
+    }
+
+    fn failed_discovery_envelope(code: &str, message: &str) -> DiscoveryJobEnvelope {
+        let raw = json!({
+            "job": {
+                "job_id": "job-1",
+                "state": "JOB_STATE_FAILED",
+                "result": {"response": null, "error": {"code": code, "message": message}},
+            }
+        });
+        serde_json::from_value(raw).expect("Discovery failed-job envelope decodes")
+    }
+
+    #[test]
+    fn failed_discovery_job_reports_result_error_instead_of_a_generic_failure()
+    -> Result<(), AifarmDecodeError> {
+        let envelope = failed_discovery_envelope(
+            "UPSTREAM_ERROR",
+            "[Errno -3] Temporary failure in name resolution",
+        );
+
+        let status = discovery_status_from_envelope("fallback", &envelope)?;
+        let update = job_status_from_envelope("fallback", &envelope)?;
+
+        assert_eq!(status.error_code, "UPSTREAM_ERROR");
+        assert_eq!(
+            status.message,
+            "UPSTREAM_ERROR: [Errno -3] Temporary failure in name resolution"
+        );
+        assert_eq!(update.message, status.message);
+        Ok(())
+    }
+
+    #[test]
+    fn unreachable_discovery_backend_is_a_typed_unavailable_error() -> Result<(), AifarmDecodeError>
+    {
+        for code in [
+            "UPSTREAM_ERROR",
+            "SERVICE_NOT_FOUND",
+            "SERVICE_DISABLED",
+            "ENDPOINT_NOT_FOUND",
+        ] {
+            let status =
+                discovery_status_from_envelope("job-1", &failed_discovery_envelope(code, "down"))?;
+            let error = discovery_result_from_status("job-1", &status, STATUS_FAILED)
+                .expect_err("a failed job is an error");
+            assert!(
+                matches!(
+                    error.downcast_ref::<AifarmClientError>(),
+                    Some(AifarmClientError::BackendUnavailable(message)) if message == &format!("{code}: down")
+                ),
+                "{code} must mean the backend is unavailable, got {error:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_timeout_and_unknown_failures_stay_upstream_errors() -> Result<(), AifarmDecodeError>
+    {
+        for (code, expected) in [
+            ("UPSTREAM_TIMEOUT", "UPSTREAM_TIMEOUT: read timed out"),
+            ("INTERNAL_ERROR", "INTERNAL_ERROR: read timed out"),
+        ] {
+            let status = discovery_status_from_envelope(
+                "job-1",
+                &failed_discovery_envelope(code, "read timed out"),
+            )?;
+            let error = discovery_result_from_status("job-1", &status, STATUS_FAILED)
+                .expect_err("a failed job is an error");
+            assert!(
+                matches!(
+                    error.downcast_ref::<AifarmClientError>(),
+                    Some(AifarmClientError::Upstream(message)) if message == expected
+                ),
+                "{code} got {error:?}"
+            );
+        }
+
+        let bare = DiscoveryJobStatus {
+            status: STATUS_FAILED.to_owned(),
+            ..DiscoveryJobStatus::default()
+        };
+        let error = discovery_result_from_status("job-1", &bare, STATUS_FAILED)
+            .expect_err("a failed job is an error");
+        assert_eq!(error.to_string(), "dialog job failed");
         Ok(())
     }
 

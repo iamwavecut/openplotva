@@ -15,6 +15,19 @@ use crate::{
     ToolboxError, VisionRequest,
 };
 
+/// Longest explicit draw request, in words, that is shown as the caption unchanged.
+pub const VERBATIM_DRAW_CAPTION_MAX_WORDS: usize = 10;
+
+/// Caption for a short explicit draw request: the user's own words, unchanged.
+///
+/// Longer requests return `None`; the model writes a concise caption for them.
+#[must_use]
+pub fn verbatim_draw_caption(meta: &ChatMessageMeta) -> Option<String> {
+    let request = crate::sanitize_tool_text(&meta.draw_request);
+    let words = request.split_whitespace().count();
+    (words > 0 && words <= VERBATIM_DRAW_CAPTION_MAX_WORDS).then_some(request)
+}
+
 /// Dispatch one tool step to the toolbox.
 pub async fn dispatch_dialog_tool(
     toolbox: &dyn DialogToolbox,
@@ -23,6 +36,7 @@ pub async fn dispatch_dialog_tool(
 ) -> Result<ToolResult, ToolboxError> {
     if matches!(step.step.as_str(), STEP_DRAW_IMAGE | "draw_api")
         && crate::sanitize_tool_text(&step.caption).is_empty()
+        && verbatim_draw_caption(&meta.message_meta).is_none()
     {
         return Ok(ToolResult::failed(
             "image_caption_required",
@@ -356,6 +370,61 @@ mod tests {
                 2
             ]
         );
+    }
+
+    fn draw_request_meta(request: &str) -> ChatMessageMeta {
+        ChatMessageMeta {
+            draw_request: request.to_owned(),
+            ..ChatMessageMeta::default()
+        }
+    }
+
+    #[test]
+    fn verbatim_draw_caption_keeps_requests_up_to_ten_words() {
+        for (request, expected) in [
+            ("собаквака", Some("собаквака")),
+            ("  кот   в сапогах  ", Some("кот   в сапогах")),
+            (
+                "раз два три четыре пять шесть семь восемь девять десять",
+                Some("раз два три четыре пять шесть семь восемь девять десять"),
+            ),
+            (
+                "раз два три четыре пять шесть семь восемь девять десять одиннадцать",
+                None,
+            ),
+            ("   ", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                verbatim_draw_caption(&draw_request_meta(request)).as_deref(),
+                expected,
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_explicit_draw_request_does_not_need_a_model_caption() {
+        let toolbox = ImageRecorder::default();
+        let meta = ToolContext {
+            message_text: "Плотва, нарисуй собаквака".to_owned(),
+            message_meta: draw_request_meta("собаквака"),
+            ..ToolContext::default()
+        };
+        for tool in [STEP_DRAW_IMAGE, "draw_api"] {
+            let result = poll_ready(dispatch_dialog_tool(
+                &toolbox,
+                &meta,
+                &ToolStep {
+                    step: tool.to_owned(),
+                    prompt: "A dog-frog hybrid, cinematic lighting".to_owned(),
+                    ..ToolStep::default()
+                },
+            ))
+            .expect("image dispatch");
+            assert!(result.error.is_none(), "{tool}: {:?}", result.error);
+        }
+        assert_eq!(toolbox.0.lock().expect("images").len(), 2);
     }
 
     #[derive(Default)]
