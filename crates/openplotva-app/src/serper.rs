@@ -57,8 +57,16 @@ impl SerperClient {
         if api_key.is_empty() {
             return Ok(None);
         }
-        let timeout_seconds = if config.timeout_seconds > 0 {
-            config.timeout_seconds
+        Self::build(api_key, config.timeout_seconds, base_url).map(Some)
+    }
+
+    pub fn for_crawling(timeout_seconds: i32) -> Result<Self, SerperError> {
+        Self::build("", timeout_seconds, SERPER_BASE_URL)
+    }
+
+    fn build(api_key: &str, timeout_seconds: i32, base_url: &str) -> Result<Self, SerperError> {
+        let timeout_seconds = if timeout_seconds > 0 {
+            timeout_seconds
         } else {
             DEFAULT_SERPER_TIMEOUT_SECONDS
         };
@@ -68,12 +76,12 @@ impl SerperClient {
             .timeout(timeout)
             .build()
             .map_err(SerperError::HttpClient)?;
-        Ok(Some(Self {
+        Ok(Self {
             http,
             api_key: Arc::from(api_key),
             base_url: Arc::from(base_url.trim_end_matches('/')),
             timeout,
-        }))
+        })
     }
 
     pub async fn search(&self, query: &str) -> Result<String, SerperError> {
@@ -608,15 +616,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crawl_rejects_private_and_loopback_destinations() -> Result<(), Box<dyn Error>> {
-        let config = AppConfig::from_raw(RawConfig {
-            serper_api_key: Some("serper-test-key".to_owned()),
-            serper_timeout_seconds: Some("1".to_owned()),
-            ..RawConfig::default()
-        })?;
-        let client =
-            SerperClient::from_config_with_base_url(&config.serper, "https://google.serper.dev")?
-                .ok_or_else(|| std::io::Error::other("Serper client was not built"))?;
+    async fn crawler_without_serper_key_rejects_private_and_loopback_destinations()
+    -> Result<(), Box<dyn Error>> {
+        let client = SerperClient::for_crawling(1)?;
 
         for url in [
             "http://127.0.0.1/private",

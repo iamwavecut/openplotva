@@ -7,6 +7,7 @@ pub mod asr;
 pub mod callbacks;
 pub mod checkin;
 pub mod control_jobs;
+pub mod deepseek;
 pub mod delete_drawing;
 pub mod delete_lyrics;
 pub mod delete_message;
@@ -12759,7 +12760,7 @@ async fn start_runtime_workers(
         Ok(Some(client)) => {
             readiness_checks.push(ReadinessCheck::ok(
                 "serper",
-                "Serper web_search/crawl_url dialog tools wired as the primary search provider",
+                "Serper HTTP adapter configured",
             ));
             Some(Arc::new(client))
         }
@@ -12821,11 +12822,59 @@ async fn start_runtime_workers(
         app_dialog_toolbox = app_dialog_toolbox.with_youtube_summarizer(youtube_summarizer);
     }
     if let Some(serper) = serper_client.as_ref() {
-        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
         let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-        app_dialog_toolbox = app_dialog_toolbox
-            .with_web_searcher(web_searcher)
-            .with_url_crawler(url_crawler);
+        app_dialog_toolbox = app_dialog_toolbox.with_url_crawler(url_crawler);
+    }
+    match config.web_search_provider {
+        openplotva_config::SearchProvider::Serper => {
+            if let Some(serper) = serper_client {
+                app_dialog_toolbox = app_dialog_toolbox.with_web_searcher(serper);
+                readiness_checks.push(ReadinessCheck::ok(
+                    "web_search",
+                    "Serper search provider wired",
+                ));
+            } else {
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "web_search",
+                    "SERPER_API_KEY is not configured",
+                ));
+            }
+        }
+        openplotva_config::SearchProvider::Deepseek => {
+            match deepseek::DeepSeekClient::from_config(&config.deepseek) {
+                Ok(Some(client)) => {
+                    app_dialog_toolbox = app_dialog_toolbox.with_web_searcher(Arc::new(client));
+                    readiness_checks.push(ReadinessCheck::ok(
+                        "web_search",
+                        "DeepSeek search provider wired",
+                    ));
+                }
+                Ok(None) => readiness_checks.push(ReadinessCheck::skipped(
+                    "web_search",
+                    "DEEPSEEK_API_KEY is not configured",
+                )),
+                Err(error) => {
+                    tracing::warn!(%error, "DeepSeek search provider unavailable");
+                    readiness_checks.push(ReadinessCheck::skipped(
+                        "web_search",
+                        format!("DeepSeek unavailable: {error}"),
+                    ));
+                }
+            }
+            if serper_client.is_none() {
+                match serper::SerperClient::for_crawling(config.serper.timeout_seconds) {
+                    Ok(crawler) => {
+                        app_dialog_toolbox = app_dialog_toolbox.with_url_crawler(Arc::new(crawler))
+                    }
+                    Err(error) => {
+                        readiness_checks.push(ReadinessCheck::skipped(
+                            "crawl_url",
+                            format!("HTTP crawler unavailable: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
     }
     if config.sandbox.url.is_empty() {
         readiness_checks.push(ReadinessCheck::skipped(
