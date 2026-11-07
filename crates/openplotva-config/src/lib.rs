@@ -448,6 +448,8 @@ pub struct AppConfig {
     pub market_rates: MarketRatesConfig,
     /// Serper web search provider configuration.
     pub serper: SerperConfig,
+    pub web_search_provider: SearchProvider,
+    pub deepseek: DeepSeekConfig,
     /// Translation provider configuration.
     pub translation: TranslationConfig,
     pub google_ai: GoogleAiConfig,
@@ -727,6 +729,19 @@ pub struct MarketRatesConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SerperConfig {
+    pub api_key: String,
+    pub timeout_seconds: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProvider {
+    Serper,
+    Deepseek,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekConfig {
     pub api_key: String,
     pub timeout_seconds: i32,
 }
@@ -1319,6 +1334,12 @@ pub struct RawConfig {
     pub serper_api_key: Option<String>,
     /// `SERPER_TIMEOUT_SECONDS`.
     pub serper_timeout_seconds: Option<String>,
+    /// `WEB_SEARCH_PROVIDER` (`serper` or `deepseek`).
+    pub web_search_provider: Option<String>,
+    /// `DEEPSEEK_API_KEY`.
+    pub deepseek_api_key: Option<String>,
+    /// `DEEPSEEK_SEARCH_TIMEOUT_SECONDS`.
+    pub deepseek_search_timeout_seconds: Option<String>,
     /// `DEEPL_KEY`.
     pub deepl_key: Option<String>,
     /// `DEEPL_URL`.
@@ -1697,6 +1718,8 @@ pub struct RawConfig {
 /// Configuration loading failures.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid WEB_SEARCH_PROVIDER: expected serper or deepseek")]
+    InvalidSearchProvider,
     #[error("invalid maintenance configuration: {reason}")]
     InvalidMaintenance { reason: &'static str },
     /// `.env` exists but could not be loaded.
@@ -2149,6 +2172,27 @@ impl AppConfig {
                 DEFAULT_SERPER_TIMEOUT_SECONDS,
             )?,
         };
+        let web_search_provider = match raw
+            .web_search_provider
+            .as_deref()
+            .unwrap_or("serper")
+            .trim()
+        {
+            "serper" => SearchProvider::Serper,
+            "deepseek" => SearchProvider::Deepseek,
+            _ => return Err(ConfigError::InvalidSearchProvider),
+        };
+        let deepseek = DeepSeekConfig {
+            api_key: raw.deepseek_api_key.unwrap_or_default().trim().to_owned(),
+            timeout_seconds: validate_positive_i32(
+                "DEEPSEEK_SEARCH_TIMEOUT_SECONDS",
+                parse_i32(
+                    "DEEPSEEK_SEARCH_TIMEOUT_SECONDS",
+                    raw.deepseek_search_timeout_seconds,
+                    30,
+                )?,
+            )?,
+        };
         let boogu_image_timeout_seconds = validate_positive_i32(
             "BOOGU_IMAGE_TIMEOUT_SECONDS",
             parse_i32(
@@ -2476,6 +2520,8 @@ impl AppConfig {
                 )?,
             },
             serper,
+            web_search_provider,
+            deepseek,
             translation: TranslationConfig {
                 deepl: DeeplConfig {
                     key: raw.deepl_key.unwrap_or_default(),
@@ -3286,6 +3332,9 @@ impl RawConfig {
             rbc_timeout_seconds: env("RBC_TIMEOUT_SECONDS"),
             serper_api_key: env("SERPER_API_KEY"),
             serper_timeout_seconds: env("SERPER_TIMEOUT_SECONDS"),
+            web_search_provider: env("WEB_SEARCH_PROVIDER"),
+            deepseek_api_key: env("DEEPSEEK_API_KEY"),
+            deepseek_search_timeout_seconds: env("DEEPSEEK_SEARCH_TIMEOUT_SECONDS"),
             deepl_key: env("DEEPL_KEY"),
             deepl_url: env("DEEPL_URL"),
             googleai_key: env("GOOGLEAI_KEY"),
@@ -4864,6 +4913,45 @@ mod tests {
         })?;
 
         assert_eq!(config.market_rates.timeout_seconds, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_defaults_preserve_serper() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AppConfig::from_raw(RawConfig::default())?;
+        let serialized = serde_json::to_value(config)?;
+        assert_eq!(serialized["web_search_provider"], "serper");
+        assert_eq!(serialized["deepseek"]["timeout_seconds"], 30);
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_selects_deepseek_and_validates_settings() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            web_search_provider: Some("deepseek".to_owned()),
+            deepseek_api_key: Some(" deepseek-key ".to_owned()),
+            deepseek_search_timeout_seconds: Some("7".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert_eq!(config.web_search_provider, super::SearchProvider::Deepseek);
+        assert_eq!(config.deepseek.api_key, "deepseek-key");
+        assert_eq!(config.deepseek.timeout_seconds, 7);
+        assert!(matches!(
+            AppConfig::from_raw(RawConfig {
+                web_search_provider: Some("unknown".to_owned()),
+                ..RawConfig::default()
+            }),
+            Err(super::ConfigError::InvalidSearchProvider)
+        ));
+        for timeout in ["0", "-1", "invalid"] {
+            assert!(
+                AppConfig::from_raw(RawConfig {
+                    deepseek_search_timeout_seconds: Some(timeout.to_owned()),
+                    ..RawConfig::default()
+                })
+                .is_err()
+            );
+        }
         Ok(())
     }
 

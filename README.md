@@ -83,7 +83,16 @@ The app reads `.env` files and environment variables. Important groups:
 - `ADMINS_ADMIN_IDS` for administrative Telegram users.
 - `RUNTIME_API_*` for the optional diagnostic API.
 - `PERSISTENT_QUEUE_*` for worker and queue behavior.
-- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, and `SERPER_*` for provider integrations.
+- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, `SERPER_*`, and `DEEPSEEK_*` for provider integrations.
+
+Web search uses Serper by default. Set `WEB_SEARCH_PROVIDER=deepseek` and
+`DEEPSEEK_API_KEY` to use the [DeepSeek Search API](https://api-docs.deepseek.com/guides/search/).
+`DEEPSEEK_SEARCH_TIMEOUT_SECONDS` defaults to 30 and bounds the complete request,
+including retries. Queries must contain 1 to 128 Unicode characters. Results
+include source titles, URLs, snippets, and summaries. Empty results are valid.
+The selected provider requires its own key; requests never switch providers on failure.
+`crawl_url` continues to fetch pages directly over HTTP and needs no Serper key
+when DeepSeek is selected. `SERPER_TIMEOUT_SECONDS` still controls these page fetches.
 
 Service connections are opt-in by default for local shell runs:
 
