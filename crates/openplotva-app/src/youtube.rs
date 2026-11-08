@@ -37,8 +37,6 @@ const INNERTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player";
 const INNERTUBE_CLIENT_NAME: &str = "ANDROID";
 const INNERTUBE_CLIENT_VERSION: &str = "20.10.38";
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const YOUTUBE_SUMMARY_TEMPERATURE: f64 = 0.3;
 const YOUTUBE_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -67,16 +65,6 @@ pub enum YouTubeSummaryError {
     /// JSON/XML decode failed.
     #[error("{0}")]
     Decode(String),
-}
-
-/// Error returned while building the runtime YouTube summarizer.
-#[derive(Debug, Error)]
-pub enum YouTubeSummaryBuildError {
-    #[error("{provider} API key is required")]
-    ProviderApiKeyRequired {
-        /// Provider that needs credentials.
-        provider: &'static str,
-    },
 }
 
 /// Runtime config for YouTube summary.
@@ -122,102 +110,6 @@ impl YouTubeSummaryConfig {
             self.transcript_timeout = YOUTUBE_TRANSCRIPT_TIMEOUT;
         }
         self
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct OpenAiCompatibleYouTubeSummaryConfig {
-    /// Provider API key.
-    pub api_key: String,
-    /// Provider model after the GenKit provider prefix.
-    pub model: String,
-    /// Chat completions endpoint.
-    pub direct_url: String,
-    /// Request timeout.
-    pub request_timeout: Duration,
-}
-
-impl OpenAiCompatibleYouTubeSummaryConfig {
-    fn with_defaults(mut self) -> Self {
-        if self.request_timeout.is_zero() {
-            self.request_timeout = Duration::from_secs(600);
-        }
-        self
-    }
-}
-
-#[derive(Clone)]
-pub enum RuntimeYouTubeSummarizer {
-    /// DB-routed summary generation with the existing transcript fetcher.
-    Routed(RoutedYouTubeSummarizer),
-    /// Direct Gemini/GoogleAI route.
-    Gemini(GeminiYouTubeSummarizer),
-    /// GenKit OpenAI-compatible plugin route.
-    OpenAiCompatible(OpenAiCompatibleYouTubeSummarizer),
-}
-
-impl RuntimeYouTubeSummarizer {
-    pub fn from_app_config(config: &AppConfig) -> Result<Option<Self>, YouTubeSummaryBuildError> {
-        let api_key = resolve_google_ai_key(&config.google_ai);
-        if api_key.trim().is_empty() {
-            return Ok(None);
-        }
-        let model = crate::memory_runtime::genkit_runtime_default_model(config);
-        let transcript = GeminiYouTubeSummarizer::new(YouTubeSummaryConfig {
-            api_key: api_key.clone(),
-            model: model.clone(),
-            request_timeout: Duration::from_secs(
-                config.llm.dialog.request_timeout_seconds.max(1) as u64
-            ),
-            ..YouTubeSummaryConfig::default()
-        });
-        if let Some(cfg) = openai_compatible_youtube_config_from_app_config(config, &model)? {
-            return Ok(Some(Self::OpenAiCompatible(
-                OpenAiCompatibleYouTubeSummarizer::new(transcript, cfg),
-            )));
-        }
-        Ok(Some(Self::Gemini(transcript)))
-    }
-
-    pub fn routed_from_app_config(
-        config: &AppConfig,
-        walker: RoutedAttemptWalker,
-    ) -> Result<Option<Self>, YouTubeSummaryBuildError> {
-        let api_key = resolve_google_ai_key(&config.google_ai);
-        if api_key.trim().is_empty() {
-            return Ok(None);
-        }
-        let transcript = GeminiYouTubeSummarizer::new(YouTubeSummaryConfig {
-            api_key,
-            model: crate::memory_runtime::genkit_runtime_default_model(config),
-            request_timeout: Duration::from_secs(
-                config.llm.dialog.request_timeout_seconds.max(1) as u64
-            ),
-            ..YouTubeSummaryConfig::default()
-        });
-        Ok(Some(Self::Routed(RoutedYouTubeSummarizer::new(
-            transcript, walker, config,
-        ))))
-    }
-
-    /// Human-readable provider label for readiness diagnostics.
-    #[must_use]
-    pub fn provider_label(&self) -> &'static str {
-        match self {
-            Self::Routed(_) => "routed provider",
-            Self::Gemini(_) => "direct Gemini",
-            Self::OpenAiCompatible(summarizer) => summarizer.provider,
-        }
-    }
-}
-
-impl YouTubeSummarizer for RuntimeYouTubeSummarizer {
-    fn summarize<'a>(&'a self, video: &'a str) -> YouTubeSummaryFuture<'a> {
-        match self {
-            Self::Routed(summarizer) => summarizer.summarize(video),
-            Self::Gemini(summarizer) => summarizer.summarize(video),
-            Self::OpenAiCompatible(summarizer) => summarizer.summarize(video),
-        }
     }
 }
 
@@ -324,11 +216,6 @@ impl GeminiYouTubeSummarizer {
             .build()
             .expect("YouTube reqwest client configuration is valid");
         Self { cfg, http }
-    }
-
-    async fn run(&self, video: &str) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
-        let fetched = self.transcript_for_video(video).await?;
-        summary_result(self, fetched).await
     }
 
     async fn transcript_for_video(
@@ -467,6 +354,7 @@ impl GeminiYouTubeSummarizer {
         &self,
         stage: YouTubeStage,
         payload: &str,
+        provider: &str,
     ) -> Result<String, YouTubeSummaryError> {
         let system = openplotva_prompts::read(stage.prompt_name())?;
         let request = youtube_summary_gemini_request(&system, payload, stage);
@@ -474,8 +362,8 @@ impl GeminiYouTubeSummarizer {
         let url = gemini_generate_url(&self.cfg.base_url, &model)?;
         let trace = YouTubeCallTrace::begin(
             YouTubeTraceTags {
-                provider: "genkit",
-                source: "youtube_gemini",
+                provider,
+                source: "youtube_routed",
                 request_kind: "gemini.generateContent",
             },
             &model,
@@ -501,128 +389,48 @@ impl GeminiYouTubeSummarizer {
     }
 }
 
-impl YouTubeSummaryModel for GeminiYouTubeSummarizer {
-    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
-        Box::pin(self.generate(stage, payload))
-    }
-}
-
-impl YouTubeSummarizer for GeminiYouTubeSummarizer {
-    fn summarize<'a>(&'a self, video: &'a str) -> YouTubeSummaryFuture<'a> {
-        Box::pin(async move {
-            self.run(video)
-                .await
-                .map_err(|error| Box::new(error) as BoxedError)
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct OpenAiCompatibleYouTubeSummarizer {
-    transcript: GeminiYouTubeSummarizer,
-    cfg: OpenAiCompatibleYouTubeSummaryConfig,
-    provider: &'static str,
-    http: reqwest::Client,
-}
-
-impl OpenAiCompatibleYouTubeSummarizer {
-    /// Build with explicit transcript fetcher and OpenAI-compatible config.
-    #[must_use]
-    pub fn new(
-        transcript: GeminiYouTubeSummarizer,
-        cfg: OpenAiCompatibleYouTubeSummaryConfig,
-    ) -> Self {
-        let cfg = cfg.with_defaults();
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(cfg.request_timeout)
-            .build()
-            .expect("OpenAI-compatible YouTube reqwest client configuration is valid");
-        let provider = if cfg.direct_url.contains("openrouter.ai") {
-            "openrouter"
-        } else {
-            "openai-compatible"
-        };
-        Self {
-            transcript,
-            cfg,
-            provider,
-            http,
-        }
-    }
-
-    async fn run(&self, video: &str) -> Result<YouTubeSummaryResult, YouTubeSummaryError> {
-        let fetched = self.transcript.transcript_for_video(video).await?;
-        summary_result(self, fetched).await
-    }
-
-    async fn generate(
-        &self,
-        stage: YouTubeStage,
-        payload: &str,
-    ) -> Result<String, YouTubeSummaryError> {
-        let system = openplotva_prompts::read(stage.prompt_name())?;
-        let request =
-            youtube_summary_openai_request(&self.cfg.model, &system, payload, stage, true);
-        let trace = YouTubeCallTrace::begin(
-            YouTubeTraceTags {
-                provider: self.provider,
-                source: "youtube_openai_compatible",
-                request_kind: "openai.chat.completions",
-            },
-            &self.cfg.model,
-            &request,
-        );
-        let sent = self
-            .http
-            .post(self.cfg.direct_url.trim())
-            .bearer_auth(self.cfg.api_key.trim())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&request)
-            .send()
-            .await;
-        let (status, body) = trace.read_response(sent).await?;
-        if !status.is_success() {
-            return Err(YouTubeSummaryError::Http(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                String::from_utf8_lossy(&body).trim()
-            )));
-        }
-        decode_openai_text(&body)
-    }
-}
-
-impl YouTubeSummaryModel for OpenAiCompatibleYouTubeSummarizer {
-    fn complete<'a>(&'a self, stage: YouTubeStage, payload: &'a str) -> YouTubeModelFuture<'a> {
-        Box::pin(self.generate(stage, payload))
-    }
-}
-
-impl YouTubeSummarizer for OpenAiCompatibleYouTubeSummarizer {
-    fn summarize<'a>(&'a self, video: &'a str) -> YouTubeSummaryFuture<'a> {
-        Box::pin(async move {
-            self.run(video)
-                .await
-                .map_err(|error| Box::new(error) as BoxedError)
-        })
-    }
-}
-
 async fn generate_youtube_summary_with_attempt(
     config: &AppConfig,
     attempt: RoutedAttempt,
     stage: YouTubeStage,
     payload: &str,
 ) -> Result<String, YouTubeSummaryError> {
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit) {
+        let (api_key, base_url) =
+            crate::provider_transport::gemini_endpoint_for_attempt(config, &attempt)
+                .map_err(|error| YouTubeSummaryError::Http(error.to_string()))?;
+        let summarizer = GeminiYouTubeSummarizer::new(YouTubeSummaryConfig {
+            api_key,
+            base_url,
+            model: attempt.model_name.clone(),
+            request_timeout: Duration::from_secs(
+                config.llm.dialog.request_timeout_seconds.max(1) as u64
+            ),
+            ..YouTubeSummaryConfig::default()
+        });
+        return summarizer
+            .generate(stage, payload, &attempt.provider_name)
+            .await;
+    }
     if routed_attempt_uses_discovery(&attempt) {
-        let client = AifarmHttpClient::new(youtube_farm_client_config(config, &attempt));
+        let client = AifarmHttpClient::new(youtube_farm_client_config(config, &attempt)?);
         return complete_youtube_stage_through_discovery(&client, &attempt, stage, payload).await;
     }
+    let client_config = crate::provider_transport::openai_client_for_attempt(
+        config,
+        &attempt,
+        AifarmClientConfig {
+            request_timeout: Duration::from_secs(
+                config.open_router.request_timeout_seconds.max(1) as u64
+            ),
+            ..AifarmClientConfig::default()
+        },
+    )
+    .map_err(|error| YouTubeSummaryError::Http(error.to_string()))?;
     let system = openplotva_prompts::read(stage.prompt_name())?;
-    let model = attempt.model_name.trim().to_owned();
+    let model = &client_config.default_model;
     let mut request = youtube_summary_openai_request(
-        &model,
+        model,
         &system,
         payload,
         stage,
@@ -631,16 +439,14 @@ async fn generate_youtube_summary_with_attempt(
     let gateway = GatewayRequestFields::from_overrides(&attempt.overrides.extra);
     request.provider = gateway.provider;
     request.reasoning = gateway.reasoning;
-    let endpoint = routed_attempt_endpoint(&attempt).ok_or_else(|| {
-        YouTubeSummaryError::Http("routed provider has no chat completions endpoint".to_owned())
-    })?;
-    let api_key = routed_attempt_api_key(config, &attempt).ok_or_else(|| {
-        YouTubeSummaryError::Http(format!(
-            "provider {} API key is not configured",
-            attempt.provider_name
-        ))
-    })?;
-    let timeout = routed_attempt_timeout(config, &attempt);
+    if client_config.direct_url.is_empty() {
+        return Err(YouTubeSummaryError::Http(
+            "routed provider has no chat completions endpoint".into(),
+        ));
+    }
+    let endpoint = &client_config.direct_url;
+    let api_key = &client_config.api_key;
+    let timeout = client_config.request_timeout;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
@@ -673,7 +479,7 @@ async fn generate_youtube_summary_with_attempt(
             source: "youtube_routed",
             request_kind: "openai.chat.completions",
         },
-        &model,
+        model,
         &request,
     );
     let sent = builder.send().await;
@@ -701,7 +507,9 @@ async fn generate_youtube_summary_with_attempt(
 }
 
 fn routed_attempt_uses_discovery(attempt: &RoutedAttempt) -> bool {
-    attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some()
+    let (service, endpoint) = attempt.discovery_names();
+    attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::OpenAiCompat)
+        && (service.is_some() || endpoint.is_some())
 }
 
 /// Farm models answer through Discovery jobs, not a chat completions URL.
@@ -726,38 +534,29 @@ async fn complete_youtube_stage_through_discovery<T: AifarmHttpTransport>(
     decode_openai_text(&body)
 }
 
-fn youtube_farm_client_config(config: &AppConfig, attempt: &RoutedAttempt) -> AifarmClientConfig {
+fn youtube_farm_client_config(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> Result<AifarmClientConfig, YouTubeSummaryError> {
     let dialog = &config.llm.dialog;
     let seconds = |value: i32| Duration::from_secs(u64::try_from(value).unwrap_or(0));
-    AifarmClientConfig {
-        base_url: attempt
-            .model_base_url
-            .as_deref()
-            .or(attempt.provider_endpoint.as_deref())
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty())
-            .map_or_else(|| config.llm.discovery.base_url.clone(), str::to_owned),
-        service_name: attempt
-            .discovery_service_name
-            .clone()
-            .unwrap_or_else(|| dialog.discovery_service_name.clone()),
-        endpoint_name: attempt
-            .discovery_endpoint_name
-            .clone()
-            .unwrap_or_else(|| dialog.discovery_endpoint_name.clone()),
-        api_key: routed_attempt_api_key(config, attempt).unwrap_or_default(),
-        request_timeout: seconds(dialog.request_timeout_seconds),
-        poll_interval: seconds(dialog.poll_interval_seconds),
-        task_timeout: seconds(dialog.task_timeout_seconds),
-        capacity_wait: seconds(dialog.aifarm_capacity_wait_seconds),
-        capacity_poll_interval: seconds(dialog.aifarm_capacity_poll_seconds),
-        default_model: attempt.model_name.trim().to_owned(),
-        runtime_hint: attempt.provider_runtime_hint.clone().unwrap_or_default(),
-        supports_message_name: attempt.supports_message_name(),
-        supports_cache_control: attempt.supports_cache_control(),
-        workload: AIFARM_WORKLOAD_SUMMARY.to_owned(),
-        ..AifarmClientConfig::default()
-    }
+    crate::provider_transport::openai_client_for_attempt(
+        config,
+        attempt,
+        AifarmClientConfig {
+            base_url: config.llm.discovery.base_url.clone(),
+            service_name: dialog.discovery_service_name.clone(),
+            endpoint_name: dialog.discovery_endpoint_name.clone(),
+            request_timeout: seconds(dialog.request_timeout_seconds),
+            poll_interval: seconds(dialog.poll_interval_seconds),
+            task_timeout: seconds(dialog.task_timeout_seconds),
+            capacity_wait: seconds(dialog.aifarm_capacity_wait_seconds),
+            capacity_poll_interval: seconds(dialog.aifarm_capacity_poll_seconds),
+            workload: AIFARM_WORKLOAD_SUMMARY.to_owned(),
+            ..AifarmClientConfig::default()
+        },
+    )
+    .map_err(|error| YouTubeSummaryError::Http(error.to_string()))
 }
 
 fn youtube_summary_farm_request(
@@ -941,102 +740,11 @@ fn youtube_trace_usage(response: &serde_json::Value) -> Option<DialogTraceUsage>
     })
 }
 
-fn routed_attempt_is_openrouter(attempt: &RoutedAttempt) -> bool {
-    attempt.provider_name.eq_ignore_ascii_case("openrouter")
-        || attempt
-            .provider_name
-            .eq_ignore_ascii_case("openrouter-free")
-        || attempt
-            .provider_endpoint
-            .as_deref()
-            .is_some_and(|endpoint| endpoint.contains("openrouter.ai"))
-        || attempt
-            .model_base_url
-            .as_deref()
-            .is_some_and(|endpoint| endpoint.contains("openrouter.ai"))
-}
-
-fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
-    attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .filter(|endpoint| !endpoint.trim().is_empty())
-        .map(openplotva_llm::aifarm::normalize_chat_completions_url)
-}
-
-fn routed_attempt_api_key(config: &AppConfig, attempt: &RoutedAttempt) -> Option<String> {
-    if let Some(reference) = attempt
-        .provider_api_key_ref
-        .as_deref()
-        .filter(|reference| !reference.trim().is_empty())
-        && let Ok(value) = std::env::var(reference.trim())
-        && !value.trim().is_empty()
-    {
-        return Some(value);
-    }
-    if let Some(sealed) = attempt.provider_api_key_encrypted.as_deref() {
-        let master = std::env::var("MASTER_KEY").unwrap_or_default();
-        if let Ok(value) = openplotva_storage::llm_routing::open_key(&master, sealed)
-            && !value.trim().is_empty()
-        {
-            return Some(value);
-        }
-    }
-    if routed_attempt_is_openrouter(attempt) && !config.open_router.key.trim().is_empty() {
-        return Some(config.open_router.key.trim().to_owned());
-    }
-    None
-}
-
-fn routed_attempt_timeout(config: &AppConfig, attempt: &RoutedAttempt) -> Duration {
-    attempt
-        .provider_config
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .map(Duration::from_millis)
-        .filter(|duration| !duration.is_zero())
-        .unwrap_or_else(|| {
-            Duration::from_secs(config.open_router.request_timeout_seconds.max(1) as u64)
-        })
-}
-
 fn youtube_summary_retryable(error: &YouTubeSummaryError) -> Option<FailureReason> {
     match error {
         YouTubeSummaryError::Http(message) => retryable_reason_from_message(message),
         _ => None,
     }
-}
-
-fn openai_compatible_youtube_config_from_app_config(
-    config: &AppConfig,
-    model: &str,
-) -> Result<Option<OpenAiCompatibleYouTubeSummaryConfig>, YouTubeSummaryBuildError> {
-    let model = model.trim();
-    let (direct_url, api_key, model, request_timeout_seconds, provider) =
-        if let Some(model) = strip_prefix_fold(model, OPENROUTER_MODEL_PREFIX) {
-            (
-                OPENROUTER_CHAT_COMPLETIONS_URL,
-                config.open_router.key.trim().to_owned(),
-                model.trim().to_owned(),
-                config.open_router.request_timeout_seconds,
-                "openrouter",
-            )
-        } else {
-            return Ok(None);
-        };
-    if model.is_empty() {
-        return Ok(None);
-    }
-    if api_key.trim().is_empty() {
-        return Err(YouTubeSummaryBuildError::ProviderApiKeyRequired { provider });
-    }
-    Ok(Some(OpenAiCompatibleYouTubeSummaryConfig {
-        api_key,
-        model,
-        direct_url: direct_url.to_owned(),
-        request_timeout: Duration::from_secs(request_timeout_seconds.max(1) as u64),
-    }))
 }
 
 #[must_use]
@@ -2312,31 +2020,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_youtube_config_routes_openrouter_default_model() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some("google-key".to_owned()),
-            genkit_default_model: Some(" openrouter/openai/gpt-4.1-mini ".to_owned()),
-            openrouter_key: Some(" openrouter-key ".to_owned()),
-            openrouter_request_timeout_seconds: Some("333".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let summarizer = RuntimeYouTubeSummarizer::from_app_config(&config)
-            .expect("build")
-            .expect("summary");
-
-        let RuntimeYouTubeSummarizer::OpenAiCompatible(summarizer) = summarizer else {
-            panic!("expected OpenAI-compatible route");
-        };
-        assert_eq!(summarizer.provider, "openrouter");
-        assert_eq!(summarizer.cfg.model, "openai/gpt-4.1-mini");
-        assert_eq!(summarizer.cfg.api_key, "openrouter-key");
-        assert_eq!(summarizer.cfg.direct_url, OPENROUTER_CHAT_COMPLETIONS_URL);
-        assert_eq!(summarizer.cfg.request_timeout, Duration::from_secs(333));
-    }
-
-    #[test]
     fn youtube_trace_artifact_reads_openai_usage_and_http_errors() {
         let trace = YouTubeCallTrace::begin(
             YouTubeTraceTags {
@@ -2421,6 +2104,7 @@ mod tests {
 
     fn farm_attempt() -> RoutedAttempt {
         RoutedAttempt {
+            protocol: Some(openplotva_llm::provider_schema::Protocol::OpenAiCompat),
             provider_id: 17,
             model_id: 502,
             provider_name: "farm-qwen".to_owned(),
@@ -2446,7 +2130,7 @@ mod tests {
         let attempt = farm_attempt();
         assert!(routed_attempt_uses_discovery(&attempt));
 
-        let client = youtube_farm_client_config(&config, &attempt);
+        let client = youtube_farm_client_config(&config, &attempt).expect("config");
 
         assert_eq!(client.base_url, config.llm.discovery.base_url);
         assert_eq!(client.service_name, "llm-qwen");
@@ -2462,7 +2146,9 @@ mod tests {
             ..farm_attempt()
         };
         assert_eq!(
-            youtube_farm_client_config(&config, &with_endpoint).base_url,
+            youtube_farm_client_config(&config, &with_endpoint)
+                .expect("config")
+                .base_url,
             "https://discovery.example.test"
         );
 
@@ -2471,7 +2157,9 @@ mod tests {
             ..farm_attempt()
         };
         assert!(
-            !youtube_farm_client_config(&config, &without_cache_control).supports_cache_control
+            !youtube_farm_client_config(&config, &without_cache_control)
+                .expect("config")
+                .supports_cache_control
         );
     }
 
@@ -2581,7 +2269,7 @@ mod tests {
             AifarmClientConfig {
                 base_url: "https://discovery.example.test".to_owned(),
                 poll_interval: Duration::from_millis(1),
-                ..youtube_farm_client_config(&config, &attempt)
+                ..youtube_farm_client_config(&config, &attempt).expect("config")
             },
             transport,
         );
@@ -2612,6 +2300,66 @@ mod tests {
         assert_eq!(sent["model"], "qwen3.8-27b");
         assert_eq!(sent["enable_thinking"], false);
         assert!(sent.get("chat_template_kwargs").is_none(), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn explicit_genkit_route_uses_gemini_with_selected_credentials_and_endpoint() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        type Seen = Arc<std::sync::Mutex<Vec<(HeaderMap, serde_json::Value)>>>;
+        let seen: Seen = Arc::default();
+        let app = Router::new().route("/custom-gemini/models/gemini-fixture:generateContent", post(
+            |State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+                seen.lock().expect("seen").push((headers, body));
+                Json(json!({"candidates":[{"content":{"parts":[{"text":"{\"summary\":\"ok\"}"}]}}]}))
+            }
+        )).with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let config = AppConfig::from_raw(Default::default()).expect("config");
+        let mut attempt = farm_attempt();
+        attempt.protocol = Some(openplotva_llm::provider_schema::Protocol::Genkit);
+        attempt.provider_name = "renamed-gemini-provider".into();
+        attempt.model_name = "googleai/gemini-fixture".into();
+        attempt.provider_endpoint = Some(format!("http://{address}/custom-gemini"));
+        attempt.provider_api_key_ref = Some("PATH".into());
+        assert!(!routed_attempt_uses_discovery(&attempt));
+        let result = generate_youtube_summary_with_attempt(
+            &config,
+            attempt,
+            YouTubeStage::Summary,
+            "0.5: hello",
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.expect("Gemini summary"), "{\"summary\":\"ok\"}");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]
+                .0
+                .get("x-goog-api-key")
+                .expect("key")
+                .to_str()
+                .expect("key text"),
+            std::env::var("PATH").expect("PATH")
+        );
+        assert_eq!(seen[0].1["contents"][0]["parts"][0]["text"], "0.5: hello");
+    }
+
+    #[test]
+    fn discovery_selection_uses_model_overrides_and_ignores_blank_names() {
+        let mut attempt = farm_attempt();
+        attempt.discovery_service_name = None;
+        attempt.discovery_endpoint_name = None;
+        attempt.model_config = json!({"service_name":"from-model"});
+        assert!(routed_attempt_uses_discovery(&attempt));
+        attempt.model_config = json!({"service_name":"  ", "endpoint_name":""});
+        assert!(!routed_attempt_uses_discovery(&attempt));
     }
 
     #[tokio::test]

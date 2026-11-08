@@ -18,7 +18,7 @@ use openplotva_server::{
 use openplotva_telegram::{TelegramOutboundMethodKind, classify_telegram_send_error};
 use time::OffsetDateTime;
 
-pub const GO_PERMISSION_CACHE_TTL: time::Duration = time::Duration::minutes(30);
+pub const PERMISSION_CACHE_TTL: time::Duration = time::Duration::minutes(30);
 
 /// Boxed future returned by permission persistence stores.
 pub type ChatPermissionStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -272,7 +272,7 @@ where
             key,
             CachedPermission {
                 allowed,
-                cached_until: now + GO_PERMISSION_CACHE_TTL,
+                cached_until: now + PERMISSION_CACHE_TTL,
             },
         );
     }

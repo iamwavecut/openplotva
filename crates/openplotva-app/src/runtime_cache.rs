@@ -5,8 +5,8 @@ use openplotva_storage::{PostgresChatSettingsStore, RedisRateLimitStore};
 
 use crate::{permissions::ChatPermissionPolicy, rate_limits::ChatRateLimitPolicy};
 
-const GO_SERVER_CACHE_CAPACITY: i32 = 10_000;
-const GO_PLANNER_CACHE_CAPACITY: i32 = 10_000;
+const SERVER_CACHE_CAPACITY: i32 = 10_000;
+const PLANNER_CACHE_CAPACITY: i32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PolicyCacheStats {
@@ -79,13 +79,13 @@ fn runtime_cache_snapshot_from_policy_stats(
     RuntimeCacheSnapshotData {
         cache: RuntimeCacheStatsData {
             size: policy_stats.size.min(i32::MAX as usize) as i32,
-            capacity: GO_SERVER_CACHE_CAPACITY,
+            capacity: SERVER_CACHE_CAPACITY,
             hits: policy_stats.hits,
             misses: policy_stats.misses,
             mem_size: policy_stats.mem_size,
         },
         planner_cache: RuntimeCacheStatsData {
-            capacity: GO_PLANNER_CACHE_CAPACITY,
+            capacity: PLANNER_CACHE_CAPACITY,
             ..RuntimeCacheStatsData::default()
         },
     }
@@ -105,12 +105,12 @@ mod tests {
         });
 
         assert_eq!(snapshot.cache.size, 12);
-        assert_eq!(snapshot.cache.capacity, GO_SERVER_CACHE_CAPACITY);
+        assert_eq!(snapshot.cache.capacity, SERVER_CACHE_CAPACITY);
         assert_eq!(snapshot.cache.hits, 34);
         assert_eq!(snapshot.cache.misses, 56);
         assert_eq!(snapshot.cache.mem_size, 78);
         assert_eq!(snapshot.planner_cache.size, 0);
-        assert_eq!(snapshot.planner_cache.capacity, GO_PLANNER_CACHE_CAPACITY);
+        assert_eq!(snapshot.planner_cache.capacity, PLANNER_CACHE_CAPACITY);
         assert_eq!(snapshot.planner_cache.hits, 0);
         assert_eq!(snapshot.planner_cache.misses, 0);
         assert_eq!(snapshot.planner_cache.mem_size, 0);

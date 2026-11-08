@@ -5,6 +5,68 @@
 //! never replayed automatically: lease recovery moves it to `ambiguous` and an
 //! idempotent terminal reaction is queued instead.
 
+/// Identity returned after all outbound parts were accepted by one queue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedBatchReceipt {
+    pub batch_id: String,
+    pub operation_ids: Vec<String>,
+    delivery: QueuedDelivery,
+    delivery_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedDelivery {
+    Dispatcher,
+    DurableOutbox,
+}
+
+impl QueuedBatchReceipt {
+    pub(crate) fn dispatcher(batch_id: String, operation_ids: Vec<String>) -> Self {
+        Self {
+            batch_id,
+            operation_ids,
+            delivery: QueuedDelivery::Dispatcher,
+            delivery_complete: false,
+        }
+    }
+
+    pub(crate) fn durable_outbox(
+        batch_id: String,
+        operation_ids: Vec<String>,
+        delivery_complete: bool,
+    ) -> Self {
+        Self {
+            batch_id,
+            operation_ids,
+            delivery: QueuedDelivery::DurableOutbox,
+            delivery_complete,
+        }
+    }
+
+    /// Whether taskman must wait for real Telegram receipts before completion.
+    #[must_use]
+    pub fn requires_delivery_wait(&self) -> bool {
+        self.delivery == QueuedDelivery::DurableOutbox
+    }
+
+    /// Whether every durable part already has a real Telegram receipt.
+    #[must_use]
+    pub fn delivery_complete(&self) -> bool {
+        self.requires_delivery_wait() && self.delivery_complete
+    }
+}
+
+pub(crate) fn telegram_outbox_ordering_key(
+    bot_id: i64,
+    chat_id: i64,
+    thread_id: Option<i32>,
+) -> String {
+    format!(
+        "dialog:{bot_id}:{chat_id}:{}",
+        thread_id.unwrap_or_default()
+    )
+}
+
 use std::{
     convert::Infallible,
     fmt,
@@ -159,6 +221,9 @@ pub struct RunAwareTelegramOutboxJobResolver {
     jobs: SharedTaskQueueRuntime,
     runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
     gradius: PostgresGradiusAdStore,
+    songs: openplotva_storage::PostgresGeneratedSongStore,
+    outbox: PostgresTelegramOutboxStore,
+    reactions: Option<crate::reactions::GenerationReactions>,
 }
 
 impl RunAwareTelegramOutboxJobResolver {
@@ -167,11 +232,16 @@ impl RunAwareTelegramOutboxJobResolver {
         jobs: SharedTaskQueueRuntime,
         runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
         gradius: PostgresGradiusAdStore,
+        outbox: PostgresTelegramOutboxStore,
+        reactions: Option<crate::reactions::GenerationReactions>,
     ) -> Self {
         Self {
             jobs,
             runs,
             gradius,
+            songs: openplotva_storage::PostgresGeneratedSongStore::new(outbox.pool().clone()),
+            outbox,
+            reactions,
         }
     }
 }
@@ -196,7 +266,56 @@ impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
                     .await
             }
             .map_err(|error| error.to_string())?;
+            let music = batch_id.ends_with(&format!(
+                ":{}",
+                crate::music_jobs::music_delivery_source(job_id)
+            ));
+            if music {
+                let message_id = self
+                    .songs
+                    .link_delivery_receipts(job_id, batch_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.jobs
+                    .queue()
+                    .update_job_result_message(job_id, Some(message_id))
+                    .map_err(|error| error.to_string())?;
+            }
+            if batch_id.ends_with(&format!(
+                ":{}",
+                crate::checkin::checkin_delivery_source(job_id)
+            )) {
+                let message_id = self
+                    .outbox
+                    .confirmed_message_id(batch_id, job_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .and_then(|id| i32::try_from(id).ok())
+                    .ok_or_else(|| "check-in delivery has no confirmed message ID".to_owned())?;
+                self.jobs
+                    .queue()
+                    .update_job_result_message(job_id, Some(message_id))
+                    .map_err(|error| error.to_string())?;
+            }
             self.jobs.complete_job(job_id, batch_id).await?;
+            if music && let Some(reactions) = &self.reactions {
+                let target = self.jobs.queue().inspect_records(|records| {
+                    records
+                        .iter()
+                        .find(|record| record.id == job_id)
+                        .and_then(|record| {
+                            openplotva_taskman::music_gen_job_params_from_stateless_job(&record.job)
+                                .ok()
+                        })
+                        .map(|params| crate::reactions::GenerationReactionTarget {
+                            chat_id: params.chat_id,
+                            message_id: params.message_id,
+                        })
+                });
+                if let Some(target) = target {
+                    reactions.clear(target).await;
+                }
+            }
             self.runs.mark_job_delivered(job_id);
             if gradius_delivered {
                 tracing::info!(
@@ -1298,6 +1417,7 @@ async fn enqueue_ambiguity_reaction_fields(
     let batch_id = format!("{AMBIGUITY_REACTION_BATCH_PREFIX}{source_operation_id}");
     let queued = store
         .enqueue_batch(&TelegramOutboxBatchInput {
+            content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
             batch_id,
             bot_id,
             chat_id: Some(chat_id),
@@ -1877,6 +1997,8 @@ mod tests {
             queue,
             crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(4),
             ledger.clone(),
+            store.clone(),
+            None,
         );
         for (already_edited, reply_missing, generation_group, ephemeral) in [
             (false, false, false, false),
@@ -1941,6 +2063,47 @@ mod tests {
                     },
                 )
                 .await?;
+            let checkin_job_id = if already_edited {
+                let queue = resolver.jobs.queue();
+                let job_id = queue.assign(
+                    openplotva_taskman::CONTROL_QUEUE_NAME,
+                    openplotva_taskman::new_control_job_at(
+                        openplotva_taskman::ControlJobParams {
+                            chat_id,
+                            message_id: 76,
+                            user_id: 9_820_825_960,
+                            data: openplotva_taskman::ControlJobData {
+                                kind: openplotva_taskman::ControlKind::Checkin,
+                                ..Default::default()
+                            },
+                            user_full_name: "Test".into(),
+                            thread_id: None,
+                        },
+                        now,
+                    ),
+                );
+                queue
+                    .dequeue_matching(
+                        openplotva_taskman::CONTROL_QUEUE_NAME,
+                        "checkin-test",
+                        now,
+                        |_| true,
+                    )
+                    .expect("control job");
+                queue.wait_for_delivery(job_id)?;
+                resolver.jobs.durability_barrier(job_id).await?;
+                Some(job_id)
+            } else {
+                None
+            };
+            let batch_id = if let Some(job_id) = checkin_job_id {
+                format!(
+                    "gradius-utility:v1:7:{}",
+                    crate::checkin::checkin_delivery_source(job_id)
+                )
+            } else {
+                batch_id
+            };
             let method = if already_edited {
                 TelegramOutboundMethod::from(openplotva_telegram::EditRichMessage {
                     chat_id,
@@ -1968,13 +2131,14 @@ mod tests {
                 .enqueue_utility_ad(
                     opportunity_id,
                     &TelegramOutboxBatchInput {
+                        content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
                         batch_id: batch_id.clone(),
                         bot_id: 7,
                         chat_id: Some(chat_id),
                         thread_id: None,
                         ordering_key: batch_id.clone(),
                         causation_update_id: None,
-                        dialog_job_id: None,
+                        dialog_job_id: checkin_job_id,
                         trigger_message_id: Some(77),
                         delivery_policy: if already_edited {
                             TelegramDeliveryPolicy::TargetIdempotent
@@ -2067,6 +2231,15 @@ mod tests {
                     .await?;
                 continue;
             }
+            if let Some(job_id) = checkin_job_id {
+                let records = resolver.jobs.queue().records();
+                let record = records
+                    .iter()
+                    .find(|record| record.id == job_id)
+                    .expect("checkin");
+                assert_eq!(record.status, openplotva_taskman::JobStatus::Completed);
+                assert_eq!(record.result_message_id, Some(77));
+            }
             assert!(shown.is_some());
             resolver.complete_unlinked_batch(&batch_id).await?;
             let repeated: Option<OffsetDateTime> =
@@ -2089,6 +2262,12 @@ mod tests {
                 .bind(chat_id)
                 .execute(&pool)
                 .await?;
+            if let Some(job_id) = checkin_job_id {
+                sqlx::query("DELETE FROM taskman_jobs WHERE id = $1")
+                    .bind(job_id)
+                    .execute(&pool)
+                    .await?;
+            }
         }
         Ok(())
     }

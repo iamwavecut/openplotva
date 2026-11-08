@@ -370,6 +370,7 @@ where
 
 #[derive(Clone)]
 pub struct RoutedVisionCaptioner<DataUrl> {
+    config: AppConfig,
     walker: RoutedAttemptWalker,
     base_config: AifarmVisionCaptionerConfig,
     data_url: DataUrl,
@@ -386,14 +387,11 @@ impl<DataUrl> fmt::Debug for RoutedVisionCaptioner<DataUrl> {
 
 impl<DataUrl> RoutedVisionCaptioner<DataUrl> {
     #[must_use]
-    pub fn new(
-        walker: RoutedAttemptWalker,
-        base_config: AifarmVisionCaptionerConfig,
-        data_url: DataUrl,
-    ) -> Self {
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig, data_url: DataUrl) -> Self {
         Self {
             walker,
-            base_config: base_config.with_defaults(),
+            config: config.clone(),
+            base_config: aifarm_vision_captioner_config_from_app_config(config),
             data_url,
         }
     }
@@ -412,6 +410,7 @@ where
         Box::pin(async move {
             let request_for_attempts = request.clone();
             let base_config = self.base_config.clone();
+            let config = self.config.clone();
             let data_url = self.data_url.clone();
             let result = self
                 .walker
@@ -423,10 +422,11 @@ where
                     move |attempt| {
                         let request = request_for_attempts.clone();
                         let base_config = base_config.clone();
+                        let config = config.clone();
                         let data_url = data_url.clone();
                         async move {
                             let captioner = AifarmVisionCaptioner::new(
-                                vision_config_for_attempt(base_config, &attempt),
+                                vision_config_for_attempt(&config, base_config, &attempt)?,
                                 data_url,
                             );
                             captioner.caption_telegram_file(request).await
@@ -447,37 +447,14 @@ where
 }
 
 fn vision_config_for_attempt(
+    app_config: &AppConfig,
     mut config: AifarmVisionCaptionerConfig,
     attempt: &RoutedAttempt,
-) -> AifarmVisionCaptionerConfig {
-    config.model = attempt.model_name.clone();
-    config.client.default_model = attempt.model_name.clone();
-    config.client.api_key = crate::dialog_runtime::resolve_provider_api_key(
-        attempt.provider_api_key_ref.as_deref(),
-        attempt.provider_api_key_encrypted.as_deref(),
-    )
-    .unwrap_or_default();
-    if let Some(endpoint) = attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
-            config.client.base_url = endpoint.to_owned();
-        } else {
-            config.client.direct_url =
-                openplotva_llm::aifarm::normalize_chat_completions_url(endpoint);
-        }
-    }
-    if let Some(service) = attempt.discovery_service_name.as_deref() {
-        config.client.service_name = service.to_owned();
-    }
-    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
-        config.client.endpoint_name = endpoint.to_owned();
-    }
-    config.client.supports_cache_control = attempt.supports_cache_control();
+) -> Result<AifarmVisionCaptionerConfig, AifarmVisionCaptionerError> {
+    config.client =
+        crate::provider_transport::openai_client_for_attempt(app_config, attempt, config.client)
+            .map_err(|error| AifarmVisionCaptionerError::Provider(error.to_string()))?;
+    config.model.clone_from(&config.client.default_model);
     if let Some(max_tokens) = attempt.overrides.max_tokens
         && max_tokens > 0
     {
@@ -491,7 +468,7 @@ fn vision_config_for_attempt(
         .extra
         .get("enable_thinking")
         .and_then(serde_json::Value::as_bool);
-    config.with_defaults()
+    Ok(config.with_defaults())
 }
 
 fn vision_call_trace(is_video: bool) -> openplotva_llm::LlmCallTrace {
@@ -2130,6 +2107,7 @@ mod tests {
     fn routed_vision_attempt_resolves_direct_endpoint_key_and_thinking_override() {
         let path = std::env::var("PATH").expect("test process PATH");
         let attempt = RoutedAttempt {
+            protocol: Some(openplotva_llm::provider_schema::Protocol::OpenAiCompat),
             provider_id: 7,
             model_id: 11,
             provider_name: "vram-cloud".to_owned(),
@@ -2151,7 +2129,12 @@ mod tests {
             variant: None,
         };
 
-        let config = vision_config_for_attempt(AifarmVisionCaptionerConfig::default(), &attempt);
+        let config = vision_config_for_attempt(
+            &AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("app config"),
+            AifarmVisionCaptionerConfig::default(),
+            &attempt,
+        )
+        .expect("config");
 
         assert_eq!(config.model, "vram.cloud/qwen3.6-35b-a3b");
         assert_eq!(

@@ -1819,17 +1819,11 @@ async fn generate_image_with_routed_attempt(
     request: ImageGenerationRequest,
     draw_api_config: AifarmDrawApiConfig,
 ) -> Result<ImageGenerationResult, ImageGenerationError> {
-    if routed_attempt_is_draw_api(&attempt) {
-        let generator = AifarmDrawApiImageGenerator::new(draw_api_config_for_attempt(
-            draw_api_config,
-            &attempt,
-        ));
-        return generator.generate_image(request).await;
-    }
-    Err(ImageGenerationError::Provider(format!(
-        "unsupported image provider {}",
-        attempt.provider_name
-    )))
+    let config = draw_api_config_for_attempt(draw_api_config, &attempt)
+        .map_err(ImageGenerationError::Provider)?;
+    AifarmDrawApiImageGenerator::new(config)
+        .generate_image(request)
+        .await
 }
 
 async fn edit_image_with_routed_attempt<DataUrl>(
@@ -1842,77 +1836,33 @@ where
     DataUrl: TelegramVisionDataUrlProvider + Send + Sync,
     DataUrl::Error: fmt::Display,
 {
-    if !routed_attempt_is_draw_api(&attempt) {
-        return Err(ImageEditError::Provider(format!(
-            "unsupported image edit provider {}",
-            attempt.provider_name
-        )));
-    }
-    let editor = ResolvingImageEditor::new(
-        data_urls,
-        AifarmDrawApiImageGenerator::new(draw_api_config_for_attempt(draw_api_config, &attempt)),
-    );
+    let config =
+        draw_api_config_for_attempt(draw_api_config, &attempt).map_err(ImageEditError::Provider)?;
+    let editor = ResolvingImageEditor::new(data_urls, AifarmDrawApiImageGenerator::new(config));
     editor.edit_image(request).await
-}
-
-fn routed_attempt_is_draw_api(attempt: &RoutedAttempt) -> bool {
-    attempt.provider_name.eq_ignore_ascii_case("aifarm-draw")
-        || attempt.provider_name.eq_ignore_ascii_case("draw-api")
-        || attempt
-            .discovery_service_name
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(AIFARM_DRAW_API_SERVICE_NAME))
 }
 
 fn draw_api_config_for_attempt(
     mut config: AifarmDrawApiConfig,
     attempt: &RoutedAttempt,
-) -> AifarmDrawApiConfig {
-    if let Some(endpoint) = routed_endpoint(attempt) {
-        config.base_url = endpoint;
+) -> Result<AifarmDrawApiConfig, String> {
+    if attempt.protocol != Some(openplotva_llm::provider_schema::Protocol::DiscoveryDraw) {
+        return Err(format!(
+            "unsupported image protocol for provider {}",
+            attempt.provider_name
+        ));
     }
-    if let Some(service_name) = routed_config_value(attempt, "service_name")
-        .or_else(|| routed_discovery_value(attempt.discovery_service_name.as_deref()))
-    {
-        config.service_name = service_name;
+    if let Some(endpoint) = attempt.endpoint() {
+        config.base_url = endpoint.to_owned();
     }
-    if let Some(endpoint_name) = routed_config_value(attempt, "endpoint_name")
-        .or_else(|| routed_discovery_value(attempt.discovery_endpoint_name.as_deref()))
-    {
-        config.endpoint_name = endpoint_name;
+    let (service_name, endpoint_name) = attempt.discovery_names();
+    if let Some(service_name) = service_name {
+        config.service_name = service_name.to_owned();
     }
-    config.with_defaults()
-}
-
-fn routed_endpoint(attempt: &RoutedAttempt) -> Option<String> {
-    attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn routed_config_value(attempt: &RoutedAttempt, key: &str) -> Option<String> {
-    attempt
-        .model_config
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            attempt
-                .provider_config
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-        })
-        .and_then(|value| routed_discovery_value(Some(value)))
-}
-
-fn routed_discovery_value(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    if let Some(endpoint_name) = endpoint_name {
+        config.endpoint_name = endpoint_name.to_owned();
+    }
+    Ok(config.with_defaults())
 }
 
 fn image_generation_retryable_reason(error: &ImageGenerationError) -> Option<FailureReason> {
@@ -9162,10 +9112,11 @@ mod tests {
 
     #[test]
     fn routed_draw_api_config_prefers_model_endpoint_over_provider_endpoint() {
-        let attempt = RoutedAttempt {
+        let mut attempt = RoutedAttempt {
+            protocol: Some(openplotva_llm::provider_schema::Protocol::DiscoveryDraw),
             provider_id: 1,
             model_id: 2,
-            provider_name: "aifarm-draw".to_owned(),
+            provider_name: "renamed-image-provider".to_owned(),
             model_name: "boogu-image-turbo-sdnq".to_owned(),
             provider_runtime_hint: None,
             provider_endpoint: None,
@@ -9187,10 +9138,26 @@ mod tests {
             variant: None,
         };
 
-        let cfg = draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt);
+        let cfg = draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt)
+            .expect("draw route");
 
         assert_eq!(cfg.service_name, AIFARM_DRAW_API_SERVICE_NAME);
         assert_eq!(cfg.endpoint_name, AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME);
+        attempt.model_base_url = Some(" ".into());
+        attempt.provider_endpoint = Some("http://draw.example.test".into());
+        attempt.model_config = json!({});
+        attempt.discovery_endpoint_name = Some("dedicated-endpoint".into());
+        let cfg = draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt)
+            .expect("dedicated route");
+        assert_eq!(cfg.base_url, "http://draw.example.test");
+        assert_eq!(cfg.endpoint_name, "dedicated-endpoint");
+        attempt.discovery_endpoint_name = Some(" ".into());
+        let cfg = draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt)
+            .expect("legacy config");
+        assert_eq!(cfg.endpoint_name, AIFARM_DRAW_API_ENDPOINT_NAME);
+        attempt.provider_name = "aifarm-draw".into();
+        attempt.protocol = Some(openplotva_llm::provider_schema::Protocol::Genkit);
+        assert!(draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt).is_err());
     }
 
     #[tokio::test]

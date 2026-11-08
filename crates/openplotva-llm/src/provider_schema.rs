@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Wire-payload protocol of a provider endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Protocol {
     /// OpenAI-compatible `/v1/chat/completions` (direct or discovery-resolved).
     OpenAiCompat,
@@ -23,6 +23,8 @@ pub enum Protocol {
     AceStep,
     /// Discovery blocking-jobs API (`/v1/jobs/blocking` + poll), e.g. embedder.
     DiscoveryJobs,
+    /// Discovery speech recognition API.
+    DiscoveryAsr,
     /// Discovery draw API (image generation/editing job queue).
     DiscoveryDraw,
     /// Non-LLM privacy/redaction discovery service.
@@ -37,6 +39,7 @@ impl Protocol {
             "genkit" => Some(Self::Genkit),
             "acestep" => Some(Self::AceStep),
             "discovery_jobs" => Some(Self::DiscoveryJobs),
+            "discovery_asr" => Some(Self::DiscoveryAsr),
             "discovery_draw" => Some(Self::DiscoveryDraw),
             "privacy_filter" => Some(Self::PrivacyFilter),
             _ => None,
@@ -50,6 +53,7 @@ impl Protocol {
             Self::Genkit => "genkit",
             Self::AceStep => "acestep",
             Self::DiscoveryJobs => "discovery_jobs",
+            Self::DiscoveryAsr => "discovery_asr",
             Self::DiscoveryDraw => "discovery_draw",
             Self::PrivacyFilter => "privacy_filter",
         }
@@ -68,6 +72,7 @@ impl Protocol {
             Self::Genkit,
             Self::AceStep,
             Self::DiscoveryJobs,
+            Self::DiscoveryAsr,
             Self::DiscoveryDraw,
             Self::PrivacyFilter,
         ]
@@ -245,7 +250,10 @@ pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value 
             { "key": "timeout_ms", "kind": "int", "label": "Request timeout (ms)" },
             { "key": "connect_timeout_ms", "kind": "int", "label": "Connect timeout (ms)" },
         ]),
-        Protocol::DiscoveryJobs | Protocol::DiscoveryDraw | Protocol::PrivacyFilter => json!([
+        Protocol::DiscoveryAsr
+        | Protocol::DiscoveryJobs
+        | Protocol::DiscoveryDraw
+        | Protocol::PrivacyFilter => json!([
             { "key": "timeout_ms", "kind": "int", "label": "Job timeout (ms)" },
         ]),
     };
@@ -258,6 +266,7 @@ pub fn param_descriptor(protocol: Protocol, hint: Option<RuntimeHint>) -> Value 
         ]),
         Protocol::AceStep
         | Protocol::DiscoveryJobs
+        | Protocol::DiscoveryAsr
         | Protocol::DiscoveryDraw
         | Protocol::PrivacyFilter => json!([]),
     };

@@ -17,6 +17,7 @@ use crate::{DialogInput, DialogTraceArtifacts, ToolContext, ToolStep};
 #[must_use]
 pub fn dialog_tool_context(input: &DialogInput) -> ToolContext {
     ToolContext {
+        invocation_id: None,
         chat_id: input.context.chat_id,
         thread_id: input.context.thread_id,
         message_id: input.message.id,

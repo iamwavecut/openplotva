@@ -603,6 +603,28 @@ where
     report
 }
 
+pub(crate) fn record_openrouter_free_key_status_failed(
+    reporter: &RoutingEventReporter,
+    source: &str,
+    error: &str,
+) {
+    reporter.record(RoutingEvent {
+        severity: "warn".to_owned(),
+        event_type: "openrouter_free_key_status_failed".to_owned(),
+        workflow_key: "routing".to_owned(),
+        provider_id: None,
+        model_id: None,
+        queue_name: None,
+        job_id: None,
+        chat_id: None,
+        user_id: None,
+        thread_id: None,
+        message_id: None,
+        dedupe_key: format!("openrouter_free_key_status_failed:{source}"),
+        summary: "OpenRouter Free key status check failed".to_owned(),
+        detail: serde_json::json!({ "error": error, "source": source }),
+    });
+}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

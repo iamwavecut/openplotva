@@ -67,10 +67,6 @@ const GROUP_SETTINGS_MEMBERSHIP_MAX_AGE_SECONDS: i64 = 5 * 60;
 pub type SettingsControlJobQueueFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
-/// Boxed future returned by settings taskman worker queue calls.
-pub type SettingsControlJobWorkerFuture<'a, T, E> =
-    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
-
 /// Boxed future returned by group settings executor permission checks.
 pub type GroupSettingsControlJobFuture<'a, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -110,7 +106,7 @@ pub trait SettingsControlJobQueue {
 
 impl<T> SettingsControlJobQueue for T
 where
-    T: crate::payments::PaymentControlJobQueue + Sync,
+    T: crate::control_jobs::ControlJobQueue + Sync,
 {
     type Error = T::Error;
 
@@ -119,7 +115,7 @@ where
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error> {
-        self.assign_payment_control_job(queue_name, job)
+        self.assign_control_job(queue_name, job)
     }
 }
 
@@ -166,71 +162,6 @@ where
 
     fn materializes_human_new_members_directly(&self) -> bool {
         true
-    }
-}
-
-/// Queue/status boundary for settings-owned taskman control-job workers.
-pub trait SettingsControlJobWorkerQueue {
-    /// Error returned by the concrete queue implementation.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn dequeue_settings_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> SettingsControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    >;
-
-    /// Finalize one settings-owned control job as completed.
-    fn complete_settings_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error>;
-
-    /// Finalize one settings-owned control job as failed.
-    fn fail_settings_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error>;
-}
-
-impl<T> SettingsControlJobWorkerQueue for T
-where
-    T: crate::payments::SharedControlJobWorkerQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn dequeue_settings_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> SettingsControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    > {
-        self.dequeue_shared_control_job_matching(
-            queue_name,
-            "settings-control",
-            is_settings_control_job,
-        )
-    }
-
-    fn complete_settings_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error> {
-        self.complete_shared_control_job(job_id)
-    }
-
-    fn fail_settings_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error> {
-        self.fail_shared_control_job(job_id, error)
     }
 }
 
@@ -1285,28 +1216,6 @@ pub enum SettingsControlJobExecution {
     NewMembersFollowup(NewMembersFollowupControlJobOutcome),
 }
 
-/// Result of one settings-owned taskman worker tick.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SettingsControlJobWorkerReport {
-    /// Whether a job was dequeued.
-    pub dequeued: bool,
-    /// Dequeued taskman job ID.
-    pub job_id: Option<i64>,
-    /// Settings executor result, when payload decoding succeeded.
-    pub execution: Option<SettingsControlJobExecution>,
-    /// The job was finalized as completed.
-    pub completed: bool,
-    /// The job was finalized as failed.
-    pub failed: bool,
-    /// Queue dequeue failed.
-    pub dequeue_error: Option<String>,
-    pub decode_error: Option<String>,
-    /// Executor returned a direct runtime error.
-    pub execution_error: Option<String>,
-    /// Completion/failure status write failed.
-    pub status_error: Option<String>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminChatSettingsCommandOutcome {
     NotAdminChatSettingsCommand,
@@ -1777,106 +1686,6 @@ where
     })
 }
 
-/// Process one settings-owned taskman control job, if available.
-pub async fn process_settings_control_job_once_at<Queue, GroupEffects, NewEffects, NextId>(
-    queue: &Queue,
-    dispatcher_queue: &DispatcherQueue,
-    group_effects: &GroupEffects,
-    new_members_effects: &NewEffects,
-    bot_username: &str,
-    mut next_virtual_id: NextId,
-) -> SettingsControlJobWorkerReport
-where
-    Queue: SettingsControlJobWorkerQueue + Sync,
-    GroupEffects: GroupSettingsControlJobEffects + Sync,
-    NewEffects: NewMembersFollowupControlJobEffects + Sync,
-    NextId: FnMut() -> String,
-{
-    let mut report = SettingsControlJobWorkerReport::default();
-    let item = match queue.dequeue_settings_control_job(CONTROL_QUEUE_NAME).await {
-        Ok(item) => item,
-        Err(error) => {
-            report.dequeue_error = Some(error.to_string());
-            return report;
-        }
-    };
-
-    let Some(item) = item else {
-        return report;
-    };
-    report.dequeued = true;
-    report.job_id = Some(item.id);
-
-    let params = match control_job_params_from_stateless_job(&item.job) {
-        Ok(params) => params,
-        Err(error) => {
-            let error = error.to_string();
-            report.decode_error = Some(error.clone());
-            mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    let execution = match params.data.kind {
-        ControlKind::GroupSettings => execute_group_settings_control_job_at(
-            dispatcher_queue,
-            group_effects,
-            &params,
-            bot_username,
-            &mut next_virtual_id,
-        )
-        .await
-        .map(SettingsControlJobExecution::GroupSettings),
-        ControlKind::NewMembersFollowup => execute_new_members_followup_control_job_at(
-            dispatcher_queue,
-            new_members_effects,
-            &params,
-            bot_username,
-            &mut next_virtual_id,
-        )
-        .await
-        .map(SettingsControlJobExecution::NewMembersFollowup),
-        kind => Ok(SettingsControlJobExecution::GroupSettings(
-            GroupSettingsControlJobOutcome::UnsupportedKind(kind),
-        )),
-    };
-
-    let execution = match execution {
-        Ok(execution) => execution,
-        Err(error) => {
-            let error = error.to_string();
-            report.execution_error = Some(error.clone());
-            mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    if let Some(error) = settings_control_job_failure_message(&execution) {
-        mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
-    } else {
-        match queue.complete_settings_control_job(item.id).await {
-            Ok(()) => report.completed = true,
-            Err(error) => report.status_error = Some(error.to_string()),
-        }
-    }
-    report.execution = Some(execution);
-    report
-}
-
-async fn mark_settings_control_job_failed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    error: &str,
-    report: &mut SettingsControlJobWorkerReport,
-) where
-    Queue: SettingsControlJobWorkerQueue + Sync,
-{
-    match queue.fail_settings_control_job(job_id, error).await {
-        Ok(()) => report.failed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
-}
-
 pub(crate) fn settings_control_job_failure_message(
     execution: &SettingsControlJobExecution,
 ) -> Option<String> {
@@ -1901,14 +1710,6 @@ pub(crate) fn settings_control_job_failure_message(
             NewMembersFollowupControlJobOutcome::Completed { .. },
         ) => None,
     }
-}
-
-fn is_settings_control_job(job: &StatelessJobItem) -> bool {
-    job.data.job_type == openplotva_taskman::JobType::Control
-        && matches!(
-            job.data.control_data.as_ref().map(|data| data.kind),
-            Some(ControlKind::GroupSettings | ControlKind::NewMembersFollowup)
-        )
 }
 
 #[must_use]
@@ -3552,6 +3353,41 @@ fn user_full_name(user: &TelegramUser) -> String {
 
 #[cfg(test)]
 mod tests {
+    async fn run_settings_on_shared_worker<
+        Group: GroupSettingsControlJobEffects + Sync,
+        New: super::NewMembersFollowupControlJobEffects + Sync,
+        Id: Fn() -> String + Sync,
+    >(
+        queue: &crate::control_jobs::InMemoryControlJobQueue,
+        dispatcher: &DispatcherQueue,
+        group: &Group,
+        new: &New,
+        bot_username: &str,
+        next_id: Id,
+    ) -> crate::control_jobs::ControlJobWorkerReport {
+        use crate::control_jobs::test_support::UnusedControlPorts;
+        let ports = UnusedControlPorts;
+        let registry = crate::control_jobs::AppControlJobExecutors {
+            payment_store: &ports,
+            payment_effects: &ports,
+            dispatcher_queue: dispatcher,
+            group_settings_effects: group,
+            new_members_effects: new,
+            bot_username,
+            next_virtual_id: &next_id,
+            translator: &ports,
+            translation_effects: &ports,
+            member_effects: &ports,
+            checkin_effects: &ports,
+        };
+        crate::control_jobs::process_control_job_once_at(
+            queue,
+            &registry,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
     use std::{
         env,
         error::Error,
@@ -3583,7 +3419,8 @@ mod tests {
         RandomDialogRng, RandomDialogSettingsStore, RandomObscenifiedTextPlan,
     };
     use crate::help::{HelpBotIdentity, HelpCommandUpdateHandler, HelpDispatcherEffects};
-    use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
+
+    use crate::control_jobs::{InMemoryControlJobQueue, InMemoryControlJobStatus};
     use crate::updates::{
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
         process_update_with_state_store_at,
@@ -3605,14 +3442,14 @@ mod tests {
         handle_admin_chat_settings_command_update_or_else_at,
         handle_group_settings_command_update_at, handle_new_members_followup_update_at,
         handle_private_settings_command_update, handle_settings_update_or_else_at,
-        new_members_followup_control_job_from_update_at, process_settings_control_job_once_at,
-        sync_chat_admins_with_cache, sync_chat_admins_with_sources,
+        new_members_followup_control_job_from_update_at, sync_chat_admins_with_cache,
+        sync_chat_admins_with_sources,
     };
 
     #[tokio::test]
     async fn settings_control_jobs_can_use_shared_persistent_control_queue()
     -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
+        let queue = InMemoryControlJobQueue::new();
         let job = new_control_job_at(
             ControlJobParams {
                 chat_id: -10042,
@@ -3649,22 +3486,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_control_worker_skips_payment_job_and_completes_group_settings_job()
-    -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
+    async fn shared_control_worker_completes_group_settings_job() -> Result<(), Box<dyn Error>> {
+        let queue = InMemoryControlJobQueue::new();
         let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
         let group_effects = GroupSettingsEffectsStub::allowing();
         let new_members_effects = NewMembersFollowupEffectsStub::blocked();
-        let payment_job = settings_test_control_job(ControlKind::VipInvoice, "vip invoice");
         let settings_job = settings_test_control_job(ControlKind::GroupSettings, "group settings");
-        queue
-            .assign_settings_control_job(CONTROL_QUEUE_NAME, payment_job)
-            .await?;
         queue
             .assign_settings_control_job(CONTROL_QUEUE_NAME, settings_job.clone())
             .await?;
 
-        let report = process_settings_control_job_once_at(
+        let report = run_settings_on_shared_worker(
             &queue,
             &dispatcher_queue,
             &group_effects,
@@ -3675,22 +3507,20 @@ mod tests {
         .await;
 
         assert!(report.dequeued);
-        assert_eq!(report.job_id, Some(2));
+        assert_eq!(report.job_id, Some(1));
         assert_eq!(
             report.execution,
-            Some(SettingsControlJobExecution::GroupSettings(
-                super::GroupSettingsControlJobOutcome::SentLink
+            Some(crate::control_jobs::ControlJobExecution::Settings(
+                SettingsControlJobExecution::GroupSettings(
+                    super::GroupSettingsControlJobOutcome::SentLink
+                )
             ))
         );
         assert!(report.completed);
         assert!(!report.failed);
         let snapshot = queue.snapshot();
-        assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
-        assert_eq!(
-            snapshot[1].status,
-            InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(snapshot[1].job, settings_job);
+        assert_eq!(snapshot[0].status, InMemoryControlJobStatus::Completed);
+        assert_eq!(snapshot[0].job, settings_job);
         assert_eq!(group_effects.synced_admin_chats(), vec![-10042]);
         let item = dispatcher_queue
             .dequeue_immediate()
@@ -3702,7 +3532,7 @@ mod tests {
     #[tokio::test]
     async fn settings_control_worker_completes_new_members_followup_job()
     -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
+        let queue = InMemoryControlJobQueue::new();
         let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
         let group_effects = GroupSettingsEffectsStub::allowing();
         let new_members_effects = NewMembersFollowupEffectsStub::blocked();
@@ -3716,7 +3546,7 @@ mod tests {
             .assign_settings_control_job(CONTROL_QUEUE_NAME, job.clone())
             .await?;
 
-        let report = process_settings_control_job_once_at(
+        let report = run_settings_on_shared_worker(
             &queue,
             &dispatcher_queue,
             &group_effects,
@@ -3729,18 +3559,17 @@ mod tests {
         assert_eq!(report.job_id, Some(1));
         assert_eq!(
             report.execution,
-            Some(SettingsControlJobExecution::NewMembersFollowup(
-                super::NewMembersFollowupControlJobOutcome::Completed {
-                    unblock_notice_queued: true
-                }
+            Some(crate::control_jobs::ControlJobExecution::Settings(
+                SettingsControlJobExecution::NewMembersFollowup(
+                    super::NewMembersFollowupControlJobOutcome::Completed {
+                        unblock_notice_queued: true
+                    }
+                )
             ))
         );
         assert!(report.completed);
         let snapshot = queue.snapshot();
-        assert_eq!(
-            snapshot[0].status,
-            InMemoryPaymentControlJobStatus::Completed
-        );
+        assert_eq!(snapshot[0].status, InMemoryControlJobStatus::Completed);
         assert_eq!(snapshot[0].job, job);
         assert_eq!(new_members_effects.enabled_chats(), vec![-10042]);
         let item = dispatcher_queue
@@ -5069,7 +4898,7 @@ mod tests {
 
         let settings_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let help_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let control_queue = Arc::new(InMemoryControlJobQueue::new());
         let terminal = Arc::new(UpdateHandlerStub::default());
         let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
             Arc::new(SettingsDialogSchedulerStub),
@@ -5093,7 +4922,7 @@ mod tests {
         let help_effects = Arc::new(HelpDispatcherEffects::new(
             telegram,
             Arc::clone(&settings_handler),
-            Arc::new(crate::rich::MockRichSender::default()),
+            crate::rich::unreachable_outbox(),
         ));
         let help_handler = HelpCommandUpdateHandler::new(
             HelpBotIdentity {
@@ -5190,7 +5019,7 @@ mod tests {
         assert_eq!(update_queue.len().await?, 3);
 
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let control_queue = Arc::new(InMemoryControlJobQueue::new());
         let terminal = Arc::new(UpdateHandlerStub::default());
         let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
             Arc::new(SettingsDialogSchedulerStub),

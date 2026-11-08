@@ -1,5 +1,8 @@
 //! App-level check-in callback control-job behavior.
 
+#[cfg(test)]
+use crate::control_jobs::ControlJobEnqueueFuture;
+use crate::control_jobs::ControlJobQueue;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -15,8 +18,8 @@ use carapax::types::{
     User as TelegramUser,
 };
 use openplotva_taskman::{
-    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-    StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
+    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
+    StatelessJobItem, new_control_job_at,
 };
 use openplotva_telegram::{
     ChatRef, DispatcherConfig, DispatcherQueue, InlineKeyboardMarkup, OUTBOUND_SEND_MAX_ATTEMPTS,
@@ -55,16 +58,14 @@ const CHECKIN_EPHEMERAL_TIMEOUT: Duration = Duration::from_secs(30);
 const NEW_CHAT_WARMUP_WINDOW: time::Duration = time::Duration::hours(24);
 const CHECKIN_DIRECT_RETRY_AFTER_INLINE_CAP_SECS: u64 = 15;
 
-/// Boxed future returned by check-in control-job queue calls.
-pub type CheckinControlJobQueueFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-/// Boxed future returned by check-in control-job worker queue calls.
-pub type CheckinControlJobWorkerFuture<'a, T, E> =
-    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
-
 /// Boxed future returned by check-in control-job effects.
-pub type CheckinControlJobFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+pub type CheckinControlJobFuture<'a, E> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, E>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Boxed future returned by check-in game storage calls.
 pub type CheckinGameStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -86,17 +87,6 @@ pub type CheckinThemeEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<()
 /// Boxed future returned by direct check-in callback method executors.
 pub type CheckinCallbackMethodFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-pub trait CheckinControlJobQueue {
-    /// Error returned by the concrete queue implementation.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn assign_checkin_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> CheckinControlJobQueueFuture<'a, Self::Error>;
-}
 
 pub trait CheckinCommandPermission {
     /// Error returned by the concrete permission policy.
@@ -136,92 +126,13 @@ where
     }
 }
 
-impl<T> CheckinControlJobQueue for T
-where
-    T: crate::payments::PaymentControlJobQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn assign_checkin_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> CheckinControlJobQueueFuture<'a, Self::Error> {
-        self.assign_payment_control_job(queue_name, job)
-    }
-}
-
-/// Queue/status boundary for check-in taskman control-job workers.
-pub trait CheckinControlJobWorkerQueue {
-    /// Queue error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn dequeue_checkin_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> CheckinControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    >;
-
-    /// Mark one check-in control job completed.
-    fn complete_checkin_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> CheckinControlJobWorkerFuture<'a, (), Self::Error>;
-
-    /// Mark one check-in control job failed.
-    fn fail_checkin_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> CheckinControlJobWorkerFuture<'a, (), Self::Error>;
-}
-
-impl<T> CheckinControlJobWorkerQueue for T
-where
-    T: crate::payments::SharedControlJobWorkerQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn dequeue_checkin_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> CheckinControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    > {
-        self.dequeue_shared_control_job_matching(
-            queue_name,
-            "checkin-control",
-            is_checkin_control_job,
-        )
-    }
-
-    fn complete_checkin_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> CheckinControlJobWorkerFuture<'a, (), Self::Error> {
-        self.complete_shared_control_job(job_id)
-    }
-
-    fn fail_checkin_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> CheckinControlJobWorkerFuture<'a, (), Self::Error> {
-        self.fail_shared_control_job(job_id, error)
-    }
-}
-
 pub trait CheckinControlJobEffects {
     /// Error returned by the concrete game runner.
     type Error: fmt::Display + Send + Sync + 'static;
 
     fn run_checkin_game<'a>(
         &'a self,
+        job_id: i64,
         params: &'a ControlJobParams,
     ) -> CheckinControlJobFuture<'a, Self::Error>;
 }
@@ -318,6 +229,7 @@ pub struct CheckinGameMessage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckinGameRunRequest {
+    pub job_id: i64,
     /// Reconstructed control-job message context.
     pub message: CheckinGameMessage,
     /// Telegram chat type string.
@@ -342,6 +254,19 @@ pub struct CheckinCommandUpdateContext<'a> {
 pub trait CheckinGameSender {
     /// Error returned by the concrete sender.
     type Error: fmt::Display + Send + Sync + 'static;
+
+    fn queued_checkin<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> CheckinGameSendFuture<'a, Option<crate::telegram_outbox::QueuedBatchReceipt>, Self::Error>;
+
+    fn finish_checkin_html<'a>(
+        &'a self,
+        job_id: i64,
+        reply_to: CheckinGameMessage,
+        target_message_id: Option<i32>,
+        html: String,
+    ) -> CheckinGameSendFuture<'a, crate::telegram_outbox::QueuedBatchReceipt, Self::Error>;
 
     /// Send one immediate HTML reply. Returns Telegram message ID when available.
     fn send_checkin_html<'a>(
@@ -517,31 +442,6 @@ impl CheckinGameStore for PostgresCheckinGameStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CheckinGameRunOutcome {
-    /// Private chat or text-send permission blocked the game before side effects.
-    SkippedByChatPolicy,
-    /// Game disabled in chat settings.
-    Disabled,
-    /// Existing daily winner was reported.
-    ExistingWinner,
-    /// Not enough valid participants.
-    NotEnoughParticipants {
-        /// Valid participant count.
-        count: usize,
-    },
-    /// New winner recorded, stats increment attempted, and winner message sent.
-    WinnerRecorded {
-        /// Winner user ID.
-        user_id: i64,
-        /// Theme key used for storage/output.
-        theme: String,
-    },
-    /// Insert raced with another worker; existing winner was reported when visible.
-    RecordRaceExistingWinner,
-    RecordFailedNoWinner,
-}
-
 /// Recoverable check-in game runner errors.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CheckinGameRunError {
@@ -570,6 +470,7 @@ pub struct CheckinGameRuntimeEffects<Store, Sender> {
 
 #[derive(Clone)]
 pub struct TelegramCheckinGameSender {
+    delivery: Arc<crate::rich::RichOutbox>,
     ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
     telegram: openplotva_telegram::TelegramClient,
     rich: openplotva_telegram::RichApiClient,
@@ -583,8 +484,10 @@ impl TelegramCheckinGameSender {
         ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
         telegram: openplotva_telegram::TelegramClient,
         rich: openplotva_telegram::RichApiClient,
+        delivery: Arc<crate::rich::RichOutbox>,
     ) -> Self {
         Self {
+            delivery,
             ephemeral_store,
             telegram,
             rich,
@@ -602,6 +505,59 @@ impl TelegramCheckinGameSender {
 
 impl CheckinGameSender for TelegramCheckinGameSender {
     type Error = CheckinGameSenderError;
+
+    fn queued_checkin<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> CheckinGameSendFuture<'a, Option<crate::telegram_outbox::QueuedBatchReceipt>, Self::Error>
+    {
+        Box::pin(async move {
+            self.delivery
+                .queued(&checkin_delivery_source(job_id), Some(job_id))
+                .await
+                .map_err(|error| CheckinGameSenderError::Telegram(error.to_string()))
+        })
+    }
+
+    fn finish_checkin_html<'a>(
+        &'a self,
+        job_id: i64,
+        reply_to: CheckinGameMessage,
+        target_message_id: Option<i32>,
+        html: String,
+    ) -> CheckinGameSendFuture<'a, crate::telegram_outbox::QueuedBatchReceipt, Self::Error> {
+        Box::pin(async move {
+            let method = match target_message_id {
+                Some(message_id) => {
+                    TelegramOutboundMethod::from(openplotva_telegram::EditRichMessage {
+                        chat_id: reply_to.chat_id,
+                        message_id: i64::from(message_id),
+                        html,
+                        reply_markup: None,
+                    })
+                }
+                None => TelegramOutboundMethod::from(openplotva_telegram::SendRichMessage {
+                    chat_id: reply_to.chat_id,
+                    html,
+                    options: openplotva_telegram::RichSendOptions {
+                        message_thread_id: reply_to.thread_id.map(i64::from),
+                        reply_to_message_id: Some(i64::from(reply_to.message_id)),
+                        allow_sending_without_reply: true,
+                        ..Default::default()
+                    },
+                }),
+            };
+            self.delivery
+                .enqueue(
+                    &checkin_delivery_source(job_id),
+                    reply_to.thread_id.map(i64::from),
+                    method,
+                    Some(job_id),
+                )
+                .await
+                .map_err(|error| CheckinGameSenderError::Telegram(error.to_string()))
+        })
+    }
 
     fn send_checkin_html<'a>(
         &'a self,
@@ -673,19 +629,19 @@ pub enum CheckinGameSenderError {
 }
 
 #[derive(Clone)]
-pub struct CheckinCommandDispatcherEffects {
+pub struct CheckinCommandDelivery {
     queue: Arc<DispatcherQueue>,
-    rich: Arc<dyn crate::rich::RichSender>,
+    delivery: Arc<crate::rich::RichOutbox>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl CheckinCommandDispatcherEffects {
+impl CheckinCommandDelivery {
     /// Build check-in command effects over an existing dispatcher queue.
     #[must_use]
-    pub fn new(queue: Arc<DispatcherQueue>, rich: Arc<dyn crate::rich::RichSender>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>, delivery: Arc<crate::rich::RichOutbox>) -> Self {
         Self {
             queue,
-            rich,
+            delivery,
             next_virtual_id: monotonic_virtual_id_factory("checkin-command-vmsg"),
         }
     }
@@ -707,7 +663,7 @@ pub enum CheckinCommandEffectError {
     RichSend(String),
 }
 
-impl CheckinCommandEffects for CheckinCommandDispatcherEffects {
+impl CheckinCommandEffects for CheckinCommandDelivery {
     type Error = CheckinCommandEffectError;
 
     fn send_checkin_today_winner_with_stats<'a>(
@@ -724,8 +680,20 @@ impl CheckinCommandEffects for CheckinCommandDispatcherEffects {
                 disable_notification: false,
                 reply_markup: None,
             };
-            self.rich
-                .send_rich(reply_to.chat_id, &html, &options)
+            self.delivery
+                .enqueue(
+                    &format!(
+                        "checkin-command:{}:{}",
+                        reply_to.chat_id, reply_to.message_id
+                    ),
+                    options.message_thread_id,
+                    openplotva_telegram::SendRichMessage {
+                        chat_id: reply_to.chat_id,
+                        html,
+                        options,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|error| CheckinCommandEffectError::RichSend(error.to_string()))?;
             Ok(())
@@ -1018,9 +986,18 @@ where
 
     fn run_checkin_game<'a>(
         &'a self,
+        job_id: i64,
         params: &'a ControlJobParams,
     ) -> CheckinControlJobFuture<'a, Self::Error> {
         Box::pin(async move {
+            if let Some(receipt) = self
+                .sender
+                .queued_checkin(job_id)
+                .await
+                .map_err(sender_error)?
+            {
+                return Ok(Some(receipt));
+            }
             let message = CheckinGameMessage {
                 chat_id: params.chat_id,
                 message_id: params.message_id,
@@ -1041,6 +1018,7 @@ where
                 &self.store,
                 &self.sender,
                 CheckinGameRunRequest {
+                    job_id,
                     message,
                     chat_type: params.data.chat_type.clone(),
                     theme_override: params.data.theme.clone(),
@@ -1060,17 +1038,17 @@ where
                     }),
             )
             .await
-            .map(|_| ())
         })
     }
 }
 
-pub async fn run_checkin_game_at<Store, Sender, Pick>(
+#[cfg(test)]
+async fn run_checkin_game_at<Store, Sender, Pick>(
     store: &Store,
     sender: &Sender,
     request: CheckinGameRunRequest,
     pick_index: Pick,
-) -> Result<CheckinGameRunOutcome, CheckinGameRunError>
+) -> Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, CheckinGameRunError>
 where
     Store: CheckinGameStore + Sync,
     Sender: CheckinGameSender + Sync,
@@ -1093,14 +1071,14 @@ async fn run_checkin_game_inner<Store, Sender, Pick>(
     pick_index: &Pick,
     sleep_between_steps: bool,
     utility_ads: Option<CheckinUtilityAds<'_>>,
-) -> Result<CheckinGameRunOutcome, CheckinGameRunError>
+) -> Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, CheckinGameRunError>
 where
     Store: CheckinGameStore + Sync,
     Sender: CheckinGameSender + Sync,
     Pick: Fn(usize) -> usize + Sync + ?Sized,
 {
     if request.chat_type.eq_ignore_ascii_case("private") || !request.can_send_text {
-        return Ok(CheckinGameRunOutcome::SkippedByChatPolicy);
+        return Ok(None);
     }
 
     let message = request.message;
@@ -1117,12 +1095,13 @@ where
             )
             .await
             .map_err(sender_error)?;
-        return Ok(CheckinGameRunOutcome::Disabled);
+        return Ok(None);
     }
 
     if let Some(winner) = load_today_winner(store, message.chat_id).await {
-        send_today_winner_message(store, sender, message, &winner).await;
-        return Ok(CheckinGameRunOutcome::ExistingWinner);
+        let receipt =
+            send_today_winner_message(store, sender, request.job_id, message, &winner).await?;
+        return Ok(Some(receipt));
     }
 
     let theme = resolve_checkin_theme(&settings, &request.theme_override);
@@ -1139,9 +1118,7 @@ where
             )
             .await
             .map_err(sender_error)?;
-        return Ok(CheckinGameRunOutcome::NotEnoughParticipants {
-            count: participants.len(),
-        });
+        return Ok(None);
     }
 
     let picked = pick_index(participants.len()).min(participants.len() - 1);
@@ -1157,7 +1134,7 @@ where
             {
                 tracing::warn!(message = %error, chat_id = message.chat_id, winner_id, "failed to increment check-in game stats");
             }
-            run_checkin_animation(
+            let receipt = run_checkin_animation(
                 store,
                 sender,
                 message,
@@ -1166,21 +1143,20 @@ where
                 pick_index,
                 sleep_between_steps,
                 utility_ads,
-                request.now,
+                request.job_id,
             )
             .await?;
-            Ok(CheckinGameRunOutcome::WinnerRecorded {
-                user_id: winner_id,
-                theme: theme.key.to_owned(),
-            })
+            Ok(Some(receipt))
         }
         Err(error) => {
             tracing::warn!(message = %error, chat_id = message.chat_id, winner_id, "failed to record check-in daily winner");
             if let Some(existing) = load_today_winner(store, message.chat_id).await {
-                send_today_winner_message(store, sender, message, &existing).await;
-                Ok(CheckinGameRunOutcome::RecordRaceExistingWinner)
+                let receipt =
+                    send_today_winner_message(store, sender, request.job_id, message, &existing)
+                        .await?;
+                Ok(Some(receipt))
             } else {
-                Ok(CheckinGameRunOutcome::RecordFailedNoWinner)
+                Ok(None)
             }
         }
     }
@@ -1333,6 +1309,10 @@ fn daily_game_disabled(settings: &openplotva_core::ChatSettings) -> bool {
     settings.enable_daily_game == Some(false)
 }
 
+pub(crate) fn checkin_delivery_source(job_id: i64) -> String {
+    format!("checkin-final:job:{job_id}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_checkin_animation<Store, Sender, Pick>(
     store: &Store,
@@ -1343,8 +1323,8 @@ async fn run_checkin_animation<Store, Sender, Pick>(
     pick_index: &Pick,
     sleep_between_steps: bool,
     utility_ads: Option<CheckinUtilityAds<'_>>,
-    game_at: OffsetDateTime,
-) -> Result<(), CheckinGameRunError>
+    job_id: i64,
+) -> Result<crate::telegram_outbox::QueuedBatchReceipt, CheckinGameRunError>
 where
     Store: CheckinGameStore + Sync,
     Sender: CheckinGameSender + Sync,
@@ -1362,7 +1342,8 @@ where
         .ok()
         .flatten()
     else {
-        return Ok(());
+        let linked_name = winner_link(store, winner_id).await;
+        return sender.finish_checkin_html(job_id, message, None, theme.winner_text(&linked_name)).await.map_err(sender_error);
     };
     for step in progress.iter().skip(1) {
         if sleep_between_steps {
@@ -1386,17 +1367,7 @@ where
     text.push_str("\n\n");
     text.push_str(&theme.winner_text(&linked_name));
     if let Some(utility) = utility_ads {
-        if let Err(_error) = sender
-            .edit_checkin_html(message, message_id, text.clone())
-            .await
-        {
-            tracing::warn!(
-                chat_id = message.chat_id,
-                message_id,
-                "failed to edit check-in winner message before optional ad"
-            );
-        }
-        let source_id = format!("{}:{}", message.chat_id, game_at.date());
+        let source_id = format!("job:{job_id}");
         let result_context = openplotva_telegram::strip_telegram_html(&text);
         let prepared = utility
             .ads
@@ -1404,10 +1375,7 @@ where
                 surface: crate::gradius_ads::GradiusUtilitySurface::Checkin,
                 include_vip_appendix: false,
                 source_id: source_id.clone(),
-                attempt_key: format!(
-                    "checkin-final:{source_id}:{}",
-                    OffsetDateTime::now_utc().unix_timestamp_nanos()
-                ),
+                attempt_key: checkin_delivery_source(job_id),
                 user_id: utility.initiator_id,
                 chat_id: message.chat_id,
                 thread_id: message.thread_id,
@@ -1430,10 +1398,19 @@ where
                         message.thread_id,
                         i64::from(message_id),
                         html,
+                        job_id,
                     )
                     .await
                 {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        return sender
+                            .queued_checkin(job_id)
+                            .await
+                            .map_err(sender_error)?
+                            .ok_or_else(|| CheckinGameRunError::Sender {
+                                message: "check-in final batch was not persisted".into(),
+                            });
+                    }
                     Err(_error) => {
                         tracing::warn!(
                             opportunity_id = ad.opportunity_id,
@@ -1453,17 +1430,11 @@ where
                 )
             }
         }
-        return Ok(());
     }
-    if let Err(error) = sender.edit_checkin_html(message, message_id, text).await {
-        tracing::warn!(
-            message = %error,
-            chat_id = message.chat_id,
-            message_id,
-            "failed to edit check-in winner message"
-        );
-    }
-    Ok(())
+    sender
+        .finish_checkin_html(job_id, message, Some(message_id), text)
+        .await
+        .map_err(sender_error)
 }
 
 fn checkin_progress_lines<Pick>(theme: CheckinGameTheme, pick_index: &Pick) -> Vec<String>
@@ -1492,9 +1463,11 @@ where
 async fn send_today_winner_message<Store, Sender>(
     store: &Store,
     sender: &Sender,
+    job_id: i64,
     message: CheckinGameMessage,
     winner: &openplotva_storage::ChatGameResult,
-) where
+) -> Result<crate::telegram_outbox::QueuedBatchReceipt, CheckinGameRunError>
+where
     Store: CheckinGameStore + Sync,
     Sender: CheckinGameSender + Sync,
 {
@@ -1505,9 +1478,10 @@ async fn send_today_winner_message<Store, Sender>(
         theme.name,
         theme.winner_text(&linked_name)
     );
-    if let Err(error) = sender.send_checkin_html(message, text).await {
-        tracing::warn!(message = %error, chat_id = message.chat_id, "failed to send today's check-in winner");
-    }
+    sender
+        .finish_checkin_html(job_id, message, None, text)
+        .await
+        .map_err(sender_error)
 }
 
 async fn today_winner_with_stats_html<Store>(
@@ -2220,12 +2194,6 @@ pub enum CheckinThemeCallbackOutcome {
     QueueError,
 }
 
-/// Result of one check-in control-job execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CheckinControlJobOutcome {
-    Completed,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CheckinCommandOutcome {
     /// Update did not belong to this slice and was delegated.
@@ -2241,28 +2209,6 @@ pub enum CheckinCommandOutcome {
     QueueError,
     /// Command message could not be reconstructed into a control job.
     MissingMessage,
-}
-
-/// Result of one check-in taskman worker tick.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CheckinControlJobWorkerReport {
-    /// Whether a job was dequeued.
-    pub dequeued: bool,
-    /// Dequeued taskman job ID.
-    pub job_id: Option<i64>,
-    /// Check-in executor result, when payload decoding succeeded.
-    pub execution: Option<CheckinControlJobOutcome>,
-    /// The job was finalized as completed.
-    pub completed: bool,
-    /// The job was finalized as failed.
-    pub failed: bool,
-    /// Queue dequeue failed.
-    pub dequeue_error: Option<String>,
-    pub decode_error: Option<String>,
-    /// Game runner failed.
-    pub execution_error: Option<String>,
-    /// Completion/failure status write failed.
-    pub status_error: Option<String>,
 }
 
 /// Fatal errors from the check-in callback wrapper.
@@ -2303,7 +2249,7 @@ impl<Queue, Effects, Next> CheckinThemeCallbackUpdateHandler<Queue, Effects, Nex
 
 impl<Queue, Effects, Next> UpdateHandler for CheckinThemeCallbackUpdateHandler<Queue, Effects, Next>
 where
-    Queue: CheckinControlJobQueue + Send + Sync,
+    Queue: ControlJobQueue + Send + Sync,
     Effects: CheckinThemeEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -2359,7 +2305,7 @@ impl<Queue, Store, Permission, Effects, Next>
 impl<Queue, Store, Permission, Effects, Next> UpdateHandler
     for CheckinCommandUpdateHandler<Queue, Store, Permission, Effects, Next>
 where
-    Queue: CheckinControlJobQueue + Send + Sync,
+    Queue: ControlJobQueue + Send + Sync,
     Store: CheckinGameStore + Send + Sync,
     Permission: CheckinCommandPermission + Send + Sync,
     Effects: CheckinCommandEffects + Send + Sync,
@@ -2417,7 +2363,7 @@ pub async fn handle_checkin_theme_callback_update_or_else_at<
     handle_other: HandleFn,
 ) -> Result<CheckinThemeCallbackOutcome, CheckinThemeCallbackError>
 where
-    Queue: CheckinControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Effects: CheckinThemeEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -2452,7 +2398,7 @@ pub async fn handle_checkin_theme_callback_at<Queue, Effects>(
     created: OffsetDateTime,
 ) -> CheckinThemeCallbackOutcome
 where
-    Queue: CheckinControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Effects: CheckinThemeEffects + Sync,
 {
     let (ack, blocked) = openplotva_telegram::checkin_theme_selection_ack_method(
@@ -2472,10 +2418,7 @@ where
         return CheckinThemeCallbackOutcome::MissingMessage;
     };
 
-    if let Err(error) = queue
-        .assign_checkin_control_job(CONTROL_QUEUE_NAME, job)
-        .await
-    {
+    if let Err(error) = queue.assign_control_job(CONTROL_QUEUE_NAME, job).await {
         tracing::warn!(message = %error, "failed to assign check-in control job");
         try_send_checkin_queue_error_notice(effects, message).await;
         return CheckinThemeCallbackOutcome::QueueError;
@@ -2558,7 +2501,7 @@ pub async fn handle_checkin_command_update_or_else_at<
     handle_other: HandleFn,
 ) -> Result<CheckinCommandOutcome, CheckinThemeCallbackError>
 where
-    Queue: CheckinControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Store: CheckinGameStore + Sync,
     Effects: CheckinCommandEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
@@ -2603,7 +2546,7 @@ pub async fn handle_checkin_command_message_at<Queue, Store, Effects>(
     created: OffsetDateTime,
 ) -> CheckinCommandOutcome
 where
-    Queue: CheckinControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Store: CheckinGameStore + Sync,
     Effects: CheckinCommandEffects + Sync,
 {
@@ -2644,99 +2587,13 @@ where
     let Some(job) = checkin_control_job_from_message_at(message, "", created) else {
         return CheckinCommandOutcome::MissingMessage;
     };
-    if let Err(error) = queue
-        .assign_checkin_control_job(CONTROL_QUEUE_NAME, job)
-        .await
-    {
+    if let Err(error) = queue.assign_control_job(CONTROL_QUEUE_NAME, job).await {
         tracing::warn!(message = %error, chat_id = reply_to.chat_id, "failed to assign /checkin control job");
         try_send_checkin_command_queue_error(effects, reply_to).await;
         return CheckinCommandOutcome::QueueError;
     }
 
     CheckinCommandOutcome::ControlJobQueued
-}
-
-/// Process one check-in control job, if available.
-pub async fn process_checkin_control_job_once_at<Queue, Effects>(
-    queue: &Queue,
-    effects: &Effects,
-) -> CheckinControlJobWorkerReport
-where
-    Queue: CheckinControlJobWorkerQueue + Sync,
-    Effects: CheckinControlJobEffects + Sync,
-{
-    let mut report = CheckinControlJobWorkerReport::default();
-    let item = match queue.dequeue_checkin_control_job(CONTROL_QUEUE_NAME).await {
-        Ok(item) => item,
-        Err(error) => {
-            report.dequeue_error = Some(error.to_string());
-            return report;
-        }
-    };
-
-    let Some(item) = item else {
-        return report;
-    };
-    report.dequeued = true;
-    report.job_id = Some(item.id);
-
-    let params = match control_job_params_from_stateless_job(&item.job) {
-        Ok(params) => params,
-        Err(error) => {
-            let error = error.to_string();
-            report.decode_error = Some(error.clone());
-            mark_checkin_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    if params.data.kind != ControlKind::Checkin {
-        let error = format!(
-            "unsupported check-in control job kind: {:?}",
-            params.data.kind
-        );
-        report.execution_error = Some(error.clone());
-        mark_checkin_control_job_failed(queue, item.id, &error, &mut report).await;
-        return report;
-    }
-
-    match effects.run_checkin_game(&params).await {
-        Ok(()) => match queue.complete_checkin_control_job(item.id).await {
-            Ok(()) => {
-                report.completed = true;
-                report.execution = Some(CheckinControlJobOutcome::Completed);
-            }
-            Err(error) => report.status_error = Some(error.to_string()),
-        },
-        Err(error) => {
-            let error = error.to_string();
-            report.execution_error = Some(error.clone());
-            mark_checkin_control_job_failed(queue, item.id, &error, &mut report).await;
-        }
-    }
-    report
-}
-
-async fn mark_checkin_control_job_failed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    error: &str,
-    report: &mut CheckinControlJobWorkerReport,
-) where
-    Queue: CheckinControlJobWorkerQueue + Sync,
-{
-    match queue.fail_checkin_control_job(job_id, error).await {
-        Ok(()) => report.failed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
-}
-
-fn is_checkin_control_job(job: &StatelessJobItem) -> bool {
-    job.data.job_type == JobType::Control
-        && matches!(
-            job.data.control_data.as_ref().map(|data| data.kind),
-            Some(ControlKind::Checkin)
-        )
 }
 
 fn checkin_theme_callback_data(
@@ -2905,12 +2762,11 @@ mod tests {
         CallbackQueryEffects, CallbackQueryFuture, CallbackQueryUpdateRoute,
         CallbackRateLimitFuture, CallbackRateLimitPolicy, handle_callback_query_update_or_else,
     };
-    use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
     use crate::updates::{
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
         process_update_with_state_store_at,
     };
-    use openplotva_taskman::{JobPayload, JobType};
+    use openplotva_taskman::{JobPayload, JobType, control_job_params_from_stateless_job};
     use openplotva_telegram::{
         CallbackHandlerKind, DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind,
     };
@@ -2922,6 +2778,65 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[tokio::test]
+    async fn live_checkin_stats_replay_reuses_the_prepared_rich_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let bot_id = OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+        let effects = CheckinCommandDelivery::new(
+            Arc::new(DispatcherQueue::new(Default::default())),
+            Arc::new(crate::rich::RichOutbox::new(
+                openplotva_storage::PostgresTelegramOutboxStore::new(pool.clone()),
+                bot_id,
+            )),
+        );
+        let reply = CheckinGameMessage {
+            chat_id: -10042,
+            message_id: 77,
+            thread_id: Some(9),
+        };
+        effects
+            .send_checkin_today_winner_with_stats(reply, "<h2>Winner</h2><p>Ada</p>".into())
+            .await?;
+        effects
+            .send_checkin_today_winner_with_stats(reply, "changed stats on replay".into())
+            .await?;
+        let rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT state, payload FROM telegram_outbox WHERE bot_id = $1")
+                .bind(bot_id)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "pending");
+        assert_eq!(rows[0].1["chat_id"], -10042);
+        assert_eq!(rows[0].1["options"]["message_thread_id"], 9);
+        assert_eq!(rows[0].1["options"]["reply_to_message_id"], 77);
+        assert!(
+            rows[0].1["html"]
+                .as_str()
+                .expect("rich HTML")
+                .contains("Ada")
+        );
+        assert!(
+            !rows[0].1["html"]
+                .as_str()
+                .expect("rich HTML")
+                .contains("changed stats")
+        );
+        sqlx::query("DELETE FROM telegram_outbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn checkin_theme_callback_acks_and_queues_go_control_job()
@@ -3380,34 +3295,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkin_control_worker_skips_other_jobs_and_runs_checkin_game()
+    async fn postgres_checkin_final_edit_is_durable_and_reuses_its_payload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
-        let effects = CheckinControlEffectsStub::default();
-        let translate_job = checkin_test_control_job(ControlKind::Translate, "translate", "");
-        let checkin_job = checkin_test_control_job(ControlKind::Checkin, "checkin", "classic");
-        queue
-            .assign_checkin_control_job(CONTROL_QUEUE_NAME, translate_job)
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
             .await?;
-        queue
-            .assign_checkin_control_job(CONTROL_QUEUE_NAME, checkin_job.clone())
-            .await?;
-
-        let report = process_checkin_control_job_once_at(&queue, &effects).await;
-
-        assert!(report.dequeued);
-        assert_eq!(report.job_id, Some(2));
-        assert_eq!(report.execution, Some(CheckinControlJobOutcome::Completed));
-        assert!(report.completed);
-        assert!(!report.failed);
-        assert_eq!(effects.runs(), vec![(-10042, 777000, "classic".to_owned())]);
-        let snapshot = queue.snapshot();
-        assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
-        assert_eq!(
-            snapshot[1].status,
-            InMemoryPaymentControlJobStatus::Completed
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let delivery = Arc::new(crate::rich::RichOutbox::new(
+            openplotva_storage::PostgresTelegramOutboxStore::new(pool.clone()),
+            7,
+        ));
+        let sender = TelegramCheckinGameSender::new(
+            openplotva_storage::RedisEphemeralMessageStore::new(redis::Client::open(
+                "redis://127.0.0.1:1/",
+            )?),
+            openplotva_telegram::telegram_client_with_base_url("123:test", "http://127.0.0.1:1")?,
+            openplotva_telegram::RichApiClient::with_base_url("123:test", "http://127.0.0.1:1")?,
+            delivery,
         );
-        assert_eq!(snapshot[1].job, checkin_job);
+        let job_id = OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+        let message = game_message();
+        assert!(sender.queued_checkin(job_id).await?.is_none());
+        let first = sender
+            .finish_checkin_html(job_id, message, Some(9001), "<h2>Winner</h2>".into())
+            .await?;
+        assert!(!first.delivery_complete());
+        let replay = sender
+            .finish_checkin_html(job_id, message, Some(9001), "<h2>Changed</h2>".into())
+            .await?;
+        assert_eq!(first, replay);
+        let saved: (serde_json::Value, String, String, Option<i64>) = sqlx::query_as(
+            "SELECT payload, delivery_policy, ordering_key, dialog_job_id FROM telegram_outbox WHERE batch_id = $1"
+        ).bind(&first.batch_id).fetch_one(&pool).await?;
+        assert_eq!(saved.0["message_id"], 9001);
+        assert_eq!(saved.0["html"], "<h2>Winner</h2>");
+        assert_eq!(saved.1, "target_idempotent");
+        assert_eq!(saved.2, "dialog:7:-10042:77");
+        assert_eq!(saved.3, Some(job_id));
+        sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
+            .bind(&first.batch_id)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
@@ -3432,13 +3364,7 @@ mod tests {
             run_checkin_game_at(&store, &sender, game_request("supergroup", "kotik"), |_| 1)
                 .await?;
 
-        assert_eq!(
-            outcome,
-            CheckinGameRunOutcome::WinnerRecorded {
-                user_id: 102,
-                theme: "kotik".to_owned(),
-            }
-        );
+        assert!(outcome.is_some());
         assert_eq!(store.recorded(), vec![(-10042, 102, "kotik".to_owned())]);
         assert_eq!(store.incremented(), vec![(-10042, 102)]);
         assert_eq!(sender.ephemeral(), Vec::<String>::new());
@@ -3506,7 +3432,7 @@ mod tests {
         let outcome =
             run_checkin_game_at(&store, &sender, game_request("group", ""), |_| 0).await?;
 
-        assert_eq!(outcome, CheckinGameRunOutcome::ExistingWinner);
+        assert!(outcome.is_some());
         assert!(store.recorded().is_empty());
         assert_eq!(sender.edits(), Vec::<String>::new());
         assert_eq!(sender.ephemeral(), Vec::<String>::new());
@@ -3581,7 +3507,7 @@ mod tests {
         let outcome =
             run_checkin_game_at(&store, &sender, game_request("supergroup", ""), |_| 0).await?;
 
-        assert_eq!(outcome, CheckinGameRunOutcome::Disabled);
+        assert!(outcome.is_none());
         assert_eq!(
             sender.ephemeral(),
             vec!["🚫 Игра выключена в настройках".to_owned()]
@@ -3943,30 +3869,6 @@ mod tests {
         })
     }
 
-    fn checkin_test_control_job(kind: ControlKind, title: &str, theme: &str) -> StatelessJobItem {
-        new_control_job_at(
-            ControlJobParams {
-                chat_id: -10042,
-                message_id: 555,
-                user_id: 777000,
-                user_full_name: "Plotva Bot".to_owned(),
-                thread_id: Some(77),
-                data: ControlJobData {
-                    kind,
-                    theme: theme.to_owned(),
-                    chat_type: "supergroup".to_owned(),
-                    user_name: "plotva_bot".to_owned(),
-                    first_name: "Plotva".to_owned(),
-                    last_name: "Bot".to_owned(),
-                    ..ControlJobData::default()
-                },
-            },
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .with_name(title)
-        .with_priority(HIGH_PRIORITY)
-    }
-
     #[derive(Default)]
     struct QueueStub {
         state: Mutex<QueueState>,
@@ -3997,14 +3899,14 @@ mod tests {
         }
     }
 
-    impl CheckinControlJobQueue for QueueStub {
+    impl ControlJobQueue for QueueStub {
         type Error = io::Error;
 
-        fn assign_checkin_control_job<'a>(
+        fn assign_control_job<'a>(
             &'a self,
             queue_name: &'static str,
             job: StatelessJobItem,
-        ) -> CheckinControlJobQueueFuture<'a, Self::Error> {
+        ) -> ControlJobEnqueueFuture<'a, Self::Error> {
             Box::pin(async move {
                 let mut state = self.lock();
                 state.assigned.push((queue_name, job));
@@ -4131,35 +4033,6 @@ mod tests {
                     .lock()
                     .expect("queue errors")
                     .push(reply_to);
-                Ok(())
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct CheckinControlEffectsStub {
-        runs: Mutex<Vec<(i64, i64, String)>>,
-    }
-
-    impl CheckinControlEffectsStub {
-        fn runs(&self) -> Vec<(i64, i64, String)> {
-            self.runs.lock().expect("checkin runs").clone()
-        }
-    }
-
-    impl CheckinControlJobEffects for CheckinControlEffectsStub {
-        type Error = io::Error;
-
-        fn run_checkin_game<'a>(
-            &'a self,
-            params: &'a ControlJobParams,
-        ) -> CheckinControlJobFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.runs.lock().expect("checkin runs").push((
-                    params.chat_id,
-                    params.user_id,
-                    params.data.theme.clone(),
-                ));
                 Ok(())
             })
         }
@@ -4372,6 +4245,38 @@ mod tests {
     impl CheckinGameSender for GameSenderStub {
         type Error = io::Error;
 
+        fn queued_checkin<'a>(
+            &'a self,
+            _job_id: i64,
+        ) -> CheckinGameSendFuture<
+            'a,
+            Option<crate::telegram_outbox::QueuedBatchReceipt>,
+            Self::Error,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn finish_checkin_html<'a>(
+            &'a self,
+            job_id: i64,
+            _reply_to: CheckinGameMessage,
+            target_message_id: Option<i32>,
+            html: String,
+        ) -> CheckinGameSendFuture<'a, crate::telegram_outbox::QueuedBatchReceipt, Self::Error>
+        {
+            Box::pin(async move {
+                if target_message_id.is_some() {
+                    self.edits.lock().expect("edits").push(html);
+                } else {
+                    self.sent_html.lock().expect("sent html").push(html);
+                }
+                Ok(crate::telegram_outbox::QueuedBatchReceipt::durable_outbox(
+                    checkin_delivery_source(job_id),
+                    vec!["checkin-final".into()],
+                    false,
+                ))
+            })
+        }
+
         fn send_checkin_html<'a>(
             &'a self,
             _reply_to: CheckinGameMessage,
@@ -4418,6 +4323,7 @@ mod tests {
 
     fn game_request(chat_type: &str, theme_override: &str) -> CheckinGameRunRequest {
         CheckinGameRunRequest {
+            job_id: 555,
             message: game_message(),
             chat_type: chat_type.to_owned(),
             theme_override: theme_override.to_owned(),

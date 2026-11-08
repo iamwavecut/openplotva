@@ -10,27 +10,20 @@ use carapax::types::{
 use openplotva_core::{ChatSettings, ChatSettingsUpdate, UserState};
 use openplotva_storage::ChatMemberUpsert;
 use openplotva_taskman::{
-    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-    StatelessJobItem, TaskQueueSchedule, control_job_params_from_stateless_job, new_control_job_at,
+    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
+    StatelessJobItem, TaskQueueSchedule, new_control_job_at,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
+    control_jobs::ControlJobQueue,
     permissions::{ChatPermissionContext, ChatPermissionStore},
     updates::UpdateHandler,
 };
 
 /// Boxed future returned by chat-communication effects.
 pub type ChatCommunicationFuture<'a, T, E> =
-    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
-
-/// Boxed future returned by member-state control-job queues.
-pub type MemberStateControlJobQueueFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
-
-/// Boxed future returned by member-state control-job worker queues.
-pub type MemberStateControlJobWorkerFuture<'a, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// Boxed future returned by member-state sync side effects.
@@ -65,116 +58,8 @@ impl StaleInactiveMemberCleanupStore for openplotva_storage::PostgresChatMemberS
     }
 }
 
-pub trait MemberStateControlJobQueue {
-    /// Queue error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn assign_member_state_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> MemberStateControlJobQueueFuture<'a, Self::Error>;
-}
-
-impl<T> MemberStateControlJobQueue for T
-where
-    T: crate::payments::PaymentControlJobQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn assign_member_state_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-        job: StatelessJobItem,
-    ) -> MemberStateControlJobQueueFuture<'a, Self::Error> {
-        let debounce_key = control_job_params_from_stateless_job(&job)
-            .ok()
-            .filter(|params| params.data.kind == ControlKind::ChatMemberSync)
-            .map(|params| format!("chat-member-sync:{}:{}", params.chat_id, params.user_id));
-        self.schedule_payment_control_job(
-            queue_name,
-            job,
-            TaskQueueSchedule {
-                debounce_key,
-                ..TaskQueueSchedule::default()
-            },
-        )
-    }
-}
-
-/// Queue/status boundary for member-state taskman control-job workers.
-pub trait MemberStateControlJobWorkerQueue {
-    /// Queue error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    fn dequeue_member_state_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> MemberStateControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    >;
-
-    /// Mark one member-state control job completed.
-    fn complete_member_state_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> MemberStateControlJobWorkerFuture<'a, (), Self::Error>;
-
-    /// Mark one member-state control job failed.
-    fn fail_member_state_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> MemberStateControlJobWorkerFuture<'a, (), Self::Error>;
-}
-
-impl<T> MemberStateControlJobWorkerQueue for T
-where
-    T: crate::payments::SharedControlJobWorkerQueue + Sync,
-{
-    type Error = T::Error;
-
-    fn dequeue_member_state_control_job<'a>(
-        &'a self,
-        queue_name: &'static str,
-    ) -> MemberStateControlJobWorkerFuture<
-        'a,
-        Option<crate::payments::PaymentControlJobWorkItem>,
-        Self::Error,
-    > {
-        self.dequeue_shared_control_job_matching(
-            queue_name,
-            "member-state-control",
-            is_member_state_control_job,
-        )
-    }
-
-    fn complete_member_state_control_job<'a>(
-        &'a self,
-        job_id: i64,
-    ) -> MemberStateControlJobWorkerFuture<'a, (), Self::Error> {
-        self.complete_shared_control_job(job_id)
-    }
-
-    fn fail_member_state_control_job<'a>(
-        &'a self,
-        job_id: i64,
-        error: &'a str,
-    ) -> MemberStateControlJobWorkerFuture<'a, (), Self::Error> {
-        self.fail_shared_control_job(job_id, error)
-    }
-}
-
 pub trait MemberStateControlJobEffects {
     fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> MemberStateControlJobFuture<'a>;
-
-    fn sync_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStateControlJobFuture<'a>;
 }
 
 pub trait ChatCommunicationEffects {
@@ -194,60 +79,29 @@ pub trait ChatCommunicationEffects {
     ) -> ChatCommunicationFuture<'a, (), Self::Error>;
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MemberStateSyncMemberReport {
-    /// Telegram API returned a member.
-    pub fetched: bool,
-    /// User row persisted successfully.
-    pub user_upserted: bool,
-    /// Chat-member row persisted successfully.
-    pub member_upserted: bool,
-    /// Best-effort user upsert failure.
-    pub user_upsert_error: Option<String>,
-    /// Best-effort chat-member upsert failure.
-    pub member_upsert_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum MemberStateSyncMemberError {
-    /// Telegram `getChatMember` failed before storage writes.
-    #[error("{0}")]
-    Telegram(String),
-}
-
 /// Runtime member-state control-job effects backed by Telegram, Postgres, and optional Redis cache.
 #[derive(Clone, Debug)]
-pub struct MemberStateRuntimeEffects<Store, MemberApi, AdminApi, AdminCache> {
+pub struct MemberStateRuntimeEffects<Store, AdminApi, AdminCache> {
     store: Store,
-    member_api: MemberApi,
     admin_api: AdminApi,
     admin_cache: AdminCache,
 }
 
-impl<Store, MemberApi, AdminApi, AdminCache>
-    MemberStateRuntimeEffects<Store, MemberApi, AdminApi, AdminCache>
-{
+impl<Store, AdminApi, AdminCache> MemberStateRuntimeEffects<Store, AdminApi, AdminCache> {
     #[must_use]
-    pub fn new(
-        store: Store,
-        member_api: MemberApi,
-        admin_api: AdminApi,
-        admin_cache: AdminCache,
-    ) -> Self {
+    pub fn new(store: Store, admin_api: AdminApi, admin_cache: AdminCache) -> Self {
         Self {
             store,
-            member_api,
             admin_api,
             admin_cache,
         }
     }
 }
 
-impl<Store, MemberApi, AdminApi, AdminCache> MemberStateControlJobEffects
-    for MemberStateRuntimeEffects<Store, MemberApi, AdminApi, AdminCache>
+impl<Store, AdminApi, AdminCache> MemberStateControlJobEffects
+    for MemberStateRuntimeEffects<Store, AdminApi, AdminCache>
 where
     Store: crate::settings::GroupSettingsAdminSyncStore + Send + Sync,
-    MemberApi: crate::settings::GroupSettingsMemberApi + Send + Sync,
     AdminApi: crate::settings::GroupSettingsAdminsApi + Send + Sync,
     AdminCache: crate::settings::GroupSettingsAdminCache + Send + Sync,
 {
@@ -269,65 +123,6 @@ where
             }
         })
     }
-
-    fn sync_chat_member<'a>(
-        &'a self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> MemberStateControlJobFuture<'a> {
-        Box::pin(async move {
-            if let Err(error) =
-                sync_chat_member_with_sources(&self.store, &self.member_api, chat_id, user_id).await
-            {
-                tracing::warn!(
-                    %error,
-                    chat_id,
-                    user_id,
-                    "failed to sync chat member for member-state control job"
-                );
-            }
-        })
-    }
-}
-
-pub async fn sync_chat_member_with_sources<Store, Api>(
-    store: &Store,
-    telegram: &Api,
-    chat_id: i64,
-    user_id: i64,
-) -> Result<MemberStateSyncMemberReport, MemberStateSyncMemberError>
-where
-    Store: crate::settings::GroupSettingsAdminSyncStore + Sync,
-    Api: crate::settings::GroupSettingsMemberApi + Sync,
-{
-    let member = telegram
-        .get_chat_member(chat_id, user_id)
-        .await
-        .map_err(|error| MemberStateSyncMemberError::Telegram(error.to_string()))?;
-    let mut report = MemberStateSyncMemberReport {
-        fetched: true,
-        ..MemberStateSyncMemberReport::default()
-    };
-
-    if let Err(error) = store
-        .upsert_user_state(user_state_from_telegram_user(member.get_user()))
-        .await
-    {
-        report.user_upsert_error = Some(error.to_string());
-    } else {
-        report.user_upserted = true;
-    }
-
-    let upsert = chat_member_state_upsert_from_telegram(chat_id, user_id, &member);
-    if let Err(error) =
-        crate::settings::GroupSettingsAdminSyncStore::upsert_chat_member(store, upsert).await
-    {
-        report.member_upsert_error = Some(error.to_string());
-    } else {
-        report.member_upserted = true;
-    }
-
-    Ok(report)
 }
 
 #[derive(Clone, Debug)]
@@ -409,30 +204,7 @@ pub struct ChatMemberStateOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemberStateControlJobExecution {
     ChatAdminsSync,
-    ChatMemberSync,
     SupersededByProjectionMaterializer,
-}
-
-/// Result of one member-state taskman worker tick.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MemberStateControlJobWorkerReport {
-    /// Whether a job was dequeued.
-    pub dequeued: bool,
-    /// Dequeued taskman job ID.
-    pub job_id: Option<i64>,
-    /// Member-state executor result, when payload decoding succeeded.
-    pub execution: Option<MemberStateControlJobExecution>,
-    /// The job was finalized as completed.
-    pub completed: bool,
-    /// The job was finalized as failed.
-    pub failed: bool,
-    /// Queue dequeue failed.
-    pub dequeue_error: Option<String>,
-    pub decode_error: Option<String>,
-    /// Unsupported decoded control kind.
-    pub execution_error: Option<String>,
-    /// Completion/failure status write failed.
-    pub status_error: Option<String>,
 }
 
 /// Result of the stale inactive member cleanup worker.
@@ -543,7 +315,7 @@ where
 
 impl<Queue, Effects, Next> UpdateHandler for ChatMemberStateUpdateHandler<Queue, Effects, Next>
 where
-    Queue: MemberStateControlJobQueue + Send + Sync,
+    Queue: ControlJobQueue + Send + Sync,
     Effects: ChatCommunicationEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -603,7 +375,7 @@ pub async fn handle_chat_member_state_update_or_else_at<
     handle_other: HandleFn,
 ) -> Result<ChatMemberStateUpdateRoute, ChatMemberStateUpdateError>
 where
-    Queue: MemberStateControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Effects: ChatCommunicationEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -630,7 +402,7 @@ async fn chat_member_state_outcome<Queue, Effects>(
     created: OffsetDateTime,
 ) -> Option<ChatMemberStateOutcome>
 where
-    Queue: MemberStateControlJobQueue + Sync,
+    Queue: ControlJobQueue + Sync,
     Effects: ChatCommunicationEffects + Sync,
 {
     let member_update = chat_member_updated(update)?;
@@ -656,7 +428,7 @@ where
     {
         outcome.queued_job = Some(kind);
         if let Err(error) = queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job)
+            .schedule_control_job(CONTROL_QUEUE_NAME, job, TaskQueueSchedule::default())
             .await
         {
             let message = error.to_string();
@@ -756,95 +528,6 @@ where
     }
 
     report
-}
-
-/// Process one member-state control job, if available.
-pub async fn process_member_state_control_job_once_at<Queue, Effects>(
-    queue: &Queue,
-    effects: &Effects,
-) -> MemberStateControlJobWorkerReport
-where
-    Queue: MemberStateControlJobWorkerQueue + Sync,
-    Effects: MemberStateControlJobEffects + Sync,
-{
-    let mut report = MemberStateControlJobWorkerReport::default();
-    let item = match queue
-        .dequeue_member_state_control_job(CONTROL_QUEUE_NAME)
-        .await
-    {
-        Ok(item) => item,
-        Err(error) => {
-            report.dequeue_error = Some(error.to_string());
-            return report;
-        }
-    };
-
-    let Some(item) = item else {
-        return report;
-    };
-    report.dequeued = true;
-    report.job_id = Some(item.id);
-
-    let params = match control_job_params_from_stateless_job(&item.job) {
-        Ok(params) => params,
-        Err(error) => {
-            let error = error.to_string();
-            report.decode_error = Some(error.clone());
-            mark_member_state_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    report.execution = match params.data.kind {
-        ControlKind::ChatAdminsSync => {
-            effects.sync_chat_admins(params.chat_id).await;
-            Some(MemberStateControlJobExecution::ChatAdminsSync)
-        }
-        ControlKind::ChatMemberSync => {
-            tracing::info!(
-                job_id = item.id,
-                chat_id = params.chat_id,
-                user_id = params.user_id,
-                outcome = "superseded_by_projection_materializer",
-                "completed legacy chat-member sync without a Telegram API call"
-            );
-            Some(MemberStateControlJobExecution::SupersededByProjectionMaterializer)
-        }
-        kind => {
-            let error = format!("unsupported member-state control job kind: {kind:?}");
-            report.execution_error = Some(error.clone());
-            mark_member_state_control_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    match queue.complete_member_state_control_job(item.id).await {
-        Ok(()) => report.completed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
-    report
-}
-
-async fn mark_member_state_control_job_failed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    error: &str,
-    report: &mut MemberStateControlJobWorkerReport,
-) where
-    Queue: MemberStateControlJobWorkerQueue + Sync,
-{
-    match queue.fail_member_state_control_job(job_id, error).await {
-        Ok(()) => report.failed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
-}
-
-fn is_member_state_control_job(job: &StatelessJobItem) -> bool {
-    job.data.job_type == JobType::Control
-        && matches!(
-            job.data.control_data.as_ref().map(|data| data.kind),
-            Some(ControlKind::ChatAdminsSync | ControlKind::ChatMemberSync)
-        )
 }
 
 fn chat_member_updated(update: &TelegramUpdate) -> Option<&TelegramChatMemberUpdated> {
@@ -1119,12 +802,12 @@ mod tests {
     use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind,
-        DIALOG_AIFARM_QUEUE_NAME, StatelessJobItem, new_control_job_at,
+        DIALOG_AIFARM_QUEUE_NAME, StatelessJobItem, TaskQueueSchedule, new_control_job_at,
     };
     use serde_json::json;
     use time::OffsetDateTime;
 
-    use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
+    use crate::control_jobs::{ControlJobQueue, InMemoryControlJobQueue};
     use crate::{
         dialog_messages::{
             DialogMessageFuture, DialogMessageSchedule, DialogMessageScheduleReport,
@@ -1144,19 +827,17 @@ mod tests {
     use super::{
         ChatCommunicationEffects, ChatCommunicationFuture, ChatMemberStateUpdateHandler,
         ChatMemberStateUpdateRoute, ChatSettingsCommunicationEffects, LeftChatMemberUpdateHandler,
-        LeftChatMemberUpdateRoute, MemberStateControlJobEffects, MemberStateControlJobExecution,
-        MemberStateControlJobQueue, MemberStateControlJobQueueFuture,
+        LeftChatMemberUpdateRoute, MemberStateControlJobEffects,
         STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL, STALE_INACTIVE_MEMBER_MAX_AGE,
         StaleInactiveMemberCleanupFuture, StaleInactiveMemberCleanupStore,
         handle_chat_member_state_update_or_else_at, handle_left_chat_member_update_or_else,
-        process_member_state_control_job_once_at,
-        run_stale_inactive_member_cleanup_worker_at_until, sync_chat_member_with_sources,
+        run_stale_inactive_member_cleanup_worker_at_until,
     };
 
     #[tokio::test]
     async fn member_state_control_jobs_can_use_shared_persistent_control_queue()
     -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
+        let queue = InMemoryControlJobQueue::new();
         let job = new_control_job_at(
             ControlJobParams {
                 chat_id: -10042,
@@ -1165,7 +846,7 @@ mod tests {
                 user_full_name: "Owner".to_owned(),
                 thread_id: None,
                 data: ControlJobData {
-                    kind: ControlKind::ChatMemberSync,
+                    kind: ControlKind::ChatAdminsSync,
                     ..ControlJobData::default()
                 },
             },
@@ -1173,7 +854,11 @@ mod tests {
         );
 
         queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job.clone())
+            .schedule_control_job(
+                CONTROL_QUEUE_NAME,
+                job.clone(),
+                TaskQueueSchedule::default(),
+            )
             .await?;
 
         let snapshot = queue.snapshot();
@@ -1187,37 +872,8 @@ mod tests {
                 .control_data
                 .as_ref()
                 .map(|data| data.kind),
-            Some(ControlKind::ChatMemberSync)
+            Some(ControlKind::ChatAdminsSync)
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn identical_pending_chat_member_sync_jobs_are_coalesced() -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
-        let job = new_control_job_at(
-            ControlJobParams {
-                chat_id: -10042,
-                message_id: 77,
-                user_id: 42,
-                user_full_name: "Owner".to_owned(),
-                thread_id: None,
-                data: ControlJobData {
-                    kind: ControlKind::ChatMemberSync,
-                    ..ControlJobData::default()
-                },
-            },
-            OffsetDateTime::UNIX_EPOCH,
-        );
-
-        queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job.clone())
-            .await?;
-        queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, job)
-            .await?;
-
-        assert_eq!(queue.snapshot().len(), 1);
         Ok(())
     }
 
@@ -1252,100 +908,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_state_control_worker_skips_other_jobs_and_supersedes_legacy_member_sync()
-    -> Result<(), Box<dyn Error>> {
-        let queue = InMemoryPaymentControlJobQueue::new();
-        let effects = MemberStateSyncEffectsStub::default();
-        let translate_job = member_state_test_control_job(ControlKind::Translate, "translate");
-        let admins_job =
-            member_state_test_control_job(ControlKind::ChatAdminsSync, "chat admins sync");
-        let member_job =
-            member_state_test_control_job(ControlKind::ChatMemberSync, "chat member sync");
-        queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, translate_job)
-            .await?;
-        queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, admins_job.clone())
-            .await?;
-        queue
-            .assign_member_state_control_job(CONTROL_QUEUE_NAME, member_job.clone())
-            .await?;
-
-        let admins_report = process_member_state_control_job_once_at(&queue, &effects).await;
-        let member_report = process_member_state_control_job_once_at(&queue, &effects).await;
-
-        assert_eq!(admins_report.job_id, Some(2));
-        assert!(admins_report.completed);
-        assert_eq!(member_report.job_id, Some(3));
-        assert!(member_report.completed);
-        assert_eq!(
-            member_report.execution,
-            Some(MemberStateControlJobExecution::SupersededByProjectionMaterializer)
-        );
-        assert_eq!(effects.admin_syncs(), vec![-10042]);
-        assert!(effects.member_syncs().is_empty());
-        let snapshot = queue.snapshot();
-        assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
-        assert_eq!(
-            snapshot[1].status,
-            InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(
-            snapshot[2].status,
-            InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(snapshot[1].job, admins_job);
-        assert_eq!(snapshot[2].job, member_job);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sync_chat_member_with_sources_fetches_user_and_member_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let store = MemberStoreStub::default();
-        let api = MemberApiStub::with_member(telegram_admin_member(7)?);
-
-        let report = sync_chat_member_with_sources(&store, &api, -10042, 7).await?;
-
-        assert_eq!(
-            report,
-            super::MemberStateSyncMemberReport {
-                fetched: true,
-                user_upserted: true,
-                member_upserted: true,
-                user_upsert_error: None,
-                member_upsert_error: None,
-            }
-        );
-        assert_eq!(api.calls(), vec![(-10042, 7)]);
-        assert_eq!(
-            store.users(),
-            vec![UserState::new(
-                7,
-                "Tracked".to_owned(),
-                Some("Member".to_owned()),
-                Some("tracked".to_owned()),
-                Some("ru".to_owned()),
-                Some(true),
-            )]
-        );
-        assert_eq!(store.upserted(), vec![admin_member_state_upsert(-10042, 7)]);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn member_state_runtime_effects_runs_admin_sync_through_existing_port()
     -> Result<(), Box<dyn Error>> {
         let store = MemberStoreStub::default();
-        let member_api = MemberApiStub::default();
         let admin_api = AdminApiStub::with_admins(vec![telegram_admin_member(11)?]);
         let cache = AdminCacheStub::default();
-        let effects = super::MemberStateRuntimeEffects::new(
-            store.clone(),
-            member_api,
-            admin_api.clone(),
-            cache.clone(),
-        );
+        let effects =
+            super::MemberStateRuntimeEffects::new(store.clone(), admin_api.clone(), cache.clone());
 
         effects.sync_chat_admins(-10042).await;
 
@@ -2029,48 +1598,6 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct MemberApiStub {
-        member: Arc<Mutex<Option<TelegramChatMember>>>,
-        calls: Arc<Mutex<Vec<(i64, i64)>>>,
-    }
-
-    impl MemberApiStub {
-        fn with_member(member: TelegramChatMember) -> Self {
-            Self {
-                member: Arc::new(Mutex::new(Some(member))),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> Vec<(i64, i64)> {
-            self.calls.lock().expect("member api").clone()
-        }
-    }
-
-    impl crate::settings::GroupSettingsMemberApi for MemberApiStub {
-        type Error = StubError;
-
-        fn get_chat_member<'a>(
-            &'a self,
-            chat_id: i64,
-            user_id: i64,
-        ) -> crate::settings::GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error>
-        {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("member api")
-                    .push((chat_id, user_id));
-                self.member
-                    .lock()
-                    .expect("member api")
-                    .clone()
-                    .ok_or(StubError)
-            })
-        }
-    }
-
-    #[derive(Clone, Default)]
     struct AdminApiStub {
         admins: Arc<Mutex<Vec<TelegramChatMember>>>,
         calls: Arc<Mutex<Vec<i64>>>,
@@ -2147,73 +1674,17 @@ mod tests {
         }
     }
 
-    fn member_state_test_control_job(kind: ControlKind, title: &str) -> StatelessJobItem {
-        new_control_job_at(
-            ControlJobParams {
-                chat_id: -10042,
-                message_id: 0,
-                user_id: 42,
-                user_full_name: "Admin Actor".to_owned(),
-                thread_id: None,
-                data: ControlJobData {
-                    kind,
-                    chat_type: "supergroup".to_owned(),
-                    ..ControlJobData::default()
-                },
-            },
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .with_name(title)
-    }
-
-    impl MemberStateControlJobQueue for MemberStateControlJobQueueStub {
+    impl ControlJobQueue for MemberStateControlJobQueueStub {
         type Error = StubError;
 
-        fn assign_member_state_control_job<'a>(
+        fn assign_control_job<'a>(
             &'a self,
             _queue_name: &'static str,
             job: StatelessJobItem,
-        ) -> MemberStateControlJobQueueFuture<'a, Self::Error> {
+        ) -> crate::control_jobs::ControlJobEnqueueFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.jobs.lock().expect("member queue").push(job);
                 Ok(())
-            })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct MemberStateSyncEffectsStub {
-        admin_syncs: Arc<Mutex<Vec<i64>>>,
-        member_syncs: Arc<Mutex<Vec<(i64, i64)>>>,
-    }
-
-    impl MemberStateSyncEffectsStub {
-        fn admin_syncs(&self) -> Vec<i64> {
-            self.admin_syncs.lock().expect("admin syncs").clone()
-        }
-
-        fn member_syncs(&self) -> Vec<(i64, i64)> {
-            self.member_syncs.lock().expect("member syncs").clone()
-        }
-    }
-
-    impl super::MemberStateControlJobEffects for MemberStateSyncEffectsStub {
-        fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> super::MemberStateControlJobFuture<'a> {
-            Box::pin(async move {
-                self.admin_syncs.lock().expect("admin syncs").push(chat_id);
-            })
-        }
-
-        fn sync_chat_member<'a>(
-            &'a self,
-            chat_id: i64,
-            user_id: i64,
-        ) -> super::MemberStateControlJobFuture<'a> {
-            Box::pin(async move {
-                self.member_syncs
-                    .lock()
-                    .expect("member syncs")
-                    .push((chat_id, user_id));
             })
         }
     }

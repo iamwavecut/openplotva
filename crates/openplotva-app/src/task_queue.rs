@@ -1,4 +1,6 @@
 //! App-owned durable task queue runtime for non-control taskman work.
+use crate::{RuntimeWorkerGroup, RuntimeWorkerPhase, RuntimeWorkerStops, wait_for_runtime_stop};
+use openplotva_server::ReadinessCheck;
 
 use std::{
     collections::BTreeMap,
@@ -889,6 +891,184 @@ where
     }
 
     report
+}
+
+pub(crate) struct SharedTaskQueueMaintenanceConfig {
+    pub(crate) recovery_interval: Duration,
+    pub(crate) cleanup_interval: Duration,
+    pub(crate) completed_retention: time::Duration,
+    pub(crate) placeholder_cleanup_interval: Duration,
+    pub(crate) placeholder_max_age: Duration,
+}
+
+pub(crate) fn build_shared_task_queue_maintenance_group(
+    runtime: &SharedTaskQueueRuntime,
+    purge_store: openplotva_storage::PostgresTaskQueueStore,
+    placeholder_effects: openplotva_telegram::TelegramClient,
+    config: SharedTaskQueueMaintenanceConfig,
+    stops: &RuntimeWorkerStops,
+) -> (RuntimeWorkerGroup, Vec<ReadinessCheck>) {
+    let SharedTaskQueueMaintenanceConfig {
+        recovery_interval,
+        cleanup_interval,
+        completed_retention,
+        placeholder_cleanup_interval,
+        placeholder_max_age,
+    } = config;
+    let mut workers = RuntimeWorkerGroup::new(RuntimeWorkerPhase::Processor);
+    let mut readiness = Vec::with_capacity(6);
+
+    let db_journal = runtime
+        .db_journal()
+        .expect("Postgres taskman runtime should have a DB journal");
+    let db_sync_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-db-sync",
+        tokio::spawn(async move {
+            let report = run_task_queue_db_sync_worker_until(
+                db_journal,
+                wait_for_runtime_stop(db_sync_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman Postgres sync worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_postgres_sync",
+        format!(
+            "Postgres sync after {}s dirty window or {} mutations",
+            TASK_QUEUE_DB_SYNC_INTERVAL.as_secs(),
+            TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD
+        ),
+    ));
+
+    let recovery_runtime = runtime.clone();
+    let recovery_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-recovery",
+        tokio::spawn(async move {
+            let report = run_shared_task_queue_recovery_worker_until(
+                recovery_runtime,
+                recovery_interval,
+                wait_for_runtime_stop(recovery_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman recovery worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_recovery",
+        format!(
+            "stale processing recovery every {}s",
+            recovery_interval.as_secs()
+        ),
+    ));
+
+    let cleanup_runtime = runtime.clone();
+    let cleanup_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-terminal-cleanup",
+        tokio::spawn(async move {
+            let report = run_shared_task_queue_terminal_cleanup_worker_until(
+                cleanup_runtime,
+                cleanup_interval,
+                FINISHED_JOB_MEMORY_RETENTION,
+                wait_for_runtime_stop(cleanup_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman terminal cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_terminal_cleanup",
+        format!(
+            "finished-job eviction from memory every {}s, kept {}m",
+            cleanup_interval.as_secs(),
+            FINISHED_JOB_MEMORY_RETENTION.whole_minutes()
+        ),
+    ));
+
+    let purge_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-postgres-purge",
+        tokio::spawn(async move {
+            let report = run_shared_task_queue_db_purge_worker_until(
+                purge_store,
+                cleanup_interval,
+                completed_retention,
+                wait_for_runtime_stop(purge_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman Postgres purge worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_postgres_purge",
+        format!(
+            "Postgres purge every {}s, finished jobs kept {}d, deleted jobs {}d",
+            cleanup_interval.as_secs(),
+            completed_retention.whole_days() * 2,
+            completed_retention.whole_days()
+        ),
+    ));
+
+    let stuck_runtime = runtime.clone();
+    let stuck_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-stuck-cleanup",
+        tokio::spawn(async move {
+            let report = run_shared_task_queue_stuck_cleanup_worker_until(
+                stuck_runtime,
+                SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL,
+                SHARED_TASK_QUEUE_STUCK_DURATION,
+                wait_for_runtime_stop(stuck_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman stuck-job cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_stuck_cleanup",
+        format!(
+            "stuck-job cleanup every {}s, stuck after {}s",
+            SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL.as_secs(),
+            SHARED_TASK_QUEUE_STUCK_DURATION.as_secs()
+        ),
+    ));
+
+    let placeholder_runtime = runtime.clone();
+    let placeholder_stop = stops.subscribe(RuntimeWorkerPhase::Processor);
+    workers.register(
+        "shared-task-queue-placeholder-cleanup",
+        tokio::spawn(async move {
+            let report = run_shared_task_queue_placeholder_cleanup_worker_until(
+                placeholder_runtime,
+                placeholder_effects,
+                placeholder_cleanup_interval,
+                placeholder_max_age,
+                Duration::from_secs(1),
+                wait_for_runtime_stop(placeholder_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "shared taskman placeholder cleanup worker stopped");
+        }),
+    );
+    readiness.push(ReadinessCheck::ok(
+        "shared_task_queue_placeholder_cleanup",
+        format!(
+            "placeholder cleanup every {}s, max age {}s",
+            placeholder_cleanup_interval.as_secs(),
+            placeholder_max_age.as_secs()
+        ),
+    ));
+
+    (workers, readiness)
 }
 
 #[cfg(test)]

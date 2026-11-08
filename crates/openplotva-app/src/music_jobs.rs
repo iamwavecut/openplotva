@@ -26,10 +26,7 @@ use openplotva_taskman::{
     LLM_JOB_RETRY_STAGE, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, TaskQueueError,
     TaskQueueJobEvent, TaskQueueWorkItem, music_gen_job_params_from_stateless_job,
 };
-use openplotva_telegram::{
-    TelegramOutboundMethod, TelegramOutboundResponse, ensure_telegram_safe_text,
-    escape_telegram_html_text, execute_telegram_method,
-};
+use openplotva_telegram::{ensure_telegram_safe_text, escape_telegram_html_text};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,7 +46,7 @@ pub const MUSIC_JOB_WORKER_QUEUES: [&str; 1] = [MUSIC_VIP_QUEUE_NAME];
 pub const MUSIC_WORKFLOW_KEY: &str = "music";
 /// Key of the song block inside `MusicGenJobParams::meta`.
 pub const SONG_JOB_META_KEY: &str = "song";
-pub const GO_MUSIC_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(360);
+pub const MUSIC_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(360);
 pub const SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 
@@ -209,20 +206,43 @@ pub struct GeneratedSongAudio {
     pub duration_seconds: Option<f64>,
 }
 
-/// One send-song plan.
+/// Material and audio for one variant, before transport preparation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GeneratedSongSendPlan {
-    pub chat_id: i64,
-    pub message_id: i32,
-    pub user_id: i64,
-    pub user_full_name: String,
-    pub thread_id: Option<i32>,
-    pub topic: String,
+    pub song: NewGeneratedSong,
     pub material: SongMaterial,
     pub generated: GeneratedSongAudio,
-    pub is_vip: bool,
-    /// Persisted song row, linked to the delivered message after the send.
-    pub song_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{message}")]
+pub struct MusicJobError {
+    pub message: String,
+    pub retry_reason: Option<FailureReason>,
+}
+
+impl From<String> for MusicJobError {
+    fn from(message: String) -> Self {
+        Self {
+            retry_reason: retryable_reason_from_message(&message),
+            message,
+        }
+    }
+}
+
+impl MusicJobError {
+    fn storage(error: openplotva_storage::StorageError) -> Self {
+        let retry_reason = match &error {
+            openplotva_storage::StorageError::Postgres {
+                source: sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::PoolClosed,
+            } => Some(FailureReason::ProviderUnavailable),
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            retry_reason,
+        }
+    }
 }
 
 /// Errors from generation-side work.
@@ -439,26 +459,26 @@ async fn build_song_prompt_with_attempt_and_prompt_store(
     request: SongPromptRequest,
     prompt_store: &Arc<openplotva_prompts::PromptStore>,
 ) -> Result<SongPromptResult, MusicGenerationError> {
-    if media::routed_attempt_is_genkit(&attempt) {
-        let model = media::genkit_model_for_attempt(&attempt);
-        if let Some(cfg) = media::gateway_structured_json_config_for_attempt(config, &attempt) {
-            let generator =
-                AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
-            return generator.build_song_prompt(request).await;
-        }
-        let Some(gemini) =
-            media::gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
-        else {
-            return Err(MusicGenerationError::Material(format!(
-                "song reprompt provider {} is unavailable",
-                attempt.provider_name
-            )));
-        };
-        let gemini = gemini.with_prompt_store(Arc::clone(prompt_store));
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit) {
+        let (api_key, base_url) =
+            crate::provider_transport::gemini_endpoint_for_attempt(config, &attempt)
+                .map_err(|error| MusicGenerationError::Material(error.to_string()))?;
+        let gemini = openplotva_llm::gemini::GeminiMediaPromptOptimizer::new(
+            openplotva_llm::gemini::GeminiMediaPromptOptimizerConfig {
+                api_key,
+                base_url,
+                model: attempt.model_name.clone(),
+                request_timeout: std::time::Duration::from_secs(
+                    config.llm.dialog.request_timeout_seconds.max(1) as u64,
+                ),
+            },
+        )
+        .with_prompt_store(Arc::clone(prompt_store));
         return gemini.build_song_prompt(request).await;
     }
 
-    let cfg = media::aifarm_structured_json_config_for_attempt(config, &attempt);
+    let cfg = media::aifarm_structured_json_config_for_attempt(config, &attempt)
+        .map_err(|error| MusicGenerationError::Material(error.to_string()))?;
     let generator =
         AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(Arc::clone(prompt_store));
     generator.build_song_prompt(request).await
@@ -669,10 +689,6 @@ fn completion_voice(material: SongMaterial) -> (String, String) {
     }
 }
 
-/// Every song request is answered with this many independent takes of the same
-/// material (the service draws a fresh seed per call), each in its own message.
-pub const SONG_TAKES_PER_REQUEST: usize = 1;
-
 impl MusicGenerator for AceStepMusicGenerator {
     fn generate_song<'a>(&'a self, request: MusicGenerationRequest) -> MusicGenerationFuture<'a> {
         Box::pin(async move {
@@ -780,19 +796,7 @@ async fn generate_song_with_routed_attempt(
     request: MusicGenerationRequest,
     base_config: AceStepConfig,
 ) -> Result<GeneratedSongAudio, MusicGenerationError> {
-    if !attempt.provider_name.eq_ignore_ascii_case("acestep")
-        && !attempt
-            .provider_config
-            .get("provider")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case("acestep"))
-    {
-        return Err(MusicGenerationError::Provider(format!(
-            "unsupported music provider {}",
-            attempt.provider_name
-        )));
-    }
-    let config = acestep_config_for_attempt(base_config, &attempt);
+    let config = acestep_config_for_attempt(base_config, &attempt)?;
     let audio_format = config.audio_format.clone();
     let client = AceStepClient::new(config)?;
     AceStepMusicGenerator::new(client, audio_format)
@@ -800,28 +804,31 @@ async fn generate_song_with_routed_attempt(
         .await
 }
 
-fn acestep_config_for_attempt(mut config: AceStepConfig, attempt: &RoutedAttempt) -> AceStepConfig {
-    if let Some(endpoint) = attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+fn acestep_config_for_attempt(
+    mut config: AceStepConfig,
+    attempt: &RoutedAttempt,
+) -> Result<AceStepConfig, MusicGenerationError> {
+    if attempt.protocol != Some(openplotva_llm::provider_schema::Protocol::AceStep) {
+        return Err(MusicGenerationError::Provider(format!(
+            "unsupported music protocol for provider {}",
+            attempt.provider_name
+        )));
+    }
+    if let Some(endpoint) = attempt.endpoint() {
         config.base_url = endpoint.to_owned();
     }
     if !attempt.model_name.trim().is_empty() {
         config.model = attempt.model_name.clone();
     }
     if let Some(mode) = attempt
-        .provider_config
+        .model_config
         .get("api_mode")
-        .or_else(|| attempt.model_config.get("api_mode"))
+        .or_else(|| attempt.provider_config.get("api_mode"))
         .and_then(serde_json::Value::as_str)
     {
         config.api_mode = AceStepApiMode::from_go(mode);
     }
-    config.with_defaults()
+    Ok(config.with_defaults())
 }
 
 fn music_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
@@ -844,20 +851,6 @@ pub trait MusicJobEffects {
         Box::pin(async {})
     }
 
-    /// Best-effort: remove the lifecycle reaction from the trigger message.
-    /// Called only on the success path so a late clear can never erase the
-    /// obligations watcher's failure signal.
-    fn clear_song_signal<'a>(
-        &'a self,
-        _chat_id: i64,
-        _trigger_message_id: i32,
-    ) -> MusicJobEffectFuture<'a, ()>
-    where
-        Self: Sync,
-    {
-        Box::pin(async {})
-    }
-
     /// Return whether audio may be sent to this chat.
     fn can_send_audio<'a>(&'a self, chat_id: i64) -> MusicJobEffectFuture<'a, bool>;
 
@@ -867,45 +860,33 @@ pub trait MusicJobEffects {
         params: &'a MusicGenJobParams,
     ) -> MusicJobEffectFuture<'a, Option<MusicReferenceAudio>>;
 
-    /// Persist the material of a generated song before it is sent; the returned
-    /// row id is linked to the delivered message afterwards.
-    fn persist_generated_song<'a>(
+    fn queued_song_job<'a>(
         &'a self,
-        _song: NewGeneratedSong,
-    ) -> MusicJobEffectFuture<'a, Option<i64>>
-    where
-        Self: Sync,
-    {
-        Box::pin(async { None })
-    }
+        job_id: i64,
+    ) -> MusicJobEffectFuture<
+        'a,
+        Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, MusicJobError>,
+    >;
 
-    /// Link the delivered message to the persisted song.
-    fn mark_generated_song_sent<'a>(
+    fn prepared_song<'a>(
         &'a self,
-        _song_id: i64,
-        _message_id: i32,
-    ) -> MusicJobEffectFuture<'a, ()>
-    where
-        Self: Sync,
-    {
-        Box::pin(async {})
-    }
+        job_id: i64,
+    ) -> MusicJobEffectFuture<'a, Result<Option<openplotva_telegram::SendRichMessage>, MusicJobError>>;
 
-    /// Send the generated song as one rich message (audio + styles + lyrics + author).
-    fn send_generated_song<'a>(
+    fn prepare_song<'a>(
         &'a self,
         plan: GeneratedSongSendPlan,
-    ) -> MusicJobEffectFuture<'a, Result<Option<i32>, String>>;
+    ) -> MusicJobEffectFuture<'a, Result<openplotva_telegram::SendRichMessage, MusicJobError>>;
+
+    fn enqueue_song<'a>(
+        &'a self,
+        job_id: i64,
+        song: openplotva_telegram::SendRichMessage,
+    ) -> MusicJobEffectFuture<'a, Result<crate::telegram_outbox::QueuedBatchReceipt, MusicJobError>>;
 }
 
 /// Telegram download boundary for reference audio.
 pub trait MusicTelegramSender {
-    /// Execute a Telegram method.
-    fn send_music_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> MusicJobEffectFuture<'a, Result<TelegramOutboundResponse, String>>;
-
     /// Download Telegram file bytes by `file_id`.
     fn download_music_file<'a>(
         &'a self,
@@ -914,17 +895,6 @@ pub trait MusicTelegramSender {
 }
 
 impl MusicTelegramSender for openplotva_telegram::TelegramClient {
-    fn send_music_method<'a>(
-        &'a self,
-        method: TelegramOutboundMethod,
-    ) -> MusicJobEffectFuture<'a, Result<TelegramOutboundResponse, String>> {
-        Box::pin(async move {
-            execute_telegram_method(self, method)
-                .await
-                .map_err(|error| error.to_string())
-        })
-    }
-
     fn download_music_file<'a>(
         &'a self,
         file_id: &'a str,
@@ -983,9 +953,10 @@ pub struct TelegramMusicJobEffects<Permissions, Files, Sender> {
     permissions: Arc<Permissions>,
     files: Files,
     telegram: Sender,
-    rich: Arc<dyn crate::rich::RichSender>,
+    uploader: openplotva_media::uploader::UploaderClient,
+    delivery: Arc<crate::rich::RichOutbox>,
     reactions: Option<crate::reactions::GenerationReactions>,
-    songs: Option<Arc<PostgresGeneratedSongStore>>,
+    songs: PostgresGeneratedSongStore,
 }
 
 impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sender> {
@@ -995,15 +966,18 @@ impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sen
         permissions: Arc<Permissions>,
         files: Files,
         telegram: Sender,
-        rich: Arc<dyn crate::rich::RichSender>,
+        uploader: openplotva_media::uploader::UploaderClient,
+        delivery: Arc<crate::rich::RichOutbox>,
+        songs: PostgresGeneratedSongStore,
     ) -> Self {
         Self {
             permissions,
             files,
             telegram,
-            rich,
+            uploader,
+            delivery,
             reactions: None,
-            songs: None,
+            songs,
         }
     }
 
@@ -1011,13 +985,6 @@ impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sen
     #[must_use]
     pub fn with_reaction_ux(mut self, reactions: crate::reactions::GenerationReactions) -> Self {
         self.reactions = Some(reactions);
-        self
-    }
-
-    /// Persist generated songs (material, seed, duration) for tracing.
-    #[must_use]
-    pub fn with_song_store(mut self, songs: Arc<PostgresGeneratedSongStore>) -> Self {
-        self.songs = Some(songs);
         self
     }
 }
@@ -1038,23 +1005,6 @@ where
             if let Some(reactions) = self.reactions.as_deref() {
                 reactions
                     .set_progress(crate::reactions::GenerationReactionTarget {
-                        chat_id,
-                        message_id: trigger_message_id,
-                    })
-                    .await;
-            }
-        })
-    }
-
-    fn clear_song_signal<'a>(
-        &'a self,
-        chat_id: i64,
-        trigger_message_id: i32,
-    ) -> MusicJobEffectFuture<'a, ()> {
-        Box::pin(async move {
-            if let Some(reactions) = self.reactions.as_deref() {
-                reactions
-                    .clear(crate::reactions::GenerationReactionTarget {
                         chat_id,
                         message_id: trigger_message_id,
                     })
@@ -1102,52 +1052,58 @@ where
         })
     }
 
-    fn persist_generated_song<'a>(
+    fn queued_song_job<'a>(
         &'a self,
-        song: NewGeneratedSong,
-    ) -> MusicJobEffectFuture<'a, Option<i64>> {
+        job_id: i64,
+    ) -> MusicJobEffectFuture<
+        'a,
+        Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, MusicJobError>,
+    > {
         Box::pin(async move {
-            let songs = self.songs.as_ref()?;
-            match songs.insert(&song).await {
-                Ok(id) => Some(id),
-                Err(error) => {
-                    tracing::warn!(%error, chat_id = song.chat_id, "failed to persist generated song");
-                    None
-                }
-            }
+            self.delivery
+                .queued(&music_delivery_source(job_id), Some(job_id))
+                .await
+                .map_err(MusicJobError::storage)
         })
     }
 
-    fn mark_generated_song_sent<'a>(
+    fn prepared_song<'a>(
         &'a self,
-        song_id: i64,
-        message_id: i32,
-    ) -> MusicJobEffectFuture<'a, ()> {
+        job_id: i64,
+    ) -> MusicJobEffectFuture<'a, Result<Option<openplotva_telegram::SendRichMessage>, MusicJobError>>
+    {
         Box::pin(async move {
-            if let Some(songs) = self.songs.as_ref()
-                && let Err(error) = songs.set_result_message(song_id, message_id).await
-            {
-                tracing::warn!(%error, song_id, "failed to link generated song to its message");
-            }
+            self.songs
+                .prepared_for_job(job_id)
+                .await
+                .map_err(MusicJobError::storage)?
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| MusicJobError::from(error.to_string()))
+                })
+                .transpose()
         })
     }
 
-    fn send_generated_song<'a>(
+    fn prepare_song<'a>(
         &'a self,
         plan: GeneratedSongSendPlan,
-    ) -> MusicJobEffectFuture<'a, Result<Option<i32>, String>> {
+    ) -> MusicJobEffectFuture<'a, Result<openplotva_telegram::SendRichMessage, MusicJobError>> {
         Box::pin(async move {
             let extension = song_file_extension(&plan.generated.file_name);
-            let title = song_file_title(&plan.material.title, &plan.topic);
-            let pretty_name = build_song_file_name(&plan.user_full_name, &title, &extension);
-            let mime = song_audio_mime(&extension);
+            let title = song_file_title(&plan.material.title, &plan.song.topic);
+            let pretty_name = build_song_file_name(&plan.song.user_full_name, &title, &extension);
             let audio_url = self
-                .rich
-                .upload_bytes(plan.generated.data.clone(), mime, Some(&pretty_name))
+                .uploader
+                .upload_bytes(
+                    plan.generated.data,
+                    song_audio_mime(&extension),
+                    Some(&pretty_name),
+                )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| MusicJobError::from(error.to_string()))?;
             let footer_html =
-                build_song_footer_html(&plan.user_full_name, plan.is_vip, random_support_phrase());
+                build_song_footer_html(&plan.song.user_full_name, true, random_support_phrase());
             let html = crate::rich::compose_song_message(&crate::rich::SongMessage {
                 title: &title,
                 styles: &plan.material.raw_style,
@@ -1155,28 +1111,53 @@ where
                 lyrics: &plan.material.lyrics,
                 footer_html: &footer_html,
             });
-            let options = openplotva_telegram::RichSendOptions {
-                direct_messages_topic_id: None,
-                message_thread_id: plan.thread_id.map(i64::from),
-                reply_to_message_id: Some(i64::from(plan.message_id)),
-                allow_sending_without_reply: true,
-                disable_notification: false,
-                reply_markup: None,
+            let prepared = openplotva_telegram::SendRichMessage {
+                chat_id: plan.song.chat_id,
+                html,
+                options: openplotva_telegram::RichSendOptions {
+                    message_thread_id: plan.song.thread_id.map(i64::from),
+                    reply_to_message_id: Some(i64::from(plan.song.trigger_message_id)),
+                    allow_sending_without_reply: true,
+                    ..Default::default()
+                },
             };
-            let message_id = self
-                .rich
-                .send_rich(plan.chat_id, &html, &options)
+            let value = serde_json::to_value(&prepared)
+                .map_err(|error| MusicJobError::from(error.to_string()))?;
+            let saved = self
+                .songs
+                .save_prepared(&plan.song, &value)
                 .await
-                .map_err(|error| error.to_string())?;
-            Ok(Some(message_id as i32))
+                .map_err(MusicJobError::storage)?;
+            serde_json::from_value(saved).map_err(|error| MusicJobError::from(error.to_string()))
+        })
+    }
+
+    fn enqueue_song<'a>(
+        &'a self,
+        job_id: i64,
+        song: openplotva_telegram::SendRichMessage,
+    ) -> MusicJobEffectFuture<'a, Result<crate::telegram_outbox::QueuedBatchReceipt, MusicJobError>>
+    {
+        Box::pin(async move {
+            self.delivery
+                .enqueue(
+                    &music_delivery_source(job_id),
+                    song.options.message_thread_id,
+                    song,
+                    Some(job_id),
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::rich::RichOutboxError::Storage(error) => MusicJobError::storage(error),
+                    error => MusicJobError::from(error.to_string()),
+                })
         })
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MusicJobExecutionOutcome {
-    /// Job completed.
-    Completed,
+    Queued(crate::telegram_outbox::QueuedBatchReceipt),
     SkippedPermission,
     /// Job failed.
     Failed,
@@ -1187,14 +1168,14 @@ pub enum MusicJobExecutionOutcome {
 pub struct MusicJobExecutionReport {
     pub outcome: MusicJobExecutionOutcome,
     pub topic: String,
-    pub error: Option<String>,
-    pub result_message_id: Option<i32>,
+    pub error: Option<MusicJobError>,
 }
 
 /// Result from one queue poll.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MusicQueuePollOutcome {
     Idle,
+    WaitingDelivery,
     Completed,
     SkippedPermission,
     RetryRequeued,
@@ -1219,6 +1200,7 @@ pub struct MusicWorkerRunReport {
     pub ticks: u64,
     pub dequeued: u64,
     pub completed: u64,
+    pub waiting_delivery: u64,
     pub skipped_permission: u64,
     pub retry_requeued: u64,
     pub retry_exhausted: u64,
@@ -1275,6 +1257,7 @@ impl MusicWorkerRunReport {
         }
         match report.outcome {
             MusicQueuePollOutcome::Idle => self.idle += 1,
+            MusicQueuePollOutcome::WaitingDelivery => self.waiting_delivery += 1,
             MusicQueuePollOutcome::Completed => self.completed += 1,
             MusicQueuePollOutcome::SkippedPermission => self.skipped_permission += 1,
             MusicQueuePollOutcome::RetryRequeued => self.retry_requeued += 1,
@@ -1296,138 +1279,73 @@ pub async fn execute_music_gen_job<MaterialProvider, Generator, Effects>(
     generator: &Generator,
     effects: &Effects,
     params: MusicGenJobParams,
-    job_id: Option<i64>,
+    job_id: i64,
 ) -> MusicJobExecutionReport
 where
     MaterialProvider: SongMaterialProvider + Sync,
     Generator: MusicGenerator + Sync,
     Effects: MusicJobEffects + Sync,
 {
-    if !effects.can_send_audio(params.chat_id).await {
-        return MusicJobExecutionReport {
-            outcome: MusicJobExecutionOutcome::SkippedPermission,
-            topic: String::new(),
-            error: None,
-            result_message_id: None,
-        };
-    }
     let topic = music_job_topic(&params);
-    if topic.is_empty() {
-        return MusicJobExecutionReport {
+    let run = async {
+        if let Some(receipt) = effects.queued_song_job(job_id).await? {
+            return Ok(MusicJobExecutionOutcome::Queued(receipt));
+        }
+        if !effects.can_send_audio(params.chat_id).await {
+            return Ok(MusicJobExecutionOutcome::SkippedPermission);
+        }
+        if topic.is_empty() {
+            return Err(MusicJobError::from("music topic is empty".to_owned()));
+        }
+        let prepared = match effects.prepared_song(job_id).await? {
+            Some(prepared) => prepared,
+            None => {
+                effects
+                    .signal_song_progress(params.chat_id, params.message_id)
+                    .await;
+                let material = material_provider
+                    .build_song_material(&params, &topic)
+                    .await
+                    .map_err(|error| MusicJobError::from(error.message()))?;
+                let reference_audio = effects.reference_audio(&params).await;
+                let generated = generator
+                    .generate_song(MusicGenerationRequest {
+                        topic: topic.clone(),
+                        material: material.clone(),
+                        reference_audio,
+                    })
+                    .await
+                    .map_err(|error| MusicJobError::from(error.message()))?;
+                let song = new_generated_song(&params, Some(job_id), &topic, &material, &generated);
+                effects
+                    .prepare_song(GeneratedSongSendPlan {
+                        song,
+                        material,
+                        generated,
+                    })
+                    .await?
+            }
+        };
+        let receipt = effects.enqueue_song(job_id, prepared).await?;
+        Ok(MusicJobExecutionOutcome::Queued(receipt))
+    }
+    .await;
+    match run {
+        Ok(outcome) => MusicJobExecutionReport {
+            outcome,
+            topic,
+            error: None,
+        },
+        Err(error) => MusicJobExecutionReport {
             outcome: MusicJobExecutionOutcome::Failed,
             topic,
-            error: Some("music topic is empty".to_owned()),
-            result_message_id: None,
-        };
-    }
-    effects
-        .signal_song_progress(params.chat_id, params.message_id)
-        .await;
-    let material = match material_provider.build_song_material(&params, &topic).await {
-        Ok(material) => material,
-        Err(error) => {
-            return MusicJobExecutionReport {
-                outcome: MusicJobExecutionOutcome::Failed,
-                topic,
-                error: Some(error.message()),
-                result_message_id: None,
-            };
-        }
-    };
-    let reference_audio = effects.reference_audio(&params).await;
-    let mut first_message_id = None;
-    for take in 1..=SONG_TAKES_PER_REQUEST {
-        let generated = match generator
-            .generate_song(MusicGenerationRequest {
-                topic: topic.clone(),
-                material: material.clone(),
-                reference_audio: reference_audio.clone(),
-            })
-            .await
-        {
-            Ok(generated) => generated,
-            Err(error) if take == 1 => {
-                return MusicJobExecutionReport {
-                    outcome: MusicJobExecutionOutcome::Failed,
-                    topic,
-                    error: Some(error.message()),
-                    result_message_id: None,
-                };
-            }
-            Err(error) => {
-                tracing::warn!(error = %error.message(), take, "extra song take failed");
-                break;
-            }
-        };
-        let take_material = song_take_material(&material, &topic, take);
-        let song_id = effects
-            .persist_generated_song(new_generated_song(
-                &params,
-                job_id,
-                &topic,
-                &take_material,
-                &generated,
-            ))
-            .await;
-        match effects
-            .send_generated_song(GeneratedSongSendPlan {
-                chat_id: params.chat_id,
-                message_id: params.message_id,
-                user_id: params.user_id,
-                user_full_name: params.user_full_name.clone(),
-                thread_id: params.thread_id,
-                topic: topic.clone(),
-                material: take_material,
-                generated,
-                is_vip: true,
-                song_id,
-            })
-            .await
-        {
-            Ok(Some(audio_message_id)) => {
-                if let Some(song_id) = song_id {
-                    effects
-                        .mark_generated_song_sent(song_id, audio_message_id)
-                        .await;
-                }
-                first_message_id = first_message_id.or(Some(audio_message_id));
-            }
-            Ok(None) => {}
-            Err(error) if take == 1 => {
-                return MusicJobExecutionReport {
-                    outcome: MusicJobExecutionOutcome::Failed,
-                    topic,
-                    error: Some(error),
-                    result_message_id: None,
-                };
-            }
-            Err(error) => {
-                tracing::warn!(%error, take, "extra song take was not delivered");
-                break;
-            }
-        }
-    }
-    effects
-        .clear_song_signal(params.chat_id, params.message_id)
-        .await;
-    MusicJobExecutionReport {
-        outcome: MusicJobExecutionOutcome::Completed,
-        topic,
-        error: None,
-        result_message_id: first_message_id,
+            error: Some(error),
+        },
     }
 }
 
-/// Later takes carry their number in the title so the two messages and files
-/// are told apart.
-fn song_take_material(material: &SongMaterial, topic: &str, take: usize) -> SongMaterial {
-    if take <= 1 {
-        return material.clone();
-    }
-    SongMaterial {
-        title: format!("{} ({take})", song_file_title(&material.title, topic)),
-        ..material.clone()
-    }
+pub(crate) fn music_delivery_source(job_id: i64) -> String {
+    format!("music-job:{job_id}:take:1")
 }
 
 /// Dequeue and process one music-generation job from a queue.
@@ -1505,23 +1423,32 @@ where
         )
     });
     let execution =
-        execute_music_gen_job(material_provider, generator, effects, params, Some(work.id)).await;
+        execute_music_gen_job(material_provider, generator, effects, params, work.id).await;
     let activity = activity_guard
         .as_ref()
         .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
     drop(activity_guard);
     let finished_at = OffsetDateTime::now_utc();
     match execution.outcome {
-        MusicJobExecutionOutcome::Completed => {
-            let _ = queue.update_job_result_message(work.id, execution.result_message_id);
-            finalize_music_completed(
-                queue,
+        MusicJobExecutionOutcome::Queued(receipt) => {
+            let _ = queue.upsert_job_event(
                 work.id,
-                queue_name,
-                MusicQueuePollOutcome::Completed,
-                activity,
+                TaskQueueJobEvent {
+                    stage: "music_delivery_queued".into(),
+                    message: "music committed to Telegram outbox".into(),
+                    data: BTreeMap::from([("batch_id".into(), receipt.batch_id)]),
+                    ..Default::default()
+                },
                 finished_at,
-            )
+            );
+            let _ = queue.wait_for_delivery(work.id);
+            MusicQueuePollReport {
+                queue_name: queue_name.to_owned(),
+                job_id: Some(work.id),
+                outcome: MusicQueuePollOutcome::WaitingDelivery,
+                error: None,
+                activity,
+            }
         }
         MusicJobExecutionOutcome::SkippedPermission => finalize_music_completed(
             queue,
@@ -1532,20 +1459,21 @@ where
             finished_at,
         ),
         MusicJobExecutionOutcome::Failed => {
-            let error = execution
+            let failure = execution
                 .error
-                .unwrap_or_else(|| "music generation failed".to_owned());
+                .unwrap_or_else(|| MusicJobError::from("music generation failed".to_owned()));
             if let Some(report) = retry_or_exhaust_music_job(
                 queue,
                 &work,
                 queue_name,
-                &error,
+                &failure,
                 options.max_llm_job_attempts,
                 activity.clone(),
                 finished_at,
             ) {
                 return report;
             }
+            let error = failure.message;
             let _ = queue.fail(work.id, error.clone(), finished_at);
             MusicQueuePollReport {
                 queue_name: queue_name.to_owned(),
@@ -1562,12 +1490,13 @@ fn retry_or_exhaust_music_job(
     queue: &InMemoryTaskQueue,
     work: &TaskQueueWorkItem,
     queue_name: &str,
-    error: &str,
+    failure: &MusicJobError,
     max_llm_job_attempts: i32,
     activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> Option<MusicQueuePollReport> {
-    let reason = openplotva_llm::retry::retryable_reason_from_message(error)?;
+    let reason = failure.retry_reason?;
+    let error = failure.message.as_str();
     let attempt = next_music_llm_job_attempt(&work.events);
     let max_attempts = max_llm_job_attempts.max(1);
     let target_queue = retryable_music_job_target_queue(queue_name);
@@ -2081,6 +2010,7 @@ fn song_prompt_error_leaf(error: &MusicGenerationError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::{
         collections::VecDeque,
         error::Error,
@@ -2359,7 +2289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn music_executor_persists_the_song_and_links_the_message() {
+    async fn music_executor_persists_the_song_and_queues_delivery() {
         let material_provider = HeuristicSongMaterialProvider;
         let generator = GeneratorStub::new(Ok(GeneratedSongAudio {
             data: b"MP3".to_vec(),
@@ -2367,7 +2297,7 @@ mod tests {
             seed: Some(4242),
             duration_seconds: Some(180.5),
         }));
-        let effects = EffectsStub::allowed().with_song_ids(vec![Some(7)]);
+        let effects = EffectsStub::allowed();
         let mut meta = json!({});
         super::SongJobMeta {
             request_text: "!song ночной город".to_owned(),
@@ -2388,11 +2318,14 @@ mod tests {
                 meta,
                 ..MusicGenJobParams::default()
             },
-            Some(555),
+            555,
         )
         .await;
 
-        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
+        assert!(matches!(
+            report.outcome,
+            MusicJobExecutionOutcome::Queued(_)
+        ));
         let persisted = effects.persisted();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].job_id, Some(555));
@@ -2405,9 +2338,61 @@ mod tests {
         assert_eq!(persisted[0].audio_seconds, Some(180.5));
         assert!(!persisted[0].lyrics.is_empty());
         assert_eq!(persisted[0].tags, persisted[0].style_summary);
-        let sent = effects.sent();
-        assert_eq!(sent[0].song_id, Some(7));
-        assert_eq!(effects.marked(), vec![(7, 100)]);
+        let sent = effects.preparations();
+        assert_eq!(sent[0].song.job_id, Some(555));
+        assert!(lock(&effects.queued).contains_key(&555));
+    }
+
+    #[tokio::test]
+    async fn music_replay_reuses_prepared_media_after_enqueue_failure() {
+        let generator = GeneratorStub::new(Ok(GeneratedSongAudio {
+            data: b"MP3".to_vec(),
+            file_name: "song.mp3".into(),
+            ..Default::default()
+        }));
+        let effects = EffectsStub::allowed();
+        effects
+            .fail_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let params = MusicGenJobParams {
+            topic: "rain".into(),
+            chat_id: 42,
+            ..Default::default()
+        };
+        let first = execute_music_gen_job(
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            params.clone(),
+            555,
+        )
+        .await;
+        assert!(matches!(first.outcome, MusicJobExecutionOutcome::Failed));
+        assert!(first.error.expect("enqueue failure").retry_reason.is_some());
+        let replay = execute_music_gen_job(
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            params.clone(),
+            555,
+        )
+        .await;
+        assert!(matches!(
+            replay.outcome,
+            MusicJobExecutionOutcome::Queued(_)
+        ));
+        let repeated = execute_music_gen_job(
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            params,
+            555,
+        )
+        .await;
+        assert_eq!(replay.outcome, repeated.outcome);
+        assert_eq!(generator.requests().len(), 1);
+        assert_eq!(effects.preparations().len(), 1);
+        assert_eq!(effects.persisted().len(), 1);
     }
 
     #[tokio::test]
@@ -2491,15 +2476,18 @@ mod tests {
                 thread_id: Some(77),
                 ..MusicGenJobParams::default()
             },
-            None,
+            555,
         )
         .await;
 
-        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
-        let sent = effects.sent();
+        assert!(matches!(
+            report.outcome,
+            MusicJobExecutionOutcome::Queued(_)
+        ));
+        let sent = effects.preparations();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, 42);
-        assert_eq!(sent[0].thread_id, Some(77));
+        assert_eq!(sent[0].song.chat_id, 42);
+        assert_eq!(sent[0].song.thread_id, Some(77));
         assert_eq!(generator.requests().len(), 1);
         assert_eq!(generator.requests()[0].topic, "ночной город");
         assert_eq!(
@@ -2535,7 +2523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn music_lifecycle_reactions_mark_progress_and_clear_on_success() {
+    async fn music_lifecycle_reaction_stays_until_delivery_receipt() {
         let material_provider = HeuristicSongMaterialProvider;
         let generator = GeneratorStub::new(Ok(GeneratedSongAudio {
             data: b"MP3".to_vec(),
@@ -2555,15 +2543,15 @@ mod tests {
                 topic: "ночной город".to_owned(),
                 ..MusicGenJobParams::default()
             },
-            None,
+            555,
         )
         .await;
 
-        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
-        assert_eq!(
-            effects.reactions(),
-            vec![("progress", 42, 9), ("clear", 42, 9)]
-        );
+        assert!(matches!(
+            report.outcome,
+            MusicJobExecutionOutcome::Queued(_)
+        ));
+        assert_eq!(effects.reactions(), vec![("progress", 42, 9)]);
     }
 
     #[tokio::test]
@@ -2585,7 +2573,7 @@ mod tests {
                 topic: "ночной город".to_owned(),
                 ..MusicGenJobParams::default()
             },
-            None,
+            555,
         )
         .await;
 
@@ -2633,8 +2621,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn music_queue_once_records_result_message_id_when_completed()
-    -> Result<(), Box<dyn Error>> {
+    async fn music_queue_once_waits_without_a_fake_result_message_id() -> Result<(), Box<dyn Error>>
+    {
         let queue = openplotva_taskman::InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
         let job_id = queue.assign(
@@ -2669,16 +2657,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(report.outcome, MusicQueuePollOutcome::Completed);
+        assert_eq!(report.outcome, MusicQueuePollOutcome::WaitingDelivery);
         let record = queue.record(job_id).expect("music job");
-        assert_eq!(record.status, JobStatus::Completed);
-        assert_eq!(record.result_message_id, Some(100));
+        assert_eq!(record.status, JobStatus::WaitingDelivery);
+        assert_eq!(record.result_message_id, None);
         assert_eq!(record.started_at, Some(now));
         assert_eq!(record.execution_started_at, Some(now));
-        assert!(
-            record.completed_at > Some(now),
-            "completed_at should reflect the end of generation, not the dequeue time"
-        );
+        assert_eq!(record.completed_at, None);
         Ok(())
     }
 
@@ -2751,7 +2736,7 @@ mod tests {
         let report = poll.await;
 
         assert_eq!(report.job_id, Some(job_id));
-        assert_eq!(report.outcome, MusicQueuePollOutcome::Completed);
+        assert_eq!(report.outcome, MusicQueuePollOutcome::WaitingDelivery);
         assert!(
             report.activity.sent >= 1,
             "active music generation must report a file-upload pulse"
@@ -2766,7 +2751,7 @@ mod tests {
         );
         assert_eq!(
             queue.records()[0].status,
-            openplotva_taskman::JobStatus::Completed
+            openplotva_taskman::JobStatus::WaitingDelivery
         );
         assert_eq!(generator.requests().len(), 1);
         Ok(())
@@ -3028,38 +3013,31 @@ mod tests {
     #[derive(Clone, Debug)]
     struct EffectsStub {
         can_send: bool,
-        sent: Arc<Mutex<Vec<GeneratedSongSendPlan>>>,
+        preparation_calls: Arc<Mutex<Vec<GeneratedSongSendPlan>>>,
+        prepared: Arc<Mutex<BTreeMap<i64, openplotva_telegram::SendRichMessage>>>,
+        queued: Arc<Mutex<BTreeMap<i64, crate::telegram_outbox::QueuedBatchReceipt>>>,
+        fail_enqueue: Arc<std::sync::atomic::AtomicBool>,
         refs: Arc<Mutex<VecDeque<Option<MusicReferenceAudio>>>>,
         reactions: RecordedReactions,
-        song_ids: Arc<Mutex<VecDeque<Option<i64>>>>,
         persisted: Arc<Mutex<Vec<openplotva_storage::NewGeneratedSong>>>,
-        marked: Arc<Mutex<Vec<(i64, i32)>>>,
     }
 
     impl EffectsStub {
         fn allowed() -> Self {
             Self {
                 can_send: true,
-                sent: Arc::new(Mutex::new(Vec::new())),
+                preparation_calls: Default::default(),
+                prepared: Default::default(),
+                queued: Default::default(),
+                fail_enqueue: Default::default(),
                 refs: Arc::new(Mutex::new(VecDeque::new())),
                 reactions: Arc::new(Mutex::new(Vec::new())),
-                song_ids: Arc::new(Mutex::new(VecDeque::new())),
                 persisted: Arc::new(Mutex::new(Vec::new())),
-                marked: Arc::new(Mutex::new(Vec::new())),
             }
-        }
-
-        fn with_song_ids(self, song_ids: Vec<Option<i64>>) -> Self {
-            *lock(&self.song_ids) = song_ids.into();
-            self
         }
 
         fn persisted(&self) -> Vec<openplotva_storage::NewGeneratedSong> {
             lock(&self.persisted).clone()
-        }
-
-        fn marked(&self) -> Vec<(i64, i32)> {
-            lock(&self.marked).clone()
         }
 
         fn denied() -> Self {
@@ -3069,8 +3047,8 @@ mod tests {
             }
         }
 
-        fn sent(&self) -> Vec<GeneratedSongSendPlan> {
-            lock(&self.sent).clone()
+        fn preparations(&self) -> Vec<GeneratedSongSendPlan> {
+            lock(&self.preparation_calls).clone()
         }
 
         fn reactions(&self) -> Vec<(&'static str, i64, i32)> {
@@ -3088,15 +3066,6 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn clear_song_signal<'a>(
-            &'a self,
-            chat_id: i64,
-            trigger_message_id: i32,
-        ) -> MusicJobEffectFuture<'a, ()> {
-            lock(&self.reactions).push(("clear", chat_id, trigger_message_id));
-            Box::pin(async {})
-        }
-
         fn can_send_audio<'a>(&'a self, _chat_id: i64) -> MusicJobEffectFuture<'a, bool> {
             Box::pin(async move { self.can_send })
         }
@@ -3108,31 +3077,75 @@ mod tests {
             Box::pin(async move { lock(&self.refs).pop_front().flatten() })
         }
 
-        fn persist_generated_song<'a>(
+        fn queued_song_job<'a>(
             &'a self,
-            song: openplotva_storage::NewGeneratedSong,
-        ) -> MusicJobEffectFuture<'a, Option<i64>> {
-            lock(&self.persisted).push(song);
-            let id = lock(&self.song_ids).pop_front().flatten();
-            Box::pin(async move { id })
+            job_id: i64,
+        ) -> MusicJobEffectFuture<
+            'a,
+            Result<Option<crate::telegram_outbox::QueuedBatchReceipt>, super::MusicJobError>,
+        > {
+            Box::pin(async move { Ok(lock(&self.queued).get(&job_id).cloned()) })
         }
-
-        fn mark_generated_song_sent<'a>(
+        fn prepared_song<'a>(
             &'a self,
-            song_id: i64,
-            message_id: i32,
-        ) -> MusicJobEffectFuture<'a, ()> {
-            lock(&self.marked).push((song_id, message_id));
-            Box::pin(async {})
+            job_id: i64,
+        ) -> MusicJobEffectFuture<
+            'a,
+            Result<Option<openplotva_telegram::SendRichMessage>, super::MusicJobError>,
+        > {
+            Box::pin(async move { Ok(lock(&self.prepared).get(&job_id).cloned()) })
         }
-
-        fn send_generated_song<'a>(
+        fn prepare_song<'a>(
             &'a self,
             plan: GeneratedSongSendPlan,
-        ) -> MusicJobEffectFuture<'a, Result<Option<i32>, String>> {
+        ) -> MusicJobEffectFuture<
+            'a,
+            Result<openplotva_telegram::SendRichMessage, super::MusicJobError>,
+        > {
             Box::pin(async move {
-                lock(&self.sent).push(plan);
-                Ok(Some(100))
+                lock(&self.persisted).push(plan.song.clone());
+                let job_id = plan.song.job_id.expect("job identity");
+                let prepared = openplotva_telegram::SendRichMessage {
+                    chat_id: plan.song.chat_id,
+                    html: "prepared song".into(),
+                    options: openplotva_telegram::RichSendOptions {
+                        message_thread_id: plan.song.thread_id.map(i64::from),
+                        reply_to_message_id: Some(i64::from(plan.song.trigger_message_id)),
+                        ..Default::default()
+                    },
+                };
+                lock(&self.preparation_calls).push(plan);
+                lock(&self.prepared).insert(job_id, prepared.clone());
+                Ok(prepared)
+            })
+        }
+        fn enqueue_song<'a>(
+            &'a self,
+            job_id: i64,
+            _song: openplotva_telegram::SendRichMessage,
+        ) -> MusicJobEffectFuture<
+            'a,
+            Result<crate::telegram_outbox::QueuedBatchReceipt, super::MusicJobError>,
+        > {
+            Box::pin(async move {
+                if self
+                    .fail_enqueue
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(super::MusicJobError {
+                        message: "database temporarily unavailable".into(),
+                        retry_reason: Some(
+                            openplotva_llm::retry::FailureReason::ProviderUnavailable,
+                        ),
+                    });
+                }
+                let receipt = crate::telegram_outbox::QueuedBatchReceipt::durable_outbox(
+                    format!("music:{job_id}"),
+                    vec![format!("operation:{job_id}")],
+                    false,
+                );
+                lock(&self.queued).insert(job_id, receipt.clone());
+                Ok(receipt)
             })
         }
     }

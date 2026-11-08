@@ -22,8 +22,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-const GO_LLM_TRACE_BUFFER_CAPACITY: usize = 1_000;
-const GO_RESPONSE_PREVIEW_SIZE: usize = 500;
+const LLM_TRACE_BUFFER_CAPACITY: usize = 1_000;
+const RESPONSE_PREVIEW_SIZE: usize = 500;
 const LLM_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
 const LLM_EVENT_WRITER_BATCH_SIZE: usize = 100;
 const LLM_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -296,14 +296,14 @@ pub struct RuntimeLlmRequestEventCleanupReport {
 
 impl Default for RuntimeLlmTraceBuffer {
     fn default() -> Self {
-        Self::new(GO_LLM_TRACE_BUFFER_CAPACITY)
+        Self::new(LLM_TRACE_BUFFER_CAPACITY)
     }
 }
 
 impl RuntimeLlmTraceBuffer {
     pub fn new(capacity: usize) -> Self {
         let capacity = if capacity == 0 {
-            GO_LLM_TRACE_BUFFER_CAPACITY
+            LLM_TRACE_BUFFER_CAPACITY
         } else {
             capacity
         };
@@ -665,7 +665,7 @@ fn trace_from_record(
         .raw_response
         .as_ref()
         .and_then(trace_response_text)
-        .map(|text| compact_preview(&text, GO_RESPONSE_PREVIEW_SIZE))
+        .map(|text| compact_preview(&text, RESPONSE_PREVIEW_SIZE))
         .and_then(|text| non_empty(&text));
     trace.result = RuntimeLlmRequestResultData {
         duration_ms,
@@ -708,7 +708,7 @@ impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
         filter: RuntimeLlmRequestsFilter,
     ) -> Result<Vec<RuntimeLlmRequestData>, String> {
         let limit = filter.limit.max(1) as usize;
-        let mut out = Vec::with_capacity(limit.min(GO_LLM_TRACE_BUFFER_CAPACITY));
+        let mut out = Vec::with_capacity(limit.min(LLM_TRACE_BUFFER_CAPACITY));
         for trace in self.list() {
             if llm_trace_matches_filter(&trace, &filter) {
                 out.push(trace);

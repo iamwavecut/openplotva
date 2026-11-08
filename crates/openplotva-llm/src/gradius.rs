@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openplotva_memory::{
+use crate::redaction::{
     DiscoveryRedactor, DiscoveryRedactorConfig, DiscoveryRedactorError, RedactionReplacementMode,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
@@ -1911,7 +1911,7 @@ mod tests {
         );
         assert_eq!(
             GradiusPrivacyRedactor::replacement_mode(),
-            openplotva_memory::RedactionReplacementMode::TypedPlaceholders
+            crate::redaction::RedactionReplacementMode::TypedPlaceholders
         );
     }
 
@@ -1958,7 +1958,7 @@ mod tests {
 
     #[tokio::test]
     async fn privacy_redactor_returns_errors_instead_of_unredacted_text() {
-        let config = openplotva_memory::DiscoveryRedactorConfig {
+        let config = crate::redaction::DiscoveryRedactorConfig {
             base_url: "not a url".to_owned(),
             ..Default::default()
         };

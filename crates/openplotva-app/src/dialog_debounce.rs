@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::edited::EditedDialogJobUpdate;
 
-pub const GO_DIALOG_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(5);
+pub const DIALOG_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(5);
 pub type DialogDebounceAssignObserverFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub trait DialogDebounceAssignObserver: Send + Sync {
@@ -104,7 +104,7 @@ impl InMemoryDialogDebounce {
     #[must_use]
     pub fn delay_or_default(delay: Duration) -> Duration {
         if delay.is_zero() {
-            GO_DIALOG_DEBOUNCE_INTERVAL
+            DIALOG_DEBOUNCE_INTERVAL
         } else {
             delay
         }
@@ -357,13 +357,13 @@ mod tests {
 
     use crate::edited::EditedDialogJobUpdate;
 
-    use super::{DialogDebounceKey, GO_DIALOG_DEBOUNCE_INTERVAL, InMemoryDialogDebounce};
+    use super::{DIALOG_DEBOUNCE_INTERVAL, DialogDebounceKey, InMemoryDialogDebounce};
 
     #[test]
     fn debounce_delay_uses_go_default_for_zero_only() {
         assert_eq!(
             InMemoryDialogDebounce::delay_or_default(Duration::ZERO),
-            GO_DIALOG_DEBOUNCE_INTERVAL
+            DIALOG_DEBOUNCE_INTERVAL
         );
         assert_eq!(
             InMemoryDialogDebounce::delay_or_default(Duration::from_millis(150)),

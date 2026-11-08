@@ -1029,6 +1029,7 @@ mod tests {
         let result = toolbox
             .draw_image(DrawRequest {
                 context: openplotva_dialog::ToolContext {
+                    invocation_id: None,
                     chat_id: -91,
                     message_id: 7,
                     ..openplotva_dialog::ToolContext::default()
@@ -1057,6 +1058,7 @@ mod tests {
     async fn safe_memory_returns_mutation_ids_and_enforces_scope() {
         let toolbox = RuntimeVirtualSafeToolbox::new(Arc::new(ToolboxStub));
         let context = openplotva_dialog::ToolContext {
+            invocation_id: None,
             chat_id: -91,
             user_id: -92,
             ..Default::default()

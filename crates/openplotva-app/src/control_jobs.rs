@@ -1,3 +1,545 @@
+use crate::rate_limits::TaskEnqueueRateLimit;
+use openplotva_taskman::{InMemoryTaskQueue, TaskQueueRecord, TaskQueueSchedule};
+#[cfg(test)]
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+
+/// Boxed future returned by taskman control-job assignment calls.
+pub type ControlJobEnqueueFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+/// Queue operations used by the shared control worker.
+pub type ControlJobQueueFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+/// A taskman row ready for the shared control worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlJobWorkItem {
+    /// Taskman job ID used for completion/failure writes.
+    pub id: i64,
+    pub job: StatelessJobItem,
+}
+
+pub trait ControlJobQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Assign a control job to a named taskman queue.
+    fn assign_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error>;
+
+    /// Assign or replace a pending control job under a stable debounce key.
+    fn schedule_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error> {
+        drop(schedule);
+        self.assign_control_job(queue_name, job)
+    }
+}
+
+pub trait SharedControlJobWorkerQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Dequeue the next pending control job owned by one executor family.
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> ControlJobQueueFuture<'a, Option<ControlJobWorkItem>, Self::Error>;
+
+    /// Mark one shared control job completed.
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error>;
+
+    fn wait_for_shared_control_delivery<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error>;
+
+    /// Mark one shared control job failed.
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error>;
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct InMemoryControlJobQueue {
+    queue: InMemoryTaskQueue,
+}
+
+#[cfg(test)]
+/// Queue status projection for fixtures.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum InMemoryControlJobStatus {
+    /// Job is pending worker execution.
+    Pending,
+    /// Job has been dequeued by a worker.
+    Processing,
+    /// Job completed.
+    Completed,
+    /// Job failed and carries an error string.
+    Failed,
+}
+
+#[cfg(test)]
+/// Queue snapshot used by fixtures.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InMemoryControlJobRecord {
+    /// Taskman job ID.
+    pub id: i64,
+    pub queue_name: String,
+    /// Current in-memory status.
+    pub status: InMemoryControlJobStatus,
+    pub job: StatelessJobItem,
+    /// Worker failure.
+    pub error: Option<String>,
+}
+
+/// Rejected taskman operation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InMemoryControlJobQueueError {
+    /// A status update targeted a job ID this queue has never assigned.
+    #[error("payment control job {0} not found")]
+    JobNotFound(i64),
+    /// The shared taskman queue core rejected an operation unexpectedly.
+    #[error("payment control job queue: {0}")]
+    Taskman(String),
+}
+
+#[cfg(test)]
+impl InMemoryControlJobQueue {
+    /// Build an empty control queue for fixtures.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            queue: InMemoryTaskQueue::new(),
+        }
+    }
+
+    /// Return a stable ID-ordered snapshot of the queue state.
+    #[cfg(test)]
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<InMemoryControlJobRecord> {
+        let records = self.queue.records();
+        control_records_from_taskman(&records)
+    }
+
+    /// Return raw taskman records with worker IDs and timestamps for runtime diagnostics.
+    #[must_use]
+    pub fn taskman_records(&self) -> Vec<TaskQueueRecord> {
+        self.queue.records()
+    }
+}
+
+/// Control queue storage or enqueue failure.
+#[derive(Debug, Error)]
+pub enum PersistentControlJobQueueError {
+    #[error(transparent)]
+    Storage(#[from] openplotva_storage::StorageError),
+    /// The inner queue operation failed.
+    #[error(transparent)]
+    Queue(#[from] InMemoryControlJobQueueError),
+    /// User/chat-originated control job creation was rejected by the task enqueue limiter.
+    #[error("task enqueue rate limited")]
+    TaskEnqueueRateLimited,
+}
+
+/// Shared control queue with enqueue limiting and a Postgres journal.
+#[derive(Clone)]
+pub struct PersistentControlJobQueue {
+    queue: InMemoryTaskQueue,
+    task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
+    db_journal: Option<
+        crate::task_queue::BufferedTaskQueueJournal<openplotva_storage::PostgresTaskQueueStore>,
+    >,
+}
+
+impl PersistentControlJobQueue {
+    #[must_use]
+    pub fn from_task_queue(queue: InMemoryTaskQueue) -> Self {
+        Self {
+            queue,
+            task_enqueue_rate_limit: None,
+            db_journal: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_task_enqueue_rate_limit(
+        mut self,
+        rate_limit: Arc<dyn TaskEnqueueRateLimit>,
+    ) -> Self {
+        self.task_enqueue_rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Attach the shared Postgres journal so control/payment enqueues are flushed
+    /// to Postgres synchronously. Payment jobs (e.g. SuccessfulPayment) must be
+    /// durable before the update is acked: a lost enqueue would silently drop money.
+    #[must_use]
+    pub fn with_db_journal(
+        mut self,
+        journal: crate::task_queue::BufferedTaskQueueJournal<
+            openplotva_storage::PostgresTaskQueueStore,
+        >,
+    ) -> Self {
+        self.db_journal = Some(journal);
+        self
+    }
+
+    /// Return a stable ID-ordered snapshot of the queue state.
+    #[cfg(test)]
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<InMemoryControlJobRecord> {
+        control_records_from_taskman(&self.queue.records())
+    }
+
+    /// Return raw taskman records with worker IDs and timestamps for runtime diagnostics.
+    #[must_use]
+    pub fn taskman_records(&self) -> Vec<TaskQueueRecord> {
+        self.queue.records()
+    }
+}
+
+/// Synchronous-flush retry budget for payment-flow control jobs before falling back
+/// to the background sync worker.
+const PAYMENT_CONTROL_FLUSH_ATTEMPTS: u32 = 3;
+const PAYMENT_CONTROL_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Control kinds that must never be dropped by enqueue rate limiting.
+const fn control_kind_skips_task_enqueue_rate_limit(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::SuccessfulPayment
+            | ControlKind::VipInvoice
+            | ControlKind::DonateInvoice
+            | ControlKind::ChatAdminsSync
+            | ControlKind::ChatMemberSync
+    )
+}
+
+impl PersistentControlJobQueue {
+    async fn assign_control_job_with_schedule(
+        &self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: Option<TaskQueueSchedule>,
+    ) -> Result<(), PersistentControlJobQueueError> {
+        let params = control_job_params_from_stateless_job(&job)
+            .map_err(|error| InMemoryControlJobQueueError::Taskman(error.to_string()))?;
+        let chat_id = params.chat_id;
+        let user_id = params.user_id;
+        let control_kind = params.data.kind;
+        // Payment and member-state control jobs are exempt from enqueue throttling:
+        // dropping them would silently lose durable payment intent or Telegram state.
+        // They are rare control-plane events, not the dialog burst the limiter targets.
+        let rate_limit = if control_kind_skips_task_enqueue_rate_limit(control_kind) {
+            None
+        } else {
+            self.task_enqueue_rate_limit.as_ref()
+        };
+        if let Some(rate_limit) = rate_limit {
+            let now = OffsetDateTime::now_utc();
+            let report = rate_limit
+                .check_task_enqueue_rate_limit(chat_id, user_id, now)
+                .await;
+            if report.limited {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    rate_limit_scope = ?report.scope,
+                    rate_limit_error = ?report.error,
+                    "task enqueue rate limit rejected control job"
+                );
+                return Err(PersistentControlJobQueueError::TaskEnqueueRateLimited);
+            }
+            if let Some(error) = report.error {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    error,
+                    "task enqueue rate limit store check failed before control job assignment"
+                );
+            }
+        }
+        if let Some(schedule) = schedule {
+            self.queue.schedule_or_replace(queue_name, job, schedule);
+        } else {
+            self.queue.assign(queue_name, job);
+        }
+        // Best-effort synchronous durability for the payment-flow job: retry the
+        // flush a few times to ride out a transient Postgres blip so the job is
+        // durable before the update is acked. If every attempt fails, the 1s
+        // background sync worker remains the durability backstop (a crash inside
+        // that residual window would re-deliver the update, which is idempotent).
+        if let Some(journal) = &self.db_journal {
+            let mut last_error = None;
+            for attempt in 0..PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                match journal.flush_dirty().await {
+                    Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt + 1 < PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                            tokio::time::sleep(PAYMENT_CONTROL_FLUSH_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = last_error {
+                tracing::error!(
+                    queue_name,
+                    control_kind = ?control_kind,
+                    %error,
+                    "control job not durably flushed after retries; relying on background sync worker"
+                );
+            }
+        }
+        if let Some(rate_limit) = rate_limit {
+            let report = rate_limit
+                .grow_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
+                .await;
+            for error in report.save_errors {
+                tracing::warn!(
+                    queue_name,
+                    chat_id,
+                    user_id,
+                    control_kind = ?control_kind,
+                    error,
+                    "task enqueue rate limit store save failed after control job assignment"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ControlJobQueue for PersistentControlJobQueue {
+    type Error = PersistentControlJobQueueError;
+
+    fn assign_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error> {
+        Box::pin(self.assign_control_job_with_schedule(queue_name, job, None))
+    }
+
+    fn schedule_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error> {
+        Box::pin(self.assign_control_job_with_schedule(queue_name, job, Some(schedule)))
+    }
+}
+
+impl SharedControlJobWorkerQueue for PersistentControlJobQueue {
+    type Error = PersistentControlJobQueueError;
+
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> ControlJobQueueFuture<'a, Option<ControlJobWorkItem>, Self::Error> {
+        Box::pin(async move {
+            Ok(self
+                .queue
+                .dequeue_matching(queue_name, worker_id, OffsetDateTime::now_utc(), predicate)
+                .map(|item| ControlJobWorkItem {
+                    id: item.id,
+                    job: item.job,
+                }))
+        })
+    }
+
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .complete(job_id, OffsetDateTime::now_utc())
+                .map_err(control_queue_error)?;
+            Ok(())
+        })
+    }
+
+    fn wait_for_shared_control_delivery<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .wait_for_delivery(job_id)
+                .map_err(control_queue_error)?;
+            if let Some(journal) = &self.db_journal {
+                journal.flush_job(job_id).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .fail(job_id, error, OffsetDateTime::now_utc())
+                .map_err(control_queue_error)?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+impl Default for InMemoryControlJobQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl ControlJobQueue for InMemoryControlJobQueue {
+    type Error = InMemoryControlJobQueueError;
+
+    fn assign_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.queue.assign(queue_name, job);
+            Ok(())
+        })
+    }
+
+    fn schedule_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> ControlJobEnqueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.queue.schedule_or_replace(queue_name, job, schedule);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+impl SharedControlJobWorkerQueue for InMemoryControlJobQueue {
+    type Error = InMemoryControlJobQueueError;
+
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> ControlJobQueueFuture<'a, Option<ControlJobWorkItem>, Self::Error> {
+        Box::pin(async move {
+            Ok(self
+                .queue
+                .dequeue_matching(queue_name, worker_id, OffsetDateTime::now_utc(), predicate)
+                .map(|item| ControlJobWorkItem {
+                    id: item.id,
+                    job: item.job,
+                }))
+        })
+    }
+
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .complete(job_id, OffsetDateTime::now_utc())
+                .map_err(control_queue_error)?;
+            Ok(())
+        })
+    }
+
+    fn wait_for_shared_control_delivery<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .wait_for_delivery(job_id)
+                .map_err(control_queue_error)?;
+            Ok(())
+        })
+    }
+
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> ControlJobQueueFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .fail(job_id, error, OffsetDateTime::now_utc())
+                .map_err(control_queue_error)?;
+            Ok(())
+        })
+    }
+}
+
+fn control_queue_error(error: openplotva_taskman::TaskQueueError) -> InMemoryControlJobQueueError {
+    match error {
+        openplotva_taskman::TaskQueueError::JobNotFound(job_id) => {
+            InMemoryControlJobQueueError::JobNotFound(job_id)
+        }
+        error => InMemoryControlJobQueueError::Taskman(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+fn control_records_from_taskman(records: &[TaskQueueRecord]) -> Vec<InMemoryControlJobRecord> {
+    records
+        .iter()
+        .map(|record| InMemoryControlJobRecord {
+            id: record.id,
+            queue_name: record.queue_name.clone(),
+            status: control_status_from_taskman(record.status),
+            job: record.job.clone(),
+            error: record.error.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn control_status_from_taskman(status: openplotva_taskman::JobStatus) -> InMemoryControlJobStatus {
+    use openplotva_taskman::JobStatus;
+    match status {
+        JobStatus::Pending => InMemoryControlJobStatus::Pending,
+        JobStatus::Processing | JobStatus::WaitingDelivery => InMemoryControlJobStatus::Processing,
+        JobStatus::Completed => InMemoryControlJobStatus::Completed,
+        JobStatus::Failed | JobStatus::Cancelled => InMemoryControlJobStatus::Failed,
+    }
+}
+
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use openplotva_taskman::{
@@ -8,11 +550,11 @@ use openplotva_telegram::DispatcherQueue;
 use time::OffsetDateTime;
 
 use crate::{
-    checkin::{CheckinControlJobEffects, CheckinControlJobOutcome},
+    checkin::CheckinControlJobEffects,
     members::{MemberStateControlJobEffects, MemberStateControlJobExecution},
     payments::{
-        PaymentControlJobReport, SharedControlJobWorkerQueue, SuccessfulPaymentStore,
-        execute_payment_control_job_at, payment_control_job_failure_message,
+        PaymentControlJobReport, SuccessfulPaymentStore, execute_payment_control_job_at,
+        payment_control_job_failure_message,
     },
     settings::{
         GroupSettingsControlJobEffects, NewMembersFollowupControlJobEffects,
@@ -43,7 +585,7 @@ pub enum ControlJobExecution {
     /// Chat-admin/member sync executor result.
     MemberState(MemberStateControlJobExecution),
     /// Check-in game executor result.
-    Checkin(CheckinControlJobOutcome),
+    Checkin,
 }
 
 /// Result returned by one control-kind executor.
@@ -51,6 +593,7 @@ pub enum ControlJobExecution {
 pub enum ControlJobExecutionResult {
     /// Executor completed and the queue row should be marked completed.
     Completed(ControlJobExecution),
+    WaitingDelivery(crate::telegram_outbox::QueuedBatchReceipt),
     /// Executor failed and the queue row should be marked failed.
     Failed {
         /// Optional partial execution details.
@@ -73,6 +616,7 @@ pub struct ControlJobWorkerReport {
     pub execution: Option<ControlJobExecution>,
     /// The job was finalized as completed.
     pub completed: bool,
+    pub waiting_delivery: bool,
     /// The job was finalized as failed.
     pub failed: bool,
     /// Queue dequeue failed.
@@ -93,6 +637,7 @@ pub struct ControlJobWorkerRunReport {
     pub dequeued: u64,
     /// Number of jobs completed.
     pub completed: u64,
+    pub waiting_delivery: u64,
     /// Number of jobs failed.
     pub failed: u64,
     /// Number of queue dequeue errors.
@@ -105,6 +650,7 @@ pub trait ControlJobExecutorRegistry {
     /// Execute one already-decoded control job.
     fn execute_control_job<'a>(
         &'a self,
+        job_id: i64,
         params: &'a ControlJobParams,
         now: OffsetDateTime,
     ) -> ControlJobExecutorFuture<'a>;
@@ -183,6 +729,7 @@ where
 {
     fn execute_control_job<'a>(
         &'a self,
+        job_id: i64,
         params: &'a ControlJobParams,
         now: OffsetDateTime,
     ) -> ControlJobExecutorFuture<'a> {
@@ -285,15 +832,18 @@ where
                         MemberStateControlJobExecution::SupersededByProjectionMaterializer,
                     ))
                 }
-                ControlKind::Checkin => match self.checkin_effects.run_checkin_game(params).await {
-                    Ok(()) => ControlJobExecutionResult::Completed(ControlJobExecution::Checkin(
-                        CheckinControlJobOutcome::Completed,
-                    )),
-                    Err(error) => ControlJobExecutionResult::Failed {
-                        execution: None,
-                        error: error.to_string(),
-                    },
-                },
+                ControlKind::Checkin => {
+                    match self.checkin_effects.run_checkin_game(job_id, params).await {
+                        Ok(Some(receipt)) => ControlJobExecutionResult::WaitingDelivery(receipt),
+                        Ok(None) => {
+                            ControlJobExecutionResult::Completed(ControlJobExecution::Checkin)
+                        }
+                        Err(error) => ControlJobExecutionResult::Failed {
+                            execution: None,
+                            error: error.to_string(),
+                        },
+                    }
+                }
                 kind => unsupported_control_job_kind(kind),
             }
         })
@@ -371,7 +921,7 @@ where
 
     let result = match tokio::time::timeout(
         control_job_timeout(params.data.kind),
-        registry.execute_control_job(&params, now),
+        registry.execute_control_job(item.id, &params, now),
     )
     .await
     {
@@ -391,6 +941,12 @@ where
             report.execution = Some(execution);
             match queue.complete_shared_control_job(item.id).await {
                 Ok(()) => report.completed = true,
+                Err(error) => report.status_error = Some(error.to_string()),
+            }
+        }
+        ControlJobExecutionResult::WaitingDelivery(_) => {
+            match queue.wait_for_shared_control_delivery(item.id).await {
+                Ok(()) => report.waiting_delivery = true,
                 Err(error) => report.status_error = Some(error.to_string()),
             }
         }
@@ -464,6 +1020,9 @@ impl ControlJobWorkerRunReport {
         if tick.completed {
             self.completed += 1;
         }
+        if tick.waiting_delivery {
+            self.waiting_delivery += 1;
+        }
         if tick.failed {
             self.failed += 1;
         }
@@ -516,14 +1075,15 @@ fn is_control_job(job: &StatelessJobItem) -> bool {
 
 impl<F> ControlJobExecutorRegistry for F
 where
-    F: for<'a> Fn(&'a ControlJobParams, OffsetDateTime) -> ControlJobExecutorFuture<'a> + Sync,
+    F: for<'a> Fn(i64, &'a ControlJobParams, OffsetDateTime) -> ControlJobExecutorFuture<'a> + Sync,
 {
     fn execute_control_job<'a>(
         &'a self,
+        job_id: i64,
         params: &'a ControlJobParams,
         now: OffsetDateTime,
     ) -> ControlJobExecutorFuture<'a> {
-        self(params, now)
+        self(job_id, params, now)
     }
 }
 
@@ -531,6 +1091,7 @@ impl fmt::Display for ControlJobExecutionResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Completed(_) => formatter.write_str("completed"),
+            Self::WaitingDelivery(_) => formatter.write_str("waiting_delivery"),
             Self::Failed { error, .. } => error.fmt(formatter),
         }
     }
@@ -549,22 +1110,23 @@ mod tests {
     };
 
     use super::*;
-    use crate::payments::{InMemoryPaymentControlJobStatus, PaymentControlJobQueue};
+
+    use crate::control_jobs::{ControlJobQueue, InMemoryControlJobStatus};
 
     #[tokio::test]
     async fn unified_control_worker_dequeues_next_pending_control_job_by_go_order()
     -> Result<(), Box<dyn Error>> {
-        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let queue = crate::control_jobs::InMemoryControlJobQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         queue
-            .assign_payment_control_job(
+            .assign_control_job(
                 CONTROL_QUEUE_NAME,
                 control_job(ControlKind::Translate, now, 0),
             )
             .await?;
         let low_id = queue.snapshot().last().expect("low job").id;
         queue
-            .assign_payment_control_job(
+            .assign_control_job(
                 CONTROL_QUEUE_NAME,
                 control_job(
                     ControlKind::Checkin,
@@ -584,22 +1146,17 @@ mod tests {
 
         assert_eq!(report.job_id, Some(high_id));
         assert_eq!(report.kind, Some(ControlKind::Checkin));
-        assert_eq!(
-            report.execution,
-            Some(ControlJobExecution::Checkin(
-                CheckinControlJobOutcome::Completed
-            ))
-        );
+        assert_eq!(report.execution, Some(ControlJobExecution::Checkin));
         assert!(report.completed);
         assert_eq!(*seen.lock().expect("seen"), vec![ControlKind::Checkin]);
         let snapshot = queue.snapshot();
         assert_eq!(
             snapshot_record(&snapshot, high_id).status,
-            InMemoryPaymentControlJobStatus::Completed
+            InMemoryControlJobStatus::Completed
         );
         assert_eq!(
             snapshot_record(&snapshot, low_id).status,
-            InMemoryPaymentControlJobStatus::Pending
+            InMemoryControlJobStatus::Pending
         );
         Ok(())
     }
@@ -607,16 +1164,16 @@ mod tests {
     #[tokio::test]
     async fn transactional_control_job_overtakes_older_membership_sync()
     -> Result<(), Box<dyn Error>> {
-        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let queue = crate::control_jobs::InMemoryControlJobQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         queue
-            .assign_payment_control_job(
+            .assign_control_job(
                 CONTROL_QUEUE_NAME,
                 control_job(ControlKind::ChatMemberSync, now, HIGH_PRIORITY),
             )
             .await?;
         queue
-            .assign_payment_control_job(
+            .assign_control_job(
                 CONTROL_QUEUE_NAME,
                 control_job(
                     ControlKind::SuccessfulPayment,
@@ -642,11 +1199,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_control_result_waits_for_delivery_without_completing()
+    -> Result<(), Box<dyn Error>> {
+        fn queued(
+            job_id: i64,
+            _params: &ControlJobParams,
+            _now: OffsetDateTime,
+        ) -> ControlJobExecutorFuture<'_> {
+            Box::pin(async move {
+                ControlJobExecutionResult::WaitingDelivery(
+                    crate::telegram_outbox::QueuedBatchReceipt::durable_outbox(
+                        crate::checkin::checkin_delivery_source(job_id),
+                        vec!["checkin-part".into()],
+                        false,
+                    ),
+                )
+            })
+        }
+        let queue = crate::control_jobs::InMemoryControlJobQueue::new();
+        let now = OffsetDateTime::now_utc();
+        queue
+            .assign_control_job(
+                CONTROL_QUEUE_NAME,
+                control_job(ControlKind::Checkin, now, HIGH_PRIORITY),
+            )
+            .await?;
+        let report = process_control_job_once_at(&queue, &queued, now).await;
+        assert!(report.waiting_delivery);
+        assert!(!report.completed);
+        assert!(!report.failed);
+        let records = queue.taskman_records();
+        assert_eq!(
+            records[0].status,
+            openplotva_taskman::JobStatus::WaitingDelivery
+        );
+        assert_eq!(records[0].result_message_id, None);
+        assert_eq!(records[0].completed_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unified_control_worker_fails_unknown_control_kind() -> Result<(), Box<dyn Error>> {
-        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let queue = crate::control_jobs::InMemoryControlJobQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         queue
-            .assign_payment_control_job(
+            .assign_control_job(
                 CONTROL_QUEUE_NAME,
                 control_job(ControlKind::Unknown, now, HIGH_PRIORITY),
             )
@@ -665,7 +1262,7 @@ mod tests {
         );
         let snapshot = queue.snapshot();
         let record = snapshot_record(&snapshot, job_id);
-        assert_eq!(record.status, InMemoryPaymentControlJobStatus::Failed);
+        assert_eq!(record.status, InMemoryControlJobStatus::Failed);
         assert_eq!(
             record.error.as_deref(),
             Some("unsupported control job kind: Unknown")
@@ -725,6 +1322,7 @@ mod tests {
     impl ControlJobExecutorRegistry for RecordingRegistry {
         fn execute_control_job<'a>(
             &'a self,
+            _job_id: i64,
             params: &'a ControlJobParams,
             _now: OffsetDateTime,
         ) -> ControlJobExecutorFuture<'a> {
@@ -743,9 +1341,9 @@ mod tests {
                     ControlKind::Translate => ControlJobExecutionResult::Completed(
                         ControlJobExecution::Translate(TranslateControlJobOutcome::Sent),
                     ),
-                    ControlKind::Checkin => ControlJobExecutionResult::Completed(
-                        ControlJobExecution::Checkin(CheckinControlJobOutcome::Completed),
-                    ),
+                    ControlKind::Checkin => {
+                        ControlJobExecutionResult::Completed(ControlJobExecution::Checkin)
+                    }
                     kind => unsupported_control_job_kind(kind),
                 }
             })
@@ -755,11 +1353,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn worker_drains_ready_control_jobs_without_poll_interval_between_them()
     -> Result<(), Box<dyn Error>> {
-        let queue = crate::payments::InMemoryPaymentControlJobQueue::new();
+        let queue = crate::control_jobs::InMemoryControlJobQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         for kind in [ControlKind::Translate, ControlKind::Checkin] {
             queue
-                .assign_payment_control_job(CONTROL_QUEUE_NAME, control_job(kind, now, 0))
+                .assign_control_job(CONTROL_QUEUE_NAME, control_job(kind, now, 0))
                 .await?;
         }
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -805,12 +1403,15 @@ mod tests {
     }
 
     fn snapshot_record(
-        snapshot: &[crate::payments::InMemoryPaymentControlJobRecord],
+        snapshot: &[crate::control_jobs::InMemoryControlJobRecord],
         id: i64,
-    ) -> &crate::payments::InMemoryPaymentControlJobRecord {
+    ) -> &crate::control_jobs::InMemoryControlJobRecord {
         snapshot
             .iter()
             .find(|record| record.id == id)
             .expect("snapshot record")
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

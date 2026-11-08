@@ -4154,6 +4154,7 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext {
+            invocation_id: None,
             chat_id: -100,
             thread_id: Some(7),
             message_id: 11,
@@ -4445,6 +4446,7 @@ mod tests {
         };
         let request = DrawRequest {
             context: ToolContext {
+                invocation_id: None,
                 message_meta: meta,
                 message_text: "объедини эти картинки".to_owned(),
                 ..context()
@@ -4960,6 +4962,7 @@ mod tests {
         };
         let mut request = DrawRequest {
             context: ToolContext {
+                invocation_id: None,
                 image_attachments: vec![first.clone(), second.clone(), unrelated],
                 ..Default::default()
             },
@@ -5001,6 +5004,7 @@ mod tests {
                 .collect();
             let mut request = DrawRequest {
                 context: ToolContext {
+                    invocation_id: None,
                     message_meta: ChatMessageMeta {
                         attachments: vec![images[0].clone()],
                         ..Default::default()
@@ -5120,6 +5124,7 @@ mod tests {
         };
         let request = SongRequest {
             context: ToolContext {
+                invocation_id: None,
                 message_meta: meta.clone(),
                 ..context()
             },
@@ -5194,6 +5199,7 @@ mod tests {
         };
         let request = VisionRequest {
             context: ToolContext {
+                invocation_id: None,
                 message_meta: meta.clone(),
                 ..context()
             },
@@ -5754,7 +5760,6 @@ mod tests {
     -> Result<(), ToolboxError> {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let vip = Arc::new(DrawImageVipStatusStub::new(true));
-        let rich = Arc::new(crate::rich::MockRichSender::default());
         let reactions = Arc::new(crate::reactions::test_support::RecordingReactionSink::default());
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
             .with_generation_reactions(
@@ -5777,7 +5782,7 @@ mod tests {
         assert_eq!(scheduled.status, "scheduled");
         // Reactions take precedence: no ⏳ placeholder message, a 👀 reaction
         // on the trigger instead, and no queue-position id to reuse later.
-        assert!(rich.sent.lock().expect("rich sent").is_empty());
+        assert!(queue.records()[0].messages.is_empty());
         let calls = reactions.calls.lock().expect("reaction calls").clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "queued");
@@ -6960,6 +6965,7 @@ mod tests {
     fn fallback_draw_request() -> DrawRequest {
         DrawRequest {
             context: ToolContext {
+                invocation_id: None,
                 message_meta: ChatMessageMeta {
                     attachments: vec![
                         image_attachment("reference-a"),

@@ -12,7 +12,7 @@ use std::{
 
 use time::OffsetDateTime;
 
-pub const GO_RATE_LIMIT_CACHE_TTL: time::Duration = time::Duration::minutes(30);
+pub const RATE_LIMIT_CACHE_TTL: time::Duration = time::Duration::minutes(30);
 pub const TASK_ENQUEUE_WINDOW: Duration = Duration::from_secs(60);
 pub const TASK_ENQUEUE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const TASK_ENQUEUE_USER_CHAT_LIMIT: usize = 30;
@@ -398,7 +398,7 @@ where
             chat_id,
             CachedRateLimit {
                 expiry,
-                cached_until: now + GO_RATE_LIMIT_CACHE_TTL,
+                cached_until: now + RATE_LIMIT_CACHE_TTL,
             },
         );
     }

@@ -15,7 +15,6 @@ use openplotva_telegram::{
     build_text_message_methods_without_link_previews,
     build_text_message_methods_without_link_previews_with_atomic_tail,
 };
-use sqlx::Row;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -29,15 +28,7 @@ use super::{
     DialogJobEffectFuture, DialogJobReceiptFuture, DialogJobReceiptLookupFuture,
     dialog_response_requires_rich,
 };
-
-/// Identity returned after all final-answer parts were accepted by one queue.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueuedBatchReceipt {
-    pub batch_id: String,
-    pub operation_ids: Vec<String>,
-    delivery: QueuedDelivery,
-    delivery_complete: bool,
-}
+use crate::telegram_outbox::{QueuedBatchReceipt, telegram_outbox_ordering_key};
 
 /// Final-answer delivery behavior derived from the completed dialog session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -53,48 +44,6 @@ pub struct DialogAnswerSendOptions {
 impl DialogAnswerSendOptions {
     const fn link_previews_disabled(self) -> bool {
         self.disable_link_preview || self.contains_advertising
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QueuedDelivery {
-    Dispatcher,
-    DurableOutbox,
-}
-
-impl QueuedBatchReceipt {
-    pub(crate) fn dispatcher(batch_id: String, operation_ids: Vec<String>) -> Self {
-        Self {
-            batch_id,
-            operation_ids,
-            delivery: QueuedDelivery::Dispatcher,
-            delivery_complete: false,
-        }
-    }
-
-    pub(crate) fn durable_outbox(
-        batch_id: String,
-        operation_ids: Vec<String>,
-        delivery_complete: bool,
-    ) -> Self {
-        Self {
-            batch_id,
-            operation_ids,
-            delivery: QueuedDelivery::DurableOutbox,
-            delivery_complete,
-        }
-    }
-
-    /// Whether taskman must wait for real Telegram receipts before completion.
-    #[must_use]
-    pub fn requires_delivery_wait(&self) -> bool {
-        self.delivery == QueuedDelivery::DurableOutbox
-    }
-
-    /// Whether every durable part already has a real Telegram receipt.
-    #[must_use]
-    pub fn delivery_complete(&self) -> bool {
-        self.requires_delivery_wait() && self.delivery_complete
     }
 }
 
@@ -345,30 +294,19 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 return Ok(None);
             };
             let batch_id = dialog_answer_batch_id(outbox.bot_id, dialog_job_id);
-            let rows = sqlx::query(
-                "SELECT operation_id, state FROM telegram_outbox \
-                 WHERE batch_id = $1 AND dialog_job_id = $2 \
-                 ORDER BY part_index",
-            )
-            .bind(&batch_id)
-            .bind(dialog_job_id)
-            .fetch_all(outbox.store.pool())
-            .await
-            .map_err(openplotva_storage::StorageError::from)?;
-            if rows.is_empty() {
+            let Some(queued) = outbox
+                .store
+                .queued_batch(outbox.bot_id, &batch_id, Some(dialog_job_id))
+                .await?
+            else {
                 return Ok(None);
-            }
-            let delivery_complete = rows.iter().all(|row| {
-                matches!(
-                    row.try_get::<String, _>("state").as_deref(),
-                    Ok("delivered")
-                )
-            });
-            let operation_ids = rows
+            };
+            let delivery_complete = queued.parts.iter().all(|part| part.state == "delivered");
+            let operation_ids = queued
+                .parts
                 .into_iter()
-                .map(|row| row.try_get("operation_id"))
-                .collect::<Result<Vec<String>, sqlx::Error>>()
-                .map_err(openplotva_storage::StorageError::from)?;
+                .map(|part| part.operation_id)
+                .collect();
             Ok(Some(QueuedBatchReceipt::durable_outbox(
                 batch_id,
                 operation_ids,
@@ -562,6 +500,7 @@ fn dialog_intermediate_outbox_batch(
     parts: Vec<TelegramOutboxPartInput>,
 ) -> TelegramOutboxBatchInput {
     TelegramOutboxBatchInput {
+        content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
         batch_id: if params.meta["agent_final_reply"].as_bool() == Some(true) {
             dialog_answer_batch_id(bot_id, dialog_job_id)
         } else {
@@ -570,7 +509,7 @@ fn dialog_intermediate_outbox_batch(
         bot_id,
         chat_id: Some(params.chat_id),
         thread_id: params.thread_id,
-        ordering_key: dialog_outbox_ordering_key(bot_id, params.chat_id, params.thread_id),
+        ordering_key: telegram_outbox_ordering_key(bot_id, params.chat_id, params.thread_id),
         causation_update_id,
         dialog_job_id: Some(dialog_job_id),
         trigger_message_id: Some(i64::from(params.message_id)),
@@ -582,17 +521,6 @@ fn dialog_intermediate_outbox_batch(
 }
 
 /// Per-chat delivery order shared by dialog messages and the banners queued after them.
-pub(crate) fn dialog_outbox_ordering_key(
-    bot_id: i64,
-    chat_id: i64,
-    thread_id: Option<i32>,
-) -> String {
-    format!(
-        "dialog:{bot_id}:{chat_id}:{}",
-        thread_id.unwrap_or_default()
-    )
-}
-
 fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {
     format!("dialog-answer:v1:{bot_id}:{dialog_job_id}")
 }
@@ -662,11 +590,12 @@ async fn enqueue_durable_dialog_answer(
         .collect::<Result<Vec<_>, _>>()?;
     let batch_id = dialog_answer_batch_id(outbox.bot_id, dialog_job_id);
     let batch = TelegramOutboxBatchInput {
+        content_policy: openplotva_storage::TelegramOutboxContentPolicy::Immutable,
         batch_id: batch_id.clone(),
         bot_id: outbox.bot_id,
         chat_id: Some(params.chat_id),
         thread_id: params.thread_id,
-        ordering_key: dialog_outbox_ordering_key(outbox.bot_id, params.chat_id, params.thread_id),
+        ordering_key: telegram_outbox_ordering_key(outbox.bot_id, params.chat_id, params.thread_id),
         causation_update_id,
         dialog_job_id: Some(dialog_job_id),
         trigger_message_id: Some(i64::from(params.message_id)),

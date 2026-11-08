@@ -18,10 +18,7 @@ use openplotva_dialog::{
     TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult,
     ToolSideEffect,
 };
-use openplotva_telegram::{
-    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
-    TextMessageRequest,
-};
+use openplotva_telegram::{ChatRef, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest};
 use rand::RngExt;
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
@@ -31,15 +28,11 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::updates::UpdateHandler;
-use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
-};
 
 const RATES_UNAVAILABLE_TEXT: &str = "❌ Сервис курсов временно недоступен";
 const RATES_FETCH_ERRORS_PREFIX: &str = "❌ Ошибки получения курсов:\n";
 pub const RATES_MESSAGE_KIND: &str = "rates_message";
 const RATES_TOOL_MODE_MULTI_TURN: &str = "multi_turn";
-const RATES_TOOL_MODE_LEGACY: &str = "legacy";
 const MARKET_RATES_YAHOO_TTL: Duration = Duration::from_secs(5 * 60);
 const MARKET_RATES_DAILY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MARKET_RATES_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1150,32 +1143,23 @@ pub trait RatesEffects {
     fn send_rates_text<'a>(&'a self, plan: RatesTextPlan) -> RatesEffectFuture<'a, Self::Error>;
 }
 
-/// Generator for virtual-message IDs used by rates command sends.
-pub type RatesVirtualIdFactory = VirtualIdFactory;
-
-/// Rich-message-backed rates command side effects.
+/// Durable delivery for rates commands and tool invocations.
 #[derive(Clone)]
-pub struct RatesRichEffects {
-    rich: Arc<dyn crate::rich::RichSender>,
-}
-
-#[derive(Clone)]
-pub struct RatesUtilityEffects {
-    rich: RatesRichEffects,
+pub struct RatesDelivery {
+    delivery: Arc<crate::rich::RichOutbox>,
     ads: Option<Arc<crate::gradius_ads::GradiusUtilityAdService>>,
-    outbox: Option<Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>>,
+    ad_outbox: Option<Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>>,
 }
 
-impl RatesUtilityEffects {
+impl RatesDelivery {
     #[must_use]
-    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
+    pub fn new(delivery: Arc<crate::rich::RichOutbox>) -> Self {
         Self {
-            rich: RatesRichEffects::new(rich),
+            delivery,
             ads: None,
-            outbox: None,
+            ad_outbox: None,
         }
     }
-
     #[must_use]
     pub fn with_utility_ads(
         mut self,
@@ -1183,29 +1167,62 @@ impl RatesUtilityEffects {
         outbox: Arc<crate::gradius_utility_outbox::GradiusUtilityOutbox>,
     ) -> Self {
         self.ads = Some(ads);
-        self.outbox = Some(outbox);
+        self.ad_outbox = Some(outbox);
         self
     }
 }
 
-impl RatesEffects for RatesUtilityEffects {
+impl RatesEffects for RatesDelivery {
     type Error = RatesRichEffectError;
 
     fn send_rates_text<'a>(&'a self, plan: RatesTextPlan) -> RatesEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat_id = plan.reply_to.chat.id;
+            let source = format!("rates-command:{chat_id}:{}", plan.reply_to.message_id);
+            let message = rates_rich_message(&plan);
+            if self
+                .delivery
+                .queued(&source, None)
+                .await
+                .map_err(|error| RatesRichEffectError::Send(error.to_string()))?
+                .is_some()
+            {
+                return Ok(());
+            }
             let (Some(user_id), Some(plain_html), Some(ads), Some(outbox)) = (
                 plan.initiator_id,
                 plan.plain_html.as_deref(),
                 self.ads.as_ref(),
-                self.outbox.as_ref(),
+                self.ad_outbox.as_ref(),
             ) else {
-                return self.rich.send_rates_text(plan).await;
+                return self
+                    .delivery
+                    .enqueue(
+                        &source,
+                        message.options.message_thread_id,
+                        message.clone(),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| RatesRichEffectError::Send(error.to_string()));
             };
             let thread_id = if plan.reply_to.is_topic_message {
                 match i32::try_from(plan.reply_to.message_thread_id) {
                     Ok(thread_id) => Some(thread_id),
-                    Err(_) => return self.rich.send_rates_text(plan).await,
+                    Err(_) => {
+                        return self
+                            .delivery
+                            .enqueue(
+                                &source,
+                                message.options.message_thread_id,
+                                message.clone(),
+                                None,
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| RatesRichEffectError::Send(error.to_string()));
+                    }
                 }
             } else {
                 None
@@ -1217,10 +1234,7 @@ impl RatesEffects for RatesUtilityEffects {
                     surface: crate::gradius_ads::GradiusUtilitySurface::Rates,
                     include_vip_appendix: false,
                     source_id: source_id.clone(),
-                    attempt_key: format!(
-                        "rates-command:{source_id}:{}",
-                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-                    ),
+                    attempt_key: format!("rates-command:{source_id}"),
                     user_id,
                     chat_id,
                     thread_id,
@@ -1267,52 +1281,44 @@ impl RatesEffects for RatesUtilityEffects {
                     )
                 }
             }
-            self.rich.send_rates_text(plan).await
-        })
-    }
-}
-
-impl RatesRichEffects {
-    /// Build rates effects that reply with a rich message.
-    #[must_use]
-    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
-        Self { rich }
-    }
-}
-
-impl RatesEffects for RatesRichEffects {
-    type Error = RatesRichEffectError;
-
-    fn send_rates_text<'a>(&'a self, plan: RatesTextPlan) -> RatesEffectFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let chat_id = plan
-                .message
-                .chat
-                .as_ref()
-                .map_or(plan.reply_to.chat.id, |chat| chat.id);
-            let options = openplotva_telegram::RichSendOptions {
-                direct_messages_topic_id: None,
-                message_thread_id: if plan.message.message_thread_id != 0 {
-                    Some(plan.message.message_thread_id)
-                } else if plan.reply_to.is_topic_message {
-                    Some(plan.reply_to.message_thread_id)
-                } else {
-                    None
-                },
-                reply_to_message_id: Some(plan.reply_to.message_id),
-                allow_sending_without_reply: plan
-                    .message
-                    .allow_sending_without_reply
-                    .unwrap_or(false),
-                disable_notification: plan.message.disable_notification,
-                reply_markup: None,
-            };
-            self.rich
-                .send_rich(chat_id, &plan.message.text, &options)
+            self.delivery
+                .enqueue(
+                    &source,
+                    message.options.message_thread_id,
+                    message.clone(),
+                    None,
+                )
                 .await
-                .map_err(|err| RatesRichEffectError::Send(err.to_string()))?;
-            Ok(())
+                .map(|_| ())
+                .map_err(|error| RatesRichEffectError::Send(error.to_string()))
         })
+    }
+}
+
+fn rates_rich_message(plan: &RatesTextPlan) -> openplotva_telegram::SendRichMessage {
+    let chat_id = plan
+        .message
+        .chat
+        .as_ref()
+        .map_or(plan.reply_to.chat.id, |chat| chat.id);
+    let options = openplotva_telegram::RichSendOptions {
+        direct_messages_topic_id: None,
+        message_thread_id: if plan.message.message_thread_id != 0 {
+            Some(plan.message.message_thread_id)
+        } else if plan.reply_to.is_topic_message {
+            Some(plan.reply_to.message_thread_id)
+        } else {
+            None
+        },
+        reply_to_message_id: Some(plan.reply_to.message_id),
+        allow_sending_without_reply: plan.message.allow_sending_without_reply.unwrap_or(false),
+        disable_notification: plan.message.disable_notification,
+        reply_markup: None,
+    };
+    openplotva_telegram::SendRichMessage {
+        chat_id,
+        html: plan.message.text.clone(),
+        options,
     }
 }
 
@@ -1323,21 +1329,7 @@ pub enum RatesRichEffectError {
     Send(String),
 }
 
-/// Rich-message-backed dialog-tool rates side effects.
-#[derive(Clone)]
-pub struct RatesToolRichEffects {
-    rich: Arc<dyn crate::rich::RichSender>,
-}
-
-impl RatesToolRichEffects {
-    /// Build dialog rates effects that send the rich rates table directly.
-    #[must_use]
-    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
-        Self { rich }
-    }
-}
-
-impl RatesSideEffectDispatcher for RatesToolRichEffects {
+impl RatesSideEffectDispatcher for RatesDelivery {
     type Error = RatesRichEffectError;
 
     fn dispatch_rates<'a>(
@@ -1363,144 +1355,44 @@ impl RatesSideEffectDispatcher for RatesToolRichEffects {
                 disable_notification: false,
                 reply_markup: None,
             };
-            let sent_message_id = self
-                .rich
-                .send_rich(meta.chat_id, &trimmed, &options)
+            let invocation = meta
+                .invocation_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RatesRichEffectError::Send(
+                        "rates tool invocation has no stable identity".into(),
+                    )
+                })?;
+            let source = format!("rates-tool:{}:{invocation}", meta.chat_id);
+            let receipt = self
+                .delivery
+                .enqueue(
+                    &source,
+                    options.message_thread_id,
+                    openplotva_telegram::SendRichMessage {
+                        chat_id: meta.chat_id,
+                        html: trimmed,
+                        options,
+                    },
+                    None,
+                )
                 .await
-                .map_err(|err| RatesRichEffectError::Send(err.to_string()))?;
+                .map_err(|error| RatesRichEffectError::Send(error.to_string()))?;
 
             Ok(RatesSideEffectDispatchResult {
                 kind: RATES_MESSAGE_KIND.to_owned(),
-                ticket_id: sent_message_id.to_string(),
+                ticket_id: receipt.batch_id.clone(),
                 eta: String::new(),
-                state: "executed".to_owned(),
-            })
-        })
-    }
-}
-
-/// Generator for async rates side-effect ticket IDs.
-pub type RatesTicketFactory = Arc<dyn Fn() -> String + Send + Sync>;
-
-/// Dispatcher-backed dialog-tool rates side effects.
-#[derive(Clone)]
-pub struct RatesToolDispatcherEffects {
-    queue: Arc<DispatcherQueue>,
-    next_virtual_id: RatesVirtualIdFactory,
-    next_ticket_id: RatesTicketFactory,
-}
-
-impl RatesToolDispatcherEffects {
-    /// Build dialog rates effects backed by the normal outbound dispatcher.
-    #[must_use]
-    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
-        Self {
-            queue,
-            next_virtual_id: monotonic_virtual_id_factory("rates-tool-vmsg"),
-            next_ticket_id: Arc::new(|| {
-                time::OffsetDateTime::now_utc()
-                    .unix_timestamp_nanos()
-                    .to_string()
-            }),
-        }
-    }
-
-    /// Override ID generation for deterministic tests.
-    #[must_use]
-    pub fn with_id_factories(
-        mut self,
-        next_virtual_id: RatesVirtualIdFactory,
-        next_ticket_id: RatesTicketFactory,
-    ) -> Self {
-        self.next_virtual_id = next_virtual_id;
-        self.next_ticket_id = next_ticket_id;
-        self
-    }
-}
-
-impl fmt::Debug for RatesToolDispatcherEffects {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RatesToolDispatcherEffects")
-            .finish_non_exhaustive()
-    }
-}
-
-impl RatesSideEffectDispatcher for RatesToolDispatcherEffects {
-    type Error = RatesToolDispatchEffectError;
-
-    fn dispatch_rates<'a>(
-        &'a self,
-        meta: RatesToolInvocationContext,
-        text: String,
-    ) -> RatesDispatchFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let trimmed = text.trim().to_owned();
-            if trimmed.is_empty() {
-                return Ok(RatesSideEffectDispatchResult {
-                    kind: RATES_MESSAGE_KIND.to_owned(),
-                    state: "noop".to_owned(),
-                    ..RatesSideEffectDispatchResult::default()
-                });
-            }
-
-            let chat = ChatRef {
-                direct_messages_topic_id: None,
-                id: meta.chat_id,
-                is_forum: meta.thread_id.is_some(),
-            };
-            let message = TextMessageRequest {
-                chat: Some(chat),
-                message_thread_id: meta.thread_id.map_or(0, i64::from),
-                disable_notification: false,
-                allow_sending_without_reply: None,
-                text: trimmed,
-                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-                reply_markup: None,
-            };
-            let reply_to = ReplyMessageRef {
-                message_id: i64::from(meta.message_id),
-                chat,
-                is_topic_message: meta.thread_id.is_some(),
-                message_thread_id: i64::from(meta.thread_id.unwrap_or_default()),
-            };
-            queue_text_message_parts(
-                &self.queue,
-                QueueTextRequest {
-                    protected: false,
-                    debounce_key: None,
-                    message: &message,
-                    reply_to: Some(&reply_to),
-                    immediate_first: false,
-                    bypass_chat_restrictions: false,
-                    ephemeral_delete_after: None,
-                },
-                || (self.next_virtual_id)(),
-            )
-            .await?;
-
-            let is_legacy = meta
-                .mode
-                .trim()
-                .eq_ignore_ascii_case(RATES_TOOL_MODE_LEGACY);
-            Ok(RatesSideEffectDispatchResult {
-                kind: RATES_MESSAGE_KIND.to_owned(),
-                ticket_id: if is_legacy {
-                    String::new()
+                state: if receipt.delivery_complete() {
+                    "executed"
                 } else {
-                    (self.next_ticket_id)()
-                },
-                eta: String::new(),
-                state: if is_legacy { "executed" } else { "queued" }.to_owned(),
+                    "queued"
+                }
+                .to_owned(),
             })
         })
     }
-}
-
-/// Recoverable errors from dispatcher-backed dialog rates side effects.
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum RatesToolDispatchEffectError {
-    #[error("failed to queue rates side effect: {0}")]
-    Queue(#[from] OutboundBuildError),
 }
 
 pub trait RatesSideEffectDispatcher {
@@ -1532,6 +1424,7 @@ pub struct RatesTextPlan {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RatesToolInvocationContext {
+    pub invocation_id: Option<String>,
     /// Telegram chat ID.
     pub chat_id: i64,
     /// Forum topic ID, when present.
@@ -1917,6 +1810,7 @@ pub fn format_dialog_rates_message(rates: &RatesSnapshot) -> String {
 #[must_use]
 pub fn dialog_rates_tool_context(meta: &ToolContext) -> RatesToolInvocationContext {
     RatesToolInvocationContext {
+        invocation_id: meta.invocation_id.clone(),
         chat_id: meta.chat_id,
         thread_id: meta.thread_id,
         message_id: meta.message_id,
@@ -2178,14 +2072,16 @@ mod tests {
     #[tokio::test]
     async fn rates_update_handler_sends_rich_message_payload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mock = Arc::new(crate::rich::MockRichSender::default());
+        let Some((delivery, pool, bot_id)) = live_rates_delivery().await? else {
+            return Ok(());
+        };
         let next = Arc::new(NextStub::default());
         let handler = RatesCommandUpdateHandler::new(
             bot_identity()?,
             Arc::new(PermissionStub::allowed()),
             Some(Arc::new(RatesFetcherStub::successful())),
             Arc::new(HeaderStub),
-            Arc::new(RatesRichEffects::new(mock.clone())),
+            Arc::new(RatesDelivery::new(delivery)),
             Arc::clone(&next),
         );
 
@@ -2194,22 +2090,44 @@ mod tests {
             .await?;
 
         assert!(next.calls().is_empty());
-        let sent = mock
-            .sent
-            .lock()
-            .expect("rates rich effects sent mutex should not be poisoned");
+        let sent: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM telegram_outbox WHERE bot_id = $1 ORDER BY part_index",
+        )
+        .bind(bot_id)
+        .fetch_all(&pool)
+        .await?;
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, -10042);
-        assert_eq!(sent[0].message_thread_id, Some(9));
-        assert_eq!(sent[0].reply_to_message_id, Some(82));
+        assert_eq!(sent[0]["chat_id"], -10042);
+        assert_eq!(sent[0]["options"]["message_thread_id"], 9);
+        assert_eq!(sent[0]["options"]["reply_to_message_id"], 82);
         assert!(
-            sent[0]
-                .html
-                .starts_with("<p>Header for Ada Lovelace</p><table")
+            sent[0]["html"]
+                .as_str()
+                .expect("rich html")
+                .starts_with("<p>Header for Ada Lovelace</p>\n\n<table")
         );
-        assert!(sent[0].html.contains("<td>💵 USD/RUB</td>"));
-        assert!(sent[0].html.contains("90.00 ₽"));
-        assert!(sent[0].html.contains("₿ BTC/USD"));
+        assert!(
+            sent[0]["html"]
+                .as_str()
+                .expect("rich html")
+                .contains("<td>💵 USD/RUB</td>")
+        );
+        assert!(
+            sent[0]["html"]
+                .as_str()
+                .expect("rich html")
+                .contains("90.00 ₽")
+        );
+        assert!(
+            sent[0]["html"]
+                .as_str()
+                .expect("rich html")
+                .contains("₿ BTC/USD")
+        );
+        sqlx::query("DELETE FROM telegram_outbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
@@ -2560,42 +2478,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rates_tool_dispatcher_queues_trimmed_html_side_effect()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = Arc::new(DispatcherQueue::new(Default::default()));
-        let dispatcher = RatesToolDispatcherEffects::new(Arc::clone(&queue)).with_id_factories(
-            Arc::new(|| "rates-vmsg-1".to_owned()),
-            Arc::new(|| "123456789".to_owned()),
-        );
-
-        let result = dispatcher
-            .dispatch_rates(
-                dialog_rates_tool_context(&tool_context()),
-                "  <b>rates</b>  ".to_owned(),
-            )
-            .await?;
-
-        assert_eq!(
-            result,
-            RatesSideEffectDispatchResult {
-                kind: RATES_MESSAGE_KIND.to_owned(),
-                ticket_id: "123456789".to_owned(),
-                eta: String::new(),
-                state: "queued".to_owned(),
-            }
-        );
-        let snapshot = queue.snapshot();
-        assert_eq!(snapshot.regular.len(), 1);
-        assert_eq!(snapshot.regular[0].virtual_id, "rates-vmsg-1");
-        assert!(snapshot.immediate.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn rates_tool_rich_dispatcher_sends_trimmed_rich_side_effect()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mock = Arc::new(crate::rich::MockRichSender::default());
-        let dispatcher = RatesToolRichEffects::new(mock.clone());
+        let Some((delivery, pool, bot_id)) = live_rates_delivery().await? else {
+            return Ok(());
+        };
+        let dispatcher = RatesDelivery::new(delivery);
 
         let result = dispatcher
             .dispatch_rates(
@@ -2604,36 +2492,51 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            result,
-            RatesSideEffectDispatchResult {
-                kind: RATES_MESSAGE_KIND.to_owned(),
-                ticket_id: "1001".to_owned(),
-                eta: String::new(),
-                state: "executed".to_owned(),
-            }
-        );
-        let sent = mock
-            .sent
-            .lock()
-            .expect("rates rich effects sent mutex should not be poisoned");
+        assert_eq!(result.state, "queued");
+        assert!(result.ticket_id.contains("rates-tool:"));
+        let replay = dispatcher
+            .dispatch_rates(
+                dialog_rates_tool_context(&tool_context()),
+                "a changed table".into(),
+            )
+            .await?;
+        assert_eq!(replay.ticket_id, result.ticket_id);
+        let sent: Vec<serde_json::Value> =
+            sqlx::query_scalar("SELECT payload FROM telegram_outbox WHERE bot_id = $1")
+                .bind(bot_id)
+                .fetch_all(&pool)
+                .await?;
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, -10042);
-        assert_eq!(sent[0].message_thread_id, Some(9));
-        assert_eq!(sent[0].reply_to_message_id, Some(77));
-        assert!(sent[0].allow_sending_without_reply);
+        assert_eq!(sent[0]["chat_id"], -10042);
+        assert_eq!(sent[0]["options"]["message_thread_id"], 9);
+        assert_eq!(sent[0]["options"]["reply_to_message_id"], 77);
+        assert_eq!(sent[0]["options"]["allow_sending_without_reply"], true);
         assert_eq!(
-            sent[0].html,
-            "<h3>Rates</h3><table><tr><td>USD/PLN</td></tr></table>"
+            sent[0]["html"],
+            "<h3>Rates</h3>\n\n<table><tr><td>USD/PLN</td></tr></table>"
         );
+        let mut distinct = dialog_rates_tool_context(&tool_context());
+        distinct.invocation_id = Some("another-call".into());
+        let distinct = dispatcher
+            .dispatch_rates(distinct, "a new table".into())
+            .await?;
+        assert_ne!(distinct.ticket_id, result.ticket_id);
+        sqlx::query("DELETE FROM telegram_outbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn rates_tool_dispatcher_empty_text_is_go_noop() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dispatcher =
-            RatesToolDispatcherEffects::new(Arc::new(DispatcherQueue::new(Default::default())));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@127.0.0.1:1/test")?;
+        let dispatcher = RatesDelivery::new(Arc::new(crate::rich::RichOutbox::new(
+            openplotva_storage::PostgresTelegramOutboxStore::new(pool),
+            7,
+        )));
 
         let result = dispatcher
             .dispatch_rates(
@@ -2720,8 +2623,31 @@ mod tests {
         serde_json::from_value(value)
     }
 
+    async fn live_rates_delivery()
+    -> Result<Option<(Arc<crate::rich::RichOutbox>, sqlx::PgPool, i64)>, Box<dyn std::error::Error>>
+    {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(None);
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let bot_id = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+        Ok(Some((
+            Arc::new(crate::rich::RichOutbox::new(
+                openplotva_storage::PostgresTelegramOutboxStore::new(pool.clone()),
+                bot_id,
+            )),
+            pool,
+            bot_id,
+        )))
+    }
+
     fn tool_context() -> ToolContext {
         ToolContext {
+            invocation_id: Some("dialog-job:42:tool:call-1".into()),
             chat_id: -10042,
             thread_id: Some(9),
             message_id: 77,

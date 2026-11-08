@@ -3,12 +3,14 @@
 use std::{error::Error as StdError, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use openplotva_config::{AppConfig, MemoryConfig, ShieldConfig};
+use openplotva_llm::redaction::{
+    DiscoveryRedactor, DiscoveryRedactorConfig, DiscoveryRedactorError,
+};
 use openplotva_llm::{
     aifarm::{
         AifarmClientConfig, AifarmMemoryExtractor, AifarmMemoryExtractorConfig,
         AifarmMemoryExtractorError, GenkitOpenAiCompatibleMemoryExtractor,
         GenkitOpenAiCompatibleMemoryExtractorConfig, GenkitOpenAiCompatibleMemoryExtractorError,
-        ReqwestAifarmTransport, normalize_chat_completions_url,
     },
     gemini::{
         GeminiMemoryExtractor, GeminiMemoryExtractorConfig, GeminiMemoryExtractorError,
@@ -17,10 +19,9 @@ use openplotva_llm::{
     retry::{FailureReason, retryable_reason, retryable_reason_from_message},
 };
 use openplotva_memory::{
-    Card, CardInput, DiscoveryRedactor, DiscoveryRedactorConfig, DiscoveryRedactorError, Episode,
-    ExtractInput, ExtractOutput, FallbackMemoryExtractor, FallbackMemoryExtractorError, LinkInput,
-    MemoryExtractor, MemoryExtractorFuture, RedactingMemoryExtractor, RunStats, TextRedactor,
-    TextRedactorFuture, redact_extract_output_with_async,
+    Card, CardInput, Episode, ExtractInput, ExtractOutput, LinkInput, MemoryExtractor,
+    MemoryExtractorFuture, RunStats, TextRedactor, TextRedactorFuture,
+    redact_extract_output_with_async,
 };
 use openplotva_storage::{
     DialogMemoryChatMeta, PgEmbeddingVector, PostgresMemoryStore, StorageError,
@@ -61,21 +62,6 @@ const EXISTING_USER_CARDS_LIMIT: i32 = 20;
 const EXISTING_PARTICIPANT_CARDS_MAX_USER: usize = 20;
 const RELATED_CARDS_LIMIT: i32 = 24;
 const RELATED_QUERY_MAX_CHARS: usize = 320;
-const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-
-type AifarmGenkitMemoryExtractor = FallbackMemoryExtractor<
-    AifarmMemoryExtractor<ReqwestAifarmTransport>,
-    AppGenkitMemoryExtractor,
-    fn(&AifarmMemoryExtractorError) -> bool,
->;
-
-type RedactingAifarmGenkitMemoryExtractor =
-    RedactingMemoryExtractor<AifarmGenkitMemoryExtractor, DiscoveryRedactor>;
-
-type RedactingAifarmRouteMemoryExtractor =
-    RedactingMemoryExtractor<AifarmRouteMemoryExtractor, DiscoveryRedactor>;
-
 /// Boxed future returned by embedding providers.
 pub type EmbeddingProviderFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<PgEmbeddingVector>, EmbedderClientError>> + Send + 'a>,
@@ -3796,198 +3782,6 @@ pub fn aifarm_memory_extractor_config_from_app_config_with_model(
     .with_defaults()
 }
 
-/// Build the reqwest-backed AIFarm memory extractor.
-#[must_use]
-pub fn aifarm_memory_extractor_from_app_config(
-    config: &AppConfig,
-) -> AifarmMemoryExtractor<ReqwestAifarmTransport> {
-    AifarmMemoryExtractor::new(aifarm_memory_extractor_config_from_app_config(config))
-}
-
-/// Build the reqwest-backed AIFarm memory extractor with an override model.
-#[must_use]
-pub fn aifarm_memory_extractor_from_app_config_with_model(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> AifarmMemoryExtractor<ReqwestAifarmTransport> {
-    AifarmMemoryExtractor::new(aifarm_memory_extractor_config_from_app_config_with_model(
-        config,
-        model_override,
-    ))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AifarmMemoryRouteBackendPlan {
-    pub label: String,
-    pub model: String,
-    pub service_name: String,
-    pub direct_url: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AifarmMemoryRoutePlan {
-    pub backends: Vec<AifarmMemoryRouteBackendPlan>,
-}
-
-struct AifarmRouteMemoryBackend {
-    plan: AifarmMemoryRouteBackendPlan,
-    extractor: AifarmMemoryExtractor<ReqwestAifarmTransport>,
-}
-
-pub struct AifarmRouteMemoryExtractor {
-    backends: Vec<AifarmRouteMemoryBackend>,
-}
-
-#[derive(Debug, Error)]
-pub enum AifarmRouteMemoryExtractorError {
-    #[error("memory extractor route has no available backends")]
-    NoBackends,
-    #[error("memory extractor backend {backend} failed: {source}")]
-    Backend {
-        backend: String,
-        #[source]
-        source: AifarmMemoryExtractorError,
-    },
-    #[error("memory extractor route exhausted retryable backends: {0}")]
-    Exhausted(String),
-}
-
-impl MemoryExtractor for AifarmRouteMemoryExtractor {
-    type Error = AifarmRouteMemoryExtractorError;
-
-    fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error> {
-        Box::pin(async move {
-            let mut retryable_errors = Vec::new();
-            let mut attempted = false;
-            for backend in &self.backends {
-                attempted = true;
-                match MemoryExtractor::extract(&backend.extractor, input).await {
-                    Ok(output) => return Ok(output),
-                    Err(source) if retryable_reason(&source).is_some() => {
-                        retryable_errors.push(format!("{}: {source}", backend.plan.label));
-                    }
-                    Err(source) => {
-                        return Err(AifarmRouteMemoryExtractorError::Backend {
-                            backend: backend.plan.label.clone(),
-                            source,
-                        });
-                    }
-                }
-            }
-            if !attempted {
-                return Err(AifarmRouteMemoryExtractorError::NoBackends);
-            }
-            Err(AifarmRouteMemoryExtractorError::Exhausted(
-                retryable_errors.join("\n"),
-            ))
-        })
-    }
-}
-
-#[must_use]
-pub fn aifarm_memory_route_plan_from_app_config(config: &AppConfig) -> AifarmMemoryRoutePlan {
-    AifarmMemoryRoutePlan {
-        backends: aifarm_memory_route_backend_configs_from_app_config(config, None)
-            .into_iter()
-            .map(|(plan, _)| plan)
-            .collect(),
-    }
-}
-
-fn aifarm_route_memory_extractor_from_app_config_with_model(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> AifarmRouteMemoryExtractor {
-    AifarmRouteMemoryExtractor {
-        backends: aifarm_memory_route_backend_configs_from_app_config(config, model_override)
-            .into_iter()
-            .map(|(plan, cfg)| AifarmRouteMemoryBackend {
-                plan,
-                extractor: AifarmMemoryExtractor::new(cfg),
-            })
-            .collect(),
-    }
-}
-
-fn aifarm_memory_route_backend_configs_from_app_config(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> Vec<(AifarmMemoryRouteBackendPlan, AifarmMemoryExtractorConfig)> {
-    let primary = aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
-    vec![(
-        aifarm_memory_route_backend_plan("primary", &primary),
-        primary,
-    )]
-}
-
-fn aifarm_memory_route_backend_plan(
-    label: impl Into<String>,
-    cfg: &AifarmMemoryExtractorConfig,
-) -> AifarmMemoryRouteBackendPlan {
-    AifarmMemoryRouteBackendPlan {
-        label: label.into(),
-        model: cfg.model.clone(),
-        service_name: cfg.client.service_name.clone(),
-        direct_url: cfg.client.direct_url.clone(),
-    }
-}
-
-/// App-owned GenKit memory extractor branch.
-pub enum AppGenkitMemoryExtractor {
-    /// Direct Gemini implementation.
-    Gemini(GeminiMemoryExtractor<ReqwestAifarmTransport>),
-    OpenAiCompatible(Box<GenkitOpenAiCompatibleMemoryExtractor<ReqwestAifarmTransport>>),
-}
-
-/// App-owned GenKit memory extractor error.
-#[derive(Debug, Error)]
-pub enum AppGenkitMemoryExtractorError {
-    /// Direct Gemini implementation failed.
-    #[error(transparent)]
-    Gemini(#[from] GeminiMemoryExtractorError),
-    /// OpenAI-compatible plugin implementation failed.
-    #[error(transparent)]
-    OpenAiCompatible(#[from] GenkitOpenAiCompatibleMemoryExtractorError),
-}
-
-impl MemoryExtractor for AppGenkitMemoryExtractor {
-    type Error = AppGenkitMemoryExtractorError;
-
-    fn extract<'a>(
-        &'a self,
-        input: &'a openplotva_memory::ExtractInput,
-    ) -> MemoryExtractorFuture<'a, Self::Error> {
-        Box::pin(async move {
-            match self {
-                Self::Gemini(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::OpenAiCompatible(extractor) => {
-                    MemoryExtractor::extract(extractor.as_ref(), input)
-                        .await
-                        .map_err(Into::into)
-                }
-            }
-        })
-    }
-}
-
-/// App-owned memory extractor composition.
-pub enum AppMemoryExtractor {
-    /// Plain AIFarm extractor without redaction.
-    Plain(AifarmMemoryExtractor<ReqwestAifarmTransport>),
-    Redacting(
-        RedactingMemoryExtractor<AifarmMemoryExtractor<ReqwestAifarmTransport>, DiscoveryRedactor>,
-    ),
-    AifarmFallback(AifarmGenkitMemoryExtractor),
-    RedactingAifarmFallback(RedactingAifarmGenkitMemoryExtractor),
-    AifarmRoute(AifarmRouteMemoryExtractor),
-    RedactingAifarmRoute(RedactingAifarmRouteMemoryExtractor),
-    /// Plain Gemini/GenKit extractor without redaction.
-    GeminiPlain(AppGenkitMemoryExtractor),
-    GeminiRedacting(RedactingMemoryExtractor<AppGenkitMemoryExtractor, DiscoveryRedactor>),
-}
-
 #[derive(Clone)]
 pub struct RoutedMemoryExtractor {
     walker: RoutedAttemptWalker,
@@ -4055,7 +3849,7 @@ impl RoutedDiscoveryRedactor {
 #[derive(Debug, Error)]
 pub enum RoutedDiscoveryRedactorError {
     #[error(transparent)]
-    Build(#[from] reqwest::Error),
+    Transport(#[from] openplotva_llm::retry::ProviderError),
     #[error(transparent)]
     Redactor(#[from] DiscoveryRedactorError),
     #[error(transparent)]
@@ -4105,11 +3899,11 @@ impl TextRedactor for RoutedDiscoveryRedactor {
 #[derive(Debug, Error)]
 pub enum RoutedMemoryExtractorError {
     #[error(transparent)]
-    Build(#[from] AppMemoryExtractorBuildError),
-    #[error(transparent)]
     Aifarm(#[from] AifarmMemoryExtractorError),
     #[error(transparent)]
-    Genkit(#[from] AppGenkitMemoryExtractorError),
+    Gemini(#[from] GeminiMemoryExtractorError),
+    #[error(transparent)]
+    OpenAiCompatible(#[from] GenkitOpenAiCompatibleMemoryExtractorError),
     #[error(transparent)]
     Routing(#[from] RoutedRoutingError),
 }
@@ -4269,25 +4063,17 @@ async fn redact_text_with_routed_attempt(
     attempt: RoutedAttempt,
     text: &str,
 ) -> Result<String, RoutedDiscoveryRedactorError> {
-    let Some(mut cfg) = discovery_redactor_config_from_app_config(config) else {
+    let Some(cfg) = discovery_redactor_config_from_app_config(config) else {
         return Ok(text.to_owned());
     };
-    if let Some(endpoint) = routed_attempt_endpoint(&attempt) {
-        cfg.base_url = endpoint;
-    }
-    if let Some(service) = attempt.discovery_service_name.as_deref() {
-        cfg.service_name = service.to_owned();
-    }
-    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
-        cfg.endpoint_name = endpoint.to_owned();
-    }
+    let cfg = crate::provider_transport::redactor_config_for_attempt(&attempt, cfg)?;
     let redactor = DiscoveryRedactor::with_client(cfg, http);
     redactor.redact_text(text).await.map_err(Into::into)
 }
 
 fn routed_redactor_retryable_reason(error: &RoutedDiscoveryRedactorError) -> Option<FailureReason> {
     match error {
-        RoutedDiscoveryRedactorError::Build(_) => Some(FailureReason::ProviderUnavailable),
+        RoutedDiscoveryRedactorError::Transport(error) => Some(error.reason()),
         RoutedDiscoveryRedactorError::Redactor(error) => {
             retryable_reason_from_message(&error.to_string())
         }
@@ -4300,15 +4086,44 @@ async fn extract_memory_with_routed_attempt(
     attempt: RoutedAttempt,
     input: &ExtractInput,
 ) -> Result<ExtractOutput, RoutedMemoryExtractorError> {
-    if routed_attempt_is_genkit(&attempt) {
-        let model = genkit_model_for_attempt(&attempt);
-        let extractor = genkit_memory_extractor_from_app_config_with_model(config, Some(&model))?;
-        return MemoryExtractor::extract(&extractor, input)
-            .await
-            .map_err(Into::into);
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit) {
+        let (api_key, base_url) = crate::provider_transport::gemini_endpoint_for_attempt(
+            config, &attempt,
+        )
+        .map_err(|source| AifarmMemoryExtractorError::Completion {
+            source: Box::new(source),
+        })?;
+        let extractor = GeminiMemoryExtractor::new(GeminiMemoryExtractorConfig {
+            api_key,
+            base_url,
+            model: attempt.model_name.clone(),
+            request_timeout: positive_seconds(config.memory.consolidation_timeout_seconds),
+            ..GeminiMemoryExtractorConfig::default()
+        });
+        return extractor.extract(input).await.map_err(Into::into);
+    }
+    if crate::provider_transport::is_openrouter(&attempt) {
+        let client = crate::provider_transport::openai_client_for_attempt(
+            config,
+            &attempt,
+            AifarmClientConfig::default(),
+        )
+        .map_err(|source| AifarmMemoryExtractorError::Completion {
+            source: Box::new(source),
+        })?;
+        let extractor = GenkitOpenAiCompatibleMemoryExtractor::new(
+            GenkitOpenAiCompatibleMemoryExtractorConfig {
+                direct_url: client.direct_url,
+                api_key: client.api_key,
+                model: client.default_model,
+                request_timeout: client.request_timeout,
+                ..GenkitOpenAiCompatibleMemoryExtractorConfig::default()
+            },
+        );
+        return extractor.extract(input).await.map_err(Into::into);
     }
 
-    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt)?);
     MemoryExtractor::extract(&extractor, input)
         .await
         .map_err(Into::into)
@@ -4319,10 +4134,12 @@ async fn resolve_candidates_with_routed_attempt(
     attempt: RoutedAttempt,
     input: &openplotva_memory::ResolutionInput,
 ) -> Result<Option<openplotva_memory::ResolutionPlan>, RoutedMemoryExtractorError> {
-    if routed_attempt_is_genkit(&attempt) {
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit)
+        || crate::provider_transport::is_openrouter(&attempt)
+    {
         return Ok(None);
     }
-    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt)?);
     MemoryExtractor::resolve(&extractor, input)
         .await
         .map_err(Into::into)
@@ -4333,12 +4150,14 @@ async fn merge_subject_with_routed_attempt(
     attempt: RoutedAttempt,
     input: &openplotva_memory::SubjectMergeInput,
 ) -> Result<openplotva_memory::SubjectMergePlan, RoutedSubjectMergerAttemptError> {
-    if routed_attempt_is_genkit(&attempt) {
+    if attempt.protocol == Some(openplotva_llm::provider_schema::Protocol::Genkit)
+        || crate::provider_transport::is_openrouter(&attempt)
+    {
         return Err(RoutedSubjectMergerAttemptError::UnsupportedProvider(
             attempt.provider_name,
         ));
     }
-    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt)?);
     openplotva_memory::SubjectMerger::merge_subject(&extractor, input)
         .await
         .map_err(Into::into)
@@ -4353,62 +4172,19 @@ fn routed_subject_merger_retryable_reason(
     }
 }
 
-fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
-    attempt.provider_name.eq_ignore_ascii_case("genkit")
-        || attempt.provider_name.eq_ignore_ascii_case("gemini")
-        || attempt.provider_name.eq_ignore_ascii_case("openrouter")
-}
-
-fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
-    if attempt.provider_name.eq_ignore_ascii_case("openrouter")
-        && !attempt
-            .model_name
-            .get(..OPENROUTER_MODEL_PREFIX.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
-    {
-        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
-    } else {
-        attempt.model_name.clone()
-    }
-}
-
 fn aifarm_memory_config_for_attempt(
     config: &AppConfig,
     attempt: &RoutedAttempt,
-) -> AifarmMemoryExtractorConfig {
+) -> Result<AifarmMemoryExtractorConfig, AifarmMemoryExtractorError> {
     let mut cfg = aifarm_memory_extractor_config_from_app_config_with_model(
         config,
         Some(attempt.model_name.trim()),
     );
-    cfg.client.default_model = attempt.model_name.clone();
-    cfg.client.api_key = crate::dialog_runtime::resolve_provider_api_key(
-        attempt.provider_api_key_ref.as_deref(),
-        attempt.provider_api_key_encrypted.as_deref(),
-    )
-    .unwrap_or_default();
-
-    if let Some(endpoint) = routed_attempt_endpoint(attempt) {
-        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
-            cfg.client.base_url = endpoint;
-        } else {
-            cfg.client.direct_url = normalize_chat_completions_url(&endpoint);
-            if attempt
-                .provider_name
-                .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
-            {
-                cfg.client.api_key = config.llm.dialog.aifarm_pool_api_key.clone();
-            }
-        }
-    }
-    if let Some(service) = attempt.discovery_service_name.as_deref() {
-        cfg.client.service_name = service.to_owned();
-    }
-    cfg.client.runtime_hint = attempt.provider_runtime_hint.clone().unwrap_or_default();
-    cfg.client.supports_message_name = attempt.supports_message_name();
-    cfg.client.supports_cache_control = attempt.supports_cache_control();
-    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
-        cfg.client.endpoint_name = endpoint.to_owned();
-    }
+    cfg.client = crate::provider_transport::openai_client_for_attempt(config, attempt, cfg.client)
+        .map_err(|source| AifarmMemoryExtractorError::Completion {
+            source: Box::new(source),
+        })?;
+    cfg.model.clone_from(&cfg.client.default_model);
     if let Some(max_tokens) = attempt.overrides.max_tokens
         && max_tokens > 0
     {
@@ -4435,17 +4211,7 @@ fn aifarm_memory_config_for_attempt(
     if let Some(include_reasoning) = routed_bool_override(attempt, "include_reasoning") {
         cfg.include_reasoning = Some(include_reasoning);
     }
-    cfg.with_defaults()
-}
-
-fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
-    attempt
-        .model_base_url
-        .as_deref()
-        .or(attempt.provider_endpoint.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    Ok(cfg.with_defaults())
 }
 
 fn routed_bool_override(attempt: &RoutedAttempt, key: &str) -> Option<bool> {
@@ -4454,190 +4220,6 @@ fn routed_bool_override(attempt: &RoutedAttempt, key: &str) -> Option<bool> {
 
 fn routed_f64_override(attempt: &RoutedAttempt, key: &str) -> Option<f64> {
     attempt.overrides.extra.get(key).and_then(Value::as_f64)
-}
-
-/// App memory extractor build error.
-#[derive(Debug, Error)]
-pub enum AppMemoryExtractorBuildError {
-    /// HTTP client construction failed.
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
-    #[error("unsupported memory consolidation provider {0:?}")]
-    UnsupportedProvider(String),
-    /// Gemini/GenKit provider was requested without an active Google AI key.
-    #[error("google ai key is required for genkit memory extractor")]
-    GoogleAiKeyRequired,
-    /// GenKit OpenAI-compatible provider was requested without its API key.
-    #[error("{provider} api key is required for genkit memory extractor")]
-    ProviderApiKeyRequired {
-        /// Provider name.
-        provider: &'static str,
-    },
-}
-
-/// App memory extractor runtime error.
-#[derive(Debug, Error)]
-pub enum AppMemoryExtractorError {
-    /// AIFarm extraction failed.
-    #[error(transparent)]
-    Aifarm(#[from] openplotva_llm::aifarm::AifarmMemoryExtractorError),
-    /// Gemini/GenKit extraction failed.
-    #[error(transparent)]
-    Gemini(#[from] AppGenkitMemoryExtractorError),
-    /// AIFarm primary failed retryably and Gemini/GenKit fallback failed too, or AIFarm failed terminally.
-    #[error(transparent)]
-    AifarmFallback(
-        #[from]
-        FallbackMemoryExtractorError<AifarmMemoryExtractorError, AppGenkitMemoryExtractorError>,
-    ),
-    #[error(transparent)]
-    AifarmRoute(#[from] AifarmRouteMemoryExtractorError),
-}
-
-impl MemoryExtractor for AppMemoryExtractor {
-    type Error = AppMemoryExtractorError;
-
-    fn extract<'a>(
-        &'a self,
-        input: &'a openplotva_memory::ExtractInput,
-    ) -> MemoryExtractorFuture<'a, Self::Error> {
-        Box::pin(async move {
-            match self {
-                Self::Plain(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::Redacting(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::AifarmFallback(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::RedactingAifarmFallback(extractor) => {
-                    MemoryExtractor::extract(extractor, input)
-                        .await
-                        .map_err(Into::into)
-                }
-                Self::AifarmRoute(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::RedactingAifarmRoute(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::GeminiPlain(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-                Self::GeminiRedacting(extractor) => MemoryExtractor::extract(extractor, input)
-                    .await
-                    .map_err(Into::into),
-            }
-        })
-    }
-}
-
-pub fn memory_extractor_from_app_config(
-    config: &AppConfig,
-) -> Result<AppMemoryExtractor, AppMemoryExtractorBuildError> {
-    memory_extractor_from_app_config_with_override(config, None, None)
-}
-
-#[must_use]
-pub fn routed_memory_extractor_from_app_config(
-    config: &AppConfig,
-    walker: RoutedAttemptWalker,
-) -> RoutedMemoryExtractor {
-    RoutedMemoryExtractor::new(walker, config)
-}
-
-#[must_use]
-pub fn routed_subject_merger_from_app_config(
-    config: &AppConfig,
-    walker: RoutedAttemptWalker,
-) -> RoutedSubjectMerger {
-    RoutedSubjectMerger::new(walker, config)
-}
-
-pub fn memory_extractor_from_app_config_with_model(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> Result<AppMemoryExtractor, AppMemoryExtractorBuildError> {
-    memory_extractor_from_app_config_with_override(config, None, model_override)
-}
-
-/// Build app memory extractor with optional provider/model override and optional redaction.
-pub fn memory_extractor_from_app_config_with_override(
-    config: &AppConfig,
-    provider_override: Option<&str>,
-    model_override: Option<&str>,
-) -> Result<AppMemoryExtractor, AppMemoryExtractorBuildError> {
-    let provider = memory_extractor_provider(config, provider_override);
-    match provider.as_str() {
-        "aifarm" => {
-            let extractor =
-                aifarm_route_memory_extractor_from_app_config_with_model(config, model_override);
-            let redactor = discovery_redactor_from_app_config(config)?;
-            if let Some(redactor) = redactor {
-                Ok(AppMemoryExtractor::RedactingAifarmRoute(
-                    RedactingMemoryExtractor::new(extractor, redactor),
-                ))
-            } else {
-                Ok(AppMemoryExtractor::AifarmRoute(extractor))
-            }
-        }
-        "genkit" | "gemini" => {
-            let extractor =
-                genkit_memory_extractor_from_app_config_with_model(config, model_override)?;
-            if let Some(redactor) = discovery_redactor_from_app_config(config)? {
-                Ok(AppMemoryExtractor::GeminiRedacting(
-                    RedactingMemoryExtractor::new(extractor, redactor),
-                ))
-            } else {
-                Ok(AppMemoryExtractor::GeminiPlain(extractor))
-            }
-        }
-        other => Err(AppMemoryExtractorBuildError::UnsupportedProvider(
-            other.to_owned(),
-        )),
-    }
-}
-
-fn memory_extractor_provider(config: &AppConfig, provider_override: Option<&str>) -> String {
-    let provider = provider_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| config.memory.consolidation_provider.trim())
-        .to_ascii_lowercase();
-    if provider.is_empty() {
-        "aifarm".to_owned()
-    } else {
-        provider
-    }
-}
-
-/// Build the reqwest-backed Gemini/GenKit memory extractor with an optional override model.
-pub fn genkit_memory_extractor_from_app_config_with_model(
-    config: &AppConfig,
-    model_override: Option<&str>,
-) -> Result<AppGenkitMemoryExtractor, AppMemoryExtractorBuildError> {
-    let model = genkit_memory_extractor_model(config, model_override);
-    if let Some(cfg) =
-        genkit_openai_compatible_memory_extractor_config_from_app_config(config, &model)?
-    {
-        return Ok(AppGenkitMemoryExtractor::OpenAiCompatible(Box::new(
-            GenkitOpenAiCompatibleMemoryExtractor::new(cfg),
-        )));
-    }
-    let api_key = resolve_google_ai_key(&config.google_ai);
-    if api_key.trim().is_empty() {
-        return Err(AppMemoryExtractorBuildError::GoogleAiKeyRequired);
-    }
-    Ok(AppGenkitMemoryExtractor::Gemini(
-        GeminiMemoryExtractor::new(GeminiMemoryExtractorConfig {
-            api_key,
-            model,
-            request_timeout: positive_seconds(config.memory.consolidation_timeout_seconds),
-            ..GeminiMemoryExtractorConfig::default()
-        }),
-    ))
 }
 
 #[must_use]
@@ -4662,45 +4244,6 @@ pub fn genkit_runtime_default_model(config: &AppConfig) -> String {
     } else {
         MODEL_GEMINI_FLASH_FALLBACK.to_owned()
     }
-}
-
-fn genkit_openai_compatible_memory_extractor_config_from_app_config(
-    config: &AppConfig,
-    model: &str,
-) -> Result<Option<GenkitOpenAiCompatibleMemoryExtractorConfig>, AppMemoryExtractorBuildError> {
-    let model = model.trim();
-    let (direct_url, api_key, model, request_timeout_seconds, provider) =
-        if let Some(model) = strip_provider_prefix_fold(model, OPENROUTER_MODEL_PREFIX) {
-            (
-                OPENROUTER_CHAT_COMPLETIONS_URL,
-                config.open_router.key.trim().to_owned(),
-                model.trim().to_owned(),
-                config.open_router.request_timeout_seconds,
-                "openrouter",
-            )
-        } else {
-            return Ok(None);
-        };
-    if model.is_empty() {
-        return Ok(None);
-    }
-    if api_key.trim().is_empty() {
-        return Err(AppMemoryExtractorBuildError::ProviderApiKeyRequired { provider });
-    }
-    Ok(Some(GenkitOpenAiCompatibleMemoryExtractorConfig {
-        direct_url: direct_url.to_owned(),
-        api_key,
-        model,
-        request_timeout: positive_seconds(request_timeout_seconds),
-        ..GenkitOpenAiCompatibleMemoryExtractorConfig::default()
-    }))
-}
-
-fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        .then(|| &value[prefix.len()..])
 }
 
 #[must_use]
@@ -4748,15 +4291,6 @@ pub fn discovery_redactor_config_from_app_config(
         }
         .with_defaults(),
     )
-}
-
-/// Build the reqwest-backed Discovery privacy-filter redactor.
-pub fn discovery_redactor_from_app_config(
-    config: &AppConfig,
-) -> Result<Option<DiscoveryRedactor>, reqwest::Error> {
-    discovery_redactor_config_from_app_config(config)
-        .map(DiscoveryRedactor::new)
-        .transpose()
 }
 
 #[must_use]
@@ -4809,6 +4343,77 @@ fn runtime_memory_restart_model(model: &str) -> String {
     }
 }
 
+pub(crate) fn build_memory_retention_worker_group(
+    store: &PostgresMemoryStore,
+    stops: &crate::RuntimeWorkerStops,
+) -> (
+    crate::RuntimeWorkerGroup,
+    Vec<openplotva_server::ReadinessCheck>,
+) {
+    use crate::{RuntimeWorkerGroup, RuntimeWorkerPhase, wait_for_runtime_stop};
+    use openplotva_server::ReadinessCheck;
+    let mut group = RuntimeWorkerGroup::new(RuntimeWorkerPhase::Ancillary);
+    let mut readiness = Vec::with_capacity(3);
+
+    let archival_store = store.clone();
+    let archival_stop = stops.subscribe(RuntimeWorkerPhase::Ancillary);
+    let worker = tokio::spawn(async move {
+        let report = run_memory_card_archival_worker_until(
+            archival_store,
+            MEMORY_CARD_ARCHIVAL_INTERVAL,
+            MEMORY_CARD_ARCHIVAL_BATCH,
+            wait_for_runtime_stop(archival_stop),
+        )
+        .await;
+        tracing::info!(?report, "memory card archival worker stopped");
+    });
+    readiness.push(ReadinessCheck::ok(
+        "memory_card_archival",
+        "Expired memory cards archived hourly (durability-based forgetting)",
+    ));
+    group.register("memory-card-archival", worker);
+
+    let decay_store = store.clone();
+    let decay_stop = stops.subscribe(RuntimeWorkerPhase::Ancillary);
+    let decay_worker = tokio::spawn(async move {
+        let report = run_memory_card_decay_worker_until(
+            decay_store,
+            MEMORY_CARD_DECAY_INTERVAL,
+            MEMORY_CARD_DECAY_BATCH,
+            MEMORY_CARD_DECAY_GRACE_DAYS,
+            MEMORY_CARD_DECAY_SALIENCE_MAX,
+            MEMORY_CARD_DECAY_COLD_DAYS,
+            wait_for_runtime_stop(decay_stop),
+        )
+        .await;
+        tracing::info!(?report, "memory card decay worker stopped");
+    });
+    readiness.push(ReadinessCheck::ok(
+        "memory_card_decay",
+        "Cold never-expiring cards given a grace TTL (bounded forgetting)",
+    ));
+    group.register("memory-card-decay", decay_worker);
+
+    let collapse_store = store.clone();
+    let collapse_stop = stops.subscribe(RuntimeWorkerPhase::Ancillary);
+    let collapse_worker = tokio::spawn(async move {
+        let report = run_memory_duplicate_collapse_worker_until(
+            collapse_store,
+            MEMORY_DUP_COLLAPSE_INTERVAL,
+            MEMORY_DUP_COLLAPSE_GROUP_LIMIT,
+            wait_for_runtime_stop(collapse_stop),
+        )
+        .await;
+        tracing::info!(?report, "memory duplicate collapse worker stopped");
+    });
+    readiness.push(ReadinessCheck::ok(
+        "memory_dup_collapse",
+        "Exact-duplicate memory cards collapsed every 6h (off-hours backlog cleanup)",
+    ));
+    group.register("memory-duplicate-collapse", collapse_worker);
+    (group, readiness)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4827,6 +4432,7 @@ mod tests {
         let path = std::env::var("PATH").expect("test process PATH");
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
         let attempt = RoutedAttempt {
+            protocol: Some(openplotva_llm::provider_schema::Protocol::OpenAiCompat),
             provider_id: 7,
             model_id: 11,
             provider_name: "aifarm-ninfer-gpu2".to_owned(),
@@ -4845,7 +4451,7 @@ mod tests {
             variant: None,
         };
 
-        let routed = aifarm_memory_config_for_attempt(&config, &attempt);
+        let routed = aifarm_memory_config_for_attempt(&config, &attempt).expect("config");
 
         assert_eq!(routed.client.api_key, path);
     }
@@ -5759,36 +5365,6 @@ mod tests {
         assert_eq!(cfg.enqueue_policy.min_messages_per_run, 21);
     }
 
-    #[test]
-    fn aifarm_memory_route_plan_ignores_hidden_pool_backends() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_aifarm_pool_models: Some("pool-a,pool-b".to_owned()),
-            dialog_aifarm_pool_base_urls: Some(
-                "https://pool-a.test/v1,https://pool-b.test/v1/chat/completions".to_owned(),
-            ),
-            dialog_aifarm_pool_api_key: Some("pool-key".to_owned()),
-            llm_provider_names: Some("qwen-reasoner".to_owned()),
-            llm_provider_kinds: Some("aifarm".to_owned()),
-            llm_provider_discovery_service_names: Some("custom-qwen".to_owned()),
-            llm_provider_models: Some("custom-qwen-model".to_owned()),
-            memory_consolidation_model: Some("primary-memory".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let plan = aifarm_memory_route_plan_from_app_config(&config);
-
-        assert_eq!(
-            plan.backends
-                .iter()
-                .map(|backend| backend.label.as_str())
-                .collect::<Vec<_>>(),
-            vec!["primary"]
-        );
-        assert_eq!(plan.backends[0].service_name, "llm-openai");
-        assert_eq!(plan.backends[0].model, "primary-memory");
-    }
-
     #[tokio::test]
     async fn runtime_memory_restarter_retries_specific_run_and_triggers_worker() {
         let trigger = Arc::new(tokio::sync::Notify::new());
@@ -5887,7 +5463,7 @@ mod tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(2));
         assert_eq!(
             cfg.capacity_wait,
-            openplotva_memory::DEFAULT_MEMORY_REDACTION_CAPACITY_WAIT
+            openplotva_llm::redaction::DEFAULT_MEMORY_REDACTION_CAPACITY_WAIT
         );
         assert_eq!(cfg.capacity_poll_interval, Duration::from_secs(3));
         assert_eq!(cfg.categories, vec!["private_email", "secret"]);
@@ -5902,139 +5478,6 @@ mod tests {
         .expect("config");
 
         assert!(discovery_redactor_config_from_app_config(&config).is_none());
-    }
-
-    #[test]
-    fn app_memory_extractor_composes_fail_open_redaction_when_enabled() {
-        let redacting = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_redaction_enabled: Some("true".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("redacting config");
-        let plain = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_redaction_enabled: Some("false".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("plain config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&redacting).expect("redacting extractor"),
-            AppMemoryExtractor::RedactingAifarmRoute(_)
-        ));
-        assert!(matches!(
-            memory_extractor_from_app_config(&plain).expect("plain extractor"),
-            AppMemoryExtractor::AifarmRoute(_)
-        ));
-    }
-
-    #[test]
-    fn app_memory_extractor_keeps_aifarm_route_when_google_key_resolves() {
-        let plain = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some(" google-key ".to_owned()),
-            memory_redaction_enabled: Some("false".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("plain config");
-        let redacting = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some(" google-key ".to_owned()),
-            memory_redaction_enabled: Some("true".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("redacting config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&plain).expect("route extractor"),
-            AppMemoryExtractor::AifarmRoute(_)
-        ));
-        assert!(matches!(
-            memory_extractor_from_app_config_with_override(
-                &redacting,
-                Some("aifarm"),
-                Some(" override-model ")
-            )
-            .expect("redacting route extractor"),
-            AppMemoryExtractor::RedactingAifarmRoute(_)
-        ));
-    }
-
-    #[test]
-    fn app_memory_extractor_builds_genkit_gemini_when_configured() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_consolidation_provider: Some(" genkit ".to_owned()),
-            memory_redaction_enabled: Some("false".to_owned()),
-            googleai_key: Some(" google-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&config).expect("gemini extractor"),
-            AppMemoryExtractor::GeminiPlain(_)
-        ));
-        assert_eq!(
-            genkit_memory_extractor_model(&config, None),
-            MODEL_GEMINI_FLASH_LITE
-        );
-        assert_eq!(
-            genkit_memory_extractor_model(&config, Some(" custom-model ")),
-            "custom-model"
-        );
-    }
-
-    #[test]
-    fn app_memory_extractor_builds_genkit_openai_compatible_models() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_consolidation_provider: Some(" genkit ".to_owned()),
-            memory_redaction_enabled: Some("false".to_owned()),
-            genkit_default_model: Some(" openrouter/provider-model ".to_owned()),
-            openrouter_key: Some(" openrouter-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&config).expect("openrouter extractor"),
-            AppMemoryExtractor::GeminiPlain(AppGenkitMemoryExtractor::OpenAiCompatible(_))
-        ));
-        assert_eq!(
-            genkit_memory_extractor_model(&config, None),
-            "openrouter/provider-model"
-        );
-    }
-
-    #[test]
-    fn app_memory_extractor_requires_google_key_for_genkit() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_consolidation_provider: Some("gemini".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&config),
-            Err(AppMemoryExtractorBuildError::GoogleAiKeyRequired)
-        ));
-        assert_eq!(
-            genkit_memory_extractor_model(&config, None),
-            MODEL_GEMINI_FLASH_FALLBACK
-        );
-    }
-
-    #[test]
-    fn app_memory_extractor_requires_plugin_key_for_genkit_openai_compatible_models() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_consolidation_provider: Some("genkit".to_owned()),
-            genkit_default_model: Some("openrouter/provider-model".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        assert!(matches!(
-            memory_extractor_from_app_config(&config),
-            Err(AppMemoryExtractorBuildError::ProviderApiKeyRequired {
-                provider: "openrouter"
-            })
-        ));
     }
 
     #[test]

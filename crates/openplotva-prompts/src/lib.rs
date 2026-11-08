@@ -541,9 +541,14 @@ mod tests {
 
     impl TestPromptRoot {
         fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let directory_id = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let root = std::env::temp_dir()
-                .join(format!("openplotva-prompts-{}-{nonce}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "openplotva-prompts-{}-{nonce}-{directory_id}",
+                std::process::id()
+            ));
             fs::create_dir_all(&root)?;
             Ok(Self(root))
         }

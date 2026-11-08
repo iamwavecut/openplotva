@@ -13,10 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::media::{
-    aifarm_structured_json_config_for_attempt, gateway_structured_json_config_for_attempt,
-    routed_attempt_is_genkit,
-};
+use crate::media::aifarm_structured_json_config_for_attempt;
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
@@ -179,12 +176,8 @@ async fn translate_with_attempt(
     attempt: &RoutedAttempt,
     request: AifarmStructuredJsonRequest,
 ) -> Result<String, LlmTranslationError> {
-    let cfg = if routed_attempt_is_genkit(attempt) {
-        gateway_structured_json_config_for_attempt(config, attempt)
-            .ok_or_else(|| LlmTranslationError::Unavailable(attempt.provider_name.clone()))?
-    } else {
-        aifarm_structured_json_config_for_attempt(config, attempt)
-    };
+    let cfg = aifarm_structured_json_config_for_attempt(config, attempt)
+        .map_err(|error| LlmTranslationError::Routing(error.to_string()))?;
     let content = AifarmStructuredJsonGenerator::new(cfg)
         .generate_json(request, &mut |_| {})
         .await?;

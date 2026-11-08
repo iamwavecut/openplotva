@@ -17,6 +17,8 @@ use openplotva_llm::router::{
     ProviderRow, RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
 };
 use openplotva_storage::StorageError;
+use openplotva_storage::app_settings::{app_setting_present, upsert_app_setting};
+use openplotva_storage::llm_routing::begin_bootstrap_update;
 use openplotva_storage::llm_routing::{
     AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, ProviderRecord,
     RoutingSnapshot, TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model,
@@ -25,7 +27,7 @@ use openplotva_storage::llm_routing::{
     update_provider,
 };
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 /// Read the snapshot and build a routing table in one step.
 pub async fn load_routing_table(pool: &PgPool) -> Result<RoutingTable, StorageError> {
@@ -53,43 +55,16 @@ pub const PROTOCOL_DISCOVERY_DRAW: &str = "discovery_draw";
 pub const PROTOCOL_DISCOVERY_ASR: &str = "discovery_asr";
 pub const PROTOCOL_PRIVACY_FILTER: &str = "privacy_filter";
 
-async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
-    let row = sqlx::query("SELECT value FROM app_settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.is_some())
-}
-
-async fn mark_app_setting(pool: &PgPool, key: &str) -> Result<(), StorageError> {
-    sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ($1, '1', NOW()) \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-    )
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-async fn already_seeded(pool: &PgPool) -> Result<bool, StorageError> {
-    app_setting_present(pool, SEEDED_KEY).await
-}
-
-async fn mark_seeded(pool: &PgPool) -> Result<(), StorageError> {
-    mark_app_setting(pool, SEEDED_KEY).await
-}
-
 /// Insert one provider plus one model and return their ids.
 async fn seed_provider_model(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     provider: ProviderInput,
     model_name: &str,
     base_url: Option<&str>,
     capabilities: &[&str],
     embedding_dim: Option<i32>,
 ) -> Result<i64, StorageError> {
-    let provider_id = insert_provider(pool, &provider).await?;
+    let provider_id = insert_provider(&mut *pool, &provider).await?;
     let model = ModelInput {
         provider_id,
         model_name: model_name.to_owned(),
@@ -101,7 +76,7 @@ async fn seed_provider_model(
         enabled: true,
         config: json!({}),
     };
-    insert_model(pool, &model).await
+    insert_model(&mut *pool, &model).await
 }
 
 fn chat_provider(
@@ -134,13 +109,13 @@ fn chat_provider(
 }
 
 async fn seed_primary(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     workflow: &str,
     model_id: i64,
     weight: Option<i32>,
 ) -> Result<i64, StorageError> {
     insert_assignment(
-        pool,
+        &mut *pool,
         &AssignmentInput {
             workflow_key: workflow.to_owned(),
             scope: "global".to_owned(),
@@ -171,7 +146,10 @@ pub async fn seed_routing_from_env(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if already_seeded(pool).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, SEEDED_KEY).await? {
         return Ok(false);
     }
 
@@ -321,7 +299,7 @@ pub async fn seed_routing_from_env(
     // --- dialog: weighted primary + ordered fallback + queue-depth overflow ---
     seed_primary(pool, "dialog", aifarm_model, Some(100)).await?;
     insert_assignment(
-        pool,
+        &mut *pool,
         &AssignmentInput {
             workflow_key: "dialog".to_owned(),
             scope: "global".to_owned(),
@@ -338,7 +316,7 @@ pub async fn seed_routing_from_env(
     )
     .await?;
     let overflow_assignment = insert_assignment(
-        pool,
+        &mut *pool,
         &AssignmentInput {
             workflow_key: "dialog".to_owned(),
             scope: "global".to_owned(),
@@ -355,7 +333,7 @@ pub async fn seed_routing_from_env(
     )
     .await?;
     insert_trigger(
-        pool,
+        &mut *pool,
         &TriggerInput {
             workflow_key: "dialog".to_owned(),
             trigger_type: "queue_depth".to_owned(),
@@ -389,7 +367,8 @@ pub async fn seed_routing_from_env(
         seed_primary(pool, workflow, aifarm_model, None).await?;
     }
 
-    mark_seeded(pool).await?;
+    upsert_app_setting(&mut *pool, SEEDED_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("seeded LLM routing tables from env configuration");
     Ok(true)
 }
@@ -422,7 +401,9 @@ pub async fn backfill_vram_cloud_from_env(
     if dialog.aifarm_pool_models.is_empty() {
         return Ok(false);
     }
-    if list_providers(pool)
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+    if list_providers(&mut *pool)
         .await?
         .iter()
         .any(|p| p.name == VRAM_CLOUD_PROVIDER)
@@ -431,7 +412,7 @@ pub async fn backfill_vram_cloud_from_env(
     }
 
     let provider_id = insert_provider(
-        pool,
+        &mut *pool,
         &ProviderInput {
             name: VRAM_CLOUD_PROVIDER.to_owned(),
             kind: "chat".to_owned(),
@@ -455,7 +436,7 @@ pub async fn backfill_vram_cloud_from_env(
             .or_else(|| dialog.aifarm_pool_base_urls.first())
             .cloned();
         let model_id = insert_model(
-            pool,
+            &mut *pool,
             &ModelInput {
                 provider_id,
                 model_name: model_name.clone(),
@@ -472,6 +453,7 @@ pub async fn backfill_vram_cloud_from_env(
         seed_primary(pool, "dialog", model_id, Some(33)).await?;
     }
 
+    transaction.commit().await?;
     tracing::info!(
         models = dialog.aifarm_pool_models.len(),
         "backfilled VRAM Cloud models into routing tables"
@@ -483,10 +465,13 @@ pub async fn backfill_vram_cloud_from_env(
 /// smokes confirm image/video input, and add them behind the existing vision
 /// primary. The existence checks keep operator-defined assignments intact.
 pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, StorageError> {
-    if app_setting_present(pool, VRAM_CLOUD_VISION_BACKFILL_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, VRAM_CLOUD_VISION_BACKFILL_KEY).await? {
         return Ok(false);
     }
-    let Some(provider_id) = list_providers(pool)
+    let Some(provider_id) = list_providers(&mut *pool)
         .await?
         .iter()
         .find(|provider| provider.name == VRAM_CLOUD_PROVIDER)
@@ -494,7 +479,7 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
     else {
         return Ok(false);
     };
-    let mut models = list_models(pool).await?;
+    let mut models = list_models(&mut *pool).await?;
     let mut targets = Vec::new();
     for model_name in VRAM_CLOUD_VISION_MODELS {
         let Some(index) = models.iter().position(|model| {
@@ -509,7 +494,7 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
         {
             let mut input = model_input_from_record(&models[index], model_name.to_owned());
             input.capabilities.push("vision".to_owned());
-            update_model(pool, models[index].id, &input).await?;
+            update_model(&mut *pool, models[index].id, &input).await?;
             models[index].capabilities = input.capabilities;
         }
         targets.push(models[index].id);
@@ -518,7 +503,7 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
         return Ok(false);
     }
 
-    let mut assignments = list_assignments(pool).await?;
+    let mut assignments = list_assignments(&mut *pool).await?;
     let mut fallback_order = assignments
         .iter()
         .filter(|assignment| {
@@ -555,7 +540,8 @@ pub async fn backfill_vram_cloud_vision_fallback(pool: &PgPool) -> Result<bool, 
         fallback_order += 1;
         added += 1;
     }
-    mark_app_setting(pool, VRAM_CLOUD_VISION_BACKFILL_KEY).await?;
+    upsert_app_setting(&mut *pool, VRAM_CLOUD_VISION_BACKFILL_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!(added, "backfilled VRAM Cloud image/video vision fallbacks");
     Ok(true)
 }
@@ -625,7 +611,10 @@ fn assignment_input_from_record(
 /// right workflows. Values are read from config, so it
 /// adapts to whatever each flow is configured to use.
 pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bool, StorageError> {
-    if app_setting_present(pool, GPU_BACKFILL_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, GPU_BACKFILL_KEY).await? {
         return Ok(false);
     }
 
@@ -652,17 +641,17 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
         return Ok(false);
     }
 
-    let mut provider_ids: std::collections::HashMap<String, i64> = list_providers(pool)
+    let mut provider_ids: std::collections::HashMap<String, i64> = list_providers(&mut *pool)
         .await?
         .into_iter()
         .map(|p| (p.name, p.id))
         .collect();
-    let mut model_ids: std::collections::HashMap<(i64, String), i64> = list_models(pool)
+    let mut model_ids: std::collections::HashMap<(i64, String), i64> = list_models(&mut *pool)
         .await?
         .into_iter()
         .map(|m| ((m.provider_id, m.model_name), m.id))
         .collect();
-    let assignments = list_assignments(pool).await?;
+    let assignments = list_assignments(&mut *pool).await?;
 
     for (workflow, service, endpoint, model) in &targets {
         let provider_name = gpu_provider_name(service, config);
@@ -670,7 +659,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
             Some(id) => *id,
             None => {
                 let id = insert_provider(
-                    pool,
+                    &mut *pool,
                     &ProviderInput {
                         name: provider_name.clone(),
                         kind: "chat".to_owned(),
@@ -696,7 +685,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
             Some(id) => *id,
             None => {
                 let id = insert_model(
-                    pool,
+                    &mut *pool,
                     &ModelInput {
                         provider_id,
                         model_name: model.clone(),
@@ -721,7 +710,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
             && assignment.provider_model_id != model_id
         {
             update_assignment(
-                pool,
+                &mut *pool,
                 assignment.id,
                 &assignment_input_from_record(assignment, model_id),
             )
@@ -729,7 +718,8 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
         }
     }
 
-    mark_app_setting(pool, GPU_BACKFILL_KEY).await?;
+    upsert_app_setting(&mut *pool, GPU_BACKFILL_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("backfilled GPU llama.cpp models and repointed config-only workflows");
     Ok(true)
 }
@@ -740,7 +730,10 @@ pub async fn backfill_dialog_local_reasoner_fallback(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, DIALOG_QWEN_FALLBACK_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, DIALOG_QWEN_FALLBACK_KEY).await? {
         return Ok(false);
     }
 
@@ -749,9 +742,9 @@ pub async fn backfill_dialog_local_reasoner_fallback(
         return Ok(false);
     }
 
-    let mut providers = list_providers(pool).await?;
-    let mut models = list_models(pool).await?;
-    let mut assignments = list_assignments(pool).await?;
+    let mut providers = list_providers(&mut *pool).await?;
+    let mut models = list_models(&mut *pool).await?;
+    let mut assignments = list_assignments(&mut *pool).await?;
     let provider_name = gpu_provider_name(&reasoner.discovery_service_name, config);
     if provider_name == "aifarm" {
         return Ok(false);
@@ -810,18 +803,10 @@ pub async fn backfill_dialog_local_reasoner_fallback(
     )
     .await?;
 
-    mark_app_setting(pool, DIALOG_QWEN_FALLBACK_KEY).await?;
+    upsert_app_setting(&mut *pool, DIALOG_QWEN_FALLBACK_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("backfilled dialog GPU local-reasoner fallback");
     Ok(true)
-}
-
-/// Legacy Rust API alias; the persisted setting key remains unchanged.
-#[deprecated(note = "use backfill_dialog_local_reasoner_fallback")]
-pub async fn backfill_dialog_qwen_fallback(
-    pool: &PgPool,
-    config: &AppConfig,
-) -> Result<bool, StorageError> {
-    backfill_dialog_local_reasoner_fallback(pool, config).await
 }
 
 const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
@@ -865,25 +850,28 @@ pub async fn backfill_genkit_flash_model(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, GENKIT_FLASH_FIX_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, GENKIT_FLASH_FIX_KEY).await? {
         return Ok(false);
     }
     let canonical = crate::memory_runtime::genkit_runtime_default_model(config);
     if canonical.trim().is_empty() || canonical == STALE_GENKIT_FLASH_MODEL {
         return Ok(false);
     }
-    let provider_ids: std::collections::HashSet<i64> = list_providers(pool)
+    let provider_ids: std::collections::HashSet<i64> = list_providers(&mut *pool)
         .await?
         .into_iter()
         .filter(|p| p.name == "genkit" || p.name == "gemini")
         .map(|p| p.id)
         .collect();
     let mut fixed = 0usize;
-    for model in list_models(pool).await? {
+    for model in list_models(&mut *pool).await? {
         if provider_ids.contains(&model.provider_id) && model.model_name == STALE_GENKIT_FLASH_MODEL
         {
             update_model(
-                pool,
+                &mut *pool,
                 model.id,
                 &model_input_from_record(&model, canonical.clone()),
             )
@@ -891,7 +879,8 @@ pub async fn backfill_genkit_flash_model(
             fixed += 1;
         }
     }
-    mark_app_setting(pool, GENKIT_FLASH_FIX_KEY).await?;
+    upsert_app_setting(&mut *pool, GENKIT_FLASH_FIX_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!(
         fixed,
         canonical = %canonical,
@@ -929,14 +918,14 @@ fn assignment_exists(
 }
 
 async fn ensure_provider(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     providers: &mut Vec<ProviderRecord>,
     input: ProviderInput,
 ) -> Result<i64, StorageError> {
     if let Some(id) = existing_provider_id(providers, &input.name) {
         return Ok(id);
     }
-    let id = insert_provider(pool, &input).await?;
+    let id = insert_provider(&mut *pool, &input).await?;
     providers.push(ProviderRecord {
         id,
         name: input.name,
@@ -955,14 +944,14 @@ async fn ensure_provider(
 }
 
 async fn ensure_model(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     models: &mut Vec<ModelRecord>,
     input: ModelInput,
 ) -> Result<i64, StorageError> {
     if let Some(id) = existing_model_id(models, input.provider_id, &input.model_name) {
         return Ok(id);
     }
-    let id = insert_model(pool, &input).await?;
+    let id = insert_model(&mut *pool, &input).await?;
     models.push(ModelRecord {
         id,
         provider_id: input.provider_id,
@@ -979,7 +968,7 @@ async fn ensure_model(
 }
 
 async fn ensure_assignment(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     assignments: &mut Vec<AssignmentRecord>,
     input: AssignmentInput,
 ) -> Result<i64, StorageError> {
@@ -991,7 +980,7 @@ async fn ensure_assignment(
     }) {
         return Ok(existing.id);
     }
-    let id = insert_assignment(pool, &input).await?;
+    let id = insert_assignment(&mut *pool, &input).await?;
     assignments.push(AssignmentRecord {
         id,
         workflow_key: input.workflow_key,
@@ -1010,7 +999,7 @@ async fn ensure_assignment(
 }
 
 async fn ensure_primary_assignment(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     assignments: &mut Vec<AssignmentRecord>,
     workflow: &str,
     model_id: i64,
@@ -1037,7 +1026,7 @@ async fn ensure_primary_assignment(
 }
 
 async fn ensure_draw_api_provider(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     providers: &mut Vec<ProviderRecord>,
     config: &AppConfig,
 ) -> Result<i64, StorageError> {
@@ -1058,7 +1047,7 @@ async fn ensure_draw_api_provider(
         }),
     };
     let draw_provider_id = ensure_provider(pool, providers, provider_input.clone()).await?;
-    update_provider(pool, draw_provider_id, &provider_input).await?;
+    update_provider(&mut *pool, draw_provider_id, &provider_input).await?;
     if let Some(provider) = providers
         .iter_mut()
         .find(|provider| provider.id == draw_provider_id)
@@ -1079,7 +1068,7 @@ async fn ensure_draw_api_provider(
 }
 
 async fn ensure_draw_api_model(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     providers: &mut Vec<ProviderRecord>,
     models: &mut Vec<ModelRecord>,
     config: &AppConfig,
@@ -1092,7 +1081,7 @@ async fn ensure_draw_api_model(
         crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
     );
     let draw_model_id = ensure_model(pool, models, model_input.clone()).await?;
-    update_model(pool, draw_model_id, &model_input).await?;
+    update_model(&mut *pool, draw_model_id, &model_input).await?;
     if let Some(model) = models.iter_mut().find(|model| model.id == draw_model_id) {
         model.provider_id = model_input.provider_id;
         model.model_name = model_input.model_name;
@@ -1130,7 +1119,7 @@ fn draw_api_model_input(
 }
 
 async fn ensure_draw_api_endpoint_model(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     models: &mut Vec<ModelRecord>,
     provider_id: i64,
     model_name: &str,
@@ -1139,7 +1128,7 @@ async fn ensure_draw_api_endpoint_model(
 ) -> Result<i64, StorageError> {
     let model_input = draw_api_model_input(provider_id, model_name, display_name, endpoint_name);
     let model_id = ensure_model(pool, models, model_input.clone()).await?;
-    update_model(pool, model_id, &model_input).await?;
+    update_model(&mut *pool, model_id, &model_input).await?;
     if let Some(model) = models.iter_mut().find(|model| model.id == model_id) {
         model.provider_id = model_input.provider_id;
         model.model_name = model_input.model_name;
@@ -1154,7 +1143,7 @@ async fn ensure_draw_api_endpoint_model(
 }
 
 async fn ensure_image_generation_draw_api_primary_assignment(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     assignments: &mut Vec<AssignmentRecord>,
     draw_model_id: i64,
 ) -> Result<(), StorageError> {
@@ -1181,7 +1170,7 @@ async fn ensure_image_generation_draw_api_primary_assignment(
         if should_enable {
             input.weight = Some(100);
         }
-        update_assignment(pool, assignment.id, &input).await?;
+        update_assignment(&mut *pool, assignment.id, &input).await?;
         assignment.enabled = input.enabled;
         assignment.weight = input.weight;
     }
@@ -1208,16 +1197,28 @@ pub async fn backfill_declarative_v2(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, DECLARATIVE_V2_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, DECLARATIVE_V2_KEY).await? {
         return Ok(false);
     }
 
-    insert_workflow_if_missing(pool, IMAGE_EDIT_WORKFLOW, "image", true, 3, 60_000, true).await?;
+    insert_workflow_if_missing(
+        &mut *pool,
+        IMAGE_EDIT_WORKFLOW,
+        "image",
+        true,
+        3,
+        60_000,
+        true,
+    )
+    .await?;
 
-    let mut providers = list_providers(pool).await?;
-    let mut models = list_models(pool).await?;
-    let mut assignments = list_assignments(pool).await?;
-    let triggers = openplotva_storage::llm_routing::list_triggers(pool).await?;
+    let mut providers = list_providers(&mut *pool).await?;
+    let mut models = list_models(&mut *pool).await?;
+    let mut assignments = list_assignments(&mut *pool).await?;
+    let triggers = openplotva_storage::llm_routing::list_triggers(&mut *pool).await?;
 
     let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
     ensure_primary_assignment(
@@ -1359,7 +1360,7 @@ pub async fn backfill_declarative_v2(
                 });
                 if !trigger_exists(&triggers, "dialog", "provider_capacity", &params) {
                     insert_trigger(
-                        pool,
+                        &mut *pool,
                         &TriggerInput {
                             workflow_key: "dialog".to_owned(),
                             trigger_type: "provider_capacity".to_owned(),
@@ -1377,7 +1378,8 @@ pub async fn backfill_declarative_v2(
         }
     }
 
-    mark_app_setting(pool, DECLARATIVE_V2_KEY).await?;
+    upsert_app_setting(&mut *pool, DECLARATIVE_V2_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("backfilled declarative routing v2 rows");
     Ok(true)
 }
@@ -1386,19 +1388,32 @@ pub async fn backfill_image_generation_draw_api_primary(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, IMAGE_DRAW_API_PRIMARY_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, IMAGE_DRAW_API_PRIMARY_KEY).await? {
         return Ok(false);
     }
 
-    insert_workflow_if_missing(pool, "image_generation", "image", true, 3, 60_000, true).await?;
-    let mut providers = list_providers(pool).await?;
-    let mut models = list_models(pool).await?;
-    let mut assignments = list_assignments(pool).await?;
+    insert_workflow_if_missing(
+        &mut *pool,
+        "image_generation",
+        "image",
+        true,
+        3,
+        60_000,
+        true,
+    )
+    .await?;
+    let mut providers = list_providers(&mut *pool).await?;
+    let mut models = list_models(&mut *pool).await?;
+    let mut assignments = list_assignments(&mut *pool).await?;
     let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
     ensure_image_generation_draw_api_primary_assignment(pool, &mut assignments, draw_model_id)
         .await?;
 
-    mark_app_setting(pool, IMAGE_DRAW_API_PRIMARY_KEY).await?;
+    upsert_app_setting(&mut *pool, IMAGE_DRAW_API_PRIMARY_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("backfilled image_generation primary to draw-api");
     Ok(true)
 }
@@ -1407,7 +1422,10 @@ pub async fn backfill_boogu_image_slots(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, BOOGU_IMAGE_SLOTS_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, BOOGU_IMAGE_SLOTS_KEY).await? {
         return Ok(false);
     }
 
@@ -1417,12 +1435,12 @@ pub async fn backfill_boogu_image_slots(
         crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY,
         crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY,
     ] {
-        insert_workflow_if_missing(pool, workflow, "image", true, 3, 60_000, true).await?;
+        insert_workflow_if_missing(&mut *pool, workflow, "image", true, 3, 60_000, true).await?;
     }
 
-    let mut providers = list_providers(pool).await?;
-    let mut models = list_models(pool).await?;
-    let mut assignments = list_assignments(pool).await?;
+    let mut providers = list_providers(&mut *pool).await?;
+    let mut models = list_models(&mut *pool).await?;
+    let mut assignments = list_assignments(&mut *pool).await?;
     let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
     let draw_provider_id = ensure_draw_api_provider(pool, &mut providers, config).await?;
     let boogu_turbo_model_id = ensure_draw_api_endpoint_model(
@@ -1477,13 +1495,14 @@ pub async fn backfill_boogu_image_slots(
     )
     .await?;
 
-    mark_app_setting(pool, BOOGU_IMAGE_SLOTS_KEY).await?;
+    upsert_app_setting(&mut *pool, BOOGU_IMAGE_SLOTS_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!("backfilled Boogu image slot workflows");
     Ok(true)
 }
 
 async fn ensure_asr_model(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     providers: &mut Vec<ProviderRecord>,
     models: &mut Vec<ModelRecord>,
     config: &AppConfig,
@@ -1505,7 +1524,7 @@ async fn ensure_asr_model(
         }),
     };
     let provider_id = ensure_provider(pool, providers, provider_input.clone()).await?;
-    update_provider(pool, provider_id, &provider_input).await?;
+    update_provider(&mut *pool, provider_id, &provider_input).await?;
     if let Some(provider) = providers
         .iter_mut()
         .find(|provider| provider.id == provider_id)
@@ -1538,7 +1557,7 @@ async fn ensure_asr_model(
         }),
     };
     let model_id = ensure_model(pool, models, model_input.clone()).await?;
-    update_model(pool, model_id, &model_input).await?;
+    update_model(&mut *pool, model_id, &model_input).await?;
     if let Some(model) = models.iter_mut().find(|model| model.id == model_id) {
         model.provider_id = model_input.provider_id;
         model.model_name = model_input.model_name;
@@ -1554,11 +1573,11 @@ async fn ensure_asr_model(
 }
 
 async fn ensure_draw_gpu_pool_with_unpooled_asr(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     providers: &[ProviderRecord],
     models: &[ModelRecord],
 ) -> Result<i64, StorageError> {
-    let existing_pools = list_pools(pool).await?;
+    let existing_pools = list_pools(&mut *pool).await?;
     let existing_pool_id =
         preferred_provider_pool_id(providers, models, DRAW_API_PROVIDER, DRAW_API_MODEL);
     let existing_pool = existing_pool_id.and_then(|pool_id| {
@@ -1578,9 +1597,11 @@ async fn ensure_draw_gpu_pool_with_unpooled_asr(
     };
     let pool_id = match existing_pool_id {
         Some(pool_id) => pool_id,
-        None => openplotva_storage::llm_routing::insert_pool_if_missing(pool, &pool_input).await?,
+        None => {
+            openplotva_storage::llm_routing::insert_pool_if_missing(&mut *pool, &pool_input).await?
+        }
     };
-    openplotva_storage::llm_routing::update_pool(pool, pool_id, &pool_input).await?;
+    openplotva_storage::llm_routing::update_pool(&mut *pool, pool_id, &pool_input).await?;
     let mut draw_attached = 0_u64;
     let mut asr_detached = 0_u64;
     for provider_name in [DRAW_API_PROVIDER, ASR_PROVIDER] {
@@ -1593,7 +1614,7 @@ async fn ensure_draw_gpu_pool_with_unpooled_asr(
             .filter(|model| model.provider_id == provider_id)
         {
             if model.pool_id != target_pool_id {
-                set_model_pool(pool, model.id, target_pool_id).await?;
+                set_model_pool(&mut *pool, model.id, target_pool_id).await?;
                 if target_pool_id.is_some() {
                     draw_attached += 1;
                 } else {
@@ -1646,27 +1667,32 @@ fn draw_and_asr_models_ready(providers: &[ProviderRecord], models: &[ModelRecord
     })
 }
 
-async fn repair_draw_gpu_pool_for_asr_priority(pool: &PgPool) -> Result<bool, StorageError> {
-    if app_setting_present(pool, ASR_TASKMAN_PRIORITY_KEY).await? {
+async fn repair_draw_gpu_pool_for_asr_priority(
+    pool: &mut PgConnection,
+) -> Result<bool, StorageError> {
+    if app_setting_present(&mut *pool, ASR_TASKMAN_PRIORITY_KEY).await? {
         return Ok(false);
     }
-    let providers = list_providers(pool).await?;
-    let models = list_models(pool).await?;
+    let providers = list_providers(&mut *pool).await?;
+    let models = list_models(&mut *pool).await?;
     if !draw_and_asr_models_ready(&providers, &models) {
         tracing::warn!("ASR priority repair deferred until draw and ASR providers have models");
         return Ok(false);
     }
     ensure_draw_gpu_pool_with_unpooled_asr(pool, &providers, &models).await?;
-    mark_app_setting(pool, ASR_TASKMAN_PRIORITY_KEY).await?;
+    upsert_app_setting(&mut *pool, ASR_TASKMAN_PRIORITY_KEY, "1").await?;
     Ok(true)
 }
 
 pub async fn backfill_asr_routing(pool: &PgPool, config: &AppConfig) -> Result<bool, StorageError> {
-    let seeded = if app_setting_present(pool, ASR_ROUTING_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    let seeded = if app_setting_present(&mut *pool, ASR_ROUTING_KEY).await? {
         false
     } else {
         insert_workflow_if_missing(
-            pool,
+            &mut *pool,
             crate::asr::ASR_WORKFLOW_KEY,
             "asr",
             false,
@@ -1675,9 +1701,9 @@ pub async fn backfill_asr_routing(pool: &PgPool, config: &AppConfig) -> Result<b
             true,
         )
         .await?;
-        let mut providers = list_providers(pool).await?;
-        let mut models = list_models(pool).await?;
-        let mut assignments = list_assignments(pool).await?;
+        let mut providers = list_providers(&mut *pool).await?;
+        let mut models = list_models(&mut *pool).await?;
+        let mut assignments = list_assignments(&mut *pool).await?;
         let asr_model_id = ensure_asr_model(pool, &mut providers, &mut models, config).await?;
         ensure_primary_assignment(
             pool,
@@ -1688,11 +1714,14 @@ pub async fn backfill_asr_routing(pool: &PgPool, config: &AppConfig) -> Result<b
         )
         .await?;
 
-        mark_app_setting(pool, ASR_ROUTING_KEY).await?;
-        tracing::info!("backfilled ASR routing rows");
+        upsert_app_setting(&mut *pool, ASR_ROUTING_KEY, "1").await?;
         true
     };
     repair_draw_gpu_pool_for_asr_priority(pool).await?;
+    transaction.commit().await?;
+    if seeded {
+        tracing::info!("backfilled ASR routing rows");
+    }
     Ok(seeded)
 }
 
@@ -1707,51 +1736,36 @@ const DEFAULT_DRAW_GPU_POOL: &str = "boogu-gpu";
 const DRAW_GPU_POOL_DESCRIPTION: &str =
     "Draw GPU capacity; ASR uses Taskman priority and CPU fallback while draw is active";
 
-/// Classify a provider row's wire protocol from its seeded shape. Pure so it
-/// is table-testable; used only to fill NULL protocols, never to overwrite an
-/// operator-set value.
-fn derive_protocol(kind: &str, name: &str, has_discovery: bool) -> &'static str {
-    match kind {
-        "embedding" => PROTOCOL_DISCOVERY_JOBS,
-        "image" => PROTOCOL_DISCOVERY_DRAW,
-        "asr" => PROTOCOL_DISCOVERY_ASR,
-        "music" => PROTOCOL_ACESTEP,
-        "privacy_filter" => PROTOCOL_PRIVACY_FILTER,
-        // chat / vision: genkit-family providers speak the Google AI API;
-        // everything else (aifarm and friends via discovery, vram-cloud,
-        // openrouter, nvidia, vmlx direct) is OpenAI-compatible.
-        _ => {
-            if !has_discovery && matches!(name, "genkit" | "gemini") {
-                PROTOCOL_GENKIT
-            } else {
-                PROTOCOL_OPENAI_COMPAT
-            }
-        }
-    }
-}
-
 /// Fill NULL provider protocols from the classifier. Guarded, idempotent, and
 /// never overwrites an operator-set protocol (SQL is `WHERE protocol IS NULL`).
 pub async fn backfill_provider_protocols(pool: &PgPool) -> Result<bool, StorageError> {
-    if app_setting_present(pool, PROVIDER_PROTOCOL_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, PROVIDER_PROTOCOL_KEY).await? {
         return Ok(false);
     }
-    let providers = list_providers(pool).await?;
+    let providers = list_providers(&mut *pool).await?;
     let mut filled = 0usize;
     for provider in &providers {
         if provider.protocol.is_some() {
             continue;
         }
-        let protocol = derive_protocol(
-            &provider.kind,
+        let protocol = openplotva_llm::router::table::legacy_provider_protocol(
+            Kind::from_db(&provider.kind).unwrap_or(Kind::Chat),
             &provider.name,
             provider.discovery_service_name.is_some(),
         );
-        openplotva_storage::llm_routing::set_provider_protocol_if_null(pool, provider.id, protocol)
-            .await?;
+        openplotva_storage::llm_routing::set_provider_protocol_if_null(
+            &mut *pool,
+            provider.id,
+            protocol.as_str(),
+        )
+        .await?;
         filled += 1;
     }
-    mark_app_setting(pool, PROVIDER_PROTOCOL_KEY).await?;
+    upsert_app_setting(&mut *pool, PROVIDER_PROTOCOL_KEY, "1").await?;
+    transaction.commit().await?;
     tracing::info!(filled, "backfilled provider protocols");
     Ok(true)
 }
@@ -1766,10 +1780,13 @@ pub async fn backfill_capacity_pools(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
-    if app_setting_present(pool, CAPACITY_POOLS_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+
+    if app_setting_present(&mut *pool, CAPACITY_POOLS_KEY).await? {
         return Ok(false);
     }
-    let providers = list_providers(pool).await?;
+    let providers = list_providers(&mut *pool).await?;
     let targets = [
         (
             "aifarm-dialog",
@@ -1795,17 +1812,19 @@ pub async fn backfill_capacity_pools(
             config: serde_json::json!({}),
         };
         let pool_id =
-            openplotva_storage::llm_routing::insert_pool_if_missing(pool, &pool_input).await?;
-        openplotva_storage::llm_routing::update_pool(pool, pool_id, &pool_input).await?;
+            openplotva_storage::llm_routing::insert_pool_if_missing(&mut *pool, &pool_input)
+                .await?;
+        openplotva_storage::llm_routing::update_pool(&mut *pool, pool_id, &pool_input).await?;
         let attached = openplotva_storage::llm_routing::attach_provider_models_to_pool_if_unpooled(
-            pool,
+            &mut *pool,
             provider_id,
             pool_id,
         )
         .await?;
         tracing::info!(pool = pool_name, slots, attached, "seeded capacity pool");
     }
-    mark_app_setting(pool, CAPACITY_POOLS_KEY).await?;
+    upsert_app_setting(&mut *pool, CAPACITY_POOLS_KEY, "1").await?;
+    transaction.commit().await?;
     Ok(true)
 }
 
@@ -1931,20 +1950,23 @@ fn dialog_cascade_ready(
 /// upgraded database; this guarded pass makes a brand-new database converge
 /// after its models are seeded during the first startup.
 pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, StorageError> {
-    let providers = list_providers(pool).await?;
-    let models = list_models(pool).await?;
-    let assignments = list_assignments(pool).await?;
-    let extraction = if app_setting_present(pool, MEMORY_EXTRACTION_CASCADE_KEY).await? {
+    let mut transaction = begin_bootstrap_update(pool).await?;
+    let pool = &mut *transaction;
+    let providers = list_providers(&mut *pool).await?;
+    let models = list_models(&mut *pool).await?;
+    let assignments = list_assignments(&mut *pool).await?;
+    let extraction = if app_setting_present(&mut *pool, MEMORY_EXTRACTION_CASCADE_KEY).await? {
         None
     } else {
         resolved_memory_workflow_targets(MEMORY_EXTRACTION_WORKFLOW, &providers, &models)
     };
-    let subject_merge = if app_setting_present(pool, MEMORY_SUBJECT_MERGE_CASCADE_KEY).await? {
+    let subject_merge = if app_setting_present(&mut *pool, MEMORY_SUBJECT_MERGE_CASCADE_KEY).await?
+    {
         None
     } else {
         resolved_memory_workflow_targets(MEMORY_SUBJECT_MERGE_WORKFLOW, &providers, &models)
     };
-    let normalize_dialog = !app_setting_present(pool, DIALOG_FALLBACK_CASCADE_KEY).await?
+    let normalize_dialog = !app_setting_present(&mut *pool, DIALOG_FALLBACK_CASCADE_KEY).await?
         && dialog_cascade_ready(&providers, &models, &assignments);
     if extraction.is_none() && subject_merge.is_none() && !normalize_dialog {
         return Ok(false);
@@ -1953,7 +1975,6 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
     // Keep the route replacement, shared-pool reconciliation, overflow disable,
     // and their guards atomic. The runtime loads the routing snapshot only after
     // this transaction commits, so it can never publish a half-replaced chain.
-    let mut transaction = pool.begin().await?;
 
     if let Some(targets) = subject_merge.as_ref() {
         sqlx::query(
@@ -2015,7 +2036,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
             targets,
         )
         .await?;
-        mark_app_setting_in_transaction(&mut transaction, MEMORY_SUBJECT_MERGE_CASCADE_KEY).await?;
+        upsert_app_setting(&mut *transaction, MEMORY_SUBJECT_MERGE_CASCADE_KEY, "1").await?;
     }
 
     if let Some(targets) = extraction.as_ref() {
@@ -2034,7 +2055,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
         .await?;
         replace_memory_workflow_assignments(&mut transaction, MEMORY_EXTRACTION_WORKFLOW, targets)
             .await?;
-        mark_app_setting_in_transaction(&mut transaction, MEMORY_EXTRACTION_CASCADE_KEY).await?;
+        upsert_app_setting(&mut *transaction, MEMORY_EXTRACTION_CASCADE_KEY, "1").await?;
     }
 
     if normalize_dialog {
@@ -2082,7 +2103,7 @@ pub async fn backfill_memory_routing_cascades(pool: &PgPool) -> Result<bool, Sto
         )
         .execute(&mut *transaction)
         .await?;
-        mark_app_setting_in_transaction(&mut transaction, DIALOG_FALLBACK_CASCADE_KEY).await?;
+        upsert_app_setting(&mut *transaction, DIALOG_FALLBACK_CASCADE_KEY, "1").await?;
     }
 
     transaction.commit().await?;
@@ -2121,20 +2142,6 @@ async fn replace_memory_workflow_assignments(
         .execute(&mut **transaction)
         .await?;
     }
-    Ok(())
-}
-
-async fn mark_app_setting_in_transaction(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    key: &str,
-) -> Result<(), StorageError> {
-    sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ($1, '1', NOW()) \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-    )
-    .bind(key)
-    .execute(&mut **transaction)
-    .await?;
     Ok(())
 }
 
@@ -2927,40 +2934,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_protocol_classifies_every_seeded_provider() {
-        // (kind, name, has_discovery) -> protocol, over the exact seeded rows.
-        let cases = [
-            ("chat", "aifarm", true, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "genkit", false, PROTOCOL_GENKIT),
-            ("chat", "gemini", false, PROTOCOL_GENKIT),
-            ("chat", "vram-cloud", false, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "openrouter", false, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "nvidia", false, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "vmlx", false, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "aifarm-llamacpp-gpu2", true, PROTOCOL_OPENAI_COMPAT),
-            ("chat", "aifarm-maple", true, PROTOCOL_OPENAI_COMPAT),
-            ("vision", "aifarm-vision", true, PROTOCOL_OPENAI_COMPAT),
-            ("embedding", "aifarm-embed", true, PROTOCOL_DISCOVERY_JOBS),
-            ("image", "aifarm-draw", true, PROTOCOL_DISCOVERY_DRAW),
-            ("music", "acestep", false, PROTOCOL_ACESTEP),
-            (
-                "privacy_filter",
-                "privacy-filter",
-                true,
-                PROTOCOL_PRIVACY_FILTER,
-            ),
-            ("asr", "aifarm-asr", true, PROTOCOL_DISCOVERY_ASR),
-        ];
-        for (kind, name, has_discovery, expected) in cases {
-            assert_eq!(
-                derive_protocol(kind, name, has_discovery),
-                expected,
-                "provider {name} (kind {kind})"
-            );
-        }
-    }
-
-    #[test]
     fn asr_models_match_only_asr_capability() {
         let mut model = model(10, 1, "gigaam-v3-vosk-fallback");
         assert!(!model_matches_kind(&model, Kind::Asr));
@@ -3126,6 +3099,86 @@ mod tests {
             resolved_memory_workflow_targets(MEMORY_EXTRACTION_WORKFLOW, &providers, &models)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn live_bootstrap_rolls_back_failed_markers_and_serializes_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let schema = format!("routing_bootstrap_{suffix}");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
+        let search_path = format!("{schema},public");
+        let options = dsn
+            .parse::<sqlx::postgres::PgConnectOptions>()?
+            .options([("search_path", search_path.as_str())]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await?;
+        let result: Result<(), Box<dyn std::error::Error>> = async {
+            openplotva_storage::run_migrations_on(&pool).await?;
+            let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_class AS c JOIN pg_namespace AS n ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relname=ANY($2)")
+                .bind(&schema).bind(vec!["app_settings", "llm_providers", "provider_models", "workflows", "workflow_assignments", "workflow_triggers", "llm_capacity_pools"])
+                .fetch_one(&pool).await?;
+            assert_eq!(tables, 7, "fixtures must own all modified tables");
+            sqlx::raw_sql("TRUNCATE workflow_triggers, workflow_assignments, provider_models, llm_providers, llm_capacity_pools RESTART IDENTITY CASCADE; DELETE FROM app_settings WHERE key LIKE 'llm.routing.%'; ALTER TABLE app_settings ADD CONSTRAINT reject_seed_marker CHECK (key <> 'llm.routing.seeded')")
+                .execute(&pool).await?;
+            let config = AppConfig::from_raw(openplotva_config::RawConfig::default())?;
+            let error = seed_routing_from_env(&pool, &config).await.expect_err("marker must fail");
+            assert!(error.to_string().contains("reject_seed_marker"), "{error}");
+            let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM llm_providers), (SELECT count(*) FROM provider_models), (SELECT count(*) FROM workflow_assignments), (SELECT count(*) FROM app_settings WHERE key='llm.routing.seeded')")
+                .fetch_one(&pool).await?;
+            assert_eq!(counts, (0,0,0,0));
+            sqlx::query("ALTER TABLE app_settings DROP CONSTRAINT reject_seed_marker").execute(&pool).await?;
+            let (left,right) = tokio::join!(seed_routing_from_env(&pool,&config), seed_routing_from_env(&pool,&config));
+            assert_ne!(left?, right?, "one concurrent startup seeds, the other sees its marker");
+            assert_eq!(openplotva_storage::app_settings::app_setting(&pool, SEEDED_KEY).await?.as_deref(), Some("1"));
+            sqlx::query("UPDATE llm_providers SET endpoint='https://operator.invalid/kept' WHERE name='aifarm'").execute(&pool).await?;
+            assert!(!seed_routing_from_env(&pool, &config).await?);
+            let endpoint: Option<String> = sqlx::query_scalar("SELECT endpoint FROM llm_providers WHERE name='aifarm'").fetch_one(&pool).await?;
+            assert_eq!(endpoint.as_deref(), Some("https://operator.invalid/kept"));
+
+            sqlx::query("UPDATE provider_models SET model_name=$1 WHERE provider_id IN (SELECT id FROM llm_providers WHERE name='genkit')")
+                .bind(STALE_GENKIT_FLASH_MODEL).execute(&pool).await?;
+            sqlx::query("ALTER TABLE app_settings ADD CONSTRAINT reject_genkit_marker CHECK (key <> 'llm.routing.genkit_flash_fixed')").execute(&pool).await?;
+            let error = backfill_genkit_flash_model(&pool, &config).await.expect_err("marker must fail");
+            assert!(error.to_string().contains("reject_genkit_marker"), "{error}");
+            let model: String = sqlx::query_scalar("SELECT model_name FROM provider_models WHERE provider_id IN (SELECT id FROM llm_providers WHERE name='genkit') LIMIT 1").fetch_one(&pool).await?;
+            assert_eq!(model, STALE_GENKIT_FLASH_MODEL, "marker failure must roll back its preceding update");
+            sqlx::query("ALTER TABLE app_settings DROP CONSTRAINT reject_genkit_marker").execute(&pool).await?;
+            assert!(backfill_genkit_flash_model(&pool, &config).await?);
+            assert!(!backfill_genkit_flash_model(&pool, &config).await?);
+
+            backfill_vram_cloud_from_env(&pool,&config).await?;
+            backfill_vram_cloud_vision_fallback(&pool).await?;
+            backfill_gpu_models(&pool,&config).await?;
+            backfill_dialog_local_reasoner_fallback(&pool,&config).await?;
+            backfill_declarative_v2(&pool,&config).await?;
+            backfill_image_generation_draw_api_primary(&pool,&config).await?;
+            backfill_boogu_image_slots(&pool,&config).await?;
+            backfill_asr_routing(&pool,&config).await?;
+            backfill_provider_protocols(&pool).await?;
+            backfill_capacity_pools(&pool,&config).await?;
+            backfill_memory_routing_cascades(&pool).await?;
+            Ok(())
+        }.await;
+        pool.close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
     }
 
     #[tokio::test]

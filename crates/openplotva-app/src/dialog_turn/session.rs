@@ -1377,6 +1377,7 @@ where
                 let slice = session_tool_slice(&budget, cfg, failure_now);
                 let result = tokio::time::timeout(slice, execute_session_tool(
                     SessionToolExecution {
+                        invocation_id: format!("dialog-job:{}:step:{iteration}:call:{call_index}", ctx.item_id),
                         call,
                         cfg,
                         meta: &tool_context,
@@ -1997,6 +1998,7 @@ async fn dispatch_session_tool_with_timeout(
 }
 
 struct SessionToolExecution<'a, 'b> {
+    invocation_id: String,
     call: &'a ChatStepToolCall,
     cfg: &'a SessionTurnConfig<'b>,
     meta: &'a ToolContext,
@@ -2026,6 +2028,7 @@ where
 {
     let step = &exec.call.step;
     let mut tool_meta = exec.meta.clone();
+    tool_meta.invocation_id = Some(exec.invocation_id.clone());
     tool_meta.message_meta.agent_gift = false;
     if step.gift {
         let granted = exec
@@ -2412,7 +2415,7 @@ async fn queue_gradius_banner(
 async fn append_session_queued_marker<Queue>(
     queue: &Queue,
     job_id: i64,
-    receipt: &crate::dialog_jobs::QueuedBatchReceipt,
+    receipt: &crate::telegram_outbox::QueuedBatchReceipt,
     at: OffsetDateTime,
 ) where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
@@ -2699,7 +2702,7 @@ impl DialogJobEffects for CaptureDelivery {
                 .lock()
                 .expect("capture delivery")
                 .push(answer.to_owned());
-            Ok(crate::dialog_jobs::QueuedBatchReceipt::dispatcher(
+            Ok(crate::telegram_outbox::QueuedBatchReceipt::dispatcher(
                 "capture".to_owned(),
                 Vec::new(),
             ))

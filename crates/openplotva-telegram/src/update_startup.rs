@@ -25,9 +25,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-pub const GO_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+pub const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const GO_LONG_POLL_RETRY_DELAY: Duration = Duration::from_secs(3);
+pub const LONG_POLL_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 pub const TELEGRAM_WEBHOOK_PATH: &str = "/telegram/webhook";
 
@@ -75,7 +75,7 @@ impl<C> LongPollUpdateSource<C> {
     pub fn new(client: C) -> Self {
         Self {
             client,
-            retry_delay: GO_LONG_POLL_RETRY_DELAY,
+            retry_delay: LONG_POLL_RETRY_DELAY,
             state: Mutex::new(LongPollState::default()),
         }
     }
@@ -213,7 +213,7 @@ where
                     record_limited_error(&mut report.append_errors, error.to_string());
                     tokio::select! {
                         _ = &mut stop => return report,
-                        () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                        () = sleep(LONG_POLL_RETRY_DELAY) => {}
                     }
                 }
             }
@@ -231,7 +231,7 @@ where
                 record_limited_error(&mut report.poll_errors, error.to_string());
                 tokio::select! {
                     _ = &mut stop => break,
-                    () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                    () = sleep(LONG_POLL_RETRY_DELAY) => {}
                 }
                 continue;
             }
@@ -300,7 +300,7 @@ where
         if serialization_failed {
             tokio::select! {
                 _ = &mut stop => break,
-                () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                () = sleep(LONG_POLL_RETRY_DELAY) => {}
             }
             continue;
         }
@@ -320,7 +320,7 @@ where
                     record_limited_error(&mut report.append_errors, error.to_string());
                     tokio::select! {
                         _ = &mut stop => return report,
-                        () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                        () = sleep(LONG_POLL_RETRY_DELAY) => {}
                     }
                 }
             }
@@ -678,7 +678,7 @@ pub fn build_get_updates_method() -> GetUpdates {
 pub fn build_get_updates_method_with_offset(offset: i64) -> GetUpdates {
     GetUpdates::default()
         .with_offset(offset)
-        .with_timeout(GO_LONG_POLL_TIMEOUT)
+        .with_timeout(LONG_POLL_TIMEOUT)
         .with_allowed_updates(product_allowed_update_set())
 }
 
@@ -716,7 +716,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        GO_LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
+        LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
         TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup, WebhookUpdateRequestError,
         build_delete_webhook_method, build_get_updates_method, build_set_webhook_method,
     };
@@ -735,7 +735,7 @@ mod tests {
             payload.get("limit").is_none(),
             "Zero update limit stays unset"
         );
-        assert_eq!(GO_LONG_POLL_TIMEOUT.as_secs(), 60);
+        assert_eq!(LONG_POLL_TIMEOUT.as_secs(), 60);
     }
 
     #[test]

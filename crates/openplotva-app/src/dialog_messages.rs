@@ -2277,7 +2277,7 @@ where
         .ok()
         .flatten()
         .unwrap_or_else(|| ChatSettings::defaults(chat_id));
-    if settings_row.reactivity_percentage == GO_SETTINGS_REACTIVITY_OFF {
+    if settings_row.reactivity_percentage == SETTINGS_REACTIVITY_OFF {
         return Ok(DialogMessageUpdateRoute::RandomSkippedReactivityOff);
     }
 
@@ -2409,7 +2409,7 @@ fn aifarm_dialog_max_output_tokens(
 }
 
 fn random_response_triggers(reactivity_percentage: i32, roll: i32) -> bool {
-    if reactivity_percentage == GO_SETTINGS_REACTIVITY_OFF {
+    if reactivity_percentage == SETTINGS_REACTIVITY_OFF {
         return false;
     }
     roll > 100 - reactivity_percentage
@@ -2443,7 +2443,7 @@ fn obscenify_string(text: &str, variant_roll: i32) -> String {
 fn first_obscenify_vowel_with_suffix(value: &str) -> Option<(&str, &str)> {
     let (index, _) = value
         .char_indices()
-        .find(|(_, ch)| GO_OBSCENIFY_VOWELS.contains(*ch))?;
+        .find(|(_, ch)| OBSCENIFY_VOWELS.contains(*ch))?;
     let next = index + value[index..].chars().next()?.len_utf8();
     (next < value.len()).then_some((&value[index..next], &value[next..]))
 }
@@ -2530,8 +2530,8 @@ const LONG_DIALOG_PHRASES: &[&str] = &[
     "review",
 ];
 
-const GO_SETTINGS_REACTIVITY_OFF: i32 = 0;
-const GO_OBSCENIFY_VOWELS: &str = "ауоыиэяюёе";
+const SETTINGS_REACTIVITY_OFF: i32 = 0;
+const OBSCENIFY_VOWELS: &str = "ауоыиэяюёе";
 
 #[cfg(test)]
 mod tests {
@@ -2657,7 +2657,7 @@ mod tests {
         let scheduler = TaskmanDialogMessageScheduler::new(
             Arc::clone(&queue),
             debounce,
-            crate::dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+            crate::dialog_debounce::DIALOG_DEBOUNCE_INTERVAL,
             durability,
         )
         .with_typing_effects(typing);
@@ -2700,7 +2700,7 @@ mod tests {
         let scheduler = TaskmanDialogMessageScheduler::new(
             Arc::clone(&queue),
             Arc::new(InMemoryDialogDebounce::new()),
-            crate::dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+            crate::dialog_debounce::DIALOG_DEBOUNCE_INTERVAL,
             Arc::new(NoopDialogTaskDurabilityBarrier),
         )
         .with_typing_effects(Arc::new(PendingTypingStub));
@@ -5520,6 +5520,20 @@ mod tests {
         let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
             return Ok(());
         };
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
+        let (runtime, _) =
+            crate::task_queue::SharedTaskQueueRuntime::load_from_postgres_with_id_allocator(
+                openplotva_storage::PostgresTaskQueueStore::new(pool.clone()),
+                openplotva_taskman::TaskQueueIdAllocator::default(),
+            )
+            .await?;
         let redis_client = redis::Client::open(redis_url)?;
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let key = format!("openplotva:test:decoded-song:{suffix}");
@@ -5542,7 +5556,7 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("expected decoded song update"))?;
 
         let state_store = UpdateStateStoreStub::default();
-        let queue = Arc::new(InMemoryTaskQueue::new());
+        let queue = runtime.queue();
         let song_scheduler = crate::dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&queue))
             .with_draw_image_vip_status(Arc::new(VipStatusStub(true)));
         let scheduler = SchedulerStub::default();
@@ -5602,19 +5616,34 @@ mod tests {
                 "user:99:Ada:ada_l".to_owned()
             ]
         );
-        assert_eq!(
+        assert!(matches!(
             *lock(&route),
-            Some(DialogMessageUpdateRoute::SongScheduled {
-                status: "scheduled".to_owned(),
-                no_reply: false,
-            })
-        );
-        assert!(scheduler.calls().is_empty());
+            Some(DialogMessageUpdateRoute::Scheduled { .. })
+        ));
+        assert_eq!(scheduler.calls().len(), 1);
+        assert_eq!(scheduler.metas()[0].requested_tool, "generate_song");
         assert!(effects.sent_song_notices().is_empty());
-        let job_id = {
+        let scheduled = song_scheduler
+            .schedule_song(crate::dialog_tools::SongScheduleRequest {
+                chat_id: -100,
+                message_id: 78,
+                user_id: 99,
+                user_full_name: "Ada".into(),
+                topic: "neon rain".into(),
+                message_text: "!song neon rain".into(),
+                message_meta: scheduler.metas()[0].clone(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(scheduled.status, "scheduled");
+        let job_id = scheduled.job_id.expect("scheduled song job");
+        {
             let records = queue.records();
-            assert_eq!(records.len(), 1);
-            let record = &records[0];
+            let record = records
+                .iter()
+                .find(|record| record.id == job_id)
+                .expect("music job");
             assert_eq!(record.queue_name, MUSIC_VIP_QUEUE_NAME);
             assert_eq!(record.status, JobStatus::Pending);
             assert_eq!(record.job.title, "music");
@@ -5626,8 +5655,7 @@ mod tests {
             let music = record.job.data.music_data.as_ref().expect("music");
             assert_eq!(music.topic, "neon rain");
             assert_eq!(music.reference_file_id, "");
-            record.id
-        };
+        }
 
         let material_provider = MusicMaterialProviderStub::new(crate::music_jobs::SongMaterial {
             title: "Neon Rain".to_owned(),
@@ -5648,12 +5676,34 @@ mod tests {
         ));
         let music_files = MusicReferenceFileStoreCapture::default();
         let music_sender = MusicTelegramSenderCapture::new(vec![]);
-        let music_rich = Arc::new(crate::rich::MockRichSender::default());
+        let uploads = Arc::new(Mutex::new(Vec::new()));
+        let captured_uploads = uploads.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let uploader = openplotva_media::uploader::UploaderClient::new(
+            openplotva_media::uploader::UploaderConfig {
+                base_url: format!("http://{}", listener.local_addr()?),
+                secret: "test-secret".into(),
+                ..Default::default()
+            },
+        )?;
+        let server =
+            tokio::spawn(async move {
+                axum::serve(listener, axum::Router::new().route("/upload", axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                    assert_eq!(headers["authorization"], "Bearer test-secret");
+                    captured_uploads.lock().expect("uploads").push(body);
+                    axum::Json(serde_json::json!({"url":"https://media.example.test/song.mp3"}))
+                }
+            ))).await
+            });
+        let store = openplotva_storage::PostgresTelegramOutboxStore::new(pool.clone());
         let music_effects = crate::music_jobs::TelegramMusicJobEffects::new(
             permissions,
             music_files.clone(),
             music_sender.clone(),
-            music_rich.clone(),
+            uploader,
+            Arc::new(crate::rich::RichOutbox::new(store.clone(), 7)),
+            openplotva_storage::PostgresGeneratedSongStore::new(pool.clone()),
         );
         let worker_report = crate::music_jobs::run_music_queue_once(
             &queue,
@@ -5669,7 +5719,7 @@ mod tests {
             crate::music_jobs::MusicQueuePollReport {
                 queue_name: MUSIC_VIP_QUEUE_NAME.to_owned(),
                 job_id: Some(job_id),
-                outcome: crate::music_jobs::MusicQueuePollOutcome::Completed,
+                outcome: crate::music_jobs::MusicQueuePollOutcome::WaitingDelivery,
                 error: None,
                 activity: crate::telegram_activity::TelegramActivitySnapshot::default(),
             }
@@ -5700,17 +5750,127 @@ mod tests {
             music_sender.methods().is_empty(),
             "song now sends one rich message, not classic audio + lyrics"
         );
-        {
-            let sent = music_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, -100);
-            assert_eq!(sent[0].reply_to_message_id, Some(78));
-            assert!(sent[0].html.contains(r#"<audio src="#));
-            assert!(sent[0].html.contains("Neon Rain"));
-            assert!(sent[0].html.contains("Synthwave"));
-            assert!(sent[0].html.contains("neon rain"));
+        assert_eq!(
+            queue
+                .records()
+                .into_iter()
+                .find(|record| record.id == job_id)
+                .expect("music job")
+                .status,
+            JobStatus::WaitingDelivery
+        );
+        assert_eq!(
+            queue
+                .records()
+                .into_iter()
+                .find(|record| record.id == job_id)
+                .expect("music job")
+                .result_message_id,
+            None
+        );
+        runtime.durability_barrier(job_id).await?;
+        let payload: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM telegram_outbox WHERE dialog_job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(payload["chat_id"], -100);
+        assert_eq!(payload["options"]["reply_to_message_id"], 78);
+        let html = payload["html"].as_str().expect("rich HTML");
+        for expected in [
+            "https://media.example.test/song.mp3",
+            "Neon Rain",
+            "Synthwave",
+            "neon rain",
+        ] {
+            assert!(html.contains(expected), "{html}");
         }
-        assert_eq!(queue.records()[0].status, JobStatus::Completed);
+        {
+            let uploads = uploads.lock().expect("uploads");
+            assert_eq!(uploads.len(), 1);
+            let body = String::from_utf8_lossy(&uploads[0]);
+            assert!(body.contains("MP3"));
+            assert!(body.contains("audio/mpeg"));
+        }
+        let (restored, _) =
+            crate::task_queue::SharedTaskQueueRuntime::load_from_postgres_with_id_allocator(
+                openplotva_storage::PostgresTaskQueueStore::new(pool.clone()),
+                openplotva_taskman::TaskQueueIdAllocator::default(),
+            )
+            .await?;
+        let queue = restored.queue();
+        assert_eq!(
+            queue
+                .records()
+                .into_iter()
+                .find(|record| record.id == job_id)
+                .expect("music job")
+                .status,
+            JobStatus::WaitingDelivery
+        );
+        let resolver = crate::telegram_outbox::RunAwareTelegramOutboxJobResolver::new(
+            restored,
+            crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(4),
+            openplotva_storage::gradius_ads::PostgresGradiusAdStore::new(pool.clone()),
+            store.clone(),
+            None,
+        );
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(crate::telegram_outbox::run_telegram_outbox_worker_until(
+            store,
+            openplotva_storage::PostgresHistoryStore::new(pool.clone()),
+            MusicReceiptTransport,
+            resolver,
+            "music-test",
+            7,
+            crate::telegram_outbox::TelegramOutboxWorkerConfig::default(),
+            crate::telegram_outbox::TelegramOutboxWorkerMetrics::default(),
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while queue
+                .records()
+                .iter()
+                .find(|record| record.id == job_id)
+                .expect("song")
+                .status
+                != JobStatus::Completed
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let _ = stop_tx.send(());
+        let delivery = worker.await?;
+        assert_eq!(delivery.delivered, 1, "{delivery:?}");
+        assert_eq!(delivery.errors, 0, "{delivery:?}");
+        assert_eq!(
+            queue
+                .records()
+                .into_iter()
+                .find(|record| record.id == job_id)
+                .expect("music job")
+                .result_message_id,
+            Some(100)
+        );
+        let song_message: Option<i32> = sqlx::query_scalar("SELECT result_message_id FROM generated_songs WHERE job_id = $1 AND prepared_delivery IS NOT NULL")
+            .bind(job_id).fetch_one(&pool).await?;
+        assert_eq!(song_message, Some(100));
+        server.abort();
+        sqlx::query("DELETE FROM telegram_outbox WHERE dialog_job_id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM generated_songs WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM taskman_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await?;
         assert_eq!(update_queue.len().await?, 0);
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
@@ -5947,7 +6107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_postgres_serialized_album_schedules_one_edit_with_original_caption()
+    async fn live_postgres_serialized_album_preserves_caption_and_source_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
             return Ok(());
@@ -5956,13 +6116,21 @@ mod tests {
             .max_connections(2)
             .connect(&dsn)
             .await?;
+        openplotva_storage::run_migrations_on(&pool).await?;
         let bot_id = i64::from(rand::random::<u32>()) + 1000;
         let store = openplotva_storage::PostgresTelegramDeliveryStore::new(pool.clone());
         let files = openplotva_storage::PostgresTelegramFileStore::new(pool.clone());
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        for (case, (count, caption_last)) in [(2, false), (10, false), (2, true), (10, true)]
-            .into_iter()
-            .enumerate()
+        for (case, (count, caption_last)) in [
+            (2, false),
+            (openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES, false),
+            (openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES + 1, false),
+            (2, true),
+            (openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES, true),
+            (openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES + 1, true),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let album = format!("serial-album-{bot_id}-{case}");
             let caption_index = if caption_last { count - 1 } else { 0 };
@@ -6026,32 +6194,54 @@ mod tests {
                 )
                 .await?;
                 if index == caption_index {
-                    assert!(matches!(
-                        route,
-                        DialogMessageUpdateRoute::DrawImageScheduled { .. }
-                    ));
+                    assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
                 } else {
                     assert_eq!(route, DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
                 }
                 sqlx::query("UPDATE telegram_update_inbox SET status='completed' WHERE bot_id=$1 AND update_id=$2")
                     .bind(bot_id).bind(case as i64 * 100 + index as i64).execute(&pool).await?;
             }
-            assert!(scheduler.calls().is_empty());
-            let records = queue.records();
-            assert_eq!(records.len(), 1);
-            let data = &records[0].job.data;
-            let image = data.image_data.as_ref().expect("image edit");
-            assert!(image.image_urls.is_empty());
-            assert_eq!(image.image_file_ids, expected_file_ids);
-            assert_eq!(image.prompt, prompt);
-            assert_eq!(image.original_text, prompt);
-            assert_eq!(
-                data.telegram_data
-                    .as_ref()
-                    .expect("telegram target")
-                    .message_id,
-                77 + caption_index as i32
-            );
+            assert_eq!(scheduler.calls().len(), 1);
+            let meta = scheduler.metas()[0].clone();
+            assert_eq!(meta.requested_tool, "draw_image");
+            let scheduled = image_scheduler
+                .schedule_image(crate::dialog_tools::DrawImageScheduleRequest {
+                    chat_id: 42,
+                    message_id: 77 + caption_index as i32,
+                    user_id: meta.sender_id,
+                    user_full_name: meta.sender_name.clone(),
+                    prompt: prompt.to_owned(),
+                    original_prompt: prompt.to_owned(),
+                    message_text: prompt.to_owned(),
+                    attachments: meta.attachments,
+                    edit_media_group_id: album.clone(),
+                    ..Default::default()
+                })
+                .await;
+            if count > openplotva_core::MAX_IMAGE_EDIT_SOURCE_IMAGES {
+                let error = scheduled.expect_err("oversized album must be rejected");
+                assert_eq!(error.to_string(), "too many album reference images");
+                assert!(queue.records().is_empty());
+            } else {
+                let scheduled =
+                    scheduled.map_err(|error| std::io::Error::other(error.to_string()))?;
+                assert_eq!(scheduled.status, "scheduled");
+                let records = queue.records();
+                assert_eq!(records.len(), 1);
+                let data = &records[0].job.data;
+                let image = data.image_data.as_ref().expect("image edit");
+                assert!(image.image_urls.is_empty());
+                assert_eq!(image.image_file_ids, expected_file_ids);
+                assert_eq!(image.prompt, prompt);
+                assert_eq!(image.original_text, prompt);
+                assert_eq!(
+                    data.telegram_data
+                        .as_ref()
+                        .expect("telegram target")
+                        .message_id,
+                    77 + caption_index as i32
+                );
+            }
             sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id=$1")
                 .bind(bot_id)
                 .execute(&pool)
@@ -6829,6 +7019,27 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct MusicReceiptTransport;
+
+    impl crate::telegram_outbox::TelegramOutboxTransport for MusicReceiptTransport {
+        fn execute<'a>(
+            &'a self,
+            command: openplotva_telegram::OutboundCommand,
+        ) -> crate::telegram_outbox::TelegramOutboxTransportFuture<'a> {
+            Box::pin(async move {
+                let (_, _, payload) = command.into_storage_parts().expect("rich command");
+                assert_eq!(payload["chat_id"], -100);
+                let message = serde_json::from_value(serde_json::json!({
+                    "message_id":100,"date":1,"chat":{"id":-100,"type":"supergroup","title":"Group"}
+                }))
+                .expect("Telegram receipt");
+                Ok(openplotva_telegram::TelegramOutboundResponse::Message(
+                    Box::new(message),
+                ))
+            })
+        }
+    }
+
     struct MusicMaterialProviderStub {
         material: crate::music_jobs::SongMaterial,
         calls: Arc<Mutex<Vec<String>>>,
@@ -7029,14 +7240,6 @@ mod tests {
     }
 
     impl crate::music_jobs::MusicTelegramSender for TelegramMethodCapture {
-        fn send_music_method<'a>(
-            &'a self,
-            method: TelegramOutboundMethod,
-        ) -> crate::music_jobs::MusicJobEffectFuture<'a, Result<TelegramOutboundResponse, String>>
-        {
-            Box::pin(async move { self.record_method(&method) })
-        }
-
         fn download_music_file<'a>(
             &'a self,
             file_id: &'a str,

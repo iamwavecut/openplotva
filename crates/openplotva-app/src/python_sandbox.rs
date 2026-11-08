@@ -1066,6 +1066,7 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext {
+            invocation_id: None,
             chat_id: -10_042,
             thread_id: Some(7),
             message_id: 11,

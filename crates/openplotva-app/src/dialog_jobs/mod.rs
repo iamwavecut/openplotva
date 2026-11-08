@@ -5,6 +5,7 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
+use crate::telegram_outbox::QueuedBatchReceipt;
 use openplotva_dialog::DialogInput;
 use openplotva_taskman::{DIALOG_AIFARM_QUEUE_NAME, TEXT_QUEUE_NAME};
 use thiserror::Error;
