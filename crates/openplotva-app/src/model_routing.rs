@@ -5,6 +5,7 @@
 //! unit-tested without a database; [`load_routing_table`] and [`reload_router`]
 //! wrap it with the storage read and the atomic `ArcSwap` publish.
 
+use openplotva_storage::database as sqlx;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2589,6 +2590,7 @@ fn build_route(
 #[cfg(test)]
 mod tests {
     use openplotva_llm::router::{BreakerLiveness, BreakerSet, TriggerState, select};
+    use openplotva_storage::database as sqlx;
     use openplotva_storage::llm_routing::{
         AssignmentRecord, ModelRecord, PoolRecord, ProviderRecord, RoutingSnapshot, TriggerRecord,
         WorkflowRecord,

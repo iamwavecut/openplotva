@@ -1,6 +1,7 @@
 //! Persisted application settings, usable in an existing transaction.
 
 use crate::StorageError;
+use crate::database as sqlx;
 use sqlx::{Executor, Postgres};
 
 pub async fn app_setting<'a>(

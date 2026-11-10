@@ -2,6 +2,7 @@
 //! `RuntimeLlmObserver` pattern in `runtime_llm.rs`. One record per dialog
 //! worker tick that dequeued a job.
 
+use openplotva_storage::database as sqlx;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicI64, Ordering},
@@ -443,6 +444,7 @@ pub async fn delete_old_turn_outcomes_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
     use sqlx::Execute;
 
     fn sample_record(job_id: i64, outcome: &str) -> DialogTurnOutcomeRecord {

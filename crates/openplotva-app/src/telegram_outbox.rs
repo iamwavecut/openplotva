@@ -5,6 +5,7 @@
 //! never replayed automatically: lease recovery moves it to `ambiguous` and an
 //! idempotent terminal reaction is queued instead.
 
+use openplotva_storage::database as sqlx;
 /// Identity returned after all outbound parts were accepted by one queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedBatchReceipt {
@@ -1915,6 +1916,7 @@ fn merge_worker_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
 
     struct UtilityReceiptTransport {
         already_edited: bool,
@@ -2111,6 +2113,18 @@ mod tests {
                     html: "<h2>Winner</h2><hr/>📢 Offer".to_owned(),
                     reply_markup: None,
                 })
+            } else if generation_group {
+                let mut payload = json!({"chat_id": chat_id, "text": "📢 Offer", "parse_mode": "HTML", "link_preview_options": {"is_disabled": true}, "reply_parameters": {"message_id": 77, "allow_sending_without_reply": false}});
+                if ephemeral {
+                    payload["ephemeral_message_parameters"] =
+                        json!({"receiver_user_id": 9_820_825_960_i64});
+                }
+                OutboundCommand::decode(
+                    openplotva_telegram::OUTBOUND_COMMAND_PAYLOAD_VERSION,
+                    "sendMessage",
+                    &serde_json::to_vec(&payload)?,
+                )?
+                .into_method()
             } else {
                 TelegramOutboundMethod::from(crate::gradius_utility_outbox::image_ad_message(
                     chat_id,

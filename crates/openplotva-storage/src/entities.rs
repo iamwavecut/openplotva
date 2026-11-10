@@ -1,10 +1,11 @@
 //! Stored Telegram entity profiles shared by HTTP and runtime API adapters.
 
 use crate::StorageError;
+use crate::database as sqlx;
 use sqlx::{FromRow, PgPool, Row};
 use time::OffsetDateTime;
 
-#[derive(Clone, Debug, serde::Deserialize, sqlx::FromRow)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct TelegramUserProfile {
     pub id: i64,
     pub is_premium: Option<bool>,
@@ -20,10 +21,26 @@ pub struct TelegramUserProfile {
     pub updated: Option<OffsetDateTime>,
 }
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TelegramUserProfile {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            is_premium: row.try_get("is_premium")?,
+            first_name: row.try_get("first_name")?,
+            last_name: row.try_get("last_name")?,
+            username: row.try_get("username")?,
+            language_code: row.try_get("language_code")?,
+            is_vip: row.try_get("is_vip")?,
+            settings: row.try_get("settings")?,
+            discovered: row.try_get("discovered")?,
+            updated: row.try_get("updated")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct TelegramChatProfile {
     pub id: i64,
-    #[sqlx(rename = "type")]
     pub chat_type: String,
     pub title: Option<String>,
     pub username: Option<String>,
@@ -53,6 +70,44 @@ pub struct TelegramChatProfile {
     pub location: Option<serde_json::Value>,
     pub discovered: Option<OffsetDateTime>,
     pub updated: Option<OffsetDateTime>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TelegramChatProfile {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            chat_type: row.try_get("type")?,
+            title: row.try_get("title")?,
+            username: row.try_get("username")?,
+            first_name: row.try_get("first_name")?,
+            last_name: row.try_get("last_name")?,
+            is_forum: row.try_get("is_forum")?,
+            active_usernames: row.try_get("active_usernames")?,
+            available_reactions: row.try_get("available_reactions")?,
+            bio: row.try_get("bio")?,
+            has_private_forwards: row.try_get("has_private_forwards")?,
+            has_restricted_voice_and_video_messages: row
+                .try_get("has_restricted_voice_and_video_messages")?,
+            join_to_send_messages: row.try_get("join_to_send_messages")?,
+            join_by_request: row.try_get("join_by_request")?,
+            description: row.try_get("description")?,
+            invite_link: row.try_get("invite_link")?,
+            pinned_message: row.try_get("pinned_message")?,
+            permissions: row.try_get("permissions")?,
+            slow_mode_delay: row.try_get("slow_mode_delay")?,
+            message_auto_delete_time: row.try_get("message_auto_delete_time")?,
+            has_aggressive_anti_spam_enabled: row.try_get("has_aggressive_anti_spam_enabled")?,
+            has_hidden_members: row.try_get("has_hidden_members")?,
+            has_protected_content: row.try_get("has_protected_content")?,
+            has_visible_history: row.try_get("has_visible_history")?,
+            sticker_set_name: row.try_get("sticker_set_name")?,
+            can_set_sticker_set: row.try_get("can_set_sticker_set")?,
+            linked_chat_id: row.try_get("linked_chat_id")?,
+            location: row.try_get("location")?,
+            discovered: row.try_get("discovered")?,
+            updated: row.try_get("updated")?,
+        })
+    }
 }
 
 const SQL_COUNT_USERS_FILTERED: &str = r#"
@@ -236,9 +291,8 @@ const SQL_ADMIN_LIST_VIP_USERS: &str = "WITH latest_vip AS (SELECT DISTINCT ON (
 
 const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM telegram_chats_effective c JOIN telegram_chat_members_effective cm ON c.id = cm.chat_id JOIN telegram_users_effective u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id LIMIT $3";
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct VipUserProfile {
-    #[sqlx(flatten)]
     pub user: TelegramUserProfile,
     pub remaining_seconds: Option<i64>,
     pub vip_active: Option<bool>,
@@ -250,6 +304,24 @@ pub struct VipUserProfile {
     pub latest_created_at: Option<OffsetDateTime>,
     pub subscriptions_count: Option<i64>,
     pub latest_subscription_expires_at: Option<OffsetDateTime>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for VipUserProfile {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            user: <TelegramUserProfile as sqlx::FromRow<sqlx::postgres::PgRow>>::from_row(row)?,
+            remaining_seconds: row.try_get("remaining_seconds")?,
+            vip_active: row.try_get("vip_active")?,
+            vip_expires_at: row.try_get("vip_expires_at")?,
+            latest_event_id: row.try_get("latest_event_id")?,
+            latest_event_type: row.try_get("latest_event_type")?,
+            latest_delta_seconds: row.try_get("latest_delta_seconds")?,
+            latest_reason: row.try_get("latest_reason")?,
+            latest_created_at: row.try_get("latest_created_at")?,
+            subscriptions_count: row.try_get("subscriptions_count")?,
+            latest_subscription_expires_at: row.try_get("latest_subscription_expires_at")?,
+        })
+    }
 }
 
 impl PostgresEntityStore {
@@ -283,13 +355,24 @@ impl PostgresEntityStore {
     }
 }
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct ChatMemberProfile {
-    #[sqlx(flatten)]
     pub membership: crate::ChatMemberRecord,
     pub created_at: Option<OffsetDateTime>,
     pub updated_at: Option<OffsetDateTime>,
     pub last_message_at: Option<OffsetDateTime>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ChatMemberProfile {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            membership:
+                <crate::ChatMemberRecord as sqlx::FromRow<sqlx::postgres::PgRow>>::from_row(row)?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            last_message_at: row.try_get("last_message_at")?,
+        })
+    }
 }
 
 impl PostgresEntityStore {
@@ -341,7 +424,7 @@ impl PostgresEntityStore {
     }
 }
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct StoredChatSettings {
     pub chat_id: i64,
     pub mood_alignment: Option<String>,
@@ -359,7 +442,28 @@ pub struct StoredChatSettings {
     pub greeting_html: Option<String>,
 }
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for StoredChatSettings {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            chat_id: row.try_get("chat_id")?,
+            mood_alignment: row.try_get("mood_alignment")?,
+            custom_persona: row.try_get("custom_persona")?,
+            updated: row.try_get("updated")?,
+            reactivity_percentage: row.try_get("reactivity_percentage")?,
+            proactivity_percentage: row.try_get("proactivity_percentage")?,
+            enable_global_text_reply: row.try_get("enable_global_text_reply")?,
+            enable_global_draw_reply: row.try_get("enable_global_draw_reply")?,
+            enable_obscenifier: row.try_get("enable_obscenifier")?,
+            enable_profanity: row.try_get("enable_profanity")?,
+            enable_greet_joiners: row.try_get("enable_greet_joiners")?,
+            enable_daily_game: row.try_get("enable_daily_game")?,
+            daily_game_theme: row.try_get("daily_game_theme")?,
+            greeting_html: row.try_get("greeting_html")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredChatPermissions {
     pub chat_id: i64,
     pub status: Option<String>,
@@ -385,6 +489,37 @@ pub struct StoredChatPermissions {
     pub created_at: Option<OffsetDateTime>,
     pub updated_at: Option<OffsetDateTime>,
     pub error_count: Option<i32>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for StoredChatPermissions {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            chat_id: row.try_get("chat_id")?,
+            status: row.try_get("status")?,
+            can_manage_chat: row.try_get("can_manage_chat")?,
+            can_delete_messages: row.try_get("can_delete_messages")?,
+            can_manage_video_chats: row.try_get("can_manage_video_chats")?,
+            can_restrict_members: row.try_get("can_restrict_members")?,
+            can_promote_members: row.try_get("can_promote_members")?,
+            can_change_info: row.try_get("can_change_info")?,
+            can_invite_users: row.try_get("can_invite_users")?,
+            can_post_messages: row.try_get("can_post_messages")?,
+            can_edit_messages: row.try_get("can_edit_messages")?,
+            can_pin_messages: row.try_get("can_pin_messages")?,
+            can_manage_topics: row.try_get("can_manage_topics")?,
+            can_send_messages: row.try_get("can_send_messages")?,
+            can_send_media_messages: row.try_get("can_send_media_messages")?,
+            can_send_polls: row.try_get("can_send_polls")?,
+            can_send_other_messages: row.try_get("can_send_other_messages")?,
+            can_add_web_page_previews: row.try_get("can_add_web_page_previews")?,
+            last_checked_at: row.try_get("last_checked_at")?,
+            last_error_at: row.try_get("last_error_at")?,
+            error_message: row.try_get("error_message")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            error_count: row.try_get("error_count")?,
+        })
+    }
 }
 
 const SQL_ADMIN_GET_CHAT_SETTINGS: &str = "SELECT * FROM chat_settings WHERE chat_id = $1";
@@ -419,5 +554,96 @@ impl PostgresEntityStore {
             .bind(chat_id)
             .fetch_one(&self.pool)
             .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database as sqlx;
+
+    #[tokio::test]
+    async fn postgres_entity_rows_preserve_field_names_flattening_and_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let user_json = serde_json::json!({"id": 42, "first_name": "Row test", "is_vip": false, "settings": {"language": "ru"}});
+        let user: TelegramUserProfile = sqlx::query_as(
+            "SELECT * FROM jsonb_populate_record(NULL::telegram_users_effective, $1)",
+        )
+        .bind(&user_json)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(user.id, 42);
+        assert_eq!(user.first_name, "Row test");
+        assert_eq!(user.is_vip, Some(false));
+        assert_eq!(user.settings, Some(serde_json::json!({"language": "ru"})));
+        assert_eq!(user.updated, None);
+
+        let chat: TelegramChatProfile = sqlx::query_as(
+            "SELECT * FROM jsonb_populate_record(NULL::telegram_chats_effective, $1)",
+        ).bind(serde_json::json!({"id": -10042, "type": "supergroup", "title": "Row test", "is_forum": true})).fetch_one(&pool).await?;
+        assert_eq!(chat.chat_type, "supergroup");
+        assert_eq!(chat.id, -10042);
+        assert_eq!(chat.is_forum, Some(true));
+
+        let vip: VipUserProfile = sqlx::query_as(
+            "SELECT profile.*, 60::bigint AS remaining_seconds, true AS vip_active, NULL::timestamptz AS vip_expires_at, 7::bigint AS latest_event_id, 'purchase'::text AS latest_event_type, 60::bigint AS latest_delta_seconds, NULL::text AS latest_reason, NULL::timestamptz AS latest_created_at, 1::bigint AS subscriptions_count, NULL::timestamptz AS latest_subscription_expires_at FROM jsonb_populate_record(NULL::telegram_users_effective, $1) AS profile",
+        ).bind(&user_json).fetch_one(&pool).await?;
+        assert_eq!(vip.user.id, 42);
+        assert_eq!(vip.user.first_name, user.first_name);
+        assert_eq!(vip.remaining_seconds, Some(60));
+        assert_eq!(vip.latest_event_id, Some(7));
+
+        let membership = serde_json::json!({"chat_id": -10042, "user_id": 42, "status": "member", "can_delete_messages": false});
+        let member: ChatMemberProfile = sqlx::query_as(
+            "SELECT * FROM jsonb_populate_record(NULL::telegram_chat_members_effective, $1)",
+        )
+        .bind(&membership)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(member.membership.user_id, 42);
+        assert_eq!(member.membership.status, "member");
+        assert_eq!(member.membership.can_delete_messages, Some(false));
+        assert_eq!(member.membership.telegram_observed_at, None);
+
+        let settings: StoredChatSettings = sqlx::query_as(
+            "SELECT * FROM jsonb_populate_record(NULL::chat_settings, $1)",
+        ).bind(serde_json::json!({"chat_id": -10042, "reactivity_percentage": 75, "proactivity_percentage": 20, "enable_global_text_reply": true, "enable_global_draw_reply": false, "enable_obscenifier": false, "enable_profanity": true, "enable_greet_joiners": false})).fetch_one(&pool).await?;
+        assert_eq!(settings.reactivity_percentage, 75);
+        assert!(settings.enable_global_text_reply);
+        assert_eq!(settings.daily_game_theme, None);
+
+        let permissions: StoredChatPermissions = sqlx::query_as(
+            "SELECT * FROM jsonb_populate_record(NULL::chat_permissions, $1)",
+        )
+        .bind(serde_json::json!({"chat_id": -10042, "can_delete_messages": true, "error_count": 0}))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(permissions.can_delete_messages, Some(true));
+        assert_eq!(permissions.error_count, Some(0));
+
+        let missing = sqlx::query_as::<_, TelegramUserProfile>("SELECT 42::bigint AS other_id")
+            .fetch_one(&pool)
+            .await;
+        assert!(matches!(missing, Err(sqlx::Error::ColumnNotFound(_))));
+        let invalid = sqlx::query_as::<_, TelegramUserProfile>("SELECT 'invalid'::text AS id")
+            .fetch_one(&pool)
+            .await;
+        assert!(matches!(invalid, Err(sqlx::Error::ColumnDecode { .. })));
+        let invalid_default = sqlx::query_as::<_, crate::ChatMemberRecord>(
+            "SELECT member.*, 'invalid'::text AS telegram_observed_at FROM jsonb_populate_record(NULL::telegram_chat_members_effective, $1) AS member",
+        ).bind(&membership).fetch_one(&pool).await;
+        assert!(matches!(
+            invalid_default,
+            Err(sqlx::Error::ColumnDecode { .. })
+        ));
+        Ok(())
     }
 }

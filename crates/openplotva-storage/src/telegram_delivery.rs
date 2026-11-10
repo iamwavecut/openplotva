@@ -4,6 +4,7 @@
 //! whole Stream batch and provides the leased, fenced processing boundary used
 //! after that commit.
 
+use crate::database as sqlx;
 use std::{collections::HashMap, time::Duration};
 
 use serde::de::DeserializeOwned;
@@ -1900,6 +1901,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::{env, error::Error, time::SystemTime};
 
     use openplotva_core::{ChatState, UserState};

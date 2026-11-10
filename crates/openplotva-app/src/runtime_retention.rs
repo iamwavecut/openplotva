@@ -9,6 +9,7 @@
 //! sleep. The drain inner loop clears a large initial backlog gradually (a small
 //! pause between batches) so it does not spike replication lag or autovacuum.
 
+use openplotva_storage::database as sqlx;
 use std::time::Duration;
 
 use openplotva_storage::PostgresTelegramDeliveryStore;

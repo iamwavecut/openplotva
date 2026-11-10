@@ -8,7 +8,7 @@ Usage:
 
 Runs the dependency, advisory, license, and supply-chain gate:
   - cargo deny check
-  - cargo audit, with a documented sqlx optional-MySQL false-positive ignore
+  - cargo audit
   - cargo machete
   - cargo vet --locked, only when supply-chain/ exists
 
@@ -76,10 +76,7 @@ if [[ "$skip_deny" == false ]]; then
 else
   echo "+ skip cargo deny check"
 fi
-# cargo audit scans every package recorded in Cargo.lock, including sqlx's
-# optional MySQL support. The workspace enables only Postgres sqlx features;
-# cargo deny checks that selected feature graph above.
-run cargo audit --ignore RUSTSEC-2023-0071
+run cargo audit
 run cargo machete
 
 if [[ -d supply-chain ]]; then

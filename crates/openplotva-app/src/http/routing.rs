@@ -14,6 +14,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::Response,
 };
+use openplotva_storage::database as sqlx;
 use serde_json::json;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};

@@ -4,6 +4,7 @@
 //! the panel degrades per-section instead of blanking when the butler or the
 //! database is unreachable.
 
+use openplotva_storage::database as sqlx;
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 

@@ -1,5 +1,6 @@
 //! App-level music generation task execution.
 
+use openplotva_storage::database as sqlx;
 use std::{
     collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration,
 };

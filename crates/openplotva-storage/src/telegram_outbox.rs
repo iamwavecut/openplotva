@@ -1,5 +1,6 @@
 //! Durable Postgres outbox for Telegram operations.
 
+use crate::database as sqlx;
 use std::{collections::HashMap, time::Duration};
 
 use serde_json::Value;
@@ -1649,6 +1650,7 @@ fn outbox_attempt_from_row(row: PgRow) -> Result<TelegramOutboxAttempt, StorageE
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::{env, error::Error, time::SystemTime};
 
     use sqlx::{Execute as _, postgres::PgPoolOptions};

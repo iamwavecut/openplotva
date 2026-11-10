@@ -2019,6 +2019,7 @@ fn user_full_name(user: &TelegramUser) -> String {
 mod tests {
     use super::*;
     use crate::updates::UpdateHandler;
+    use openplotva_storage::database as sqlx;
     use serde_json::json;
     use std::{
         io::{self, Read, Write},

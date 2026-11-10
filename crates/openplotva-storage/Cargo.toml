@@ -21,11 +21,15 @@ redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "time"] }
+sqlx-core = { workspace = true, features = ["json", "migrate", "offline", "_rt-tokio", "time"] }
+sqlx-postgres = { workspace = true, features = ["json", "migrate", "offline", "time"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+
+[build-dependencies]
+sqlx-core = { workspace = true, features = ["migrate"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

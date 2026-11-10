@@ -3,6 +3,7 @@
 //! The in-memory queue only holds active jobs and a short tail of finished ones,
 //! so listings read `taskman_jobs`, which keeps finished jobs until retention.
 
+use crate::database as sqlx;
 use std::collections::BTreeMap;
 
 use sqlx::{Postgres, QueryBuilder, Row};

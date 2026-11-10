@@ -1,3 +1,4 @@
+use crate::database as sqlx;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -590,6 +591,7 @@ fn unavailable(reason: &'static str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::error::Error;
 
     use serde_json::json;

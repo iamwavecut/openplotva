@@ -1,5 +1,6 @@
 //! HTTP state and feature-specific request adapters.
 
+use openplotva_storage::database as sqlx;
 pub(crate) mod assets;
 pub(crate) mod auth;
 pub(crate) mod common;

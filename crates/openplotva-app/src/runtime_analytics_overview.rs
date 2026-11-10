@@ -8,6 +8,7 @@
 //! honest (no rollup approximation). Long-range historical trends stay on the
 //! rollup-backed views elsewhere.
 
+use openplotva_storage::database as sqlx;
 use std::time::Duration as StdDuration;
 
 use serde_json::{Value, json};

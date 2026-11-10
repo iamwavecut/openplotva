@@ -1,3 +1,4 @@
+use openplotva_storage::database as sqlx;
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -417,6 +418,7 @@ pub async fn record_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
 
     #[tokio::test]
     async fn maintenance_lifecycle_captures_without_telegram_and_retains_notifications()
