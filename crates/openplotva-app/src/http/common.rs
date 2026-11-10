@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use openplotva_storage::database as sqlx;
 use std::collections::BTreeMap;
 
 pub(crate) fn query_values(raw_query: Option<&str>) -> BTreeMap<String, String> {

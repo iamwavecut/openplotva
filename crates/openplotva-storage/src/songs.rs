@@ -1,6 +1,7 @@
 //! Generated song material, prepared payloads, and confirmed delivery links.
 
 use crate::StorageError;
+use crate::database as sqlx;
 use sqlx::{PgPool, Row, postgres::PgRow};
 use time::OffsetDateTime;
 
@@ -201,6 +202,7 @@ fn generated_song_from_row(row: PgRow) -> Result<GeneratedSongRecord, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database as sqlx;
     use serde_json::json;
 
     #[tokio::test]

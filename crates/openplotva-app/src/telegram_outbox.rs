@@ -5,6 +5,7 @@
 //! never replayed automatically: lease recovery moves it to `ambiguous` and an
 //! idempotent terminal reaction is queued instead.
 
+use openplotva_storage::database as sqlx;
 /// Identity returned after all outbound parts were accepted by one queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedBatchReceipt {
@@ -1915,6 +1916,7 @@ fn merge_worker_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
 
     struct UtilityReceiptTransport {
         already_edited: bool,

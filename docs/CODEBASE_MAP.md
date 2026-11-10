@@ -462,6 +462,13 @@ without hiding the rest); `TriggerState` (engaged set + capacity-until).
 No `sqlx`, no `tracing`, no `futures` — policy is pure/sync. **Reply finalization** *(2026-07-06, PR #17)*: `aifarm::extract_final_answer` and `gemini::gemini_final_answer` both delegate to `openplotva_dialog::finalize_dialog_reply`; suppression variants map to retryable errors (`AifarmDialogError::FinalAnswer{ContextLeak,Pathological,ProtocolOnly}` / gemini `ProviderProtocolError` with a granular reason string). aifarm also keeps a separate `ReasoningBudgetExhausted` (detected on `finish_reason=="length"`); gemini runs a second `sanitize_genkit_final_answer` after finalization that can re-suppress.
 
 #### `openplotva-storage`
+`database.rs` exposes only `sqlx-core` and `sqlx-postgres` to storage and runtime
+adapters. The multi-driver `sqlx` facade and its derive/migration macros are not
+dependencies. `build.rs` embeds migrations with SQLx's own resolver, preserving
+their order, SQL, checksums, and transaction flags. Entity row mappings implement
+PostgreSQL `FromRow` explicitly. A CI test rejects SQLite and MySQL drivers
+in the lockfile. The dependency gate runs `cargo audit` without advisory exclusions.
+
 ~20 typed Postgres stores + 11 Redis stores + taskman WAL adapter + AES-GCM
 key sealing. `MIGRATOR` embedded at compile time. Pool: 50 max / 10 min, **10s
 acquire timeout** (shorter than dispatcher send budget → fail fast on

@@ -1,4 +1,5 @@
 //! Caller-scoped queries used by dialog tools.
+use crate::database as sqlx;
 use crate::{PostgresHistoryStore, PostgresMemoryStore, StorageError};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -140,6 +141,7 @@ impl PostgresMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database as sqlx;
 
     #[tokio::test]
     async fn live_agent_tools_enforce_owner_topic_reset_and_memory_scope()

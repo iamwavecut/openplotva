@@ -1,3 +1,4 @@
+use openplotva_storage::database as sqlx;
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use openplotva_llm::gradius::vip_hint_for_impression;
@@ -1667,6 +1668,7 @@ fn is_word_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use openplotva_storage::database as sqlx;
     use std::{
         collections::VecDeque,
         future::Future,

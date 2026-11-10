@@ -2134,6 +2134,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use openplotva_storage::database as sqlx;
     use std::{
         collections::{BTreeMap, VecDeque},
         env,

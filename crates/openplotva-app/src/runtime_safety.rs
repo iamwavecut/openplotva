@@ -1,5 +1,6 @@
 //! Runtime API WhiteCircle safety-check reader backed by Postgres.
 
+use openplotva_storage::database as sqlx;
 use std::time::Duration;
 
 use openplotva_server::{

@@ -1,3 +1,4 @@
+use crate::database as sqlx;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
@@ -1362,6 +1363,7 @@ fn parse_ineligibility_reason(value: &str) -> Option<GradiusAdIneligibility> {
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::{env, error::Error};
 
     use serde_json::{Value, json};

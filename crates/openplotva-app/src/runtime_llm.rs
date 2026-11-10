@@ -1,5 +1,6 @@
 //! Runtime API LLM trace buffer and dialog provider recorder.
 
+use openplotva_storage::database as sqlx;
 use std::{
     sync::{
         Arc, Mutex,
@@ -1719,6 +1720,7 @@ fn format_ts(ts: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use openplotva_server::RuntimeLlmGenConfigData;
+    use openplotva_storage::database as sqlx;
 
     use super::*;
 

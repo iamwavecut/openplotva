@@ -1,5 +1,6 @@
 //! Composition root for the OpenPlotva application shell.
 
+use openplotva_storage::database as sqlx;
 pub mod admin;
 pub mod agent_runtime;
 mod agent_tools;
@@ -5666,6 +5667,7 @@ mod tests {
         admin_auth_check, admin_auth_date_is_fresh, admin_auth_response, admin_auth_user_state,
         admin_bootstrap, admin_session_is_authorized, admin_static_asset_requires_auth,
     };
+    use openplotva_storage::database as sqlx;
 
     use crate::http::common::parse_memory_limit;
     use crate::http::settings::{

@@ -1,3 +1,4 @@
+use crate::database as sqlx;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
@@ -133,6 +134,7 @@ fn notification_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database as sqlx;
 
     #[tokio::test]
     async fn live_maintenance_notification_receipts_fence_replay_and_ambiguous_delivery()

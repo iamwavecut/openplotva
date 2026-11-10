@@ -8,6 +8,7 @@ use openplotva_server::{
     RuntimeTelegramUpdateAttemptData, RuntimeTelegramUpdateInboxItemData,
     RuntimeTelegramUpdateInboxStatsData,
 };
+use openplotva_storage::database as sqlx;
 use openplotva_storage::{
     PostgresTelegramDeliveryStore, PostgresTelegramOutboxStore, TelegramOutboxAttempt,
     TelegramOutboxItem, TelegramOutboxStats, TelegramUpdateAttempt, TelegramUpdateInboxItem,

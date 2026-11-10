@@ -2536,6 +2536,7 @@ const OBSCENIFY_VOWELS: &str = "ауоыиэяюёе";
 #[cfg(test)]
 mod tests {
     use crate::dialog_tools::DrawImageScheduleRequest;
+    use openplotva_storage::database as sqlx;
     use openplotva_telegram::TELEGRAM_PARSE_MODE_HTML;
     use std::{
         collections::VecDeque,

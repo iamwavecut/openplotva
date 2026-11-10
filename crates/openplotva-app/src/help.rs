@@ -615,6 +615,7 @@ fn command_for_bot(command: &ParsedBotCommand<'_>, private_chat: bool, bot_usern
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
     use openplotva_telegram::build_text_message_methods;
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::{Value, json};

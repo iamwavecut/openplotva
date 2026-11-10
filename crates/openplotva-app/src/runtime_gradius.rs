@@ -4,6 +4,7 @@ use openplotva_server::{
     RuntimeGradiusAuditReader, RuntimeGradiusAuditReaderFuture, RuntimeGradiusOpportunitiesFilter,
     RuntimeGradiusSummaryFilter,
 };
+use openplotva_storage::database as sqlx;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -311,6 +312,7 @@ fn error_text(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    use openplotva_storage::database as sqlx;
     use std::{env, error::Error};
 
     use openplotva_storage::gradius_ads::{

@@ -2766,6 +2766,7 @@ mod tests {
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateStateStore, UpdateStateStoreFuture,
         process_update_with_state_store_at,
     };
+    use openplotva_storage::database as sqlx;
     use openplotva_taskman::{JobPayload, JobType, control_job_params_from_stateless_job};
     use openplotva_telegram::{
         CallbackHandlerKind, DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind,

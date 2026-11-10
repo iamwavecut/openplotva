@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use openplotva_storage::database as sqlx;
 use openplotva_storage::{
     PostgresChatMemberStore, PostgresChatSettingsStore, PostgresPaymentStore, PostgresVipStore,
     RedisBlockedChatStore,

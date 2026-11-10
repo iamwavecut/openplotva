@@ -7,6 +7,7 @@ use openplotva_server::{
     RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter, RuntimeVipCacheData,
     RuntimeVipEventData, RuntimeVipSummaryData,
 };
+use openplotva_storage::database as sqlx;
 use openplotva_storage::entities::{
     ChatMemberProfile, PostgresEntityStore, TelegramChatProfile, TelegramUserProfile,
 };
@@ -459,6 +460,7 @@ fn error_text(error: openplotva_storage::StorageError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::database as sqlx;
 
     #[test]
     fn subscription_status_matches_go_priority_order() {

@@ -6,6 +6,7 @@
 //! crate convention of binding `$N::jsonb` from a JSON string and selecting
 //! `column::text`; `TEXT[]` maps directly to `Vec<String>`.
 
+use crate::database as sqlx;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use serde::Deserialize;
@@ -1941,6 +1942,7 @@ pub fn open_key(master_secret: &str, sealed: &[u8]) -> Result<String, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database as sqlx;
 
     #[tokio::test]
     async fn live_admin_digest_correlates_models_without_counting_retries_as_incidents()

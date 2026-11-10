@@ -1,5 +1,7 @@
 //! Rich layouts, durable final delivery, and temporary draft transport.
 
+#[cfg(test)]
+use openplotva_storage::database as sqlx;
 use openplotva_telegram::{escape_telegram_html_text as esc, format_rich_html, sanitize_rich_html};
 
 /// Persists final rich messages through the existing Telegram outbox.

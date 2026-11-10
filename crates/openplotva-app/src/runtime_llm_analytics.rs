@@ -1,5 +1,6 @@
 //! Runtime API LLM analytics reader backed by Postgres.
 
+use openplotva_storage::database as sqlx;
 use std::{collections::BTreeMap, sync::Arc, time::Duration as StdDuration};
 
 use openplotva_server::{

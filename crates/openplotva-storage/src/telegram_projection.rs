@@ -1,5 +1,6 @@
 //! Bulk Telegram state projections backed by UNLOGGED coalescing tables.
 
+use crate::database as sqlx;
 use openplotva_core::{ChatState, UserState};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -1539,6 +1540,7 @@ async fn write_files(
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::{env, error::Error};
 
     use openplotva_core::{ChatState, UserState};

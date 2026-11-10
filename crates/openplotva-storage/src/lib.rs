@@ -1,7 +1,9 @@
 //! Storage boundary for Postgres, pgvector, SQLx, Redis, and Dragonfly.
 
+use crate::database as sqlx;
 mod agent_tools;
 pub mod app_settings;
+pub mod database;
 pub mod entities;
 pub mod redis_inspector;
 pub mod songs;
@@ -37,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
     PgPool, Postgres, Row, Transaction,
-    migrate::{MigrateError, Migration, Migrator},
+    migrate::{MigrateError, Migration},
     postgres::{PgPoolOptions, PgRow},
 };
 use thiserror::Error;
@@ -1586,7 +1588,7 @@ pub const CHAT_MEMBER_STATUS_LEFT: &str = "left";
 
 pub const CHAT_MEMBER_STATUS_KICKED: &str = "kicked";
 
-pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 // SQLx's database advisory lock serializes normal transactional migrations, but
 // concurrent-index migrations must release the transaction. Serialize callers
 // inside one process as well, otherwise parallel integration tests can deadlock
@@ -3601,7 +3603,7 @@ pub struct PostgresChatMemberStore {
     pool: PgPool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChatMemberRecord {
     /// Telegram chat ID.
     pub chat_id: i64,
@@ -3651,8 +3653,44 @@ pub struct ChatMemberRecord {
     /// Optional restricted/kicked expiration.
     pub until_date: Option<OffsetDateTime>,
     /// Time at which Telegram last supplied this membership state; absent on effective snapshots.
-    #[sqlx(default)]
     pub telegram_observed_at: Option<OffsetDateTime>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ChatMemberRecord {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            chat_id: row.try_get("chat_id")?,
+            user_id: row.try_get("user_id")?,
+            status: row.try_get("status")?,
+            is_member: row.try_get("is_member")?,
+            is_anonymous: row.try_get("is_anonymous")?,
+            custom_title: row.try_get("custom_title")?,
+            can_be_edited: row.try_get("can_be_edited")?,
+            can_manage_chat: row.try_get("can_manage_chat")?,
+            can_delete_messages: row.try_get("can_delete_messages")?,
+            can_manage_video_chats: row.try_get("can_manage_video_chats")?,
+            can_restrict_members: row.try_get("can_restrict_members")?,
+            can_promote_members: row.try_get("can_promote_members")?,
+            can_change_info: row.try_get("can_change_info")?,
+            can_invite_users: row.try_get("can_invite_users")?,
+            can_post_messages: row.try_get("can_post_messages")?,
+            can_edit_messages: row.try_get("can_edit_messages")?,
+            can_pin_messages: row.try_get("can_pin_messages")?,
+            can_manage_topics: row.try_get("can_manage_topics")?,
+            can_send_messages: row.try_get("can_send_messages")?,
+            can_send_media_messages: row.try_get("can_send_media_messages")?,
+            can_send_polls: row.try_get("can_send_polls")?,
+            can_send_other_messages: row.try_get("can_send_other_messages")?,
+            can_add_web_page_previews: row.try_get("can_add_web_page_previews")?,
+            until_date: row.try_get("until_date")?,
+            telegram_observed_at: row.try_get("telegram_observed_at").or_else(
+                |error| match error {
+                    sqlx::Error::ColumnNotFound(_) => Ok(None),
+                    error => Err(error),
+                },
+            )?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -9561,6 +9599,7 @@ fn vip_event_list_from_row(row: PgRow) -> Result<VipEventListRecord, sqlx::Error
 
 #[cfg(test)]
 mod tests {
+    use crate::database as sqlx;
     use std::{
         collections::BTreeMap,
         env,
@@ -9856,6 +9895,22 @@ mod tests {
         let dropped = super::drop_expired_chat_history_partitions(&pool, 1000).await?;
         assert!(dropped.contains(&expected), "retried drop: {dropped:?}");
         Ok(())
+    }
+
+    #[test]
+    fn embedded_migrations_match_sqlx_source_metadata() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let resolved = sqlx::migrate::resolve_blocking(&directory).expect("migration source");
+        let embedded: Vec<_> = super::MIGRATOR.iter().collect();
+        assert_eq!(embedded.len(), resolved.len());
+        for (embedded, (source, _)) in embedded.iter().zip(resolved) {
+            assert_eq!(embedded.version, source.version);
+            assert_eq!(embedded.description, source.description);
+            assert_eq!(embedded.migration_type, source.migration_type);
+            assert_eq!(embedded.sql.as_str(), source.sql.as_str());
+            assert_eq!(embedded.checksum, source.checksum);
+            assert_eq!(embedded.no_tx, source.no_tx);
+        }
     }
 
     #[test]
