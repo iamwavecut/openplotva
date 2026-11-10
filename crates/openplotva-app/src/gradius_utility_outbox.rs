@@ -15,14 +15,14 @@ use openplotva_telegram::{
 };
 use time::OffsetDateTime;
 
-use crate::gradius_ads::{GradiusUtilityAdRequest, GradiusUtilityAdService, GradiusUtilitySurface};
+use crate::gradius_ads::{
+    GradiusUtilityAdRequest, GradiusUtilityAdService, GradiusUtilitySurface, is_private_ad_chat,
+};
 
 #[derive(Clone)]
 pub struct GradiusUtilityImageAds {
     pub ads: Arc<GradiusUtilityAdService>,
     pub outbox: Arc<GradiusUtilityOutbox>,
-    pub telegram: openplotva_telegram::TelegramClient,
-    pub bot_id: i64,
 }
 
 impl std::fmt::Debug for GradiusUtilityImageAds {
@@ -45,24 +45,16 @@ impl GradiusUtilityImageAds {
         prompt: String,
         first_photo_id: i32,
     ) -> Result<(), String> {
-        let delivery = image_ad_delivery(&self.telegram, self.bot_id, chat_id).await?;
-        if delivery == ImageAdDelivery::Persistent
-            && chat_id < 0
-            && !self
-                .outbox
-                .store
-                .public_image_group_available(chat_id)
-                .await
-                .map_err(|error| error.to_string())?
-        {
+        if !is_private_ad_chat(chat_id, user_id) {
             return Ok(());
         }
+        let delivery = ImageAdDelivery::Persistent;
         let source_id = job_id.to_string();
         let Some(ad) = self
             .ads
             .prepare(GradiusUtilityAdRequest {
                 surface: GradiusUtilitySurface::Image,
-                include_vip_appendix: chat_id > 0 || delivery == ImageAdDelivery::Ephemeral,
+                include_vip_appendix: true,
                 source_id: source_id.clone(),
                 attempt_key,
                 user_id,
@@ -97,29 +89,6 @@ impl GradiusUtilityImageAds {
 pub enum ImageAdDelivery {
     Persistent,
     Ephemeral,
-}
-
-async fn image_ad_delivery<Api: crate::settings::GroupSettingsMemberApi>(
-    api: &Api,
-    bot_id: i64,
-    chat_id: i64,
-) -> Result<ImageAdDelivery, String> {
-    if chat_id > 0 {
-        return Ok(ImageAdDelivery::Persistent);
-    }
-    let member = api
-        .get_chat_member(chat_id, bot_id)
-        .await
-        .map_err(|_| "Failed to resolve bot membership for image advertising".to_owned())?;
-    if member.get_user().id != bot_id || !member.get_user().is_bot || !member.is_member() {
-        return Err("Image advertising requires active bot membership".to_owned());
-    }
-    Ok(match member {
-        carapax::types::ChatMember::Administrator(_) | carapax::types::ChatMember::Creator(_) => {
-            ImageAdDelivery::Ephemeral
-        }
-        _ => ImageAdDelivery::Persistent,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +234,9 @@ impl GradiusUtilityOutbox {
         method: TelegramOutboundMethod,
         job_id: Option<i64>,
     ) -> Result<Option<String>, String> {
+        if chat_id <= 0 {
+            return Err("Advertising is restricted to private chats".to_owned());
+        }
         let command = match OutboundCommand::try_from_method(method) {
             Ok(command) => command,
             Err(error) => {
@@ -360,8 +332,8 @@ pub(crate) fn image_ad_message(
     reply_to_message_id: i64,
     html: &str,
 ) -> Result<carapax::types::SendMessage, String> {
-    if user_id <= 0 || chat_id == 0 || (chat_id > 0 && chat_id != user_id) {
-        return Err("Image advertising requires an identified initiator".to_owned());
+    if !is_private_ad_chat(chat_id, user_id) {
+        return Err("Advertising requires the initiator's private chat".to_owned());
     }
     if delivery == ImageAdDelivery::Ephemeral && chat_id > 0 {
         return Err("Ephemeral image advertising requires a group chat".to_owned());
@@ -423,6 +395,9 @@ fn utility_rich_send(
     reply_to: i64,
     html: &str,
 ) -> Result<TelegramOutboundMethod, String> {
+    if chat_id <= 0 {
+        return Err("Advertising is restricted to private chats".to_owned());
+    }
     Ok(SendRichMessage {
         chat_id,
         html: utility_rich_html(html)?,
@@ -441,6 +416,9 @@ fn utility_rich_edit(
     message_id: i64,
     html: &str,
 ) -> Result<TelegramOutboundMethod, String> {
+    if chat_id <= 0 {
+        return Err("Advertising is restricted to private chats".to_owned());
+    }
     Ok(EditRichMessage {
         chat_id,
         message_id,
@@ -455,11 +433,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_ads_preserve_the_selected_visibility_on_replay() {
+    fn all_ad_delivery_methods_reject_non_private_chats() {
+        for chat_id in [-10042, 0] {
+            assert!(
+                image_ad_message(chat_id, 42, ImageAdDelivery::Persistent, None, 77, "Offer")
+                    .is_err()
+            );
+            assert!(
+                image_ad_message(chat_id, 42, ImageAdDelivery::Ephemeral, None, 77, "Offer")
+                    .is_err()
+            );
+            assert!(utility_rich_send(chat_id, None, 77, "<p>Offer</p>").is_err());
+            assert!(utility_rich_edit(chat_id, 77, "<p>Offer</p>").is_err());
+        }
+    }
+
+    #[test]
+    fn private_image_ads_preserve_their_payload_on_replay() {
         for (chat, user, delivery, thread) in [
-            (-100, 42, ImageAdDelivery::Ephemeral, Some(12)),
-            (-100, 42, ImageAdDelivery::Persistent, Some(12)),
             (42, 42, ImageAdDelivery::Persistent, None),
+            (42, 42, ImageAdDelivery::Persistent, Some(12)),
         ] {
             let method = image_ad_message(chat, user, delivery, thread, 77, "📢 <b>Offer</b>")
                 .expect("image ad");
@@ -504,93 +497,6 @@ mod tests {
         ] {
             assert!(image_ad_message(chat, user, delivery, None, 77, "Offer").is_err());
         }
-    }
-
-    struct MemberApi {
-        result: Result<carapax::types::ChatMember, &'static str>,
-        calls: std::sync::Mutex<Vec<(i64, i64)>>,
-    }
-
-    impl crate::settings::GroupSettingsMemberApi for MemberApi {
-        type Error = &'static str;
-
-        fn get_chat_member<'a>(
-            &'a self,
-            chat_id: i64,
-            user_id: i64,
-        ) -> crate::settings::GroupSettingsMemberFuture<'a, carapax::types::ChatMember, Self::Error>
-        {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("member calls")
-                    .push((chat_id, user_id));
-                self.result.clone()
-            })
-        }
-    }
-
-    fn member_api(status: &str, user_id: i64, is_bot: bool) -> MemberApi {
-        let member = serde_json::from_value(serde_json::json!({
-            "status":status,"user":{"id":user_id,"is_bot":is_bot,"first_name":"Bot"},
-            "is_anonymous":false,"can_be_edited":false,"can_change_info":false,
-            "can_delete_messages":false,"can_invite_users":false,"can_manage_chat":true,
-            "can_manage_video_chats":false,"can_promote_members":false,
-            "can_restrict_members":false,"can_send_welcome_messages":false
-        }))
-        .expect("member fixture");
-        MemberApi {
-            result: Ok(member),
-            calls: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    #[tokio::test]
-    async fn image_ad_visibility_uses_current_bot_membership_and_private_needs_no_lookup() {
-        for (status, expected) in [
-            ("administrator", ImageAdDelivery::Ephemeral),
-            ("creator", ImageAdDelivery::Ephemeral),
-            ("member", ImageAdDelivery::Persistent),
-        ] {
-            let api = member_api(status, 7, true);
-            assert_eq!(image_ad_delivery(&api, 7, -100).await, Ok(expected));
-            assert_eq!(*api.calls.lock().expect("member calls"), vec![(-100, 7)]);
-        }
-        let api = MemberApi {
-            result: Err("unavailable"),
-            calls: std::sync::Mutex::new(Vec::new()),
-        };
-        assert_eq!(
-            image_ad_delivery(&api, 7, 42).await,
-            Ok(ImageAdDelivery::Persistent)
-        );
-        assert!(api.calls.lock().expect("member calls").is_empty());
-    }
-
-    #[tokio::test]
-    async fn image_ad_visibility_does_not_publish_on_unknown_or_invalid_bot_membership() {
-        for api in [
-            MemberApi {
-                result: Err("unavailable"),
-                calls: std::sync::Mutex::new(Vec::new()),
-            },
-            member_api("administrator", 42, true),
-            member_api("administrator", 7, false),
-            member_api("left", 7, true),
-        ] {
-            assert!(image_ad_delivery(&api, 7, -100).await.is_err());
-        }
-        let mut api = member_api("administrator", 7, true);
-        assert_eq!(
-            image_ad_delivery(&api, 7, -100).await,
-            Ok(ImageAdDelivery::Ephemeral)
-        );
-        api.result = member_api("member", 7, true).result;
-        assert_eq!(
-            image_ad_delivery(&api, 7, -100).await,
-            Ok(ImageAdDelivery::Persistent)
-        );
-        assert_eq!(api.calls.lock().expect("member calls").len(), 2);
     }
 
     #[test]

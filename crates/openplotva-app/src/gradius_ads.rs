@@ -542,6 +542,10 @@ pub struct GradiusUtilityAdRequest {
     pub completed_at: OffsetDateTime,
 }
 
+pub(crate) const fn is_private_ad_chat(chat_id: i64, user_id: i64) -> bool {
+    chat_id > 0 && chat_id == user_id
+}
+
 pub(crate) fn initialize_placement_service(
     config: &openplotva_config::AppConfig,
     api_key: &str,
@@ -595,17 +599,13 @@ impl GradiusUtilityAdService {
         &self,
         request: GradiusUtilityAdRequest,
     ) -> Result<Option<GradiusAdTail>, String> {
-        if request.user_id <= 0
+        if !is_private_ad_chat(request.chat_id, request.user_id)
             || request.source_id.is_empty()
             || request.source_id.len() > 128
             || !request
                 .source_id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
-            || request.chat_id == 0
-            || (request.surface == GradiusUtilitySurface::Image
-                && request.chat_id > 0
-                && request.chat_id != request.user_id)
             || (request.surface == GradiusUtilitySurface::Image
                 && request
                     .prompt
@@ -976,7 +976,7 @@ impl GradiusAdService {
         &self,
         request: GradiusAdAppendRequest,
     ) -> Result<Option<GradiusPreparedAd>, String> {
-        if request.chat_id <= 0
+        if !is_private_ad_chat(request.chat_id, request.user_id)
             || self
                 .vip
                 .verified_is_vip(request.user_id, request.completed_at)
@@ -1190,7 +1190,7 @@ impl GradiusAdService {
         &self,
         request: GradiusAdAppendRequest,
     ) -> Result<(), String> {
-        if request.chat_id <= 0
+        if !is_private_ad_chat(request.chat_id, request.user_id)
             || self
                 .vip
                 .verified_is_vip(request.user_id, request.completed_at)
@@ -1514,6 +1514,9 @@ fn banner_outbox_batch(
     banner: &GradiusAdBanner,
     target: GradiusBannerTarget,
 ) -> Result<TelegramOutboxBatchInput, String> {
+    if target.chat_id <= 0 {
+        return Err("Advertising is restricted to private chats".to_owned());
+    }
     let chat = ChatRef {
         direct_messages_topic_id: None,
         id: target.chat_id,
@@ -2224,9 +2227,21 @@ mod tests {
             assert_eq!(kind, "sendRichMessage");
             let html = payload["html"].as_str().expect("rich content");
             assert!(html.contains("<table>"));
-            assert!(html.contains("<hr/>"));
-            assert!(html.find("</table>") < html.find("<hr/>"));
-            assert!(html.find("<hr/>") < html.find("📢"));
+            if chat_id > 0 {
+                assert!(html.contains("<hr/>"));
+                assert!(html.find("</table>") < html.find("<hr/>"));
+                assert!(html.find("<hr/>") < html.find("📢"));
+            } else {
+                assert!(!html.contains("📢"));
+                assert!(!html.contains("<hr/>"));
+                let ad_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM gradius_ad_opportunities WHERE chat_id = $1",
+                )
+                .bind(chat_id)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(ad_count, 0);
+            }
             assert!(payload.get("link_preview_options").is_none());
             assert_eq!(payload["options"]["reply_to_message_id"], 77);
             sqlx::query("DELETE FROM telegram_outbox WHERE batch_id = $1")
@@ -2238,12 +2253,125 @@ mod tests {
                 .execute(&pool)
                 .await?;
         }
-        assert_eq!(client.calls.lock().expect("provider calls").len(), 2);
+        assert_eq!(client.calls.lock().expect("provider calls").len(), 1);
         Ok(())
     }
 
     #[tokio::test]
-    async fn public_image_ad_has_no_vip_appendix_in_persisted_html() {
+    async fn all_utility_surfaces_allow_the_initiators_private_chat() {
+        for surface in [
+            GradiusUtilitySurface::Image,
+            GradiusUtilitySurface::Rates,
+            GradiusUtilitySurface::Checkin,
+        ] {
+            let ledger = LedgerStub::default();
+            let service = GradiusUtilityAdService::new(
+                Arc::new(UtilityStub::default()),
+                Arc::new(RedactorStub::default()),
+                Arc::new(ledger.clone()),
+                Arc::new(VipStub(false)),
+            );
+            assert!(
+                service
+                    .prepare(GradiusUtilityAdRequest {
+                        surface,
+                        include_vip_appendix: true,
+                        source_id: "private-only".to_owned(),
+                        attempt_key: "claim-1".to_owned(),
+                        user_id: 42,
+                        chat_id: 42,
+                        thread_id: None,
+                        prompt: Some("Portrait".to_owned()),
+                        result_context: None,
+                        completed_at: OffsetDateTime::UNIX_EPOCH,
+                    })
+                    .await
+                    .expect("private placement")
+                    .is_some()
+            );
+            assert_eq!(
+                ledger.reserved_inputs.lock().expect("reservations").len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_utility_surfaces_skip_non_private_chats_before_external_calls() {
+        for surface in [
+            GradiusUtilitySurface::Image,
+            GradiusUtilitySurface::Rates,
+            GradiusUtilitySurface::Checkin,
+        ] {
+            for chat_id in [-10042, 0, 43] {
+                let client = UtilityStub::default();
+                let ledger = LedgerStub::default();
+                let service = GradiusUtilityAdService::new(
+                    Arc::new(client.clone()),
+                    Arc::new(FailingRedactor),
+                    Arc::new(ledger.clone()),
+                    Arc::new(FailingVipStub),
+                );
+                let ad = service
+                    .prepare(GradiusUtilityAdRequest {
+                        surface,
+                        include_vip_appendix: true,
+                        source_id: "private-only".to_owned(),
+                        attempt_key: "claim-1".to_owned(),
+                        user_id: 42,
+                        chat_id,
+                        thread_id: None,
+                        prompt: Some("Portrait".to_owned()),
+                        result_context: None,
+                        completed_at: OffsetDateTime::UNIX_EPOCH,
+                    })
+                    .await
+                    .expect("non-private chat skips VIP and privacy lookups");
+                assert!(ad.is_none());
+                assert!(
+                    ledger
+                        .reserved_inputs
+                        .lock()
+                        .expect("reservations")
+                        .is_empty()
+                );
+                assert!(client.calls.lock().expect("utility calls").is_empty());
+                assert!(
+                    client
+                        .generation_calls
+                        .lock()
+                        .expect("generation calls")
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn banner_delivery_rejects_non_private_targets() {
+        let banner = super::GradiusAdBanner {
+            opportunity_id: 1,
+            html: "<p>Offer</p><footer>Реклама</footer>".to_owned(),
+            keyboard: Vec::new(),
+        };
+        for chat_id in [-10042, 0] {
+            assert!(
+                super::banner_outbox_batch(
+                    7,
+                    &banner,
+                    GradiusBannerTarget {
+                        dialog_job_id: 1,
+                        chat_id,
+                        thread_id: None
+                    },
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_image_ad_can_omit_vip_appendix_in_persisted_html() {
         let ledger = LedgerStub::default();
         let service = GradiusUtilityAdService::new(
             Arc::new(UtilityStub::default()),
@@ -2255,11 +2383,11 @@ mod tests {
             .prepare(GradiusUtilityAdRequest {
                 surface: GradiusUtilitySurface::Image,
                 include_vip_appendix: false,
-                source_id: "public-image".to_owned(),
+                source_id: "private-image".to_owned(),
                 attempt_key: "claim-1".to_owned(),
                 user_id: 100,
-                chat_id: -100,
-                thread_id: Some(12),
+                chat_id: 100,
+                thread_id: None,
                 prompt: Some("Portrait".to_owned()),
                 result_context: None,
                 completed_at: OffsetDateTime::UNIX_EPOCH,
@@ -2276,40 +2404,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_and_ephemeral_image_ads_keep_vip_appendix_in_persisted_html() {
-        for chat_id in [100, -100] {
-            let ledger = LedgerStub::default();
-            let service = GradiusUtilityAdService::new(
-                Arc::new(UtilityStub::default()),
-                Arc::new(RedactorStub::default()),
-                Arc::new(ledger.clone()),
-                Arc::new(VipStub(false)),
-            );
-            let ad = service
-                .prepare(GradiusUtilityAdRequest {
-                    surface: GradiusUtilitySurface::Image,
-                    include_vip_appendix: true,
-                    source_id: "personal-image".to_owned(),
-                    attempt_key: "claim-1".to_owned(),
-                    user_id: 100,
-                    chat_id,
-                    thread_id: None,
-                    prompt: Some("Portrait".to_owned()),
-                    result_context: None,
-                    completed_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .await
-                .expect("prepared")
-                .expect("ad");
-            assert!(
-                ad.html
-                    .starts_with("📢 <b>Ad</b> <a href=\"https://ads.example/1\">here</a>\n\n")
-            );
-            assert!(ad.html.contains("<tg-spoiler>"));
-            assert!(ad.html.contains("https://t.me/PlotvoBot?start=vip"));
-            let stored = ledger.finished_ads.lock().expect("finished ads");
-            assert_eq!(stored[0].1.rendered_html, ad.html);
-        }
+    async fn private_image_ads_keep_vip_appendix_in_persisted_html() {
+        let ledger = LedgerStub::default();
+        let service = GradiusUtilityAdService::new(
+            Arc::new(UtilityStub::default()),
+            Arc::new(RedactorStub::default()),
+            Arc::new(ledger.clone()),
+            Arc::new(VipStub(false)),
+        );
+        let ad = service
+            .prepare(GradiusUtilityAdRequest {
+                surface: GradiusUtilitySurface::Image,
+                include_vip_appendix: true,
+                source_id: "personal-image".to_owned(),
+                attempt_key: "claim-1".to_owned(),
+                user_id: 100,
+                chat_id: 100,
+                thread_id: None,
+                prompt: Some("Portrait".to_owned()),
+                result_context: None,
+                completed_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .await
+            .expect("prepared")
+            .expect("ad");
+        assert!(
+            ad.html
+                .starts_with("📢 <b>Ad</b> <a href=\"https://ads.example/1\">here</a>\n\n")
+        );
+        assert!(ad.html.contains("<tg-spoiler>"));
+        assert!(ad.html.contains("https://t.me/PlotvoBot?start=vip"));
+        let stored = ledger.finished_ads.lock().expect("finished ads");
+        assert_eq!(stored[0].1.rendered_html, ad.html);
     }
 
     #[tokio::test]
@@ -2364,16 +2490,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_group_ads_use_initiator_and_skip_vip_or_unknown_users() {
+    async fn generation_private_ads_use_initiator_and_skip_vip_or_unknown_users() {
         let client = UtilityStub::default();
         let ledger = LedgerStub::default();
         let request = |user_id| GradiusUtilityAdRequest {
             surface: GradiusUtilitySurface::Image,
             include_vip_appendix: true,
-            source_id: format!("group-{user_id}"),
+            source_id: format!("private-{user_id}"),
             attempt_key: "claim-1".to_owned(),
             user_id,
-            chat_id: -100,
+            chat_id: user_id,
             thread_id: Some(12),
             prompt: Some("Portrait".to_owned()),
             result_context: None,
@@ -2396,14 +2522,14 @@ mod tests {
             service
                 .prepare(request(100))
                 .await
-                .expect("free group user")
+                .expect("free private user")
                 .is_some()
         );
         assert!(
             service
                 .prepare(request(101))
                 .await
-                .expect("another free group user")
+                .expect("another free private user")
                 .is_some()
         );
         let vip = GradiusUtilityAdService::new(
@@ -2420,12 +2546,12 @@ mod tests {
         );
         let calls = client.generation_calls.lock().expect("generation calls");
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].chat_id, calls[1].chat_id);
+        assert_ne!(calls[0].chat_id, calls[1].chat_id);
         assert_ne!(calls[0].user_id, calls[1].user_id);
         let opportunities = ledger.reserved_inputs.lock().expect("opportunities");
         assert_eq!(opportunities[0].integration_kind, "native_generation");
         assert_eq!(opportunities[0].user_id, 100);
-        assert_eq!(opportunities[0].chat_id, -100);
+        assert_eq!(opportunities[0].chat_id, 100);
         assert_eq!(opportunities[0].thread_id, 12);
     }
 
@@ -2439,7 +2565,7 @@ mod tests {
             source_id: "privacy-test".to_owned(),
             attempt_key: "claim-1".to_owned(),
             user_id: 100,
-            chat_id: -100,
+            chat_id: 100,
             thread_id: None,
             prompt: Some("Portrait of Alice@example.com".to_owned()),
             result_context: None,
@@ -2503,10 +2629,10 @@ mod tests {
         let request = |user_id| GradiusUtilityAdRequest {
             surface: GradiusUtilitySurface::Rates,
             include_vip_appendix: false,
-            source_id: format!("-100:{user_id}"),
+            source_id: format!("private:{user_id}"),
             attempt_key: "rates-claim".to_owned(),
             user_id,
-            chat_id: -100,
+            chat_id: user_id,
             thread_id: None,
             prompt: None,
             result_context: Some("Alice's rate table".to_owned()),
@@ -2553,9 +2679,17 @@ mod tests {
             Arc::new(ledger.clone()),
             Arc::new(VipStub(false)),
         );
-        let mut group_request = test_request(70);
-        group_request.chat_id = -10042;
-        assert_eq!(group_service.append(group_request).await, Ok(None));
+        for chat_id in [-10042, 0, 43] {
+            let mut group_request = test_request(70);
+            group_request.chat_id = chat_id;
+            assert_eq!(group_service.append(group_request.clone()).await, Ok(None));
+            assert_eq!(
+                group_service
+                    .record_unsupported_surface(group_request)
+                    .await,
+                Ok(())
+            );
+        }
 
         let vip_service = GradiusAdService::new(
             Arc::new(dialogue.clone()),

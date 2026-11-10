@@ -4541,8 +4541,6 @@ async fn start_runtime_workers(
             gradius_utility_outbox::GradiusUtilityImageAds {
                 ads: Arc::clone(ads),
                 outbox: Arc::clone(outbox),
-                telegram: telegram.clone(),
-                bot_id: bot_identity.id,
             },
         ));
     }

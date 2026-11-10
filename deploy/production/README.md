@@ -109,32 +109,18 @@ stable synthetic user/chat IDs. Ads are offered only after a successful image
 result, with a verified non-VIP initiator. Privacy, VIP lookup, provider, or
 rendering failures skip the ad without affecting the image.
 
-The ad is a separate reply to the resulting image. Private-chat ads remain.
-For group ads, the bot's current membership is fetched from Telegram before
-requesting an advertisement. Administrators use native Bot API ephemeral messages, with
-`ephemeral_message_parameters.receiver_user_id` set to the image initiator.
-Only that user and the bot can see the advertisement. If the bot is a regular
-group member, it sends an ordinary public reply that remains in the chat.
-Neither mode schedules deletion. A failed membership lookup skips advertising;
-a rejected ephemeral send is not retried as a public message. Telegram controls
-expiry and does not guarantee delivery to offline users. API acknowledgement
-is the available receipt, not proof that the user viewed the advertisement.
+The ad is a separate reply to the resulting image in the initiating user's
+private chat with the bot. All Gradius integrations, including dialogue text,
+media banners, rates and check-in placements, reject groups and channels before
+VIP lookups, privacy redaction or advertising requests. Group membership and
+administrator privileges do not permit advertising. The enable switches cannot
+override this restriction.
 
 Image ad limits are per user: one accepted impression per hour and at most ten
-in a rolling 24 hours across private chats, groups, and topics. Historical
-utility image impressions retain these limits. Other users in the same group
-have independent eligibility. Ephemeral replies retain the receiver during
-outbox replay and do not enter shared conversation history.
+in a rolling 24 hours. Historical utility image impressions retain these limits.
 
-Public image ads additionally share a 15-minute gap across all users and topics
-in the group. Pending public deliveries reserve the group slot atomically;
-confirmed deliveries start the gap, and an ambiguous send conservatively holds
-the slot for 15 minutes. Failed sends free the slot. Native ephemeral and private
-ads do not consume it. Ads blocked by this limit are skipped, not deferred.
-The group limit is checked before calling Gradius and checked again atomically
-when enqueueing to prevent simultaneous requests from different users sending
-multiple public advertisements. Migration 191 adds a concurrent index for this
-lookup and preserves existing records and readers.
-
-References: [Telegram Bot Features](https://core.telegram.org/bots/features#ephemeral-messages)
-and [Bot API Reference](https://core.telegram.org/bots/api#ephemeral-messages-and-commands).
+Dialogue media banners preserve the provider's sanitized rich HTML, including
+HTTPS images and collages, and URL buttons. They are sent as a separate
+`sendRichMessage` after the answer. The provider selects whether to return a
+text placement or a media banner. A text placement does not imply a missing
+image. Generation and utility placements use their separate text-ad contracts.
