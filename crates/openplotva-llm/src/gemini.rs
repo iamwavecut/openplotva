@@ -2636,7 +2636,7 @@ fn decode_gemini_response(response: &AifarmHttpResponse) -> Result<String, ChatP
     if text.trim().is_empty() {
         return Err(Box::new(ProviderError::new(
             PROVIDER_GENKIT,
-            FailureReason::ProviderProtocolError,
+            FailureReason::ModelOutputRejected,
             "empty final text",
         )));
     }
@@ -2693,7 +2693,7 @@ fn decode_gemini_dialog_response(
     if calls.is_empty() {
         Err(Box::new(ProviderError::new(
             PROVIDER_GENKIT,
-            FailureReason::ProviderProtocolError,
+            FailureReason::ModelOutputRejected,
             "empty final text",
         )))
     } else {
@@ -4191,6 +4191,38 @@ mod tests {
         assert_eq!(
             crate::retry::retryable_reason(error.as_ref()),
             Some(FailureReason::ProviderOverloaded)
+        );
+    }
+
+    #[test]
+    fn gemini_empty_text_is_a_model_output_rejection_and_a_bad_body_a_protocol_fault() {
+        let empty = json_response(json!({
+            "candidates": [{"content": {"parts": [{"text": "  "}]}}]
+        }));
+        let error = decode_gemini_response(&empty).expect_err("empty text");
+        assert_eq!(
+            crate::retry::retryable_reason(error.as_ref()),
+            Some(FailureReason::ModelOutputRejected)
+        );
+        let Err(error) = decode_gemini_dialog_response(&empty) else {
+            panic!("empty dialog text must be rejected");
+        };
+        assert_eq!(
+            crate::retry::retryable_reason(error.as_ref()),
+            Some(FailureReason::ModelOutputRejected)
+        );
+
+        let undecodable = AifarmHttpResponse {
+            status_code: 200,
+            body: b"not json".to_vec(),
+            ..AifarmHttpResponse::default()
+        };
+        let Err(error) = decode_gemini_dialog_response(&undecodable) else {
+            panic!("an undecodable body must be rejected");
+        };
+        assert_eq!(
+            crate::retry::retryable_reason(error.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
         );
     }
 
