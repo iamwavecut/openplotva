@@ -1319,6 +1319,11 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
     });
     let effects = EffectsStub::default();
 
+    let reporter = crate::runtime_routing::RoutingEventReporter::new(
+        crate::runtime_routing::RoutingEventBuffer::new(8),
+        None,
+        None,
+    );
     let outcomes = crate::dialog_turn::DialogTurnObserver::new(
         crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
         None,
@@ -1338,7 +1343,7 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
             now,
-            routing_events: None,
+            routing_events: Some(&reporter),
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
@@ -1362,6 +1367,7 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
     assert_eq!(rows[0].outcome, "terminal_failed");
     assert_eq!(rows[0].reason.as_deref(), Some("sanitized_empty_exhausted"));
     assert_eq!(rows[0].user_signal.as_deref(), Some("none"));
+    assert_validator_exhaustion_routing_event(&reporter, job_id);
     Ok(())
 }
 
@@ -1691,6 +1697,11 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
     );
     let provider = ProviderStub::returning(DialogOutput::default());
     let effects = EffectsStub::default();
+    let reporter = crate::runtime_routing::RoutingEventReporter::new(
+        crate::runtime_routing::RoutingEventBuffer::new(8),
+        None,
+        None,
+    );
     let outcomes = crate::dialog_turn::DialogTurnObserver::new(
         crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
         None,
@@ -1704,7 +1715,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
         terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
         obligations: None,
         now,
-        routing_events: None,
+        routing_events: Some(&reporter),
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
         llm_runs: None,
@@ -1750,6 +1761,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
     assert_eq!(rows[0].outcome, "terminal_failed");
     assert_eq!(rows[0].reason.as_deref(), Some("provider_empty_exhausted"));
     assert_eq!(rows[0].attempt, 2);
+    assert_validator_exhaustion_routing_event(&reporter, job_id);
     Ok(())
 }
 
@@ -1768,6 +1780,11 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         ..DialogOutput::default()
     });
     let effects = EffectsStub::default();
+    let reporter = crate::runtime_routing::RoutingEventReporter::new(
+        crate::runtime_routing::RoutingEventBuffer::new(8),
+        None,
+        None,
+    );
     let outcomes = crate::dialog_turn::DialogTurnObserver::new(
         crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
         None,
@@ -1781,7 +1798,7 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
         obligations: None,
         now,
-        routing_events: None,
+        routing_events: Some(&reporter),
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
         llm_runs: None,
@@ -1829,6 +1846,7 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         rows[0].reason.as_deref(),
         Some("undeliverable_answer_exhausted")
     );
+    assert_validator_exhaustion_routing_event(&reporter, job_id);
     Ok(())
 }
 
@@ -7650,4 +7668,22 @@ async fn random_finish_keeps_tool_history_and_report() -> Result<(), Box<dyn Err
     assert!(effects.sent().is_empty());
     assert!(effects.intermediates().is_empty());
     Ok(())
+}
+
+/// A provider that answered but whose output our validators rejected must
+/// surface as a model-output failure, never as a provider protocol fault.
+fn assert_validator_exhaustion_routing_event(
+    reporter: &crate::runtime_routing::RoutingEventReporter,
+    job_id: i64,
+) {
+    let routing_events = reporter.buffer().routing_events(10);
+    let exhausted = routing_events
+        .iter()
+        .find(|event| event.event_type == "all_attempts_exhausted")
+        .expect("job retry exhaustion routing event");
+    assert_eq!(exhausted.job_id, Some(job_id));
+    assert_eq!(
+        exhausted.detail["last_retryable_reason"],
+        "model_output_rejected"
+    );
 }

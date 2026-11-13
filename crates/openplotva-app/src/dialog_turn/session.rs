@@ -888,7 +888,7 @@ where
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
                         provider_name: step.provider.as_str(),
-                        reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
+                        reason: openplotva_llm::retry::FailureReason::ModelOutputRejected,
                         codes,
                         error,
                         max_attempts: if image_action_missing {
@@ -1064,7 +1064,7 @@ where
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
                         provider_name: step.provider.as_str(),
-                        reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
+                        reason: openplotva_llm::retry::FailureReason::ModelOutputRejected,
                         codes: UNDELIVERABLE_RETRY_CODES,
                         error: &error,
                         max_attempts: ctx.max_llm_job_attempts.max(1),
