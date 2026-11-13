@@ -631,10 +631,14 @@ pub(crate) async fn admin_routing_apply_action(
             routing::update_workflow(
                 pool,
                 &key,
-                routing_json_bool(body, "full_routing", true),
-                routing_json_i32(body, "retry_max_hops").unwrap_or(3),
-                routing_json_i32(body, "retry_wall_ms").unwrap_or(60_000),
-                routing_json_bool(body, "enabled", true),
+                routing::WorkflowUpdate {
+                    full_routing: body
+                        .get("full_routing")
+                        .and_then(serde_json::Value::as_bool),
+                    retry_max_hops: routing_json_i32(body, "retry_max_hops"),
+                    retry_wall_ms: routing_json_i32(body, "retry_wall_ms"),
+                    enabled: body.get("enabled").and_then(serde_json::Value::as_bool),
+                },
             )
             .await
             .map_err(storage_err)?;

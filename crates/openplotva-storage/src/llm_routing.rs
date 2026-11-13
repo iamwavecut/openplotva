@@ -427,7 +427,7 @@ const SQL_DELETE_POOL: &str = "DELETE FROM llm_capacity_pools WHERE id = $1";
 
 const SQL_LIST_WORKFLOWS: &str = "SELECT key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled, lane_priority, fallback_reserve_ms FROM workflows ORDER BY key ASC";
 const SQL_INSERT_WORKFLOW_IF_MISSING: &str = "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (key) DO NOTHING";
-const SQL_UPDATE_WORKFLOW: &str = "UPDATE workflows SET full_routing = $2, retry_max_hops = $3, retry_wall_ms = $4, enabled = $5 WHERE key = $1";
+const SQL_UPDATE_WORKFLOW: &str = "UPDATE workflows SET full_routing = COALESCE($2, full_routing), retry_max_hops = COALESCE($3, retry_max_hops), retry_wall_ms = COALESCE($4, retry_wall_ms), enabled = COALESCE($5, enabled) WHERE key = $1";
 const SQL_SET_WORKFLOW_ENABLED: &str = "UPDATE workflows SET enabled = $2 WHERE key = $1";
 
 const SQL_LIST_ASSIGNMENTS: &str = "SELECT id, workflow_key, scope, role, provider_model_id, weight, fallback_order, canary_percent, enabled, inference_overrides::text AS inference_overrides, cb_failure_threshold, cb_cooldown_ms FROM workflow_assignments ORDER BY id ASC";
@@ -1358,20 +1358,26 @@ pub async fn insert_workflow_if_missing(
     Ok(())
 }
 
+/// Fields left `None` keep their stored values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkflowUpdate {
+    pub full_routing: Option<bool>,
+    pub retry_max_hops: Option<i32>,
+    pub retry_wall_ms: Option<i32>,
+    pub enabled: Option<bool>,
+}
+
 pub async fn update_workflow(
     pool: &PgPool,
     key: &str,
-    full_routing: bool,
-    retry_max_hops: i32,
-    retry_wall_ms: i32,
-    enabled: bool,
+    update: WorkflowUpdate,
 ) -> Result<(), StorageError> {
     sqlx::query(SQL_UPDATE_WORKFLOW)
         .bind(key)
-        .bind(full_routing)
-        .bind(retry_max_hops)
-        .bind(retry_wall_ms)
-        .bind(enabled)
+        .bind(update.full_routing)
+        .bind(update.retry_max_hops)
+        .bind(update.retry_wall_ms)
+        .bind(update.enabled)
         .execute(pool)
         .await?;
     Ok(())
@@ -1943,6 +1949,72 @@ pub fn open_key(master_secret: &str, sealed: &[u8]) -> Result<String, StorageErr
 mod tests {
     use super::*;
     use crate::database as sqlx;
+
+    #[tokio::test]
+    async fn partial_workflow_update_keeps_the_stored_retry_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE workflows (
+                key TEXT PRIMARY KEY, full_routing BOOLEAN NOT NULL,
+                retry_max_hops INTEGER NOT NULL, retry_wall_ms INTEGER NOT NULL,
+                enabled BOOLEAN NOT NULL
+            ) ON COMMIT DROP;
+            INSERT INTO workflows VALUES ('dialog', true, 5, 180000, true);
+            "#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        let enabled_only = WorkflowUpdate {
+            enabled: Some(false),
+            ..WorkflowUpdate::default()
+        };
+        sqlx::query(SQL_UPDATE_WORKFLOW)
+            .bind("dialog")
+            .bind(enabled_only.full_routing)
+            .bind(enabled_only.retry_max_hops)
+            .bind(enabled_only.retry_wall_ms)
+            .bind(enabled_only.enabled)
+            .execute(&mut *transaction)
+            .await?;
+        let row: (bool, i32, i32, bool) = sqlx::query_as(
+            "SELECT full_routing, retry_max_hops, retry_wall_ms, enabled FROM workflows WHERE key = 'dialog'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(row, (true, 5, 180_000, false));
+
+        let budget = WorkflowUpdate {
+            retry_max_hops: Some(3),
+            retry_wall_ms: Some(60_000),
+            ..WorkflowUpdate::default()
+        };
+        sqlx::query(SQL_UPDATE_WORKFLOW)
+            .bind("dialog")
+            .bind(budget.full_routing)
+            .bind(budget.retry_max_hops)
+            .bind(budget.retry_wall_ms)
+            .bind(budget.enabled)
+            .execute(&mut *transaction)
+            .await?;
+        let row: (bool, i32, i32, bool) = sqlx::query_as(
+            "SELECT full_routing, retry_max_hops, retry_wall_ms, enabled FROM workflows WHERE key = 'dialog'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(row, (true, 3, 60_000, false));
+        transaction.rollback().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn live_admin_digest_correlates_models_without_counting_retries_as_incidents()
