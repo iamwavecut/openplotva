@@ -778,6 +778,7 @@ fn job_type_name(job_type: JobType) -> &'static str {
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",
+        JobType::VideoGen => "video_gen",
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",
@@ -797,7 +798,7 @@ fn job_preview(payload: &JobPayload) -> Option<String> {
             .asr_data
             .as_ref()
             .and_then(|data| first_preview([data.file_unique_id.as_str(), ""])),
-        JobType::ImageGen | JobType::ImageEdit => payload
+        JobType::ImageGen | JobType::ImageEdit | JobType::VideoGen => payload
             .image_data
             .as_ref()
             .and_then(|data| first_preview([data.prompt.as_str(), data.original_text.as_str()])),

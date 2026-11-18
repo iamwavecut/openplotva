@@ -345,6 +345,7 @@ pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_WIDTH: i32 = 1536;
 pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_HEIGHT: i32 = 1536;
 
 pub const DEFAULT_ACESTEP_ENABLED: bool = false;
+pub const DEFAULT_VIDEO_GENERATION_ENABLED: bool = true;
 
 pub const DEFAULT_ACESTEP_BASE_URL: &str = "http://127.0.0.1:8001";
 
@@ -469,6 +470,8 @@ pub struct AppConfig {
     pub image_providers: ImageProvidersConfig,
     /// Music and ACE-Step configuration.
     pub music: MusicConfig,
+    /// FastFrames clips through draw-api.
+    pub video: VideoConfig,
     /// Memory pipeline configuration.
     pub memory: MemoryConfig,
     /// Shield retrieval configuration.
@@ -1022,6 +1025,12 @@ pub struct VisionConfig {
 pub struct ImageProvidersConfig {
     pub boogu_turbo: BooguImageTurboConfig,
     pub boogu_edit_turbo: BooguImageEditTurboConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VideoConfig {
+    /// Offer the make_video tool and run the video worker.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1580,6 +1589,8 @@ pub struct RawConfig {
     pub boogu_image_edit_turbo_height: Option<String>,
     /// `ACESTEP_ENABLED`.
     pub acestep_enabled: Option<String>,
+    /// `VIDEO_GENERATION_ENABLED`.
+    pub video_generation_enabled: Option<String>,
     /// `ACESTEP_BASE_URL`.
     pub acestep_base_url: Option<String>,
     /// `ACESTEP_API_KEY`.
@@ -2899,6 +2910,13 @@ impl AppConfig {
                 )?,
             },
             image_providers,
+            video: VideoConfig {
+                enabled: parse_bool(
+                    "VIDEO_GENERATION_ENABLED",
+                    raw.video_generation_enabled,
+                    DEFAULT_VIDEO_GENERATION_ENABLED,
+                )?,
+            },
             music: MusicConfig {
                 acestep: AceStepConfig {
                     enabled: parse_bool(
@@ -3450,6 +3468,7 @@ impl RawConfig {
             boogu_image_edit_turbo_width: env("BOOGU_IMAGE_EDIT_TURBO_WIDTH"),
             boogu_image_edit_turbo_height: env("BOOGU_IMAGE_EDIT_TURBO_HEIGHT"),
             acestep_enabled: env("ACESTEP_ENABLED"),
+            video_generation_enabled: env("VIDEO_GENERATION_ENABLED"),
             acestep_base_url: env("ACESTEP_BASE_URL"),
             acestep_api_key: env("ACESTEP_API_KEY"),
             acestep_api_mode: env("ACESTEP_API_MODE"),

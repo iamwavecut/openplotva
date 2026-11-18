@@ -9,10 +9,10 @@ use openplotva_core::ChatMessageMeta;
 use crate::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest, PythonRunRequest,
     RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL,
-    STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
+    STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH, STEP_MAKE_VIDEO,
     STEP_QUEUE_STATUS, STEP_RUN_PYTHON, STEP_TRANSLATE_TEXT, STEP_UNDERSTAND_MEDIA,
     STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest, ToolContext, ToolResult, ToolStep,
-    ToolboxError, VisionRequest,
+    ToolboxError, VideoRequest, VisionRequest,
 };
 
 /// Longest explicit draw request, in words, that is shown as the caption unchanged.
@@ -85,6 +85,22 @@ pub async fn dispatch_dialog_tool(
                 .generate_song(SongRequest {
                     context: meta.clone(),
                     topic,
+                })
+                .await
+        }
+        STEP_MAKE_VIDEO => {
+            let prompt = non_empty_or(&step.prompt, &meta.message_text);
+            if prompt.trim().is_empty() {
+                return Ok(ToolResult::failed(
+                    "make_video_prompt_empty",
+                    "make_video prompt is empty",
+                ));
+            }
+            toolbox
+                .make_video(VideoRequest {
+                    context: meta.clone(),
+                    prompt,
+                    caption: step.caption.clone(),
                 })
                 .await
         }
@@ -550,5 +566,68 @@ mod tests {
             Some("generate_song_topic_empty")
         );
         assert!(toolbox.topics.lock().expect("recorder lock").is_empty());
+    }
+
+    #[derive(Default)]
+    struct VideoRecorder(Mutex<Vec<(String, String)>>);
+
+    impl DialogToolbox for VideoRecorder {
+        fn make_video<'a>(&'a self, req: VideoRequest) -> ToolboxFuture<'a> {
+            self.0
+                .lock()
+                .expect("videos")
+                .push((req.prompt, req.caption));
+            Box::pin(async { Ok(ToolResult::default()) })
+        }
+    }
+
+    #[test]
+    fn make_video_passes_the_brief_and_falls_back_to_the_message_text() {
+        let toolbox = VideoRecorder::default();
+        let meta = ToolContext {
+            message_text: "сделай видео как кот ловит снежинку".to_owned(),
+            ..ToolContext::default()
+        };
+        for step in [
+            ToolStep {
+                step: STEP_MAKE_VIDEO.to_owned(),
+                prompt: "A grey cat catches a snowflake".to_owned(),
+                caption: "Кот и снежинка".to_owned(),
+                ..ToolStep::default()
+            },
+            ToolStep {
+                step: STEP_MAKE_VIDEO.to_owned(),
+                ..ToolStep::default()
+            },
+        ] {
+            poll_ready(dispatch_dialog_tool(&toolbox, &meta, &step)).expect("dispatch");
+        }
+        assert_eq!(
+            toolbox.0.lock().expect("videos").as_slice(),
+            [
+                (
+                    "A grey cat catches a snowflake".to_owned(),
+                    "Кот и снежинка".to_owned()
+                ),
+                (
+                    "сделай видео как кот ловит снежинку".to_owned(),
+                    String::new()
+                ),
+            ]
+        );
+
+        let empty = poll_ready(dispatch_dialog_tool(
+            &toolbox,
+            &ToolContext::default(),
+            &ToolStep {
+                step: STEP_MAKE_VIDEO.to_owned(),
+                ..ToolStep::default()
+            },
+        ))
+        .expect("dispatch");
+        assert_eq!(
+            empty.error.as_ref().map(|e| e.code.as_str()),
+            Some("make_video_prompt_empty")
+        );
     }
 }

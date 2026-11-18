@@ -13,6 +13,8 @@ use crate::{
 pub const SIDE_EFFECT_KIND_IMAGE: &str = "image_generation_job";
 /// Side-effect kind emitted by the song generation scheduler.
 pub const SIDE_EFFECT_KIND_MUSIC: &str = "music_generation_job";
+/// Side-effect kind emitted by the video generation scheduler.
+pub const SIDE_EFFECT_KIND_VIDEO: &str = "video_generation_job";
 
 pub const SIDE_EFFECT_STATE_QUEUED: &str = "queued";
 
@@ -38,7 +40,7 @@ pub enum ReplyMaterial {
 /// One generation job queued by a tool during the turn.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedSideEffect {
-    /// `image_generation_job` or `music_generation_job`.
+    /// `image_generation_job`, `music_generation_job` or `video_generation_job`.
     pub kind: String,
     /// Taskman ticket ID, when the scheduler populated it.
     pub ticket_job_id: Option<i64>,
@@ -176,7 +178,7 @@ fn is_queued_generation_side_effect(side_effect: &ToolSideEffect) -> bool {
         .eq_ignore_ascii_case(SIDE_EFFECT_STATE_QUEUED)
         && matches!(
             side_effect.kind.as_str(),
-            SIDE_EFFECT_KIND_IMAGE | SIDE_EFFECT_KIND_MUSIC
+            SIDE_EFFECT_KIND_IMAGE | SIDE_EFFECT_KIND_MUSIC | SIDE_EFFECT_KIND_VIDEO
         )
 }
 
@@ -296,6 +298,22 @@ mod tests {
                     side_effects: vec![QueuedSideEffect {
                         kind: SIDE_EFFECT_KIND_MUSIC.to_owned(),
                         ticket_job_id: Some(456),
+                        eta: "~2 минуты".to_owned(),
+                    }],
+                },
+            ),
+            (
+                "queued video delegates",
+                output_with_tool_outputs(vec![queued_side_effect_output(
+                    SIDE_EFFECT_KIND_VIDEO,
+                    "789",
+                )]),
+                "",
+                "",
+                ReplyMaterial::Delegated {
+                    side_effects: vec![QueuedSideEffect {
+                        kind: SIDE_EFFECT_KIND_VIDEO.to_owned(),
+                        ticket_job_id: Some(789),
                         eta: "~2 минуты".to_owned(),
                     }],
                 },

@@ -9,7 +9,8 @@ use openplotva_core::{ChatMessageMeta, ChatState, SENDER_TYPE_USER, ToolCall, Us
 use openplotva_dialog::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest, ROLE_MODEL, ROLE_USER,
     RatesRequest, SongRequest, TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_OK,
-    TOOL_RESULT_STATUS_QUEUED, ToolResult, ToolSideEffect, ToolboxFuture, VisionRequest,
+    TOOL_RESULT_STATUS_QUEUED, ToolResult, ToolSideEffect, ToolboxFuture, VideoRequest,
+    VisionRequest,
 };
 use openplotva_llm::ChatProviderHandle;
 use openplotva_server::{
@@ -678,6 +679,21 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
                 req.context.message_id,
                 json!({
                     "topic": req.topic,
+                    "tool_mode": "SAFE",
+                }),
+            ))
+        })
+    }
+
+    fn make_video<'a>(&'a self, req: VideoRequest) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            Ok(synthetic_side_effect_result(
+                openplotva_dialog::turn::SIDE_EFFECT_KIND_VIDEO,
+                req.context.chat_id,
+                req.context.message_id,
+                json!({
+                    "prompt": req.prompt,
+                    "caption": req.caption,
                     "tool_mode": "SAFE",
                 }),
             ))

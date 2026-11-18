@@ -98,6 +98,7 @@ pub mod update_importer;
 pub mod update_materializer;
 mod update_reconciler;
 pub mod updates;
+pub mod video_jobs;
 pub mod virtual_messages;
 pub mod vision;
 pub mod youtube;
@@ -1514,6 +1515,10 @@ fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCo
             admin::AdminQueueWorkerConfig {
                 queue_name: openplotva_taskman::MUSIC_VIP_QUEUE_NAME.to_owned(),
                 worker_count: queue.music_vip_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::VIDEO_QUEUE_NAME.to_owned(),
+                worker_count: i32::from(config.video.enabled),
             },
             admin::AdminQueueWorkerConfig {
                 queue_name: openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
@@ -3642,6 +3647,7 @@ async fn start_runtime_workers(
             .with_draw_image_permission(permission_policy.clone())
             .with_song_service_available(music_service_available)
             .with_song_audio_permission(permission_policy.clone())
+            .with_video_permission(permission_policy.clone())
             .with_delivery_obligations(
                 Arc::clone(&delivery_obligation_store)
                     as Arc<dyn dialog_turn::DeliveryObligationRecorder>,
@@ -3903,6 +3909,9 @@ async fn start_runtime_workers(
         dialog_messages::DrawQueueNoticeDispatcherSender::new(Arc::clone(&dispatcher_queue)),
     ))
     .with_vision_describer(dialog_tool_media);
+    if config.video.enabled {
+        app_dialog_toolbox = app_dialog_toolbox.with_video_scheduler(dialog_tool_adapter.clone());
+    }
     let dialog_history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
         agent_runtime::PostgresHistorySearch::new(history_store.clone()),
     );
@@ -4658,6 +4667,56 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::skipped(
             "music_jobs",
             "ACESTEP_ENABLED=false",
+        ));
+    }
+    if config.video.enabled {
+        let video_queue = Arc::clone(&task_queue_for_updates);
+        let video_optimizer = media::RoutedMediaPromptOptimizer::new(
+            attempt_walker.clone(),
+            config,
+            Arc::clone(&prompt_store),
+        );
+        let video_generator =
+            image_jobs::AifarmDrawApiImageGenerator::new(image_jobs::AifarmDrawApiConfig {
+                endpoint_name: image_jobs::AIFARM_DRAW_API_FASTFRAMES_ENDPOINT_NAME.to_owned(),
+                ..image_jobs::aifarm_draw_api_config_from_app_config(config)
+            });
+        let video_effects = video_jobs::TelegramVideoJobEffects::new(
+            Arc::clone(&permission_policy),
+            telegram.clone(),
+        )
+        .with_reaction_ux(Arc::clone(&generation_reactions));
+        let video_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
+        let video_activity_pulse = Arc::clone(&telegram_activity_pulse);
+        let video_worker = tokio::spawn(async move {
+            let report = video_jobs::run_video_worker_until(
+                video_queue.as_ref(),
+                &video_optimizer,
+                &video_generator,
+                &video_effects,
+                Some(video_activity_pulse.as_ref()),
+                wait_for_runtime_stop(video_stop),
+            )
+            .await;
+            tracing::info!(?report, "video generation taskman worker stopped");
+        });
+        worker_registry.register(
+            "video-generation-worker",
+            RuntimeWorkerPhase::Processor,
+            video_worker,
+        );
+        readiness_checks.push(ReadinessCheck::ok(
+            "video_jobs",
+            "Video taskman worker started for the video queue with FastFrames on draw-api",
+        ));
+        shared_taskman_worker_counts
+            .entry(openplotva_taskman::VIDEO_QUEUE_NAME.to_owned())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "video_jobs",
+            "VIDEO_GENERATION_ENABLED=false",
         ));
     }
     let shared_taskman_worker_ids =
