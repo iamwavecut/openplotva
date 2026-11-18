@@ -96,14 +96,19 @@ pub trait VideoJobEffects: Send + Sync {
     fn clear_signal<'a>(&'a self, chat_id: i64, message_id: i32) -> VideoJobFuture<'a, ()>;
 
     /// Tell the requester that the request was blocked by the safety verdict.
+    /// Returns the refusal's message id.
     fn send_blocked<'a>(
         &'a self,
         chat_id: i64,
         message_id: i32,
         thread_id: Option<i32>,
-    ) -> VideoJobFuture<'a, ()>;
+    ) -> VideoJobFuture<'a, Option<i32>>;
 
-    fn send_video<'a>(&'a self, delivery: VideoDelivery) -> VideoJobFuture<'a, Result<(), String>>;
+    /// Returns the sent animation's message id.
+    fn send_video<'a>(
+        &'a self,
+        delivery: VideoDelivery,
+    ) -> VideoJobFuture<'a, Result<Option<i32>, String>>;
 }
 
 /// Telegram effects: permission policy, reaction lifecycle and `sendAnimation`.
@@ -171,29 +176,39 @@ where
         chat_id: i64,
         message_id: i32,
         thread_id: Option<i32>,
-    ) -> VideoJobFuture<'a, ()> {
+    ) -> VideoJobFuture<'a, Option<i32>> {
         Box::pin(async move {
             let (request, reply_to) =
                 crate::image_jobs::nsfw_blocked_message_request(chat_id, message_id, thread_id);
-            let Ok(methods) = build_text_message_methods(&request, Some(&reply_to)) else {
-                return;
-            };
+            let methods = build_text_message_methods(&request, Some(&reply_to)).ok()?;
+            let mut first_message_id = None;
             for method in methods {
-                let _ = self
+                if let Ok(response) = self
                     .telegram
                     .send_image_job_method(TelegramOutboundMethod::from(method))
-                    .await;
+                    .await
+                {
+                    first_message_id = first_message_id.or_else(|| {
+                        crate::image_jobs::image_job_response_message_ids(&response)
+                            .first()
+                            .copied()
+                    });
+                }
             }
+            first_message_id
         })
     }
 
-    fn send_video<'a>(&'a self, delivery: VideoDelivery) -> VideoJobFuture<'a, Result<(), String>> {
+    fn send_video<'a>(
+        &'a self,
+        delivery: VideoDelivery,
+    ) -> VideoJobFuture<'a, Result<Option<i32>, String>> {
         Box::pin(async move {
             let method = animation_method(&delivery)?;
             self.telegram
                 .execute(method)
                 .await
-                .map(|_message| ())
+                .map(|message| i32::try_from(message.id).ok())
                 .map_err(|error| format!("send video: {error}"))
         })
     }
@@ -232,13 +247,28 @@ fn animation_method(delivery: &VideoDelivery) -> Result<carapax::types::SendAnim
     Ok(method)
 }
 
-/// What one video job ended with.
+/// What one video job ended with. The message ids become the ticket's result
+/// message, which the delivery obligation watcher needs to stay silent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoJobOutcome {
-    Delivered,
+    Delivered {
+        message_id: Option<i32>,
+    },
     /// The optimizer classified the request as forbidden; the refusal was sent.
-    Blocked,
+    Blocked {
+        message_id: Option<i32>,
+    },
     SkippedPermission,
+}
+
+impl VideoJobOutcome {
+    #[must_use]
+    pub fn result_message_id(self) -> Option<i32> {
+        match self {
+            Self::Delivered { message_id } | Self::Blocked { message_id } => message_id,
+            Self::SkippedPermission => None,
+        }
+    }
 }
 
 pub async fn execute_video_gen_job<Optimizer, Generator, Effects>(
@@ -263,16 +293,16 @@ where
         .optimize_video_prompt(&params.request_text, &params.brief)
         .await?;
     if optimized.nsfw_result == NsfwResult::Forbidden {
-        effects
+        let message_id = effects
             .send_blocked(params.chat_id, params.message_id, params.thread_id)
             .await;
         effects
             .clear_signal(params.chat_id, params.message_id)
             .await;
-        return Ok(VideoJobOutcome::Blocked);
+        return Ok(VideoJobOutcome::Blocked { message_id });
     }
     let video = generator.generate_video(&optimized.prompt, job_id).await?;
-    effects
+    let message_id = effects
         .send_video(VideoDelivery {
             chat_id: params.chat_id,
             thread_id: params.thread_id,
@@ -285,7 +315,7 @@ where
     effects
         .clear_signal(params.chat_id, params.message_id)
         .await;
-    Ok(VideoJobOutcome::Delivered)
+    Ok(VideoJobOutcome::Delivered { message_id })
 }
 
 fn video_caption(caption: &str) -> String {
@@ -352,6 +382,9 @@ where
     let finished_at = OffsetDateTime::now_utc();
     match result {
         Ok(outcome) => {
+            if let Some(message_id) = outcome.result_message_id() {
+                let _ = queue.update_job_result_message(work.id, Some(message_id));
+            }
             let _ = queue.complete(work.id, finished_at);
             VideoQueuePoll::Finished {
                 job_id: work.id,
@@ -411,8 +444,8 @@ where
                     VideoQueuePoll::Finished { job_id, outcome } => {
                         tracing::info!(job_id, ?outcome, "video job finished");
                         match outcome {
-                            VideoJobOutcome::Delivered => report.delivered += 1,
-                            VideoJobOutcome::Blocked => report.blocked += 1,
+                            VideoJobOutcome::Delivered { .. } => report.delivered += 1,
+                            VideoJobOutcome::Blocked { .. } => report.blocked += 1,
                             VideoJobOutcome::SkippedPermission => report.skipped_permission += 1,
                         }
                     }
@@ -526,23 +559,26 @@ mod tests {
             _chat_id: i64,
             _message_id: i32,
             _thread_id: Option<i32>,
-        ) -> VideoJobFuture<'a, ()> {
+        ) -> VideoJobFuture<'a, Option<i32>> {
             self.events
                 .lock()
                 .expect("events")
                 .push("blocked".to_owned());
-            Box::pin(async {})
+            Box::pin(async { Some(BLOCKED_MESSAGE_ID) })
         }
 
         fn send_video<'a>(
             &'a self,
             delivery: VideoDelivery,
-        ) -> VideoJobFuture<'a, Result<(), String>> {
+        ) -> VideoJobFuture<'a, Result<Option<i32>, String>> {
             self.events.lock().expect("events").push("video".to_owned());
             self.sent.lock().expect("sent").push(delivery);
-            Box::pin(async { Ok(()) })
+            Box::pin(async { Ok(Some(VIDEO_MESSAGE_ID)) })
         }
     }
+
+    const VIDEO_MESSAGE_ID: i32 = 501;
+    const BLOCKED_MESSAGE_ID: i32 = 502;
 
     fn optimized(nsfw_result: NsfwResult) -> FixedOptimizer {
         FixedOptimizer(Ok(VideoOptimize {
@@ -593,7 +629,9 @@ mod tests {
             poll,
             VideoQueuePoll::Finished {
                 job_id,
-                outcome: VideoJobOutcome::Delivered
+                outcome: VideoJobOutcome::Delivered {
+                    message_id: Some(VIDEO_MESSAGE_ID)
+                }
             }
         );
         assert_eq!(
@@ -613,10 +651,36 @@ mod tests {
                 spoiler: false,
             }]
         );
+        let record = queue.record(job_id).expect("video job");
+        assert_eq!(record.status, openplotva_taskman::JobStatus::Completed);
+        assert_eq!(record.result_message_id, Some(VIDEO_MESSAGE_ID));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_request_records_the_refusal_as_the_result_message() {
+        let (queue, job_id) = queue_with_job();
+        let poll = run_video_queue_once(
+            &queue,
+            &optimized(NsfwResult::Forbidden),
+            &RecordingGenerator::default(),
+            &RecordingEffects::default(),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+
         assert_eq!(
-            queue.record(job_id).map(|record| record.status),
-            Some(openplotva_taskman::JobStatus::Completed)
+            poll,
+            VideoQueuePoll::Finished {
+                job_id,
+                outcome: VideoJobOutcome::Blocked {
+                    message_id: Some(BLOCKED_MESSAGE_ID)
+                }
+            }
         );
+        let record = queue.record(job_id).expect("video job");
+        assert_eq!(record.status, openplotva_taskman::JobStatus::Completed);
+        assert_eq!(record.result_message_id, Some(BLOCKED_MESSAGE_ID));
     }
 
     #[tokio::test]
@@ -630,7 +694,12 @@ mod tests {
             9,
         )
         .await;
-        assert_eq!(outcome, Ok(VideoJobOutcome::Delivered));
+        assert_eq!(
+            outcome,
+            Ok(VideoJobOutcome::Delivered {
+                message_id: Some(VIDEO_MESSAGE_ID)
+            })
+        );
         assert!(effects.sent.lock().expect("sent")[0].spoiler);
     }
 
@@ -646,7 +715,12 @@ mod tests {
             9,
         )
         .await;
-        assert_eq!(outcome, Ok(VideoJobOutcome::Blocked));
+        assert_eq!(
+            outcome,
+            Ok(VideoJobOutcome::Blocked {
+                message_id: Some(BLOCKED_MESSAGE_ID)
+            })
+        );
         assert!(generator.prompts.lock().expect("prompts").is_empty());
         assert_eq!(effects.events(), ["progress", "blocked", "clear"]);
     }

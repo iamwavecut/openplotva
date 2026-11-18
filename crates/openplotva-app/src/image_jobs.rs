@@ -3004,7 +3004,7 @@ fn replacement_image_message_request(
     }
 }
 
-fn image_job_response_message_ids(response: &TelegramOutboundResponse) -> Vec<i32> {
+pub(crate) fn image_job_response_message_ids(response: &TelegramOutboundResponse) -> Vec<i32> {
     match response {
         TelegramOutboundResponse::Message(message) => {
             i32::try_from(message.id).ok().into_iter().collect()
