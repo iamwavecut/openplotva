@@ -25,6 +25,7 @@ pub enum TelegramActivityAction {
     UploadPhoto,
     /// Official Bot API has no `upload_audio` chat action; songs are files.
     UploadDocumentForAudio,
+    UploadVideo,
 }
 
 impl TelegramActivityAction {
@@ -34,6 +35,7 @@ impl TelegramActivityAction {
             Self::Typing => "typing",
             Self::UploadPhoto => "upload_photo",
             Self::UploadDocumentForAudio => "upload_document",
+            Self::UploadVideo => "upload_video",
         }
     }
 }

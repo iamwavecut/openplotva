@@ -911,6 +911,11 @@ pub enum AifarmMediaOptimizerError {
         #[source]
         source: openplotva_media::acestep::AceStepError,
     },
+    #[error(transparent)]
+    VideoPrompt {
+        #[from]
+        source: openplotva_media::video::VideoOptimizeError,
+    },
 }
 
 /// AIFarm status update.
@@ -2403,6 +2408,46 @@ where
         })?;
         openplotva_media::acestep::normalize_song_prompt_payload_for_request(payload, &request)
             .map_err(|source| AifarmMediaOptimizerError::SongPrompt { source })
+    }
+
+    /// Write the FastFrames prompt for a clip from the user's `request` and the
+    /// dialog's `brief`.
+    pub async fn optimize_video_prompt(
+        &self,
+        request: &str,
+        brief: &str,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> Result<openplotva_media::video::VideoOptimize, AifarmMediaOptimizerError> {
+        if request.trim().is_empty() && brief.trim().is_empty() {
+            return Err(AifarmMediaOptimizerError::EmptyText);
+        }
+        let messages = match self.client.prompt_store() {
+            Some(prompts) => openplotva_media::video::render_video_optimizer_messages_with(
+                prompts, request, brief,
+            )?,
+            None => openplotva_media::video::render_video_optimizer_messages(request, brief)?,
+        }
+        .into_iter()
+        .map(|message| AifarmStructuredJsonMessage {
+            role: message.role,
+            content: message.content,
+        })
+        .collect();
+        let content = self
+            .generate_json(
+                AifarmStructuredJsonRequest {
+                    name: openplotva_media::video::VIDEO_OPTIMIZER_TOOL_NAME.to_owned(),
+                    messages,
+                    schema: openplotva_media::video::video_optimizer_schema(),
+                    max_tokens: aifarm_optimizer_max_tokens(1),
+                    temperature: 0.3,
+                    ..AifarmStructuredJsonRequest::default()
+                },
+                on_status,
+            )
+            .await?;
+        openplotva_media::video::decode_video_optimize_payload(&content)
+            .map_err(|source| AifarmMediaOptimizerError::VideoPrompt { source })
     }
 
     fn request(&self, request: AifarmStructuredJsonRequest) -> ChatCompletionRequest {
@@ -5781,7 +5826,7 @@ fn extract_final_answer_for_provider(
     }
 }
 
-const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song"];
+const GENERATION_TOOL_NAMES: &[&str] = &["draw_image", "draw_api", "generate_song", "make_video"];
 
 /// The turn's own sampling, set by the routing config of the serving model, replaces the
 /// provider's configured value field by field.
@@ -6410,7 +6455,11 @@ pub fn build_runtime_context(input: &DialogInput) -> String {
     let mut out = String::new();
     out.push_str("<chat_context>\n");
     let requested_tool = input.message.meta.requested_tool.as_str();
-    if !input.disable_tools && matches!(requested_tool, "draw_image" | "draw_api" | "generate_song")
+    if !input.disable_tools
+        && matches!(
+            requested_tool,
+            "draw_image" | "draw_api" | "generate_song" | "make_video"
+        )
     {
         write_text_element(
             &mut out,

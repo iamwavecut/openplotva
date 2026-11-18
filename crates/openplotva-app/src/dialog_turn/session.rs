@@ -29,7 +29,7 @@ use openplotva_dialog::{
     dialog_tool_context, dialog_tool_continuation, dispatch_dialog_tool, tool_call_arguments,
     turn::{
         ANTI_LOOP_HINT, QueuedSideEffect, SIDE_EFFECT_KIND_IMAGE, SIDE_EFFECT_KIND_MUSIC,
-        SIDE_EFFECT_STATE_QUEUED,
+        SIDE_EFFECT_KIND_VIDEO, SIDE_EFFECT_STATE_QUEUED,
     },
 };
 use openplotva_llm::ChatStepProvider;
@@ -1599,6 +1599,7 @@ fn effect_tool(name: &str) -> bool {
         name,
         "draw_image"
             | "generate_song"
+            | "make_video"
             | "draw_api"
             | "send_message"
             | "react_to_message"
@@ -1718,7 +1719,7 @@ fn queued_generation_side_effect(result: &ToolResult) -> Option<QueuedSideEffect
         .eq_ignore_ascii_case(SIDE_EFFECT_STATE_QUEUED)
         && matches!(
             side_effect.kind.as_str(),
-            SIDE_EFFECT_KIND_IMAGE | SIDE_EFFECT_KIND_MUSIC
+            SIDE_EFFECT_KIND_IMAGE | SIDE_EFFECT_KIND_MUSIC | SIDE_EFFECT_KIND_VIDEO
         );
     queued.then(|| QueuedSideEffect {
         kind: side_effect.kind.clone(),

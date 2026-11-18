@@ -56,6 +56,8 @@ pub const TOOL_RESULT_STATUS_EXECUTED: &str = "executed";
 
 pub const IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE: &str = "Не удалось запустить генерацию изображения. Проверьте лимиты, доступ по подписке или настройки чата.";
 pub const SONG_GENERATION_NOT_SCHEDULED_MESSAGE: &str = "Не удалось запустить генерацию песни. Проверьте лимиты, доступ по подписке или настройки чата.";
+pub const VIDEO_GENERATION_NOT_SCHEDULED_MESSAGE: &str =
+    "Не удалось запустить генерацию видео. Проверьте лимиты или настройки чата.";
 
 /// Error wrapper carrying hidden provider trace events without changing the visible error text.
 #[derive(Debug)]
@@ -286,6 +288,18 @@ pub struct SongRequest {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct VideoRequest {
+    /// Tool context.
+    pub context: ToolContext,
+    /// Clip brief in the user's words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    /// Short clip title in the user's language.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct VisionRequest {
     /// Tool context.
     pub context: ToolContext,
@@ -389,6 +403,11 @@ pub trait DialogToolbox: Send + Sync {
         unsupported_tool_future(STEP_GENERATE_SONG)
     }
 
+    /// Make video tool.
+    fn make_video<'a>(&'a self, _req: VideoRequest) -> ToolboxFuture<'a> {
+        unsupported_tool_future(STEP_MAKE_VIDEO)
+    }
+
     /// Understand a supported visual, video, voice, or audio attachment.
     fn understand_media<'a>(&'a self, _req: VisionRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future(STEP_UNDERSTAND_MEDIA)
@@ -446,6 +465,7 @@ fn unsupported_tool_future<'a>(tool: &'static str) -> ToolboxFuture<'a> {
 
 pub const STEP_DRAW_IMAGE: &str = "draw_image";
 pub const STEP_GENERATE_SONG: &str = "generate_song";
+pub const STEP_MAKE_VIDEO: &str = "make_video";
 pub const STEP_UNDERSTAND_MEDIA: &str = "understand_media";
 const LEGACY_STEP_VISION_IMAGE: &str = "vision_image";
 pub const STEP_CURRENCY_RATES: &str = "currency_rates";
@@ -474,6 +494,7 @@ pub const STEP_REACT_TO_MESSAGE: &str = "react_to_message";
 const ALL_STEPS: &[&str] = &[
     STEP_DRAW_IMAGE,
     STEP_GENERATE_SONG,
+    STEP_MAKE_VIDEO,
     STEP_UNDERSTAND_MEDIA,
     LEGACY_STEP_VISION_IMAGE,
     STEP_CURRENCY_RATES,
@@ -649,6 +670,22 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[
                   user stated about genre, mood, language of the lyrics, vocals (male, female, \
                   instrumental), length and references. Keep names and specific details; do not \
                   summarize them away.",
+    },
+];
+
+const MAKE_VIDEO_ARGS: &[ToolArgSpec] = &[
+    ToolArgSpec {
+        name: "prompt",
+        required: true,
+        description: "The clip brief in the user's own words: who or what is shown, the action, \
+                  the place, the mood and every style wish. Keep names and specific details.",
+    },
+    ToolArgSpec {
+        name: "caption",
+        required: true,
+        description: "Short clip title in the user's language. Preserve the requested subject and \
+                  names. Remove the bot address, the request to make a video and politeness. \
+                  Start with a capital letter.",
     },
 ];
 
@@ -883,6 +920,19 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
                  tool call is not published.",
         continuation: ToolContinuation::MayTerminateOnSuccess,
         args: GENERATE_SONG_ARGS,
+    },
+    ToolSpec {
+        name: STEP_MAKE_VIDEO,
+        summary: "Generate a short silent video clip from a text description.",
+        when_to_use: "Use when the latest user message asks for a video, clip, animation, GIF or \
+                      moving picture (видео, ролик, клип, гифка, анимация, оживи). It makes one \
+                      continuous five-second shot without sound from text only; it cannot animate \
+                      an attached picture.",
+        result: "Schedules video generation and ENDS your turn; the clip arrives asynchronously. \
+                 Call it without accompanying text or a promise to make the clip: text alongside \
+                 a tool call is not published.",
+        continuation: ToolContinuation::MayTerminateOnSuccess,
+        args: MAKE_VIDEO_ARGS,
     },
     ToolSpec {
         name: STEP_UNDERSTAND_MEDIA,
@@ -4118,6 +4168,7 @@ fn primary_tool_arg_key(step: &str) -> Option<&'static str> {
     match step {
         STEP_DRAW_IMAGE => Some("prompt"),
         STEP_GENERATE_SONG => Some("topic"),
+        STEP_MAKE_VIDEO => Some("prompt"),
         STEP_UNDERSTAND_MEDIA | LEGACY_STEP_VISION_IMAGE => Some("file_id"),
         STEP_WEB_SEARCH | STEP_HISTORY_SEARCH | STEP_MEMORY_SEARCH => Some("query"),
         STEP_CRAWL_URL => Some("url"),
@@ -5308,6 +5359,9 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     if step.step == STEP_GENERATE_SONG && step.topic.is_empty() && !step.prompt.is_empty() {
         step.topic = std::mem::take(&mut step.prompt);
     }
+    if step.step == STEP_MAKE_VIDEO && step.prompt.is_empty() && !step.topic.is_empty() {
+        step.prompt = std::mem::take(&mut step.topic);
+    }
     if step_contains_protocol_sentinel_argument(&step) {
         return Err(ToolParseError::new(format!(
             "{} tool argument contains protocol sentinel",
@@ -6134,6 +6188,7 @@ mod tests {
                 "finish_turn",
                 STEP_DRAW_IMAGE,
                 STEP_GENERATE_SONG,
+                STEP_MAKE_VIDEO,
                 STEP_UNDERSTAND_MEDIA,
                 STEP_CURRENCY_RATES,
                 STEP_WEB_SEARCH,

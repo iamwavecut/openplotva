@@ -7636,6 +7636,7 @@ const fn task_queue_job_type_name(job_type: JobType) -> &'static str {
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",
+        JobType::VideoGen => "video_gen",
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",

@@ -16,15 +16,17 @@ use openplotva_dialog::{
     SONG_GENERATION_NOT_SCHEDULED_MESSAGE, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
     TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
     TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
-    VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
-    user_facing_not_scheduled_message, verbatim_draw_caption,
+    VIDEO_GENERATION_NOT_SCHEDULED_MESSAGE, VideoRequest, VisionRequest,
+    is_internal_not_scheduled_instruction, sanitize_tool_text, user_facing_not_scheduled_message,
+    verbatim_draw_caption,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
     DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_PRIORITY,
     IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue,
-    MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, fallback_queue_time_estimate, format_duration_ru,
-    format_go_duration, new_image_edit_job_at, new_image_gen_job_at, new_music_gen_job_at,
+    MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, VIDEO_QUEUE_NAME, VideoGenJobParams,
+    fallback_queue_time_estimate, format_duration_ru, format_go_duration, new_image_edit_job_at,
+    new_image_gen_job_at, new_music_gen_job_at, new_video_gen_job_at,
 };
 use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -39,7 +41,7 @@ use crate::{
     task_queue::TaskQueueDurabilityBarrier,
     translate::{TextTranslator, TranslationResult, translate_text_tool},
 };
-use openplotva_server::{ACTION_SEND_AUDIO, ACTION_SEND_IMAGE};
+use openplotva_server::{ACTION_SEND_AUDIO, ACTION_SEND_IMAGE, ACTION_SEND_VIDEO};
 
 /// Boxed future returned by taskman queue status providers.
 pub type QueueStatusFuture<'a> =
@@ -100,6 +102,10 @@ pub type DrawImagePermissionFuture<'a> =
 /// Boxed future returned by song scheduling providers.
 pub type GenerateSongFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SongScheduleResult, ToolboxError>> + Send + 'a>>;
+
+/// Boxed future returned by video schedulers.
+pub type ScheduleVideoFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<VideoScheduleResult, ToolboxError>> + Send + 'a>>;
 
 /// Boxed future returned by direct song audio permission checks.
 pub type SongAudioPermissionFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
@@ -627,6 +633,28 @@ where
     }
 }
 
+pub trait VideoScheduler: Send + Sync {
+    fn schedule_video<'a>(&'a self, request: VideoScheduleRequest) -> ScheduleVideoFuture<'a>;
+}
+
+pub trait VideoPermission: Send + Sync {
+    /// Return whether a generated clip may be sent to this chat.
+    fn can_send_video<'a>(&'a self, chat_id: i64) -> SongAudioPermissionFuture<'a>;
+}
+
+impl<Store> VideoPermission for ChatPermissionPolicy<Store>
+where
+    Store: ChatPermissionStore + Send + Sync,
+{
+    fn can_send_video<'a>(&'a self, chat_id: i64) -> SongAudioPermissionFuture<'a> {
+        Box::pin(async move {
+            self.can_perform_action_at(chat_id, None, ACTION_SEND_VIDEO, OffsetDateTime::now_utc())
+                .await
+                .allowed
+        })
+    }
+}
+
 pub trait VisionDescriber: Send + Sync {
     /// Describe an image attachment.
     fn describe_image<'a>(&'a self, request: VisionDescribeRequest) -> VisionImageFuture<'a>;
@@ -892,6 +920,67 @@ impl SongScheduleRejection {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VideoScheduleRequest {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub message_id: i32,
+    pub user_id: i64,
+    pub user_full_name: String,
+    /// Sanitized clip brief from the dialog model.
+    pub brief: String,
+    /// Sanitized clip title in the user's language.
+    pub caption: String,
+    /// The user's message that asked for the clip.
+    pub message_text: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VideoScheduleResult {
+    pub status: String,
+    /// Model-facing refusal; empty when the clip is queued.
+    pub message: String,
+    pub rejection: Option<VideoScheduleRejection>,
+    /// Taskman ticket id of the queued clip.
+    pub job_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoScheduleRejection {
+    /// Bot cannot send videos in this chat.
+    VideoNotAllowed,
+    /// The user's previous clip is still in progress.
+    ActiveLimit,
+    /// Enqueue throttled by the task-enqueue rate limit.
+    RateLimited,
+}
+
+impl VideoScheduleRejection {
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::VideoNotAllowed => "video_not_allowed",
+            Self::ActiveLimit => "active_job_limit",
+            Self::RateLimited => "enqueue_rate_limited",
+        }
+    }
+
+    #[must_use]
+    pub const fn model_facing_message(self) -> &'static str {
+        match self {
+            Self::VideoNotAllowed => {
+                "В этот чат нельзя отправлять видео. Ролик не поставлен в очередь."
+            }
+            Self::ActiveLimit => {
+                "Предыдущее видео пользователя ещё делается. Новый ролик не поставлен в очередь: пусть дождётся готового."
+            }
+            Self::RateLimited => {
+                "Слишком много запросов подряд, сработал лимит очереди. Задача не поставлена в очередь."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SongQueueNotice {
     pub position: usize,
@@ -997,6 +1086,7 @@ pub struct TaskmanDialogToolAdapter {
     image_edit_file_resolver: Option<Arc<dyn ImageEditFileResolver>>,
     song_service_available: bool,
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
+    video_permission: Option<Arc<dyn VideoPermission>>,
     generation_reactions: Option<crate::reactions::GenerationReactions>,
     delivery_obligations: Option<Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>>,
     draw_queue_notice: Option<Arc<dyn DrawQueueNoticeSender>>,
@@ -1068,6 +1158,7 @@ impl TaskmanDialogToolAdapter {
             image_edit_file_resolver: None,
             song_service_available: true,
             song_audio_permission: None,
+            video_permission: None,
             generation_reactions: None,
             delivery_obligations: None,
             draw_queue_notice: None,
@@ -1239,6 +1330,12 @@ impl TaskmanDialogToolAdapter {
     #[must_use]
     pub fn with_song_audio_permission(mut self, permission: Arc<dyn SongAudioPermission>) -> Self {
         self.song_audio_permission = Some(permission);
+        self
+    }
+
+    #[must_use]
+    pub fn with_video_permission(mut self, permission: Arc<dyn VideoPermission>) -> Self {
+        self.video_permission = Some(permission);
         self
     }
 }
@@ -1526,6 +1623,66 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                     })
                 }
                 Ok(None) => Ok(not_scheduled_song(SongScheduleRejection::ActiveLimit)),
+                Err(error) => Err(Box::new(error) as ToolboxError),
+            }
+        })
+    }
+}
+
+impl VideoScheduler for TaskmanDialogToolAdapter {
+    fn schedule_video<'a>(&'a self, request: VideoScheduleRequest) -> ScheduleVideoFuture<'a> {
+        Box::pin(async move {
+            if let Some(permission) = self.video_permission.as_deref()
+                && !permission.can_send_video(request.chat_id).await
+            {
+                return Ok(not_scheduled_video(VideoScheduleRejection::VideoNotAllowed));
+            }
+            let chat_id = request.chat_id;
+            let user_id = request.user_id;
+            if self
+                .task_enqueue_limited(VIDEO_QUEUE_NAME, chat_id, user_id)
+                .await
+            {
+                return Ok(not_scheduled_video(VideoScheduleRejection::RateLimited));
+            }
+            let job = new_video_gen_job_at(
+                VideoGenJobParams {
+                    chat_id,
+                    message_id: request.message_id,
+                    user_id,
+                    user_full_name: request.user_full_name,
+                    thread_id: request.thread_id,
+                    request_text: request.message_text.trim().to_owned(),
+                    brief: request.brief,
+                    caption: request.caption,
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .with_name("video")
+            .with_priority(DEFAULT_PRIORITY);
+            match self.queue.assign_with_user_limit(VIDEO_QUEUE_NAME, job, 1) {
+                Ok(Some(job_id)) => {
+                    self.persist_generation_handoff(job_id).await?;
+                    self.grow_task_enqueue(VIDEO_QUEUE_NAME, chat_id, user_id)
+                        .await;
+                    self.record_delivery_obligation(
+                        openplotva_dialog::turn::SIDE_EFFECT_KIND_VIDEO,
+                        job_id,
+                        chat_id,
+                        request.thread_id,
+                        user_id,
+                        request.message_id,
+                    )
+                    .await;
+                    self.ack_queued_generation(chat_id, request.message_id)
+                        .await;
+                    Ok(VideoScheduleResult {
+                        status: "scheduled".to_owned(),
+                        job_id: Some(job_id),
+                        ..VideoScheduleResult::default()
+                    })
+                }
+                Ok(None) => Ok(not_scheduled_video(VideoScheduleRejection::ActiveLimit)),
                 Err(error) => Err(Box::new(error) as ToolboxError),
             }
         })
@@ -2102,6 +2259,15 @@ fn is_draw_prompt_whitelisted(prompt: &str, whitelist: &[String]) -> bool {
 /// Rejections always feed back to the model (`no_reply: false`): the tool
 /// result carries a model-facing refusal message plus a machine-readable
 /// reason code, and the model composes the user-visible reply.
+fn not_scheduled_video(rejection: VideoScheduleRejection) -> VideoScheduleResult {
+    VideoScheduleResult {
+        status: "not_scheduled".to_owned(),
+        message: rejection.model_facing_message().to_owned(),
+        rejection: Some(rejection),
+        job_id: None,
+    }
+}
+
 fn not_scheduled_song(rejection: SongScheduleRejection) -> SongScheduleResult {
     SongScheduleResult {
         status: "not_scheduled".to_owned(),
@@ -2262,6 +2428,7 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     youtube_summarizer: Option<Arc<dyn YouTubeSummarizer>>,
     image_scheduler: Option<Arc<dyn ImageScheduler>>,
     song_scheduler: Option<Arc<dyn SongScheduler>>,
+    video_scheduler: Option<Arc<dyn VideoScheduler>>,
     vision_describer: Option<Arc<dyn VisionDescriber>>,
     image_fallback_notice: Option<Arc<dyn ImageFallbackNoticeSender>>,
     history_summarizer: Option<Arc<dyn ChatHistorySummarizer>>,
@@ -2290,6 +2457,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             youtube_summarizer: None,
             image_scheduler: None,
             song_scheduler: None,
+            video_scheduler: None,
             vision_describer: None,
             image_fallback_notice: None,
             history_summarizer: None,
@@ -2347,6 +2515,12 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     #[must_use]
     pub fn with_song_scheduler(mut self, song_scheduler: Arc<dyn SongScheduler>) -> Self {
         self.song_scheduler = Some(song_scheduler);
+        self
+    }
+
+    #[must_use]
+    pub fn with_video_scheduler(mut self, video_scheduler: Arc<dyn VideoScheduler>) -> Self {
+        self.video_scheduler = Some(video_scheduler);
         self
     }
 
@@ -2471,7 +2645,11 @@ where
     TranslatorT: TextTranslator + Send + Sync + 'static,
 {
     fn offers_tool(&self, name: &str) -> bool {
-        name != openplotva_dialog::STEP_RUN_PYTHON || self.python_sandbox.is_some()
+        match name {
+            openplotva_dialog::STEP_RUN_PYTHON => self.python_sandbox.is_some(),
+            openplotva_dialog::STEP_MAKE_VIDEO => self.video_scheduler.is_some(),
+            _ => true,
+        }
     }
 
     fn run_python<'a>(&'a self, req: PythonRunRequest) -> ToolboxFuture<'a> {
@@ -2611,6 +2789,31 @@ where
                     "generate_song_failed",
                     error.to_string(),
                 )),
+            }
+        })
+    }
+
+    fn make_video<'a>(&'a self, req: VideoRequest) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            let Some(scheduler) = self.video_scheduler.as_deref() else {
+                return Ok(ToolResult::failed(
+                    "make_video_unavailable",
+                    "video service unavailable",
+                ));
+            };
+            let request = VideoScheduleRequest {
+                chat_id: req.context.chat_id,
+                thread_id: req.context.thread_id,
+                message_id: req.context.message_id,
+                user_id: req.context.user_id,
+                user_full_name: req.context.user_full_name,
+                brief: sanitize_tool_text(&req.prompt),
+                caption: sanitize_tool_text(&req.caption),
+                message_text: req.context.message_text,
+            };
+            match scheduler.schedule_video(request).await {
+                Ok(result) => Ok(dialog_make_video_tool_result(&result)),
+                Err(error) => Ok(ToolResult::failed("make_video_failed", error.to_string())),
             }
         })
     }
@@ -2907,6 +3110,19 @@ fn dialog_generate_song_tool_result(result: &SongScheduleResult) -> ToolResult {
         ticket_job_id: result.job_id,
         not_scheduled_fallback: SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
         not_scheduled_error_code: "generate_song_not_scheduled",
+    })
+}
+
+fn dialog_make_video_tool_result(result: &VideoScheduleResult) -> ToolResult {
+    scheduled_generation_tool_result(GenerationToolResultArgs {
+        scheduler_status: &result.status,
+        scheduler_message: &result.message,
+        scheduler_no_reply: false,
+        reason_code: result.rejection.map(VideoScheduleRejection::reason_code),
+        side_effect_kind: openplotva_dialog::turn::SIDE_EFFECT_KIND_VIDEO,
+        ticket_job_id: result.job_id,
+        not_scheduled_fallback: VIDEO_GENERATION_NOT_SCHEDULED_MESSAGE,
+        not_scheduled_error_code: "make_video_not_scheduled",
     })
 }
 
@@ -5108,6 +5324,114 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    struct VideoPermissionStub(bool);
+
+    impl VideoPermission for VideoPermissionStub {
+        fn can_send_video<'a>(&'a self, _chat_id: i64) -> SongAudioPermissionFuture<'a> {
+            let allowed = self.0;
+            Box::pin(async move { allowed })
+        }
+    }
+
+    fn video_request(message_id: i32) -> VideoScheduleRequest {
+        VideoScheduleRequest {
+            chat_id: -100,
+            thread_id: Some(7),
+            message_id,
+            user_id: 42,
+            user_full_name: "Alice".to_owned(),
+            brief: "A grey cat catches a snowflake".to_owned(),
+            caption: "Кот и снежинка".to_owned(),
+            message_text: " !видео кот ловит снежинку ".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_queues_one_video_per_user_with_an_obligation()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let recorder = Arc::new(ObligationRecorderStub::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_video_permission(Arc::new(VideoPermissionStub(true)))
+            .with_delivery_obligations(recorder.clone(), 1200, 1800);
+
+        let scheduled = adapter.schedule_video(video_request(11)).await?;
+
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(scheduled.status, "scheduled");
+        assert_eq!(scheduled.job_id, Some(records[0].id));
+        assert_eq!(records[0].queue_name, VIDEO_QUEUE_NAME);
+        assert_eq!(
+            openplotva_taskman::video_gen_job_params_from_payload(&records[0].job.data),
+            Ok(VideoGenJobParams {
+                chat_id: -100,
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                thread_id: Some(7),
+                request_text: "!видео кот ловит снежинку".to_owned(),
+                brief: "A grey cat catches a snowflake".to_owned(),
+                caption: "Кот и снежинка".to_owned(),
+            })
+        );
+        let recorded = recorder.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind, "video_generation_job");
+        assert_eq!(recorded[0].ticket_job_id, records[0].id);
+        let queued = dialog_make_video_tool_result(&scheduled);
+        assert_eq!(queued.status, TOOL_RESULT_STATUS_QUEUED);
+        assert_eq!(
+            queued
+                .side_effect
+                .map(|effect| (effect.kind, effect.ticket_id)),
+            Some(("video_generation_job".to_owned(), records[0].id.to_string()))
+        );
+
+        let second = adapter.schedule_video(video_request(12)).await?;
+        assert_eq!(second.rejection, Some(VideoScheduleRejection::ActiveLimit));
+        assert_eq!(queue.records().len(), 1);
+        let refused = dialog_make_video_tool_result(&second);
+        assert_eq!(refused.status, TOOL_RESULT_STATUS_FAILED);
+        assert_eq!(
+            refused
+                .data
+                .as_ref()
+                .and_then(|data| data["reason"].as_str()),
+            Some("active_job_limit")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_refuses_video_where_the_chat_forbids_it()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_video_permission(Arc::new(VideoPermissionStub(false)));
+
+        let refused = adapter.schedule_video(video_request(11)).await?;
+
+        assert_eq!(refused.status, "not_scheduled");
+        assert_eq!(
+            refused.rejection,
+            Some(VideoScheduleRejection::VideoNotAllowed)
+        );
+        assert!(queue.records().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn app_dialog_toolbox_offers_make_video_only_with_a_scheduler() {
+        let without = toolbox(None);
+        assert!(!without.offers_tool(openplotva_dialog::STEP_MAKE_VIDEO));
+        assert!(without.offers_tool(openplotva_dialog::STEP_GENERATE_SONG));
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let with =
+            toolbox(None).with_video_scheduler(Arc::new(TaskmanDialogToolAdapter::new(queue)));
+        assert!(with.offers_tool(openplotva_dialog::STEP_MAKE_VIDEO));
     }
 
     #[tokio::test]

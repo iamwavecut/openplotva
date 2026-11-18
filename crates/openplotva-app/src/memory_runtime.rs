@@ -1836,6 +1836,7 @@ fn taskman_job_type_string(job_type: JobType) -> &'static str {
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",
+        JobType::VideoGen => "video_gen",
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",

@@ -10,6 +10,7 @@ use openplotva_llm::aifarm::{
 };
 use openplotva_llm::gemini::{GeminiMediaPromptOptimizer, GeminiMediaPromptOptimizerConfig};
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
+use openplotva_media::video::VideoOptimize;
 use openplotva_media::{ImageEditOptimize, ImageOptimize, OptimizePromptOptions};
 use thiserror::Error;
 
@@ -178,6 +179,57 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
                 }
             }
         })
+    }
+}
+
+impl RoutedMediaPromptOptimizer {
+    /// Write the FastFrames prompt for a clip over the media optimizer route. Only
+    /// OpenAI-compatible attempts serve it.
+    pub async fn optimize_video_prompt(
+        &self,
+        request: &str,
+        brief: &str,
+    ) -> Result<VideoOptimize, MediaPromptOptimizerError> {
+        let request = request.to_owned();
+        let brief = brief.to_owned();
+        let result = self
+            .walker
+            .run(
+                routed_media_context(),
+                |attempt| {
+                    let config = self.config.clone();
+                    let prompt_store = Arc::clone(&self.prompt_store);
+                    let request = request.clone();
+                    let brief = brief.clone();
+                    async move {
+                        if attempt.protocol
+                            == Some(openplotva_llm::provider_schema::Protocol::Genkit)
+                        {
+                            return Err(MediaPromptOptimizerError::Provider(format!(
+                                "video prompt optimizer does not support the Genkit provider {}",
+                                attempt.provider_name
+                            )));
+                        }
+                        let cfg = aifarm_structured_json_config_for_attempt(&config, &attempt)?;
+                        let optimizer =
+                            AifarmStructuredJsonGenerator::new(cfg).with_prompt_store(prompt_store);
+                        let mut ignore_status = |_status: StatusUpdate| {};
+                        optimizer
+                            .optimize_video_prompt(&request, &brief, &mut ignore_status)
+                            .await
+                            .map_err(|err| MediaPromptOptimizerError::Provider(err.to_string()))
+                    }
+                },
+                media_optimizer_retryable_reason,
+            )
+            .await;
+        match result {
+            Ok(value) => Ok(value),
+            Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+            Err(RoutedAttemptRunError::Routing(error)) => {
+                Err(MediaPromptOptimizerError::Provider(error.to_string()))
+            }
+        }
     }
 }
 

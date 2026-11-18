@@ -81,7 +81,7 @@ impl DialogToolbox for AgentContextTools {
                     .await
                 {
                     Ok(vip) => Ok(ok(
-                        json!({"user_id":ctx.user_id, "status":"verified", "vip":vip, "entitlements":{"generate_song":vip,"edit_image":vip,"draw_image":true},"subject_to_chat_policy_and_rate_limits":true}),
+                        json!({"user_id":ctx.user_id, "status":"verified", "vip":vip, "entitlements":{"generate_song":vip,"edit_image":vip,"draw_image":true,"make_video":true},"subject_to_chat_policy_and_rate_limits":true}),
                     )),
                     Err(_) => Ok(ToolResult::failed(
                         "status_unknown",

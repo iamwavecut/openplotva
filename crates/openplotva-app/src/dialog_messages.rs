@@ -1664,6 +1664,7 @@ where
         || is_bang_draw_shortcut(&first_word_lower)
         || is_bang_song_shortcut(&first_word_lower)
         || is_song_command_for_bot(message, &first_word_lower, &bot_username)
+        || is_video_shortcut(message, &first_word_lower, &bot_username)
         || is_search_command_for_bot(message, &first_word_lower, &bot_username)
     {
         return handle_dialog_message_update_or_else_with_image_and_song_notices(
@@ -1810,6 +1811,7 @@ where
         parsed.is_addressed = true;
     }
     parsed.is_addressed |= is_bang_draw_shortcut(&first_word_lower)
+        || is_video_shortcut(message, &first_word_lower, &bot_username)
         || direct_song_shortcut_topic(
             message,
             parsed.is_addressed,
@@ -1868,6 +1870,15 @@ where
             format!(
                 "Requested tool: generate_song. Topic: {}",
                 resolve_song_topic(message, &topic).unwrap_or_default()
+            ),
+            String::new(),
+        ))
+    } else if is_video_shortcut(message, &first_word_lower, &bot_username) {
+        Some((
+            openplotva_dialog::STEP_MAKE_VIDEO,
+            format!(
+                "Requested tool: make_video. Prompt: {}",
+                parsed.rest_text.trim()
             ),
             String::new(),
         ))
@@ -2063,6 +2074,24 @@ fn slash_command_parts(word: &str) -> Option<(&str, Option<&str>)> {
         None => (command, None),
     };
     Some((name, target))
+}
+
+/// `/video` (with the bot's name in groups), `!video` or `!видео`.
+fn is_video_shortcut(
+    message: &carapax::types::Message,
+    first_word_lower: &str,
+    bot_username: &str,
+) -> bool {
+    let word = first_word_lower.trim();
+    if matches!(word, "!video" | "!видео") {
+        return true;
+    }
+    let Some((command, target)) = slash_command_parts(word) else {
+        return false;
+    };
+    command == "video"
+        && (telegram_chat_is_private(&message.chat)
+            || target.is_some_and(|target| target.eq_ignore_ascii_case(bot_username)))
 }
 
 fn is_plain_song_alias(first_word: &str) -> bool {
@@ -6743,6 +6772,9 @@ mod tests {
             ("!song", "generate_song", ""),
             ("/song@plotva_bot neon rain", "generate_song", ""),
             ("@plotva_bot песня про море", "generate_song", ""),
+            ("!video кот ловит снежинку", "make_video", ""),
+            ("!видео кот ловит снежинку", "make_video", ""),
+            ("/video@plotva_bot кот ловит снежинку", "make_video", ""),
             ("!draw red fish", "draw_image", "red fish"),
             ("@plotva_bot нарисуй рыбу", "draw_image", "рыбу"),
             ("@plotva_bot пожалуйста, нарисуй рыбу", "draw_image", "рыбу"),

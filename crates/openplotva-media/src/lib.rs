@@ -2,6 +2,7 @@
 
 pub mod acestep;
 pub mod uploader;
+pub mod video;
 
 use std::sync::LazyLock;
 
