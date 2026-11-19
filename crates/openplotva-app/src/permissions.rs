@@ -12,8 +12,8 @@ use std::{
 use openplotva_core::{ChatSettings, ChatSettingsUpdate};
 use openplotva_server::{
     ACTION_EDIT_MESSAGE, ACTION_SEND_AUDIO, ACTION_SEND_IMAGE, ACTION_SEND_STICKER,
-    ACTION_SEND_TEXT, can_perform_action, permission_cache_key, permission_error_chat_type,
-    permission_error_settings_update,
+    ACTION_SEND_TEXT, ACTION_SEND_VIDEO, can_perform_action, permission_cache_key,
+    permission_error_chat_type, permission_error_settings_update,
 };
 use openplotva_telegram::{TelegramOutboundMethodKind, classify_telegram_send_error};
 use time::OffsetDateTime;
@@ -135,6 +135,7 @@ impl<S> ChatPermissionPolicy<S> {
             ACTION_SEND_IMAGE,
             ACTION_SEND_STICKER,
             ACTION_SEND_AUDIO,
+            ACTION_SEND_VIDEO,
         ] {
             cache.remove(&permission_cache_key(chat_id, action));
         }
@@ -348,7 +349,9 @@ mod tests {
     };
 
     use openplotva_core::{ChatSettings, ChatSettingsUpdate};
-    use openplotva_server::{ACTION_EDIT_MESSAGE, ACTION_SEND_STICKER, ACTION_SEND_TEXT};
+    use openplotva_server::{
+        ACTION_EDIT_MESSAGE, ACTION_SEND_STICKER, ACTION_SEND_TEXT, ACTION_SEND_VIDEO,
+    };
     use openplotva_telegram::TelegramOutboundMethodKind;
     use time::OffsetDateTime;
 
@@ -440,6 +443,39 @@ mod tests {
         assert!(!reloaded_text.allowed);
         assert_eq!(reloaded_text.source, PermissionCheckSource::Store);
         assert_eq!(store.load_count(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn video_follows_the_group_draw_setting_and_invalidates_with_it()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let group = |enable_global_draw_reply| {
+            PermissionStoreStub::with_context(ChatPermissionContext {
+                chat_type: Some("supergroup".to_owned()),
+                settings: Some(ChatSettings {
+                    enable_global_draw_reply,
+                    ..ChatSettings::defaults(42)
+                }),
+            })
+        };
+        let drawing = ChatPermissionPolicy::new(group(true));
+        let silent = ChatPermissionPolicy::new(group(false));
+
+        let allowed = drawing
+            .can_perform_action_at(42, None, ACTION_SEND_VIDEO, now)
+            .await;
+        drawing.invalidate_chat(42);
+        let reloaded = drawing
+            .can_perform_action_at(42, None, ACTION_SEND_VIDEO, now)
+            .await;
+        let refused = silent
+            .can_perform_action_at(42, None, ACTION_SEND_VIDEO, now)
+            .await;
+
+        assert!(allowed.allowed);
+        assert_eq!(reloaded.source, PermissionCheckSource::Store);
+        assert!(!refused.allowed);
         Ok(())
     }
 

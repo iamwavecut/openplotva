@@ -611,7 +611,7 @@ pub fn can_perform_action(chat_type: &str, settings: Option<&ChatSettings>, acti
         ACTION_SEND_TEXT | ACTION_EDIT_MESSAGE | ACTION_SEND_MESSAGE => {
             settings.enable_global_text_reply
         }
-        ACTION_SEND_IMAGE | ACTION_SEND_STICKER | ACTION_SEND_AUDIO => {
+        ACTION_SEND_IMAGE | ACTION_SEND_STICKER | ACTION_SEND_AUDIO | ACTION_SEND_VIDEO => {
             settings.enable_global_draw_reply
         }
         _ => false,
@@ -3174,9 +3174,14 @@ mod tests {
             Some(&draw_only),
             ACTION_SEND_STICKER
         ));
-        assert!(!can_perform_action(
+        assert!(can_perform_action(
             "supergroup",
             Some(&draw_only),
+            ACTION_SEND_VIDEO
+        ));
+        assert!(!can_perform_action(
+            "supergroup",
+            Some(&disabled),
             ACTION_SEND_VIDEO
         ));
     }
