@@ -15,7 +15,10 @@ pub mod tool_telemetry;
 pub mod transcript;
 pub mod turn;
 
-pub use dispatch::{VERBATIM_DRAW_CAPTION_MAX_WORDS, dispatch_dialog_tool, verbatim_draw_caption};
+pub use dispatch::{
+    VERBATIM_DRAW_CAPTION_MAX_WORDS, dispatch_dialog_tool, verbatim_draw_caption,
+    verbatim_video_caption,
+};
 pub use leak_guard::{DialogLeak, ReplyLeakGuard, ReplyLeakGuardBuilder};
 
 pub use history::{
@@ -683,9 +686,10 @@ const MAKE_VIDEO_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "caption",
         required: true,
-        description: "Short clip title in the user's language. Preserve the requested subject and \
-                  names. Remove the bot address, the request to make a video and politeness. \
-                  Start with a capital letter.",
+        description: "Short clip title in the user's language. Preserve the requested subject, \
+                  names and details. Remove the bot address, the request to make a video and \
+                  politeness. Start with a capital letter. Never include technical instructions \
+                  or details added for generation.",
     },
 ];
 

@@ -32,7 +32,6 @@ pub const TEXT_QUEUE_NAME: &str = "text";
 pub const IMAGE_REGULAR_QUEUE_NAME: &str = "image-regular";
 pub const IMAGE_VIP_QUEUE_NAME: &str = "image-vip";
 pub const MUSIC_VIP_QUEUE_NAME: &str = "music-vip";
-pub const VIDEO_QUEUE_NAME: &str = "video";
 pub const ASR_GPU1_QUEUE_NAME: &str = "asr-gpu1";
 pub const DIALOG_AIFARM_QUEUE_NAME: &str = "dialog-aifarm";
 pub const MEMORY_CONSOLIDATION_QUEUE_NAME: &str = "memory-consolidation";
@@ -3475,7 +3474,7 @@ fn next_pending_index_matching(
         .map(|(index, _record)| index)
 }
 
-/// Arbitrate separate ASR, VIP-image, and regular-image workers while the queue
+/// Arbitrate separate ASR, VIP-media, and regular-media workers while the queue
 /// state is locked. Waiting jobs age to the ASR priority ceiling, after which
 /// the existing creation-time and ID order guarantees eventual eligibility.
 fn accelerator_work_blocked_by_higher_ranked_work(
@@ -3499,7 +3498,7 @@ fn accelerator_work_blocked_by_higher_ranked_work(
 fn is_accelerator_record(record: &TaskQueueRecord) -> bool {
     matches!(
         record.job.data.job_type,
-        JobType::Asr | JobType::ImageGen | JobType::ImageEdit
+        JobType::Asr | JobType::ImageGen | JobType::ImageEdit | JobType::VideoGen
     )
 }
 
@@ -3515,12 +3514,12 @@ fn compare_accelerator_records(
 }
 
 fn accelerator_effective_priority(record: &TaskQueueRecord, now: OffsetDateTime) -> Priority {
-    let is_vip_image = record.queue_name == IMAGE_VIP_QUEUE_NAME
+    let is_vip_media = record.queue_name == IMAGE_VIP_QUEUE_NAME
         && matches!(
             record.job.data.job_type,
-            JobType::ImageGen | JobType::ImageEdit
+            JobType::ImageGen | JobType::ImageEdit | JobType::VideoGen
         );
-    let (base_priority, ceiling) = if is_vip_image {
+    let (base_priority, ceiling) = if is_vip_media {
         // The floor upgrades already-persisted priority-4 VIP jobs without rewriting queue state.
         (
             record.job.priority.max(IMAGE_VIP_PRIORITY),
@@ -3798,7 +3797,6 @@ pub fn fallback_queue_time_estimate(queue_name: &str, depth: usize) -> std::time
     }
     let base_secs = match queue_name {
         IMAGE_REGULAR_QUEUE_NAME | IMAGE_VIP_QUEUE_NAME | MUSIC_VIP_QUEUE_NAME => 8 * 60,
-        VIDEO_QUEUE_NAME => 60,
         CONTROL_QUEUE_NAME | TEXT_QUEUE_NAME => 2 * 60,
         _ => 5 * 60,
     };
@@ -3890,21 +3888,22 @@ mod tests {
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind,
         DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams,
         DialogJobPayloadError, HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
-        IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams,
-        ImageGenJobPayloadError, ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType,
-        LOWEST_PRIORITY, MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
-        MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
-        MusicGenJobPayloadError, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE,
-        QUEUE_ESTIMATE_MIN_SAMPLE_SIZE, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
-        TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
-        TaskQueueRecord, TaskQueueSchedule, TaskQueueScheduleDisposition, TaskQueueWalRecord,
-        TaskQueueWalSink, accelerator_effective_priority, asr_job_params_from_stateless_job,
+        IMAGE_VIP_PRIORITY, IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageEditJobPayloadError,
+        ImageGenJobParams, ImageGenJobPayloadError, ImageJobData, InMemoryTaskQueue, JobPayload,
+        JobStatus, JobType, LOWEST_PRIORITY, MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED,
+        MESSAGE_STATUS_FAILED, MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT,
+        MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, MusicGenJobPayloadError,
+        QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE, QUEUE_ESTIMATE_MIN_SAMPLE_SIZE,
+        STUCK_JOB_ERROR_MESSAGE, StatelessJobItem, TASK_QUEUE_SNAPSHOT_FORMAT, TEXT_QUEUE_NAME,
+        TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams, TaskQueueRecord,
+        TaskQueueSchedule, TaskQueueScheduleDisposition, TaskQueueWalRecord, TaskQueueWalSink,
+        VideoGenJobParams, accelerator_effective_priority, asr_job_params_from_stateless_job,
         decode_task_queue_snapshot, encode_task_queue_snapshot, fallback_queue_time_estimate,
         format_duration_ru, image_edit_job_params_from_stateless_job,
         image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
         new_agent_job_at, new_asr_job_at, new_control_job_at, new_dialog_job_at,
         new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
-        new_music_gen_job_at, replay_task_queue_wal_records,
+        new_music_gen_job_at, new_video_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -5067,6 +5066,94 @@ mod tests {
                 })
                 .map(|work| work.id),
             Some(aged_vip)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clips_share_accelerator_arbitration_with_images() -> Result<(), Box<dyn std::error::Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let clip = |message_id| {
+            new_video_gen_job_at(
+                VideoGenJobParams {
+                    chat_id: 1,
+                    message_id,
+                    user_id: 2,
+                    brief: "cat".to_owned(),
+                    ..VideoGenJobParams::default()
+                },
+                now,
+            )
+        };
+        let picture = |message_id| {
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id,
+                    user_id: 2,
+                    prompt: "cat".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now,
+            )
+        };
+        let is_media = |job: &StatelessJobItem| {
+            matches!(job.data.job_type, JobType::ImageGen | JobType::VideoGen)
+        };
+
+        let queue = InMemoryTaskQueue::new();
+        queue.assign(IMAGE_REGULAR_QUEUE_NAME, picture(10));
+        let vip_clip = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            clip(11).with_priority(IMAGE_VIP_PRIORITY),
+        );
+        let vip_clip_record = queue.record(vip_clip).expect("VIP clip record");
+        assert_eq!(
+            accelerator_effective_priority(&vip_clip_record, now),
+            IMAGE_VIP_PRIORITY
+        );
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, is_media)
+                .is_none(),
+            "a waiting VIP clip must hold back regular images"
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, is_media)
+                .map(|work| work.id),
+            Some(vip_clip)
+        );
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, is_media)
+                .is_none(),
+            "a running VIP clip must not render next to a regular image"
+        );
+
+        let regular = InMemoryTaskQueue::new();
+        let first = regular.assign(IMAGE_REGULAR_QUEUE_NAME, clip(20));
+        let second = regular.assign(IMAGE_REGULAR_QUEUE_NAME, picture(21));
+        assert_eq!(
+            regular
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, is_media)
+                .map(|work| work.id),
+            Some(first),
+            "clips and images leave the shared queue in arrival order"
+        );
+        assert_eq!(
+            regular
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, is_media)
+                .map(|work| work.id),
+            None,
+            "the image waits while the earlier clip renders"
+        );
+        regular.complete(first, now)?;
+        assert_eq!(
+            regular
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, is_media)
+                .map(|work| work.id),
+            Some(second)
         );
         Ok(())
     }

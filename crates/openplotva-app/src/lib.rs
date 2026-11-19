@@ -1517,10 +1517,6 @@ fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCo
                 worker_count: queue.music_vip_workers,
             },
             admin::AdminQueueWorkerConfig {
-                queue_name: openplotva_taskman::VIDEO_QUEUE_NAME.to_owned(),
-                worker_count: i32::from(config.video.enabled),
-            },
-            admin::AdminQueueWorkerConfig {
                 queue_name: openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
                 worker_count: queue.memory_consolidation_workers,
             },
@@ -4429,6 +4425,30 @@ async fn start_runtime_workers(
             memory_store.clone(),
         )),
     ));
+    // Clips ride the image queues: the VIP and regular generation workers render them
+    // in queue order instead of next to the drawings.
+    let video_runner: Option<Arc<dyn video_jobs::VideoJobRunner>> =
+        config.video.enabled.then(|| {
+            Arc::new(video_jobs::VideoPipeline {
+                optimizer: media::RoutedMediaPromptOptimizer::new(
+                    attempt_walker.clone(),
+                    config,
+                    Arc::clone(&prompt_store),
+                ),
+                generator: image_jobs::AifarmDrawApiImageGenerator::new(
+                    image_jobs::AifarmDrawApiConfig {
+                        endpoint_name: image_jobs::AIFARM_DRAW_API_FASTFRAMES_ENDPOINT_NAME
+                            .to_owned(),
+                        ..image_jobs::aifarm_draw_api_config_from_app_config(config)
+                    },
+                ),
+                effects: video_jobs::TelegramVideoJobEffects::new(
+                    Arc::clone(&permission_policy),
+                    telegram.clone(),
+                )
+                .with_reaction_ux(Arc::clone(&generation_reactions)),
+            }) as Arc<dyn video_jobs::VideoJobRunner>
+        });
     let vip_image_queue = Arc::clone(&task_queue_for_updates);
     let image_attempt_walker = attempt_walker.clone();
     let vip_slot = |workflow_key: &str| {
@@ -4462,6 +4482,7 @@ async fn start_runtime_workers(
     }
     let vip_image_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let vip_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
+    let vip_video_runner = video_runner.clone();
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
             vip_image_queue.as_ref(),
@@ -4472,6 +4493,7 @@ async fn start_runtime_workers(
                 interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
                 max_llm_job_attempts: media_max_llm_job_attempts,
                 activity_pulse: Some(vip_image_activity_pulse.as_ref()),
+                video: vip_video_runner.as_deref(),
             },
             wait_for_runtime_stop(vip_image_stop),
         )
@@ -4519,6 +4541,7 @@ async fn start_runtime_workers(
                 interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
                 max_llm_job_attempts: media_max_llm_job_attempts,
                 activity_pulse: Some(vip_image_edit_activity_pulse.as_ref()),
+                video: None,
             },
             wait_for_runtime_stop(vip_image_edit_stop),
         )
@@ -4560,6 +4583,7 @@ async fn start_runtime_workers(
     }
     let regular_image_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
     let regular_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
+    let regular_video_runner = video_runner.clone();
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
             regular_image_queue.as_ref(),
@@ -4570,6 +4594,7 @@ async fn start_runtime_workers(
                 interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
                 max_llm_job_attempts: media_max_llm_job_attempts,
                 activity_pulse: Some(regular_image_activity_pulse.as_ref()),
+                video: regular_video_runner.as_deref(),
             },
             wait_for_runtime_stop(regular_image_stop),
         )
@@ -4669,50 +4694,11 @@ async fn start_runtime_workers(
             "ACESTEP_ENABLED=false",
         ));
     }
-    if config.video.enabled {
-        let video_queue = Arc::clone(&task_queue_for_updates);
-        let video_optimizer = media::RoutedMediaPromptOptimizer::new(
-            attempt_walker.clone(),
-            config,
-            Arc::clone(&prompt_store),
-        );
-        let video_generator =
-            image_jobs::AifarmDrawApiImageGenerator::new(image_jobs::AifarmDrawApiConfig {
-                endpoint_name: image_jobs::AIFARM_DRAW_API_FASTFRAMES_ENDPOINT_NAME.to_owned(),
-                ..image_jobs::aifarm_draw_api_config_from_app_config(config)
-            });
-        let video_effects = video_jobs::TelegramVideoJobEffects::new(
-            Arc::clone(&permission_policy),
-            telegram.clone(),
-        )
-        .with_reaction_ux(Arc::clone(&generation_reactions));
-        let video_stop = worker_stops.subscribe(RuntimeWorkerPhase::Processor);
-        let video_activity_pulse = Arc::clone(&telegram_activity_pulse);
-        let video_worker = tokio::spawn(async move {
-            let report = video_jobs::run_video_worker_until(
-                video_queue.as_ref(),
-                &video_optimizer,
-                &video_generator,
-                &video_effects,
-                Some(video_activity_pulse.as_ref()),
-                wait_for_runtime_stop(video_stop),
-            )
-            .await;
-            tracing::info!(?report, "video generation taskman worker stopped");
-        });
-        worker_registry.register(
-            "video-generation-worker",
-            RuntimeWorkerPhase::Processor,
-            video_worker,
-        );
+    if video_runner.is_some() {
         readiness_checks.push(ReadinessCheck::ok(
             "video_jobs",
-            "Video taskman worker started for the video queue with FastFrames on draw-api",
+            "Clips share the image-vip and image-regular queues and their generation workers, rendered by FastFrames on draw-api",
         ));
-        shared_taskman_worker_counts
-            .entry(openplotva_taskman::VIDEO_QUEUE_NAME.to_owned())
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
             "video_jobs",

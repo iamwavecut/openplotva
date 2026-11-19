@@ -50,6 +50,7 @@ use crate::routed_attempts::{
 use crate::telegram_activity::{
     TelegramActivityAction, TelegramActivityPulse, TelegramActivitySnapshot,
 };
+use crate::video_jobs::{VideoJobOutcome, VideoJobRunner, VideoQueuePoll};
 use crate::vision::TelegramVisionDataUrlProvider;
 
 /// Boxed future returned by image generation providers.
@@ -3260,6 +3261,8 @@ impl ImageEditWorkerRunReport {
 pub struct ImageQueuePollOptions<'a> {
     pub max_llm_job_attempts: i32,
     pub activity_pulse: Option<&'a TelegramActivityPulse>,
+    /// Takes `VideoGen` tickets from the same queue when set.
+    pub video: Option<&'a dyn VideoJobRunner>,
     pub now: OffsetDateTime,
 }
 
@@ -3269,6 +3272,7 @@ impl ImageQueuePollOptions<'_> {
         Self {
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             activity_pulse: None,
+            video: None,
             now,
         }
     }
@@ -3279,6 +3283,8 @@ pub struct ImageWorkerRunOptions<'a> {
     pub interval: StdDuration,
     pub max_llm_job_attempts: i32,
     pub activity_pulse: Option<&'a TelegramActivityPulse>,
+    /// Takes `VideoGen` tickets from the same queues when set.
+    pub video: Option<&'a dyn VideoJobRunner>,
 }
 
 impl ImageWorkerRunOptions<'_> {
@@ -3288,6 +3294,7 @@ impl ImageWorkerRunOptions<'_> {
             interval,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             activity_pulse: None,
+            video: None,
         }
     }
 }
@@ -3862,8 +3869,10 @@ where
     Generator: ImageGenerator + Sync,
     Effects: ImageJobEffects + Sync,
 {
+    let takes_clips = options.video.is_some();
     let Some(work) = queue.dequeue_matching(queue_name, worker_id, options.now, |job| {
         job.data.job_type == JobType::ImageGen
+            || (takes_clips && job.data.job_type == JobType::VideoGen)
     }) else {
         return ImageGenQueuePollReport {
             queue_name: queue_name.to_owned(),
@@ -3873,6 +3882,15 @@ where
             activity: TelegramActivitySnapshot::default(),
         };
     };
+    if let Some(video) = options.video
+        && work.job.data.job_type == JobType::VideoGen
+    {
+        let vip = queue_name == IMAGE_VIP_QUEUE_NAME;
+        let poll = video
+            .run_video_job(queue, work, vip, options.activity_pulse)
+            .await;
+        return video_poll_report(queue_name, poll);
+    }
 
     let params = match image_gen_job_params_from_stateless_job(&work.job) {
         Ok(params) => params,
@@ -4419,6 +4437,7 @@ where
                         ImageQueuePollOptions {
                             max_llm_job_attempts: options.max_llm_job_attempts,
                             activity_pulse: options.activity_pulse,
+                            video: options.video,
                             now: OffsetDateTime::now_utc(),
                         },
                     ).await;
@@ -4510,6 +4529,7 @@ where
                         ImageQueuePollOptions {
                             max_llm_job_attempts: options.max_llm_job_attempts,
                             activity_pulse: options.activity_pulse,
+                            video: None,
                             now: OffsetDateTime::now_utc(),
                         },
                     ).await;
@@ -4521,6 +4541,28 @@ where
     }
 
     report
+}
+
+fn video_poll_report(queue_name: &str, poll: VideoQueuePoll) -> ImageGenQueuePollReport {
+    let (job_id, outcome, error) = match poll {
+        VideoQueuePoll::Finished {
+            job_id,
+            outcome: VideoJobOutcome::Blocked { .. },
+        } => (job_id, ImageGenQueuePollOutcome::SafetyBlocked, None),
+        VideoQueuePoll::Finished { job_id, .. } => {
+            (job_id, ImageGenQueuePollOutcome::Completed, None)
+        }
+        VideoQueuePoll::Failed { job_id, error } => {
+            (job_id, ImageGenQueuePollOutcome::Failed, Some(error))
+        }
+    };
+    ImageGenQueuePollReport {
+        queue_name: queue_name.to_owned(),
+        job_id: Some(job_id),
+        outcome,
+        error,
+        activity: TelegramActivitySnapshot::default(),
+    }
 }
 
 fn finalize_completed(
@@ -5501,12 +5543,95 @@ mod tests {
         DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
         IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, ImageJobData, JobPayload,
         JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE, LLM_JOB_RETRY_STAGE, StatelessJobItem,
-        TaskQueueJobEvent, TelegramData, new_image_edit_job_at, new_image_gen_job_at,
+        TaskQueueJobEvent, TelegramData, VideoGenJobParams, new_image_edit_job_at,
+        new_image_gen_job_at, new_video_gen_job_at,
     };
     use openplotva_telegram::TelegramOutboundMethodKind;
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Default)]
+    struct VideoRunnerStub {
+        runs: Mutex<Vec<(i64, bool)>>,
+    }
+
+    impl VideoJobRunner for VideoRunnerStub {
+        fn run_video_job<'a>(
+            &'a self,
+            queue: &'a InMemoryTaskQueue,
+            work: TaskQueueWorkItem,
+            vip: bool,
+            _activity_pulse: Option<&'a TelegramActivityPulse>,
+        ) -> crate::video_jobs::VideoJobFuture<'a, VideoQueuePoll> {
+            self.runs.lock().expect("runs").push((work.id, vip));
+            let _ = queue.complete(work.id, OffsetDateTime::now_utc());
+            Box::pin(async move {
+                VideoQueuePoll::Finished {
+                    job_id: work.id,
+                    outcome: VideoJobOutcome::Delivered {
+                        message_id: Some(1),
+                    },
+                }
+            })
+        }
+    }
+
+    fn queued_clip(queue: &InMemoryTaskQueue, queue_name: &str, now: OffsetDateTime) -> i64 {
+        queue.assign(
+            queue_name,
+            new_video_gen_job_at(
+                VideoGenJobParams {
+                    chat_id: -100,
+                    message_id: 20,
+                    user_id: 30,
+                    brief: "кот ловит снежинку".to_owned(),
+                    ..VideoGenJobParams::default()
+                },
+                now,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn image_generation_workers_render_clips_from_their_shared_queue() {
+        let now = OffsetDateTime::now_utc();
+        let runner = VideoRunnerStub::default();
+        for (queue_name, vip) in [
+            (IMAGE_REGULAR_QUEUE_NAME, false),
+            (IMAGE_VIP_QUEUE_NAME, true),
+        ] {
+            let queue = InMemoryTaskQueue::new();
+            let clip = queued_clip(&queue, queue_name, now);
+
+            let without_runner = run_image_gen_queue_once_with_max_attempts(
+                &queue,
+                queue_name,
+                &GeneratorStub::success("https://img.test/unused.png"),
+                &EffectsStub::new(),
+                "image-worker",
+                ImageQueuePollOptions::at(now),
+            )
+            .await;
+            assert_eq!(without_runner.outcome, ImageGenQueuePollOutcome::Idle);
+
+            let report = run_image_gen_queue_once_with_max_attempts(
+                &queue,
+                queue_name,
+                &GeneratorStub::success("https://img.test/unused.png"),
+                &EffectsStub::new(),
+                "image-worker",
+                ImageQueuePollOptions {
+                    video: Some(&runner),
+                    ..ImageQueuePollOptions::at(now)
+                },
+            )
+            .await;
+            assert_eq!(report.job_id, Some(clip));
+            assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+            assert_eq!(runner.runs.lock().expect("runs").last(), Some(&(clip, vip)));
+        }
+    }
 
     fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
         let mut encoded = Cursor::new(Vec::new());
@@ -7385,6 +7510,7 @@ mod tests {
             ImageQueuePollOptions {
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
                 activity_pulse: Some(&pulse),
+                video: None,
                 now,
             },
         );
@@ -7635,6 +7761,7 @@ mod tests {
             ImageQueuePollOptions {
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
                 activity_pulse: Some(&pulse),
+                video: None,
                 now,
             },
         );
@@ -7770,6 +7897,7 @@ mod tests {
             ImageQueuePollOptions {
                 max_llm_job_attempts: 2,
                 activity_pulse: None,
+                video: None,
                 now,
             },
         )
@@ -7824,6 +7952,7 @@ mod tests {
             ImageQueuePollOptions {
                 max_llm_job_attempts: 2,
                 activity_pulse: None,
+                video: None,
                 now,
             },
         )

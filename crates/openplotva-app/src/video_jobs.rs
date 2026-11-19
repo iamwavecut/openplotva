@@ -1,29 +1,30 @@
-//! Video jobs: the optimizer writes a FastFrames prompt, draw-api renders the clip, and the
-//! bot replies with it as a Telegram animation.
+//! Video jobs share the image queues: the image generation worker hands every dequeued
+//! `VideoGen` ticket to a [`VideoJobRunner`]. The optimizer writes a FastFrames prompt,
+//! draw-api renders the clip, and the bot replies with it as a Telegram animation captioned
+//! like a drawing.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use openplotva_llm::aifarm::AifarmHttpTransport;
 use openplotva_media::{NsfwResult, video::VideoOptimize};
 use openplotva_server::ACTION_SEND_VIDEO;
 use openplotva_taskman::{
-    InMemoryTaskQueue, JobType, VIDEO_QUEUE_NAME, VideoGenJobParams,
-    video_gen_job_params_from_payload,
+    InMemoryTaskQueue, TaskQueueWorkItem, VideoGenJobParams, video_gen_job_params_from_payload,
 };
 use openplotva_telegram::{
-    ChatRef, ReplyParametersPlan, TelegramClient, TelegramOutboundMethod, UploadMessageRequest,
-    build_animation_message_method, build_text_message_methods, ensure_telegram_safe_text,
+    ChatRef, ReplyParametersPlan, TELEGRAM_PARSE_MODE_HTML, TelegramClient, TelegramOutboundMethod,
+    UploadMessageRequest, build_animation_message_method, build_text_message_methods,
 };
 use time::OffsetDateTime;
 
-use crate::image_jobs::{AifarmDrawApiImageGenerator, DrawApiVideo, ImageJobTelegramSender};
+use crate::image_jobs::{
+    AifarmDrawApiImageGenerator, DrawApiVideo, ImageJobTelegramSender,
+    build_image_generation_caption,
+};
 use crate::permissions::{ChatPermissionPolicy, ChatPermissionStore};
 use crate::telegram_activity::{TelegramActivityAction, TelegramActivityPulse};
 
-pub const VIDEO_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
-const VIDEO_WORKER_ID: &str = "video-worker";
 const VIDEO_FILE_NAME: &str = "video.mp4";
-const TELEGRAM_CAPTION_MAX_CHARS: usize = 1024;
 
 pub type VideoJobFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -227,7 +228,7 @@ fn animation_method(delivery: &VideoDelivery) -> Result<carapax::types::SendAnim
         file_name: VIDEO_FILE_NAME.to_owned(),
         bytes: delivery.video.bytes.clone(),
         caption: delivery.caption.clone(),
-        render_as: String::new(),
+        render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
         reply_parameters: Some(ReplyParametersPlan {
             message_id: i64::from(delivery.reply_to_message_id),
             chat_id: delivery.chat_id,
@@ -277,6 +278,7 @@ pub async fn execute_video_gen_job<Optimizer, Generator, Effects>(
     effects: &Effects,
     params: &VideoGenJobParams,
     job_id: i64,
+    vip: bool,
 ) -> Result<VideoJobOutcome, String>
 where
     Optimizer: VideoPromptOptimizer + ?Sized,
@@ -302,14 +304,20 @@ where
         return Ok(VideoJobOutcome::Blocked { message_id });
     }
     let video = generator.generate_video(&optimized.prompt, job_id).await?;
+    let adult = optimized.nsfw_result == NsfwResult::Adult;
     let message_id = effects
         .send_video(VideoDelivery {
             chat_id: params.chat_id,
             thread_id: params.thread_id,
             reply_to_message_id: params.message_id,
-            caption: video_caption(&params.caption),
+            caption: build_image_generation_caption(
+                video_caption_text(params),
+                &params.user_full_name,
+                vip,
+                adult,
+            ),
             video,
-            spoiler: optimized.nsfw_result == NsfwResult::Adult,
+            spoiler: adult,
         })
         .await?;
     effects
@@ -318,17 +326,18 @@ where
     Ok(VideoJobOutcome::Delivered { message_id })
 }
 
-fn video_caption(caption: &str) -> String {
-    ensure_telegram_safe_text(caption.trim())
-        .chars()
-        .take(TELEGRAM_CAPTION_MAX_CHARS)
-        .collect()
+/// The clip title shown like a drawing's: the dialog caption, else the brief.
+fn video_caption_text(params: &VideoGenJobParams) -> &str {
+    [&params.caption, &params.brief, &params.request_text]
+        .into_iter()
+        .map(|text| text.trim())
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
 }
 
-/// What one poll of the video queue did.
+/// What one video ticket ended with.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VideoQueuePoll {
-    Idle,
     Finished {
         job_id: i64,
         outcome: VideoJobOutcome,
@@ -339,37 +348,80 @@ pub enum VideoQueuePoll {
     },
 }
 
-/// Dequeue and run one video job.
-pub async fn run_video_queue_once<Optimizer, Generator, Effects>(
+/// Runs video tickets that a shared image-queue worker dequeued.
+pub trait VideoJobRunner: Send + Sync {
+    /// Run one dequeued `VideoGen` ticket to a terminal state. `vip` marks a ticket
+    /// from the VIP queue, which gets the VIP caption.
+    fn run_video_job<'a>(
+        &'a self,
+        queue: &'a InMemoryTaskQueue,
+        work: TaskQueueWorkItem,
+        vip: bool,
+        activity_pulse: Option<&'a TelegramActivityPulse>,
+    ) -> VideoJobFuture<'a, VideoQueuePoll>;
+}
+
+/// The FastFrames clip pipeline.
+pub struct VideoPipeline<Optimizer, Generator, Effects> {
+    pub optimizer: Optimizer,
+    pub generator: Generator,
+    pub effects: Effects,
+}
+
+impl<Optimizer, Generator, Effects> VideoJobRunner for VideoPipeline<Optimizer, Generator, Effects>
+where
+    Optimizer: VideoPromptOptimizer,
+    Generator: VideoGenerator,
+    Effects: VideoJobEffects,
+{
+    fn run_video_job<'a>(
+        &'a self,
+        queue: &'a InMemoryTaskQueue,
+        work: TaskQueueWorkItem,
+        vip: bool,
+        activity_pulse: Option<&'a TelegramActivityPulse>,
+    ) -> VideoJobFuture<'a, VideoQueuePoll> {
+        Box::pin(run_dequeued_video_job(
+            queue,
+            work,
+            vip,
+            &self.optimizer,
+            &self.generator,
+            &self.effects,
+            activity_pulse,
+        ))
+    }
+}
+
+/// Run one dequeued video ticket and record its terminal state.
+pub async fn run_dequeued_video_job<Optimizer, Generator, Effects>(
     queue: &InMemoryTaskQueue,
+    work: TaskQueueWorkItem,
+    vip: bool,
     optimizer: &Optimizer,
     generator: &Generator,
     effects: &Effects,
     activity_pulse: Option<&TelegramActivityPulse>,
-    now: OffsetDateTime,
 ) -> VideoQueuePoll
 where
     Optimizer: VideoPromptOptimizer + ?Sized,
     Generator: VideoGenerator + ?Sized,
     Effects: VideoJobEffects + ?Sized,
 {
-    let Some(work) = queue.dequeue_matching(VIDEO_QUEUE_NAME, VIDEO_WORKER_ID, now, |job| {
-        job.data.job_type == JobType::VideoGen
-    }) else {
-        return VideoQueuePoll::Idle;
-    };
+    let started_at = OffsetDateTime::now_utc();
     let params = match video_gen_job_params_from_payload(&work.job.data) {
         Ok(params) => params,
         Err(error) => {
             let error = error.to_string();
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), started_at);
+            tracing::warn!(job_id = work.id, %error, "video job payload is invalid");
             return VideoQueuePoll::Failed {
                 job_id: work.id,
                 error,
             };
         }
     };
-    let _ = queue.set_execution_started(work.id, now);
+    let _ = queue.set_execution_started(work.id, started_at);
     let activity = activity_pulse.map(|pulse| {
         pulse.start(
             params.chat_id,
@@ -377,7 +429,7 @@ where
             TelegramActivityAction::UploadVideo,
         )
     });
-    let result = execute_video_gen_job(optimizer, generator, effects, &params, work.id).await;
+    let result = execute_video_gen_job(optimizer, generator, effects, &params, work.id, vip).await;
     drop(activity);
     let finished_at = OffsetDateTime::now_utc();
     match result {
@@ -386,6 +438,7 @@ where
                 let _ = queue.update_job_result_message(work.id, Some(message_id));
             }
             let _ = queue.complete(work.id, finished_at);
+            tracing::info!(job_id = work.id, vip, ?outcome, "video job finished");
             VideoQueuePoll::Finished {
                 job_id: work.id,
                 outcome,
@@ -393,6 +446,7 @@ where
         }
         Err(error) => {
             let _ = queue.fail(work.id, error.clone(), finished_at);
+            tracing::warn!(job_id = work.id, vip, %error, "video job failed");
             VideoQueuePoll::Failed {
                 job_id: work.id,
                 error,
@@ -401,70 +455,11 @@ where
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct VideoWorkerRunReport {
-    pub delivered: u64,
-    pub blocked: u64,
-    pub skipped_permission: u64,
-    pub failed: u64,
-}
-
-/// Run the video worker until `stop` resolves.
-pub async fn run_video_worker_until<Optimizer, Generator, Effects, Stop>(
-    queue: &InMemoryTaskQueue,
-    optimizer: &Optimizer,
-    generator: &Generator,
-    effects: &Effects,
-    activity_pulse: Option<&TelegramActivityPulse>,
-    stop: Stop,
-) -> VideoWorkerRunReport
-where
-    Optimizer: VideoPromptOptimizer + ?Sized,
-    Generator: VideoGenerator + ?Sized,
-    Effects: VideoJobEffects + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    let mut report = VideoWorkerRunReport::default();
-    let mut stop = std::pin::pin!(stop);
-    loop {
-        tokio::select! {
-            () = &mut stop => break,
-            () = tokio::time::sleep(VIDEO_JOB_POLL_INTERVAL) => {
-                let poll = run_video_queue_once(
-                    queue,
-                    optimizer,
-                    generator,
-                    effects,
-                    activity_pulse,
-                    OffsetDateTime::now_utc(),
-                )
-                .await;
-                match poll {
-                    VideoQueuePoll::Idle => {}
-                    VideoQueuePoll::Finished { job_id, outcome } => {
-                        tracing::info!(job_id, ?outcome, "video job finished");
-                        match outcome {
-                            VideoJobOutcome::Delivered { .. } => report.delivered += 1,
-                            VideoJobOutcome::Blocked { .. } => report.blocked += 1,
-                            VideoJobOutcome::SkippedPermission => report.skipped_permission += 1,
-                        }
-                    }
-                    VideoQueuePoll::Failed { job_id, error } => {
-                        tracing::warn!(job_id, %error, "video job failed");
-                        report.failed += 1;
-                    }
-                }
-            }
-        }
-    }
-    report
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use openplotva_taskman::new_video_gen_job_at;
+    use openplotva_taskman::{IMAGE_REGULAR_QUEUE_NAME, JobType, new_video_gen_job_at};
 
     use super::*;
 
@@ -603,10 +598,27 @@ mod tests {
     fn queue_with_job() -> (InMemoryTaskQueue, i64) {
         let queue = InMemoryTaskQueue::new();
         let job_id = queue.assign(
-            VIDEO_QUEUE_NAME,
+            IMAGE_REGULAR_QUEUE_NAME,
             new_video_gen_job_at(params(), OffsetDateTime::UNIX_EPOCH),
         );
         (queue, job_id)
+    }
+
+    async fn run_next(
+        queue: &InMemoryTaskQueue,
+        optimizer: &FixedOptimizer,
+        generator: &RecordingGenerator,
+        effects: &RecordingEffects,
+    ) -> VideoQueuePoll {
+        let work = queue
+            .dequeue_matching(
+                IMAGE_REGULAR_QUEUE_NAME,
+                "image-regular-worker",
+                OffsetDateTime::now_utc(),
+                |job| job.data.job_type == JobType::VideoGen,
+            )
+            .expect("queued clip");
+        run_dequeued_video_job(queue, work, false, optimizer, generator, effects, None).await
     }
 
     #[tokio::test]
@@ -615,15 +627,7 @@ mod tests {
         let generator = RecordingGenerator::default();
         let effects = RecordingEffects::default();
 
-        let poll = run_video_queue_once(
-            &queue,
-            &optimized(NsfwResult::Safe),
-            &generator,
-            &effects,
-            None,
-            OffsetDateTime::now_utc(),
-        )
-        .await;
+        let poll = run_next(&queue, &optimized(NsfwResult::Safe), &generator, &effects).await;
 
         assert_eq!(
             poll,
@@ -640,16 +644,24 @@ mod tests {
         );
         assert_eq!(effects.events(), ["progress", "video", "clear"]);
         let sent = effects.sent.lock().expect("sent");
+        assert_eq!(sent.len(), 1);
+        let delivery = &sent[0];
         assert_eq!(
-            sent.as_slice(),
-            [VideoDelivery {
-                chat_id: -100,
-                thread_id: Some(3),
-                reply_to_message_id: 42,
-                caption: "Кот и снежинка".to_owned(),
-                video: clip(),
-                spoiler: false,
-            }]
+            (
+                delivery.chat_id,
+                delivery.thread_id,
+                delivery.reply_to_message_id
+            ),
+            (-100, Some(3), 42)
+        );
+        assert_eq!(delivery.video, clip());
+        assert!(!delivery.spoiler);
+        assert!(
+            delivery
+                .caption
+                .starts_with("<code>Кот и снежинка</code> \nза авторством <i>Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"),
+            "{}",
+            delivery.caption
         );
         let record = queue.record(job_id).expect("video job");
         assert_eq!(record.status, openplotva_taskman::JobStatus::Completed);
@@ -659,13 +671,11 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_request_records_the_refusal_as_the_result_message() {
         let (queue, job_id) = queue_with_job();
-        let poll = run_video_queue_once(
+        let poll = run_next(
             &queue,
             &optimized(NsfwResult::Forbidden),
             &RecordingGenerator::default(),
             &RecordingEffects::default(),
-            None,
-            OffsetDateTime::now_utc(),
         )
         .await;
 
@@ -684,7 +694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_adult_clip_is_sent_under_a_spoiler() {
+    async fn an_adult_vip_clip_is_sent_under_a_spoiler_with_the_drawing_tags() {
         let effects = RecordingEffects::default();
         let outcome = execute_video_gen_job(
             &optimized(NsfwResult::Adult),
@@ -692,6 +702,7 @@ mod tests {
             &effects,
             &params(),
             9,
+            true,
         )
         .await;
         assert_eq!(
@@ -700,7 +711,20 @@ mod tests {
                 message_id: Some(VIDEO_MESSAGE_ID)
             })
         );
-        assert!(effects.sent.lock().expect("sent")[0].spoiler);
+        let sent = effects.sent.lock().expect("sent");
+        assert!(sent[0].spoiler);
+        assert!(sent[0].caption.contains(
+            "за авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice\n#nsfw 18+</i>"
+        ));
+    }
+
+    #[test]
+    fn a_clip_without_a_dialog_caption_is_titled_by_its_brief() {
+        let untitled = VideoGenJobParams {
+            caption: " ".to_owned(),
+            ..params()
+        };
+        assert_eq!(video_caption_text(&untitled), "кот ловит снежинку");
     }
 
     #[tokio::test]
@@ -713,6 +737,7 @@ mod tests {
             &effects,
             &params(),
             9,
+            false,
         )
         .await;
         assert_eq!(
@@ -738,6 +763,7 @@ mod tests {
             &effects,
             &params(),
             9,
+            false,
         )
         .await;
         assert_eq!(outcome, Ok(VideoJobOutcome::SkippedPermission));
@@ -748,13 +774,11 @@ mod tests {
     async fn optimizer_and_render_failures_fail_the_job_and_keep_the_progress_signal() {
         let (queue, job_id) = queue_with_job();
         let effects = RecordingEffects::default();
-        let poll = run_video_queue_once(
+        let poll = run_next(
             &queue,
             &FixedOptimizer(Err("video prompt optimizer: all attempts failed".to_owned())),
             &RecordingGenerator::default(),
             &effects,
-            None,
-            OffsetDateTime::now_utc(),
         )
         .await;
         assert_eq!(
@@ -779,6 +803,7 @@ mod tests {
             &RecordingEffects::default(),
             &params(),
             9,
+            false,
         )
         .await;
         assert_eq!(render_failure, Err("draw-api provider timeout".to_owned()));
@@ -802,6 +827,7 @@ mod tests {
             "height: Some(480)",
             "duration: Some(5)",
             "message_thread_id: Some(3)",
+            "parse_mode: Some(Html)",
         ] {
             assert!(debug.contains(expected), "missing {expected} in {debug}");
         }
