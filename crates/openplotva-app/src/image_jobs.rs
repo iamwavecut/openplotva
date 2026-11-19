@@ -3261,7 +3261,7 @@ impl ImageEditWorkerRunReport {
 pub struct ImageQueuePollOptions<'a> {
     pub max_llm_job_attempts: i32,
     pub activity_pulse: Option<&'a TelegramActivityPulse>,
-    /// Takes `VideoGen` tickets from the same queue when set.
+    /// Renders `VideoGen` tickets from the same queue; without it they fail.
     pub video: Option<&'a dyn VideoJobRunner>,
     pub now: OffsetDateTime,
 }
@@ -3283,7 +3283,7 @@ pub struct ImageWorkerRunOptions<'a> {
     pub interval: StdDuration,
     pub max_llm_job_attempts: i32,
     pub activity_pulse: Option<&'a TelegramActivityPulse>,
-    /// Takes `VideoGen` tickets from the same queues when set.
+    /// Renders `VideoGen` tickets from the same queues; without it they fail.
     pub video: Option<&'a dyn VideoJobRunner>,
 }
 
@@ -3869,10 +3869,8 @@ where
     Generator: ImageGenerator + Sync,
     Effects: ImageJobEffects + Sync,
 {
-    let takes_clips = options.video.is_some();
     let Some(work) = queue.dequeue_matching(queue_name, worker_id, options.now, |job| {
-        job.data.job_type == JobType::ImageGen
-            || (takes_clips && job.data.job_type == JobType::VideoGen)
+        matches!(job.data.job_type, JobType::ImageGen | JobType::VideoGen)
     }) else {
         return ImageGenQueuePollReport {
             queue_name: queue_name.to_owned(),
@@ -3882,13 +3880,25 @@ where
             activity: TelegramActivitySnapshot::default(),
         };
     };
-    if let Some(video) = options.video
-        && work.job.data.job_type == JobType::VideoGen
-    {
-        let vip = queue_name == IMAGE_VIP_QUEUE_NAME;
-        let poll = video
-            .run_video_job(queue, work, vip, options.activity_pulse)
-            .await;
+    if work.job.data.job_type == JobType::VideoGen {
+        let poll = match options.video {
+            Some(video) => {
+                let vip = queue_name == IMAGE_VIP_QUEUE_NAME;
+                video
+                    .run_video_job(queue, work, vip, options.activity_pulse)
+                    .await
+            }
+            // A clip left over after video generation was switched off would otherwise
+            // hold back every drawing ranked below it.
+            None => {
+                let error = "video generation is disabled".to_owned();
+                let _ = queue.fail(work.id, error.clone(), options.now);
+                VideoQueuePoll::Failed {
+                    job_id: work.id,
+                    error,
+                }
+            }
+        };
         return video_poll_report(queue_name, poll);
     }
 
@@ -5603,18 +5613,6 @@ mod tests {
         ] {
             let queue = InMemoryTaskQueue::new();
             let clip = queued_clip(&queue, queue_name, now);
-
-            let without_runner = run_image_gen_queue_once_with_max_attempts(
-                &queue,
-                queue_name,
-                &GeneratorStub::success("https://img.test/unused.png"),
-                &EffectsStub::new(),
-                "image-worker",
-                ImageQueuePollOptions::at(now),
-            )
-            .await;
-            assert_eq!(without_runner.outcome, ImageGenQueuePollOutcome::Idle);
-
             let report = run_image_gen_queue_once_with_max_attempts(
                 &queue,
                 queue_name,
@@ -5631,6 +5629,34 @@ mod tests {
             assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
             assert_eq!(runner.runs.lock().expect("runs").last(), Some(&(clip, vip)));
         }
+    }
+
+    #[tokio::test]
+    async fn a_clip_left_after_video_is_switched_off_fails_instead_of_blocking_drawings() {
+        let now = OffsetDateTime::now_utc();
+        let queue = InMemoryTaskQueue::new();
+        let clip = queued_clip(&queue, IMAGE_REGULAR_QUEUE_NAME, now);
+
+        let report = run_image_gen_queue_once_with_max_attempts(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            &GeneratorStub::success("https://img.test/unused.png"),
+            &EffectsStub::new(),
+            "image-worker",
+            ImageQueuePollOptions::at(now),
+        )
+        .await;
+
+        assert_eq!(report.job_id, Some(clip));
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Failed);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("video generation is disabled")
+        );
+        assert_eq!(
+            queue.record(clip).map(|record| record.status),
+            Some(JobStatus::Failed)
+        );
     }
 
     fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
