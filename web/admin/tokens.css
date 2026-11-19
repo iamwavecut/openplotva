@@ -112,6 +112,7 @@
     /* Z-index ladder */
     --z-base: 0;
     --z-resizer: 5;
+    --z-sticky: 6;
     --z-sidebar: 10;
     --z-mobile-sidebar: 100;
     --z-dropdown: 1000;
@@ -311,6 +312,19 @@
     --c-flow-vision: var(--p-sky-500);
     --c-flow-shield: var(--p-orange-400);
     --c-flow-other: var(--p-slate-500);
+    /* Text drawn on categorical fills (card types, flows); dark in both themes */
+    --c-text-on-cat: var(--p-slate-950);
+    /* LLM Dialogs: run-timeline step kinds */
+    --c-step-trigger: var(--c-accent);
+    --c-step-recall: var(--p-teal-400);
+    --c-step-context: var(--p-slate-400);
+    --c-step-round: var(--c-primary);
+    --c-step-aux: var(--p-sky-500);
+    --c-step-tool: var(--p-violet-400);
+    --c-step-inbox: var(--p-amber-500);
+    --c-step-note: var(--p-slate-500);
+    --c-step-ok: var(--c-success);
+    --c-step-fail: var(--c-danger);
 
     --c-ent-workflow: var(--p-indigo-500);
     --c-ent-model: var(--p-cyan-400);

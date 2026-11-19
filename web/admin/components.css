@@ -1556,3 +1556,208 @@ pl-textarea.redis-value .pl-field {
     color: var(--c-text-muted);
     padding: var(--sp-2) 0;
 }
+
+/* ============================================================
+   pl-disclosure — collapsible block with a one-line head
+   ============================================================ */
+.pl-disclosure {
+    display: block;
+    min-width: 0;
+}
+
+.pl-disclosure > .pl-disclosure-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--rad-sm);
+    cursor: pointer;
+    user-select: text;
+    min-width: 0;
+}
+
+.pl-disclosure > .pl-disclosure-head:hover {
+    background: var(--c-row-hover-overlay);
+}
+
+.pl-disclosure > .pl-disclosure-head:focus-visible {
+    outline: var(--focus-ring-width) solid var(--c-focus-ring);
+    outline-offset: calc(var(--focus-ring-offset) * -1);
+}
+
+.pl-disclosure > .pl-disclosure-head > .pl-disclosure-chevron {
+    flex: 0 0 auto;
+    width: 0.9rem;
+    height: 1.35em;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--c-text-muted);
+}
+
+.pl-disclosure > .pl-disclosure-head > .pl-disclosure-chevron::before {
+    content: "";
+    width: 0.38rem;
+    height: 0.38rem;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform var(--dur-quick) var(--ease-out);
+}
+
+.pl-disclosure.is-open > .pl-disclosure-head > .pl-disclosure-chevron::before {
+    transform: rotate(45deg);
+}
+
+.pl-disclosure > .pl-disclosure-head > .pl-disclosure-summary {
+    flex: 1;
+    min-width: 0;
+}
+
+.pl-disclosure > .pl-disclosure-head > .pl-disclosure-meta {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    color: var(--c-text-muted);
+    font-size: var(--fs-xs);
+}
+
+.pl-disclosure > .pl-disclosure-head > .pl-disclosure-meta:empty {
+    display: none;
+}
+
+.pl-disclosure > .pl-disclosure-body {
+    padding: var(--sp-1) var(--sp-3) var(--sp-3) calc(var(--sp-3) + 0.9rem + var(--sp-2));
+    min-width: 0;
+}
+
+.pl-disclosure > .pl-disclosure-body[hidden] {
+    display: none;
+}
+
+/* ============================================================
+   pl-constellation — radial recall map
+   ============================================================ */
+.pl-constellation {
+    display: block;
+    width: 100%;
+}
+
+.pl-constellation svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+}
+
+.pl-constellation .pl-const-ring {
+    fill: none;
+    stroke: var(--c-border-light);
+    stroke-width: 1;
+    stroke-dasharray: 2 5;
+}
+
+.pl-constellation .pl-const-ring-label {
+    fill: var(--c-text-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+}
+
+.pl-constellation .pl-const-spoke {
+    stroke: var(--c-text-sec);
+    stroke-width: 1;
+    opacity: var(--spoke-o, 0.25);
+    transition: opacity var(--dur-quick) var(--ease-out);
+}
+
+.pl-constellation .pl-const-edge {
+    fill: none;
+    stroke: var(--edge-c, var(--c-text-sec));
+    stroke-width: 1.75;
+    opacity: 0.75;
+    transition: opacity var(--dur-quick) var(--ease-out);
+}
+
+.pl-constellation .pl-const-edge.is-dashed {
+    stroke-dasharray: 5 4;
+}
+
+.pl-constellation .pl-const-center circle {
+    fill: var(--c-bg-card);
+    stroke: var(--c-accent);
+    stroke-width: 2;
+}
+
+.pl-constellation .pl-const-center-label {
+    fill: var(--c-accent);
+    font-family: var(--font-sans);
+    font-size: 11px;
+}
+
+.pl-constellation .pl-const-node {
+    cursor: pointer;
+    outline: none;
+    transition: opacity var(--dur-quick) var(--ease-out);
+}
+
+.pl-constellation .pl-const-dot {
+    fill: var(--node-c, var(--c-primary));
+    stroke: var(--c-bg-card);
+    stroke-width: 2;
+}
+
+.pl-constellation .pl-const-node.has-ring .pl-const-dot {
+    stroke: var(--c-status-competing);
+    stroke-width: 2.5;
+}
+
+.pl-constellation .pl-const-mark {
+    fill: var(--c-text-on-cat);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: var(--fw-semibold);
+    pointer-events: none;
+}
+
+.pl-constellation .pl-const-node:focus-visible .pl-const-dot,
+.pl-constellation .pl-const-node.is-selected .pl-const-dot {
+    stroke: var(--c-text-main);
+    stroke-width: 2.5;
+}
+
+.pl-constellation svg.is-focusing .pl-const-node:not(.is-hot):not(.is-selected) {
+    opacity: 0.28;
+}
+
+.pl-constellation svg.is-focusing .pl-const-spoke:not(.is-hot),
+.pl-constellation svg.is-focusing .pl-const-edge:not(.is-hot) {
+    opacity: 0.08;
+}
+
+.pl-constellation svg.is-focusing .pl-const-spoke.is-hot {
+    opacity: 0.7;
+}
+
+.pl-constellation .pl-const-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1) var(--sp-3);
+    margin-top: var(--sp-2);
+    font-size: var(--fs-xs);
+    color: var(--c-text-sec);
+}
+
+.pl-constellation .pl-const-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    cursor: default;
+}
+
+.pl-constellation .pl-const-legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: var(--rad-full);
+    background: var(--node-c, var(--c-primary));
+}

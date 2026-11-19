@@ -299,11 +299,15 @@ impl RuntimeLlmRunBuffer {
     }
 
     /// Attach the captured turn-context artifact (recalled memories, persona,
-    /// settings) to an open run for the admin "Context X-ray". No-op for unknown
-    /// or already-closed runs.
+    /// settings) to an open run for the admin "Context X-ray", and fill the
+    /// origin's chat title from it when the caller did not know the title.
+    /// No-op for unknown or already-closed runs.
     pub fn record_context(&self, run_id: &str, context: openplotva_dialog::TurnContextArtifact) {
         let mut inner = self.lock();
         if let Some(record) = inner.open.get_mut(run_id) {
+            if record.origin.chat_title.is_none() && !context.chat_title.is_empty() {
+                record.origin.chat_title = Some(context.chat_title.clone());
+            }
             record.context = Some(context);
         }
     }
@@ -794,6 +798,7 @@ mod tests {
         let buffer = RuntimeLlmRunBuffer::new(4);
         buffer.begin_run("job-1".to_owned(), "dialog", RunOrigin::default(), ts(0));
         let artifact = openplotva_dialog::TurnContextArtifact {
+            chat_title: "Tea Club".to_owned(),
             memories: vec![openplotva_dialog::CapturedMemory {
                 card_id: 42,
                 salience: 0.9,
@@ -827,8 +832,29 @@ mod tests {
             record.detail_json()["context"]["persona"]["mood"],
             "playful"
         );
-        // The list skeleton never carries the heavy context.
+        // The list skeleton never carries the heavy context, but it does pick
+        // up the chat title the turn was rendered with.
         assert!(record.skeleton_json().get("context").is_none());
+        assert_eq!(record.skeleton_json()["origin"]["chat_title"], "Tea Club");
+
+        let titled = RunOrigin {
+            chat_title: Some("Known".to_owned()),
+            ..RunOrigin::default()
+        };
+        buffer.begin_run("job-2".to_owned(), "dialog", titled, ts(2));
+        buffer.record_context(
+            "job-2",
+            openplotva_dialog::TurnContextArtifact {
+                chat_title: "Other".to_owned(),
+                ..openplotva_dialog::TurnContextArtifact::default()
+            },
+        );
+        let record = buffer
+            .list(&RunListFilter::default(), ts(3))
+            .into_iter()
+            .find(|record| record.run_id == "job-2")
+            .expect("second run present");
+        assert_eq!(record.origin.chat_title.as_deref(), Some("Known"));
     }
 
     #[test]

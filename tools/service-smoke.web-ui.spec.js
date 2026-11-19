@@ -484,16 +484,21 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
   await expect(page.locator('#llmd-detail-body')).toContainText('Smoke Chat');
   await expect(page.locator('#llmd-detail-body')).toContainText('smoke final answer');
   await expect(page.locator('#llmd-detail-body')).toContainText('web_search');
-  await expect(page.locator('#llmd-detail-body')).toContainText('rotated out');
 
-  // Context X-ray: the recalled-memory constellation + persona/settings.
-  await expect(page.locator('#llmd-detail-body .llmd-xray')).toBeVisible();
-  await expect(page.locator('#llmd-detail-body')).toContainText('Context X-ray');
-  await expect(page.locator('.llmd-xray pl-graph svg')).toBeVisible();
-  await expect(page.locator('.llmd-xray-mem')).toContainText('smoke prefers tea');
-  await expect(page.locator('.llmd-xray')).toContainText('competing');
-  await expect(page.locator('.llmd-xray')).toContainText('playful');
-  await expect(page.locator('.llmd-xray')).toContainText('reactivity');
+  // Run timeline: trigger first, collapsed steps open on "Expand all".
+  await expect(page.locator('#llmd-detail-body .llmd-step[data-step="trigger"]')).toContainText('когда солнцестояние?');
+  await page.locator('#llmd-detail [data-action="llmdExpandAll"][data-args="[true]"]').click();
+  await expect(page.locator('#llmd-detail-body')).toContainText('rotated out');
+  await expect(page.locator('#llmd-detail-body .llmd-step[data-step="tool"]')).toContainText('June 21');
+  await expect(page.locator('.llmd-recall')).toContainText('smoke prefers tea');
+
+  // Rail: the recall map + persona/settings.
+  await expect(page.locator('#llmd-detail-body .llmd-rail')).toBeVisible();
+  await expect(page.locator('#llmd-detail-body')).toContainText('Recall map');
+  await expect(page.locator('.llmd-rail pl-constellation svg')).toBeVisible();
+  await expect(page.locator('#llmd-detail-body')).toContainText('competing');
+  await expect(page.locator('.llmd-rail')).toContainText('playful');
+  await expect(page.locator('.llmd-rail')).toContainText('reactivity');
 
   await page.locator('#llmd-detail [data-action="llmdCloseDetail"]').first().click();
   await expect(page.locator('#llmd-detail')).toBeHidden();

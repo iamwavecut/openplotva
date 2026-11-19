@@ -1124,6 +1124,7 @@ fn turn_context_artifact(
         .map(|image| image.data_url.chars().count())
         .sum::<usize>();
     TurnContextArtifact {
+        chat_title: input.context.chat_title.trim().to_owned(),
         memories,
         persona: Some(persona),
         settings: chat_settings_context_kv(settings),
@@ -1714,6 +1715,7 @@ mod context_artifact_tests {
     fn artifact_snapshots_persona_settings_and_counts() {
         let mut input = DialogInput::default();
         input.message.id = 100;
+        input.context.chat_title = " Tea Club ".to_owned();
         input.persona.mood = "playful".to_owned();
         input.persona.custom_persona = "be terse".to_owned();
         input.persona.profanity = true;
@@ -1757,6 +1759,7 @@ mod context_artifact_tests {
             ..ChatSettings::defaults(-1)
         };
         let artifact = turn_context_artifact(&input, &settings, Vec::new());
+        assert_eq!(artifact.chat_title, "Tea Club");
         let persona = artifact.persona.expect("persona snapshot");
         assert_eq!(persona.mood, "playful");
         assert!(persona.custom);

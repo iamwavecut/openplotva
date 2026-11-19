@@ -503,6 +503,17 @@
         badge(label, tone) {
             const map = { success: 'badge-success', danger: 'badge-danger', warning: 'badge-warning', info: 'badge-info', neutral: 'badge-neutral' };
             return el('span', { class: 'badge ' + (map[tone] || 'badge-neutral') }, label);
+        },
+        /* Collapsible block: {summary, meta, open, render (lazy body), content, className} */
+        disclosure(opts) {
+            opts = opts || {};
+            const node = el('pl-disclosure', opts.className ? { class: opts.className } : null);
+            if (opts.summary != null) node.summary = opts.summary;
+            if (opts.meta != null) node.meta = opts.meta;
+            if (opts.content != null) node.content = opts.content;
+            if (opts.render) node.render = opts.render;
+            if (opts.open) node.open = true;
+            return node;
         }
     };
 
@@ -1276,6 +1287,249 @@
         }
     }
 
+    /* ============================================================
+       pl-disclosure — collapsible block with a one-line head
+       props: summary (Node|string), meta (Node|string), content (Node),
+              render (() => Node, runs once on first open), open (bool)
+       The head is the toggle (role=button, aria-expanded). Clicks on
+       controls inside the head and text selections do not toggle.
+       emits pl:toggle {open}
+       ============================================================ */
+    let disclosureSeq = 0;
+    class PlDisclosure extends HTMLElement {
+        connectedCallback() { this._ensure(); }
+        _ensure() {
+            if (this._head) return;
+            this.classList.add('pl-disclosure');
+            const bodyId = 'pl-disclosure-' + (++disclosureSeq);
+            this._head = el('div', { class: 'pl-disclosure-head', role: 'button', tabindex: '0', 'aria-expanded': 'false', 'aria-controls': bodyId });
+            this._head.appendChild(el('span', { class: 'pl-disclosure-chevron', 'aria-hidden': 'true' }));
+            this._summary = el('div', { class: 'pl-disclosure-summary' });
+            this._meta = el('div', { class: 'pl-disclosure-meta' });
+            this._head.appendChild(this._summary);
+            this._head.appendChild(this._meta);
+            this._body = el('div', { class: 'pl-disclosure-body', id: bodyId });
+            this._body.hidden = true;
+            while (this.firstChild) this._body.appendChild(this.firstChild);
+            this.appendChild(this._head);
+            this.appendChild(this._body);
+            this._head.addEventListener('click', (e) => {
+                const control = e.target.closest('pl-button, a, [data-no-toggle]');
+                if (control && this._head.contains(control)) return;
+                const selection = window.getSelection && window.getSelection();
+                if (selection && !selection.isCollapsed && this._head.contains(selection.anchorNode)) return;
+                this.toggle();
+            });
+            this._head.addEventListener('keydown', (e) => {
+                if (e.target !== this._head) return;
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.toggle(); }
+            });
+            if (this.hasAttribute('open')) this.open = true;
+        }
+        _fill(host, value) {
+            host.textContent = '';
+            if (value == null) return;
+            (Array.isArray(value) ? value : [value]).forEach((v) => {
+                if (v != null) host.appendChild(v instanceof Node ? v : document.createTextNode(String(v)));
+            });
+        }
+        set summary(v) { this._ensure(); this._fill(this._summary, v); }
+        set meta(v) { this._ensure(); this._fill(this._meta, v); }
+        set content(node) { this._ensure(); this._fill(this._body, node); this._rendered = true; }
+        set render(fn) {
+            this._ensure();
+            this._render = fn;
+            this._rendered = false;
+            if (this.open) this._materialize();
+        }
+        get head() { this._ensure(); return this._head; }
+        get body() { this._ensure(); return this._body; }
+        _materialize() {
+            if (this._rendered || !this._render) return;
+            this._rendered = true;
+            const node = this._render();
+            this._body.textContent = '';
+            if (node != null) this._body.appendChild(node);
+        }
+        get open() { return !!this._body && !this._body.hidden; }
+        set open(v) {
+            this._ensure();
+            const next = !!v;
+            if (next === this.open) return;
+            if (next) this._materialize();
+            this._body.hidden = !next;
+            this._head.setAttribute('aria-expanded', next ? 'true' : 'false');
+            this.classList.toggle('is-open', next);
+            this.dispatchEvent(new CustomEvent('pl:toggle', { bubbles: false, detail: { open: next } }));
+        }
+        toggle() { this.open = !this.open; }
+    }
+
+    /* ============================================================
+       pl-constellation — radial recall map (data prop)
+       data: {
+         center: {label, title},
+         nodes: [{id, mark, title, group, color, weight 0..1, size 0..1, ring}],
+         edges: [{from, to, kind, color, dashed}],
+         legend: [{group, label, color, count}],
+         rings: [0.25, 0.5, 0.75]
+       }
+       Distance from the centre encodes weight (stronger = closer); nodes of
+       one group share a sector so colour reads as a cluster. Each node shows
+       a short mark (a rank number) so a list next to the map can carry the
+       text without labels colliding on the canvas.
+       emits pl:node-hover {id|null}, pl:node-click {id}
+       methods: highlight(id|null), highlightGroup(group|null), select(id|null)
+       ============================================================ */
+    const CONST_W = 560, CONST_H = 420, CONST_R_MIN = 56, CONST_R_MAX = 196;
+    class PlConstellation extends HTMLElement {
+        connectedCallback() { this.classList.add('pl-constellation'); if (this._data && !this._svg) this.render(); }
+        set data(d) { this._data = d || {}; if (this.isConnected) this.render(); }
+        get data() { return this._data; }
+        _radius(weight) { return CONST_R_MIN + (1 - clamp01(weight)) * (CONST_R_MAX - CONST_R_MIN); }
+        render() {
+            this.textContent = '';
+            this._svg = null;
+            const d = this._data || {};
+            const nodes = (d.nodes || []).slice();
+            if (!nodes.length) return;
+            const cx = CONST_W / 2, cy = CONST_H / 2;
+            const svg = svgEl('svg', { viewBox: '0 0 ' + CONST_W + ' ' + CONST_H, role: 'group', 'aria-label': d.ariaLabel || 'Recall map' });
+            (d.rings || [0.25, 0.5, 0.75]).forEach((w) => {
+                const r = this._radius(w);
+                svg.appendChild(svgEl('circle', { cx: cx, cy: cy, r: r.toFixed(1), class: 'pl-const-ring' }));
+                svg.appendChild(svgEl('text', { x: cx + 4, y: (cy - r - 4).toFixed(1), class: 'pl-const-ring-label' }, Math.round(w * 100) + '%'));
+            });
+
+            const groupOrder = [];
+            nodes.forEach((n) => { if (!groupOrder.includes(n.group)) groupOrder.push(n.group); });
+            nodes.sort((a, b) => (groupOrder.indexOf(a.group) - groupOrder.indexOf(b.group)) || (clamp01(b.weight) - clamp01(a.weight)));
+            const pos = {};
+            const step = (Math.PI * 2) / nodes.length;
+            nodes.forEach((n, i) => {
+                const stagger = nodes.length > 14 ? (i % 2 ? 12 : -12) : 0;
+                const r = this._radius(n.weight) + stagger;
+                // Half a step off the vertical keeps nodes clear of the ring labels.
+                const a = (i + 0.5) * step - Math.PI / 2;
+                pos[n.id] = { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
+            });
+
+            this._spokes = {};
+            nodes.forEach((n) => {
+                const p = pos[n.id];
+                const line = svgEl('line', { x1: cx, y1: cy, x2: p.x.toFixed(1), y2: p.y.toFixed(1), class: 'pl-const-spoke' });
+                line.style.setProperty('--spoke-o', (0.12 + clamp01(n.weight) * 0.5).toFixed(2));
+                svg.appendChild(line);
+                this._spokes[n.id] = line;
+            });
+
+            this._edges = [];
+            (d.edges || []).forEach((e) => {
+                const a = pos[e.from], b = pos[e.to];
+                if (!a || !b) return;
+                const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+                const qx = mx + (cx - mx) * 0.35, qy = my + (cy - my) * 0.35;
+                const path = svgEl('path', {
+                    d: 'M' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) + ' Q' + qx.toFixed(1) + ' ' + qy.toFixed(1) + ' ' + b.x.toFixed(1) + ' ' + b.y.toFixed(1),
+                    class: e.dashed ? 'pl-const-edge is-dashed' : 'pl-const-edge'
+                });
+                if (e.color) path.style.setProperty('--edge-c', e.color);
+                path.appendChild(svgEl('title', null, e.kind || 'related'));
+                svg.appendChild(path);
+                this._edges.push({ from: e.from, to: e.to, node: path });
+            });
+
+            const center = d.center || {};
+            const cg = svgEl('g', { class: 'pl-const-center' });
+            cg.appendChild(svgEl('circle', { cx: cx, cy: cy, r: 9 }));
+            if (center.title) cg.appendChild(svgEl('title', null, center.title));
+            if (center.label) cg.appendChild(svgEl('text', { x: cx, y: cy + 24, 'text-anchor': 'middle', class: 'pl-const-center-label' }, center.label));
+            svg.appendChild(cg);
+
+            this._nodes = {};
+            nodes.forEach((n) => {
+                const p = pos[n.id];
+                const r = 9 + clamp01(n.size == null ? 0.5 : n.size) * 7;
+                const g = svgEl('g', { class: 'pl-const-node', tabindex: '0', role: 'button', 'aria-label': n.title || String(n.mark || n.id) });
+                g.dataset.id = String(n.id);
+                g.dataset.group = String(n.group || '');
+                if (n.color) g.style.setProperty('--node-c', n.color);
+                if (n.ring) g.classList.add('has-ring');
+                g.appendChild(svgEl('circle', { cx: p.x.toFixed(1), cy: p.y.toFixed(1), r: r.toFixed(1), class: 'pl-const-dot' }));
+                if (n.mark != null) {
+                    g.appendChild(svgEl('text', { x: p.x.toFixed(1), y: (p.y + 4).toFixed(1), 'text-anchor': 'middle', class: 'pl-const-mark' }, String(n.mark)));
+                }
+                if (n.title) g.appendChild(svgEl('title', null, n.title));
+                const emitHover = (id) => this.dispatchEvent(new CustomEvent('pl:node-hover', { bubbles: true, detail: { id: id } }));
+                g.addEventListener('mouseenter', () => { this.highlight(n.id); emitHover(n.id); });
+                g.addEventListener('mouseleave', () => { this.highlight(null); emitHover(null); });
+                g.addEventListener('focus', () => { this.highlight(n.id); emitHover(n.id); });
+                g.addEventListener('blur', () => { this.highlight(null); emitHover(null); });
+                const activate = () => this.dispatchEvent(new CustomEvent('pl:node-click', { bubbles: true, detail: { id: n.id } }));
+                g.addEventListener('click', activate);
+                g.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+                });
+                svg.appendChild(g);
+                this._nodes[n.id] = g;
+            });
+            this._svg = svg;
+            this.appendChild(svg);
+
+            const legend = d.legend || [];
+            if (legend.length) {
+                const box = el('div', { class: 'pl-const-legend' });
+                legend.forEach((item) => {
+                    const chip = el('span', { class: 'pl-const-legend-item' });
+                    const dot = el('span', { class: 'pl-const-legend-dot', 'aria-hidden': 'true' });
+                    if (item.color) dot.style.setProperty('--node-c', item.color);
+                    chip.appendChild(dot);
+                    chip.appendChild(el('span', null, item.count != null ? item.label + ' ' + item.count : item.label));
+                    if (item.group != null) {
+                        chip.addEventListener('mouseenter', () => this.highlightGroup(item.group));
+                        chip.addEventListener('mouseleave', () => this.highlightGroup(null));
+                    }
+                    box.appendChild(chip);
+                });
+                this.appendChild(box);
+            }
+            if (this._selected != null) this.select(this._selected);
+        }
+        _applyFocus(match) {
+            if (!this._svg) return;
+            this._svg.classList.toggle('is-focusing', !!match);
+            Object.keys(this._nodes || {}).forEach((id) => {
+                this._nodes[id].classList.toggle('is-hot', !!match && match(id));
+            });
+            Object.keys(this._spokes || {}).forEach((id) => {
+                this._spokes[id].classList.toggle('is-hot', !!match && match(id));
+            });
+            (this._edges || []).forEach((e) => {
+                e.node.classList.toggle('is-hot', !!match && match(String(e.from)) && match(String(e.to)));
+            });
+        }
+        highlight(id) {
+            if (id == null) { this._applyFocus(null); return; }
+            const key = String(id);
+            const peers = new Set([key]);
+            (this._edges || []).forEach((e) => {
+                if (String(e.from) === key) peers.add(String(e.to));
+                if (String(e.to) === key) peers.add(String(e.from));
+            });
+            this._applyFocus((nid) => peers.has(String(nid)));
+        }
+        highlightGroup(group) {
+            if (group == null) { this._applyFocus(null); return; }
+            this._applyFocus((nid) => this._nodes[nid] && this._nodes[nid].dataset.group === String(group));
+        }
+        select(id) {
+            this._selected = id;
+            Object.keys(this._nodes || {}).forEach((nid) => {
+                this._nodes[nid].classList.toggle('is-selected', id != null && String(nid) === String(id));
+            });
+        }
+    }
+
     /* ---------- register ---------- */
     customElements.define('pl-button', PlButton);
     customElements.define('pl-button-group', PlButtonGroup);
@@ -1294,4 +1548,6 @@
     customElements.define('pl-slotbar', PlSlotbar);
     customElements.define('pl-flow', PlFlow);
     customElements.define('pl-diff-list', PlDiffList);
+    customElements.define('pl-disclosure', PlDisclosure);
+    customElements.define('pl-constellation', PlConstellation);
 })();

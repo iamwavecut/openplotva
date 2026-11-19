@@ -363,6 +363,9 @@ pub struct SettingKv {
 /// Light, in-memory X-ray of everything that shaped one dialog turn's request.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnContextArtifact {
+    /// Chat title the turn was rendered with; empty for untitled private chats.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_title: String,
     pub memories: Vec<CapturedMemory>,
     pub persona: Option<PersonaSnapshot>,
     pub settings: Vec<SettingKv>,
