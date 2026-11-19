@@ -37,13 +37,13 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "tokens.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/tokens.css"),
-        sha256: "c57fbf4511ec384282f9d09a52507835ba4cbb537647a4b3d9754edc991f08c6",
+        sha256: "4e4102c03abe5ba652a237063f31a24a0c63ba5858f866763bb582e9f056a0e6",
     },
     StaticAsset {
         path: "admin.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/admin.css"),
-        sha256: "0c904bfd9b33f1f7ddde6a859143f6ff3382a363aaeab3a11278e2c2ac5ee5be",
+        sha256: "dc19085f17c549bd66708712ed89b090da83dd30a19d21a055e3865403236134",
     },
     StaticAsset {
         path: "components.css",
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "958a886bffd300c24929e2c84deeea1a70f8fe592b1330e79982b56e7cc75eb4",
+        sha256: "4c85e85dc3fdc3bf008028a93bf70f12ac75809d8223016da161cd682287bc74",
     },
     StaticAsset {
         path: "login.html",

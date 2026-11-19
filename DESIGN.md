@@ -111,11 +111,12 @@ Three tiers. Components reference **only** the semantic/extended tiers.
 |---|---|---|---|
 | Primitive | `--p-*` | Raw, theme-agnostic palette. Never referenced by components. | `--p-slate-900`, `--p-indigo-500`, `--p-cyan-400`, `--p-red-500` |
 | Semantic | `--c-*`, `--sp-*`, `--rad-*`, `--fs-*`, `--fw-*`, `--lh-*`, `--elev-*`, `--dur-*`, `--ease-*`, `--z-*` | Meaning-based aliases — the vocabulary components use. | `--c-bg-card`, `--c-primary`, `--c-danger`, `--c-text-main`, `--c-focus-ring`, `--sp-4`, `--rad-md`, `--fs-base`, `--elev-2`, `--z-modal` |
-| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--c-ent-*`, `--c-role-*`, `--c-slot-*`, `--c-flow-*`, `--c-step-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, routing entity/role/slot categories, LLM run kinds and run-timeline step kinds, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--c-ent-pool`, `--c-role-overflow`, `--c-slot-busy`, `--grad-brand` |
+| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--c-ent-*`, `--c-role-*`, `--c-slot-*`, `--c-flow-*`, `--c-step-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, routing entity/role/slot categories, LLM run kinds and run-timeline step kinds — one hue per actor: model, tools, people, memory, runtime — brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--c-ent-pool`, `--c-role-overflow`, `--c-slot-busy`, `--grad-brand` |
 
 Token families:
 
-- **Color** — surfaces (`--c-bg-app/sidebar/card/card-hover/input/elevated`), borders, brand
+- **Color** — surfaces (`--c-bg-app/sidebar/card/card-hover/input/elevated`, plus `--c-bg-raised` for a
+  block raised inside a card, distinct from the card in both themes), borders, brand
   (`--c-primary`, `--c-primary-hover`, `--c-accent`), state (`--c-success/warning/danger/info`) with
   tinted-surface variants (`--c-*-bg`, `--c-*-bg-strong`, derived via `color-mix`), text
   (`--c-text-main/sec/muted/on-primary`), and interaction (`--c-focus-ring`, `--c-scrim`,

@@ -5781,6 +5781,48 @@
             return end - Number(round.duration_ms || 0);
         }
 
+        // Tool calls grouped under the model round that issued them. Older
+        // records attach a tool to whatever round came last, which can be the
+        // auxiliary vision call the tool itself made.
+        function llmdRoundTools(run) {
+            const tools = new Map();
+            let issuer = null;
+            for (const round of (run.rounds || [])) {
+                if (!round.is_aux) {
+                    issuer = round;
+                    tools.set(round, []);
+                }
+                const owner = issuer || round;
+                if (!tools.has(owner)) tools.set(owner, []);
+                tools.get(owner).push(...(round.tool_calls || []));
+            }
+            return tools;
+        }
+
+        // Start and end of each tool call. Records made before tools carried a
+        // start time place the call at the end of its round.
+        function llmdToolSpans(round, tools) {
+            const roundEnd = llmdParseTime(round.at);
+            return tools.map(tool => {
+                const started = llmdParseTime(tool.started_at);
+                const start = started !== null ? started : roundEnd;
+                if (start === null) return { start: null, end: null };
+                return { start, end: start + Math.max(0, Number(tool.duration_ms) || 0) };
+            });
+        }
+
+        function llmdToolNames(rounds, requests) {
+            const names = new Map();
+            const remember = calls => calls.forEach(call => {
+                if (call.id && call.name && call.name !== 'tool') names.set(call.id, call.name);
+            });
+            for (const messages of requests.values()) {
+                messages.forEach(message => remember(message.toolCalls));
+            }
+            rounds.forEach(round => remember(llmdResponseOutput(round).toolCalls));
+            return names;
+        }
+
         // Turns the run into ordered timeline steps.
         function llmdBuildTimeline(run) {
             const rounds = run.rounds || [];
@@ -5818,18 +5860,21 @@
                 deltas.set(round, llmdDeltaItems(messages.slice(common)));
             });
 
+            const roundTools = llmdRoundTools(run);
+            const toolNames = llmdToolNames(mains, requests);
             const steps = [{ kind: 'trigger', prompt }];
             if (run.context) steps.push({ kind: 'recall', prompt });
-            if (first) steps.push({ kind: 'prompt', prompt, round: first });
+            const head = steps.length;
+            if (first) steps.push({ kind: 'prompt', prompt, round: first, at: llmdRoundStart(run, first) });
             const consumed = new Set();
             let mainIndex = 0;
             rounds.forEach(round => {
                 if (round.is_aux) {
-                    steps.push({ kind: 'aux', round });
+                    steps.push({ kind: 'aux', round, at: llmdRoundStart(run, round) });
                     return;
                 }
                 const delta = deltas.get(round) || [];
-                if (rebuilt.has(round)) steps.push({ kind: 'rebuilt', round, ...rebuilt.get(round) });
+                if (rebuilt.has(round)) steps.push({ kind: 'rebuilt', round, ...rebuilt.get(round), at: null });
                 let echoSkipped = mainIndex === 0;
                 const seenAt = llmdRoundStart(run, round);
                 for (const item of delta) {
@@ -5839,17 +5884,18 @@
                         continue;
                     }
                     if (item.kind === 'tool_msg' || item.kind === 'tool_xml') {
-                        steps.push({ kind: 'tool', round: null, tool: null, item, seenAt });
+                        steps.push({ kind: 'tool', round: null, tool: null, item, seenAt, at: seenAt, name: item.message && toolNames.get(item.message.toolCallId) });
                         continue;
                     }
-                    steps.push({ kind: item.kind === 'inbox' ? 'inbox' : 'note', item, seenAt });
+                    steps.push({ kind: item.kind === 'inbox' ? 'inbox' : 'note', item, seenAt, at: seenAt });
                 }
                 mainIndex++;
-                steps.push({ kind: 'round', round, number: mainIndex, final: round.sent === 'final' });
+                steps.push({ kind: 'round', round, number: mainIndex, final: round.sent === 'final', at: seenAt });
                 const nextRound = mains[mains.indexOf(round) + 1];
                 const pending = (nextRound ? deltas.get(nextRound) : []).filter(item => item.kind === 'tool_msg' || item.kind === 'tool_xml');
                 const output = llmdResponseOutput(round);
-                const skeleton = round.tool_calls || [];
+                const skeleton = roundTools.get(round) || [];
+                const spans = llmdToolSpans(round, skeleton);
                 const count = Math.max(skeleton.length, output.toolCalls.length);
                 for (let i = 0; i < count; i++) {
                     const tool = skeleton[i] || null;
@@ -5859,11 +5905,29 @@
                     if (call && call.id) item = pending.find(p => !consumed.has(p) && p.message.toolCallId === call.id) || null;
                     if (!item) item = pending.find(p => !consumed.has(p) && (p.kind === 'tool_msg' || (p.node.attrs.name || '') === name)) || null;
                     if (item) consumed.add(item);
-                    steps.push({ kind: 'tool', round, tool, call, item, toolIndex: i });
+                    const span = spans[i] || { start: llmdParseTime(round.at), end: null };
+                    steps.push({ kind: 'tool', round, tool, call, item, toolIndex: i, at: span.start, end: span.end });
                 }
             });
             steps.push({ kind: 'outcome' });
-            return { steps, prompt };
+            return { steps: llmdChronological(steps, head), prompt };
+        }
+
+        // Orders the steps between the recall and the outcome by start time.
+        // A step without a time keeps its place before the next timed step;
+        // equal times keep the order in which the run produced them.
+        function llmdChronological(steps, head) {
+            const middle = steps.slice(head, -1);
+            let next = Infinity;
+            const keys = new Array(middle.length);
+            for (let i = middle.length - 1; i >= 0; i--) {
+                const at = middle[i].at;
+                if (Number.isFinite(at)) next = at;
+                keys[i] = next;
+            }
+            const order = middle.map((step, index) => ({ step, index, key: keys[index] }));
+            order.sort((a, b) => (a.key - b.key) || (a.index - b.index));
+            return [...steps.slice(0, head), ...order.map(entry => entry.step), steps[steps.length - 1]];
         }
 
         // ---- step shell ----
@@ -6509,11 +6573,25 @@
             });
         }
 
+        // Tool results are JSON envelopes; the summary line shows their message.
+        function llmdToolSnippet(text) {
+            try {
+                const value = JSON.parse(text);
+                if (value && typeof value === 'object') {
+                    if (typeof value.message === 'string' && value.message.trim()) return value.message;
+                    if (value.error && typeof value.error.message === 'string') return value.error.message;
+                }
+            } catch (_) {
+                return text;
+            }
+            return text;
+        }
+
         function llmdToolStep(run, step) {
             const tool = step.tool || {};
             const call = step.call || {};
             const item = step.item;
-            const name = tool.name || call.name || (item && (item.message && item.message.name || item.node && item.node.attrs.name)) || 'tool';
+            const name = tool.name || call.name || step.name || (item && (item.message && item.message.name || item.node && item.node.attrs.name)) || 'tool';
             let result = tool.result_json !== undefined && tool.result_json !== null ? tool.result_json : tool.result;
             if (item) {
                 const full = item.kind === 'tool_xml' ? (llmdNodeText(llmdChild(item.node, 'output')) || llmdNodeText(item.node)) : item.message.text;
@@ -6526,12 +6604,12 @@
             if (status) facts.push(PL.badge(status, failed ? 'danger' : 'success'));
             if (Number(tool.duration_ms) > 0) facts.push(formatAnalyticsMs(tool.duration_ms));
             const resultText = result === undefined || result === null ? '' : llmdPretty(result);
-            const end = step.round ? llmdParseTime(step.round.at) : (step.seenAt === undefined ? null : step.seenAt);
             return llmdStep('tool', {
                 anchor: step.round ? `llmd-step-tool-${step.round.seq}-${step.toolIndex}` : '',
                 tone: failed ? 'fail' : '',
-                time: llmdStepTime(run, end),
-                summary: llmdSummary('Tool', PL.el('span', { class: 'mono llmd-sum-title' }, name), facts, resultText),
+                time: llmdStepTime(run, Number.isFinite(step.at) ? step.at : null),
+                timeTitle: tool.started_at ? `started ${tool.started_at}` : '',
+                summary: llmdSummary('Tool', PL.el('span', { class: 'mono llmd-sum-title' }, name), facts, llmdToolSnippet(resultText)),
                 render: () => {
                     const body = PL.el('div', { class: 'llmd-stack' });
                     if (args !== undefined && args !== null && args !== '') {
@@ -6631,27 +6709,179 @@
         }
 
         // ---- waterfall overview ----
-        function llmdWaterfall(run) {
-            const start = llmdParseTime(run.started_at);
+        const LLMD_TICK_STEPS = [100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 1800000];
+        // Telegram message dates have whole-second precision, so a shorter
+        // gap between the trigger message and the run start is not a wait.
+        const LLMD_MIN_QUEUE_MS = 1000;
+        // Shorter gaps before the first or after the last call get no row.
+        const LLMD_MIN_PHASE_MS = 200;
+        // An auxiliary call starting this close to a tool still belongs to it.
+        const LLMD_NEST_SLACK_MS = 50;
+
+        function llmdFlowLabel(flow) {
+            const label = String(flow || 'auxiliary call').replace(/_/g, ' ');
+            return label.charAt(0).toUpperCase() + label.slice(1);
+        }
+
+        function llmdTriggerTime(prompt) {
+            if (!prompt || !prompt.trigger) return null;
+            const msg = llmdMessageModel(prompt.trigger);
+            return msg && msg.timestamp ? llmdParseTime(msg.timestamp) : null;
+        }
+
+        // Rounds, the tools each round called, and the auxiliary calls a tool
+        // made, as a tree of time spans in start order.
+        function llmdWaterfallSpans(run) {
+            const roundTools = llmdRoundTools(run);
             const rounds = run.rounds || [];
-            if (start === null || !rounds.length) return null;
-            const ends = rounds.map(round => llmdParseTime(round.at)).filter(v => v !== null);
+            const mainTotal = rounds.filter(round => !round.is_aux).length;
+            const top = [];
+            const tools = [];
+            let number = 0;
+            for (const round of rounds) {
+                const end = llmdParseTime(round.at);
+                if (end === null) continue;
+                const start = end - Math.max(0, Number(round.duration_ms) || 0);
+                const anchor = `llmd-step-round-${round.seq}`;
+                if (round.is_aux) {
+                    top.push({ kind: 'aux', label: llmdFlowLabel(round.flow), start, end, anchor, tone: round.error ? 'fail' : '', children: [] });
+                    continue;
+                }
+                number++;
+                const span = {
+                    kind: 'round', label: mainTotal > 1 ? `Round ${number}` : 'Model', start, end, anchor,
+                    tone: round.error ? 'fail' : (round.sent === 'final' ? 'final' : ''), children: [],
+                };
+                top.push(span);
+                const list = roundTools.get(round) || [];
+                llmdToolSpans(round, list).forEach((times, index) => {
+                    if (times.start === null) return;
+                    const tool = list[index];
+                    const child = {
+                        kind: 'tool', label: tool.name || 'tool', mono: true, start: times.start, end: times.end,
+                        anchor: `llmd-step-tool-${round.seq}-${index}`, tone: tool.status && tool.status !== 'ok' ? 'fail' : '',
+                        children: [], hosted: 0,
+                    };
+                    span.children.push(child);
+                    tools.push(child);
+                });
+            }
+            const nested = new Set();
+            for (const aux of top.filter(span => span.kind === 'aux')) {
+                const hosts = tools.filter(tool => tool.start - LLMD_NEST_SLACK_MS <= aux.start && aux.end <= tool.end + LLMD_NEST_SLACK_MS);
+                if (!hosts.length) continue;
+                hosts.sort((a, b) => (a.hosted - b.hosted) || (a.start - b.start));
+                hosts[0].hosted++;
+                hosts[0].children.push(aux);
+                nested.add(aux);
+            }
+            const rows = [];
+            const walk = (span, depth) => {
+                rows.push({ ...span, depth });
+                span.children.slice().sort((a, b) => a.start - b.start).forEach(child => walk(child, depth + 1));
+            };
+            top.filter(span => !nested.has(span)).sort((a, b) => a.start - b.start).forEach(span => walk(span, 0));
+            return rows;
+        }
+
+        function llmdUnionMs(spans) {
+            const sorted = spans.filter(span => span.end > span.start).sort((a, b) => a.start - b.start);
+            let total = 0;
+            let from = null;
+            let to = null;
+            for (const span of sorted) {
+                if (to === null || span.start > to) {
+                    if (to !== null) total += to - from;
+                    from = span.start;
+                    to = span.end;
+                } else {
+                    to = Math.max(to, span.end);
+                }
+            }
+            return to === null ? total : total + (to - from);
+        }
+
+        function llmdTickLabel(ms, step) {
+            const sign = ms < 0 ? '−' : '';
+            const abs = Math.abs(ms);
+            if (abs === 0) return '0';
+            if (abs >= 60000) {
+                const minutes = Math.floor(abs / 60000);
+                const seconds = Math.round((abs % 60000) / 1000);
+                return `${sign}${minutes}m${seconds ? ` ${seconds}s` : ''}`;
+            }
+            return `${sign}${step < 1000 ? (abs / 1000).toFixed(1) : Math.round(abs / 1000)}s`;
+        }
+
+        function llmdWaterfall(run, prompt) {
+            const start = llmdParseTime(run.started_at);
+            if (start === null) return null;
+            const rows = llmdWaterfallSpans(run);
+            if (!rows.length) return null;
             const runEnd = llmdParseTime(run.ended_at);
-            const wall = Math.max(1, (runEnd !== null ? runEnd : Math.max(...ends, start)) - start);
-            const box = PL.el('div', { class: 'llmd-wf', role: 'group', 'aria-label': 'Where the time went' });
-            const axis = PL.el('div', { class: 'llmd-wf-axis mono' }, [PL.el('span', {}, '0s'), PL.el('span', {}, formatAnalyticsMs(wall))]);
-            const row = (label, from, duration, kind, anchor, tone) => {
-                const line = PL.el('div', { class: 'llmd-wf-row', role: 'button', tabindex: '0', 'data-step': kind });
-                if (tone) line.dataset.tone = tone;
+            const firstCall = Math.min(...rows.map(row => row.start));
+            const lastCall = Math.max(...rows.map(row => row.end));
+            if (firstCall - start >= LLMD_MIN_PHASE_MS) {
+                rows.unshift({ kind: 'phase', label: 'Prepare', start, end: firstCall, anchor: 'llmd-step-prompt', depth: 0, hint: 'from the run start to the first model call' });
+            }
+            if (runEnd !== null && runEnd - lastCall >= LLMD_MIN_PHASE_MS) {
+                rows.push({ kind: 'phase', label: 'Finish', start: lastCall, end: runEnd, anchor: 'llmd-step-outcome', depth: 0, hint: 'after the last call, until the run closed' });
+            }
+            const end = Math.max(start + 1, runEnd !== null ? runEnd : start, lastCall);
+            let from = Math.min(start, firstCall);
+            const triggerAt = llmdTriggerTime(prompt);
+            let queue = null;
+            if (triggerAt !== null && start - triggerAt >= LLMD_MIN_QUEUE_MS) {
+                // The wait may dwarf the work; give it at most as much width as the run.
+                const shown = Math.min(start - triggerAt, end - start);
+                from = Math.min(from, start - shown);
+                queue = { kind: 'queue', label: 'Queue', start: triggerAt, end: start, anchor: 'llmd-step-trigger', depth: 0, clipped: triggerAt < from };
+                rows.unshift(queue);
+            }
+            const span = Math.max(1, end - from);
+            const pct = at => Math.max(0, Math.min(100, ((at - from) / span) * 100));
+            const zero = pct(start);
+
+            const facts = [`run ${formatAnalyticsMs(runEnd !== null ? runEnd - start : end - start)}`];
+            if (queue) facts.push(`queue ≈${formatAnalyticsMs(queue.end - queue.start)}`);
+            rows.filter(row => row.kind === 'phase').forEach(row => facts.push(`${row.label.toLowerCase()} ${formatAnalyticsMs(row.end - row.start)}`));
+            const model = llmdUnionMs(rows.filter(row => row.kind === 'round'));
+            if (model) facts.push(`model ${formatAnalyticsMs(model)}`);
+            const toolTime = llmdUnionMs(rows.filter(row => row.kind === 'tool'));
+            if (toolTime) facts.push(`tools ${formatAnalyticsMs(toolTime)}`);
+            const auxFlows = new Map();
+            rows.filter(row => row.kind === 'aux').forEach(row => {
+                if (!auxFlows.has(row.label)) auxFlows.set(row.label, []);
+                auxFlows.get(row.label).push(row);
+            });
+            auxFlows.forEach((spans, label) => facts.push(`${label.toLowerCase()} ${formatAnalyticsMs(llmdUnionMs(spans))}`));
+
+            const box = PL.el('section', { class: 'llmd-wf', 'aria-label': 'Where the time went' });
+            box.append(PL.el('div', { class: 'llmd-wf-head' }, [
+                PL.el('span', { class: 'llmd-rail-title' }, 'Where the time went'),
+                PL.el('span', { class: 'llmd-wf-facts mono' }, facts.join(' · ')),
+            ]));
+            const offset = at => llmdOffset(at - start);
+            for (const row of rows) {
+                const line = PL.el('div', { class: 'llmd-wf-row', role: 'button', tabindex: '0', 'data-step': row.kind });
+                line.dataset.depth = String(Math.min(row.depth, 2));
+                if (row.tone) line.dataset.tone = row.tone;
+                const hint = row.hint ? ` — ${row.hint}` : (row.kind === 'queue' ? ' — from the trigger message to the run start' : '');
+                line.title = `${row.label}: ${offset(row.start)} → ${offset(row.end)}${row.clipped ? ' (bar clipped)' : ''}${hint}`;
+                const left = pct(row.start);
+                const width = Math.max(0, pct(row.end) - left);
                 const bar = PL.el('span', { class: 'llmd-wf-bar' });
-                bar.style.setProperty('--wf-left', `${Math.max(0, Math.min(100, ((from - start) / wall) * 100)).toFixed(2)}%`);
-                bar.style.setProperty('--wf-width', `${Math.max(0.6, Math.min(100, (duration / wall) * 100)).toFixed(2)}%`);
+                bar.style.setProperty('--wf-left', `${left.toFixed(2)}%`);
+                bar.style.setProperty('--wf-width', `${width.toFixed(2)}%`);
+                const track = PL.el('span', { class: 'llmd-wf-track' }, bar);
+                if (queue) track.style.setProperty('--wf-zero', `${zero.toFixed(2)}%`);
+                const duration = row.end - row.start;
                 line.append(
-                    PL.el('span', { class: 'llmd-wf-label mono' }, label),
-                    PL.el('span', { class: 'llmd-wf-track' }, bar),
-                    PL.el('span', { class: 'llmd-wf-dur mono' }, formatAnalyticsMs(duration)),
+                    PL.el('span', { class: row.mono ? 'llmd-wf-label mono' : 'llmd-wf-label' }, row.label),
+                    track,
+                    PL.el('span', { class: 'llmd-wf-dur mono' }, `${row.kind === 'queue' ? '≈' : ''}${formatAnalyticsMs(duration)}`),
                 );
-                const go = () => llmdFocusStep(anchor);
+                const go = () => llmdFocusStep(row.anchor);
                 line.addEventListener('click', go);
                 line.addEventListener('keydown', event => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -6659,23 +6889,19 @@
                         go();
                     }
                 });
-                return line;
-            };
-            let number = 0;
-            const mainTotal = rounds.filter(round => !round.is_aux).length;
-            for (const round of rounds) {
-                const end = llmdParseTime(round.at);
-                if (end === null) continue;
-                const duration = Number(round.duration_ms || 0);
-                if (!round.is_aux) number++;
-                const label = round.is_aux ? (round.flow || 'aux') : (mainTotal > 1 ? `round ${number}` : 'model');
-                box.append(row(label, end - duration, duration, round.is_aux ? 'aux' : 'round', `llmd-step-round-${round.seq}`, round.error ? 'fail' : ''));
-                (round.tool_calls || []).forEach((tool, index) => {
-                    if (!(Number(tool.duration_ms) > 0)) return;
-                    box.append(row(tool.name, end, tool.duration_ms, 'tool', `llmd-step-tool-${round.seq}-${index}`, tool.status && tool.status !== 'ok' ? 'fail' : ''));
-                });
+                box.append(line);
             }
-            box.append(axis);
+            const step = LLMD_TICK_STEPS.find(candidate => span / candidate <= 6) || LLMD_TICK_STEPS[LLMD_TICK_STEPS.length - 1];
+            const scale = PL.el('span', { class: 'llmd-wf-scale', 'aria-hidden': 'true' });
+            for (let tick = Math.ceil((from - start) / step) * step; start + tick <= end; tick += step) {
+                const mark = PL.el('span', { class: 'llmd-wf-tick' }, llmdTickLabel(tick, step));
+                const at = pct(start + tick);
+                mark.style.setProperty('--wf-at', `${at.toFixed(2)}%`);
+                if (at < 4) mark.classList.add('is-first');
+                else if (at > 96) mark.classList.add('is-last');
+                scale.append(mark);
+            }
+            box.append(PL.el('div', { class: 'llmd-wf-axis mono' }, [PL.el('span'), scale, PL.el('span')]));
             return box;
         }
 
@@ -6984,7 +7210,7 @@
                 if (node) list.append(node);
             }
             const main = PL.el('div', { class: 'llmd-run-main' });
-            const waterfall = llmdWaterfall(run);
+            const waterfall = llmdWaterfall(run, prompt);
             if (waterfall) main.append(waterfall);
             main.append(list);
             const rail = PL.el('aside', { class: 'llmd-rail', 'aria-label': 'Run context' });

@@ -134,6 +134,8 @@
     --c-bg-card-hover: #1a1f2b;
     --c-bg-input: #0e1119;
     --c-bg-elevated: #161b26;
+    /* A block raised inside a card; differs from the card in both themes */
+    --c-bg-raised: var(--c-bg-elevated);
 
     --c-border: #1e2330;
     --c-border-light: #2b3242;
@@ -314,15 +316,17 @@
     --c-flow-other: var(--p-slate-500);
     /* Text drawn on categorical fills (card types, flows); dark in both themes */
     --c-text-on-cat: var(--p-slate-950);
-    /* LLM Dialogs: run-timeline step kinds */
-    --c-step-trigger: var(--c-accent);
-    --c-step-recall: var(--p-teal-400);
-    --c-step-context: var(--p-slate-400);
+    /* LLM Dialogs: run-timeline step kinds, one hue per actor — the model
+       (its nested calls muted), tools, people (the trigger and chat
+       messages), memory, the runtime (prompt, notes, queue) — plus status. */
     --c-step-round: var(--c-primary);
-    --c-step-aux: var(--p-sky-500);
-    --c-step-tool: var(--p-violet-400);
-    --c-step-inbox: var(--p-amber-500);
-    --c-step-note: var(--p-slate-500);
+    --c-step-aux: color-mix(in srgb, var(--c-primary) 55%, var(--c-text-muted));
+    --c-step-tool: var(--p-orange-400);
+    --c-step-trigger: var(--c-accent);
+    --c-step-inbox: var(--c-accent);
+    --c-step-recall: var(--p-violet-400);
+    --c-step-context: var(--c-text-sec);
+    --c-step-note: var(--c-text-muted);
     --c-step-ok: var(--c-success);
     --c-step-fail: var(--c-danger);
 
@@ -390,4 +394,11 @@
 
     /* Routing Ops: free pool slots need a light-surface tint on light theme */
     --c-slot-free: #d0d8e3;
+
+    /* Run-timeline step colours also colour text: darker on light surfaces */
+    --c-bg-raised: #f4f6f9;
+    --c-step-tool: #c2410c;
+    --c-step-recall: #7c3aed;
+    --c-step-ok: #047857;
+    --c-step-fail: #be123c;
 }

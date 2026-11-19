@@ -840,11 +840,13 @@ body {
     background: var(--c-bg-card);
 }
 
+/* The title takes a line of its own before it would squeeze the actions. */
 .llmd-detail-title {
     display: inline-flex;
     align-items: center;
-    gap: var(--sp-2) var(--sp-3);
-    flex: 1;
+    flex-wrap: wrap;
+    gap: var(--sp-1) var(--sp-3);
+    flex: 1 1 22rem;
     min-width: 0;
 }
 
@@ -852,6 +854,7 @@ body {
     color: var(--c-text-main);
     font-size: var(--fs-sm);
     min-width: 0;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -861,6 +864,10 @@ body {
     color: var(--c-text-muted);
     font-size: var(--fs-xs);
     white-space: nowrap;
+}
+
+.llmd-detail-actions {
+    margin-left: auto;
 }
 
 .llmd-detail-body {
@@ -913,23 +920,39 @@ body {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: var(--sp-3);
-    border: 1px solid var(--c-border);
+    min-width: 0;
+    padding: var(--sp-3) var(--sp-4) var(--sp-2);
     border-radius: var(--rad-md);
-    background: var(--c-bg-elevated);
+    background: var(--c-bg-raised);
+}
+
+.llmd-wf-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--sp-1) var(--sp-3);
+    margin-bottom: var(--sp-2);
+}
+
+.llmd-wf-facts {
+    font-size: var(--fs-xs);
+    color: var(--c-text-sec);
+    font-variant-numeric: tabular-nums;
 }
 
 .llmd-wf-row,
 .llmd-wf-axis {
     display: grid;
-    grid-template-columns: minmax(5rem, 11rem) minmax(0, 1fr) 4.5rem;
+    grid-template-columns: minmax(6rem, 10rem) minmax(0, 1fr) 4.25rem;
     align-items: center;
     gap: var(--sp-3);
+    min-width: 0;
     font-size: var(--fs-xs);
 }
 
 .llmd-wf-row {
-    padding: 1px var(--sp-1);
+    min-height: 1.5rem;
+    padding: 0 var(--sp-1);
     border-radius: var(--rad-sm);
     cursor: pointer;
     --step-c: var(--c-step-round);
@@ -941,25 +964,52 @@ body {
 
 .llmd-wf-row[data-step="aux"] { --step-c: var(--c-step-aux); }
 .llmd-wf-row[data-step="tool"] { --step-c: var(--c-step-tool); }
+.llmd-wf-row[data-step="queue"] { --step-c: var(--c-step-note); }
+.llmd-wf-row[data-step="phase"] { --step-c: var(--c-step-context); }
+.llmd-wf-row[data-tone="final"] { --step-c: var(--c-step-ok); }
 .llmd-wf-row[data-tone="fail"] { --step-c: var(--c-step-fail); }
 
 .llmd-wf-label {
-    color: var(--c-text-sec);
+    min-width: 0;
+    color: var(--c-text-main);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.llmd-wf-row[data-step="tool"] .llmd-wf-label {
+.llmd-wf-row[data-depth="1"] .llmd-wf-label {
     padding-left: var(--sp-3);
-    color: var(--c-text-muted);
+    color: var(--c-text-sec);
 }
 
+.llmd-wf-row[data-depth="2"] .llmd-wf-label {
+    padding-left: var(--sp-6);
+    color: var(--c-text-sec);
+}
+
+.llmd-wf-row[data-step="queue"] .llmd-wf-label,
+.llmd-wf-row[data-step="phase"] .llmd-wf-label {
+    color: var(--c-text-sec);
+}
+
+/* The track clips: a bar never reaches past the panel, whatever the data. */
 .llmd-wf-track {
     position: relative;
-    height: 8px;
-    border-radius: var(--rad-full);
+    height: 10px;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: var(--rad-sm);
     background: var(--c-bg-input);
+}
+
+.llmd-wf-track::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: var(--wf-zero, -10px);
+    width: 2px;
+    background: var(--c-border-light);
 }
 
 .llmd-wf-bar {
@@ -967,28 +1017,51 @@ body {
     top: 0;
     bottom: 0;
     left: var(--wf-left, 0%);
-    width: var(--wf-width, 1%);
-    border-radius: var(--rad-full);
+    width: var(--wf-width, 0%);
+    min-width: 3px;
+    max-width: calc(100% - var(--wf-left, 0%));
+    border-radius: var(--rad-sm);
     background: var(--step-c);
+}
+
+.llmd-wf-row[data-step="queue"] .llmd-wf-bar,
+.llmd-wf-row[data-step="phase"] .llmd-wf-bar {
+    opacity: 0.55;
 }
 
 .llmd-wf-dur {
     text-align: right;
-    color: var(--c-text-muted);
+    color: var(--c-text-sec);
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
 .llmd-wf-axis {
+    min-height: 1.25rem;
     color: var(--c-text-muted);
 }
 
-.llmd-wf-axis span {
-    grid-column: 2;
-    grid-row: 1;
+.llmd-wf-scale {
+    position: relative;
+    height: 1.25rem;
+    min-width: 0;
 }
 
-.llmd-wf-axis span:last-child {
-    justify-self: end;
+.llmd-wf-tick {
+    position: absolute;
+    top: 0.2rem;
+    left: var(--wf-at, 0%);
+    transform: translateX(-50%);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.llmd-wf-tick.is-first {
+    transform: none;
+}
+
+.llmd-wf-tick.is-last {
+    transform: translateX(-100%);
 }
 
 /* timeline spine */
@@ -1063,26 +1136,39 @@ body {
     background: var(--step-c);
 }
 
+/* Major steps are tone blocks; tools, auxiliary calls, chat messages and
+   notes are plain rows on the spine, so the eye runs from round to round. */
 .llmd-step-card {
     min-width: 0;
-    border: 1px solid var(--c-border);
     border-radius: var(--rad-md);
-    background: var(--c-bg-card);
-    transition: box-shadow var(--dur-base) var(--ease-out);
+    background: var(--c-bg-raised);
+    transition: box-shadow var(--dur-base) var(--ease-out), background var(--dur-base) var(--ease-out);
 }
 
 .llmd-step[data-step="tool"] .llmd-step-card,
+.llmd-step[data-step="aux"] .llmd-step-card,
 .llmd-step[data-step="inbox"] .llmd-step-card,
 .llmd-step[data-step="note"] .llmd-step-card {
     background: transparent;
 }
 
+.llmd-step[data-step="tool"] .llmd-step-card:hover,
+.llmd-step[data-step="aux"] .llmd-step-card:hover,
+.llmd-step[data-step="inbox"] .llmd-step-card:hover,
+.llmd-step[data-step="note"] .llmd-step-card:hover,
+.llmd-step[data-step="tool"] .llmd-step-card:has(.pl-disclosure.is-open),
+.llmd-step[data-step="aux"] .llmd-step-card:has(.pl-disclosure.is-open),
+.llmd-step[data-step="inbox"] .llmd-step-card:has(.pl-disclosure.is-open),
+.llmd-step[data-step="note"] .llmd-step-card:has(.pl-disclosure.is-open) {
+    background: var(--c-bg-raised);
+}
+
 .llmd-step[data-tone="final"] .llmd-step-card {
-    border-color: color-mix(in srgb, var(--c-success) 45%, var(--c-border));
+    background: color-mix(in srgb, var(--c-success) 8%, var(--c-bg-raised));
 }
 
 .llmd-step[data-tone="fail"] .llmd-step-card {
-    border-color: color-mix(in srgb, var(--c-danger) 50%, var(--c-border));
+    background: color-mix(in srgb, var(--c-danger) 10%, var(--c-bg-raised));
 }
 
 .llmd-step.is-flash .llmd-step-card {
@@ -1165,11 +1251,11 @@ body {
     min-width: 0;
 }
 
+/* Blocks inside a raised step sink back to the card tone. */
 .llmd-block,
 .llmd-raw-block {
-    border: 1px solid var(--c-border);
     border-radius: var(--rad-sm);
-    background: var(--c-bg-elevated);
+    background: var(--c-bg-card);
 }
 
 .llmd-block-title {
@@ -1618,9 +1704,8 @@ body {
     flex-direction: column;
     gap: var(--sp-3);
     padding: var(--sp-4);
-    border: 1px solid var(--c-border);
     border-radius: var(--rad-md);
-    background: var(--c-bg-elevated);
+    background: var(--c-bg-raised);
 }
 
 .llmd-rail-head {
@@ -1658,8 +1743,9 @@ body {
     display: flex;
     flex-direction: column;
     gap: var(--sp-2);
-    padding-top: var(--sp-3);
-    border-top: 1px solid var(--c-border);
+    padding: var(--sp-3);
+    border-radius: var(--rad-sm);
+    background: var(--c-bg-card);
 }
 
 .llmd-recall-focus pl-button {
@@ -1687,9 +1773,24 @@ body {
         visibility: hidden;
     }
 
-    .llmd-wf-row,
+    /* On a phone each bar gets the full width under its label. */
+    .llmd-wf-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas: "label dur" "track track";
+        row-gap: 2px;
+        padding-block: var(--sp-1);
+    }
+
+    .llmd-wf-label { grid-area: label; }
+    .llmd-wf-dur { grid-area: dur; }
+    .llmd-wf-track { grid-area: track; }
+
     .llmd-wf-axis {
-        grid-template-columns: minmax(4rem, 7rem) minmax(0, 1fr) 3.5rem;
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .llmd-wf-axis > span:not(.llmd-wf-scale) {
+        display: none;
     }
 }
 
