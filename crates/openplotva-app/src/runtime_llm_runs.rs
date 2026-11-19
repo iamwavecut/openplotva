@@ -70,6 +70,8 @@ impl RunStatus {
 pub struct RunToolCall {
     pub name: String,
     pub status: String,
+    /// Wall-clock start; parallel calls are recorded after the whole batch ends.
+    pub started_at: Option<OffsetDateTime>,
     pub duration_ms: Option<i64>,
     /// Serialized tool arguments, capped at [`RUN_TOOL_JSON_MAX_CHARS`].
     pub args_json: Option<String>,
@@ -167,6 +169,17 @@ pub struct RunRecord {
 }
 
 impl RunRecord {
+    /// The latest non-auxiliary round, or the latest round when every round
+    /// so far is auxiliary.
+    fn last_main_round_mut(&mut self) -> Option<&mut RunRound> {
+        let index = self
+            .rounds
+            .iter()
+            .rposition(|round| !round.is_aux)
+            .or_else(|| self.rounds.len().checked_sub(1))?;
+        self.rounds.get_mut(index)
+    }
+
     /// Final-response preview for the list skeleton.
     #[must_use]
     pub fn preview(&self) -> Option<String> {
@@ -280,7 +293,9 @@ impl RuntimeLlmRunBuffer {
         Some(seq)
     }
 
-    /// Attach an executed tool result to the run's latest round.
+    /// Attach an executed tool result to the round that issued it: the latest
+    /// non-auxiliary round, since a tool's own nested calls (vision inside
+    /// `understand_media`) are recorded as auxiliary rounds before it returns.
     pub fn record_tool_result(&self, run_id: &str, mut tool: RunToolCall) {
         tool.args_json = tool
             .args_json
@@ -293,7 +308,7 @@ impl RuntimeLlmRunBuffer {
             return;
         };
         record.totals.tool_calls += 1;
-        if let Some(round) = record.rounds.last_mut() {
+        if let Some(round) = record.last_main_round_mut() {
             round.tool_calls.push(tool);
         }
     }
@@ -312,13 +327,13 @@ impl RuntimeLlmRunBuffer {
         }
     }
 
-    /// Mark the latest round's text as delivered to the chat.
+    /// Mark the latest model round's text as delivered to the chat.
     pub fn mark_round_sent(&self, run_id: &str, sent: RunRoundSent) {
         let mut inner = self.lock();
         if let Some(round) = inner
             .open
             .get_mut(run_id)
-            .and_then(|record| record.rounds.last_mut())
+            .and_then(RunRecord::last_main_round_mut)
         {
             round.sent = sent;
         }
@@ -359,12 +374,18 @@ impl RuntimeLlmRunBuffer {
         round.response_text = round
             .response_text
             .map(|text| cap_chars(&text, RUN_ROUND_RESPONSE_TEXT_MAX_CHARS));
+        // A round is stamped when its call returns, so the call began
+        // `duration_ms` earlier.
+        let started_at = OffsetDateTime::parse(&round.at, &Rfc3339).map_or_else(
+            |_| round.at.clone(),
+            |end| format_ts(end - Duration::milliseconds(i64::from(round.duration_ms))),
+        );
         let record = RunRecord {
             id,
             run_id: format!("call-{}", round.trace_id),
             kind: kind.to_owned(),
             origin,
-            started_at: round.at.clone(),
+            started_at,
             ended_at: Some(format_ts(now)),
             status: if failed {
                 RunStatus::Failed
@@ -406,8 +427,7 @@ impl RuntimeLlmRunBuffer {
             return;
         };
         if record
-            .rounds
-            .last()
+            .last_main_round_mut()
             .is_some_and(|round| round.sent == RunRoundSent::Final)
         {
             mark_queued_outcome_delivered(outcome.as_mut());
@@ -494,7 +514,7 @@ impl RuntimeLlmRunBuffer {
 }
 
 fn mark_record_delivered(record: &mut RunRecord) {
-    if let Some(round) = record.rounds.last_mut() {
+    if let Some(round) = record.last_main_round_mut() {
         round.sent = RunRoundSent::Final;
     }
     mark_queued_outcome_delivered(record.outcome.as_mut());
@@ -539,6 +559,7 @@ impl RunToolCall {
         serde_json::json!({
             "name": self.name,
             "status": self.status,
+            "started_at": self.started_at.map(format_ts),
             "duration_ms": self.duration_ms,
             "args_json": self.args_json,
             "result_json": self.result_json,
@@ -913,6 +934,44 @@ mod tests {
     }
 
     #[test]
+    fn tools_and_sent_markers_skip_nested_auxiliary_rounds() {
+        let buffer = RuntimeLlmRunBuffer::new(4);
+        buffer.begin_run("job-7".to_owned(), "dialog", RunOrigin::default(), ts(0));
+        assert_eq!(buffer.record_round("job-7", round("")), Some(1));
+        let vision = RunRound {
+            flow: Some("vision".to_owned()),
+            is_aux: true,
+            ..round("a cat on a sofa")
+        };
+        assert_eq!(buffer.record_round("job-7", vision), Some(2));
+        buffer.record_tool_result(
+            "job-7",
+            RunToolCall {
+                name: "understand_media".to_owned(),
+                status: "ok".to_owned(),
+                started_at: Some(ts(1)),
+                duration_ms: Some(5_600),
+                ..RunToolCall::default()
+            },
+        );
+        buffer.mark_round_sent("job-7", RunRoundSent::Intermediate);
+
+        let run = buffer
+            .list(&RunListFilter::default(), ts(8))
+            .into_iter()
+            .next()
+            .expect("open run");
+        assert_eq!(run.rounds[0].tool_calls.len(), 1);
+        assert_eq!(run.rounds[0].sent, RunRoundSent::Intermediate);
+        assert!(run.rounds[1].tool_calls.is_empty());
+        assert_eq!(run.rounds[1].sent, RunRoundSent::No);
+        assert_eq!(
+            run.rounds[0].to_json()["tool_calls"][0]["started_at"],
+            serde_json::json!(format_ts(ts(1)))
+        );
+    }
+
+    #[test]
     fn delivered_outbox_reconciles_closed_queued_run() {
         let buffer = RuntimeLlmRunBuffer::new(4);
         buffer.begin_run(
@@ -1011,6 +1070,10 @@ mod tests {
         assert_eq!(runs[0].kind, "memory_extraction");
         assert_eq!(runs[0].status, RunStatus::Failed);
         assert_eq!(runs[0].totals.rounds, 1);
+        assert_eq!(
+            runs[0].started_at,
+            format_ts(ts(0) - Duration::milliseconds(1_200))
+        );
     }
 
     #[test]

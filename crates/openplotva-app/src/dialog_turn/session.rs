@@ -1339,7 +1339,9 @@ where
                     .await,
                 );
             }
-            let tool_started = tokio::time::Instant::now();
+            let tool_started = parallel_media_results
+                .get(&call_index)
+                .map_or_else(tokio::time::Instant::now, |prepared| prepared.started);
             let semantic_key = semantic_tool_call_key(
                 active_params.message_id,
                 &call.step,
@@ -1450,6 +1452,13 @@ where
                     crate::runtime_llm_runs::RunToolCall {
                         name: call.step.step.clone(),
                         status: result.status.clone(),
+                        started_at: Some(
+                            ctx.now
+                                + TimeDuration::try_from(
+                                    tool_started.saturating_duration_since(processing_started),
+                                )
+                                .unwrap_or_default(),
+                        ),
                         duration_ms: i64::try_from(tool_duration_ms).ok(),
                         args_json: serde_json::to_string(&call.step).ok(),
                         result_json: serde_json::to_string(&result).ok(),
@@ -1883,6 +1892,7 @@ fn reused_tool_result(cached: &ToolResult, original_call_id: &str) -> ToolResult
 
 struct TimedToolResult {
     result: ToolResult,
+    started: tokio::time::Instant,
     duration_ms: u128,
 }
 
@@ -1968,6 +1978,7 @@ async fn execute_timed_session_tool(
         index,
         TimedToolResult {
             result,
+            started,
             duration_ms: started.elapsed().as_millis(),
         },
     )
