@@ -18,15 +18,15 @@ use openplotva_dialog::{
     TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
     VIDEO_GENERATION_NOT_SCHEDULED_MESSAGE, VideoRequest, VisionRequest,
     is_internal_not_scheduled_instruction, sanitize_tool_text, user_facing_not_scheduled_message,
-    verbatim_draw_caption,
+    verbatim_draw_caption, verbatim_video_caption,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
     DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_PRIORITY,
     IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue,
-    MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, VIDEO_QUEUE_NAME, VideoGenJobParams,
-    fallback_queue_time_estimate, format_duration_ru, format_go_duration, new_image_edit_job_at,
-    new_image_gen_job_at, new_music_gen_job_at, new_video_gen_job_at,
+    MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, VideoGenJobParams, fallback_queue_time_estimate,
+    format_duration_ru, format_go_duration, new_image_edit_job_at, new_image_gen_job_at,
+    new_music_gen_job_at, new_video_gen_job_at,
 };
 use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -949,8 +949,10 @@ pub struct VideoScheduleResult {
 pub enum VideoScheduleRejection {
     /// Bot cannot send videos in this chat.
     VideoNotAllowed,
-    /// The user's previous clip is still in progress.
+    /// The user already has the maximum of queued drawings and clips.
     ActiveLimit,
+    /// The per-user generation frequency limit shared with drawings.
+    GenerationRateLimited,
     /// Enqueue throttled by the task-enqueue rate limit.
     RateLimited,
 }
@@ -961,6 +963,7 @@ impl VideoScheduleRejection {
         match self {
             Self::VideoNotAllowed => "video_not_allowed",
             Self::ActiveLimit => "active_job_limit",
+            Self::GenerationRateLimited => "generation_rate_limited",
             Self::RateLimited => "enqueue_rate_limited",
         }
     }
@@ -972,7 +975,10 @@ impl VideoScheduleRejection {
                 "В этот чат нельзя отправлять видео. Ролик не поставлен в очередь."
             }
             Self::ActiveLimit => {
-                "Предыдущее видео пользователя ещё делается. Новый ролик не поставлен в очередь: пусть дождётся готового."
+                "У пользователя уже выполняется максимум задач генерации картинок и роликов. Новый ролик не поставлен в очередь."
+            }
+            Self::GenerationRateLimited => {
+                "Сработал лимит частоты генерации. Ролик не поставлен в очередь."
             }
             Self::RateLimited => {
                 "Слишком много запросов подряд, сработал лимит очереди. Задача не поставлена в очередь."
@@ -1630,6 +1636,8 @@ impl SongScheduler for TaskmanDialogToolAdapter {
 }
 
 impl VideoScheduler for TaskmanDialogToolAdapter {
+    /// Clips join the drawing queue: the same VIP plan, per-user limits, rate limits and
+    /// queue notice as `draw_image`.
     fn schedule_video<'a>(&'a self, request: VideoScheduleRequest) -> ScheduleVideoFuture<'a> {
         Box::pin(async move {
             if let Some(permission) = self.video_permission.as_deref()
@@ -1637,10 +1645,40 @@ impl VideoScheduler for TaskmanDialogToolAdapter {
             {
                 return Ok(not_scheduled_video(VideoScheduleRejection::VideoNotAllowed));
             }
+            let has_vip = match self.draw_image_vip_status.as_deref() {
+                Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
+                None => false,
+            };
+            let plan = image_gen_queue_plan(has_vip);
+            if self
+                .queue
+                .user_active_count(plan.queue_name, request.user_id)
+                >= plan.max_active_jobs
+            {
+                return Ok(not_scheduled_video(VideoScheduleRejection::ActiveLimit));
+            }
+            if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
+                let report = rate_limit
+                    .check_draw_image_rate_limit(
+                        &request.brief,
+                        request.user_id,
+                        has_vip,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await;
+                if report.limited {
+                    return Ok(VideoScheduleResult {
+                        message: draw_rate_limit_response_text(&report.notice_text, has_vip),
+                        ..not_scheduled_video(VideoScheduleRejection::GenerationRateLimited)
+                    });
+                }
+            }
             let chat_id = request.chat_id;
             let user_id = request.user_id;
+            let message_id = request.message_id;
+            let thread_id = request.thread_id;
             if self
-                .task_enqueue_limited(VIDEO_QUEUE_NAME, chat_id, user_id)
+                .task_enqueue_limited(plan.queue_name, chat_id, user_id)
                 .await
             {
                 return Ok(not_scheduled_video(VideoScheduleRejection::RateLimited));
@@ -1648,10 +1686,10 @@ impl VideoScheduler for TaskmanDialogToolAdapter {
             let job = new_video_gen_job_at(
                 VideoGenJobParams {
                     chat_id,
-                    message_id: request.message_id,
+                    message_id,
                     user_id,
                     user_full_name: request.user_full_name,
-                    thread_id: request.thread_id,
+                    thread_id,
                     request_text: request.message_text.trim().to_owned(),
                     brief: request.brief,
                     caption: request.caption,
@@ -1659,23 +1697,37 @@ impl VideoScheduler for TaskmanDialogToolAdapter {
                 OffsetDateTime::now_utc(),
             )
             .with_name("video")
-            .with_priority(DEFAULT_PRIORITY);
-            match self.queue.assign_with_user_limit(VIDEO_QUEUE_NAME, job, 1) {
+            .with_priority(plan.priority);
+            let queue_position = self.image_queue_position(plan);
+            match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
                 Ok(Some(job_id)) => {
                     self.persist_generation_handoff(job_id).await?;
-                    self.grow_task_enqueue(VIDEO_QUEUE_NAME, chat_id, user_id)
+                    self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                         .await;
+                    if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
+                        rate_limit
+                            .grow_draw_image_rate_limit(user_id, OffsetDateTime::now_utc())
+                            .await;
+                    }
                     self.record_delivery_obligation(
                         openplotva_dialog::turn::SIDE_EFFECT_KIND_VIDEO,
                         job_id,
                         chat_id,
-                        request.thread_id,
+                        thread_id,
                         user_id,
-                        request.message_id,
+                        message_id,
                     )
                     .await;
-                    self.ack_queued_generation(chat_id, request.message_id)
-                        .await;
+                    self.ack_queued_generation(chat_id, message_id).await;
+                    self.maybe_send_draw_queue_notice(
+                        DrawQueueNoticeKind::Generation,
+                        plan,
+                        queue_position,
+                        chat_id,
+                        message_id,
+                        thread_id,
+                    )
+                    .await;
                     Ok(VideoScheduleResult {
                         status: "scheduled".to_owned(),
                         job_id: Some(job_id),
@@ -2808,7 +2860,8 @@ where
                 user_id: req.context.user_id,
                 user_full_name: req.context.user_full_name,
                 brief: sanitize_tool_text(&req.prompt),
-                caption: sanitize_tool_text(&req.caption),
+                caption: verbatim_video_caption(&req.context.message_meta)
+                    .unwrap_or_else(|| sanitize_tool_text(&req.caption)),
                 message_text: req.context.message_text,
             };
             match scheduler.schedule_video(request).await {
@@ -5348,13 +5401,31 @@ mod tests {
         }
     }
 
+    fn queued_drawing(user_id: i64, message_id: i32) -> openplotva_taskman::StatelessJobItem {
+        new_image_gen_job_at(
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id,
+                user_id,
+                prompt: "castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            OffsetDateTime::now_utc(),
+        )
+    }
+
     #[tokio::test]
-    async fn taskman_dialog_tool_adapter_queues_one_video_per_user_with_an_obligation()
+    async fn taskman_dialog_tool_adapter_queues_videos_in_the_drawing_queue_with_an_obligation()
     -> Result<(), ToolboxError> {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let recorder = Arc::new(ObligationRecorderStub::default());
+        let rate_limit = Arc::new(DrawImageRateLimitStub::new(
+            DrawImageRateLimitReport::default(),
+        ));
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
             .with_video_permission(Arc::new(VideoPermissionStub(true)))
+            .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(false)))
+            .with_draw_image_rate_limit(rate_limit.clone())
             .with_delivery_obligations(recorder.clone(), 1200, 1800);
 
         let scheduled = adapter.schedule_video(video_request(11)).await?;
@@ -5363,7 +5434,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(scheduled.status, "scheduled");
         assert_eq!(scheduled.job_id, Some(records[0].id));
-        assert_eq!(records[0].queue_name, VIDEO_QUEUE_NAME);
+        assert_eq!(records[0].queue_name, IMAGE_REGULAR_QUEUE_NAME);
+        assert_eq!(records[0].job.priority, DEFAULT_PRIORITY);
         assert_eq!(
             openplotva_taskman::video_gen_job_params_from_payload(&records[0].job.data),
             Ok(VideoGenJobParams {
@@ -5377,6 +5449,11 @@ mod tests {
                 caption: "Кот и снежинка".to_owned(),
             })
         );
+        assert_eq!(
+            rate_limit.checks(),
+            vec![("A grey cat catches a snowflake".to_owned(), 42, false)]
+        );
+        assert_eq!(rate_limit.grows(), vec![42]);
         let recorded = recorder.recorded();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].kind, "video_generation_job");
@@ -5389,19 +5466,78 @@ mod tests {
                 .map(|effect| (effect.kind, effect.ticket_id)),
             Some(("video_generation_job".to_owned(), records[0].id.to_string()))
         );
+        Ok(())
+    }
 
-        let second = adapter.schedule_video(video_request(12)).await?;
-        assert_eq!(second.rejection, Some(VideoScheduleRejection::ActiveLimit));
-        assert_eq!(queue.records().len(), 1);
-        let refused = dialog_make_video_tool_result(&second);
-        assert_eq!(refused.status, TOOL_RESULT_STATUS_FAILED);
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_gives_vip_videos_the_vip_queue() -> Result<(), ToolboxError>
+    {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_video_permission(Arc::new(VideoPermissionStub(true)))
+            .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)));
+
+        let scheduled = adapter.schedule_video(video_request(11)).await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        let records = queue.records();
+        assert_eq!(records[0].queue_name, IMAGE_VIP_QUEUE_NAME);
+        assert_eq!(records[0].job.priority, IMAGE_VIP_PRIORITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_counts_drawings_and_videos_against_one_limit()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        for message_id in 1..=5 {
+            queue.assign(IMAGE_REGULAR_QUEUE_NAME, queued_drawing(42, message_id));
+        }
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_video_permission(Arc::new(VideoPermissionStub(true)));
+
+        let refused = adapter.schedule_video(video_request(11)).await?;
+
+        assert_eq!(refused.rejection, Some(VideoScheduleRejection::ActiveLimit));
+        assert_eq!(queue.records().len(), 5);
+        let result = dialog_make_video_tool_result(&refused);
+        assert_eq!(result.status, TOOL_RESULT_STATUS_FAILED);
         assert_eq!(
-            refused
+            result
                 .data
                 .as_ref()
                 .and_then(|data| data["reason"].as_str()),
             Some("active_job_limit")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_applies_the_draw_rate_limit_to_videos()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let rate_limit = Arc::new(DrawImageRateLimitStub::new(DrawImageRateLimitReport {
+            limited: true,
+            notice_text: "Вы часто повторяете этот запрос. Попробуйте снова через 1 мин."
+                .to_owned(),
+        }));
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_video_permission(Arc::new(VideoPermissionStub(true)))
+            .with_draw_image_rate_limit(rate_limit.clone());
+
+        let refused = adapter.schedule_video(video_request(11)).await?;
+
+        assert_eq!(
+            refused.rejection,
+            Some(VideoScheduleRejection::GenerationRateLimited)
+        );
+        assert!(
+            refused
+                .message
+                .starts_with("Вы часто повторяете этот запрос. Попробуйте снова через 1 мин.\n\nПриобретите VIP-подписку")
+        );
+        assert!(rate_limit.grows().is_empty());
+        assert!(queue.records().is_empty());
         Ok(())
     }
 

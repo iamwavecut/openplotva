@@ -1880,7 +1880,7 @@ where
                 "Requested tool: make_video. Prompt: {}",
                 parsed.rest_text.trim()
             ),
-            String::new(),
+            parsed.rest_text.trim().to_owned(),
         ))
     } else {
         direct_image_shortcut(
@@ -6772,9 +6772,21 @@ mod tests {
             ("!song", "generate_song", ""),
             ("/song@plotva_bot neon rain", "generate_song", ""),
             ("@plotva_bot песня про море", "generate_song", ""),
-            ("!video кот ловит снежинку", "make_video", ""),
-            ("!видео кот ловит снежинку", "make_video", ""),
-            ("/video@plotva_bot кот ловит снежинку", "make_video", ""),
+            (
+                "!video кот ловит снежинку",
+                "make_video",
+                "кот ловит снежинку",
+            ),
+            (
+                "!видео кот ловит снежинку",
+                "make_video",
+                "кот ловит снежинку",
+            ),
+            (
+                "/video@plotva_bot кот ловит снежинку",
+                "make_video",
+                "кот ловит снежинку",
+            ),
             ("!draw red fish", "draw_image", "red fish"),
             ("@plotva_bot нарисуй рыбу", "draw_image", "рыбу"),
             ("@plotva_bot пожалуйста, нарисуй рыбу", "draw_image", "рыбу"),

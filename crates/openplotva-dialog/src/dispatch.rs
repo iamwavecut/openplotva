@@ -28,6 +28,16 @@ pub fn verbatim_draw_caption(meta: &ChatMessageMeta) -> Option<String> {
     (words > 0 && words <= VERBATIM_DRAW_CAPTION_MAX_WORDS).then_some(request)
 }
 
+/// Caption for a short explicit clip request such as `!видео кот`: the user's own words,
+/// unchanged, by the same rule as drawings.
+#[must_use]
+pub fn verbatim_video_caption(meta: &ChatMessageMeta) -> Option<String> {
+    if meta.requested_tool != STEP_MAKE_VIDEO {
+        return None;
+    }
+    verbatim_draw_caption(meta)
+}
+
 /// Dispatch one tool step to the toolbox.
 pub async fn dispatch_dialog_tool(
     toolbox: &dyn DialogToolbox,
@@ -94,6 +104,14 @@ pub async fn dispatch_dialog_tool(
                 return Ok(ToolResult::failed(
                     "make_video_prompt_empty",
                     "make_video prompt is empty",
+                ));
+            }
+            if crate::sanitize_tool_text(&step.caption).is_empty()
+                && verbatim_video_caption(&meta.message_meta).is_none()
+            {
+                return Ok(ToolResult::failed(
+                    "video_caption_required",
+                    "Retry with a nonempty caption naming the requested clip in the user's language. Remove the bot address and the request to make a video. Keep generation instructions in prompt.",
                 ));
             }
             toolbox
@@ -597,6 +615,7 @@ mod tests {
             },
             ToolStep {
                 step: STEP_MAKE_VIDEO.to_owned(),
+                caption: "Кот ловит снежинку".to_owned(),
                 ..ToolStep::default()
             },
         ] {
@@ -611,9 +630,53 @@ mod tests {
                 ),
                 (
                     "сделай видео как кот ловит снежинку".to_owned(),
-                    String::new()
+                    "Кот ловит снежинку".to_owned()
                 ),
             ]
+        );
+
+        let untitled = poll_ready(dispatch_dialog_tool(
+            &toolbox,
+            &meta,
+            &ToolStep {
+                step: STEP_MAKE_VIDEO.to_owned(),
+                prompt: "A grey cat catches a snowflake".to_owned(),
+                ..ToolStep::default()
+            },
+        ))
+        .expect("dispatch");
+        assert_eq!(
+            untitled.error.as_ref().map(|e| e.code.as_str()),
+            Some("video_caption_required")
+        );
+
+        let shortcut = ToolContext {
+            message_meta: ChatMessageMeta {
+                requested_tool: STEP_MAKE_VIDEO.to_owned(),
+                draw_request: "кот ловит снежинку".to_owned(),
+                ..ChatMessageMeta::default()
+            },
+            ..meta.clone()
+        };
+        poll_ready(dispatch_dialog_tool(
+            &toolbox,
+            &shortcut,
+            &ToolStep {
+                step: STEP_MAKE_VIDEO.to_owned(),
+                prompt: "A grey cat catches a snowflake".to_owned(),
+                ..ToolStep::default()
+            },
+        ))
+        .expect("dispatch");
+        assert_eq!(toolbox.0.lock().expect("videos").len(), 3);
+        assert_eq!(
+            verbatim_video_caption(&shortcut.message_meta).as_deref(),
+            Some("кот ловит снежинку")
+        );
+        assert_eq!(
+            verbatim_video_caption(&draw_request_meta("кот ловит снежинку")),
+            None,
+            "a drawing shortcut does not title a clip"
         );
 
         let empty = poll_ready(dispatch_dialog_tool(
