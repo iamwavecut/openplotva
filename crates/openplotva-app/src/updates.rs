@@ -26,7 +26,7 @@ use openplotva_updates::{
     UPDATE_CLAIM_SLOW_LOG_AFTER, UPDATE_CLAIM_TIMEOUT, UpdateConsumerConfig, UpdateProcessReport,
     UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
     build_fetcher_message_context, build_history_text_entry, build_history_text_entry_with_text,
-    extract_update_state, fetcher_message_text, should_skip_side_effects_at,
+    extract_update_state, fetcher_message_text, should_skip_side_effects_at, update_is_late_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -119,6 +119,15 @@ pub trait UpdateHandler {
         &self,
         update: TelegramUpdate,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Keep what a late update tells about the chat without reacting to it.
+    fn record_late_update(
+        &self,
+        update: TelegramUpdate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        drop(update);
+        std::future::ready(Ok(()))
+    }
 }
 
 /// Explicitly erases one segment of a statically composed handler chain.
@@ -590,6 +599,18 @@ where
         .await
         .map(|_| ())
     }
+
+    async fn record_late_update(&self, update: TelegramUpdate) -> Result<(), Self::Error> {
+        persist_update_history(self.history_store.as_ref(), &update, self.bot_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                trace_update_history_error(&update, &error.to_string());
+                UpdateHandleWithHistoryError::History {
+                    message: error.to_string(),
+                }
+            })
+    }
 }
 
 pub async fn persist_inbound_message_history<S>(
@@ -1003,10 +1024,14 @@ const MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(2
 const MATERIALIZED_UPDATE_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const MATERIALIZED_UPDATE_MAX_ATTEMPTS: i32 = 8;
 const MATERIALIZED_UPDATE_REPORTED_CLAIM_ERRORS: usize = 64;
+/// Messages older than this when claimed only reach history: after an outage
+/// Telegram redelivers hours of chat, and answering it would bury live traffic.
+const LATE_UPDATE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+const LATE_UPDATE_IGNORED_REASON: &str = "stale_update";
 
-/// Consume only committed inbox rows. Unlike the legacy Redis List consumer,
-/// this path intentionally does not use Telegram event time as an admission
-/// decision: an old addressed message remains processable after a long outage.
+/// Consume only committed inbox rows. An update whose Telegram event time is
+/// older than [`LATE_UPDATE_MAX_AGE`] keeps its history but skips the handler,
+/// except for payments and chat membership changes.
 pub async fn run_materialized_update_consumer_until<H, Tracker, Stop>(
     delivery_store: PostgresTelegramDeliveryStore,
     config: UpdateConsumerConfig,
@@ -1225,17 +1250,28 @@ where
 
     let started_at = SystemTime::now();
     let started = Instant::now();
+    let late = update_is_late_at(&update, LATE_UPDATE_MAX_AGE, started_at);
     let token = tracker.stage_started(&update, UpdateStage::Handle, started_at);
-    let handled =
-        tokio::time::timeout(config.handle_timeout, handler.handle_update(update.clone())).await;
+    let handled = if late {
+        tokio::time::timeout(
+            config.handle_timeout,
+            handler.record_late_update(update.clone()),
+        )
+        .await
+    } else {
+        tokio::time::timeout(config.handle_timeout, handler.handle_update(update.clone())).await
+    };
+    let handled = handled
+        .ok()
+        .map(|result| result.map_err(|error| error.to_string()));
     let outcome = match &handled {
-        Ok(Ok(())) => UpdateStageOutcome::Completed,
-        Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
-        Err(_) => UpdateStageOutcome::TimedOut,
+        Some(Ok(())) => UpdateStageOutcome::Completed,
+        Some(Err(error)) => UpdateStageOutcome::Failed(error.clone()),
+        None => UpdateStageOutcome::TimedOut,
     };
     finish_tracked_stage(tracker, token, UpdateStage::Handle, outcome, started);
 
-    if matches!(&handled, Ok(Ok(())))
+    if matches!(&handled, Some(Ok(())))
         && let Some(caption) = raw_paid_media_caption(&claim.raw_payload)
         && let Err(error) =
             persist_paid_media_caption_history(delivery_store, &update, &caption, claim.bot_id)
@@ -1251,18 +1287,31 @@ where
         .await;
     }
 
-    let disposition = match handled {
-        Ok(Ok(())) => UpdateDisposition::Handled,
-        Ok(Err(error)) => {
-            let error = error.to_string();
+    let disposition = claimed_update_disposition(handled, late, claim.attempt, &update);
+    transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
+}
+
+/// Inbox outcome of one handler run; `handled` is `None` when the run timed out.
+fn claimed_update_disposition(
+    handled: Option<Result<(), String>>,
+    late: bool,
+    attempt: i32,
+    update: &TelegramUpdate,
+) -> UpdateDisposition {
+    match handled {
+        Some(Ok(())) if late => UpdateDisposition::Ignored {
+            reason: LATE_UPDATE_IGNORED_REASON.to_owned(),
+        },
+        Some(Ok(())) => UpdateDisposition::Handled,
+        Some(Err(error)) => {
             if error.starts_with("unported fetcher route for ") {
                 UpdateDisposition::Ignored {
                     reason: format!(
                         "unsupported_type:{}",
-                        openplotva_updates::update_name(&update)
+                        openplotva_updates::update_name(update)
                     ),
                 }
-            } else if claim.attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS {
+            } else if attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS {
                 UpdateDisposition::DeadLetter {
                     error_class: "handler_error".to_owned(),
                     error,
@@ -1274,18 +1323,15 @@ where
                 }
             }
         }
-        Err(_) if claim.attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS => {
-            UpdateDisposition::DeadLetter {
-                error_class: "handler_timeout".to_owned(),
-                error: "update handler timed out".to_owned(),
-            }
-        }
-        Err(_) => UpdateDisposition::Retry {
+        None if attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS => UpdateDisposition::DeadLetter {
             error_class: "handler_timeout".to_owned(),
             error: "update handler timed out".to_owned(),
         },
-    };
-    transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
+        None => UpdateDisposition::Retry {
+            error_class: "handler_timeout".to_owned(),
+            error: "update handler timed out".to_owned(),
+        },
+    }
 }
 
 pub(crate) fn decode_telegram_update_payload(
@@ -2021,9 +2067,10 @@ mod tests {
 
     use super::{
         BoxedUpdateHandler, EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
-        InboundHistoryStoreFuture, InboundHistoryUpsert, TelegramFileMetadataStoreFuture,
-        TypedUpdateRouter, UpdateHandler, UpdateHandlerWithHistory, UpdateSource,
-        UpdateSourceBatchFuture, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
+        InboundHistoryStoreFuture, InboundHistoryUpsert, MATERIALIZED_UPDATE_MAX_ATTEMPTS,
+        TelegramFileMetadataStoreFuture, TypedUpdateRouter, UpdateDisposition, UpdateHandler,
+        UpdateHandlerWithHistory, UpdateSource, UpdateSourceBatchFuture, UpdateSourceFuture,
+        UpdateStateStore, UpdateStateStoreFuture, claimed_update_disposition,
         decode_telegram_update_payload, persist_update_state,
         process_update_with_state_and_history_store_at, process_update_with_state_store_at,
         raw_paid_media_caption, restore_paid_media_attachment_caption, restore_paid_media_context,
@@ -2926,6 +2973,51 @@ mod tests {
             vec![12353, 12354]
         );
         assert_eq!(report.coalesced_member_updates, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_update_keeps_history_without_reaching_the_router() -> Result<(), Box<dyn Error>> {
+        let history = Arc::new(HistoryStoreStub::default());
+        let inner_handler = Arc::new(HandlerStub::default());
+        let handler =
+            UpdateHandlerWithHistory::new(Arc::clone(&history), Arc::clone(&inner_handler), 0);
+
+        handler.record_late_update(sample_message_update()?).await?;
+
+        assert_eq!(history.entries().len(), 1);
+        assert!(inner_handler.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn late_update_disposition_is_ignored_only_when_recorded() -> Result<(), Box<dyn Error>> {
+        let update = sample_message_update()?;
+
+        assert_eq!(
+            claimed_update_disposition(Some(Ok(())), true, 1, &update),
+            UpdateDisposition::Ignored {
+                reason: "stale_update".to_owned()
+            }
+        );
+        assert_eq!(
+            claimed_update_disposition(Some(Ok(())), false, 1, &update),
+            UpdateDisposition::Handled
+        );
+        assert_eq!(
+            claimed_update_disposition(Some(Err("history down".to_owned())), true, 1, &update),
+            UpdateDisposition::Retry {
+                error_class: "handler_error".to_owned(),
+                error: "history down".to_owned()
+            }
+        );
+        assert_eq!(
+            claimed_update_disposition(None, true, MATERIALIZED_UPDATE_MAX_ATTEMPTS, &update),
+            UpdateDisposition::DeadLetter {
+                error_class: "handler_timeout".to_owned(),
+                error: "update handler timed out".to_owned()
+            }
+        );
         Ok(())
     }
 

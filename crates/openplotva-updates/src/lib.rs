@@ -2112,13 +2112,50 @@ pub fn should_skip_side_effects_at(
     i128::from(update_date) + i128::from(max_age.as_secs()) <= now_secs
 }
 
+/// Whether an update must run its handler however late it arrives: payments and
+/// the service messages that change who is in a chat or which id it has.
 #[must_use]
 pub fn stale_update_requires_handle(update: &TelegramUpdate) -> bool {
     matches!(
         &update.update_type,
         TelegramUpdateType::Message(message)
-            if matches!(message.data, TelegramMessageData::SuccessfulPayment(_))
+            if matches!(
+                message.data,
+                TelegramMessageData::SuccessfulPayment(_)
+                    | TelegramMessageData::RefundedPayment(_)
+                    | TelegramMessageData::NewChatMembers(_)
+                    | TelegramMessageData::LeftChatMember(_)
+                    | TelegramMessageData::MigrateToChatId(_)
+                    | TelegramMessageData::MigrateFromChatId(_)
+                    | TelegramMessageData::GroupChatCreated
+            )
     )
+}
+
+/// Telegram time of the user action an update reports. Callback, inline and
+/// payment queries carry no such time, so they never count as late.
+#[must_use]
+pub fn update_event_unix_date(update: &TelegramUpdate) -> Option<i64> {
+    match &update.update_type {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::GuestMessage(message) => {
+            Some(message.date)
+        }
+        TelegramUpdateType::EditedMessage(message) => {
+            Some(message.edit_date.unwrap_or(message.date))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an update reports a user action older than `max_age` and may skip
+/// its user-visible handling.
+#[must_use]
+pub fn update_is_late_at(update: &TelegramUpdate, max_age: Duration, now: SystemTime) -> bool {
+    let Some(event_date) = update_event_unix_date(update) else {
+        return false;
+    };
+    i128::from(event_date) + i128::from(max_age.as_secs()) <= unix_timestamp_seconds(now)
+        && !stale_update_requires_handle(update)
 }
 
 fn extract_update_chat(update: &TelegramUpdate) -> Option<&TelegramChat> {
@@ -3755,8 +3792,9 @@ mod tests {
         parse_leading_bot_command, process_update_at, process_update_with_stage_tracker_at,
         producer_update_name, producer_update_type, react_message_words,
         resolve_draw_prompt_from_message, run_update_producer_until,
-        should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
-        telegram_message_attachments, update_name,
+        should_handle_addressed_message, should_handle_random_response,
+        stale_update_requires_handle, strip_guest_address_prefix, telegram_message_attachments,
+        update_is_late_at, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, MessageData as TelegramMessageData, Update as TelegramUpdate,
@@ -6979,6 +7017,78 @@ mod tests {
         );
         assert!(!report.skipped_handle);
 
+        Ok(())
+    }
+
+    #[test]
+    fn late_update_detection_uses_telegram_event_time() -> Result<(), Box<dyn Error>> {
+        let max_age = Duration::from_secs(5 * 60);
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_300);
+
+        let late = sample_message_update_with_date(1_710_000_000)?;
+        let fresh = sample_message_update_with_date(1_710_000_001)?;
+        assert!(update_is_late_at(&late, max_age, now));
+        assert!(!update_is_late_at(&fresh, max_age, now));
+
+        let mut edited_message = sample_message_json(77, 1_700_000_000, "fixed typo");
+        edited_message["edit_date"] = json!(1_710_000_100);
+        let fresh_edit = sample_update_json(json!({
+            "update_id": 12347,
+            "edited_message": edited_message
+        }))?;
+        assert!(!update_is_late_at(&fresh_edit, max_age, now));
+        let late_edit = sample_update_json(json!({
+            "update_id": 12348,
+            "edited_message": sample_message_json(77, 1_700_000_000, "old edit")
+        }))?;
+        assert!(update_is_late_at(&late_edit, max_age, now));
+
+        let button_on_old_message = sample_update_json(json!({
+            "update_id": 12349,
+            "callback_query": {
+                "id": "query-1",
+                "from": sample_user_json(),
+                "chat_instance": "instance",
+                "data": "settings",
+                "message": sample_message_json(77, 1_700_000_000, "menu")
+            }
+        }))?;
+        assert!(!update_is_late_at(&button_on_old_message, max_age, now));
+        Ok(())
+    }
+
+    #[test]
+    fn late_payments_and_membership_changes_still_run_their_handlers() -> Result<(), Box<dyn Error>>
+    {
+        let max_age = Duration::from_secs(5 * 60);
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_003_600);
+
+        let payment = sample_successful_payment_update_with_date(1_710_000_000)?;
+        assert!(!update_is_late_at(&payment, max_age, now));
+
+        let mut refund = sample_message_json(79, 1_710_000_000, "");
+        refund
+            .as_object_mut()
+            .ok_or("message fixture is an object")?
+            .remove("text");
+        refund["refunded_payment"] = json!({
+            "currency": "XTR",
+            "total_amount": 300,
+            "invoice_payload": "subscription_42",
+            "telegram_payment_charge_id": "telegram-charge"
+        });
+        let refund = sample_update_json(json!({ "update_id": 12350, "message": refund }))?;
+        assert!(stale_update_requires_handle(&refund));
+        assert!(!update_is_late_at(&refund, max_age, now));
+
+        let mut joined = sample_message_json(80, 1_710_000_000, "");
+        joined
+            .as_object_mut()
+            .ok_or("message fixture is an object")?
+            .remove("text");
+        joined["new_chat_members"] = json!([sample_user_json()]);
+        let joined = sample_update_json(json!({ "update_id": 12351, "message": joined }))?;
+        assert!(!update_is_late_at(&joined, max_age, now));
         Ok(())
     }
 
