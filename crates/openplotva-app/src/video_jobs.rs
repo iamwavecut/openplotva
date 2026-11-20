@@ -206,9 +206,9 @@ where
     ) -> VideoJobFuture<'a, Result<Option<i32>, String>> {
         Box::pin(async move {
             let method = animation_method(&delivery)?;
-            self.telegram
-                .execute(method)
+            crate::image_jobs::within_media_job_telegram_timeout(self.telegram.execute(method))
                 .await
+                .map_err(|error| format!("send video: {error}"))?
                 .map(|message| i32::try_from(message.id).ok())
                 .map_err(|error| format!("send video: {error}"))
         })

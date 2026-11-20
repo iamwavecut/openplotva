@@ -2316,6 +2316,7 @@ dependencies = [
  "base64",
  "carapax",
  "crc",
+ "futures-util",
  "html-escape",
  "html5ever",
  "openplotva-updates",

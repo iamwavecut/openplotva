@@ -4,12 +4,11 @@
 use std::{fmt, future::Future, io::Cursor, pin::Pin, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::StreamExt;
 use image::{
     DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage, codecs::jpeg::JpegEncoder,
     imageops::FilterType, metadata::Orientation,
 };
-use openplotva_telegram::TelegramClient;
+use openplotva_telegram::{TelegramClient, TelegramFileError};
 
 use crate::image_jobs::{ImageEditError, ImageEditFuture, ImageEditRequest, ImageEditor};
 
@@ -45,32 +44,22 @@ impl TelegramImageEditReferenceLoader {
     }
 
     async fn file_path(&self, file_id: &str) -> Result<String, String> {
-        let file: carapax::types::File = self
-            .client
-            .execute(carapax::types::GetFile::new(file_id))
+        openplotva_telegram::get_telegram_file_path(&self.client, file_id)
             .await
-            .map_err(|error| format!("get telegram file: {error}"))?;
-        file.file_path
-            .map(|path| path.trim().to_owned())
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| "telegram file_path is empty".to_owned())
+            .map_err(|error| error.to_string())
     }
 
     async fn download(&self, file_path: &str) -> Result<Vec<u8>, String> {
-        let mut stream = self
-            .client
-            .download_file(file_path)
+        openplotva_telegram::download_telegram_file(&self.client, file_path, MAX_REFERENCE_BYTES)
             .await
-            .map_err(|_| "download telegram file failed".to_owned())?;
-        let mut data = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "download telegram file chunk failed".to_owned())?;
-            if data.len().saturating_add(chunk.len()) > MAX_REFERENCE_BYTES {
-                return Err("telegram image exceeds 20 MiB".to_owned());
-            }
-            data.extend_from_slice(&chunk);
-        }
-        Ok(data)
+            .map_err(|error| match error {
+                TelegramFileError::TooLarge { .. } => "telegram image exceeds 20 MiB".to_owned(),
+                TelegramFileError::DownloadTimedOut(_) => error.to_string(),
+                TelegramFileError::DownloadChunk(_) => {
+                    "download telegram file chunk failed".to_owned()
+                }
+                _ => "download telegram file failed".to_owned(),
+            })
     }
 }
 

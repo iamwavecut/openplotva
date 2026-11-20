@@ -11,7 +11,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose};
-use futures_util::StreamExt;
 use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::DialogInput;
 use openplotva_llm::{
@@ -30,7 +29,7 @@ use openplotva_taskman::{
     ASR_GPU1_QUEUE_NAME, AsrJobParams, InMemoryTaskQueue, JobType,
     asr_job_params_from_stateless_job, new_asr_job_at,
 };
-use openplotva_telegram::TelegramClient;
+use openplotva_telegram::{TelegramClient, TelegramFileError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -171,30 +170,14 @@ impl TelegramVoiceDownloader for TelegramClientVoiceDownloader {
         latest_file_id: &'a str,
     ) -> TelegramVoiceDownloadFuture<'a, Self::Error> {
         Box::pin(async move {
-            let file: carapax::types::File = self
-                .client
-                .execute(carapax::types::GetFile::new(latest_file_id))
-                .await
-                .map_err(TelegramVoiceDownloadError::GetFile)?;
-            let file_path = file
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .ok_or(TelegramVoiceDownloadError::MissingFilePath)?;
-            let mut stream = self
-                .client
-                .download_file(file_path)
-                .await
-                .map_err(TelegramVoiceDownloadError::Download)?;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(TelegramVoiceDownloadError::DownloadChunk)?;
-                if data.len().saturating_add(chunk.len()) > ASR_MAX_MEDIA_BYTES {
-                    return Err(TelegramVoiceDownloadError::FileTooLarge);
-                }
-                data.extend_from_slice(&chunk);
-            }
+            let file_path =
+                openplotva_telegram::get_telegram_file_path(&self.client, latest_file_id).await?;
+            let data = openplotva_telegram::download_telegram_file(
+                &self.client,
+                &file_path,
+                ASR_MAX_MEDIA_BYTES,
+            )
+            .await?;
             if data.is_empty() {
                 return Err(TelegramVoiceDownloadError::EmptyFile);
             }
@@ -205,18 +188,21 @@ impl TelegramVoiceDownloader for TelegramClientVoiceDownloader {
 
 #[derive(Debug, Error)]
 pub enum TelegramVoiceDownloadError {
-    #[error("get telegram file: {0}")]
-    GetFile(#[source] carapax::api::ExecuteError),
-    #[error("telegram file has no downloadable path")]
-    MissingFilePath,
-    #[error("download telegram file: {0}")]
-    Download(#[source] carapax::api::DownloadFileError),
-    #[error("download telegram file chunk: {0}")]
-    DownloadChunk(#[source] reqwest::Error),
+    #[error(transparent)]
+    File(TelegramFileError),
     #[error("empty telegram voice file")]
     EmptyFile,
     #[error("telegram media exceeds 20 MiB")]
     FileTooLarge,
+}
+
+impl From<TelegramFileError> for TelegramVoiceDownloadError {
+    fn from(error: TelegramFileError) -> Self {
+        match error {
+            TelegramFileError::TooLarge { .. } => Self::FileTooLarge,
+            error => Self::File(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -92,6 +92,10 @@ pub const AIFARM_DRAW_API_DEFAULT_CAPACITY_WAIT: StdDuration = StdDuration::from
 const AIFARM_DRAW_API_SUBMIT_MARGIN: StdDuration = StdDuration::from_secs(30);
 const AIFARM_DRAW_API_POLL_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const AIFARM_DRAW_API_MAX_POLL_RETRY_DELAY: StdDuration = StdDuration::from_secs(10);
+/// Bound for one Telegram call made by a media generation worker. The worker
+/// holds the accelerator slot while it waits, and the shared HTTP timeout is
+/// sized for the `getUpdates` long poll.
+pub const MEDIA_JOB_TELEGRAM_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
@@ -2445,11 +2449,25 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
         method: TelegramOutboundMethod,
     ) -> ImageJobEffectFuture<'a, Result<TelegramOutboundResponse, String>> {
         Box::pin(async move {
-            execute_telegram_method(self, method)
-                .await
+            within_media_job_telegram_timeout(execute_telegram_method(self, method))
+                .await?
                 .map_err(|error| error.to_string())
         })
     }
+}
+
+/// Run one Telegram call of a media generation worker within [`MEDIA_JOB_TELEGRAM_TIMEOUT`].
+pub(crate) async fn within_media_job_telegram_timeout<T>(
+    call: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(MEDIA_JOB_TELEGRAM_TIMEOUT, call)
+        .await
+        .map_err(|_| {
+            format!(
+                "telegram request timed out after {}s",
+                MEDIA_JOB_TELEGRAM_TIMEOUT.as_secs()
+            )
+        })
 }
 
 pub trait ImageJobEffects {
@@ -3465,7 +3483,7 @@ where
                 {
                     Ok(_) => filled += 1,
                     Err(error) => {
-                        tracing::debug!(%error, "progressive placeholder fill failed");
+                        tracing::warn!(chat_id, %error, "image placeholder fill failed");
                     }
                 }
             }
@@ -10169,6 +10187,17 @@ mod tests {
                     .unwrap_or(Ok(TelegramOutboundResponse::Boolean(true)))
             })
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_job_telegram_call_gives_up_after_the_bound() {
+        let started = tokio::time::Instant::now();
+
+        let hung = within_media_job_telegram_timeout(std::future::pending::<()>()).await;
+
+        assert_eq!(hung, Err("telegram request timed out after 30s".to_owned()));
+        assert_eq!(started.elapsed(), MEDIA_JOB_TELEGRAM_TIMEOUT);
+        assert_eq!(within_media_job_telegram_timeout(async { 7 }).await, Ok(7));
     }
 
     #[tokio::test]
