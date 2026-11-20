@@ -280,15 +280,10 @@ impl ImageEditFileProbe for TelegramBotFileProbe {
             if file_id.is_empty() {
                 return Ok(false);
             }
-            let file: carapax::types::File = self
-                .client
-                .execute(carapax::types::GetFile::new(file_id))
+            let file = openplotva_telegram::get_telegram_file(&self.client, file_id)
                 .await
                 .map_err(|error| Box::new(error) as ToolboxError)?;
-            Ok(file
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty()))
+            Ok(openplotva_telegram::telegram_file_path(&file).is_some())
         })
     }
 }

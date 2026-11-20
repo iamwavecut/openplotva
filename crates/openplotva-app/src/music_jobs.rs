@@ -5,7 +5,6 @@ use std::{
     collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration,
 };
 
-use futures_util::StreamExt;
 use openplotva_config::AppConfig;
 use openplotva_llm::{
     aifarm::{AifarmHttpTransport, AifarmStructuredJsonGenerator, StatusUpdate},
@@ -901,26 +900,12 @@ impl MusicTelegramSender for openplotva_telegram::TelegramClient {
         file_id: &'a str,
     ) -> MusicJobEffectFuture<'a, Result<Vec<u8>, String>> {
         Box::pin(async move {
-            let file: carapax::types::File = self
-                .execute(carapax::types::GetFile::new(file_id))
+            let file_path = openplotva_telegram::get_telegram_file_path(self, file_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            let file_path = file
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .ok_or_else(|| "telegram file_path is empty".to_owned())?;
-            let mut stream = self
-                .download_file(file_path)
+            openplotva_telegram::download_telegram_file(self, &file_path, usize::MAX)
                 .await
-                .map_err(|error| error.to_string())?;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| error.to_string())?;
-                data.extend_from_slice(&chunk);
-            }
-            Ok(data)
+                .map_err(|error| error.to_string())
         })
     }
 }

@@ -3,6 +3,7 @@
 mod callback;
 mod dedup;
 mod dispatcher;
+mod files;
 mod html;
 mod markdown;
 mod outbound;
@@ -37,6 +38,10 @@ pub use dispatcher::{
     DispatcherRestoredMessage, DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherStats,
     DispatcherWorkItem, DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome,
     QueueSnapshot, RegularDequeueOutcome, run_limiter_cleanup_until,
+};
+pub use files::{
+    TELEGRAM_FILE_DOWNLOAD_TIMEOUT, TELEGRAM_GET_FILE_TIMEOUT, TelegramFileError,
+    download_telegram_file, get_telegram_file, get_telegram_file_path, telegram_file_path,
 };
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,

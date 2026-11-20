@@ -3,7 +3,6 @@
 use std::{fmt, future::Future, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::StreamExt;
 use image::{GenericImageView, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use openplotva_config::AppConfig;
 use openplotva_core::ChatAttachment;
@@ -21,7 +20,7 @@ use openplotva_storage::{
     TelegramFileMetadataUpsert, TelegramFileRecord, TelegramFileVisionUpdate,
     VisionDescriptionUpdate,
 };
-use openplotva_telegram::TelegramClient;
+use openplotva_telegram::{TelegramClient, TelegramFileError};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -683,33 +682,27 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
     ) -> TelegramVisionDataUrlFuture<'a, Self::Error> {
         Box::pin(async move {
             let video = vision_media_is_video(media_kind, mime_type);
-            let file: carapax::types::File = self
-                .client
-                .execute(carapax::types::GetFile::new(latest_file_id))
-                .await
-                .map_err(TelegramVisionDataUrlError::GetFile)?;
-            let file_path = file
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .ok_or(TelegramVisionDataUrlError::MissingFilePath)?;
-            let mut stream = self
-                .client
-                .download_file(file_path)
-                .await
-                .map_err(TelegramVisionDataUrlError::Download)?;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(TelegramVisionDataUrlError::DownloadChunk)?;
-                if video && data.len().saturating_add(chunk.len()) > VISION_MAX_VIDEO_BYTES {
-                    return Err(TelegramVisionDataUrlError::VideoTooLarge);
-                }
-                if !video && data.len().saturating_add(chunk.len()) > VISION_MAX_IMAGE_BYTES {
-                    return Err(TelegramVisionDataUrlError::ImageTooLarge);
-                }
-                data.extend_from_slice(&chunk);
-            }
+            let file_path =
+                openplotva_telegram::get_telegram_file_path(&self.client, latest_file_id)
+                    .await
+                    .map_err(TelegramVisionDataUrlError::File)?;
+            let max_bytes = if video {
+                VISION_MAX_VIDEO_BYTES
+            } else {
+                VISION_MAX_IMAGE_BYTES
+            };
+            let data =
+                openplotva_telegram::download_telegram_file(&self.client, &file_path, max_bytes)
+                    .await
+                    .map_err(|error| match error {
+                        TelegramFileError::TooLarge { .. } if video => {
+                            TelegramVisionDataUrlError::VideoTooLarge
+                        }
+                        TelegramFileError::TooLarge { .. } => {
+                            TelegramVisionDataUrlError::ImageTooLarge
+                        }
+                        error => TelegramVisionDataUrlError::File(error),
+                    })?;
             if video {
                 telegram_vision_video_data_url_from_bytes(&data, mime_type)
                     .map_err(TelegramVisionDataUrlError::Build)
@@ -727,18 +720,9 @@ impl TelegramVisionDataUrlProvider for TelegramClientVisionDataUrlProvider {
 /// Error returned by concrete direct image payload preparation.
 #[derive(Debug, Error)]
 pub enum TelegramVisionDataUrlError {
-    /// `getFile` failed.
-    #[error("get telegram file: {0}")]
-    GetFile(#[source] carapax::api::ExecuteError),
-    /// Telegram returned no downloadable path.
-    #[error("telegram file_path is empty")]
-    MissingFilePath,
-    /// Download setup failed.
-    #[error("download telegram file: {0}")]
-    Download(#[source] carapax::api::DownloadFileError),
-    /// Download stream failed.
-    #[error("download telegram file chunk: {0}")]
-    DownloadChunk(#[source] reqwest::Error),
+    /// `getFile` or the download failed or ran out of time.
+    #[error(transparent)]
+    File(TelegramFileError),
     /// Video exceeded the Bot API download contract and local memory bound.
     #[error("telegram video exceeds 20 MiB")]
     VideoTooLarge,

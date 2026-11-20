@@ -8,14 +8,14 @@
 use std::{collections::BTreeSet, future::Future, path::Path, pin::Pin, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::StreamExt;
 use openplotva_dialog::{PythonRunRequest, TOOL_RESULT_STATUS_OK, ToolContext, ToolResult};
 use openplotva_sandbox::api::{InputFile, RunRequest, RunResponse, Termination};
 use openplotva_sandbox::client::{SandboxClient, SandboxClientError};
 use openplotva_storage::{PostgresTelegramFileStore, TelegramFileRecord};
 use openplotva_telegram::{
     AudioMessageRequest, AudioSource, ChatRef, MediaGroupMessageRequest, MediaGroupPhotoItem,
-    PhotoMessageRequest, PhotoSource, ReplyParametersPlan, TelegramClient, UploadMessageRequest,
+    PhotoMessageRequest, PhotoSource, ReplyParametersPlan, TelegramClient, TelegramFileError,
+    UploadMessageRequest,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -689,9 +689,7 @@ impl TelegramSandboxIo {
     }
 
     async fn download(&self, file_id: &str) -> Result<(Vec<u8>, String), ChatFileError> {
-        let file: carapax::types::File = self
-            .telegram
-            .execute(carapax::types::GetFile::new(file_id))
+        let file = openplotva_telegram::get_telegram_file(&self.telegram, file_id)
             .await
             .map_err(|error| ChatFileError::Failed(format!("getFile failed: {error}")))?;
         if let Some(size) = file.file_size.and_then(|size| u64::try_from(size).ok())
@@ -702,32 +700,19 @@ impl TelegramSandboxIo {
                 limit: MAX_INPUT_FILE_BYTES,
             });
         }
-        let path = file
-            .file_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| ChatFileError::Failed("Telegram returned no file path".to_owned()))?
-            .to_owned();
-        let mut stream = self
-            .telegram
-            .download_file(&path)
+        let path = openplotva_telegram::telegram_file_path(&file)
+            .ok_or_else(|| ChatFileError::Failed("Telegram returned no file path".to_owned()))?;
+        let limit = usize::try_from(MAX_INPUT_FILE_BYTES).unwrap_or(usize::MAX);
+        let bytes = openplotva_telegram::download_telegram_file(&self.telegram, path, limit)
             .await
-            .map_err(|error| ChatFileError::Failed(format!("download failed: {error}")))?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|error| ChatFileError::Failed(format!("download failed: {error}")))?;
-            let size = (bytes.len() + chunk.len()) as u64;
-            if size > MAX_INPUT_FILE_BYTES {
-                return Err(ChatFileError::TooLarge {
-                    size,
+            .map_err(|error| match error {
+                TelegramFileError::TooLarge { received, .. } => ChatFileError::TooLarge {
+                    size: received as u64,
                     limit: MAX_INPUT_FILE_BYTES,
-                });
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok((bytes, file_extension(&path)))
+                },
+                error => ChatFileError::Failed(format!("download failed: {error}")),
+            })?;
+        Ok((bytes, file_extension(path)))
     }
 
     async fn send(
