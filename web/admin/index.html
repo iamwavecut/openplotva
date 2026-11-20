@@ -6573,6 +6573,14 @@
             });
         }
 
+        // Tool result statuses from openplotva-dialog: only `failed` is a failure;
+        // `queued` hands work to a background job and `noop` changes nothing.
+        const LLMD_TOOL_STATUS_TONES = { ok: 'success', executed: 'success', queued: 'info', noop: 'neutral', failed: 'danger' };
+
+        function llmdToolStatusTone(status) {
+            return LLMD_TOOL_STATUS_TONES[status] || 'neutral';
+        }
+
         // Tool results are JSON envelopes; the summary line shows their message.
         function llmdToolSnippet(text) {
             try {
@@ -6599,9 +6607,9 @@
             }
             const args = tool.args_json !== undefined && tool.args_json !== null ? tool.args_json : call.args;
             const status = String(tool.status || (item ? 'ok' : '') || '');
-            const failed = status && status !== 'ok';
+            const failed = status === 'failed';
             const facts = [];
-            if (status) facts.push(PL.badge(status, failed ? 'danger' : 'success'));
+            if (status) facts.push(PL.badge(status, llmdToolStatusTone(status)));
             if (Number(tool.duration_ms) > 0) facts.push(formatAnalyticsMs(tool.duration_ms));
             const resultText = result === undefined || result === null ? '' : llmdPretty(result);
             return llmdStep('tool', {
@@ -6759,7 +6767,7 @@
                     const tool = list[index];
                     const child = {
                         kind: 'tool', label: tool.name || 'tool', mono: true, start: times.start, end: times.end,
-                        anchor: `llmd-step-tool-${round.seq}-${index}`, tone: tool.status && tool.status !== 'ok' ? 'fail' : '',
+                        anchor: `llmd-step-tool-${round.seq}-${index}`, tone: tool.status === 'failed' ? 'fail' : '',
                         children: [], hosted: 0,
                     };
                     span.children.push(child);
