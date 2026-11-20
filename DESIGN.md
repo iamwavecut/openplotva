@@ -5,7 +5,7 @@
 | **Status** | Adopted |
 | **Scope** | `web/admin/` (the runtime admin console). The Settings WebApp (`web/settings/`, Framework7 + Telegram theme) is explicitly out of scope. |
 | **Owners** | OpenPlotva maintainers |
-| **Last updated** | 2026-08-03 |
+| **Last updated** | 2026-10-11 |
 | **Source of truth** | `web/admin/tokens.css`, `web/admin/components.css`, `web/admin/components.js` |
 | **Enforced by** | guard tests in `crates/openplotva-web/src/lib.rs`; the `openplotva-design-system-review` skill |
 | **Related** | `AGENTS.md` (§ Web UI / Design System), `docs/admin-ux-audit.md`, `skills/openplotva-design-system-review/SKILL.md` |
@@ -111,11 +111,12 @@ Three tiers. Components reference **only** the semantic/extended tiers.
 |---|---|---|---|
 | Primitive | `--p-*` | Raw, theme-agnostic palette. Never referenced by components. | `--p-slate-900`, `--p-indigo-500`, `--p-cyan-400`, `--p-red-500` |
 | Semantic | `--c-*`, `--sp-*`, `--rad-*`, `--fs-*`, `--fw-*`, `--lh-*`, `--elev-*`, `--dur-*`, `--ease-*`, `--z-*` | Meaning-based aliases — the vocabulary components use. | `--c-bg-card`, `--c-primary`, `--c-danger`, `--c-text-main`, `--c-focus-ring`, `--sp-4`, `--rad-md`, `--fs-base`, `--elev-2`, `--z-modal` |
-| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--c-ent-*`, `--c-role-*`, `--c-slot-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, routing entity/role/slot categories, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--c-ent-pool`, `--c-role-overflow`, `--c-slot-busy`, `--grad-brand` |
+| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--c-ent-*`, `--c-role-*`, `--c-slot-*`, `--c-flow-*`, `--c-step-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, routing entity/role/slot categories, LLM run kinds and run-timeline step kinds — one hue per actor: model, tools, people, memory, runtime — brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--c-ent-pool`, `--c-role-overflow`, `--c-slot-busy`, `--grad-brand` |
 
 Token families:
 
-- **Color** — surfaces (`--c-bg-app/sidebar/card/card-hover/input/elevated`), borders, brand
+- **Color** — surfaces (`--c-bg-app/sidebar/card/card-hover/input/elevated`, plus `--c-bg-raised` for a
+  block raised inside a card, distinct from the card in both themes), borders, brand
   (`--c-primary`, `--c-primary-hover`, `--c-accent`), state (`--c-success/warning/danger/info`) with
   tinted-surface variants (`--c-*-bg`, `--c-*-bg-strong`, derived via `color-mix`), text
   (`--c-text-main/sec/muted/on-primary`), and interaction (`--c-focus-ring`, `--c-scrim`,
@@ -126,7 +127,7 @@ Token families:
   weights `--fw-normal … --fw-extrabold`; line-heights `--lh-tight/snug/normal`.
 - **Elevation** — `--elev-0 … --elev-3`, `--elev-modal`, `--elev-glow-brand`.
 - **Motion** — `--dur-instant/quick/base`, `--ease-out`; legacy aliases `--trans-fast/norm`.
-- **Z-index** — a named ladder `--z-base/resizer/sidebar/mobile-sidebar/dropdown/overlay/modal/toast`
+- **Z-index** — a named ladder `--z-base/resizer/sticky/sidebar/mobile-sidebar/dropdown/overlay/modal/toast`
   (formalizes the old `5/10/100/9999` magic numbers).
 - **Layout** — `--w-sidebar`, `--h-header`.
 
@@ -155,6 +156,8 @@ working — tokens were only added, never renamed.
 | `pl-timeline` | — (bitemporal) | JS prop `data = {lanes:[{key,label}], items:[{id,lane,label,card_type,validFrom,validUntil,recordedAt,status,competing}], now, asOf}`; emits `pl:item-click {id}`, `pl:asof-change {date}` | SVG swimlanes; valid bars, recorded markers, superseded muted, competing ring, now + as-of lines; click-to-set as-of; `role=img` |
 | `pl-slotbar` | — (pool occupancy) | attrs/props `capacity` (int; absent = unlimited), `busy`, `blocked`, `size=mini\|card\|cockpit`; pure renderer, re-renders on attribute change | discrete cells (`--c-slot-busy/free/blocked`) when capacity ≤ 16, continuous bar + `busy/capacity` text otherwise; `role=img` + "N of M slots busy" label; busy pulse gated behind `prefers-reduced-motion: no-preference` |
 | `pl-flow` | — (routing DAG) | JS prop `data = {nodes:[{id,kind:workflow\|model\|provider\|pool,label,state?,badge?}], edges:[{from,to,kind:primary\|fallback\|overflow\|canary\|shadow\|attach,weight?,order?,engaged?}]}`; emits `pl:node-click {id,kind}` | deterministic layered layout (fixed columns by kind), cubic bezier edges stroked by `--c-role-*` (width ∝ weight, overflow dashed unless engaged), nodes tinted by `--c-ent-*` with breaker/capacity state rings; nodes focusable (`tabindex=0`, Enter activates); horizontal scroll container |
+| `pl-disclosure` | ad-hoc ghost-button toggles + hidden bodies | `PL.disclosure({summary, meta, open, render, content, className})`; props `summary`/`meta` (Node\|string), `content` (Node), `render` (lazy body, runs once on first open), `open` get/set, `toggle()`; emits `pl:toggle {open}`; `data-raw` opts a block out of "expand all" | one-line head is the toggle (`role=button`, `aria-expanded`, `aria-controls`, Enter/Space); controls inside the head and text selections do not toggle; chevron rotates; body `hidden` until open |
+| `pl-constellation` | — (recall map) | JS prop `data = {center:{label,title}, nodes:[{id,mark,title,group,color,weight,size,ring}], edges:[{from,to,kind,color,dashed}], legend:[{group,label,color,count}], rings}`; `highlight(id)`, `highlightGroup(group)`, `select(id)`; emits `pl:node-hover {id\|null}`, `pl:node-click {id}` | radial SVG: distance from the centre encodes weight (stronger = closer), one sector per group, node size ∝ `size`, `ring` draws the competing stroke, `mark` (rank number) inside the node pairs it with an adjacent list; hover/focus dims non-neighbours; nodes focusable (`tabindex=0`, Enter activates); legend hover highlights a group |
 | `pl-diff-list` | — (model import diff) | JS prop `data = {groups:[{key:new\|imported\|gone, title, items:[{name,selected?,meta?}]}]}`; `selected` getter; emits `pl:diff-change {selected}` | "new" groups selectable via per-row `pl-toggle` + a select-all toggle; other groups informational; sticky group headers |
 
 Actions are wired by **event delegation**: a single document listener maps `[data-action="fn"]`

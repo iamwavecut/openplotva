@@ -37,25 +37,25 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "tokens.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/tokens.css"),
-        sha256: "12042e8934419ae96b20aefe0f1727aed16332ca307a88ef94b2fc75681f978f",
+        sha256: "4e4102c03abe5ba652a237063f31a24a0c63ba5858f866763bb582e9f056a0e6",
     },
     StaticAsset {
         path: "admin.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/admin.css"),
-        sha256: "6b5634c713216fd7e0691454102469c80bf7d65e3c1cbfb8d5cc5cf2bf41325d",
+        sha256: "dc19085f17c549bd66708712ed89b090da83dd30a19d21a055e3865403236134",
     },
     StaticAsset {
         path: "components.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/components.css"),
-        sha256: "c61a8a304c1f8c60cd61c23a3b5024eb37e8e439c8700abaad12e508e18ba04f",
+        sha256: "3fca0a45cb8e832ec20f790ddc6560b70b844af2c497eba3614220be21f3ffbb",
     },
     StaticAsset {
         path: "components.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/components.js"),
-        sha256: "ea15cfe0de29d60938e8e76768075a7f647c60827af02f1656bb72303b46868f",
+        sha256: "7180f55f9f01ffbf8a639810e40565061b997b332c58a5085e1a25d9afe6dc58",
     },
     StaticAsset {
         path: "favicon.svg",
@@ -67,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "45da119b5a77937c8316cf1aa5844f9fc5fdf5376231c4985e0395d0e7ac2562",
+        sha256: "4c85e85dc3fdc3bf008028a93bf70f12ac75809d8223016da161cd682287bc74",
     },
     StaticAsset {
         path: "login.html",

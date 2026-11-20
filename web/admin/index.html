@@ -881,9 +881,23 @@
                             <div class="llmd-detail-head">
                                 <pl-button variant="outline" size="sm"
                                     data-action="llmdCloseDetail">← Runs</pl-button>
+                                <pl-button-group class="llmd-pager">
+                                    <pl-button variant="ghost" size="sm" data-action="llmdStepRun" data-args="[-1]"
+                                        aria-label="Newer run" title="Newer run (k)"><i class="ti ti-arrow-up"
+                                            aria-hidden="true"></i></pl-button>
+                                    <pl-button variant="ghost" size="sm" data-action="llmdStepRun" data-args="[1]"
+                                        aria-label="Older run" title="Older run (j)"><i class="ti ti-arrow-down"
+                                            aria-hidden="true"></i></pl-button>
+                                </pl-button-group>
                                 <span id="llmd-detail-title" class="llmd-detail-title"></span>
-                                <pl-button variant="outline" size="sm"
-                                    data-action="llmdCopyRunJSON">Copy JSON</pl-button>
+                                <pl-button-group class="llmd-detail-actions">
+                                    <pl-button variant="ghost" size="sm" data-action="llmdExpandAll"
+                                        data-args="[true]">Expand all</pl-button>
+                                    <pl-button variant="ghost" size="sm" data-action="llmdExpandAll"
+                                        data-args="[false]">Collapse all</pl-button>
+                                    <pl-button variant="outline" size="sm"
+                                        data-action="llmdCopyRunJSON">Copy JSON</pl-button>
+                                </pl-button-group>
                             </div>
                             <div id="llmd-detail-body" class="llmd-detail-body"></div>
                         </pl-drawer>
@@ -5201,20 +5215,28 @@
             return { label: 'ok', tone: 'success', pulse: false };
         }
 
+        function llmdOriginChat(origin) {
+            if (origin.chat_title) return origin.chat_title;
+            if (!origin.chat_id) return '';
+            return origin.user_id && String(origin.chat_id) === String(origin.user_id) ? 'private chat' : `chat ${origin.chat_id}`;
+        }
+
         function llmdBuildRow(run) {
             const kind = llmdKind(run);
+            const key = run.id !== undefined ? run.id : run.run_id;
             const row = PL.el('div', {
                 class: 'list-item llmd-row',
                 role: 'button',
                 tabindex: '0',
                 'data-action': 'llmdOpenDetail',
-                'data-args': JSON.stringify([run.id !== undefined ? run.id : run.run_id]),
+                'data-args': JSON.stringify([key]),
             });
             row.setAttribute('data-kind', kind);
-            if (llmdState.openRunId !== null && String(llmdState.openRunId) === String(run.id !== undefined ? run.id : run.run_id)) {
+            if (llmdState.openRunId !== null && String(llmdState.openRunId) === String(key)) {
                 row.classList.add('active');
             }
 
+            const origin = run.origin || {};
             const top = PL.el('div', { class: 'llmd-row-top' });
             const time = PL.el('span', { class: 'llmd-row-time mono' }, llmdFormatTime(run.started_at));
             time.title = String(run.started_at || '');
@@ -5228,47 +5250,41 @@
             outcomeEl.classList.add('llmd-outcome');
             if (badge.pulse) outcomeEl.classList.add('llmd-pulse');
             top.append(outcomeEl);
+            const where = [llmdOriginChat(origin), origin.user_full_name || (origin.user_id ? `u:${origin.user_id}` : '')]
+                .filter(Boolean).join(' · ');
+            if (where) top.append(PL.el('span', { class: 'llmd-row-origin' }, where));
+            const right = PL.el('span', { class: 'llmd-row-right mono' });
             const providers = llmdProviders(run);
             if (providers.length) {
                 const label = providers.length > 1 ? `${providers[0]} +${providers.length - 1}` : providers[0];
-                top.append(PL.el('span', { class: 'llmd-row-provider mono' }, label));
+                right.append(PL.el('span', { class: 'llmd-row-provider' }, label));
             }
-            const right = PL.el('span', { class: 'llmd-row-right mono' });
             const duration = llmdDuration(run);
             if (duration !== null) right.append(PL.el('span', {}, formatAnalyticsMs(duration)));
             const roundsCount = (run.totals && run.totals.rounds) || (run.rounds || []).length || 0;
             right.append(PL.el('span', {}, `×${roundsCount}`));
+            const tokens = llmdFormatTokens(run.totals && run.totals.total_tokens);
+            if (tokens) right.append(PL.el('span', {}, `${tokens} tok`));
             top.append(right);
             row.append(top);
 
-            const origin = run.origin || {};
-            const originParts = [];
-            originParts.push(origin.chat_title || (origin.chat_id ? `chat ${origin.chat_id}` : 'no chat'));
-            if (origin.thread_id) originParts.push(`thread ${origin.thread_id}`);
-            if (origin.user_id) originParts.push(`u:${origin.user_id}`);
-            const originLine = PL.el('div', { class: 'llmd-row-origin' }, originParts.join(' · '));
             if (origin.trigger_preview) {
-                originLine.append(PL.el('span', { class: 'llmd-row-trigger' }, ` «${compactLLMText(origin.trigger_preview, 90)}»`));
+                row.append(PL.el('div', { class: 'llmd-row-trigger' }, compactLLMText(origin.trigger_preview, 220)));
             }
-            row.append(originLine);
-
-            const chips = PL.el('div', { class: 'llmd-row-chips' });
-            for (const tool of (run.tools || [])) {
-                const chipEl = PL.el('span', { class: 'llmd-tool-chip' }, tool.count > 1 ? `${tool.name} ×${tool.count}` : tool.name);
-                chipEl.setAttribute('data-status', String(tool.status || 'ok'));
-                chips.append(chipEl);
-            }
-            const tokens = llmdFormatTokens(run.totals && run.totals.total_tokens);
-            if (tokens) chips.append(PL.el('span', { class: 'llmd-token-chip mono' }, `${tokens} tok`));
-            if (chips.childNodes.length) row.append(chips);
-
             const failed = llmdRunFailed(run);
             const previewText = failed
                 ? (run.error || (run.outcome && run.outcome.reason) || 'failed')
                 : (run.preview || '');
-            if (previewText) {
-                row.append(PL.el('div', {
-                    class: failed ? 'llmd-preview llmd-preview-error' : 'llmd-preview' }, compactLLMText(previewText, 160)));
+            const tools = run.tools || [];
+            if (previewText || tools.length) {
+                const answer = PL.el('div', { class: failed ? 'llmd-row-answer llmd-preview-error' : 'llmd-row-answer' });
+                for (const tool of tools) {
+                    const chipEl = PL.el('span', { class: 'llmd-tool-chip' }, tool.count > 1 ? `${tool.name} ×${tool.count}` : tool.name);
+                    chipEl.setAttribute('data-status', String(tool.status || 'ok'));
+                    answer.append(chipEl);
+                }
+                if (previewText) answer.append(PL.el('span', { class: 'llmd-row-answer-text' }, compactLLMText(previewText, 220)));
+                row.append(answer);
             }
             return row;
         }
@@ -5324,9 +5340,18 @@
             const drawer = document.getElementById('llmd-detail');
             if (drawer) drawer.addEventListener('pl:close', () => llmdCloseDetail());
             document.addEventListener('keydown', event => {
-                if (event.key !== 'Escape') return;
                 const detail = document.getElementById('llmd-detail');
-                if (detail && detail.open) llmdCloseDetail();
+                if (!detail || !detail.open) return;
+                const pane = document.getElementById('llm');
+                if (!pane || !pane.classList.contains('active')) return;
+                if (event.key === 'Escape') {
+                    llmdCloseDetail();
+                    return;
+                }
+                if (event.metaKey || event.ctrlKey || event.altKey) return;
+                if (event.target.closest && event.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+                if (event.key === 'j') llmdStepRun(1);
+                else if (event.key === 'k') llmdStepRun(-1);
             });
             const list = document.getElementById('llmd-list');
             if (list) {
@@ -5373,9 +5398,18 @@
             await loadLLMDialogs(true);
         }
 
-        // ---- Detail ----
+        // ---- Detail: run inspector ----
+        // A run reads top to bottom as one timeline: the trigger message, what
+        // memory recalled, the prompt the model actually received, every round
+        // with its output, the tools it ran and the chat messages that arrived
+        // meanwhile, then the outcome. Each round's request repeats the whole
+        // prompt, so the prompt is shown once and later rounds only add the
+        // messages appended since the previous request.
+        let llmdOpenRun = null;
+
         function llmdCloseDetail() {
             llmdState.openRunId = null;
+            llmdOpenRun = null;
             const drawer = document.getElementById('llmd-detail');
             const browse = document.getElementById('llmd-browse');
             if (drawer) drawer.open = false;
@@ -5387,17 +5421,20 @@
 
         async function llmdOpenDetail(id) {
             const scroller = document.querySelector('.content-scroll');
-            llmdState.browseScroll = scroller ? scroller.scrollTop : 0;
+            const browse = document.getElementById('llmd-browse');
+            if (browse && !browse.hidden) llmdState.browseScroll = scroller ? scroller.scrollTop : 0;
             llmdState.openRunId = id;
             const drawer = document.getElementById('llmd-detail');
-            const browse = document.getElementById('llmd-browse');
             const body = document.getElementById('llmd-detail-body');
+            const title = document.getElementById('llmd-detail-title');
             if (!drawer || !body) return;
             if (browse) browse.hidden = true;
             drawer.open = true;
             if (scroller) scroller.scrollTop = 0;
+            if (title) title.replaceChildren();
             PL.skeleton(body, { rows: 6 });
             const data = await apiCall(`/llm/dialogs/detail?id=${encodeURIComponent(id)}`);
+            if (String(llmdState.openRunId) !== String(id)) return;
             if (!data || !data.run) {
                 if (data === null) {
                     PL.error(body, { title: 'Failed to load the run', onRetry: () => llmdOpenDetail(id) });
@@ -5409,77 +5446,526 @@
             llmdRenderDetail(data.run);
         }
 
-        function llmdMetaGrid(run) {
-            const grid = PL.el('div', { class: 'llmd-meta' });
-            const cell = (label, value, danger) => {
-                if (value === null || value === undefined || value === '') return;
-                const box = PL.el('div', { class: 'llmd-meta-cell' });
-                box.append(PL.el('div', { class: 'llmd-meta-label' }, label));
-                box.append(PL.el('div', { class: danger ? 'llmd-meta-value llmd-kpi-danger' : 'llmd-meta-value' }, String(value)));
-                grid.append(box);
-            };
-            const origin = run.origin || {};
-            cell('chat', origin.chat_title ? `${origin.chat_title} (${origin.chat_id})` : origin.chat_id);
-            cell('thread', origin.thread_id);
-            cell('user', origin.user_full_name ? `${origin.user_full_name} (${origin.user_id})` : origin.user_id);
-            cell('trigger message', origin.trigger_message_id);
-            cell('queue', origin.queue_name);
-            cell('started', run.started_at);
-            const duration = llmdDuration(run);
-            cell('duration', duration !== null ? formatAnalyticsMs(duration) : null);
-            const totals = run.totals || {};
-            cell('rounds', totals.rounds || (run.rounds || []).length || null);
-            cell('tokens', llmdFormatTokens(totals.total_tokens));
-            cell('tool calls', totals.tool_calls);
-            const outcome = run.outcome || {};
-            cell('outcome', [outcome.outcome, outcome.reason].filter(Boolean).join(' · '));
-            cell('sent parts', outcome.sent_message_parts);
-            cell('error', run.error, true);
-            return grid;
+        function llmdRunKey(run) {
+            return String(run.id !== undefined ? run.id : run.run_id);
         }
 
-        function llmdFlowStrip(run) {
-            const strip = PL.el('div', { class: 'llmd-strip', role: 'group', 'aria-label': 'Run rounds' });
-            for (const [index, round] of (run.rounds || []).entries()) {
-                const pip = PL.el('pl-button', {
-                    class: 'llmd-pip',
-                    'data-action': 'llmdScrollToRound',
-                    'data-args': JSON.stringify([index]),
-                    'aria-label': `Round ${index + 1}`,
-                });
-                if (round.is_aux) pip.classList.add('llmd-pip-aux');
-                if (round.error) pip.classList.add('llmd-pip-error');
-                if (round.sent === 'final') pip.classList.add('llmd-pip-final');
-                pip.style.setProperty('--pip-c', llmdModelColorVar(round.model || round.provider));
-                pip.append(PL.el('span', {}, String(index + 1)));
-                strip.append(pip);
-                for (const tool of (round.tool_calls || [])) {
-                    const glyph = PL.el('span', { class: 'llmd-strip-tool' }, tool.name);
-                    glyph.setAttribute('data-status', String(tool.status || 'ok'));
-                    strip.append(glyph);
+        function llmdStepRun(delta) {
+            const runs = llmdFilteredRuns(false);
+            if (!runs.length) return;
+            const index = runs.findIndex(run => llmdRunKey(run) === String(llmdState.openRunId));
+            const next = runs[index < 0 ? 0 : index + Number(delta)];
+            if (!next) {
+                PL.toast(Number(delta) < 0 ? 'This is the newest run' : 'This is the oldest loaded run', 'info');
+                return;
+            }
+            llmdOpenDetail(next.id !== undefined ? next.id : next.run_id);
+        }
+
+        function llmdExpandAll(open) {
+            const body = document.getElementById('llmd-detail-body');
+            if (!body) return;
+            // Opening renders lazy bodies that can hold further disclosures, so
+            // repeat a few passes. Raw payload trees stay as they are.
+            for (let pass = 0; pass < 5; pass++) {
+                const targets = [...body.querySelectorAll('pl-disclosure')]
+                    .filter(d => !d.hasAttribute('data-raw') && d.open !== !!open);
+                if (!targets.length) break;
+                targets.forEach(d => { d.open = !!open; });
+                if (!open) break;
+            }
+        }
+
+        // ---- formatting ----
+        function llmdParseTime(at) {
+            if (!at) return null;
+            const normalized = String(at).replace(/(\.\d{3})\d+/, '$1');
+            const ms = Date.parse(normalized);
+            return Number.isNaN(ms) ? null : ms;
+        }
+
+        function llmdClock(at) {
+            const ms = llmdParseTime(at);
+            if (ms === null) return String(at || '');
+            const date = new Date(ms);
+            return [date.getHours(), date.getMinutes(), date.getSeconds()].map(v => String(v).padStart(2, '0')).join(':');
+        }
+
+        function llmdOffset(ms) {
+            if (ms === null || ms === undefined || Number.isNaN(ms)) return '';
+            const sign = ms < 0 ? '−' : '+';
+            const abs = Math.abs(ms);
+            if (abs >= 60000) return `${sign}${Math.floor(abs / 60000)}m ${Math.round((abs % 60000) / 1000)}s`;
+            if (abs >= 10000) return `${sign}${Math.round(abs / 1000)}s`;
+            return `${sign}${(abs / 1000).toFixed(1)}s`;
+        }
+
+        function llmdChars(n) {
+            const value = Number(n || 0);
+            return value >= 1000 ? `${(value / 1000).toFixed(1)}k chars` : `${value} chars`;
+        }
+
+        function llmdPercent(value) {
+            return `${Math.round(Math.max(0, Math.min(1, Number(value || 0))) * 100)}%`;
+        }
+
+        function llmdPretty(value) {
+            const parsed = normalizeRawJSONValue(value);
+            if (parsed && typeof parsed === 'object') return safeStringify(parsed);
+            return String(parsed === null || parsed === undefined ? '' : parsed);
+        }
+
+        // ---- tolerant XML reader for prompt envelopes ----
+        // Prompt text is model input, not a document: tags may be unbalanced and
+        // text is entity-escaped. Unknown or unmatched closing tags stay text.
+        const LLMD_XML_TAG = /<(\/?)([A-Za-z_][\w.:-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
+
+        function llmdDecodeEntities(text) {
+            return String(text).replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (match, code) => {
+                if (code === 'amp') return '&';
+                if (code === 'lt') return '<';
+                if (code === 'gt') return '>';
+                if (code === 'quot') return '"';
+                if (code === 'apos') return "'";
+                const point = code[1] === 'x' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+                try { return String.fromCodePoint(point); } catch (_) { return match; }
+            });
+        }
+
+        function llmdParseAttrs(text) {
+            const attrs = {};
+            const re = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+            let m;
+            while ((m = re.exec(text || ''))) attrs[m[1]] = llmdDecodeEntities(m[2] !== undefined ? m[2] : m[3]);
+            return attrs;
+        }
+
+        function llmdParseXml(text) {
+            const root = { tag: '#root', attrs: {}, children: [] };
+            const stack = [root];
+            const source = String(text || '');
+            const pushText = chunk => {
+                if (chunk) stack[stack.length - 1].children.push({ text: llmdDecodeEntities(chunk) });
+            };
+            LLMD_XML_TAG.lastIndex = 0;
+            let last = 0;
+            let m;
+            while ((m = LLMD_XML_TAG.exec(source))) {
+                pushText(source.slice(last, m.index));
+                last = LLMD_XML_TAG.lastIndex;
+                const [, closing, tag, attrText, selfClose] = m;
+                if (closing) {
+                    let i = stack.length - 1;
+                    while (i > 0 && stack[i].tag !== tag) i--;
+                    if (i > 0) stack.length = i;
+                    else pushText(m[0]);
+                    continue;
+                }
+                const node = { tag, attrs: llmdParseAttrs(attrText), children: [] };
+                stack[stack.length - 1].children.push(node);
+                if (!selfClose) stack.push(node);
+            }
+            pushText(source.slice(last));
+            return root;
+        }
+
+        function llmdChild(node, tag) {
+            return node ? (node.children || []).find(child => child.tag === tag) || null : null;
+        }
+
+        function llmdChildren(node, tag) {
+            return node ? (node.children || []).filter(child => child.tag === tag) : [];
+        }
+
+        function llmdNodeText(node) {
+            if (!node) return '';
+            if (!node.tag) return node.text || '';
+            return (node.children || []).map(llmdNodeText).join('');
+        }
+
+        function llmdElements(node) {
+            return (node && node.children || []).filter(child => child.tag);
+        }
+
+        function llmdTagLabel(node) {
+            const attrs = Object.entries(node.attrs || {}).map(([key, value]) => ` ${key}="${value}"`).join('');
+            return `${node.tag}${attrs}`;
+        }
+
+        // ---- request / response normalization ----
+        function llmdContentText(content) {
+            if (typeof content === 'string') return content;
+            if (Array.isArray(content)) {
+                return content.map(part => {
+                    if (!part) return '';
+                    if (typeof part === 'string') return part;
+                    if (typeof part.text === 'string') return part.text;
+                    if (part.type === 'tool_result') return llmdContentText(part.content);
+                    return '';
+                }).filter(Boolean).join('\n');
+            }
+            if (content && typeof content === 'object' && typeof content.text === 'string') return content.text;
+            return '';
+        }
+
+        function llmdContentMedia(content) {
+            if (!Array.isArray(content)) return [];
+            const media = [];
+            for (const part of content) {
+                if (!part || typeof part !== 'object' || ['text', 'tool_result', 'tool_use', 'thinking'].includes(part.type)) continue;
+                const ref = part.image_url || part.video_url || part.input_audio || part.source || part.file || {};
+                const url = typeof ref === 'string' ? ref : (ref.url || ref.data || '');
+                media.push({ type: String(part.type || 'media'), url: String(url || ''), size: String(url || '').length });
+            }
+            return media;
+        }
+
+        function llmdNormalizeMessage(message) {
+            const m = message || {};
+            const toolCalls = [];
+            for (const call of (Array.isArray(m.tool_calls) ? m.tool_calls : [])) {
+                const fn = call && call.function || {};
+                toolCalls.push({ id: call && call.id || '', name: fn.name || call && call.name || 'tool', args: fn.arguments !== undefined ? fn.arguments : call && call.arguments });
+            }
+            if (Array.isArray(m.content)) {
+                for (const part of m.content) {
+                    if (part && part.type === 'tool_use') toolCalls.push({ id: part.id || '', name: part.name || 'tool', args: part.input });
                 }
             }
-            return strip;
+            let key;
+            try { key = JSON.stringify([m.role, m.content, m.tool_calls || null, m.tool_call_id || null]); } catch (_) { key = `${m.role}:${Math.random()}`; }
+            return {
+                role: String(m.role || 'user'),
+                text: llmdContentText(m.content),
+                media: llmdContentMedia(m.content),
+                cached: Array.isArray(m.content) && m.content.some(part => part && part.cache_control),
+                toolCalls,
+                toolCallId: m.tool_call_id || '',
+                name: m.name || '',
+                key,
+            };
         }
 
-        function llmdScrollToRound(index) {
-            const card = document.querySelector(`.llmd-round[data-round="${index}"]`);
-            if (!card) return;
-            card.classList.add('open');
-            card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        function llmdRequestMessages(request) {
+            if (!request || typeof request !== 'object') return [];
+            const out = [];
+            if (request.system) out.push(llmdNormalizeMessage({ role: 'system', content: request.system }));
+            for (const message of (Array.isArray(request.messages) ? request.messages : [])) {
+                out.push(llmdNormalizeMessage(message));
+            }
+            if (!out.length && typeof request.prompt === 'string') out.push(llmdNormalizeMessage({ role: 'user', content: request.prompt }));
+            return out;
         }
 
-        function llmdCollapse(labelText, contentEl, extraClass) {
-            const box = PL.el('div', { class: extraClass ? `llmd-collapse ${extraClass}` : 'llmd-collapse' });
-            const toggle = PL.el('pl-button', { variant: 'ghost', size: 'sm', class: 'llmd-collapse-toggle' });
-            toggle.append(PL.el('span', {}, labelText));
-            const bodyEl = PL.el('div', { class: 'llmd-collapse-body hidden' });
-            bodyEl.append(contentEl);
-            toggle.addEventListener('click', () => {
-                bodyEl.classList.toggle('hidden');
+        function llmdResponseOutput(round) {
+            const out = { text: '', reasoning: '', toolCalls: [], finish: '' };
+            const response = round.raw_response;
+            if (response && Array.isArray(response.choices) && response.choices.length) {
+                const choice = response.choices[0] || {};
+                const message = choice.message || choice.delta || {};
+                out.text = llmdContentText(message.content);
+                out.reasoning = message.reasoning_content || message.reasoning || '';
+                out.toolCalls = llmdNormalizeMessage(message).toolCalls;
+                out.finish = choice.finish_reason || '';
+            } else if (response && Array.isArray(response.content)) {
+                out.text = response.content.filter(part => part && part.type === 'text').map(part => part.text || '').join('\n');
+                out.reasoning = response.content.filter(part => part && part.type === 'thinking').map(part => part.thinking || '').join('\n');
+                out.toolCalls = llmdNormalizeMessage({ content: response.content }).toolCalls;
+                out.finish = response.stop_reason || '';
+            }
+            if (!out.text && round.response_text) out.text = round.response_text;
+            if (!out.toolCalls.length) {
+                out.toolCalls = (round.tool_calls || []).map(tool => ({ id: '', name: tool.name, args: tool.args_json !== undefined ? tool.args_json : tool.args }));
+            }
+            return out;
+        }
+
+        function llmdInjectedMessage(text) {
+            const trimmed = String(text || '').trim();
+            if (!trimmed.startsWith('{') || !trimmed.includes('can_change_task')) return null;
+            try {
+                const value = JSON.parse(trimmed);
+                return value && typeof value === 'object' && 'can_change_task' in value ? value : null;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // ---- prompt model ----
+        function llmdPromptModel(messages) {
+            const model = { system: [], context: null, history: [], trigger: null, inputs: [], media: [] };
+            const absorb = node => {
+                switch (node.tag) {
+                    case 'chat_context': model.context = node; return;
+                    case 'history': llmdElements(node).forEach(absorb); return;
+                    case 'last_message':
+                        model.trigger = llmdChild(node, 'message') || llmdChild(node, 'assistant_message') || node;
+                        return;
+                    case 'message': model.history.push({ kind: 'message', node }); return;
+                    case 'assistant_message': model.history.push({ kind: 'message', node }); return;
+                    case 'tool_result': model.history.push({ kind: 'tool_result', node }); return;
+                    default: model.history.push({ kind: 'element', node });
+                }
+            };
+            for (const message of messages) {
+                if (message.role === 'system' || message.role === 'developer') {
+                    model.system.push(message);
+                    continue;
+                }
+                model.media.push(...message.media);
+                if (message.role === 'assistant') {
+                    model.history.push({ kind: 'assistant', message });
+                    continue;
+                }
+                if (message.role === 'tool') {
+                    model.history.push({ kind: 'tool_message', message });
+                    continue;
+                }
+                const injected = llmdInjectedMessage(message.text);
+                if (injected) {
+                    model.history.push({ kind: 'inbox', data: injected });
+                    continue;
+                }
+                const tree = llmdParseXml(message.text);
+                if (!llmdElements(tree).length) {
+                    model.inputs.push(message);
+                    continue;
+                }
+                for (const node of tree.children) {
+                    if (node.tag) absorb(node);
+                    else if (node.text.trim()) model.history.push({ kind: 'text', text: node.text.trim() });
+                }
+            }
+            return model;
+        }
+
+        function llmdHistoryCounts(model) {
+            let messages = 0;
+            let tools = 0;
+            for (const item of model.history) {
+                if (item.kind === 'message' || item.kind === 'assistant' || item.kind === 'inbox') messages++;
+                else if (item.kind === 'tool_result' || item.kind === 'tool_message') tools++;
+            }
+            return { messages, tools };
+        }
+
+        function llmdContextIndex(messages) {
+            for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === 'user' && /<(last_message|chat_context)[\s>]/.test(messages[i].text)) return i;
+            }
+            return -1;
+        }
+
+        function llmdCommonPrefix(a, b) {
+            let i = 0;
+            while (i < a.length && i < b.length && a[i].key === b[i].key) i++;
+            return i;
+        }
+
+        function llmdDeltaItems(messages) {
+            return messages.map(message => {
+                if (message.role === 'tool') return { kind: 'tool_msg', message };
+                if (message.role === 'assistant') return { kind: 'assistant', message };
+                if (message.role === 'system') return { kind: 'note', message, label: 'System message' };
+                const injected = llmdInjectedMessage(message.text);
+                if (injected) return { kind: 'inbox', data: injected, message };
+                const elements = llmdElements(llmdParseXml(message.text));
+                if (elements.length === 1 && elements[0].tag === 'tool_result') return { kind: 'tool_xml', node: elements[0], message };
+                return { kind: 'note', message, label: 'Runtime note' };
             });
-            box.append(toggle, bodyEl);
+        }
+
+        function llmdRoundStart(run, round) {
+            const end = llmdParseTime(round.at);
+            if (end === null) return null;
+            return end - Number(round.duration_ms || 0);
+        }
+
+        // Tool calls grouped under the model round that issued them. Older
+        // records attach a tool to whatever round came last, which can be the
+        // auxiliary vision call the tool itself made.
+        function llmdRoundTools(run) {
+            const tools = new Map();
+            let issuer = null;
+            for (const round of (run.rounds || [])) {
+                if (!round.is_aux) {
+                    issuer = round;
+                    tools.set(round, []);
+                }
+                const owner = issuer || round;
+                if (!tools.has(owner)) tools.set(owner, []);
+                tools.get(owner).push(...(round.tool_calls || []));
+            }
+            return tools;
+        }
+
+        // Start and end of each tool call. Records made before tools carried a
+        // start time place the call at the end of its round.
+        function llmdToolSpans(round, tools) {
+            const roundEnd = llmdParseTime(round.at);
+            return tools.map(tool => {
+                const started = llmdParseTime(tool.started_at);
+                const start = started !== null ? started : roundEnd;
+                if (start === null) return { start: null, end: null };
+                return { start, end: start + Math.max(0, Number(tool.duration_ms) || 0) };
+            });
+        }
+
+        function llmdToolNames(rounds, requests) {
+            const names = new Map();
+            const remember = calls => calls.forEach(call => {
+                if (call.id && call.name && call.name !== 'tool') names.set(call.id, call.name);
+            });
+            for (const messages of requests.values()) {
+                messages.forEach(message => remember(message.toolCalls));
+            }
+            rounds.forEach(round => remember(llmdResponseOutput(round).toolCalls));
+            return names;
+        }
+
+        // Turns the run into ordered timeline steps.
+        function llmdBuildTimeline(run) {
+            const rounds = run.rounds || [];
+            const mains = rounds.filter(round => !round.is_aux);
+            const requests = new Map(mains.map(round => [round, llmdRequestMessages(round.raw_request)]));
+            const first = mains[0] || null;
+            const firstMessages = first ? requests.get(first) : [];
+            const contextIndex = llmdContextIndex(firstMessages);
+            const split = contextIndex >= 0 ? contextIndex + 1 : firstMessages.length;
+            const prompt = llmdPromptModel(firstMessages.slice(0, split));
+            prompt.request = first ? first.raw_request : null;
+            prompt.rawSource = first ? first.raw_source : '';
+            prompt.tools = first && first.raw_request && Array.isArray(first.raw_request.tools) ? first.raw_request.tools : [];
+
+            const deltas = new Map();
+            const rebuilt = new Map();
+            mains.forEach((round, j) => {
+                const messages = requests.get(round);
+                if (j === 0) {
+                    deltas.set(round, llmdDeltaItems(firstMessages.slice(split)));
+                    return;
+                }
+                const previous = requests.get(mains[j - 1]);
+                if (!messages.length) {
+                    deltas.set(round, []);
+                    return;
+                }
+                const common = llmdCommonPrefix(previous, messages);
+                const ownContext = llmdContextIndex(messages);
+                if (previous.length && ownContext >= 0 && common <= ownContext) {
+                    rebuilt.set(round, { model: llmdPromptModel(messages.slice(0, ownContext + 1)), previous: llmdPromptModel(previous.slice(0, llmdContextIndex(previous) + 1)) });
+                    deltas.set(round, llmdDeltaItems(messages.slice(ownContext + 1)));
+                    return;
+                }
+                deltas.set(round, llmdDeltaItems(messages.slice(common)));
+            });
+
+            const roundTools = llmdRoundTools(run);
+            const toolNames = llmdToolNames(mains, requests);
+            const steps = [{ kind: 'trigger', prompt }];
+            if (run.context) steps.push({ kind: 'recall', prompt });
+            const head = steps.length;
+            if (first) steps.push({ kind: 'prompt', prompt, round: first, at: llmdRoundStart(run, first) });
+            const consumed = new Set();
+            let mainIndex = 0;
+            rounds.forEach(round => {
+                if (round.is_aux) {
+                    steps.push({ kind: 'aux', round, at: llmdRoundStart(run, round) });
+                    return;
+                }
+                const delta = deltas.get(round) || [];
+                if (rebuilt.has(round)) steps.push({ kind: 'rebuilt', round, ...rebuilt.get(round), at: null });
+                let echoSkipped = mainIndex === 0;
+                const seenAt = llmdRoundStart(run, round);
+                for (const item of delta) {
+                    if (consumed.has(item)) continue;
+                    if (item.kind === 'assistant' && !echoSkipped) {
+                        echoSkipped = true;
+                        continue;
+                    }
+                    if (item.kind === 'tool_msg' || item.kind === 'tool_xml') {
+                        steps.push({ kind: 'tool', round: null, tool: null, item, seenAt, at: seenAt, name: item.message && toolNames.get(item.message.toolCallId) });
+                        continue;
+                    }
+                    steps.push({ kind: item.kind === 'inbox' ? 'inbox' : 'note', item, seenAt, at: seenAt });
+                }
+                mainIndex++;
+                steps.push({ kind: 'round', round, number: mainIndex, final: round.sent === 'final', at: seenAt });
+                const nextRound = mains[mains.indexOf(round) + 1];
+                const pending = (nextRound ? deltas.get(nextRound) : []).filter(item => item.kind === 'tool_msg' || item.kind === 'tool_xml');
+                const output = llmdResponseOutput(round);
+                const skeleton = roundTools.get(round) || [];
+                const spans = llmdToolSpans(round, skeleton);
+                const count = Math.max(skeleton.length, output.toolCalls.length);
+                for (let i = 0; i < count; i++) {
+                    const tool = skeleton[i] || null;
+                    const call = output.toolCalls[i] || null;
+                    const name = (tool && tool.name) || (call && call.name) || 'tool';
+                    let item = null;
+                    if (call && call.id) item = pending.find(p => !consumed.has(p) && p.message.toolCallId === call.id) || null;
+                    if (!item) item = pending.find(p => !consumed.has(p) && (p.kind === 'tool_msg' || (p.node.attrs.name || '') === name)) || null;
+                    if (item) consumed.add(item);
+                    const span = spans[i] || { start: llmdParseTime(round.at), end: null };
+                    steps.push({ kind: 'tool', round, tool, call, item, toolIndex: i, at: span.start, end: span.end });
+                }
+            });
+            steps.push({ kind: 'outcome' });
+            return { steps: llmdChronological(steps, head), prompt };
+        }
+
+        // Orders the steps between the recall and the outcome by start time.
+        // A step without a time keeps its place before the next timed step;
+        // equal times keep the order in which the run produced them.
+        function llmdChronological(steps, head) {
+            const middle = steps.slice(head, -1);
+            let next = Infinity;
+            const keys = new Array(middle.length);
+            for (let i = middle.length - 1; i >= 0; i--) {
+                const at = middle[i].at;
+                if (Number.isFinite(at)) next = at;
+                keys[i] = next;
+            }
+            const order = middle.map((step, index) => ({ step, index, key: keys[index] }));
+            order.sort((a, b) => (a.key - b.key) || (a.index - b.index));
+            return [...steps.slice(0, head), ...order.map(entry => entry.step), steps[steps.length - 1]];
+        }
+
+        // ---- step shell ----
+        function llmdSummary(label, title, facts, snippet) {
+            const box = PL.el('div', { class: 'llmd-sum' });
+            const line = PL.el('div', { class: 'llmd-sum-line' });
+            line.append(PL.el('span', { class: 'llmd-sum-label' }, label));
+            if (title !== null && title !== undefined && title !== '') {
+                line.append(title instanceof Node ? title : PL.el('span', { class: 'llmd-sum-title' }, title));
+            }
+            for (const fact of (facts || [])) {
+                if (fact === null || fact === undefined || fact === '') continue;
+                line.append(fact instanceof Node ? fact : PL.el('span', { class: 'llmd-sum-fact' }, fact));
+            }
+            box.append(line);
+            if (snippet) box.append(PL.el('div', { class: 'llmd-sum-snippet' }, compactLLMText(snippet, 240)));
             return box;
+        }
+
+        function llmdStep(kind, opts) {
+            const item = PL.el('li', { class: 'llmd-step' });
+            item.dataset.step = kind;
+            if (opts.tone) item.dataset.tone = opts.tone;
+            if (opts.anchor) item.id = opts.anchor;
+            if (opts.color) item.style.setProperty('--step-c', opts.color);
+            const time = PL.el('div', { class: 'llmd-step-time mono' }, opts.time || '');
+            if (opts.timeTitle) time.title = opts.timeTitle;
+            const card = PL.el('div', { class: 'llmd-step-card' });
+            const disclosure = PL.disclosure({
+                summary: opts.summary,
+                meta: opts.meta,
+                render: opts.render,
+                content: opts.content,
+                open: !!opts.open,
+            });
+            card.append(disclosure);
+            item.append(time, PL.el('div', { class: 'llmd-step-marker', 'aria-hidden': 'true' }), card);
+            return item;
         }
 
         function llmdJSONPane(value) {
@@ -5489,361 +5975,1257 @@
             return pane;
         }
 
-        function llmdToolBlock(tool) {
-            const box = PL.el('div', { class: 'llmd-tool' });
-            const head = PL.el('div', { class: 'llmd-tool-head' });
-            const name = PL.el('span', { class: 'llmd-tool-chip' }, tool.name);
-            name.setAttribute('data-status', String(tool.status || 'ok'));
-            head.append(name);
-            if (typeof tool.duration_ms === 'number') {
-                head.append(PL.el('span', { class: 'mono llmd-dim' }, formatAnalyticsMs(tool.duration_ms)));
+        function llmdRawDisclosure(label, value) {
+            const node = PL.disclosure({
+                className: 'llmd-raw-block',
+                summary: PL.el('span', { class: 'llmd-block-title' }, label),
+                meta: llmdChars(safeStringify(value).length),
+                render: () => llmdJSONPane(value),
+            });
+            node.setAttribute('data-raw', '');
+            return node;
+        }
+
+        function llmdBlock(label, meta, render, open) {
+            return PL.disclosure({
+                className: 'llmd-block',
+                summary: PL.el('span', { class: 'llmd-block-title' }, label),
+                meta,
+                render,
+                open,
+            });
+        }
+
+        function llmdKV(pairs) {
+            const grid = PL.el('div', { class: 'llmd-kv' });
+            for (const [label, value, mono] of pairs) {
+                if (value === null || value === undefined || value === '') continue;
+                grid.append(
+                    PL.el('div', { class: 'llmd-kv-k' }, label),
+                    PL.el('div', { class: mono ? 'llmd-kv-v mono' : 'llmd-kv-v' }, value instanceof Node ? [value] : String(value)),
+                );
             }
-            box.append(head);
-            const args = tool.args_json !== undefined ? tool.args_json : tool.args;
-            if (args !== undefined && args !== null) {
-                box.append(llmdCollapse('args', llmdJSONPane(args)));
-            }
-            const result = tool.result_json !== undefined ? tool.result_json : tool.result;
-            if (result !== undefined && result !== null) {
-                if (typeof result === 'string') {
-                    if (result.length <= 400) {
-                        box.append(llmdCollapse('result', PL.el('pre', { class: 'llmd-tool-result' }, result)));
-                    } else {
-                        const size = ` (${(result.length / 1024).toFixed(1)} KB)`;
-                        box.append(PL.el('pre', { class: 'llmd-tool-result' }, `${result.slice(0, 400)}…`));
-                        box.append(llmdCollapse(
-                            `Expand${size}`,
-                            PL.el('pre', { class: 'llmd-tool-result llmd-tool-full-text' }, result),
-                            'llmd-tool-full'
-                        ));
+            return grid;
+        }
+
+        function llmdTextBlock(text, className) {
+            return PL.el('div', { class: className ? `llmd-prose ${className}` : 'llmd-prose' }, text);
+        }
+
+        function llmdCodeBlock(text) {
+            return PL.el('pre', { class: 'llmd-code' }, text);
+        }
+
+        // Telegram HTML subset rendered as DOM nodes, never through innerHTML.
+        const LLMD_RICH_TAGS = {
+            b: 'strong', strong: 'strong', i: 'em', em: 'em', u: 'u', ins: 'u', s: 's', strike: 's', del: 's',
+            code: 'code', pre: 'pre', blockquote: 'blockquote', 'tg-spoiler': 'span', a: 'a', br: 'br',
+        };
+
+        function llmdRichText(text) {
+            const root = PL.el('div', { class: 'llmd-rich' });
+            const stack = [root];
+            const source = String(text || '');
+            const re = /<(\/?)([a-zA-Z][\w-]*)((?:\s+[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'))?)*)\s*(\/?)>/g;
+            const pushText = chunk => {
+                if (chunk) stack[stack.length - 1].append(document.createTextNode(llmdDecodeEntities(chunk)));
+            };
+            let last = 0;
+            let m;
+            while ((m = re.exec(source))) {
+                const tag = m[2].toLowerCase();
+                const mapped = LLMD_RICH_TAGS[tag];
+                if (!mapped) continue;
+                pushText(source.slice(last, m.index));
+                last = re.lastIndex;
+                if (m[1]) {
+                    for (let i = stack.length - 1; i > 0; i--) {
+                        if (stack[i].dataset.tag === tag) {
+                            stack.length = i;
+                            break;
+                        }
                     }
-                } else {
-                    // Objects render lazily: a cheap summary line up front, the
-                    // tree materializes only when expanded.
-                    box.append(PL.el('pre', { class: 'llmd-tool-result' }, jsonNodeSummary(result)));
-                    box.append(llmdCollapse('Expand result', llmdJSONPane(result), 'llmd-tool-full'));
+                    continue;
                 }
+                if (mapped === 'br') {
+                    stack[stack.length - 1].append(document.createElement('br'));
+                    continue;
+                }
+                let node;
+                if (mapped === 'a') {
+                    const href = llmdParseAttrs(m[3]).href || '';
+                    node = /^https?:\/\//i.test(href)
+                        ? PL.el('a', { href, target: '_blank', rel: 'noopener noreferrer' })
+                        : PL.el('span', { class: 'llmd-rich-link' });
+                    node.title = href;
+                } else {
+                    node = PL.el(mapped, tag === 'tg-spoiler' ? { class: 'llmd-rich-spoiler' } : null);
+                }
+                node.dataset.tag = tag;
+                stack[stack.length - 1].append(node);
+                if (!m[4]) stack.push(node);
+            }
+            pushText(source.slice(last));
+            return root;
+        }
+
+        function llmdOutputView(text) {
+            const box = PL.el('div', { class: 'llmd-output' });
+            const rendered = llmdRichText(text);
+            const raw = PL.el('pre', { class: 'llmd-code llmd-output-raw' }, text);
+            raw.hidden = true;
+            const textBtn = PL.el('pl-button', { variant: 'ghost', size: 'sm', 'aria-pressed': 'true' }, 'Text');
+            const rawBtn = PL.el('pl-button', { variant: 'ghost', size: 'sm', 'aria-pressed': 'false' }, 'Raw');
+            const show = asRaw => {
+                rendered.hidden = asRaw;
+                raw.hidden = !asRaw;
+                textBtn.setAttribute('aria-pressed', asRaw ? 'false' : 'true');
+                rawBtn.setAttribute('aria-pressed', asRaw ? 'true' : 'false');
+            };
+            textBtn.addEventListener('click', () => show(false));
+            rawBtn.addEventListener('click', () => show(true));
+            const bar = PL.el('div', { class: 'llmd-output-bar' });
+            bar.append(PL.el('span', { class: 'llmd-block-title' }, 'Output'), PL.el('pl-button-group', { class: 'llmd-seg' }, [textBtn, rawBtn]));
+            box.append(bar, rendered, raw);
+            return box;
+        }
+
+        // ---- chat messages ----
+        function llmdMessageModel(node) {
+            const meta = llmdChild(node, 'meta');
+            const find = tag => llmdChild(node, tag) || llmdChild(meta, tag);
+            const attrs = node.attrs || {};
+            const speaker = llmdChild(node, 'user') || llmdChild(node, 'assistant');
+            const reply = llmdChild(node, 'reply');
+            const attachments = find('attachments');
+            return {
+                id: attrs.id || '',
+                timestamp: attrs.timestamp || '',
+                userId: attrs.user_id || '',
+                bot: node.tag === 'assistant_message' || !!(speaker && speaker.tag === 'assistant'),
+                author: speaker ? llmdNodeText(speaker).trim() : '',
+                username: speaker && speaker.attrs.username || '',
+                senderType: speaker && speaker.attrs.type || '',
+                replyTo: reply ? { id: reply.attrs.to_id || '', user: llmdNodeText(llmdChild(reply, 'to_user')).trim() } : null,
+                text: llmdNodeText(find('text')).trim(),
+                original: llmdNodeText(find('original')).trim(),
+                empty: !!find('no_text'),
+                type: llmdNodeText(find('message_type')).trim(),
+                annotation: llmdNodeText(find('annotation')).trim(),
+                vision: llmdNodeText(find('vision_description')).trim(),
+                attachments: llmdChildren(attachments, 'attachment').map(att => ({
+                    kind: att.attrs.kind || 'file',
+                    fields: llmdElements(att).map(child => [child.tag, llmdNodeText(child).trim()]),
+                })),
+            };
+        }
+
+        function llmdAttachmentChip(att) {
+            const fields = Object.fromEntries(att.fields);
+            const detail = fields.file_name || fields.caption || fields.title || fields.content || '';
+            const chip = PL.el('span', { class: 'llmd-attach' }, detail ? `${att.kind} · ${compactLLMText(detail, 60)}` : att.kind);
+            chip.title = att.fields.map(([key, value]) => `${key}: ${value}`).join('\n');
+            return chip;
+        }
+
+        function llmdChatMessageView(msg, opts) {
+            const options = opts || {};
+            const row = PL.el('div', { class: 'llmd-msg' });
+            if (msg.bot) row.classList.add('is-bot');
+            if (options.trigger) row.classList.add('is-trigger');
+            const head = PL.el('div', { class: 'llmd-msg-head' });
+            if (msg.timestamp) head.append(PL.el('span', { class: 'llmd-msg-time mono' }, llmdClock(msg.timestamp)));
+            head.append(PL.el('span', { class: 'llmd-msg-author' }, msg.author || (msg.bot ? 'bot' : (msg.userId ? `user ${msg.userId}` : 'unknown'))));
+            if (msg.username) head.append(PL.el('span', { class: 'llmd-msg-dim' }, `@${msg.username}`));
+            if (msg.senderType && !['user', 'assistant'].includes(msg.senderType)) head.append(PL.badge(msg.senderType, 'neutral'));
+            if (msg.type && msg.type !== 'text') head.append(PL.badge(msg.type, 'neutral'));
+            if (msg.replyTo) {
+                head.append(PL.el('span', { class: 'llmd-msg-dim' }, `↩ ${[msg.replyTo.user, msg.replyTo.id ? `#${msg.replyTo.id}` : ''].filter(Boolean).join(' ')}`));
+            }
+            if (msg.id) head.append(PL.el('span', { class: 'llmd-msg-dim mono llmd-msg-id' }, `#${msg.id}`));
+            row.append(head);
+            if (msg.text) row.append(PL.el('div', { class: 'llmd-msg-text' }, msg.text));
+            else if (msg.empty) row.append(PL.el('div', { class: 'llmd-msg-dim' }, 'no text'));
+            if (msg.original && msg.original !== msg.text) {
+                row.append(PL.el('div', { class: 'llmd-msg-note' }, [PL.el('span', { class: 'llmd-msg-dim' }, 'original '), msg.original]));
+            }
+            if (msg.annotation) row.append(PL.el('div', { class: 'llmd-msg-note' }, [PL.el('span', { class: 'llmd-msg-dim' }, 'annotation '), msg.annotation]));
+            if (msg.vision) row.append(PL.el('div', { class: 'llmd-msg-note' }, [PL.el('span', { class: 'llmd-msg-dim' }, 'vision '), msg.vision]));
+            if (msg.attachments.length) row.append(PL.el('div', { class: 'llmd-msg-attachments' }, msg.attachments.map(llmdAttachmentChip)));
+            return row;
+        }
+
+        function llmdInboxModel(data) {
+            const message = data.message && typeof data.message === 'object' ? data.message : data;
+            const from = message.from || {};
+            const author = data.name || message.name || [from.first_name, from.last_name].filter(Boolean).join(' ')
+                || (message.meta && message.meta.sender_name) || '';
+            let timestamp = message.timestamp || data.timestamp || '';
+            if (!timestamp && Number(message.date) > 0) timestamp = new Date(Number(message.date) * 1000).toISOString();
+            return {
+                id: String(data.message_id || message.message_id || ''),
+                timestamp: String(timestamp || ''),
+                userId: String(data.user_id || from.id || ''),
+                bot: false,
+                author,
+                username: from.username || (message.meta && message.meta.sender_username) || '',
+                senderType: '',
+                replyTo: null,
+                text: String(data.text || message.text || ''),
+                original: '',
+                empty: !(data.text || message.text),
+                type: message.kind && message.kind !== 'text' ? String(message.kind) : '',
+                annotation: '',
+                vision: '',
+                attachments: [],
+                canChangeTask: !!data.can_change_task,
+            };
+        }
+
+        function llmdToolResultRow(name, output, ref) {
+            const text = llmdPretty(output);
+            return PL.disclosure({
+                className: 'llmd-msg is-tool',
+                summary: llmdSummary('tool result', PL.el('span', { class: 'mono llmd-sum-title' }, name || 'tool'), [ref ? `ref ${ref}` : ''], text),
+                render: () => llmdCodeBlock(text),
+            });
+        }
+
+        function llmdHistoryItem(item) {
+            switch (item.kind) {
+                case 'message':
+                    return llmdChatMessageView(llmdMessageModel(item.node));
+                case 'assistant': {
+                    const msg = { author: 'assistant', bot: true, text: item.message.text, attachments: [], empty: !item.message.text };
+                    const view = llmdChatMessageView(msg);
+                    if (item.message.toolCalls.length) {
+                        view.append(PL.el('div', { class: 'llmd-msg-dim' }, `tool calls: ${item.message.toolCalls.map(call => call.name).join(', ')}`));
+                    }
+                    return view;
+                }
+                case 'tool_result':
+                    return llmdToolResultRow(item.node.attrs.name, llmdNodeText(llmdChild(item.node, 'output')) || llmdNodeText(item.node), item.node.attrs.ref);
+                case 'tool_message':
+                    return llmdToolResultRow(item.message.name || 'tool', item.message.text, '');
+                case 'inbox':
+                    return llmdChatMessageView(llmdInboxModel(item.data));
+                case 'text':
+                    return PL.el('div', { class: 'llmd-msg llmd-msg-dim' }, item.text);
+                default:
+                    return PL.el('div', { class: 'llmd-msg' }, [PL.el('div', { class: 'llmd-tag mono' }, llmdTagLabel(item.node)), llmdOutlineBody(item.node)]);
+            }
+        }
+
+        // ---- prompt sections ----
+        function llmdOutlineBody(node) {
+            const box = PL.el('div', { class: 'llmd-outline-body' });
+            for (const child of node.children || []) {
+                if (!child.tag) {
+                    const text = child.text.trim();
+                    if (text) box.append(PL.el('div', { class: 'llmd-outline-text' }, text));
+                    continue;
+                }
+                if (!llmdElements(child).length) {
+                    const row = PL.el('div', { class: 'llmd-outline-leaf' });
+                    row.append(PL.el('span', { class: 'llmd-tag mono' }, llmdTagLabel(child)), PL.el('span', { class: 'llmd-outline-text' }, llmdNodeText(child).trim()));
+                    box.append(row);
+                    continue;
+                }
+                box.append(PL.el('div', { class: 'llmd-outline-group' }, [PL.el('div', { class: 'llmd-tag mono' }, llmdTagLabel(child)), llmdOutlineBody(child)]));
             }
             return box;
         }
 
-        function llmdTechPanel(round) {
-            const grid = PL.el('div', { class: 'llmd-meta llmd-tech-grid' });
-            const cell = (label, value) => {
-                if (value === null || value === undefined || value === '') return;
-                const box = PL.el('div', { class: 'llmd-meta-cell' });
-                box.append(PL.el('div', { class: 'llmd-meta-label' }, label));
-                box.append(PL.el('div', { class: 'llmd-meta-value mono' }, String(value)));
-                grid.append(box);
-            };
-            const usage = round.usage || {};
-            cell('input tok', usage.input_tokens);
-            cell('output tok', usage.output_tokens);
-            cell('total tok', usage.total_tokens);
-            cell('cached tok', usage.cached_tokens);
-            const timings = round.timings || {};
-            if (timings.prompt_eval_ms) cell('prompt eval', formatAnalyticsMs(timings.prompt_eval_ms));
-            if (timings.prompt_tps) cell('prompt tps', formatAnalyticsTPS(timings.prompt_tps));
-            if (timings.generation_ms) cell('generation', formatAnalyticsMs(timings.generation_ms));
-            if (timings.generation_tps) cell('gen tps', formatAnalyticsTPS(timings.generation_tps));
-            cell('at', round.at);
-            const wrap = PL.el('div', { class: 'llmd-tech' });
-            wrap.append(grid);
-            if (round.inference_params) {
-                wrap.append(llmdCollapse('inference params', llmdJSONPane(round.inference_params)));
+        function llmdOutlineView(text) {
+            const root = llmdParseXml(text);
+            let top = root;
+            while (llmdElements(top).length === 1 && !top.children.some(child => !child.tag && child.text.trim())) {
+                top = llmdElements(top)[0];
             }
-            const rawSource = String(round.raw_source || '');
-            if (rawSource === 'rotated_out') {
-                wrap.append(PL.el('div', { class: 'llmd-dim' }, 'raw payload rotated out of the buffer'));
-            } else {
-                if (round.raw_request !== undefined && round.raw_request !== null) {
-                    wrap.append(llmdCollapse('Raw request', llmdJSONPane(round.raw_request)));
+            if (!llmdElements(top).length) return llmdTextBlock(String(text || '').trim());
+            const box = PL.el('div', { class: 'llmd-outline' });
+            if (top !== root) box.append(PL.el('div', { class: 'llmd-tag mono' }, `<${llmdTagLabel(top)}>`));
+            for (const child of top.children) {
+                if (!child.tag) {
+                    if (child.text.trim()) box.append(PL.el('div', { class: 'llmd-outline-text' }, child.text.trim()));
+                    continue;
                 }
-                if (round.raw_response !== undefined && round.raw_response !== null) {
-                    wrap.append(llmdCollapse('Raw response', llmdJSONPane(round.raw_response)));
-                }
+                const content = llmdNodeText(child);
+                box.append(PL.disclosure({
+                    className: 'llmd-outline-section',
+                    summary: [PL.el('span', { class: 'llmd-tag mono' }, child.tag), PL.el('span', { class: 'llmd-outline-peek' }, compactLLMText(content, 160))],
+                    meta: llmdChars(content.length),
+                    render: () => llmdOutlineBody(child),
+                }));
             }
-            const copyBtn = PL.el('pl-button', { variant: 'outline', size: 'sm' });
-            copyBtn.append(PL.el('span', {}, 'Copy round JSON'));
-            copyBtn.addEventListener('click', () => llmdCopyText(safeStringify(round)));
-            wrap.append(copyBtn);
-            return wrap;
+            return box;
         }
 
-        function llmdRoundCard(round, index, expanded) {
-            const card = PL.el('div', { class: expanded ? 'llmd-round open' : 'llmd-round' });
-            card.setAttribute('data-round', String(index));
-            if (round.is_aux) card.classList.add('llmd-round-aux');
-            if (round.sent === 'final') card.classList.add('llmd-round-final');
-
-            const head = PL.el('div', { class: 'llmd-round-head', role: 'button', tabindex: '0' });
-            head.addEventListener('click', () => card.classList.toggle('open'));
-            head.addEventListener('keydown', event => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    card.classList.toggle('open');
-                }
+        function llmdReferenceView(node) {
+            const box = PL.el('div', { class: 'llmd-reference' });
+            const chunks = llmdChildren(node, 'chunk');
+            (chunks.length ? chunks : [node]).forEach(chunk => {
+                const row = PL.el('div', { class: 'llmd-reference-chunk' });
+                if (chunk.attrs && chunk.attrs.index) row.append(PL.el('span', { class: 'llmd-tag mono' }, `chunk ${chunk.attrs.index}`));
+                row.append(llmdTextBlock(llmdNodeText(chunk).trim()));
+                box.append(row);
             });
-            head.append(PL.el('span', { class: 'llmd-round-num mono' }, `#${index + 1}`));
-            const dot = PL.el('span', { class: 'llmd-round-dot' });
-            dot.style.setProperty('--pip-c', llmdModelColorVar(round.model || round.provider));
-            head.append(dot);
-            head.append(PL.el('span', { class: 'mono llmd-round-model' }, [round.provider, round.model].filter(Boolean).join('@') || 'provider'));
-            if (typeof round.duration_ms === 'number') {
-                head.append(PL.el('span', { class: 'mono llmd-dim' }, formatAnalyticsMs(round.duration_ms)));
-            }
-            const usage = round.usage || {};
-            if (usage.input_tokens || usage.output_tokens) {
-                head.append(PL.el('span', {
-                    class: 'mono llmd-dim' }, `${llmdFormatTokens(usage.input_tokens) || 0}→${llmdFormatTokens(usage.output_tokens) || 0}`));
-            }
-            head.append(PL.el('span', { class: round.error ? 'llmd-round-status llmd-kpi-danger' : 'llmd-round-status' }, round.error ? '✕' : '✓'));
-            if (round.is_aux) head.append(PL.badge(`aux: ${round.flow || 'aux'}`, 'neutral'));
-            if (round.sent === 'final') head.append(PL.badge('final answer', 'success'));
-            else if (round.sent === 'intermediate') head.append(PL.badge('sent to chat', 'info'));
-            card.append(head);
+            return box;
+        }
 
-            const body = PL.el('div', { class: 'llmd-round-body' });
-            if (round.error) {
-                body.append(PL.el('div', { class: 'llmd-round-error' }, round.error));
-            }
-            const text = round.response_text || round.text || '';
-            if (text) {
-                const textEl = PL.el('div', { class: 'llmd-text clamped' }, text);
-                body.append(textEl);
-                if (text.length > 480) {
-                    const showAll = PL.el('pl-button', { variant: 'ghost', size: 'sm' });
-                    showAll.append(PL.el('span', {}, `Show all (${text.length} chars)`));
-                    showAll.addEventListener('click', () => {
-                        textEl.classList.remove('clamped');
-                        showAll.remove();
-                    });
-                    body.append(showAll);
+        function llmdChatContextView(node) {
+            const box = PL.el('div', { class: 'llmd-ctx' });
+            const pairs = [];
+            const blocks = [];
+            for (const child of llmdElements(node)) {
+                const text = llmdNodeText(child).trim();
+                if (!llmdElements(child).length && text.length <= 160) {
+                    pairs.push([child.tag.replace(/_/g, ' '), text, /(_id|datetime)/.test(child.tag)]);
+                    continue;
                 }
-            } else if (!round.error) {
-                body.append(PL.el('div', { class: 'llmd-dim' }, 'no text response'));
+                if (child.tag === 'reference_context') {
+                    blocks.push(PL.el('div', { class: 'llmd-ctx-block' }, [PL.el('div', { class: 'llmd-tag mono' }, 'reference_context'), llmdReferenceView(child)]));
+                    continue;
+                }
+                blocks.push(PL.el('div', { class: 'llmd-ctx-block' }, [PL.el('div', { class: 'llmd-tag mono' }, llmdTagLabel(child)), llmdOutlineBody(child)]));
             }
-            for (const tool of (round.tool_calls || [])) {
-                body.append(llmdToolBlock(tool));
+            if (pairs.length) box.append(llmdKV(pairs));
+            box.append(...blocks);
+            return box;
+        }
+
+        function llmdToolsView(tools) {
+            const box = PL.el('div', { class: 'llmd-tools' });
+            for (const tool of tools) {
+                const fn = tool && (tool.function || tool) || {};
+                const name = fn.name || 'tool';
+                const description = fn.description || '';
+                const params = fn.parameters || tool.input_schema || null;
+                const props = params && params.properties ? Object.keys(params.properties) : [];
+                box.append(PL.disclosure({
+                    className: 'llmd-tool-def',
+                    summary: [PL.el('span', { class: 'mono llmd-tool-name' }, name), PL.el('span', { class: 'llmd-outline-peek' }, compactLLMText(description, 140))],
+                    meta: props.length ? `${props.length} params` : '',
+                    render: () => {
+                        const body = PL.el('div', { class: 'llmd-stack' });
+                        if (description) body.append(llmdTextBlock(description));
+                        if (props.length) body.append(llmdCodeBlock(safeStringify(params)));
+                        return body;
+                    },
+                }));
             }
-            body.append(llmdCollapse('Stats & raw', llmdTechPanel(round)));
-            card.append(body);
+            return box;
+        }
+
+        function llmdParamsView(request) {
+            const pairs = Object.entries(request || {})
+                .filter(([key]) => !['messages', 'tools', 'system'].includes(key))
+                .map(([key, value]) => [key, typeof value === 'object' ? JSON.stringify(value) : String(value), true]);
+            return llmdKV(pairs);
+        }
+
+        function llmdMediaView(media) {
+            const box = PL.el('div', { class: 'llmd-media' });
+            for (const item of media) {
+                const tile = PL.el('div', { class: 'llmd-media-item' });
+                if (/^data:image\//.test(item.url) || /^https:\/\//.test(item.url) && item.type === 'image_url') {
+                    tile.append(PL.el('img', { src: item.url, alt: item.type, loading: 'lazy', class: 'llmd-media-thumb' }));
+                }
+                tile.append(PL.el('span', { class: 'llmd-msg-dim' }, `${item.type.replace(/_url$/, '')} · ${item.url.startsWith('data:') ? `${(item.size / 1024).toFixed(0)} KB inline` : compactLLMText(item.url, 60) || 'no payload'}`));
+                box.append(tile);
+            }
+            return box;
+        }
+
+        function llmdPromptView(prompt, opts) {
+            const options = opts || {};
+            const box = PL.el('div', { class: 'llmd-stack' });
+            prompt.system.forEach((message, index) => {
+                const meta = [llmdChars(message.text.length)];
+                if (message.cached) meta.unshift(PL.badge('cache_control', 'info'));
+                box.append(llmdBlock(prompt.system.length > 1 ? `System prompt ${index + 1}` : 'System prompt', meta, () => llmdOutlineView(message.text)));
+            });
+            if (prompt.context) {
+                const persona = llmdChild(prompt.context, 'daily_persona_accent');
+                const summary = [llmdNodeText(llmdChild(prompt.context, 'chat_title')).trim(), llmdNodeText(llmdChild(persona, 'name')).trim()].filter(Boolean).join(' · ');
+                box.append(llmdBlock('Chat context', summary || llmdChars(llmdNodeText(prompt.context).length), () => llmdChatContextView(prompt.context)));
+            }
+            const counts = llmdHistoryCounts(prompt);
+            if (prompt.history.length) {
+                const meta = [`${counts.messages} messages`, counts.tools ? `${counts.tools} tool results` : ''].filter(Boolean).join(' · ');
+                box.append(llmdBlock('History', meta, () => PL.el('div', { class: 'llmd-history' }, prompt.history.map(llmdHistoryItem))));
+            }
+            if (prompt.trigger && options.showTrigger) {
+                box.append(llmdBlock('Last message', '', () => llmdChatMessageView(llmdMessageModel(prompt.trigger), { trigger: true }), true));
+            }
+            prompt.inputs.forEach((message, index) => {
+                const label = message.role === 'assistant' ? 'Assistant message' : (prompt.inputs.length > 1 ? `User message ${index + 1}` : 'User message');
+                box.append(llmdBlock(label, llmdChars(message.text.length), () => llmdOutlineView(message.text), true));
+            });
+            if (prompt.media.length) {
+                box.append(llmdBlock('Media', `${prompt.media.length} attached`, () => llmdMediaView(prompt.media), true));
+            }
+            if (prompt.tools && prompt.tools.length) {
+                box.append(llmdBlock('Tools offered', `${prompt.tools.length}`, () => llmdToolsView(prompt.tools)));
+            }
+            if (prompt.request) {
+                box.append(llmdBlock('Request parameters', prompt.request.model ? String(prompt.request.model) : '', () => llmdParamsView(prompt.request)));
+                box.append(llmdRawDisclosure('Raw request', prompt.request));
+            }
+            return box;
+        }
+
+        // ---- step renderers ----
+        function llmdStepTime(run, ms) {
+            const start = llmdParseTime(run.started_at);
+            if (ms === null || start === null) return '';
+            return llmdOffset(ms - start);
+        }
+
+        function llmdChatTitle(run, prompt) {
+            const origin = run.origin || {};
+            const fromPrompt = prompt && prompt.context ? llmdNodeText(llmdChild(prompt.context, 'chat_title')).trim() : '';
+            return origin.chat_title || fromPrompt || llmdOriginChat(origin);
+        }
+
+        function llmdTriggerStep(run, prompt) {
+            const origin = run.origin || {};
+            let msg = prompt.trigger ? llmdMessageModel(prompt.trigger) : null;
+            if (!msg && origin.trigger_preview) {
+                msg = {
+                    id: origin.trigger_message_id ? String(origin.trigger_message_id) : '', timestamp: '', userId: String(origin.user_id || ''),
+                    bot: false, author: origin.user_full_name || '', username: '', senderType: '', replyTo: null,
+                    text: origin.trigger_preview, original: '', empty: false, type: '', annotation: '', vision: '', attachments: [],
+                };
+            }
+            if (!msg) return null;
+            if (!msg.text && !msg.attachments.length && origin.trigger_preview) msg.text = origin.trigger_preview;
+            const at = msg.timestamp ? llmdParseTime(msg.timestamp) : null;
+            const chat = llmdChatTitle(run, prompt);
+            return llmdStep('trigger', {
+                anchor: 'llmd-step-trigger',
+                time: llmdStepTime(run, at),
+                timeTitle: msg.timestamp ? `sent ${msg.timestamp}` : '',
+                summary: llmdSummary('Trigger', msg.author || 'unknown sender', [chat, origin.thread_id ? `thread ${origin.thread_id}` : '']),
+                content: llmdChatMessageView(msg, { trigger: true }),
+                open: true,
+            });
+        }
+
+        function llmdRecallStep(run, prompt) {
+            const ctx = run.context || {};
+            const memories = (ctx.memories || []).slice().sort((a, b) => (b.salience || 0) - (a.salience || 0));
+            const reference = prompt.context ? llmdChild(prompt.context, 'reference_context') : null;
+            const top = memories[0];
+            const facts = [];
+            if (top) facts.push(`top ${String(top.card_type || 'memory').replace(/_/g, ' ')} ${llmdPercent(top.salience)}`);
+            if (ctx.reference_context_chars) facts.push(`${formatAnalyticsCount(ctx.reference_context_chars)} chars injected`);
+            const competing = memories.filter(m => m.competing).length;
+            if (competing) facts.push(PL.badge(`${competing} competing`, 'warning'));
+            return llmdStep('recall', {
+                anchor: 'llmd-step-recall',
+                summary: llmdSummary('Memory recall', memories.length ? `${memories.length} memories` : 'nothing recalled', facts, top ? top.preview : ''),
+                render: () => {
+                    const body = PL.el('div', { class: 'llmd-stack' });
+                    if (memories.length) body.append(llmdRecallList(memories));
+                    else body.append(PL.el('div', { class: 'llmd-msg-dim' }, 'No memories surfaced for this turn.'));
+                    if (reference) {
+                        body.append(llmdBlock('Injected into the prompt', llmdChars(llmdNodeText(reference).length), () => llmdReferenceView(reference)));
+                    }
+                    return body;
+                },
+            });
+        }
+
+        function llmdPromptStep(run, prompt, round) {
+            const counts = llmdHistoryCounts(prompt);
+            const systemChars = prompt.system.reduce((sum, message) => sum + message.text.length, 0);
+            const usage = round.usage || {};
+            const facts = [];
+            if (systemChars) facts.push(`system ${llmdChars(systemChars)}`);
+            if (prompt.context) facts.push('chat context');
+            if (counts.messages) facts.push(`${counts.messages} history`);
+            if (counts.tools) facts.push(`${counts.tools} tool results`);
+            if (prompt.tools.length) facts.push(`${prompt.tools.length} tools`);
+            if (prompt.media.length) facts.push(`${prompt.media.length} media`);
+            if (usage.input_tokens) facts.push(`${llmdFormatTokens(usage.input_tokens)} tokens in`);
+            const missing = !prompt.request;
+            return llmdStep('prompt', {
+                anchor: 'llmd-step-prompt',
+                summary: llmdSummary('Prompt', missing ? 'payload unavailable' : (prompt.inputs.length && !prompt.context ? llmdChars(prompt.inputs.reduce((s, m) => s + m.text.length, 0)) : ''), facts),
+                render: () => {
+                    if (missing) {
+                        return PL.el('div', { class: 'llmd-msg-dim' }, prompt.rawSource === 'rotated_out'
+                            ? 'The raw request rotated out of the trace buffer and was not persisted.'
+                            : 'No raw request was captured for this round.');
+                    }
+                    return llmdPromptView(prompt);
+                },
+            });
+        }
+
+        function llmdRoundStats(round, output) {
+            const usage = round.usage || {};
+            const timings = round.timings || {};
+            const pairs = [
+                ['input tokens', usage.input_tokens, true],
+                ['cached tokens', usage.cached_tokens, true],
+                ['output tokens', usage.output_tokens, true],
+                ['prompt eval', timings.prompt_eval_ms ? formatAnalyticsMs(timings.prompt_eval_ms) : null, true],
+                ['prompt speed', timings.prompt_tps ? formatAnalyticsTPS(timings.prompt_tps) : null, true],
+                ['generation', timings.generation_ms ? formatAnalyticsMs(timings.generation_ms) : null, true],
+                ['generation speed', timings.generation_tps ? formatAnalyticsTPS(timings.generation_tps) : null, true],
+                ['finish reason', output.finish, true],
+                ['flow', round.flow, true],
+                ['iteration', round.iteration, true],
+                ['finished at', round.at, true],
+                ['raw payload', round.raw_source, true],
+            ];
+            return llmdKV(pairs);
+        }
+
+        function llmdRoundBody(round, output, prompt) {
+            const body = PL.el('div', { class: 'llmd-stack' });
+            if (round.error) body.append(PL.el('div', { class: 'llmd-error' }, round.error));
+            if (prompt) body.append(llmdBlock('Prompt', '', () => llmdPromptView(prompt)));
+            if (output.text) body.append(llmdOutputView(output.text));
+            else if (!round.error && !output.toolCalls.length) body.append(PL.el('div', { class: 'llmd-msg-dim' }, 'No text in the response.'));
+            if (output.reasoning) body.append(llmdBlock('Reasoning', llmdChars(output.reasoning.length), () => llmdTextBlock(output.reasoning)));
+            if (output.toolCalls.length) {
+                const calls = PL.el('div', { class: 'llmd-calls' });
+                output.toolCalls.forEach(call => {
+                    calls.append(PL.el('div', { class: 'llmd-call' }, [
+                        PL.el('div', { class: 'llmd-call-name mono' }, `→ ${call.name}`),
+                        llmdCodeBlock(llmdPretty(call.args === undefined ? '' : call.args)),
+                    ]));
+                });
+                body.append(PL.el('div', { class: 'llmd-stack-tight' }, [PL.el('span', { class: 'llmd-block-title' }, 'Tool calls'), calls]));
+            }
+            body.append(llmdBlock('Stats', '', () => llmdRoundStats(round, output)));
+            if (round.raw_source === 'rotated_out') {
+                body.append(PL.el('div', { class: 'llmd-msg-dim' }, 'Raw payloads rotated out of the trace buffer and were not persisted.'));
+            }
+            if (round.raw_request) body.append(llmdRawDisclosure('Raw request', round.raw_request));
+            if (round.raw_response) body.append(llmdRawDisclosure('Raw response', round.raw_response));
+            const copy = PL.el('pl-button', { variant: 'ghost', size: 'sm', class: 'llmd-copy' }, 'Copy round JSON');
+            copy.addEventListener('click', () => llmdCopyText(safeStringify(round)));
+            body.append(copy);
+            return body;
+        }
+
+        function llmdRoundFacts(round) {
+            const usage = round.usage || {};
+            const facts = [];
+            if (typeof round.duration_ms === 'number') facts.push(formatAnalyticsMs(round.duration_ms));
+            if (usage.input_tokens || usage.output_tokens) {
+                facts.push(`${llmdFormatTokens(usage.input_tokens) || 0} → ${llmdFormatTokens(usage.output_tokens) || 0} tok`);
+            }
+            if (usage.cached_tokens) facts.push(`${llmdFormatTokens(usage.cached_tokens)} cached`);
+            return facts;
+        }
+
+        function llmdModelLabel(round) {
+            const label = PL.el('span', { class: 'llmd-sum-title llmd-model' });
+            const dot = PL.el('span', { class: 'llmd-model-dot', 'aria-hidden': 'true' });
+            dot.style.setProperty('--pip-c', llmdModelColorVar(round.model || round.provider));
+            label.append(dot, PL.el('span', { class: 'mono' }, round.model || round.provider || 'model'));
+            label.title = [round.provider, round.model].filter(Boolean).join(' @ ');
+            return label;
+        }
+
+        function llmdRoundStep(run, step, total) {
+            const round = step.round;
+            const output = llmdResponseOutput(round);
+            const facts = llmdRoundFacts(round);
+            if (output.toolCalls.length) facts.push(`→ ${output.toolCalls.map(call => call.name).join(', ')}`);
+            if (round.sent === 'final') facts.push(PL.badge('sent as answer', 'success'));
+            else if (round.sent === 'intermediate') facts.push(PL.badge('sent to chat', 'info'));
+            if (round.error) facts.push(PL.badge('error', 'danger'));
+            const snippet = round.error || output.text;
+            const failed = !!round.error;
+            return llmdStep('round', {
+                anchor: `llmd-step-round-${round.seq}`,
+                tone: failed ? 'fail' : (round.sent === 'final' ? 'final' : ''),
+                time: llmdStepTime(run, llmdRoundStart(run, round)),
+                timeTitle: round.at ? `finished ${round.at}` : '',
+                summary: llmdSummary(total > 1 ? `Round ${step.number}` : 'Model', llmdModelLabel(round), facts, snippet),
+                render: () => llmdRoundBody(round, output, null),
+                open: round.sent === 'final' || failed || (total === 1 && !!output.text),
+            });
+        }
+
+        function llmdAuxStep(run, step) {
+            const round = step.round;
+            const output = llmdResponseOutput(round);
+            const messages = llmdRequestMessages(round.raw_request);
+            const prompt = messages.length ? llmdPromptModel(messages) : null;
+            if (prompt) {
+                prompt.request = round.raw_request;
+                prompt.tools = Array.isArray(round.raw_request.tools) ? round.raw_request.tools : [];
+            }
+            const label = round.flow ? round.flow.replace(/_/g, ' ') : 'auxiliary call';
+            return llmdStep('aux', {
+                anchor: `llmd-step-round-${round.seq}`,
+                tone: round.error ? 'fail' : '',
+                time: llmdStepTime(run, llmdRoundStart(run, round)),
+                summary: llmdSummary(label.charAt(0).toUpperCase() + label.slice(1), llmdModelLabel(round), llmdRoundFacts(round), round.error || output.text),
+                render: () => llmdRoundBody(round, output, prompt),
+            });
+        }
+
+        // Tool results are JSON envelopes; the summary line shows their message.
+        function llmdToolSnippet(text) {
+            try {
+                const value = JSON.parse(text);
+                if (value && typeof value === 'object') {
+                    if (typeof value.message === 'string' && value.message.trim()) return value.message;
+                    if (value.error && typeof value.error.message === 'string') return value.error.message;
+                }
+            } catch (_) {
+                return text;
+            }
+            return text;
+        }
+
+        function llmdToolStep(run, step) {
+            const tool = step.tool || {};
+            const call = step.call || {};
+            const item = step.item;
+            const name = tool.name || call.name || step.name || (item && (item.message && item.message.name || item.node && item.node.attrs.name)) || 'tool';
+            let result = tool.result_json !== undefined && tool.result_json !== null ? tool.result_json : tool.result;
+            if (item) {
+                const full = item.kind === 'tool_xml' ? (llmdNodeText(llmdChild(item.node, 'output')) || llmdNodeText(item.node)) : item.message.text;
+                if (full && (!result || String(full).length >= String(result).length)) result = full;
+            }
+            const args = tool.args_json !== undefined && tool.args_json !== null ? tool.args_json : call.args;
+            const status = String(tool.status || (item ? 'ok' : '') || '');
+            const failed = status && status !== 'ok';
+            const facts = [];
+            if (status) facts.push(PL.badge(status, failed ? 'danger' : 'success'));
+            if (Number(tool.duration_ms) > 0) facts.push(formatAnalyticsMs(tool.duration_ms));
+            const resultText = result === undefined || result === null ? '' : llmdPretty(result);
+            return llmdStep('tool', {
+                anchor: step.round ? `llmd-step-tool-${step.round.seq}-${step.toolIndex}` : '',
+                tone: failed ? 'fail' : '',
+                time: llmdStepTime(run, Number.isFinite(step.at) ? step.at : null),
+                timeTitle: tool.started_at ? `started ${tool.started_at}` : '',
+                summary: llmdSummary('Tool', PL.el('span', { class: 'mono llmd-sum-title' }, name), facts, llmdToolSnippet(resultText)),
+                render: () => {
+                    const body = PL.el('div', { class: 'llmd-stack' });
+                    if (args !== undefined && args !== null && args !== '') {
+                        body.append(PL.el('div', { class: 'llmd-stack-tight' }, [PL.el('span', { class: 'llmd-block-title' }, 'Arguments'), llmdCodeBlock(llmdPretty(args))]));
+                    }
+                    body.append(PL.el('div', { class: 'llmd-stack-tight' }, [
+                        PL.el('span', { class: 'llmd-block-title' }, 'Result'),
+                        resultText ? llmdCodeBlock(resultText) : PL.el('div', { class: 'llmd-msg-dim' }, 'No result recorded.'),
+                    ]));
+                    if (!item && tool.result_json && String(tool.result_json).length >= 3990) {
+                        body.append(PL.el('div', { class: 'llmd-msg-dim' }, 'Result capped at 4,000 chars; the full text was not in a later request.'));
+                    }
+                    return body;
+                },
+            });
+        }
+
+        function llmdInboxStep(run, step) {
+            const msg = llmdInboxModel(step.item.data);
+            const facts = [];
+            if (msg.canChangeTask) facts.push(PL.badge('can change the task', 'warning'));
+            return llmdStep('inbox', {
+                time: llmdStepTime(run, step.seenAt),
+                timeTitle: `seen by the next round${msg.timestamp ? `; sent ${msg.timestamp}` : ''}`,
+                summary: llmdSummary('Chat message', msg.author || (msg.userId ? `user ${msg.userId}` : 'unknown'), facts, msg.text),
+                render: () => PL.el('div', { class: 'llmd-stack' }, [llmdChatMessageView(msg), llmdRawDisclosure('Raw message', step.item.data)]),
+            });
+        }
+
+        function llmdNoteStep(run, step) {
+            const message = step.item.message;
+            const guidance = /^runtime guidance\b/i.test(message.text.trim());
+            const label = step.item.kind === 'assistant' ? 'Assistant message' : (guidance ? 'Runtime guidance' : (step.item.label || 'Runtime note'));
+            return llmdStep('note', {
+                time: llmdStepTime(run, step.seenAt),
+                summary: llmdSummary(label, llmdChars(message.text.length), [], message.text),
+                render: () => llmdOutlineView(message.text),
+            });
+        }
+
+        function llmdRebuiltStep(step) {
+            const before = step.previous;
+            const after = step.model;
+            const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+            const changed = [];
+            if (!same(before.system.map(m => m.text), after.system.map(m => m.text))) changed.push('system prompt');
+            if (llmdNodeText(before.context) !== llmdNodeText(after.context)) changed.push('chat context');
+            if (!same(before.history.map(i => i.kind + JSON.stringify(i.node ? llmdNodeText(i.node) : (i.message ? i.message.text : i.data || i.text))), after.history.map(i => i.kind + JSON.stringify(i.node ? llmdNodeText(i.node) : (i.message ? i.message.text : i.data || i.text))))) changed.push('history');
+            if (llmdNodeText(before.trigger) !== llmdNodeText(after.trigger)) changed.push('last message');
+            after.tools = Array.isArray(step.round.raw_request && step.round.raw_request.tools) ? step.round.raw_request.tools : [];
+            after.request = step.round.raw_request;
+            return llmdStep('note', {
+                summary: llmdSummary('Prompt rebuilt', changed.length ? `${changed.join(', ')} changed` : 'same blocks, reordered', []),
+                render: () => llmdPromptView(after, { showTrigger: changed.includes('last message') }),
+            });
+        }
+
+        function llmdOutcomeStep(run) {
+            const badge = llmdOutcomeBadge(run);
+            const outcome = run.outcome || {};
+            const facts = [];
+            if (outcome.reason) facts.push(outcome.reason);
+            if (outcome.sent_message_parts) facts.push(`${outcome.sent_message_parts} part${outcome.sent_message_parts > 1 ? 's' : ''}`);
+            if (outcome.user_signal) facts.push(`signal ${outcome.user_signal}`);
+            if (outcome.side_effect_ticket_id) facts.push(`ticket ${outcome.side_effect_ticket_id}`);
+            const failed = llmdRunFailed(run);
+            const running = String(run.status || '').toLowerCase() === 'running';
+            const title = PL.badge(badge.label, badge.tone);
+            if (badge.pulse) title.classList.add('llmd-pulse');
+            const end = llmdParseTime(run.ended_at);
+            return llmdStep('outcome', {
+                anchor: 'llmd-step-outcome',
+                tone: failed ? 'fail' : (running ? 'running' : 'ok'),
+                time: end !== null ? llmdStepTime(run, end) : '',
+                summary: llmdSummary('Outcome', title, facts, run.error || ''),
+                open: failed,
+                render: () => {
+                    const body = PL.el('div', { class: 'llmd-stack' });
+                    if (run.error) body.append(PL.el('div', { class: 'llmd-error' }, run.error));
+                    if (running) {
+                        const reload = PL.el('pl-button', { variant: 'outline', size: 'sm', dataset: { action: 'llmdOpenDetail', args: JSON.stringify([run.id]) } }, 'Reload run');
+                        body.append(PL.el('div', { class: 'llmd-msg-dim' }, 'The run is still in progress.'), reload);
+                    }
+                    body.append(llmdKV([
+                        ['status', run.status, true],
+                        ['outcome', outcome.outcome, true],
+                        ['reason', outcome.reason, true],
+                        ['user signal', outcome.user_signal, true],
+                        ['sent parts', outcome.sent_message_parts, true],
+                        ['side-effect ticket', outcome.side_effect_ticket_id, true],
+                        ['ended', run.ended_at, true],
+                    ]));
+                    if (outcome.detail && Object.keys(outcome.detail).length) body.append(llmdRawDisclosure('Ledger detail', outcome.detail));
+                    return body;
+                },
+            });
+        }
+
+        // ---- waterfall overview ----
+        const LLMD_TICK_STEPS = [100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 1800000];
+        // Telegram message dates have whole-second precision, so a shorter
+        // gap between the trigger message and the run start is not a wait.
+        const LLMD_MIN_QUEUE_MS = 1000;
+        // Shorter gaps before the first or after the last call get no row.
+        const LLMD_MIN_PHASE_MS = 200;
+        // An auxiliary call starting this close to a tool still belongs to it.
+        const LLMD_NEST_SLACK_MS = 50;
+
+        function llmdFlowLabel(flow) {
+            const label = String(flow || 'auxiliary call').replace(/_/g, ' ');
+            return label.charAt(0).toUpperCase() + label.slice(1);
+        }
+
+        function llmdTriggerTime(prompt) {
+            if (!prompt || !prompt.trigger) return null;
+            const msg = llmdMessageModel(prompt.trigger);
+            return msg && msg.timestamp ? llmdParseTime(msg.timestamp) : null;
+        }
+
+        // Rounds, the tools each round called, and the auxiliary calls a tool
+        // made, as a tree of time spans in start order.
+        function llmdWaterfallSpans(run) {
+            const roundTools = llmdRoundTools(run);
+            const rounds = run.rounds || [];
+            const mainTotal = rounds.filter(round => !round.is_aux).length;
+            const top = [];
+            const tools = [];
+            let number = 0;
+            for (const round of rounds) {
+                const end = llmdParseTime(round.at);
+                if (end === null) continue;
+                const start = end - Math.max(0, Number(round.duration_ms) || 0);
+                const anchor = `llmd-step-round-${round.seq}`;
+                if (round.is_aux) {
+                    top.push({ kind: 'aux', label: llmdFlowLabel(round.flow), start, end, anchor, tone: round.error ? 'fail' : '', children: [] });
+                    continue;
+                }
+                number++;
+                const span = {
+                    kind: 'round', label: mainTotal > 1 ? `Round ${number}` : 'Model', start, end, anchor,
+                    tone: round.error ? 'fail' : (round.sent === 'final' ? 'final' : ''), children: [],
+                };
+                top.push(span);
+                const list = roundTools.get(round) || [];
+                llmdToolSpans(round, list).forEach((times, index) => {
+                    if (times.start === null) return;
+                    const tool = list[index];
+                    const child = {
+                        kind: 'tool', label: tool.name || 'tool', mono: true, start: times.start, end: times.end,
+                        anchor: `llmd-step-tool-${round.seq}-${index}`, tone: tool.status && tool.status !== 'ok' ? 'fail' : '',
+                        children: [], hosted: 0,
+                    };
+                    span.children.push(child);
+                    tools.push(child);
+                });
+            }
+            const nested = new Set();
+            for (const aux of top.filter(span => span.kind === 'aux')) {
+                const hosts = tools.filter(tool => tool.start - LLMD_NEST_SLACK_MS <= aux.start && aux.end <= tool.end + LLMD_NEST_SLACK_MS);
+                if (!hosts.length) continue;
+                hosts.sort((a, b) => (a.hosted - b.hosted) || (a.start - b.start));
+                hosts[0].hosted++;
+                hosts[0].children.push(aux);
+                nested.add(aux);
+            }
+            const rows = [];
+            const walk = (span, depth) => {
+                rows.push({ ...span, depth });
+                span.children.slice().sort((a, b) => a.start - b.start).forEach(child => walk(child, depth + 1));
+            };
+            top.filter(span => !nested.has(span)).sort((a, b) => a.start - b.start).forEach(span => walk(span, 0));
+            return rows;
+        }
+
+        function llmdUnionMs(spans) {
+            const sorted = spans.filter(span => span.end > span.start).sort((a, b) => a.start - b.start);
+            let total = 0;
+            let from = null;
+            let to = null;
+            for (const span of sorted) {
+                if (to === null || span.start > to) {
+                    if (to !== null) total += to - from;
+                    from = span.start;
+                    to = span.end;
+                } else {
+                    to = Math.max(to, span.end);
+                }
+            }
+            return to === null ? total : total + (to - from);
+        }
+
+        function llmdTickLabel(ms, step) {
+            const sign = ms < 0 ? '−' : '';
+            const abs = Math.abs(ms);
+            if (abs === 0) return '0';
+            if (abs >= 60000) {
+                const minutes = Math.floor(abs / 60000);
+                const seconds = Math.round((abs % 60000) / 1000);
+                return `${sign}${minutes}m${seconds ? ` ${seconds}s` : ''}`;
+            }
+            return `${sign}${step < 1000 ? (abs / 1000).toFixed(1) : Math.round(abs / 1000)}s`;
+        }
+
+        function llmdWaterfall(run, prompt) {
+            const start = llmdParseTime(run.started_at);
+            if (start === null) return null;
+            const rows = llmdWaterfallSpans(run);
+            if (!rows.length) return null;
+            const runEnd = llmdParseTime(run.ended_at);
+            const firstCall = Math.min(...rows.map(row => row.start));
+            const lastCall = Math.max(...rows.map(row => row.end));
+            if (firstCall - start >= LLMD_MIN_PHASE_MS) {
+                rows.unshift({ kind: 'phase', label: 'Prepare', start, end: firstCall, anchor: 'llmd-step-prompt', depth: 0, hint: 'from the run start to the first model call' });
+            }
+            if (runEnd !== null && runEnd - lastCall >= LLMD_MIN_PHASE_MS) {
+                rows.push({ kind: 'phase', label: 'Finish', start: lastCall, end: runEnd, anchor: 'llmd-step-outcome', depth: 0, hint: 'after the last call, until the run closed' });
+            }
+            const end = Math.max(start + 1, runEnd !== null ? runEnd : start, lastCall);
+            let from = Math.min(start, firstCall);
+            const triggerAt = llmdTriggerTime(prompt);
+            let queue = null;
+            if (triggerAt !== null && start - triggerAt >= LLMD_MIN_QUEUE_MS) {
+                // The wait may dwarf the work; give it at most as much width as the run.
+                const shown = Math.min(start - triggerAt, end - start);
+                from = Math.min(from, start - shown);
+                queue = { kind: 'queue', label: 'Queue', start: triggerAt, end: start, anchor: 'llmd-step-trigger', depth: 0, clipped: triggerAt < from };
+                rows.unshift(queue);
+            }
+            const span = Math.max(1, end - from);
+            const pct = at => Math.max(0, Math.min(100, ((at - from) / span) * 100));
+            const zero = pct(start);
+
+            const facts = [`run ${formatAnalyticsMs(runEnd !== null ? runEnd - start : end - start)}`];
+            if (queue) facts.push(`queue ≈${formatAnalyticsMs(queue.end - queue.start)}`);
+            rows.filter(row => row.kind === 'phase').forEach(row => facts.push(`${row.label.toLowerCase()} ${formatAnalyticsMs(row.end - row.start)}`));
+            const model = llmdUnionMs(rows.filter(row => row.kind === 'round'));
+            if (model) facts.push(`model ${formatAnalyticsMs(model)}`);
+            const toolTime = llmdUnionMs(rows.filter(row => row.kind === 'tool'));
+            if (toolTime) facts.push(`tools ${formatAnalyticsMs(toolTime)}`);
+            const auxFlows = new Map();
+            rows.filter(row => row.kind === 'aux').forEach(row => {
+                if (!auxFlows.has(row.label)) auxFlows.set(row.label, []);
+                auxFlows.get(row.label).push(row);
+            });
+            auxFlows.forEach((spans, label) => facts.push(`${label.toLowerCase()} ${formatAnalyticsMs(llmdUnionMs(spans))}`));
+
+            const box = PL.el('section', { class: 'llmd-wf', 'aria-label': 'Where the time went' });
+            box.append(PL.el('div', { class: 'llmd-wf-head' }, [
+                PL.el('span', { class: 'llmd-rail-title' }, 'Where the time went'),
+                PL.el('span', { class: 'llmd-wf-facts mono' }, facts.join(' · ')),
+            ]));
+            const offset = at => llmdOffset(at - start);
+            for (const row of rows) {
+                const line = PL.el('div', { class: 'llmd-wf-row', role: 'button', tabindex: '0', 'data-step': row.kind });
+                line.dataset.depth = String(Math.min(row.depth, 2));
+                if (row.tone) line.dataset.tone = row.tone;
+                const hint = row.hint ? ` — ${row.hint}` : (row.kind === 'queue' ? ' — from the trigger message to the run start' : '');
+                line.title = `${row.label}: ${offset(row.start)} → ${offset(row.end)}${row.clipped ? ' (bar clipped)' : ''}${hint}`;
+                const left = pct(row.start);
+                const width = Math.max(0, pct(row.end) - left);
+                const bar = PL.el('span', { class: 'llmd-wf-bar' });
+                bar.style.setProperty('--wf-left', `${left.toFixed(2)}%`);
+                bar.style.setProperty('--wf-width', `${width.toFixed(2)}%`);
+                const track = PL.el('span', { class: 'llmd-wf-track' }, bar);
+                if (queue) track.style.setProperty('--wf-zero', `${zero.toFixed(2)}%`);
+                const duration = row.end - row.start;
+                line.append(
+                    PL.el('span', { class: row.mono ? 'llmd-wf-label mono' : 'llmd-wf-label' }, row.label),
+                    track,
+                    PL.el('span', { class: 'llmd-wf-dur mono' }, `${row.kind === 'queue' ? '≈' : ''}${formatAnalyticsMs(duration)}`),
+                );
+                const go = () => llmdFocusStep(row.anchor);
+                line.addEventListener('click', go);
+                line.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        go();
+                    }
+                });
+                box.append(line);
+            }
+            const step = LLMD_TICK_STEPS.find(candidate => span / candidate <= 6) || LLMD_TICK_STEPS[LLMD_TICK_STEPS.length - 1];
+            const scale = PL.el('span', { class: 'llmd-wf-scale', 'aria-hidden': 'true' });
+            for (let tick = Math.ceil((from - start) / step) * step; start + tick <= end; tick += step) {
+                const mark = PL.el('span', { class: 'llmd-wf-tick' }, llmdTickLabel(tick, step));
+                const at = pct(start + tick);
+                mark.style.setProperty('--wf-at', `${at.toFixed(2)}%`);
+                if (at < 4) mark.classList.add('is-first');
+                else if (at > 96) mark.classList.add('is-last');
+                scale.append(mark);
+            }
+            box.append(PL.el('div', { class: 'llmd-wf-axis mono' }, [PL.el('span'), scale, PL.el('span')]));
+            return box;
+        }
+
+        function llmdFocusStep(anchor) {
+            const target = document.getElementById(anchor);
+            if (!target) return;
+            const disclosure = target.querySelector('pl-disclosure');
+            if (disclosure) disclosure.open = true;
+            const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            target.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
+            target.classList.add('is-flash');
+            setTimeout(() => target.classList.remove('is-flash'), 1200);
+        }
+
+        // ---- recall map + rail ----
+        let llmdRecall = null;
+
+        async function llmdQuietGet(path) {
+            try {
+                const res = await fetch(`/admin/api${path}`, { credentials: 'same-origin' });
+                if (!res.ok) return null;
+                return await res.json();
+            } catch (_) {
+                return null;
+            }
+        }
+
+        function llmdRecallList(memories) {
+            const list = PL.el('div', { class: 'llmd-recall' });
+            memories.forEach((m, index) => {
+                const row = PL.el('div', { class: 'llmd-recall-row', role: 'button', tabindex: '0' });
+                row.dataset.cardId = String(m.card_id);
+                const type = m.card_type || 'preference';
+                const tag = PL.el('span', { class: 'llmd-recall-type' }, type.replace(/_/g, ' '));
+                tag.style.setProperty('--type-c', `var(--c-cardtype-${type})`);
+                const bar = PL.el('span', { class: 'llmd-recall-bar' });
+                bar.style.setProperty('--fill', llmdPercent(m.salience));
+                const head = PL.el('div', { class: 'llmd-recall-head' }, [
+                    PL.el('span', { class: 'llmd-recall-rank mono' }, String(index + 1)),
+                    tag,
+                    m.competing ? PL.badge('competing', 'warning') : null,
+                    PL.el('span', { class: 'llmd-recall-meter' }, bar),
+                    PL.el('span', { class: 'llmd-recall-score mono' }, llmdPercent(m.salience)),
+                ]);
+                head.title = `salience ${llmdPercent(m.salience)} · confidence ${llmdPercent(m.confidence)}`;
+                row.append(head, PL.el('div', { class: 'llmd-recall-text' }, m.preview || ''));
+                row.addEventListener('mouseenter', () => llmdRecall && llmdRecall.map && llmdRecall.map.highlight(m.card_id));
+                row.addEventListener('mouseleave', () => llmdRecall && llmdRecall.map && llmdRecall.map.highlight(null));
+                row.addEventListener('click', () => llmdSelectMemory(m.card_id));
+                row.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        llmdSelectMemory(m.card_id);
+                    }
+                });
+                list.append(row);
+            });
+            return list;
+        }
+
+        function llmdRecallCard(run, prompt) {
+            const ctx = run.context || {};
+            const memories = (ctx.memories || []).slice().sort((a, b) => (b.salience || 0) - (a.salience || 0));
+            const card = PL.el('section', { class: 'llmd-rail-card llmd-recall-card' });
+            card.append(PL.el('div', { class: 'llmd-rail-head' }, [
+                PL.el('span', { class: 'llmd-rail-title' }, 'Recall map'),
+                PL.el('span', { class: 'llmd-msg-dim' }, 'closer to the centre = recalled stronger'),
+            ]));
+            if (!memories.length) {
+                card.append(PL.el('div', { class: 'llmd-msg-dim' }, 'No memories surfaced for this turn.'));
+                llmdRecall = null;
+                return card;
+            }
+            const types = new Map();
+            memories.forEach(m => types.set(m.card_type || 'preference', (types.get(m.card_type || 'preference') || 0) + 1));
+            const map = PL.el('pl-constellation');
+            const trigger = prompt.trigger ? llmdMessageModel(prompt.trigger).text : (run.origin && run.origin.trigger_preview) || '';
+            const baseData = {
+                ariaLabel: 'Recalled memories around the trigger message',
+                center: { label: 'trigger', title: trigger },
+                nodes: memories.map((m, index) => ({
+                    id: m.card_id,
+                    mark: index + 1,
+                    title: `${String(m.card_type || 'memory').replace(/_/g, ' ')} · ${llmdPercent(m.salience)} · ${m.preview || ''}`,
+                    group: m.card_type || 'preference',
+                    color: `var(--c-cardtype-${m.card_type || 'preference'})`,
+                    weight: m.salience,
+                    size: m.confidence,
+                    ring: !!m.competing,
+                })),
+                edges: [],
+                legend: [...types.entries()].map(([type, count]) => ({ group: type, label: type.replace(/_/g, ' '), color: `var(--c-cardtype-${type})`, count })),
+            };
+            map.data = baseData;
+            const focus = PL.el('div', { class: 'llmd-recall-focus' });
+            focus.append(PL.el('div', { class: 'llmd-msg-dim' }, 'Select a memory on the map or in the recall list to read it in full.'));
+            const caption = PL.el('div', { class: 'llmd-recall-caption', 'aria-live': 'polite' });
+            const idle = 'Numbers match the recall list. Hover a memory to preview it.';
+            caption.textContent = idle;
+            map.addEventListener('pl:node-click', event => llmdSelectMemory(event.detail && event.detail.id));
+            map.addEventListener('pl:node-hover', event => {
+                const id = event.detail && event.detail.id;
+                const hovered = id === null || id === undefined ? -1 : memories.findIndex(m => String(m.card_id) === String(id));
+                caption.textContent = hovered < 0 ? idle : `${hovered + 1} · ${String(memories[hovered].card_type || 'memory').replace(/_/g, ' ')} · ${llmdPercent(memories[hovered].salience)} — ${memories[hovered].preview || ''}`;
+                document.querySelectorAll('#llmd-detail-body .llmd-recall-row').forEach(row => {
+                    row.classList.toggle('is-hot', hovered >= 0 && row.dataset.cardId === String(id));
+                });
+            });
+            card.append(map, caption, focus);
+            llmdRecall = { map, focus, memories, cards: new Map(), base: baseData, runId: run.id };
+            llmdRecallEnrich(llmdRecall);
             return card;
+        }
+
+        // Fetches each recalled card once (bounded concurrency): the full text
+        // feeds the focus panel and links between two recalled cards become
+        // edges on the map. Failures leave the map without that card's edges.
+        async function llmdRecallEnrich(recall) {
+            const ids = new Set(recall.memories.map(m => m.card_id));
+            const queue = recall.memories.slice();
+            const seen = new Set();
+            const edges = [];
+            const worker = async () => {
+                while (queue.length) {
+                    const m = queue.shift();
+                    const data = await llmdQuietGet(`/memory/card?id=${encodeURIComponent(m.card_id)}`);
+                    if (!data) continue;
+                    recall.cards.set(String(m.card_id), data);
+                    for (const link of (data.links || [])) {
+                        if (!ids.has(link.peer_card_id)) continue;
+                        const key = `${Math.min(m.card_id, link.peer_card_id)}-${Math.max(m.card_id, link.peer_card_id)}:${link.relation}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        edges.push({
+                            from: m.card_id,
+                            to: link.peer_card_id,
+                            kind: `${String(link.relation || 'related').replace(/_/g, ' ')} · ${Number(link.confidence || 0).toFixed(2)}`,
+                            color: `var(--c-relation-${link.relation || 'same_topic'})`,
+                            dashed: link.relation === 'contradicts',
+                        });
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(6, recall.memories.length) }, worker));
+            if (llmdRecall !== recall || !recall.map.isConnected) return;
+            if (edges.length) recall.map.data = { ...recall.base, edges };
+            if (recall.selected !== undefined) llmdSelectMemory(recall.selected);
+        }
+
+        async function llmdSelectMemory(id) {
+            const recall = llmdRecall;
+            if (!recall || id === null || id === undefined) return;
+            recall.selected = id;
+            recall.map.select(id);
+            document.querySelectorAll('#llmd-detail-body .llmd-recall-row').forEach(row => {
+                row.classList.toggle('is-selected', row.dataset.cardId === String(id));
+            });
+            const memory = recall.memories.find(m => String(m.card_id) === String(id));
+            if (!memory) return;
+            const render = data => {
+                const card = data && data.card || {};
+                const type = memory.card_type || card.card_type || 'preference';
+                const tag = PL.el('span', { class: 'llmd-recall-type' }, type.replace(/_/g, ' '));
+                tag.style.setProperty('--type-c', `var(--c-cardtype-${type})`);
+                const open = PL.el('pl-button', { variant: 'outline', size: 'sm', dataset: { action: 'llmdOpenMemoryCard', args: JSON.stringify([memory.card_id]) } }, 'Open in Memory');
+                const links = (data && data.links || []).length;
+                recall.focus.replaceChildren(
+                    PL.el('div', { class: 'llmd-recall-head' }, [
+                        tag,
+                        memory.competing ? PL.badge('competing', 'warning') : null,
+                        PL.el('span', { class: 'llmd-msg-dim mono' }, `#${memory.card_id}`),
+                    ]),
+                    llmdTextBlock(card.fact_text || memory.preview || ''),
+                    llmdKV([
+                        ['salience', llmdPercent(memory.salience), true],
+                        ['confidence', llmdPercent(card.confidence !== undefined ? card.confidence : memory.confidence), true],
+                        ['status', card.status, true],
+                        ['visibility', card.visibility, true],
+                        ['links', data ? String(links) : null, true],
+                    ]),
+                    open,
+                );
+            };
+            const cached = recall.cards.get(String(id));
+            render(cached || null);
+            if (!cached) {
+                const data = await llmdQuietGet(`/memory/card?id=${encodeURIComponent(id)}`);
+                if (data && llmdRecall === recall && String(recall.selected) === String(id)) {
+                    recall.cards.set(String(id), data);
+                    render(data);
+                }
+            }
+        }
+
+        function llmdOpenMemoryCard(id) {
+            switchTab('memory');
+            openMemoryCard(id);
+        }
+
+        function llmdPersonaCard(ctx) {
+            const card = PL.el('section', { class: 'llmd-rail-card' });
+            card.append(PL.el('div', { class: 'llmd-rail-head' }, PL.el('span', { class: 'llmd-rail-title' }, 'What shaped the reply')));
+            const persona = ctx.persona || null;
+            const flags = [];
+            if (persona && persona.custom) flags.push('custom persona');
+            if (persona && persona.profanity) flags.push('profanity');
+            if (persona && persona.obscenifier) flags.push('obscenifier');
+            const history = ctx.materialized_history_len
+                ? `${ctx.history_len || 0} selected of ${ctx.materialized_history_len} loaded`
+                : String(ctx.history_len || 0);
+            card.append(llmdKV([
+                ['persona', persona && persona.name],
+                ['mood', persona && persona.mood],
+                ['flags', flags.join(', ')],
+                ['history', history, true],
+                ['tool history', ctx.tool_history_len ? String(ctx.tool_history_len) : null, true],
+                ['tools', ctx.tools_offered ? 'offered' : 'off'],
+                ['shield', ctx.shield_on ? 'on' : 'off'],
+                ['memory text', ctx.reference_context_chars ? llmdChars(ctx.reference_context_chars) : null, true],
+                ['media', ctx.media_count ? `${ctx.media_count} · ${llmdChars(ctx.media_payload_chars || 0)}` : null, true],
+            ]));
+            const settings = ctx.settings || [];
+            if (settings.length) {
+                card.append(PL.el('div', { class: 'llmd-rail-sub' }, 'Chat settings'));
+                card.append(llmdKV(settings.map(kv => [kv.label, kv.value])));
+            }
+            return card;
+        }
+
+        function llmdRunFactsCard(run) {
+            const origin = run.origin || {};
+            const totals = run.totals || {};
+            const card = PL.el('section', { class: 'llmd-rail-card' });
+            card.append(PL.el('div', { class: 'llmd-rail-head' }, PL.el('span', { class: 'llmd-rail-title' }, 'Run')));
+            card.append(llmdKV([
+                ['run', run.run_id, true],
+                ['chat', origin.chat_title ? `${origin.chat_title} (${origin.chat_id})` : origin.chat_id],
+                ['thread', origin.thread_id, true],
+                ['user', origin.user_full_name ? `${origin.user_full_name} (${origin.user_id})` : origin.user_id],
+                ['trigger message', origin.trigger_message_id, true],
+                ['queue', origin.queue_name, true],
+                ['job', origin.job_id, true],
+                ['started', run.started_at, true],
+                ['ended', run.ended_at, true],
+                ['wall time', llmdDuration(run) !== null ? formatAnalyticsMs(llmdDuration(run)) : null, true],
+                ['rounds', totals.aux_rounds ? `${totals.rounds} (${totals.aux_rounds} auxiliary)` : totals.rounds, true],
+                ['tokens', totals.total_tokens ? `${llmdFormatTokens(totals.input_tokens)} in · ${llmdFormatTokens(totals.output_tokens)} out` : null, true],
+                ['tool calls', totals.tool_calls, true],
+                ['errors', totals.errors, true],
+            ]));
+            return card;
+        }
+
+        // ---- assembly ----
+        function llmdRenderTitle(run, prompt) {
+            const title = document.getElementById('llmd-detail-title');
+            if (!title) return;
+            title.replaceChildren();
+            const kind = llmdKind(run);
+            const kindBadge = PL.el('span', { class: 'llmd-kind' });
+            kindBadge.setAttribute('data-kind', kind);
+            kindBadge.append(PL.el('span', { class: 'llmd-kind-dot' }), PL.el('span', {}, kind));
+            const badge = llmdOutcomeBadge(run);
+            const outcome = PL.badge(badge.label, badge.tone);
+            if (badge.pulse) outcome.classList.add('llmd-pulse');
+            const origin = run.origin || {};
+            const who = [llmdChatTitle(run, prompt), origin.user_full_name].filter(Boolean).join(' · ');
+            const facts = [llmdFormatTime(run.started_at)];
+            const duration = llmdDuration(run);
+            if (duration !== null) facts.push(formatAnalyticsMs(duration));
+            const tokens = llmdFormatTokens(run.totals && run.totals.total_tokens);
+            if (tokens) facts.push(`${tokens} tok`);
+            title.append(
+                kindBadge,
+                outcome,
+                PL.el('span', { class: 'llmd-detail-who' }, who),
+                PL.el('span', { class: 'llmd-detail-facts mono' }, facts.join(' · ')),
+            );
         }
 
         function llmdRenderDetail(run) {
+            llmdOpenRun = run;
+            llmdRecall = null;
+            const { steps, prompt } = llmdBuildTimeline(run);
+            llmdRenderTitle(run, prompt);
             const body = document.getElementById('llmd-detail-body');
-            const title = document.getElementById('llmd-detail-title');
-            if (title) {
-                title.replaceChildren();
-                const kind = llmdKind(run);
-                const kindBadge = PL.el('span', { class: 'llmd-kind' });
-                kindBadge.setAttribute('data-kind', kind);
-                kindBadge.append(PL.el('span', { class: 'llmd-kind-dot' }), PL.el('span', {}, kind));
-                title.append(kindBadge);
-                const badge = llmdOutcomeBadge(run);
-                title.append(PL.badge(badge.label, badge.tone));
-                title.append(PL.el('span', { class: 'mono llmd-dim' }, String(run.run_id || run.id || '')));
-            }
             if (!body) return;
-            const rounds = run.rounds || [];
-            const lastMainIndex = (() => {
-                for (let i = rounds.length - 1; i >= 0; i--) {
-                    if (!rounds[i].is_aux) return i;
+            body.removeAttribute('aria-busy');
+            const total = (run.rounds || []).filter(round => !round.is_aux).length;
+            const list = PL.el('ol', { class: 'llmd-tl' });
+            for (const step of steps) {
+                let node = null;
+                switch (step.kind) {
+                    case 'trigger': node = llmdTriggerStep(run, step.prompt); break;
+                    case 'recall': node = llmdRecallStep(run, step.prompt); break;
+                    case 'prompt': node = llmdPromptStep(run, step.prompt, step.round); break;
+                    case 'aux': node = llmdAuxStep(run, step); break;
+                    case 'round': node = llmdRoundStep(run, step, total); break;
+                    case 'tool': node = llmdToolStep(run, step); break;
+                    case 'inbox': node = llmdInboxStep(run, step); break;
+                    case 'note': node = llmdNoteStep(run, step); break;
+                    case 'rebuilt': node = llmdRebuiltStep(step); break;
+                    case 'outcome': node = llmdOutcomeStep(run); break;
+                    default: break;
                 }
-                return rounds.length - 1;
-            })();
-            body.replaceChildren(
-                llmdMetaGrid(run),
-                llmdFlowStrip(run),
-                PL.el('div', { class: 'llmd-rounds' }),
-            );
-            const feed = body.querySelector('.llmd-rounds');
-            rounds.forEach((round, index) => {
-                const expanded = index === lastMainIndex || !!round.error || rounds.length === 1;
-                feed.append(llmdRoundCard(round, index, expanded));
-            });
-            const xray = llmdContextXray(run);
-            if (xray) body.append(xray);
-        }
-
-        // The "Context X-ray": what actually fed this turn. The recalled-memory
-        // constellation is the one bold element — nodes sized by how strongly a
-        // memory surfaced, competing ones ringed, real relations drawn between
-        // them; everything else stays quiet.
-        function llmdContextXray(run) {
-            const ctx = run && run.context;
-            if (!ctx) return null;
-            const section = PL.el('div', { class: 'llmd-xray' });
-            section.append(PL.el('div', { class: 'llmd-xray-title' }, 'Context X-ray'));
-
-            const chips = PL.el('div', { class: 'llmd-xray-chips' });
-            const memories = (ctx.memories || []).slice()
-                .sort((a, b) => (b.salience || 0) - (a.salience || 0));
-            chips.append(PL.badge(memories.length + ' memories', 'neutral'));
-            const selectedHistory = ctx.history_len || 0;
-            const loadedHistory = ctx.materialized_history_len || 0;
-            const historyLabel = loadedHistory
-                ? 'history ' + selectedHistory + ' selected · ' + loadedHistory + ' loaded'
-                : 'history ' + selectedHistory;
-            chips.append(PL.badge(historyLabel, 'neutral'));
-            if (ctx.tool_history_len) {
-                chips.append(PL.badge('tool history ' + ctx.tool_history_len, 'neutral'));
+                if (node) list.append(node);
             }
-            chips.append(PL.badge(ctx.tools_offered ? 'tools on' : 'tools off', ctx.tools_offered ? 'info' : 'neutral'));
-            chips.append(PL.badge(ctx.shield_on ? 'shield on' : 'shield off', ctx.shield_on ? 'success' : 'neutral'));
-            if (ctx.reference_context_chars) {
-                chips.append(PL.badge('injected ' + formatAnalyticsCount(ctx.reference_context_chars) + ' chars', 'neutral'));
+            const main = PL.el('div', { class: 'llmd-run-main' });
+            const waterfall = llmdWaterfall(run, prompt);
+            if (waterfall) main.append(waterfall);
+            main.append(list);
+            const rail = PL.el('aside', { class: 'llmd-rail', 'aria-label': 'Run context' });
+            if (run.context) {
+                rail.append(llmdRecallCard(run, prompt), llmdPersonaCard(run.context));
             }
-            if (ctx.media_count) {
-                chips.append(PL.badge(
-                    'media ' + ctx.media_count + ' · ' + formatAnalyticsCount(ctx.media_payload_chars || 0) + ' chars',
-                    'neutral',
-                ));
-            }
-            section.append(chips);
-
-            const memGrid = PL.el('div', { class: 'llmd-xray-grid' });
-            const graphCard = PL.el('div', { class: 'card llmd-xray-card llmd-xray-graph' });
-            graphCard.append(PL.el('div', { class: 'card-header' }, 'Memories recalled · bigger surfaced stronger'));
-            const graphBody = PL.el('div', { class: 'card-body' });
-            if (!memories.length) {
-                graphBody.append(PL.el('div', { class: 'text-muted' }, 'No memories surfaced for this turn.'));
-            } else {
-                const graph = PL.el('pl-graph');
-                const center = memories.reduce((best, m) => (m.salience || 0) > (best.salience || 0) ? m : best, memories[0]);
-                graph.data = {
-                    nodes: memories.map(m => ({ id: m.card_id, label: m.preview, card_type: m.card_type, salience: m.salience, competing: m.competing })),
-                    edges: [],
-                    center: center.card_id,
-                };
-                const focus = PL.el('div', { class: 'llmd-xray-focus text-muted' }, 'Click a memory to read it in full.');
-                graph.addEventListener('pl:node-click', async (e) => {
-                    const id = e.detail && e.detail.id;
-                    const hit = memories.find(m => m.card_id === id);
-                    if (hit) focus.textContent = hit.preview;
-                    const data = await apiCall('/memory/card?id=' + encodeURIComponent(id));
-                    if (data && data.card && data.card.fact_text) focus.textContent = data.card.fact_text;
-                });
-                graphBody.append(graph, focus);
-                llmdXrayEnrichEdges(graph, memories);
-            }
-            graphCard.append(graphBody);
-            memGrid.append(graphCard);
-
-            const listCard = PL.el('div', { class: 'card llmd-xray-card' });
-            listCard.append(PL.el('div', { class: 'card-header' }, 'Recall ranking'));
-            const listBody = PL.el('div', { class: 'card-body llmd-xray-mem' });
-            if (!memories.length) {
-                listBody.append(PL.el('div', { class: 'text-muted' }, '—'));
-            } else {
-                memories.forEach(m => {
-                    const row = PL.el('div', { class: 'llmd-xray-mem-row' });
-                    const top = PL.el('div', { class: 'llmd-xray-mem-top' });
-                    const type = m.card_type || 'preference';
-                    const typeTag = PL.el('span', { class: 'llmd-xray-type' }, type.replace(/_/g, ' '));
-                    typeTag.style.setProperty('--type-c', 'var(--c-cardtype-' + type + ')');
-                    top.append(typeTag);
-                    if (m.competing) top.append(PL.badge('competing', 'warning'));
-                    top.append(PL.el('span', { class: 'mono llmd-dim llmd-xray-score' }, Math.round((m.salience || 0) * 100) + '%'));
-                    const bar = PL.el('div', { class: 'llmd-xray-bar' });
-                    const fill = PL.el('div', { class: 'llmd-xray-bar-fill' });
-                    fill.style.setProperty('--llmd-xray-fill', Math.max(3, Math.round((m.salience || 0) * 100)) + '%');
-                    bar.append(fill);
-                    row.append(top, bar, PL.el('div', { class: 'llmd-xray-mem-text' }, m.preview || ''));
-                    listBody.append(row);
-                });
-            }
-            listCard.append(listBody);
-            memGrid.append(listCard);
-            section.append(memGrid);
-
-            const ctxGrid = PL.el('div', { class: 'llmd-xray-grid' });
-            ctxGrid.append(llmdXrayPersona(ctx.persona), llmdXraySettings(ctx.settings));
-            section.append(ctxGrid);
-            return section;
-        }
-
-        // Best-effort: fetch one-hop relations for the recalled cards and keep
-        // only edges between two recalled memories. Bounded concurrency so opening
-        // a detail view can't fan out one request per memory at once, and a single
-        // failed card lookup never discards the rest (or throws unhandled).
-        async function llmdXrayEnrichEdges(graph, memories) {
-            try {
-                const ids = new Set(memories.map(m => m.card_id));
-                const seen = new Set();
-                const edges = [];
-                const queue = memories.slice();
-                const worker = async () => {
-                    while (queue.length) {
-                        const m = queue.shift();
-                        let data = null;
-                        try {
-                            data = await apiCall('/memory/card?id=' + encodeURIComponent(m.card_id));
-                        } catch (_) { data = null; }
-                        ((data && data.links) || []).forEach(link => {
-                            if (!ids.has(link.peer_card_id)) return;
-                            const key = [Math.min(m.card_id, link.peer_card_id), Math.max(m.card_id, link.peer_card_id)].join('-') + ':' + link.relation;
-                            if (seen.has(key)) return;
-                            seen.add(key);
-                            edges.push({ from: m.card_id, to: link.peer_card_id, relation: link.relation, confidence: link.confidence });
-                        });
-                    }
-                };
-                await Promise.all(Array.from({ length: Math.min(6, memories.length) }, worker));
-                if (edges.length && graph.isConnected) {
-                    const current = graph.data || {};
-                    graph.data = { nodes: current.nodes, edges, center: current.center };
-                }
-            } catch (_) { /* the constellation stands alone without edges */ }
-        }
-
-        function llmdXrayPersona(persona) {
-            const card = PL.el('div', { class: 'card llmd-xray-card' });
-            card.append(PL.el('div', { class: 'card-header' }, 'Persona'));
-            const body = PL.el('div', { class: 'card-body' });
-            if (!persona) {
-                body.append(PL.el('div', { class: 'text-muted' }, 'default'));
-                card.append(body);
-                return card;
-            }
-            const grid = PL.el('div', { class: 'llmd-xray-kv' });
-            const kv = (label, value) => {
-                if (!value) return;
-                grid.append(PL.el('div', { class: 'llmd-xray-kv-k' }, label), PL.el('div', { class: 'llmd-xray-kv-v' }, value));
-            };
-            kv('name', persona.name);
-            kv('mood', persona.mood);
-            body.append(grid);
-            const flags = PL.el('div', { class: 'llmd-xray-chips' });
-            if (persona.custom) flags.append(PL.badge('custom persona', 'info'));
-            if (persona.profanity) flags.append(PL.badge('profanity', 'neutral'));
-            if (persona.obscenifier) flags.append(PL.badge('obscenifier', 'neutral'));
-            if (flags.children.length) body.append(flags);
-            card.append(body);
-            return card;
-        }
-
-        function llmdXraySettings(settings) {
-            const card = PL.el('div', { class: 'card llmd-xray-card' });
-            card.append(PL.el('div', { class: 'card-header' }, 'Settings that shaped this reply'));
-            const body = PL.el('div', { class: 'card-body' });
-            const list = settings || [];
-            if (!list.length) {
-                body.append(PL.el('div', { class: 'text-muted' }, 'defaults'));
-            } else {
-                const grid = PL.el('div', { class: 'llmd-xray-kv' });
-                list.forEach(kv => grid.append(
-                    PL.el('div', { class: 'llmd-xray-kv-k' }, kv.label),
-                    PL.el('div', { class: 'llmd-xray-kv-v' }, kv.value),
-                ));
-                body.append(grid);
-            }
-            card.append(body);
-            return card;
+            rail.append(llmdRunFactsCard(run));
+            body.replaceChildren(PL.el('div', { class: 'llmd-run' }, [main, rail]));
         }
 
         async function llmdCopyRunJSON() {
+            if (llmdOpenRun) {
+                await llmdCopyText(safeStringify(llmdOpenRun));
+                return;
+            }
             const id = llmdState.openRunId;
             if (id === null) return;
             const data = await apiCall(`/llm/dialogs/detail?id=${encodeURIComponent(id)}`);
@@ -6337,6 +7719,8 @@
 
         async function gradiusOpenLlmTrace(jobID) {
             switchTab('llm');
+            const detail = document.getElementById('llmd-detail');
+            if (detail && detail.open) llmdCloseDetail();
             const q = document.getElementById('llmd-q');
             if (q) q.value = String(jobID);
             await loadLLMDialogs(true);
@@ -7224,17 +8608,26 @@
             document.getElementById('logs-search-input').addEventListener('input', debounce(renderLogs, 300));
         }
 
-        function addLogEntry(entry) {
-            const coreFields = ['time', 'level', 'msg', 'attrs'];
-            const attrs = entry.attrs || {};
-            for (const key in entry) {
-                if (!coreFields.includes(key)) {
-                    attrs[key] = entry[key];
-                    delete entry[key];
-                }
+        // The SSE payload is {seq, time (epoch ms as a string), level (lowercase),
+        // message, attrs}; older builds sent {time (RFC 3339), level, msg}.
+        function normalizeLogEntry(raw) {
+            const attrs = Object.assign({}, raw.attrs || {});
+            for (const key of Object.keys(raw)) {
+                if (!['seq', 'time', 'level', 'message', 'msg', 'attrs'].includes(key)) attrs[key] = raw[key];
             }
-            entry.attrs = attrs;
+            const timeValue = /^\d+$/.test(String(raw.time || '')) ? Number(raw.time) : raw.time;
+            const time = timeValue ? new Date(timeValue) : new Date();
+            return {
+                seq: raw.seq,
+                time: Number.isNaN(time.getTime()) ? new Date() : time,
+                level: String(raw.level || 'info').toUpperCase(),
+                message: String(raw.message !== undefined ? raw.message : (raw.msg || '')),
+                attrs,
+            };
+        }
 
+        function addLogEntry(raw) {
+            const entry = normalizeLogEntry(raw);
             logsBuffer.push(entry);
             if (logsBuffer.length > MAX_LOGS) {
                 logsBuffer.shift();
@@ -7253,7 +8646,7 @@
         function shouldShowLog(entry, level, search) {
             if (level && entry.level !== level) return false;
             if (search) {
-                const hay = (entry.msg + ' ' + JSON.stringify(entry.attrs || {})).toLowerCase();
+                const hay = (entry.message + ' ' + JSON.stringify(entry.attrs)).toLowerCase();
                 if (!hay.includes(search)) return false;
             }
             return true;
@@ -7280,26 +8673,39 @@
             }
         }
 
+        function logAttrsPreview(attrs) {
+            return Object.entries(attrs).map(([key, value]) => {
+                const text = typeof value === 'string' ? value : JSON.stringify(value);
+                return `${key}=${text}`;
+            }).join(' ');
+        }
+
+        function formatLogClock(date) {
+            const pad = (value, size) => String(value).padStart(size || 2, '0');
+            return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+        }
+
         function createLogElement(entry) {
             const div = document.createElement('div');
-            div.className = `log-entry log-${(entry.level || 'info').toLowerCase()}`;
+            div.className = `log-entry log-${entry.level.toLowerCase()}`;
 
-            const timeStr = entry.time ? new Date(entry.time).toLocaleTimeString() : new Date().toLocaleTimeString();
-            const time = timeStr;
-            const level = entry.level || 'INFO';
-            const msg = entry.msg || '';
-
+            const time = PL.el('span', { class: 'log-time' }, formatLogClock(entry.time));
+            time.title = entry.time.toISOString();
+            const preview = logAttrsPreview(entry.attrs);
+            const line = PL.el('span', { class: 'log-line' }, [PL.el('span', { class: 'log-msg' }, entry.message)]);
+            if (preview) line.append(PL.el('span', { class: 'log-attrs-inline' }, preview));
             const row = PL.el('div', { class: 'log-row' }, [
-                PL.el('span', { class: 'log-time' }, time),
-                PL.el('span', { class: 'log-level' }, level),
-                PL.el('span', { class: 'log-msg' }, msg),
+                time,
+                PL.el('span', { class: 'log-level' }, entry.level),
+                line,
             ]);
             row.addEventListener('click', () => toggleLogDetails(row));
 
+            const details = PL.el('div', { class: 'log-details' });
+            if (entry.message) details.append(PL.el('div', { class: 'log-details-msg' }, entry.message));
             const attrsPre = PL.el('pre', { class: 'log-attrs' });
-            if (entry.attrs) attrsPre.textContent = JSON.stringify(entry.attrs, null, 2);
-            else attrsPre.textContent = 'No attributes';
-            const details = PL.el('div', { class: 'log-details' }, attrsPre);
+            attrsPre.textContent = Object.keys(entry.attrs).length ? JSON.stringify(entry.attrs, null, 2) : 'No attributes';
+            details.append(attrsPre);
 
             div.appendChild(row);
             div.appendChild(details);
