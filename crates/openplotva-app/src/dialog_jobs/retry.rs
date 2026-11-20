@@ -49,6 +49,8 @@ pub(crate) struct RetryableDialogProviderFailure<'a> {
     pub max_attempts: i32,
     pub now: OffsetDateTime,
     pub budget_deadline: OffsetDateTime,
+    /// Every routed model already failed this step the same way, so a requeue would replay it.
+    pub requeue_futile: bool,
 }
 
 /// Decide retry vs terminal for one retryable failure. Appends the retry job
@@ -71,7 +73,8 @@ where
     let target_queue = retryable_dialog_job_target_queue(failure.queue_name);
     let attempts_exhausted = attempt >= max_attempts;
     let budget_exhausted = failure.now >= failure.budget_deadline;
-    let exhausted = attempts_exhausted || budget_exhausted;
+    let futile = failure.requeue_futile && !attempts_exhausted && !budget_exhausted;
+    let exhausted = attempts_exhausted || budget_exhausted || futile;
     let stage = if exhausted {
         LLM_JOB_RETRY_EXHAUSTED_STAGE
     } else {
@@ -87,7 +90,10 @@ where
         failure.error,
     );
     if exhausted {
-        event.message = if budget_exhausted && !attempts_exhausted {
+        event.message = if futile {
+            "every routed model's answer was rejected; a requeue would replay the rejection"
+                .to_owned()
+        } else if budget_exhausted && !attempts_exhausted {
             "retryable LLM provider error exhausted the turn budget".to_owned()
         } else {
             "retryable LLM provider error exhausted job attempts".to_owned()
@@ -119,7 +125,9 @@ where
                 max_attempts,
             ));
         }
-        let reason = if budget_exhausted && !attempts_exhausted {
+        let reason = if futile {
+            "output_rejected_by_every_target"
+        } else if budget_exhausted && !attempts_exhausted {
             "budget_exhausted"
         } else {
             failure.codes.exhausted
@@ -232,6 +240,7 @@ fn dialog_retry_exhausted_routing_event(
             "last_retryable_reason": failure.reason.as_str(),
             "provider": provider,
             "target_queue": target_queue,
+            "rejected_by_every_target": failure.requeue_futile,
         }),
     }
 }

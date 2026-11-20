@@ -226,7 +226,7 @@ impl RoutedAttemptWalker {
     pub async fn run<T, E, F, Fut, Retry>(
         &self,
         context: RoutedRequestContext,
-        mut execute: F,
+        execute: F,
         retryable: Retry,
     ) -> Result<T, RoutedAttemptRunError<E>>
     where
@@ -234,6 +234,26 @@ impl RoutedAttemptWalker {
         F: FnMut(RoutedAttempt) -> Fut + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         Retry: Fn(&E) -> Option<FailureReason> + Send,
+    {
+        self.run_described(context, execute, retryable, |_: &E| None)
+            .await
+    }
+
+    /// [`Self::run`], plus `describe`: what was wrong with a failed attempt, recorded as
+    /// `rejection` in its `attempt_failed` or `model_output_retry` event.
+    pub async fn run_described<T, E, F, Fut, Retry, Describe>(
+        &self,
+        context: RoutedRequestContext,
+        mut execute: F,
+        retryable: Retry,
+        describe: Describe,
+    ) -> Result<T, RoutedAttemptRunError<E>>
+    where
+        E: std::fmt::Debug + Send + Sync + 'static,
+        F: FnMut(RoutedAttempt) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+        Retry: Fn(&E) -> Option<FailureReason> + Send,
+        Describe: Fn(&E) -> Option<String> + Send,
     {
         let table = self.handle.snapshot();
         let Some(route) = table.resolve(&context.workflow_key, context.vip) else {
@@ -538,6 +558,14 @@ impl RoutedAttemptWalker {
                                 model_output_retry += 1;
                                 failed_attempts += 1;
                                 last_reason = Some(reason.as_str().to_owned());
+                                let detail = with_rejection(
+                                    json!({
+                                        "retry": model_output_retry,
+                                        "limit": self.model_output_retries,
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                    describe(&error),
+                                );
                                 last_error = Some(error);
                                 self.record_event(routing_event_with_severity(
                                     "model_output_retry",
@@ -546,11 +574,7 @@ impl RoutedAttemptWalker {
                                     Some(attempt.provider),
                                     Some(attempt.model),
                                     "model output rejected; re-sampling the same model",
-                                    json!({
-                                        "retry": model_output_retry,
-                                        "limit": self.model_output_retries,
-                                        "retryable_reason": reason.as_str(),
-                                    }),
+                                    detail,
                                 ));
                                 continue;
                             }
@@ -575,10 +599,13 @@ impl RoutedAttemptWalker {
                                 Some(attempt.provider),
                                 Some(attempt.model),
                                 "routed provider attempt failed",
-                                json!({
-                                    "attempt": failed_attempts + 1,
-                                    "retryable_reason": reason.as_str(),
-                                }),
+                                with_rejection(
+                                    json!({
+                                        "attempt": failed_attempts + 1,
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                    describe(&error),
+                                ),
                             ));
                             if reason == FailureReason::CapacityUnavailable
                                 && let Some(cooldown) = provider_capacity_cooldown(
@@ -724,6 +751,13 @@ impl RoutedAttemptWalker {
             reporter.record(event);
         }
     }
+}
+
+fn with_rejection(mut detail: Value, rejection: Option<String>) -> Value {
+    if let (Some(rejection), Some(object)) = (rejection, detail.as_object_mut()) {
+        object.insert("rejection".to_owned(), json!(rejection));
+    }
+    detail
 }
 
 fn all_attempts_exhausted_detail(

@@ -755,6 +755,8 @@ where
                 let retryable_reason = openplotva_llm::retry::retryable_reason(error.as_ref());
                 let retry_provider =
                     openplotva_llm::retry::provider_name(error.as_ref()).to_owned();
+                let requeue_futile =
+                    crate::dialog_runtime::is_output_rejected_by_every_target(error.as_ref());
                 let error = error.to_string();
                 if let Some(reason) = retryable_reason {
                     if sent.any()
@@ -800,6 +802,7 @@ where
                             max_attempts: ctx.max_llm_job_attempts.max(1),
                             now: failure_now,
                             budget_deadline: budget.deadline(),
+                            requeue_futile,
                         },
                         report,
                     )
@@ -898,6 +901,7 @@ where
                         },
                         now: failure_now,
                         budget_deadline: budget.deadline(),
+                        requeue_futile: false,
                     },
                     report,
                 )
@@ -1070,6 +1074,7 @@ where
                         max_attempts: ctx.max_llm_job_attempts.max(1),
                         now: failure_now,
                         budget_deadline: budget.deadline(),
+                        requeue_futile: false,
                     },
                     report,
                 )

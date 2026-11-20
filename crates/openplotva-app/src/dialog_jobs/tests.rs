@@ -1880,6 +1880,7 @@ async fn retry_handler_exhausts_on_budget_deadline_despite_remaining_attempts()
             max_attempts: 5,
             now: now + TimeDuration::seconds(130),
             budget_deadline: now + TimeDuration::seconds(120),
+            requeue_futile: false,
         },
         &mut report,
     )
@@ -1905,6 +1906,67 @@ async fn retry_handler_exhausts_on_budget_deadline_despite_remaining_attempts()
     assert_eq!(
         event.message,
         "retryable LLM provider error exhausted the turn budget"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_handler_fails_without_requeue_when_every_target_rejected_the_answer()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("hello"), now),
+    );
+    let item = queue
+        .dequeue_dialog_job(DIALOG_AIFARM_QUEUE_NAME)
+        .await?
+        .expect("work item");
+    let params = dialog_params("hello");
+    let mut report = DialogJobWorkerReport::default();
+    let error = "every routed model's answer was rejected: pathological final text";
+
+    let resolution = handle_retryable_dialog_provider_error(
+        &queue,
+        &item,
+        &params,
+        None,
+        RetryableDialogProviderFailure {
+            queue_name: DIALOG_AIFARM_QUEUE_NAME,
+            provider_name: "aifarm",
+            reason: FailureReason::ModelOutputRejected,
+            codes: PROVIDER_ERROR_RETRY_CODES,
+            error,
+            max_attempts: 5,
+            now,
+            budget_deadline: now + TimeDuration::seconds(120),
+            requeue_futile: true,
+        },
+        &mut report,
+    )
+    .await;
+
+    assert!(report.retry_exhausted);
+    assert_eq!(report.retry_attempt, Some(1));
+    assert_eq!(
+        resolution.outcome,
+        crate::dialog_turn::TurnOutcome::TerminalFailed {
+            reason: "output_rejected_by_every_target",
+            error: error.to_owned(),
+            user_signal: crate::dialog_turn::UserSignalPlan::React,
+        }
+    );
+    assert_eq!(
+        resolution.disposition,
+        crate::dialog_turn::JobDisposition::Fail(error.to_owned())
+    );
+    let record = queue.record(job_id).expect("job record");
+    let event = record.events.last().expect("retry event");
+    assert_eq!(event.stage, LLM_JOB_RETRY_EXHAUSTED_STAGE);
+    assert_eq!(
+        event.message,
+        "every routed model's answer was rejected; a requeue would replay the rejection"
     );
     Ok(())
 }
