@@ -2335,28 +2335,110 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     if has_adjacent_repeated_block(&paragraphs) {
         return Some("repeated block".to_owned());
     }
-    let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
-    let repetition_text = strip_html_tags_for_repetition(&strip_http_urls_for_repetition(value));
-    for segment in repetition_text.split(['\n', '.', '!', '?']) {
-        let words = segment
-            .split(|ch: char| !ch.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
-        if words.len() < 2 {
+    has_looping_phrase(value).then(|| "repeated phrase".to_owned())
+}
+
+const MIN_REPEATED_PHRASE_OCCURRENCES: usize = 3;
+/// Share of the prose, in percent, that one run of back-to-back copies must cover.
+const MIN_ADJACENT_PHRASE_SHARE_PERCENT: usize = 50;
+/// Share of the prose, in percent, that all phrases seen three or more times must cover.
+/// A chorus spread across verses stays under it; a model stuck in a sentence cycle does not.
+const MIN_SPREAD_PHRASE_SHARE_PERCENT: usize = 80;
+
+/// A phrase segment: its normalized text when it is long enough to compare, and its weight
+/// in characters of normalized text.
+struct PhraseSegment {
+    key: Option<String>,
+    weight: usize,
+}
+
+fn phrase_segments(value: &str) -> Vec<PhraseSegment> {
+    // Code repeats lines by nature (`return None`, `}`), so only the prose is checked.
+    let prose = leak_guard::mask_code_spans(value);
+    let prose = strip_html_tags_for_repetition(&strip_http_urls_for_repetition(&prose));
+    prose
+        .split(['\n', '.', '!', '?'])
+        .filter_map(|segment| {
+            let tokens = phrase_tokens(segment);
+            if tokens.is_empty() {
+                return None;
+            }
+            let words = tokens
+                .iter()
+                .filter(|token| token.chars().any(char::is_alphanumeric))
+                .count();
+            let normalized = tokens.join(" ");
+            let weight = normalized.chars().count();
+            let key = (words >= 2 && weight >= 8).then_some(normalized);
+            Some(PhraseSegment { key, weight })
+        })
+        .collect()
+}
+
+/// Lowercased words plus operator symbols, so `a + b` and `a - b` stay different phrases.
+fn phrase_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    for ch in segment.chars() {
+        if ch.is_alphanumeric() {
+            word.extend(ch.to_lowercase());
             continue;
         }
-        let normalized = words.join(" ");
-        if normalized.chars().count() < 8 {
-            continue;
+        if !word.is_empty() {
+            tokens.push(std::mem::take(&mut word));
         }
-        let count = repeated_segments.entry(normalized).or_default();
-        *count += 1;
-        if *count >= 3 {
-            return Some("repeated phrase".to_owned());
+        if matches!(
+            ch,
+            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '%' | '^' | '&' | '|' | '~'
+        ) {
+            tokens.push(ch.to_string());
         }
     }
-    None
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+    tokens
+}
+
+/// Whether one phrase repeats enough to read as a sampling loop: back-to-back copies that
+/// fill half the prose, or phrases seen three or more times that fill most of it.
+fn has_looping_phrase(value: &str) -> bool {
+    let segments = phrase_segments(value);
+    let total = segments.iter().map(|segment| segment.weight).sum::<usize>();
+    if total == 0 {
+        return false;
+    }
+    let covers = |weight: usize, percent: usize| weight * 100 >= total * percent;
+
+    let mut run_key: Option<&str> = None;
+    let mut run_len = 0;
+    let mut occurrences = std::collections::HashMap::<&str, (usize, usize)>::new();
+    for segment in &segments {
+        let Some(key) = segment.key.as_deref() else {
+            run_key = None;
+            run_len = 0;
+            continue;
+        };
+        if run_key == Some(key) {
+            run_len += 1;
+        } else {
+            run_key = Some(key);
+            run_len = 1;
+        }
+        if run_len >= MIN_REPEATED_PHRASE_OCCURRENCES
+            && covers(run_len * segment.weight, MIN_ADJACENT_PHRASE_SHARE_PERCENT)
+        {
+            return true;
+        }
+        let entry = occurrences.entry(key).or_insert((0, segment.weight));
+        entry.0 += 1;
+    }
+    let repeated = occurrences
+        .values()
+        .filter(|(count, _)| *count >= MIN_REPEATED_PHRASE_OCCURRENCES)
+        .map(|(count, weight)| count * weight)
+        .sum::<usize>();
+    covers(repeated, MIN_SPREAD_PHRASE_SHARE_PERCENT)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6100,6 +6182,61 @@ mod tests {
                 "repeated phrase".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_code_whose_lines_differ_by_operator() {
+        let functions = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n\ndef mul(a, b):\n    return a * b\n\ndef div(a, b):\n    return a / b";
+        for raw in [
+            format!(
+                "Вот простой калькулятор:\n<pre><code class=\"language-python\">{functions}\n</code></pre>"
+            ),
+            format!("Вот простой калькулятор:\n```python\n{functions}\n```"),
+            format!("Вот простой калькулятор:\n\n{functions}"),
+        ] {
+            assert_eq!(
+                finalize_dialog_reply(&raw),
+                DialogReplyOutcome::Reply(raw.clone()),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_song_chorus_repeated_across_verses() {
+        let raw = "[Verse 1]\nНочь опять зовёт меня\nЯ иду туда, где ты\n\n[Chorus]\nМы горим до утра\nМы горим до утра\n\n[Verse 2]\nГород спит, а мы не спим\nСердце бьётся в такт\n\n[Chorus]\nМы горим до утра\nМы горим до утра\n\n[Outro]\nМы горим до утра";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_keeps_long_reply_with_short_repeated_tail() {
+        let raw = "Собрала для тебя короткий план на неделю. В понедельник начни с лёгкой пробежки и растяжки. Во вторник сделай силовую тренировку на ноги и корпус. В среду отдыхай и гуляй не меньше часа. В четверг повтори силовую, но добавь подтягивания. В пятницу снова пробежка, чуть длиннее первой. На выходных отдыхай. Удачи! Удачи тебе! Удачи тебе! Удачи тебе!";
+
+        assert_eq!(
+            finalize_dialog_reply(raw),
+            DialogReplyOutcome::Reply(raw.to_owned())
+        );
+    }
+
+    #[test]
+    fn finalize_dialog_reply_rejects_sentence_loops() {
+        for raw in [
+            "Я не знаю. Я не знаю. Я не знаю. Я не знаю. Я не знаю.",
+            "Хороший вопрос. Я подумаю над ним. Хороший вопрос. Я подумаю над ним. Хороший вопрос. Я подумаю над ним. Хороший вопрос. Я подумаю над ним.",
+            "Вот код:\n<pre><code>print(1)</code></pre>\nЭто всё, что я могу. Это всё, что я могу. Это всё, что я могу.",
+        ] {
+            assert_eq!(
+                finalize_dialog_reply(raw),
+                DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(
+                    "repeated phrase".to_owned()
+                )),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

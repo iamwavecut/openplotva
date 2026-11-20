@@ -1,7 +1,9 @@
 //! App-level dialog provider construction.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
     sync::{Arc, Mutex},
 };
 
@@ -201,9 +203,11 @@ impl ChatStepProvider for RouterChatProvider {
             // Feedback for a re-sample, kept per model: the note tells the model that
             // rejected sample what was wrong with it, and means nothing to a different one.
             let rejected: Arc<Mutex<Option<(i64, String)>>> = Arc::new(Mutex::new(None));
+            let tally: Arc<Mutex<RejectionTally>> = Arc::default();
+            let attempt_tally = Arc::clone(&tally);
             let result = self
                 .walker
-                .run(
+                .run_described(
                     RoutedRequestContext {
                         workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
                         queue_name: Some("dialog".to_owned()),
@@ -223,6 +227,10 @@ impl ChatStepProvider for RouterChatProvider {
                         let resolved = factory.resolve(&attempt);
                         let mut step_request = request_for_attempts.clone();
                         let rejected = Arc::clone(&rejected);
+                        let tally = Arc::clone(&attempt_tally);
+                        if let Ok(mut tally) = tally.lock() {
+                            tally.attempts += 1;
+                        }
                         if let Some(verdict) =
                             rejected.lock().ok().and_then(|last| match last.as_ref() {
                                 Some((model_id, verdict)) if *model_id == attempt.model_id => {
@@ -295,12 +303,17 @@ impl ChatStepProvider for RouterChatProvider {
                                 Err(error) => {
                                     if retryable_reason(error.as_ref())
                                         == Some(FailureReason::ModelOutputRejected)
-                                        && let Ok(mut last) = rejected.lock()
                                     {
-                                        *last = Some((
-                                            attempt_model_id,
-                                            rejection_verdict_for(error.as_ref()).to_owned(),
-                                        ));
+                                        let verdict = rejection_verdict_for(error.as_ref());
+                                        if let Ok(mut last) = rejected.lock() {
+                                            *last = Some((attempt_model_id, verdict.to_owned()));
+                                        }
+                                        if verdict == PATHOLOGICAL_VERDICT
+                                            && let Ok(mut tally) = tally.lock()
+                                        {
+                                            tally.pathological_models.insert(attempt_model_id);
+                                            tally.pathological += 1;
+                                        }
                                     }
                                     Err(error)
                                 }
@@ -308,11 +321,22 @@ impl ChatStepProvider for RouterChatProvider {
                         }
                     },
                     |error| retryable_reason(error.as_ref()),
+                    |error| rejection_detail(error.as_ref()),
                 )
                 .await;
             match result {
                 Ok(output) => Ok(output),
-                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Attempt(error)) => {
+                    if tally
+                        .lock()
+                        .is_ok_and(|tally| tally.rejected_by_every_target())
+                    {
+                        let error: ChatProviderError =
+                            Box::new(OutputRejectedByEveryTarget { source: error });
+                        return Err(error);
+                    }
+                    Err(error)
+                }
                 Err(RoutedAttemptRunError::Routing(error)) => {
                     let error: ChatProviderError = Box::new(error);
                     Err(error)
@@ -320,6 +344,79 @@ impl ChatStepProvider for RouterChatProvider {
             }
         })
     }
+}
+
+const PATHOLOGICAL_VERDICT: &str = "pathological";
+
+/// The attempts of one routed dialog step, and which of them the loop guard rejected.
+#[derive(Default)]
+struct RejectionTally {
+    attempts: usize,
+    pathological: usize,
+    pathological_models: HashSet<i64>,
+}
+
+impl RejectionTally {
+    /// Every attempt, across at least two models, wrote text the loop guard rejected: the
+    /// turn itself draws the loop, so a requeue would replay the same rejection.
+    fn rejected_by_every_target(&self) -> bool {
+        self.attempts > 0
+            && self.pathological == self.attempts
+            && self.pathological_models.len() >= 2
+    }
+}
+
+/// Every routed model answered the dialog step with text the loop guard rejected.
+#[derive(Debug)]
+pub struct OutputRejectedByEveryTarget {
+    source: ChatProviderError,
+}
+
+impl fmt::Display for OutputRejectedByEveryTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "every routed model's answer was rejected: {}",
+            self.source
+        )
+    }
+}
+
+impl Error for OutputRejectedByEveryTarget {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Whether a requeue of this dialog step would replay the same rejection.
+#[must_use]
+pub fn is_output_rejected_by_every_target(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<OutputRejectedByEveryTarget>()
+        .is_some()
+        || error
+            .source()
+            .is_some_and(is_output_rejected_by_every_target)
+}
+
+/// What the validators found wrong with a rejected sample, for its routing event.
+fn rejection_detail(error: &(dyn Error + 'static)) -> Option<String> {
+    if retryable_reason(error) != Some(FailureReason::ModelOutputRejected) {
+        return None;
+    }
+    let verdict = rejection_verdict_for(error);
+    let kind = (verdict == PATHOLOGICAL_VERDICT)
+        .then(|| error.to_string())
+        .and_then(|message| {
+            message
+                .rsplit_once(": ")
+                .map(|(_, kind)| kind.trim().to_owned())
+        })
+        .filter(|kind| !kind.is_empty());
+    Some(match kind {
+        Some(kind) => format!("{verdict}: {kind}"),
+        None => verdict.to_owned(),
+    })
 }
 
 /// Build the dialog executor from the shared routing policy.
@@ -975,6 +1072,105 @@ mod tests {
         assert_eq!(
             inputs[1].resample_verdict, "context_leak",
             "the re-sample must carry what the guard rejected"
+        );
+    }
+
+    fn two_model_dialog_snapshot() -> RoutingSnapshot {
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.workflows[0].retry_max_hops = 3;
+        let mut fallback_model = snapshot.models[0].clone();
+        fallback_model.id = 11;
+        fallback_model.model_name = "db/fallback".to_owned();
+        snapshot.models.push(fallback_model);
+        let mut fallback = snapshot.assignments[0].clone();
+        fallback.id = 101;
+        fallback.role = "fallback".to_owned();
+        fallback.provider_model_id = 11;
+        fallback.fallback_order = Some(0);
+        snapshot.assignments.push(fallback);
+        snapshot
+    }
+
+    async fn run_two_model_step(
+        results: Vec<Result<DialogOutput, ChatProviderError>>,
+    ) -> (
+        ChatProviderError,
+        Vec<crate::runtime_routing::RoutingEventData>,
+    ) {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("aifarm", results));
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(16),
+            None,
+            None,
+        );
+        let provider = router_provider_for_test(
+            two_model_dialog_snapshot(),
+            default_provider,
+            clients,
+            reporter.clone(),
+        );
+        let error = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .expect_err("every attempt fails");
+        (error, reporter.buffer().routing_events(16))
+    }
+
+    fn pathological(reason: &str) -> Result<DialogOutput, ChatProviderError> {
+        Err(Box::new(
+            openplotva_llm::aifarm::AifarmDialogError::FinalAnswerPathological(reason.to_owned()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn pathological_answers_from_every_model_mark_the_requeue_futile() {
+        let (error, events) = run_two_model_step(vec![
+            pathological("repeated phrase"),
+            pathological("repeated phrase"),
+        ])
+        .await;
+
+        assert!(is_output_rejected_by_every_target(error.as_ref()));
+        assert_eq!(
+            retryable_reason(error.as_ref()),
+            Some(FailureReason::ModelOutputRejected),
+            "the marker keeps the retry classification of the rejection it wraps"
+        );
+        let rejections = events
+            .iter()
+            .filter(|event| event.event_type == "attempt_failed")
+            .map(|event| event.detail["rejection"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rejections, vec![json!("pathological: repeated phrase"); 2]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_another_kind_keeps_the_requeue() {
+        let unavailable: ChatProviderError = Box::new(ProviderError::new(
+            "aifarm",
+            FailureReason::ProviderUnavailable,
+            "status 503",
+        ));
+        let (error, events) =
+            run_two_model_step(vec![pathological("repeated phrase"), Err(unavailable)]).await;
+
+        assert!(!is_output_rejected_by_every_target(error.as_ref()));
+        let mut rejections = events
+            .iter()
+            .filter(|event| event.event_type == "attempt_failed")
+            .map(|event| event.detail.get("rejection").cloned())
+            .collect::<Vec<_>>();
+        rejections.sort_by_key(Option::is_some);
+        assert_eq!(
+            rejections,
+            vec![None, Some(json!("pathological: repeated phrase"))],
+            "only rejected outputs carry a rejection kind"
         );
     }
 
