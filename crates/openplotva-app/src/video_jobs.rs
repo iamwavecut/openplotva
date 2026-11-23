@@ -6,6 +6,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use openplotva_llm::aifarm::AifarmHttpTransport;
+use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_media::{NsfwResult, video::VideoOptimize};
 use openplotva_server::ACTION_SEND_VIDEO;
 use openplotva_taskman::{
@@ -18,7 +19,7 @@ use openplotva_telegram::{
 use time::OffsetDateTime;
 
 use crate::image_jobs::{
-    AifarmDrawApiImageGenerator, DrawApiVideo, ImageJobTelegramSender,
+    AifarmDrawApiImageGenerator, DrawApiVideo, ImageGenerationError, ImageJobTelegramSender,
     build_image_generation_caption,
 };
 use crate::permissions::{ChatPermissionPolicy, ChatPermissionStore};
@@ -69,11 +70,38 @@ where
         job_id: i64,
     ) -> VideoJobFuture<'a, Result<DrawApiVideo, String>> {
         Box::pin(async move {
-            self.generate_video_with_job_id(prompt, &format!("video-{job_id}"))
+            let first = self
+                .generate_video_with_job_id(prompt, &format!("video-{job_id}"))
+                .await;
+            let error = match first {
+                Err(error) if video_render_retryable(&error) => error,
+                other => return other.map_err(|error| error.message()),
+            };
+            tracing::warn!(
+                job_id,
+                error = %error.message(),
+                "clip render failed on the farm; submitting it once more"
+            );
+            self.generate_video_with_job_id(prompt, &format!("video-{job_id}-retry"))
                 .await
                 .map_err(|error| error.message())
         })
     }
+}
+
+/// A second farm job can render the clip when the first one met a draw-api server error
+/// (a worker that died is loaded again) or an unreachable farm; a bad request, a safety
+/// refusal or a watchdog timeout ends the clip.
+fn video_render_retryable(error: &ImageGenerationError) -> bool {
+    let ImageGenerationError::Provider(message) = error else {
+        return false;
+    };
+    let server_error = message
+        .split("draw-api status ")
+        .skip(1)
+        .any(|rest| rest.starts_with('5'));
+    server_error
+        || retryable_reason_from_message(message) == Some(FailureReason::ProviderUnavailable)
 }
 
 /// One clip ready for the chat.
@@ -831,5 +859,32 @@ mod tests {
         ] {
             assert!(debug.contains(expected), "missing {expected} in {debug}");
         }
+    }
+
+    #[test]
+    fn only_farm_side_render_failures_get_a_second_submission() {
+        use crate::image_jobs::ImageGenerationError::{Forbidden, Provider};
+
+        for retried in [
+            r#"job failed: draw-api status 500: {"detail":"fastframes worker is not running"}"#,
+            r#"job failed: draw-api status 503: {"detail":"service unavailable: fastframes is not loaded"}"#,
+            "submit draw job: error sending request for url (http://farm.test/v1/jobs)",
+        ] {
+            assert!(
+                video_render_retryable(&Provider(retried.to_owned())),
+                "{retried}"
+            );
+        }
+        for final_failure in [
+            r#"job failed: draw-api status 400: {"detail":"fastframes needs a prompt"}"#,
+            "draw-api provider timeout: inference watchdog expired while waiting to poll draw job video-1",
+            "job completed but produced no video",
+        ] {
+            assert!(
+                !video_render_retryable(&Provider(final_failure.to_owned())),
+                "{final_failure}"
+            );
+        }
+        assert!(!video_render_retryable(&Forbidden));
     }
 }
