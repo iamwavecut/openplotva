@@ -5395,9 +5395,12 @@ fn draw_job_error(error: Option<&Value>, status_code: u16, body_text: &str) -> O
     if status_code < 400 {
         return parsed;
     }
-    parsed
-        .or_else(|| non_empty(body_text.to_owned()))
-        .or_else(|| Some(format!("API error (status {status_code})")))
+    parsed.or_else(|| {
+        Some(match non_empty(body_text.to_owned()) {
+            Some(body) => format!("draw-api status {status_code}: {body}"),
+            None => format!("draw-api status {status_code}"),
+        })
+    })
 }
 
 fn evaluate_draw_api_status(status: &DrawApiJobStatus) -> DrawApiWaitDecision {
@@ -5406,10 +5409,15 @@ fn evaluate_draw_api_status(status: &DrawApiJobStatus) -> DrawApiWaitDecision {
     {
         return DrawApiWaitDecision::Done(result.clone());
     }
+    // Discovery marks a job succeeded whenever draw-api answered, so an HTTP error reply
+    // arrives as a success without a result; its detail is the failure.
     if is_success_status(&status.status) {
-        return match &status.result {
-            Some(result) => DrawApiWaitDecision::Done(result.clone()),
-            None => DrawApiWaitDecision::Failed("job completed but no result available".to_owned()),
+        return match (&status.result, &status.error) {
+            (Some(result), _) => DrawApiWaitDecision::Done(result.clone()),
+            (None, Some(error)) => DrawApiWaitDecision::Failed(error.clone()),
+            (None, None) => {
+                DrawApiWaitDecision::Failed("job completed but no result available".to_owned())
+            }
         };
     }
     if is_failure_status(&status.status) {
@@ -8603,6 +8611,58 @@ mod tests {
         assert!(!error.contains("missing image_b64"));
     }
 
+    fn succeeded_draw_envelope(status_code: u16, body: &[u8]) -> DiscoveryJobEnvelope {
+        serde_json::from_value(json!({
+            "job": {
+                "job_id": "draw-http-error",
+                "state": "JOB_STATE_SUCCEEDED",
+                "result": {
+                    "response": {
+                        "status_code": status_code,
+                        "body": general_purpose::STANDARD.encode(body)
+                    }
+                }
+            }
+        }))
+        .expect("draw envelope")
+    }
+
+    #[test]
+    fn a_succeeded_job_with_an_http_error_fails_with_the_draw_api_detail() {
+        let envelope =
+            succeeded_draw_envelope(500, br#"{"detail":"fastframes worker is not running"}"#);
+        let status =
+            draw_api_status_from_envelope("draw-http-error", &envelope).expect("draw status");
+
+        let DrawApiWaitDecision::Failed(message) = evaluate_draw_api_status(&status) else {
+            panic!("an HTTP error reply must fail the job");
+        };
+
+        assert_eq!(
+            message,
+            r#"draw-api status 500: {"detail":"fastframes worker is not running"}"#
+        );
+    }
+
+    #[test]
+    fn a_succeeded_job_with_a_503_is_a_retryable_provider_failure() {
+        let envelope = succeeded_draw_envelope(
+            503,
+            br#"{"detail":"service unavailable: fastframes is not loaded"}"#,
+        );
+        let status =
+            draw_api_status_from_envelope("draw-http-error", &envelope).expect("draw status");
+
+        let DrawApiWaitDecision::Failed(message) = evaluate_draw_api_status(&status) else {
+            panic!("an HTTP error reply must fail the job");
+        };
+
+        assert_eq!(
+            openplotva_llm::retry::retryable_reason_from_message(&format!("job failed: {message}")),
+            Some(openplotva_llm::retry::FailureReason::ProviderUnavailable)
+        );
+    }
+
     #[test]
     fn aifarm_draw_api_default_watchdog_is_five_minutes() {
         assert_eq!(
@@ -8803,6 +8863,113 @@ mod tests {
                 "job completed but produced no video".to_owned()
             ))
         );
+    }
+
+    fn fastframes_generator(
+        transport: AifarmTransportStub,
+    ) -> AifarmDrawApiImageGenerator<AifarmTransportStub> {
+        AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_FASTFRAMES_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_nanos(1),
+                capacity_wait: StdDuration::ZERO,
+            },
+            transport,
+        )
+    }
+
+    fn draw_reply(job_id: &str, status_code: u16, body: &[u8]) -> Value {
+        json!({
+            "job": {
+                "job_id": job_id,
+                "state": "JOB_STATE_SUCCEEDED",
+                "result": {
+                    "response": {
+                        "status_code": status_code,
+                        "body": general_purpose::STANDARD.encode(body)
+                    }
+                }
+            }
+        })
+    }
+
+    fn submitted_idempotency_keys(probe: &AifarmTransportStub) -> Vec<String> {
+        probe
+            .requests()
+            .iter()
+            .filter(|request| request.method == AifarmHttpMethod::Post)
+            .map(|request| {
+                serde_json::from_slice::<DiscoveryJobRequest>(&request.body)
+                    .expect("job request")
+                    .idempotency_key
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_clip_whose_farm_job_failed_with_a_server_error_is_submitted_once_more() {
+        let clip = [0_u8, 0, 0, 24, b'f', b't', b'y', b'p'];
+        let clip_reply = serde_json::to_vec(&json!({
+            "video_b64": general_purpose::STANDARD.encode(clip),
+            "mime_type": "video/mp4",
+            "width": 832,
+            "height": 480,
+            "frames": 81,
+            "fps": 16
+        }))
+        .expect("video payload");
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "job-1", "state": "processing"}),
+            )),
+            Ok(json_response(draw_reply(
+                "job-1",
+                500,
+                br#"{"detail":"fastframes worker is not running"}"#,
+            ))),
+            Ok(json_response(
+                json!({"job_id": "job-2", "state": "processing"}),
+            )),
+            Ok(json_response(draw_reply("job-2", 200, &clip_reply))),
+        ]);
+        let probe = transport.clone();
+        let generator = fastframes_generator(transport);
+
+        let video = crate::video_jobs::VideoGenerator::generate_video(&generator, "rain", 77)
+            .await
+            .expect("the second submission renders the clip");
+
+        assert_eq!(video.bytes, clip.to_vec());
+        assert_eq!(
+            submitted_idempotency_keys(&probe),
+            ["video-77", "video-77-retry"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clip_rejected_as_a_bad_request_is_not_submitted_again() {
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "job-1", "state": "processing"}),
+            )),
+            Ok(json_response(draw_reply(
+                "job-1",
+                400,
+                br#"{"detail":"fastframes needs a prompt"}"#,
+            ))),
+        ]);
+        let probe = transport.clone();
+        let generator = fastframes_generator(transport);
+
+        let error = crate::video_jobs::VideoGenerator::generate_video(&generator, "rain", 78)
+            .await
+            .expect_err("a bad request fails the clip");
+
+        assert!(error.contains("draw-api status 400"), "{error}");
+        assert_eq!(submitted_idempotency_keys(&probe), ["video-78"]);
     }
 
     async fn submitted_draw_request(endpoint_name: &str, request: ImageGenerationRequest) -> Value {
