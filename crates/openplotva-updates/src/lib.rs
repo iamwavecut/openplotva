@@ -259,7 +259,30 @@ pub fn decode_telegram_update_value(
 ) -> Result<TelegramUpdate, serde_json::Error> {
     normalize_poll_answer_voter_chat(&mut value);
     normalize_legacy_chat_member_rights(&mut value);
+    drop_animation_document_mirrors(&mut value);
     serde_json::from_value(value)
+}
+
+/// Bot API mirrors every `animation` into `document` for old clients, and
+/// carapax picks the document, so silent GIF clips would look like videos.
+fn drop_animation_document_mirrors(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object
+                .get("animation")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                object.remove("document");
+            }
+            object
+                .values_mut()
+                .for_each(drop_animation_document_mirrors);
+        }
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(drop_animation_document_mirrors);
+        }
+        _ => {}
+    }
 }
 
 fn normalize_legacy_chat_member_rights(value: &mut serde_json::Value) {
@@ -2742,6 +2765,9 @@ pub fn fetcher_message_text(message: &TelegramMessage) -> String {
         TelegramMessageData::Sticker(sticker) => sticker.emoji.clone().unwrap_or_default(),
         TelegramMessageData::Audio(audio) => audio_fallback_text(&audio.data),
         TelegramMessageData::Video(video) => video.data.file_name.clone().unwrap_or_default(),
+        TelegramMessageData::Animation(animation) => {
+            animation.file_name.clone().unwrap_or_default()
+        }
         TelegramMessageData::Document(document) => {
             document.data.file_name.clone().unwrap_or_default()
         }
@@ -3938,6 +3964,89 @@ mod tests {
         assert_eq!(chat.id, -10043);
         assert_eq!(chat.chat_type, "supergroup");
         assert!(state.user.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_update_decoder_keeps_gif_animations_out_of_document_mirror()
+    -> Result<(), Box<dyn Error>> {
+        let gif = |unique: &str| {
+            json!({
+                "file_id": format!("{unique}-file"),
+                "file_unique_id": unique,
+                "width": 320,
+                "height": 240,
+                "duration": 3,
+                "file_name": "clip.mp4",
+                "mime_type": "video/mp4"
+            })
+        };
+        let mirror = |unique: &str| {
+            json!({
+                "file_id": format!("{unique}-file"),
+                "file_unique_id": unique,
+                "file_name": "clip.mp4",
+                "mime_type": "video/mp4"
+            })
+        };
+        let update = super::decode_telegram_update_value(json!({
+            "update_id": 19,
+            "message": {
+                "message_id": 20,
+                "date": 1_710_000_000,
+                "chat": {"id": -10045, "type": "supergroup", "title": "Gif Team"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Ann"},
+                "animation": gif("gif-current"),
+                "document": mirror("gif-current"),
+                "reply_to_message": {
+                    "message_id": 19,
+                    "date": 1_710_000_000,
+                    "chat": {"id": -10045, "type": "supergroup", "title": "Gif Team"},
+                    "document": mirror("gif-reply"),
+                    "animation": gif("gif-reply")
+                }
+            }
+        }))?;
+        let message = update
+            .get_message()
+            .ok_or_else(|| io::Error::other("expected message"))?;
+        assert!(matches!(message.data, TelegramMessageData::Animation(_)));
+        let Some(super::TelegramReplyTo::Message(reply)) = message.reply_to.as_ref() else {
+            return Err(io::Error::other("expected reply message").into());
+        };
+        assert!(matches!(reply.data, TelegramMessageData::Animation(_)));
+
+        let attachments = super::collect_media_attachments(Some(message), &[]);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, "animation");
+        assert_eq!(attachments[0].file_unique_id, "gif-current");
+        let refs = super::update_file_metadata_refs(&update);
+        assert!(
+            refs.iter()
+                .all(|file| file.media_kind == super::TELEGRAM_FILE_MEDIA_KIND_ANIMATION),
+            "{refs:?}"
+        );
+        assert!(refs.iter().any(|file| file.file_unique_id == "gif-current"));
+
+        let video_document = super::decode_telegram_update_value(json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 22,
+                "date": 1_710_000_000,
+                "chat": {"id": -10045, "type": "supergroup", "title": "Gif Team"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Ann"},
+                "document": mirror("video-file")
+            }
+        }))?;
+        let message = video_document
+            .get_message()
+            .ok_or_else(|| io::Error::other("expected message"))?;
+        assert!(matches!(message.data, TelegramMessageData::Document(_)));
+        assert_eq!(
+            super::collect_media_attachments(Some(message), &[])[0].kind,
+            "video"
+        );
 
         Ok(())
     }

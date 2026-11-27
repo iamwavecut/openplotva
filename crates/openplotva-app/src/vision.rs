@@ -1434,13 +1434,16 @@ enum MediaAnalysisRoute {
 fn media_analysis_route(attachment: &ChatAttachment) -> MediaAnalysisRoute {
     let kind = attachment.kind.trim().to_ascii_lowercase();
     let mime = attachment.mime_type.trim().to_ascii_lowercase();
+    if kind == "animation" {
+        return MediaAnalysisRoute::Visual;
+    }
     if mime.starts_with("video/") || matches!(kind.as_str(), "video" | "video_note") {
         return MediaAnalysisRoute::VisualAndAudio;
     }
     if mime.starts_with("audio/") || matches!(kind.as_str(), "voice" | "audio") {
         return MediaAnalysisRoute::Audio;
     }
-    if mime.starts_with("image/") || matches!(kind.as_str(), "image" | "photo" | "animation") {
+    if mime.starts_with("image/") || matches!(kind.as_str(), "image" | "photo") {
         return MediaAnalysisRoute::Visual;
     }
     MediaAnalysisRoute::Unsupported
@@ -2156,6 +2159,7 @@ mod tests {
             route("video", "video/mp4"),
             MediaAnalysisRoute::VisualAndAudio
         );
+        assert_eq!(route("animation", "video/mp4"), MediaAnalysisRoute::Visual);
         assert_eq!(route("voice", "audio/ogg"), MediaAnalysisRoute::Audio);
         assert_eq!(route("audio", "audio/mpeg"), MediaAnalysisRoute::Audio);
         assert_eq!(

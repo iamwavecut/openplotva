@@ -50,6 +50,7 @@ const ASR_DISCOVERY_CAPACITY_WAIT: Duration = Duration::from_secs(2);
 const ASR_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const ASR_DISCOVERY_REQUEST_RETRIES: u8 = 5;
 const ASR_TERMINAL_PAYLOAD_RETRIES: u8 = 2;
+const ASR_WARNING_NO_AUDIO_STREAM: &str = "no_audio_stream";
 pub const ASR_TASKMAN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ASR_TASKMAN_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const ASR_TASKMAN_WORKER_ID: &str = "asr-gpu1-worker-0";
@@ -1040,7 +1041,16 @@ where
         };
         let text = transcript.text.trim().to_owned();
         if text.is_empty() {
-            let error = "empty transcript".to_owned();
+            let error = if transcript
+                .warnings
+                .iter()
+                .any(|warning| warning == ASR_WARNING_NO_AUDIO_STREAM)
+            {
+                "no audio stream"
+            } else {
+                "empty transcript"
+            }
+            .to_owned();
             self.store_unavailable(record, &error, OffsetDateTime::now_utc())
                 .await
                 .map_err(|store_error| {
@@ -1332,9 +1342,11 @@ fn select_voice_candidate(meta: &ChatMessageMeta) -> Option<VoiceCandidate> {
 fn voice_candidate(index: usize, attachment: &ChatAttachment) -> Option<VoiceCandidate> {
     let kind = attachment.kind.trim();
     let mime = attachment.mime_type.trim();
-    let speech_bearing = matches!(kind, "voice" | "audio" | "video" | "video_note")
-        || mime.starts_with("audio/")
-        || mime.starts_with("video/");
+    // GIF animations are silent MP4 clips: ffmpeg finds no audio stream.
+    let speech_bearing = kind != "animation"
+        && (matches!(kind, "voice" | "audio" | "video" | "video_note")
+            || mime.starts_with("audio/")
+            || mime.starts_with("video/"));
     if !speech_bearing || attachment.source.trim() != "message" {
         return None;
     }
@@ -1695,6 +1707,7 @@ mod tests {
                     kind: "animation".to_owned(),
                     source: "message".to_owned(),
                     file_unique_id: "animation-u".to_owned(),
+                    mime_type: "video/mp4".to_owned(),
                     ..ChatAttachment::default()
                 },
             )
@@ -2163,6 +2176,36 @@ mod tests {
         assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
         assert_eq!(updates[1].asr_error.as_deref(), Some("empty transcript"));
         assert!(updates[1].asr_completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn materializer_labels_media_without_audio_stream() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut silent = transcript("");
+        silent.chunks = 0;
+        silent.warnings = vec![ASR_WARNING_NO_AUDIO_STREAM.to_owned()];
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            FakeDownloader::default(),
+            FakeTranscriber {
+                result: Ok(silent),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        let input = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(input.message.text.is_empty());
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
+        assert_eq!(updates[1].asr_error.as_deref(), Some("no audio stream"));
     }
 
     #[tokio::test]
