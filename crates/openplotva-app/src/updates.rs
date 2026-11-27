@@ -1340,7 +1340,7 @@ pub(crate) fn decode_telegram_update_payload(
     let mut payload = serde_json::from_slice(raw_payload)?;
     remove_legacy_forward_fields(&mut payload);
     prefer_sender_chat_in_messages(&mut payload);
-    serde_json::from_value(payload)
+    openplotva_updates::decode_telegram_update_value(payload)
 }
 
 fn raw_paid_media_caption(raw_payload: &[u8]) -> Option<String> {
@@ -2311,6 +2311,50 @@ mod tests {
             .filter_map(|attachment| attachment["kind"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(kinds, vec!["image", "sticker"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gif_animation_history_keeps_animation_kind() -> Result<(), Box<dyn Error>> {
+        let raw = serde_json::to_vec(&json!({
+            "update_id": 1_521_300_000,
+            "message": {
+                "message_id": 700_000,
+                "date": 1_783_909_208,
+                "chat": {"id": -1009876543211_i64, "type": "supergroup", "title": "Chat"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Ann"},
+                "animation": {
+                    "file_id": "gif",
+                    "file_unique_id": "gif-u",
+                    "width": 320,
+                    "height": 240,
+                    "duration": 3,
+                    "file_name": "clip.mp4",
+                    "mime_type": "video/mp4"
+                },
+                "document": {
+                    "file_id": "gif",
+                    "file_unique_id": "gif-u",
+                    "file_name": "clip.mp4",
+                    "mime_type": "video/mp4"
+                }
+            }
+        }))?;
+
+        let update = super::decode_telegram_update_payload(&raw)?;
+        let carapax::types::UpdateType::Message(message) = &update.update_type else {
+            return Err("expected message update".into());
+        };
+        assert!(matches!(
+            message.data,
+            carapax::types::MessageData::Animation(_)
+        ));
+        let store = HistoryStoreStub::default();
+        let report = super::persist_update_history(&store, &update, 0).await?;
+        assert!(report.inbound_entry_persisted);
+        let payload: Value = serde_json::from_slice(&store.entries()[0].payload)?;
+        assert_eq!(payload["meta"]["attachments"][0]["kind"], "animation");
+        assert_eq!(payload["meta"]["type"], "animation");
         Ok(())
     }
 
