@@ -437,9 +437,11 @@ dispatched (disallowed tools don't count toward `tool_calls_made`).
 ### 3. Integration Boundaries
 
 #### `openplotva-telegram`
-Owns the entire Bot API surface. **Inbound**: `LongPollUpdateSource` (60s
-`getUpdates`, HTTP total timeout 90s sized to exceed it) / `WebhookUpdateSource`
-(bounded mpsc, ingress guard). **Outbound**: two-queue `DispatcherQueue`
+Owns the entire Bot API surface. **Inbound**: the webhook sender and the long-poll
+Stream producer (60s `getUpdates`, HTTP total timeout 90s sized to exceed it) both
+apply the ingress guard and append each update's raw Bot API JSON to the Redis
+update Stream; every consumer decodes it with `openplotva_updates::decode_telegram_update_value`,
+so Bot API compatibility fixes belong there. **Outbound**: two-queue `DispatcherQueue`
 (immediate bypasses dedup+ratelimit; regular subject to both), per-chat
 burst-one limiter (50ms), `Debouncer` (30s window, LRU), Redis persistence
 (at-most-once replay across restarts). **Bounded retry** (`send_outbound_method_with_bounded_retry`): retries only short 429s (≤5s) and connect-phase failures; mid-response transport errors are terminal (no double-send). Rich messages via raw reqwest `RichApiClient` (Bot API 10.1). Two independent HTML sanitizers (`html.rs` classic, `rich_html.rs` large allowlist). Stars payment helpers + `StarTransactionsClient`.
