@@ -12,12 +12,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use carapax::types::{
-    AllowedUpdate, DeleteWebhook, GetUpdates, SetWebhook, Update as TelegramUpdate,
+use carapax::{
+    api::{Method, Payload, PayloadError},
+    types::{AllowedUpdate, DeleteWebhook, GetUpdates, SetWebhook, Update as TelegramUpdate},
 };
 use openplotva_updates::{
-    RedisUpdateStream, UpdateProducerSource, UpdateProducerSourceFuture, UpdateStreamAppend,
-    UpdateStreamSource,
+    RedisUpdateStream, UpdateIngressDecision, UpdateIngressGuard, UpdateProducerSource,
+    UpdateProducerSourceFuture, UpdateStreamAppend, UpdateStreamSource,
 };
 use thiserror::Error;
 use tokio::{
@@ -39,14 +40,15 @@ const LONG_POLL_STREAM_MAX_RECORDED_ERRORS: usize = 64;
 
 /// Boxed future returned by Telegram `getUpdates` executors.
 pub type GetUpdatesFuture<'a, E> =
-    Pin<Box<dyn Future<Output = Result<Vec<TelegramUpdate>, E>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>, E>> + Send + 'a>>;
 
 /// Minimal capability needed by the long-poll update source.
 pub trait GetUpdatesExecutor {
     /// Error returned by the concrete Telegram client.
     type Error: fmt::Display + Send;
 
-    /// Execute one Telegram `getUpdates` request.
+    /// Execute one Telegram `getUpdates` request. Each update stays the raw
+    /// Bot API JSON object, the same shape a webhook request body carries.
     fn get_updates<'a>(&'a self, method: GetUpdates) -> GetUpdatesFuture<'a, Self::Error>;
 }
 
@@ -54,8 +56,80 @@ impl GetUpdatesExecutor for carapax::api::Client {
     type Error = carapax::api::ExecuteError;
 
     fn get_updates<'a>(&'a self, method: GetUpdates) -> GetUpdatesFuture<'a, Self::Error> {
-        Box::pin(self.execute(method))
+        Box::pin(self.execute(RawGetUpdates(method)))
     }
+}
+
+/// `getUpdates` with an untyped result. The typed carapax result is lossy:
+/// it reads a GIF `animation` with its `document` mirror as a plain document.
+struct RawGetUpdates(GetUpdates);
+
+impl Method for RawGetUpdates {
+    type Response = Vec<serde_json::Value>;
+
+    fn into_payload(self) -> Result<Payload, PayloadError> {
+        self.0.into_payload()
+    }
+}
+
+/// One raw Bot API update as webhook and long-poll ingress see it. The raw
+/// JSON goes to the stream unchanged; the shared decoder reads it here only
+/// for the update ID and the ingress guard, as every consumer does later.
+struct RawIngressUpdate {
+    update_id: Option<i64>,
+    decoded: Option<TelegramUpdate>,
+}
+
+impl RawIngressUpdate {
+    fn from_slice(body: &[u8]) -> Self {
+        serde_json::from_slice(body).map_or(
+            Self {
+                update_id: None,
+                decoded: None,
+            },
+            Self::from_value,
+        )
+    }
+
+    fn from_value(value: serde_json::Value) -> Self {
+        let raw_update_id = value.get("update_id").and_then(serde_json::Value::as_i64);
+        let decoded = openplotva_updates::decode_telegram_update_value(value).ok();
+        Self {
+            update_id: decoded.as_ref().map(|update| update.id).or(raw_update_id),
+            decoded,
+        }
+    }
+
+    fn dropped_by(&self, ingress_guard: Option<&UpdateIngressGuard>) -> bool {
+        match (ingress_guard, &self.decoded) {
+            (Some(ingress_guard), Some(update)) => drop_by_ingress_guard(ingress_guard, update),
+            _ => false,
+        }
+    }
+}
+
+fn drop_by_ingress_guard(ingress_guard: &UpdateIngressGuard, update: &TelegramUpdate) -> bool {
+    let decision = ingress_guard.check_update(update);
+    match decision {
+        UpdateIngressDecision::Allowed { .. } => return false,
+        UpdateIngressDecision::DroppedFlood { .. } => {
+            tracing::warn!(
+                chat_id = decision.chat_id(),
+                update_id = update.id,
+                update_name = openplotva_updates::producer_update_name(update),
+                "blocked flooded Telegram chat at ingress"
+            );
+        }
+        UpdateIngressDecision::DroppedBlocked { .. } => {
+            tracing::debug!(
+                chat_id = decision.chat_id(),
+                update_id = update.id,
+                update_name = openplotva_updates::producer_update_name(update),
+                "dropped Telegram update from an ingress-blocked chat"
+            );
+        }
+    }
+    true
 }
 
 /// Concrete long-polling producer source for Telegram updates.
@@ -121,12 +195,20 @@ where
         state.buffered.pop_front()
     }
 
-    async fn push_polled_updates(&self, updates: Vec<TelegramUpdate>) {
+    async fn push_polled_updates(&self, updates: Vec<serde_json::Value>) {
         let mut state = self.state.lock().await;
-        for update in updates {
-            if update.id >= state.offset {
-                state.offset = update.id + 1;
-                state.buffered.push_back(update);
+        for raw_update in updates {
+            let update = RawIngressUpdate::from_value(raw_update);
+            let Some(update_id) = update
+                .update_id
+                .filter(|update_id| *update_id >= state.offset)
+            else {
+                continue;
+            };
+            state.offset = update_id + 1;
+            match update.decoded {
+                Some(decoded) => state.buffered.push_back(decoded),
+                None => tracing::warn!(update_id, "skipped undecodable Telegram update"),
             }
         }
     }
@@ -237,83 +319,34 @@ where
             }
         };
         report.polled_batches = report.polled_batches.saturating_add(1);
-        let updates = updates
-            .into_iter()
-            .filter(|update| update.id >= cursor)
-            .collect::<Vec<_>>();
-        if updates.is_empty() {
-            continue;
-        }
-        report.received = report.received.saturating_add(updates.len());
-        let received_at_unix_ms = unix_millis_now();
-        let mut appends = Vec::with_capacity(updates.len());
-        let mut next_cursor = cursor;
-        let mut serialization_failed = false;
-        for update in &updates {
-            next_cursor = next_cursor.max(update.id.saturating_add(1));
-            if let Some(ingress_guard) = ingress_guard {
-                let decision = ingress_guard.check_update(update);
-                if decision.is_dropped() {
-                    report.dropped_by_ingress_guard =
-                        report.dropped_by_ingress_guard.saturating_add(1);
-                    match decision {
-                        openplotva_updates::UpdateIngressDecision::DroppedFlood { .. } => {
-                            tracing::warn!(
-                                chat_id = decision.chat_id(),
-                                update_id = update.id,
-                                update_name = openplotva_updates::producer_update_name(update),
-                                "blocked flooded Telegram chat at ingress"
-                            );
-                        }
-                        openplotva_updates::UpdateIngressDecision::DroppedBlocked { .. } => {
-                            tracing::debug!(
-                                chat_id = decision.chat_id(),
-                                update_id = update.id,
-                                update_name = openplotva_updates::producer_update_name(update),
-                                "dropped Telegram update from an ingress-blocked chat"
-                            );
-                        }
-                        openplotva_updates::UpdateIngressDecision::Allowed { .. } => {}
-                    }
-                    continue;
-                }
+        let batch = long_poll_batch(updates, cursor, bot_id, ingress_guard, unix_millis_now());
+        report.received = report.received.saturating_add(batch.fresh);
+        report.dropped_by_ingress_guard = report
+            .dropped_by_ingress_guard
+            .saturating_add(batch.dropped_by_ingress_guard);
+        if !batch.serialization_errors.is_empty() {
+            for error in batch.serialization_errors {
+                record_limited_error(&mut report.serialization_errors, error);
             }
-            match serde_json::to_vec(update) {
-                Ok(raw_payload) => {
-                    appends.push(UpdateStreamAppend {
-                        bot_id,
-                        update_id: Some(update.id),
-                        source: UpdateStreamSource::LongPoll,
-                        received_at_unix_ms,
-                        raw_payload,
-                    });
-                }
-                Err(error) => {
-                    serialization_failed = true;
-                    record_limited_error(
-                        &mut report.serialization_errors,
-                        format!("update {}: {error}", update.id),
-                    );
-                }
-            }
-        }
-        if serialization_failed {
             tokio::select! {
                 _ = &mut stop => break,
                 () = sleep(LONG_POLL_RETRY_DELAY) => {}
             }
             continue;
         }
+        if batch.fresh == 0 {
+            continue;
+        }
 
         loop {
             let appended = tokio::select! {
                 _ = &mut stop => return report,
-                result = stream.append_long_poll_batch(&appends, next_cursor) => result,
+                result = stream.append_long_poll_batch(&batch.appends, batch.next_cursor) => result,
             };
             match appended {
                 Ok(ids) => {
                     report.appended = report.appended.saturating_add(ids.len());
-                    cursor = next_cursor;
+                    cursor = batch.next_cursor;
                     break;
                 }
                 Err(error) => {
@@ -327,6 +360,62 @@ where
         }
     }
     report
+}
+
+/// Stream entries for one `getUpdates` response.
+#[derive(Debug, Default)]
+struct LongPollBatch {
+    appends: Vec<UpdateStreamAppend>,
+    next_cursor: i64,
+    /// Updates at or past the cursor, including ones the ingress guard dropped.
+    fresh: usize,
+    dropped_by_ingress_guard: usize,
+    serialization_errors: Vec<String>,
+}
+
+/// Turn raw `getUpdates` results into stream entries with the same raw JSON
+/// and the same ingress checks a webhook request gets.
+fn long_poll_batch(
+    updates: Vec<serde_json::Value>,
+    cursor: i64,
+    bot_id: i64,
+    ingress_guard: Option<&UpdateIngressGuard>,
+    received_at_unix_ms: i64,
+) -> LongPollBatch {
+    let mut batch = LongPollBatch {
+        appends: Vec::with_capacity(updates.len()),
+        next_cursor: cursor,
+        ..LongPollBatch::default()
+    };
+    for raw_update in updates {
+        let raw_payload = match serde_json::to_vec(&raw_update) {
+            Ok(raw_payload) => raw_payload,
+            Err(error) => {
+                batch.serialization_errors.push(error.to_string());
+                continue;
+            }
+        };
+        let update = RawIngressUpdate::from_value(raw_update);
+        if let Some(update_id) = update.update_id {
+            if update_id < cursor {
+                continue;
+            }
+            batch.next_cursor = batch.next_cursor.max(update_id.saturating_add(1));
+        }
+        batch.fresh = batch.fresh.saturating_add(1);
+        if update.dropped_by(ingress_guard) {
+            batch.dropped_by_ingress_guard = batch.dropped_by_ingress_guard.saturating_add(1);
+            continue;
+        }
+        batch.appends.push(UpdateStreamAppend {
+            bot_id,
+            update_id: update.update_id,
+            source: UpdateStreamSource::LongPoll,
+            received_at_unix_ms,
+            raw_payload,
+        });
+    }
+    batch
 }
 
 fn record_limited_error(errors: &mut Vec<String>, error: String) {
@@ -447,20 +536,6 @@ impl WebhookUpdateSender {
         self
     }
 
-    /// Append one parsed Telegram update to the durable ingress Stream.
-    pub async fn accept_update(
-        &self,
-        update: TelegramUpdate,
-    ) -> Result<(), WebhookUpdateSendError> {
-        if self.drop_by_ingress_guard(&update) {
-            return Ok(());
-        }
-        let raw_payload =
-            serde_json::to_vec(&update).map_err(|_| WebhookUpdateSendError::Stream)?;
-        self.append_raw_stream_update(Some(update.id), &raw_payload)
-            .await
-    }
-
     pub async fn handle_webhook_request(
         &self,
         method: &str,
@@ -481,50 +556,13 @@ impl WebhookUpdateSender {
             return Err(WebhookUpdateRequestError::Unauthorized);
         }
 
-        let decoded = openplotva_updates::decode_telegram_update_json_slice(body).ok();
-        if decoded
-            .as_ref()
-            .is_some_and(|update| self.drop_by_ingress_guard(update))
-        {
+        let update = RawIngressUpdate::from_slice(body);
+        if update.dropped_by(self.ingress_guard.as_deref()) {
             return Ok(());
         }
-        let update_id = decoded
-            .as_ref()
-            .map(|update| update.id)
-            .or_else(|| raw_update_id(body));
-        self.append_raw_stream_update(update_id, body)
+        self.append_raw_stream_update(update.update_id, body)
             .await
             .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
-    }
-
-    fn drop_by_ingress_guard(&self, update: &TelegramUpdate) -> bool {
-        let Some(ingress_guard) = &self.ingress_guard else {
-            return false;
-        };
-        let decision = ingress_guard.check_update(update);
-        if !decision.is_dropped() {
-            return false;
-        }
-        match decision {
-            openplotva_updates::UpdateIngressDecision::DroppedFlood { .. } => {
-                tracing::warn!(
-                    chat_id = decision.chat_id(),
-                    update_id = update.id,
-                    update_name = openplotva_updates::producer_update_name(update),
-                    "blocked flooded Telegram chat at ingress"
-                );
-            }
-            openplotva_updates::UpdateIngressDecision::DroppedBlocked { .. } => {
-                tracing::debug!(
-                    chat_id = decision.chat_id(),
-                    update_id = update.id,
-                    update_name = openplotva_updates::producer_update_name(update),
-                    "dropped Telegram update from an ingress-blocked chat"
-                );
-            }
-            openplotva_updates::UpdateIngressDecision::Allowed { .. } => {}
-        }
-        true
     }
 
     async fn append_raw_stream_update(
@@ -600,13 +638,6 @@ fn constant_time_secret_eq(left: &[u8], right: &[u8]) -> bool {
         difference |= left ^ right;
     }
     difference == 0
-}
-
-fn raw_update_id(body: &[u8]) -> Option<i64> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()?
-        .get("update_id")?
-        .as_i64()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,14 +742,18 @@ mod tests {
         time::Duration,
     };
 
-    use carapax::types::Update as TelegramUpdate;
-    use openplotva_updates::UpdateProducerSource;
+    use carapax::types::{MessageData, Update as TelegramUpdate};
+    use openplotva_updates::{
+        RedisUpdateStream, UpdateIngressGuard, UpdateIngressGuardConfig, UpdateProducerSource,
+        UpdateStreamSource, decode_telegram_update_json_slice,
+    };
     use serde_json::{Value, json};
 
     use super::{
-        LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
+        GetUpdatesExecutor, LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
         TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup, WebhookUpdateRequestError,
-        build_delete_webhook_method, build_get_updates_method, build_set_webhook_method,
+        build_delete_webhook_method, build_get_updates_method,
+        build_get_updates_method_with_offset, build_set_webhook_method, long_poll_batch,
     };
 
     #[test]
@@ -779,8 +814,8 @@ mod tests {
     async fn long_poll_source_uses_go_offsets_and_yields_buffered_updates()
     -> Result<(), Box<dyn Error>> {
         let client = PollClientStub::new(vec![
-            PollAction::Updates(vec![sample_message_update(10)?, sample_message_update(11)?]),
-            PollAction::Updates(vec![sample_message_update(12)?]),
+            PollAction::Updates(vec![sample_message_update(10), sample_message_update(11)]),
+            PollAction::Updates(vec![sample_message_update(12)]),
         ]);
         let source = LongPollUpdateSource::new(client.clone()).with_retry_delay(Duration::ZERO);
 
@@ -803,8 +838,8 @@ mod tests {
     async fn long_poll_source_skips_updates_below_current_offset_like_go()
     -> Result<(), Box<dyn Error>> {
         let client = PollClientStub::new(vec![
-            PollAction::Updates(vec![sample_message_update(10)?]),
-            PollAction::Updates(vec![sample_message_update(9)?, sample_message_update(11)?]),
+            PollAction::Updates(vec![sample_message_update(10)]),
+            PollAction::Updates(vec![sample_message_update(9), sample_message_update(11)]),
         ]);
         let source = LongPollUpdateSource::new(client.clone()).with_retry_delay(Duration::ZERO);
 
@@ -823,7 +858,7 @@ mod tests {
     async fn long_poll_source_retries_after_poll_errors_like_go() -> Result<(), Box<dyn Error>> {
         let client = PollClientStub::new(vec![
             PollAction::Error("temporary telegram error"),
-            PollAction::Updates(vec![sample_message_update(10)?]),
+            PollAction::Updates(vec![sample_message_update(10)]),
         ]);
         let source = LongPollUpdateSource::new(client.clone()).with_retry_delay(Duration::ZERO);
 
@@ -835,6 +870,115 @@ mod tests {
         assert_eq!(update.id, 10);
         assert_eq!(request_offsets(&client.requests()), vec![0, 0]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_poll_source_decodes_with_the_shared_decoder() -> Result<(), Box<dyn Error>> {
+        let client = PollClientStub::new(vec![
+            PollAction::Updates(vec![gif_animation_update(11)]),
+            PollAction::Updates(vec![sample_message_update(12)]),
+        ]);
+        let source = LongPollUpdateSource::new(client.clone()).with_retry_delay(Duration::ZERO);
+
+        let gif = source.next_update().await.ok_or("expected GIF update")?;
+        let text = source.next_update().await.ok_or("expected text update")?;
+
+        assert_eq!([gif.id, text.id], [11, 12]);
+        assert!(is_animation(&gif));
+        assert_eq!(request_offsets(&client.requests()), vec![0, 12]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn carapax_get_updates_returns_raw_bot_api_json() -> Result<(), Box<dyn Error>> {
+        let gif = gif_animation_update(21);
+        let response = json!({"ok": true, "result": [gif.clone()]}).to_string();
+        let (host, server) = crate::test_api::serve_one_bot_api_response("200 OK", response)?;
+        let client = carapax::api::Client::new("fixture")?
+            .with_host(host)
+            .with_max_retries(0);
+
+        let updates = client
+            .get_updates(build_get_updates_method_with_offset(21))
+            .await?;
+        let request = server.join().map_err(|_| "fixture server panicked")??;
+
+        assert_eq!(updates, vec![gif]);
+        assert!(String::from_utf8_lossy(&request).starts_with("POST /botfixture/getUpdates "));
+        Ok(())
+    }
+
+    #[test]
+    fn long_poll_batch_keeps_raw_bot_api_json_for_the_shared_decoder() -> Result<(), Box<dyn Error>>
+    {
+        let gif = gif_animation_update(21);
+
+        let batch = long_poll_batch(
+            vec![
+                sample_message_update(20),
+                gif.clone(),
+                sample_message_update(22),
+            ],
+            21,
+            77,
+            None,
+            1_710_000_000_000,
+        );
+
+        assert_eq!(batch.fresh, 2);
+        assert_eq!(batch.next_cursor, 23);
+        assert!(batch.serialization_errors.is_empty());
+        let [gif_entry, text_entry] = batch.appends.as_slice() else {
+            return Err(format!("expected 2 stream entries, got {}", batch.appends.len()).into());
+        };
+        assert_eq!(gif_entry.bot_id, 77);
+        assert_eq!(gif_entry.update_id, Some(21));
+        assert_eq!(gif_entry.source, UpdateStreamSource::LongPoll);
+        assert_eq!(gif_entry.received_at_unix_ms, 1_710_000_000_000);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&gif_entry.raw_payload)?,
+            gif
+        );
+        assert!(is_animation(&decode_telegram_update_json_slice(
+            &gif_entry.raw_payload
+        )?));
+        assert_eq!(text_entry.update_id, Some(22));
+        Ok(())
+    }
+
+    #[test]
+    fn long_poll_batch_skips_stale_updates_before_the_ingress_guard() {
+        let guard = UpdateIngressGuard::new(UpdateIngressGuardConfig {
+            short_window: Duration::from_secs(10),
+            short_limit: 2,
+            long_window: Duration::from_secs(60),
+            long_limit: 100,
+            block_duration: Duration::from_secs(300),
+        });
+
+        let batch = long_poll_batch(
+            vec![
+                sample_message_update(9),
+                sample_message_update(10),
+                sample_message_update(11),
+            ],
+            10,
+            77,
+            Some(&guard),
+            0,
+        );
+
+        assert_eq!(batch.fresh, 2);
+        assert_eq!(batch.dropped_by_ingress_guard, 1);
+        assert_eq!(batch.next_cursor, 12);
+        assert_eq!(
+            batch
+                .appends
+                .iter()
+                .map(|append| append.update_id)
+                .collect::<Vec<_>>(),
+            vec![Some(10)]
+        );
     }
 
     #[tokio::test]
@@ -921,7 +1065,7 @@ mod tests {
             },
         ));
         let sender = super::webhook_update_stream(stream, 77).with_ingress_guard(guard);
-        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+        let body = serde_json::to_vec(&sample_message_update(10))?;
 
         sender
             .handle_webhook_request("POST", Some("secret"), "secret", &body)
@@ -950,6 +1094,77 @@ mod tests {
             .arg(&key)
             .query_async(&mut connection)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_webhook_and_long_poll_store_the_same_raw_update() -> Result<(), Box<dyn Error>> {
+        let Ok(url) = std::env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let client = redis::Client::open(url)?;
+        let prefix = format!("openplotva:ingress-parity-test:{}", std::process::id());
+        let webhook_key = format!("{prefix}:webhook");
+        let long_poll_key = format!("{prefix}:long-poll");
+        let webhook_stream = RedisUpdateStream::with_key(client.clone(), &webhook_key);
+        let long_poll_stream = RedisUpdateStream::with_key(client.clone(), &long_poll_key);
+        webhook_stream.ensure_consumer_group().await?;
+        long_poll_stream.ensure_consumer_group().await?;
+        let gif = gif_animation_update(31);
+
+        super::webhook_update_stream(webhook_stream.clone(), 77)
+            .handle_webhook_request("POST", Some("secret"), "secret", &serde_json::to_vec(&gif)?)
+            .await?;
+        let poll = PollClientStub::new(vec![
+            PollAction::Updates(vec![gif.clone()]),
+            PollAction::Pending,
+        ]);
+        let report =
+            super::run_long_poll_stream_producer_until(&poll, &long_poll_stream, 77, async {
+                while long_poll_stream
+                    .stats()
+                    .await
+                    .map_or(true, |stats| stats.length == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+
+        let webhook_entries = webhook_stream
+            .read_group("parity", Duration::ZERO, 10)
+            .await?;
+        let long_poll_entries = long_poll_stream
+            .read_group("parity", Duration::ZERO, 10)
+            .await?;
+        let cursor = long_poll_stream.long_poll_cursor().await?;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: usize = redis::cmd("DEL")
+            .arg(&webhook_key)
+            .arg(&long_poll_key)
+            .arg(format!("{long_poll_key}:long-poll-cursor"))
+            .query_async(&mut connection)
+            .await?;
+
+        assert_eq!(report.appended, 1);
+        assert_eq!(cursor, 32);
+        let ([webhook_entry], [long_poll_entry]) =
+            (webhook_entries.as_slice(), long_poll_entries.as_slice())
+        else {
+            return Err("expected one entry in each stream".into());
+        };
+        let webhook_entry = webhook_entry.decode()?;
+        let long_poll_entry = long_poll_entry.decode()?;
+        assert_eq!(webhook_entry.source, UpdateStreamSource::Webhook);
+        assert_eq!(long_poll_entry.source, UpdateStreamSource::LongPoll);
+        assert_eq!(webhook_entry.update_id, long_poll_entry.update_id);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&webhook_entry.raw_payload)?,
+            serde_json::from_slice::<Value>(&long_poll_entry.raw_payload)?
+        );
+        assert!(is_animation(&decode_telegram_update_json_slice(
+            &long_poll_entry.raw_payload
+        )?));
         Ok(())
     }
 
@@ -998,8 +1213,10 @@ mod tests {
     }
 
     enum PollAction {
-        Updates(Vec<TelegramUpdate>),
+        Updates(Vec<Value>),
         Error(&'static str),
+        /// Hold the poll open, like Telegram with no new updates.
+        Pending,
     }
 
     #[derive(Debug)]
@@ -1035,6 +1252,7 @@ mod tests {
                 match action {
                     PollAction::Updates(updates) => Ok(updates),
                     PollAction::Error(error) => Err(PollError(error)),
+                    PollAction::Pending => std::future::pending().await,
                 }
             })
         }
@@ -1052,8 +1270,8 @@ mod tests {
             .collect()
     }
 
-    fn sample_message_update(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
-        serde_json::from_value(json!({
+    fn sample_message_update(update_id: i64) -> Value {
+        json!({
             "update_id": update_id,
             "message": {
                 "message_id": 77,
@@ -1072,6 +1290,44 @@ mod tests {
                 },
                 "text": "/start hello"
             }
-        }))
+        })
+    }
+
+    /// GIF message as the Bot API sends it: `animation` plus a `document`
+    /// mirror for old clients.
+    fn gif_animation_update(update_id: i64) -> Value {
+        json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 78,
+                "date": 1_710_000_000,
+                "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+                "from": {"id": 99, "is_bot": false, "first_name": "Ada"},
+                "animation": {
+                    "file_id": "gif-file",
+                    "file_unique_id": "gif-unique",
+                    "width": 320,
+                    "height": 240,
+                    "duration": 3,
+                    "file_name": "clip.gif.mp4",
+                    "mime_type": "video/mp4",
+                    "file_size": 1024
+                },
+                "document": {
+                    "file_id": "gif-file",
+                    "file_unique_id": "gif-unique",
+                    "file_name": "clip.gif.mp4",
+                    "mime_type": "video/mp4",
+                    "file_size": 1024
+                }
+            }
+        })
+    }
+
+    fn is_animation(update: &TelegramUpdate) -> bool {
+        matches!(
+            update.get_message().map(|message| &message.data),
+            Some(MessageData::Animation(_))
+        )
     }
 }

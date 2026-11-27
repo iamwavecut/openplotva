@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -13,6 +14,46 @@ pub(crate) async fn bot_api_payload<M: Method>(
 where
     M::Response: serde::de::DeserializeOwned + Send + 'static,
 {
+    let (host, server) = serve_one_bot_api_response(
+        "400 Bad Request",
+        r#"{"ok":false,"error_code":400,"description":"fixture capture complete"}"#.to_owned(),
+    )?;
+    let client = Client::new("fixture")?.with_host(host).with_max_retries(0);
+    let _ = client.execute(method).await;
+    let bytes = server.join().map_err(|_| "fixture server panicked")??;
+    let offset = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("missing headers")?;
+    let headers = String::from_utf8_lossy(&bytes[..offset]);
+    let body = &bytes[offset + 4..];
+    if headers.to_ascii_lowercase().contains("application/json") {
+        return Ok(serde_json::from_slice(body)?);
+    }
+    let mut fields = Map::new();
+    let body = String::from_utf8(body.to_vec())?;
+    for part in body.split("\r\n--") {
+        if let Some((headers, value)) = part.split_once("\r\n\r\n") {
+            let name = headers
+                .split("name=\"")
+                .nth(1)
+                .and_then(|v| v.split('"').next())
+                .ok_or("missing field name")?;
+            let value = value.trim_end_matches("\r\n");
+            fields.insert(
+                name.to_owned(),
+                serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned())),
+            );
+        }
+    }
+    Ok(Value::Object(fields))
+}
+
+/// Answer one Bot API request with `body`; the handle yields the raw request.
+pub(crate) fn serve_one_bot_api_response(
+    status: &'static str,
+    body: String,
+) -> std::io::Result<(String, JoinHandle<std::io::Result<Vec<u8>>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let server = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
@@ -42,44 +83,13 @@ where
                 }
             }
         }
-        let body = r#"{"ok":false,"error_code":400,"description":"fixture capture complete"}"#;
         write!(
             stream,
-            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )?;
         Ok(bytes)
     });
-    let client = Client::new("fixture")?
-        .with_host(format!("http://{address}"))
-        .with_max_retries(0);
-    let _ = client.execute(method).await;
-    let bytes = server.join().map_err(|_| "fixture server panicked")??;
-    let offset = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("missing headers")?;
-    let headers = String::from_utf8_lossy(&bytes[..offset]);
-    let body = &bytes[offset + 4..];
-    if headers.to_ascii_lowercase().contains("application/json") {
-        return Ok(serde_json::from_slice(body)?);
-    }
-    let mut fields = Map::new();
-    let body = String::from_utf8(body.to_vec())?;
-    for part in body.split("\r\n--") {
-        if let Some((headers, value)) = part.split_once("\r\n\r\n") {
-            let name = headers
-                .split("name=\"")
-                .nth(1)
-                .and_then(|v| v.split('"').next())
-                .ok_or("missing field name")?;
-            let value = value.trim_end_matches("\r\n");
-            fields.insert(
-                name.to_owned(),
-                serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned())),
-            );
-        }
-    }
-    Ok(Value::Object(fields))
+    Ok((format!("http://{address}"), server))
 }
